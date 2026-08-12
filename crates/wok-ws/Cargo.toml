@@ -1,0 +1,24 @@
+[package]
+name = "wok-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebSocket and HTTP transport for wok"
+
+[dependencies]
+bytes.workspace = true
+flate2.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tungstenite.workspace = true
+tokio-tungstenite.workspace = true
+wok-event = { path = "../wok-event" }
+wok-relay = { path = "../wok-relay" }
+
+[dev-dependencies]
+tempfile.workspace = true

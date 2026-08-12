@@ -1,0 +1,24 @@
+[package]
+name = "wok-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Exact strfry LMDB v3 compatibility layer"
+
+[dependencies]
+flatbuffers.workspace = true
+libc.workspace = true
+lmdb-sys.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wok-event = { path = "../wok-event" }
+zstd.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+hex.workspace = true
+secp256k1.workspace = true
+rand.workspace = true
+serde_json.workspace = true

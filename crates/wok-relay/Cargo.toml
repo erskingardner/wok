@@ -1,0 +1,26 @@
+[package]
+name = "wok-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transport-neutral Nostr relay core"
+
+[dependencies]
+crossbeam-channel.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wok-db = { path = "../wok-db" }
+wok-event = { path = "../wok-event" }
+wok-negentropy = { path = "../wok-negentropy" }
+wok-query = { path = "../wok-query" }
+
+[dev-dependencies]
+tempfile.workspace = true
+hex.workspace = true
+secp256k1.workspace = true
+rand.workspace = true

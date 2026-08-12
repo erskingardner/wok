@@ -1,0 +1,31 @@
+[package]
+name = "wok-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Comparative load generation for wok and C++ strfry"
+
+[[bin]]
+name = "wok-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+hdrhistogram.workspace = true
+hex.workspace = true
+rand.workspace = true
+secp256k1.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wok-event = { path = "../wok-event" }
+wok-unix = { path = "../wok-unix" }
+futures-util = "0.3"
+tempfile.workspace = true

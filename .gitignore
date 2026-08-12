@@ -1,0 +1,17 @@
+/target
+**/*.mdb
+**/*.mdb-lock
+/strfry-db/
+/tmp/
+/artifacts/
+/corpus/
+/bench-results/
+*.swp
+*.swo
+.DS_Store
+.env
+.env.*
+!.env.example
+/fuzz/artifacts/
+/fuzz/corpus/
+Cargo.lock.bak

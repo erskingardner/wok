@@ -8,6 +8,8 @@ use lmdb_sys::*;
 use std::marker::PhantomData;
 use std::ptr;
 
+type Kv<'a> = (&'a [u8], &'a [u8]);
+
 pub struct RoTxn<'env> {
     pub(crate) txn: *mut MDB_txn,
     pub(crate) env: &'env Env,
@@ -42,7 +44,7 @@ impl<'env> RoTxn<'env> {
         get_raw(self.txn, dbi, key)
     }
 
-    pub fn get_u64<'a>(&'a self, dbi: MDB_dbi, key: u64) -> Result<Option<&'a [u8]>, DbError> {
+    pub fn get_u64(&self, dbi: MDB_dbi, key: u64) -> Result<Option<&[u8]>, DbError> {
         self.get(dbi, &key.to_ne_bytes())
     }
 
@@ -103,15 +105,27 @@ impl<'env> RwTxn<'env> {
         get_raw(self.txn, dbi, key)
     }
 
-    pub fn get_u64<'a>(&'a self, dbi: MDB_dbi, key: u64) -> Result<Option<&'a [u8]>, DbError> {
+    pub fn get_u64(&self, dbi: MDB_dbi, key: u64) -> Result<Option<&[u8]>, DbError> {
         self.get(dbi, &key.to_ne_bytes())
     }
 
-    pub fn put(&mut self, dbi: MDB_dbi, key: &[u8], val: &[u8], flags: u32) -> Result<bool, DbError> {
+    pub fn put(
+        &mut self,
+        dbi: MDB_dbi,
+        key: &[u8],
+        val: &[u8],
+        flags: u32,
+    ) -> Result<bool, DbError> {
         put_raw(self.txn, dbi, key, val, flags)
     }
 
-    pub fn put_u64(&mut self, dbi: MDB_dbi, key: u64, val: &[u8], flags: u32) -> Result<bool, DbError> {
+    pub fn put_u64(
+        &mut self,
+        dbi: MDB_dbi,
+        key: u64,
+        val: &[u8],
+        flags: u32,
+    ) -> Result<bool, DbError> {
         self.put(dbi, &key.to_ne_bytes(), val, flags)
     }
 
@@ -281,7 +295,7 @@ impl<'txn> Cursor<'txn> {
         key: Option<&[u8]>,
         val: Option<&[u8]>,
         op: u32,
-    ) -> Result<Option<(&'txn [u8], &'txn [u8])>, DbError> {
+    ) -> Result<Option<Kv<'txn>>, DbError> {
         let mut k = match key {
             Some(b) => mdb_val(b),
             None => MDB_val {
@@ -317,7 +331,17 @@ impl Drop for Cursor<'_> {
     }
 }
 
+fn dbi_flags(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<u32, DbError> {
+    let mut flags = 0u32;
+    check(unsafe { mdb_dbi_flags(txn, dbi, &mut flags) })?;
+    Ok(flags)
+}
+
 /// Iterate a DBI from a starting key/dup, matching C++ `generic_foreachFull`.
+///
+/// `MDB_GET_BOTH_RANGE` / `MDB_FIRST_DUP` are only valid on `MDB_DUPSORT`
+/// databases. Integer-key tables (Event, Meta, payloads, NegentropyFilter)
+/// must use `MDB_SET_RANGE` or they return `MDB_INCOMPATIBLE`.
 ///
 /// Returns `Ok(true)` if the scan finished, `Ok(false)` if the callback stopped it.
 pub fn foreach_full<F>(
@@ -331,11 +355,18 @@ pub fn foreach_full<F>(
 where
     F: FnMut(&[u8], &[u8]) -> bool,
 {
+    let dups = dbi_flags(txn, dbi)? & MDB_DUPSORT != 0;
     let mut cursor = Cursor::open(txn, dbi)?;
     let first = if reverse {
-        position_reverse(&mut cursor, start_key, start_dup)?
+        if dups {
+            position_reverse_dup(&mut cursor, start_key, start_dup)?
+        } else {
+            position_reverse_nodup(&mut cursor, start_key)?
+        }
+    } else if dups {
+        position_forward_dup(&mut cursor, start_key, start_dup)?
     } else {
-        position_forward(&mut cursor, start_key, start_dup)?
+        position_forward_nodup(&mut cursor, start_key)?
     };
     let Some((mut k, mut v)) = first else {
         return Ok(true);
@@ -356,19 +387,52 @@ where
     Ok(true)
 }
 
-fn position_forward<'txn>(
+fn position_forward_nodup<'txn>(
+    cursor: &mut Cursor<'txn>,
+    start_key: &[u8],
+) -> Result<Option<Kv<'txn>>, DbError> {
+    if start_key.is_empty() {
+        return cursor.get(None, None, MDB_FIRST);
+    }
+    cursor.get(Some(start_key), None, MDB_SET_RANGE)
+}
+
+fn position_reverse_nodup<'txn>(
+    cursor: &mut Cursor<'txn>,
+    start_key: &[u8],
+) -> Result<Option<Kv<'txn>>, DbError> {
+    if start_key.is_empty() {
+        return cursor.get(None, None, MDB_LAST);
+    }
+    if let Some((k, v)) = cursor.get(Some(start_key), None, MDB_SET_RANGE)? {
+        if k == start_key {
+            return Ok(Some((k, v)));
+        }
+        return cursor.get(None, None, MDB_PREV);
+    }
+    cursor.get(None, None, MDB_LAST)
+}
+
+fn position_forward_dup<'txn>(
     cursor: &mut Cursor<'txn>,
     start_key: &[u8],
     start_dup: &[u8],
-) -> Result<Option<(&'txn [u8], &'txn [u8])>, DbError> {
-    if let Some(kv) = cursor.get(Some(start_key), Some(start_dup), MDB_GET_BOTH_RANGE)? {
-        return Ok(Some(kv));
+) -> Result<Option<Kv<'txn>>, DbError> {
+    if start_key.is_empty() {
+        return cursor.get(None, None, MDB_FIRST);
+    }
+    if !start_dup.is_empty() {
+        if let Some(kv) = cursor.get(Some(start_key), Some(start_dup), MDB_GET_BOTH_RANGE)? {
+            return Ok(Some(kv));
+        }
     }
     if cursor.get(Some(start_key), None, MDB_SET)?.is_some() {
-        return cursor.get(None, None, MDB_NEXT_NODUP);
+        if let Some(dup) = cursor.get(None, None, MDB_FIRST_DUP)? {
+            return Ok(Some(dup));
+        }
+        return cursor.get(Some(start_key), None, MDB_SET);
     }
     if let Some(kv) = cursor.get(Some(start_key), None, MDB_SET_RANGE)? {
-        // C++ then MDB_FIRST_DUP
         if let Some(dup) = cursor.get(None, None, MDB_FIRST_DUP)? {
             return Ok(Some(dup));
         }
@@ -377,16 +441,21 @@ fn position_forward<'txn>(
     Ok(None)
 }
 
-fn position_reverse<'txn>(
+fn position_reverse_dup<'txn>(
     cursor: &mut Cursor<'txn>,
     start_key: &[u8],
     start_dup: &[u8],
-) -> Result<Option<(&'txn [u8], &'txn [u8])>, DbError> {
-    if let Some((k, v)) = cursor.get(Some(start_key), Some(start_dup), MDB_GET_BOTH_RANGE)? {
-        if v != start_dup {
-            return cursor.get(None, None, MDB_PREV);
+) -> Result<Option<Kv<'txn>>, DbError> {
+    if start_key.is_empty() {
+        return cursor.get(None, None, MDB_LAST);
+    }
+    if !start_dup.is_empty() {
+        if let Some((k, v)) = cursor.get(Some(start_key), Some(start_dup), MDB_GET_BOTH_RANGE)? {
+            if v != start_dup {
+                return cursor.get(None, None, MDB_PREV);
+            }
+            return Ok(Some((k, v)));
         }
-        return Ok(Some((k, v)));
     }
     if cursor.get(Some(start_key), None, MDB_SET)?.is_some() {
         return cursor.get(None, None, MDB_LAST_DUP);

@@ -1,6 +1,8 @@
 //! Event insert/delete/replace matching `src/events.cpp`.
 
-use crate::keys::{make_key_string_u64, make_key_string_u64_u64, make_key_u64_u64, parse_key_string_u64};
+use crate::keys::{
+    make_key_string_u64, make_key_string_u64_u64, make_key_u64_u64, parse_key_string_u64,
+};
 use crate::payload::encode_raw_payload;
 use crate::txn::RwTxn;
 use crate::DbError;
@@ -75,7 +77,9 @@ pub fn lookup_event_by_id(txn: &RwTxn<'_>, id: &[u8]) -> Result<Option<(u64, Vec
 }
 
 pub fn lookup_event_by_levid(txn: &RwTxn<'_>, lev_id: u64) -> Result<Option<Vec<u8>>, DbError> {
-    Ok(txn.get_u64(txn.env().dbis().event, lev_id)?.map(|b| b.to_vec()))
+    Ok(txn
+        .get_u64(txn.env().dbis().event, lev_id)?
+        .map(|b| b.to_vec()))
 }
 
 pub fn most_recent_levid(txn: &RwTxn<'_>) -> Result<u64, DbError> {
@@ -130,8 +134,7 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
             let mut s = Vec::with_capacity(32 + tag_val.len());
             s.extend_from_slice(packed.pubkey());
             s.extend_from_slice(tag_val);
-            idx.replace
-                .push(make_key_string_u64(&s, packed.kind()));
+            idx.replace.push(make_key_string_u64(&s, packed.kind()));
         } else if tag_name == 'e' && packed.kind() == 5 {
             let mut s = Vec::with_capacity(tag_val.len() + 32);
             s.extend_from_slice(tag_val);
@@ -258,12 +261,7 @@ pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbEr
 fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, DbError> {
     let dbis = txn.env().dbis();
     let lev_id = txn.next_integer_key(dbis.event)?;
-    let inserted = txn.put_u64(
-        dbis.event,
-        lev_id,
-        packed,
-        MDB_NOOVERWRITE | MDB_APPEND,
-    )?;
+    let inserted = txn.put_u64(dbis.event, lev_id, packed, MDB_NOOVERWRITE | MDB_APPEND)?;
     if !inserted {
         return Err(DbError::msg("duplicate insert into Event"));
     }
@@ -416,7 +414,8 @@ pub fn write_events<N: NegentropySink>(
                 } else if tag_name == 'a' {
                     if let Ok(s) = std::str::from_utf8(tag_val) {
                         if let Ok((kind, pubkey, d_tag)) = parse_a_tag(s) {
-                            if is_param_replaceable_kind(kind) && pubkey.as_slice() == packed.pubkey()
+                            if is_param_replaceable_kind(kind)
+                                && pubkey.as_slice() == packed.pubkey()
                             {
                                 let mut search = Vec::new();
                                 search.extend_from_slice(&pubkey);

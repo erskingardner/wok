@@ -2,7 +2,9 @@ use serde_json::Value;
 
 use crate::hash::{verify_id, verify_sig};
 use crate::packed::PackedEventView;
-use crate::parse::{from_hex, nostr_json_to_packed_event, normalize_event_json, EventLimits, ParsedEvent};
+use crate::parse::{
+    from_hex, normalize_event_json, nostr_json_to_packed_event, EventLimits, ParsedEvent,
+};
 use crate::EventError;
 
 // Re-export helper used by validate; keep json_get_string crate-private in parse
@@ -42,7 +44,8 @@ impl TimestampPolicy {
 pub fn verify_nostr_event(packed: PackedEventView<'_>, orig: &Value) -> Result<(), EventError> {
     verify_id(orig, packed.id())?;
     let sig_hex = json_string(
-        orig.get("sig").ok_or_else(|| EventError::msg("missing sig"))?,
+        orig.get("sig")
+            .ok_or_else(|| EventError::msg("missing sig"))?,
         "event sig was not a string",
     )?;
     let sig = from_hex(sig_hex)?;
@@ -55,7 +58,10 @@ pub fn verify_nostr_event(packed: PackedEventView<'_>, orig: &Value) -> Result<(
 
 pub fn verify_event_json_size(json_str: &str, max_event_size: usize) -> Result<(), EventError> {
     if json_str.len() > max_event_size {
-        return Err(EventError::msg(format!("event too large: {}", json_str.len())));
+        return Err(EventError::msg(format!(
+            "event too large: {}",
+            json_str.len()
+        )));
     }
     Ok(())
 }
@@ -156,7 +162,8 @@ mod tests {
             "tags": [],
             "content": "hi",
         }));
-        let parsed = parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).unwrap();
+        let parsed =
+            parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).unwrap();
         assert_eq!(parsed.packed.view().kind(), 1);
         assert!(parsed.json.contains("\"content\":\"hi\""));
     }

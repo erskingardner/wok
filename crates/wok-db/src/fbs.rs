@@ -40,7 +40,8 @@ fn vtable_field_offset(buf: &[u8], table_off: usize, field_id: usize) -> Result<
     if vtable_off + 4 > buf.len() {
         return Err(DbError::msg("vtable out of range"));
     }
-    let vtable_size = u16::from_le_bytes(buf[vtable_off..vtable_off + 2].try_into().unwrap()) as usize;
+    let vtable_size =
+        u16::from_le_bytes(buf[vtable_off..vtable_off + 2].try_into().unwrap()) as usize;
     let entry = 4 + field_id * 2;
     if entry + 2 > vtable_size {
         return Ok(0);

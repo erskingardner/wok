@@ -134,7 +134,11 @@ impl Env {
                     mdb_set_compare(txn, dbi, lmdb_comparator_u64_u64 as *mut MDB_cmp_func)
                 },
                 ComparatorKind::StringUint64Uint64 => unsafe {
-                    mdb_set_compare(txn, dbi, lmdb_comparator_string_u64_u64 as *mut MDB_cmp_func)
+                    mdb_set_compare(
+                        txn,
+                        dbi,
+                        lmdb_comparator_string_u64_u64 as *mut MDB_cmp_func,
+                    )
                 },
             };
             if cmp_rc != 0 {
@@ -199,7 +203,12 @@ impl Env {
                 endianness: 1,
                 negentropy_modification_counter: 1,
             };
-            txn.put_u64(self.dbis().meta, 1, &encode_meta(&meta), MDB_NOOVERWRITE | MDB_APPEND)?;
+            txn.put_u64(
+                self.dbis().meta,
+                1,
+                &encode_meta(&meta),
+                MDB_NOOVERWRITE | MDB_APPEND,
+            )?;
             txn.put_u64(
                 self.dbis().negentropy_filter,
                 1,
@@ -210,9 +219,11 @@ impl Env {
             let raw = txn
                 .get_u64(self.dbis().meta, 1)?
                 .ok_or_else(|| DbError::msg("missing Meta"))?;
-            let meta = decode_meta(&raw)?;
+            let meta = decode_meta(raw)?;
             if meta.endianness != 1 {
-                return Err(DbError::msg("DB was created on a machine with different endianness"));
+                return Err(DbError::msg(
+                    "DB was created on a machine with different endianness",
+                ));
             }
             if meta.db_version != wok_event::CURR_DB_VERSION {
                 return Err(DbError::msg(format!(
@@ -230,7 +241,7 @@ impl Env {
         let txn = self.begin_ro()?;
         match txn.get_u64(self.dbis().meta, 1)? {
             None => Ok(0),
-            Some(raw) => Ok(decode_meta(&raw)?.db_version),
+            Some(raw) => Ok(decode_meta(raw)?.db_version),
         }
     }
 
@@ -253,7 +264,9 @@ impl Env {
 
 impl std::fmt::Debug for Env {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Env").field("path", &self.inner.path).finish()
+        f.debug_struct("Env")
+            .field("path", &self.inner.path)
+            .finish()
     }
 }
 

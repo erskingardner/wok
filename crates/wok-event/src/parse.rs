@@ -1,6 +1,8 @@
 use serde_json::{Map, Value};
 
-use crate::kinds::{is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag};
+use crate::kinds::{
+    is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag,
+};
 use crate::packed::{PackedEvent, PackedEventBuilder, PackedEventTagBuilder};
 use crate::{EventError, MAX_INDEXED_TAG_VAL_SIZE};
 
@@ -29,7 +31,7 @@ pub struct ParsedEvent {
 }
 
 pub fn from_hex(s: &str) -> Result<Vec<u8>, EventError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(EventError::msg("odd hex length"));
     }
     hex::decode(s).map_err(|e| EventError::msg(format!("hex decode: {e}")))
@@ -61,7 +63,10 @@ fn json_get_array<'a>(v: &'a Value, err: &str) -> Result<&'a Vec<Value>, EventEr
 }
 
 /// Convert nostr JSON to PackedEvent. Matches `nostrJsonToPackedEvent`.
-pub fn nostr_json_to_packed_event(v: &Value, limits: &EventLimits) -> Result<PackedEvent, EventError> {
+pub fn nostr_json_to_packed_event(
+    v: &Value,
+    limits: &EventLimits,
+) -> Result<PackedEvent, EventError> {
     if !v.is_object() {
         return Err(EventError::msg("event is not an object"));
     }
@@ -70,7 +75,8 @@ pub fn nostr_json_to_packed_event(v: &Value, limits: &EventLimits) -> Result<Pac
         "event id field was not a string",
     )?)?;
     let pubkey = from_hex(json_get_string(
-        v.get("pubkey").ok_or_else(|| EventError::msg("missing pubkey"))?,
+        v.get("pubkey")
+            .ok_or_else(|| EventError::msg("missing pubkey"))?,
         "event pubkey field was not a string",
     )?)?;
     let created_at = json_get_unsigned(
@@ -79,7 +85,8 @@ pub fn nostr_json_to_packed_event(v: &Value, limits: &EventLimits) -> Result<Pac
         "event created_at field was not an integer",
     )?;
     let kind = json_get_unsigned(
-        v.get("kind").ok_or_else(|| EventError::msg("missing kind"))?,
+        v.get("kind")
+            .ok_or_else(|| EventError::msg("missing kind"))?,
         "event kind field was not an integer",
     )?;
     json_get_string(
@@ -104,7 +111,8 @@ pub fn nostr_json_to_packed_event(v: &Value, limits: &EventLimits) -> Result<Pac
     }
 
     let tags = json_get_array(
-        v.get("tags").ok_or_else(|| EventError::msg("missing tags"))?,
+        v.get("tags")
+            .ok_or_else(|| EventError::msg("missing tags"))?,
         "tags field not an array",
     )?;
     if tags.len() > limits.max_num_tags {
@@ -125,7 +133,10 @@ pub fn nostr_json_to_packed_event(v: &Value, limits: &EventLimits) -> Result<Pac
 
         if tag_name.len() == 1 {
             if tag_val.len() > limits.max_tag_val_size {
-                return Err(EventError::msg(format!("tag val too large: {}", tag_val.len())));
+                return Err(EventError::msg(format!(
+                    "tag val too large: {}",
+                    tag_val.len()
+                )));
             }
             if tag_name == "e" || tag_name == "p" {
                 if tag_val.len() != 64 {
@@ -149,12 +160,10 @@ pub fn nostr_json_to_packed_event(v: &Value, limits: &EventLimits) -> Result<Pac
             if tag_val.len() <= MAX_INDEXED_TAG_VAL_SIZE {
                 tag_builder.add(tag_name.chars().next().unwrap(), tag_val.as_bytes())?;
             }
-        } else if tag_name == "expiration" {
-            if expiration == 0 {
-                expiration = parse_uint64(&tag_val)?;
-                if expiration < 100 {
-                    return Err(EventError::msg("invalid expiration"));
-                }
+        } else if tag_name == "expiration" && expiration == 0 {
+            expiration = parse_uint64(&tag_val)?;
+            if expiration < 100 {
+                return Err(EventError::msg("invalid expiration"));
             }
         }
     }

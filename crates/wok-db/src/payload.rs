@@ -85,9 +85,10 @@ impl Decompressor {
                 self.buffer.extend_from_slice(json);
                 std::str::from_utf8(&self.buffer).map_err(|_| DbError::msg("payload not utf-8"))
             }
-            PayloadView::Zstd { dict_id, compressed } => {
-                self.decompress(txn, dict_id, compressed, max_event_size)
-            }
+            PayloadView::Zstd {
+                dict_id,
+                compressed,
+            } => self.decompress(txn, dict_id, compressed, max_event_size),
         }
     }
 
@@ -103,9 +104,10 @@ impl Decompressor {
                 self.buffer.extend_from_slice(json);
                 std::str::from_utf8(&self.buffer).map_err(|_| DbError::msg("payload not utf-8"))
             }
-            PayloadView::Zstd { dict_id, compressed } => {
-                self.decompress_rw(txn, dict_id, compressed, max_event_size)
-            }
+            PayloadView::Zstd {
+                dict_id,
+                compressed,
+            } => self.decompress_rw(txn, dict_id, compressed, max_event_size),
         }
     }
 
@@ -186,4 +188,13 @@ pub fn get_event_json<'a>(
     // Copy raw to owned because decomp.decode borrows txn and decomp.
     let owned = raw.to_vec();
     decomp.decode(txn, &owned, max_event_size)
+}
+
+pub fn event_json_owned(
+    txn: &RoTxn<'_>,
+    decomp: &mut Decompressor,
+    lev_id: u64,
+    max_event_size: usize,
+) -> Result<String, DbError> {
+    Ok(get_event_json(txn, decomp, lev_id, max_event_size)?.to_string())
 }

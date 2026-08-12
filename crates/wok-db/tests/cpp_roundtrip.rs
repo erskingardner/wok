@@ -5,9 +5,10 @@ use wok_db::{write_events, Env, EnvOptions, EventToWrite, EventWriteStatus, Noop
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 
 fn strfry_bin() -> PathBuf {
-    PathBuf::from(std::env::var("STRFRY_BIN").unwrap_or_else(|_| {
-        "/Users/jeff/code/strfry/strfry".to_string()
-    }))
+    PathBuf::from(
+        std::env::var("STRFRY_BIN")
+            .unwrap_or_else(|_| "/Users/jeff/code/strfry/strfry".to_string()),
+    )
 }
 
 fn make_cpp_db() -> (TempDir, PathBuf) {
@@ -20,7 +21,11 @@ fn make_cpp_db() -> (TempDir, PathBuf) {
         .args(["--config", conf.to_str().unwrap(), "info"])
         .output()
         .expect("run strfry info");
-    assert!(out.status.success(), "strfry info failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "strfry info failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     (tmp, db)
 }
 
@@ -51,7 +56,11 @@ fn rust_init_readable_by_cpp() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(stdout.contains("DB version: 3"), "{stdout}");
 }
 
@@ -99,7 +108,11 @@ fn rust_write_cpp_export() {
         .args(["--config", conf.to_str().unwrap(), "export"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(&id_hex), "{stdout}");
     assert!(stdout.contains("hello wok"), "{stdout}");

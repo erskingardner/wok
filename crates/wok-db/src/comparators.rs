@@ -45,7 +45,9 @@ pub fn make_key_u64_u64(n1: u64, n2: u64) -> Vec<u8> {
 
 pub fn parse_key_u64_u64(k: &[u8]) -> Result<(u64, u64), super::DbError> {
     if k.len() != 16 {
-        return Err(super::DbError::msg("Uint64Uint64 key too short/long to parse"));
+        return Err(super::DbError::msg(
+            "Uint64Uint64 key too short/long to parse",
+        ));
     }
     Ok((u64_from_ne(&k[0..8]), u64_from_ne(&k[8..16])))
 }
@@ -60,7 +62,9 @@ pub fn make_key_string_u64_u64(s: &[u8], n1: u64, n2: u64) -> Vec<u8> {
 
 pub fn parse_key_string_u64_u64(k: &[u8]) -> Result<(&[u8], u64, u64), super::DbError> {
     if k.len() < 16 {
-        return Err(super::DbError::msg("StringUint64Uint64 key too short to parse"));
+        return Err(super::DbError::msg(
+            "StringUint64Uint64 key too short to parse",
+        ));
     }
     let (s, rest) = k.split_at(k.len() - 16);
     Ok((s, u64_from_ne(&rest[0..8]), u64_from_ne(&rest[8..16])))
@@ -76,7 +80,10 @@ pub fn cmp_memn(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 pub fn cmp_string_u64(a: &[u8], b: &[u8]) -> Ordering {
-    assert!(a.len() >= 8 && b.len() >= 8, "StringUint64 key too short to compare");
+    assert!(
+        a.len() >= 8 && b.len() >= 8,
+        "StringUint64 key too short to compare"
+    );
     let a_s = &a[..a.len() - 8];
     let b_s = &b[..b.len() - 8];
     match cmp_memn(a_s, b_s) {
@@ -86,7 +93,10 @@ pub fn cmp_string_u64(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 pub fn cmp_u64_u64(a: &[u8], b: &[u8]) -> Ordering {
-    assert!(a.len() == 16 && b.len() == 16, "Uint64Uint64 key too short/long to compare");
+    assert!(
+        a.len() == 16 && b.len() == 16,
+        "Uint64Uint64 key too short/long to compare"
+    );
     match u64_from_ne(&a[0..8]).cmp(&u64_from_ne(&b[0..8])) {
         Ordering::Equal => u64_from_ne(&a[8..16]).cmp(&u64_from_ne(&b[8..16])),
         o => o,
@@ -94,16 +104,17 @@ pub fn cmp_u64_u64(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 pub fn cmp_string_u64_u64(a: &[u8], b: &[u8]) -> Ordering {
-    assert!(a.len() >= 16 && b.len() >= 16, "StringUint64Uint64 key too short to compare");
+    assert!(
+        a.len() >= 16 && b.len() >= 16,
+        "StringUint64Uint64 key too short to compare"
+    );
     let a_s = &a[..a.len() - 16];
     let b_s = &b[..b.len() - 16];
     match cmp_memn(a_s, b_s) {
         Ordering::Equal => match u64_from_ne(&a[a.len() - 16..a.len() - 8])
             .cmp(&u64_from_ne(&b[b.len() - 16..b.len() - 8]))
         {
-            Ordering::Equal => {
-                u64_from_ne(&a[a.len() - 8..]).cmp(&u64_from_ne(&b[b.len() - 8..]))
-            }
+            Ordering::Equal => u64_from_ne(&a[a.len() - 8..]).cmp(&u64_from_ne(&b[b.len() - 8..])),
             o => o,
         },
         o => o,
@@ -129,14 +140,23 @@ fn ord_to_c(o: Ordering) -> c_int {
     }
 }
 
+/// # Safety
+/// `a` and `b` must be valid pointers to `MDB_val` values provided by LMDB
+/// for the duration of this call.
 pub unsafe extern "C" fn lmdb_comparator_string_u64(a: *const MDB_val, b: *const MDB_val) -> c_int {
     ord_to_c(cmp_string_u64(val_slice(a), val_slice(b)))
 }
 
+/// # Safety
+/// `a` and `b` must be valid pointers to `MDB_val` values provided by LMDB
+/// for the duration of this call.
 pub unsafe extern "C" fn lmdb_comparator_u64_u64(a: *const MDB_val, b: *const MDB_val) -> c_int {
     ord_to_c(cmp_u64_u64(val_slice(a), val_slice(b)))
 }
 
+/// # Safety
+/// `a` and `b` must be valid pointers to `MDB_val` values provided by LMDB
+/// for the duration of this call.
 pub unsafe extern "C" fn lmdb_comparator_string_u64_u64(
     a: *const MDB_val,
     b: *const MDB_val,

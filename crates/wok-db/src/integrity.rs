@@ -73,7 +73,7 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
     })?;
     if id_index < report.events {
         report.missing_index_entries += report.events - id_index;
-    } else     if id_index > report.events {
+    } else if id_index > report.events {
         report.extra_index_entries += id_index - report.events;
     }
 

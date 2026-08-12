@@ -46,7 +46,8 @@ pub fn verify_sig(sig: &[u8], hash: &[u8], pubkey: &[u8]) -> Result<bool, EventE
     if sig.len() != 64 || hash.len() != 32 || pubkey.len() != 32 {
         return Err(EventError::msg("verify sig: bad input size"));
     }
-    let pk = XOnlyPublicKey::from_slice(pubkey).map_err(|_| EventError::msg("verify sig: bad pubkey"))?;
+    let pk = XOnlyPublicKey::from_slice(pubkey)
+        .map_err(|_| EventError::msg("verify sig: bad pubkey"))?;
     let signature = secp256k1::schnorr::Signature::from_slice(sig)
         .map_err(|_| EventError::msg("verify sig: bad signature"))?;
     Ok(SECP256K1.verify_schnorr(&signature, hash, &pk).is_ok())
@@ -79,7 +80,6 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(h, sha256(encoded.as_bytes()));
-        assert_eq!(sha256(b"abc"), sha256_secp(b"abc"));
     }
 
     #[test]

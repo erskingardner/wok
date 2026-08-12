@@ -1,0 +1,127 @@
+//! Read restriction matching `src/ReadRestrictor.h`.
+
+use wok_event::PackedEventView;
+use wok_query::{NostrFilter, NostrFilterGroup};
+
+#[derive(Clone, Debug)]
+pub struct ReadRestrictor {
+    pub restricted_kinds: Vec<u64>,
+    pub restrict_to_involved: bool,
+}
+
+impl ReadRestrictor {
+    pub fn new(kinds: Vec<u64>, restrict_to_involved: bool) -> Self {
+        Self {
+            restricted_kinds: kinds,
+            restrict_to_involved,
+        }
+    }
+
+    pub fn is_restricted_kind(&self, kind: u64) -> bool {
+        self.restricted_kinds.contains(&kind)
+    }
+
+    pub fn is_filter_fully_restricted(&self, filter: &NostrFilter) -> bool {
+        let Some(kinds) = &filter.kinds else {
+            return false;
+        };
+        if self.restricted_kinds.is_empty() {
+            return false;
+        }
+        kinds.iter().all(|k| self.restricted_kinds.contains(&k))
+    }
+
+    pub fn is_filter_group_fully_restricted(&self, fg: &NostrFilterGroup) -> bool {
+        if self.restricted_kinds.is_empty() || fg.filters.is_empty() {
+            return false;
+        }
+        fg.filters
+            .iter()
+            .all(|f| self.is_filter_fully_restricted(f))
+    }
+
+    pub fn is_filter_allowed_to_count(&self, fg: &NostrFilterGroup, authed: Option<&[u8]>) -> bool {
+        if self.restricted_kinds.is_empty() {
+            return true;
+        }
+        for f in &fg.filters {
+            let Some(kinds) = &f.kinds else {
+                continue;
+            };
+            let has_restricted = kinds.iter().any(|k| self.restricted_kinds.contains(&k));
+            if !has_restricted {
+                continue;
+            }
+            let Some(pk) = authed else {
+                return false;
+            };
+            let author_scoped = f
+                .authors
+                .as_ref()
+                .map(|a| a.size() > 0 && (0..a.size()).all(|i| a.at(i) == pk))
+                .unwrap_or(false);
+            let p_scoped = f
+                .tags
+                .get(&'p')
+                .map(|t| t.size() > 0 && (0..t.size()).all(|i| t.at(i) == pk))
+                .unwrap_or(false);
+            if !author_scoped && !p_scoped {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn should_send_to_subscriber(
+        &self,
+        packed: PackedEventView<'_>,
+        authed: Option<&[u8]>,
+    ) -> bool {
+        if !(self.is_restricted_kind(packed.kind()) && self.restrict_to_involved) {
+            return true;
+        }
+        let Some(pk) = authed else {
+            return false;
+        };
+        let mut recipient = None;
+        packed.foreach_tag(|name, val| {
+            if name == 'p' && val.len() == 32 {
+                recipient = Some(val.to_vec());
+                return false;
+            }
+            true
+        });
+        let Some(recipient) = recipient else {
+            return false;
+        };
+        pk == recipient.as_slice() || pk == packed.pubkey()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
+
+    #[test]
+    fn fully_restricted_kinds() {
+        let r = ReadRestrictor::new(vec![4, 1059], true);
+        let fg = NostrFilterGroup::from_value(&json!({"kinds":[4]}), 500, 3).unwrap();
+        assert!(r.is_filter_group_fully_restricted(&fg));
+        let fg = NostrFilterGroup::from_value(&json!({"kinds":[1,4]}), 500, 3).unwrap();
+        assert!(!r.is_filter_group_fully_restricted(&fg));
+    }
+
+    #[test]
+    fn send_restricted_to_p_tag() {
+        let r = ReadRestrictor::new(vec![4], true);
+        let mut tags = PackedEventTagBuilder::default();
+        tags.add('p', &[9u8; 32]).unwrap();
+        let ev = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 1, 4, 0, &tags).unwrap();
+        assert!(!r.should_send_to_subscriber(ev.view(), None));
+        assert!(r.should_send_to_subscriber(ev.view(), Some(&[9u8; 32])));
+        assert!(r.should_send_to_subscriber(ev.view(), Some(&[2u8; 32])));
+        assert!(!r.should_send_to_subscriber(ev.view(), Some(&[3u8; 32])));
+    }
+}

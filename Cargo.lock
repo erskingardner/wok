@@ -2322,6 +2322,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
  "wok-event",
  "wok-unix",
 ]
@@ -2364,7 +2365,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
- "wok-cli",
  "wok-db",
  "wok-event",
  "wok-query",
@@ -2413,6 +2413,8 @@ name = "wok-negentropy"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "lmdb-sys",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
@@ -2426,7 +2428,10 @@ name = "wok-query"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "lmdb-sys",
  "proptest",
+ "rand 0.8.7",
+ "secp256k1",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -2438,8 +2443,10 @@ dependencies = [
 name = "wok-relay"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "crossbeam-channel",
  "hex",
+ "notify",
  "parking_lot",
  "rand 0.8.7",
  "secp256k1",
@@ -2447,6 +2454,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "wok-db",
  "wok-event",
@@ -2475,6 +2483,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "flate2",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",

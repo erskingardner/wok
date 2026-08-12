@@ -28,4 +28,5 @@ tracing-subscriber.workspace = true
 wok-event = { path = "../wok-event" }
 wok-unix = { path = "../wok-unix" }
 futures-util = "0.3"
+walkdir.workspace = true
 tempfile.workspace = true

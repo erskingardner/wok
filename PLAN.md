@@ -50,6 +50,11 @@ See `docs/known-differences.md` as it is filled in. Initial decisions:
 - **Historical restricted-kind REQ filtering** uses the Event table PackedEvent, not the JSON payload. C++ `RelayReqWorker` currently constructs `PackedEventView` from EventPayload bytes; that does not match the monitor path or AUTH intent. wok implements the intended PackedEvent check and records the C++ discrepancy.
 - **Unix socket** is a wok extension. It is disabled by default and is not advertised as a C++-compatible feature.
 - **NIP advertisement** lists only capabilities covered by conformance tests.
+- **`foreach_full` must not use `MDB_GET_BOTH_RANGE` on non-`DUPSORT` DBIs.** Integer-key tables (Event, Meta, EventPayload, NegentropyFilter) return `MDB_INCOMPATIBLE` otherwise. This blocked the relay write path once the default `{}` negentropy filter caused `DeferredSink` to scan NegentropyFilter.
+
+## Status
+
+Phases 1–6 are implemented. See `docs/FINAL.md` for gates, evidence, and remaining production soak work.
 
 ## Non-goals
 

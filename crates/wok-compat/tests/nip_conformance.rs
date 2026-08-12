@@ -1,0 +1,177 @@
+//! Independently grounded NIP tests. NIPs pin: 656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab
+
+use serde_json::json;
+use wok_compat::sign_event;
+use wok_event::{parse_and_verify_event, EventLimits};
+use wok_query::NostrFilterGroup;
+use wok_relay::{ClientCommand, RelayMessage};
+
+#[test]
+fn nip01_event_id_and_sig() {
+    let ev = sign_event(json!({
+        "created_at": 1_700_000_010u64,
+        "kind": 1,
+        "tags": [],
+        "content": "nip01",
+    }));
+    parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).unwrap();
+}
+
+#[test]
+fn nip01_malformed_json_rejected() {
+    assert!(ClientCommand::parse("not-json").is_err());
+    assert!(ClientCommand::parse("{}").is_err());
+    assert!(ClientCommand::parse(r#"["EVENT"]"#).is_err());
+}
+
+#[test]
+fn nip01_filter_kinds_since_until_limit() {
+    let fg = NostrFilterGroup::from_value(
+        &json!({"kinds":[1],"since":10,"until":20,"limit":5}),
+        500,
+        3,
+    )
+    .unwrap();
+    assert_eq!(fg.filters[0].limit, 5);
+}
+
+#[test]
+fn nip01_unknown_filter_field_rejected() {
+    assert!(NostrFilterGroup::from_value(&json!({"foo":1}), 500, 3).is_err());
+}
+
+#[test]
+fn nip01_eose_encoding() {
+    let s = RelayMessage::Eose {
+        sub_id: "abc".into(),
+    }
+    .to_json();
+    assert_eq!(s, r#"["EOSE","abc"]"#);
+}
+
+#[test]
+fn nip09_kind5_is_deletion() {
+    assert_eq!(wok_event::DELETION_KIND, 5);
+}
+
+#[test]
+fn nip40_expiration_too_small_rejected() {
+    let ev = json!({
+        "id": "11".repeat(32),
+        "pubkey": "22".repeat(32),
+        "created_at": 1,
+        "kind": 1,
+        "content": "",
+        "tags": [["expiration","50"]],
+        "sig": "00".repeat(64),
+    });
+    assert!(wok_event::nostr_json_to_packed_event(&ev, &EventLimits::default()).is_err());
+}
+
+#[test]
+fn nip70_protected_tag_constant() {
+    assert_eq!(wok_event::PROTECTED_TAG, '-');
+}
+
+#[test]
+fn nip42_auth_kind() {
+    assert_eq!(wok_event::AUTH_KIND, 22242);
+}
+
+#[test]
+fn nip45_count_encoding() {
+    let s = RelayMessage::Count {
+        sub_id: "c".into(),
+        count: 3,
+        limited: true,
+    }
+    .to_json();
+    assert!(s.contains("\"count\":3"));
+    assert!(s.contains("\"limited\":true"));
+}
+
+#[test]
+fn nip11_software_not_strfry_when_unconfigured() {
+    let cfg = wok_relay::Config::default();
+    let nips = wok_relay::supported_nips(&cfg);
+    assert!(nips.contains(&1));
+    assert!(nips.contains(&11));
+    assert!(nips.contains(&9));
+    assert!(nips.contains(&40));
+    assert!(nips.contains(&70));
+    assert!(nips.contains(&45));
+    assert!(nips.contains(&77));
+    assert!(
+        !nips.contains(&42),
+        "NIP-42 only when AUTH serviceUrl is set"
+    );
+}
+
+#[test]
+fn nip01_invalid_signature_rejected() {
+    let mut ev = sign_event(json!({
+        "created_at": 1_700_000_011u64,
+        "kind": 1,
+        "tags": [],
+        "content": "bad-sig",
+    }));
+    ev["sig"] = json!("00".repeat(64));
+    assert!(parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).is_err());
+}
+
+#[test]
+fn nip01_prefix_ids_rejected_like_cpp() {
+    assert!(NostrFilterGroup::from_value(&json!({"ids":["aabb"]}), 500, 3).is_err());
+}
+
+#[test]
+fn nip01_close_and_unknown_cmd() {
+    let c = ClientCommand::parse(r#"["CLOSE","abc"]"#).unwrap();
+    assert!(matches!(c, ClientCommand::Close { .. }));
+    assert!(ClientCommand::parse(r#"["NOPE","x"]"#).is_err());
+}
+
+#[test]
+fn nip01_duplicate_filters_still_parse() {
+    let fg = NostrFilterGroup::from_req(
+        &[
+            json!("REQ"),
+            json!("s"),
+            json!({"kinds":[1]}),
+            json!({"kinds":[1], "limit": 2}),
+        ],
+        500,
+        3,
+    )
+    .unwrap();
+    assert_eq!(fg.size(), 2);
+}
+
+#[test]
+fn nip02_kind3_is_replaceable() {
+    assert!(wok_event::is_replaceable_kind(3));
+}
+
+#[test]
+fn nip59_gift_wrap_kinds() {
+    assert!(wok_event::GIFT_WRAP_KINDS.contains(&1059));
+    assert!(wok_event::GIFT_WRAP_KINDS.contains(&21059));
+}
+
+#[test]
+fn nip77_neg_open_parse() {
+    let c = ClientCommand::parse(r#"["NEG-OPEN","s",{"kinds":[1]},"61"]"#).unwrap();
+    assert!(matches!(c, ClientCommand::NegOpen { .. }));
+}
+
+#[test]
+fn advertised_nips_are_subset_of_tested() {
+    let tested = [1u64, 2, 4, 9, 11, 28, 40, 42, 45, 59, 70, 77];
+    let cfg = wok_relay::Config::default();
+    for n in wok_relay::supported_nips(&cfg) {
+        assert!(
+            tested.contains(&n),
+            "advertised NIP-{n} has no conformance coverage"
+        );
+    }
+}

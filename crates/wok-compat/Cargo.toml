@@ -7,6 +7,8 @@ description = "C++/Rust differential tests and fixtures"
 
 [dependencies]
 hex.workspace = true
+rand.workspace = true
+secp256k1.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 wok-db = { path = "../wok-db" }
@@ -15,11 +17,8 @@ wok-query = { path = "../wok-query" }
 wok-relay = { path = "../wok-relay" }
 
 [dev-dependencies]
-secp256k1.workspace = true
-rand.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
-wok-cli = { path = "../wok-cli" }
 wok-unix = { path = "../wok-unix" }
 wok-ws = { path = "../wok-ws" }
 futures-util = "0.3"

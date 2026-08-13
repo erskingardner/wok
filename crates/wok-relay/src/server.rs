@@ -189,7 +189,7 @@ fn bump_relay_metrics(msg: &RelayMessage, metrics: &Metrics) {
 
 #[derive(Clone)]
 pub struct RelayHandle {
-    ingest: tokio::sync::mpsc::Sender<IngestMsg>,
+    ingest: Vec<tokio::sync::mpsc::Sender<IngestMsg>>,
     conns: Arc<ConnTable>,
     next_id: Arc<AtomicU64>,
     pub metrics: Arc<Metrics>,
@@ -271,6 +271,11 @@ impl RelayHandle {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// The ingester this connection is pinned to (C++ ThreadPool hashing).
+    fn ingest_route(&self, conn_id: u64) -> &tokio::sync::mpsc::Sender<IngestMsg> {
+        &self.ingest[conn_id as usize % self.ingest.len()]
+    }
+
     /// Register a connection's outbound queue. Async: applies backpressure
     /// instead of blocking a Tokio worker when the ingest queue is full.
     pub async fn register(&self, conn_id: u64, out: Outbound) {
@@ -279,7 +284,7 @@ impl RelayHandle {
 
     pub async fn client_message(&self, conn_id: u64, ip: Vec<u8>, payload: String) {
         let _ = self
-            .ingest
+            .ingest_route(conn_id)
             .send(IngestMsg::Client {
                 conn_id,
                 ip,
@@ -290,7 +295,10 @@ impl RelayHandle {
 
     pub async fn close(&self, conn_id: u64) {
         self.conns.remove(conn_id);
-        let _ = self.ingest.send(IngestMsg::Close { conn_id }).await;
+        let _ = self
+            .ingest_route(conn_id)
+            .send(IngestMsg::Close { conn_id })
+            .await;
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -336,18 +344,33 @@ pub fn supported_nips(cfg: &Config) -> Vec<u64> {
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     env.ensure_initialized().map_err(|e| e.to_string())?;
+    let n_ingester = config.relay.ingester_threads.max(1);
+    let n_req_worker = config.relay.req_worker_threads.max(1);
+    let n_req_monitor = config.relay.req_monitor_threads.max(1);
+    let n_negentropy = config.relay.negentropy_threads.max(1);
     let config = Arc::new(parking_lot::RwLock::new(config));
     let conns = Arc::new(ConnTable::new());
     let metrics = Arc::new(Metrics::default());
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel::<IngestMsg>(4096);
+
+    // One channel per worker thread. Connections are pinned to a worker by
+    // conn_id % pool_size, exactly like C++ ThreadPool dispatch, so all
+    // per-connection state (auth sessions, subscriptions) stays on one
+    // thread and per-connection message order is preserved.
+    let (ingest_txs, ingest_rxs): (Vec<_>, Vec<_>) = (0..n_ingester)
+        .map(|_| tokio::sync::mpsc::channel::<IngestMsg>(4096))
+        .unzip();
     let (writer_tx, writer_rx) = bounded::<WriterMsg>(4096);
-    let (req_tx, req_rx) = bounded::<ReqMsg>(4096);
-    let (mon_tx, mon_rx) = bounded::<MonitorMsg>(4096);
-    let (neg_tx, neg_rx) = bounded::<NegMsg>(4096);
+    let (req_txs, req_rxs): (Vec<_>, Vec<_>) =
+        (0..n_req_worker).map(|_| bounded::<ReqMsg>(4096)).unzip();
+    let (mon_txs, mon_rxs): (Vec<_>, Vec<_>) = (0..n_req_monitor)
+        .map(|_| bounded::<MonitorMsg>(4096))
+        .unzip();
+    let (neg_txs, neg_rxs): (Vec<_>, Vec<_>) =
+        (0..n_negentropy).map(|_| bounded::<NegMsg>(4096)).unzip();
 
     let handle = RelayHandle {
-        ingest: ingest_tx,
+        ingest: ingest_txs,
         conns: conns.clone(),
         next_id: Arc::new(AtomicU64::new(1)),
         metrics: metrics.clone(),
@@ -356,20 +379,19 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
-    {
+    for (i, ingest_rx) in ingest_rxs.into_iter().enumerate() {
         let env = env.clone();
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
         let writer_tx = writer_tx.clone();
-        let req_tx = req_tx.clone();
-        let mon_tx = mon_tx.clone();
-        let neg_tx = neg_tx.clone();
+        let req_txs = req_txs.clone();
+        let neg_txs = neg_txs.clone();
         thread::Builder::new()
-            .name("ingester".into())
+            .name(format!("ingester-{i}"))
             .spawn(move || {
                 run_ingester(
-                    env, cfg, conns, metrics, ingest_rx, writer_tx, req_tx, mon_tx, neg_tx,
+                    env, cfg, conns, metrics, ingest_rx, writer_tx, req_txs, neg_txs,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -379,40 +401,40 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
-        let mon_tx = mon_tx.clone();
+        let mon_txs = mon_txs.clone();
         thread::Builder::new()
             .name("writer".into())
-            .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_tx))
+            .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_txs))
             .map_err(|e| e.to_string())?;
     }
-    {
+    for (i, req_rx) in req_rxs.into_iter().enumerate() {
         let env = env.clone();
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
-        let mon_tx = mon_tx.clone();
+        let mon_txs = mon_txs.clone();
         thread::Builder::new()
-            .name("req-worker".into())
-            .spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, mon_tx))
+            .name(format!("req-worker-{i}"))
+            .spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, mon_txs))
             .map_err(|e| e.to_string())?;
     }
-    {
+    for (i, mon_rx) in mon_rxs.into_iter().enumerate() {
         let env = env.clone();
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
         thread::Builder::new()
-            .name("req-monitor".into())
+            .name(format!("req-monitor-{i}"))
             .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx))
             .map_err(|e| e.to_string())?;
     }
-    {
+    for (i, neg_rx) in neg_rxs.into_iter().enumerate() {
         let env = env.clone();
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
         thread::Builder::new()
-            .name("negentropy".into())
+            .name(format!("negentropy-{i}"))
             .spawn(move || run_negentropy(env, cfg, conns, metrics, neg_rx))
             .map_err(|e| e.to_string())?;
     }
@@ -428,25 +450,29 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
 
     {
         let env = env.clone();
-        let mon_tx = mon_tx.clone();
         let shutdown = shutdown.clone();
         thread::Builder::new()
             .name("db-watch".into())
-            .spawn(move || run_db_watch(env, mon_tx, shutdown))
+            .spawn(move || run_db_watch(env, mon_txs, shutdown))
             .map_err(|e| e.to_string())?;
     }
 
     let _ = writer_tx;
-    let _ = req_tx;
-    let _ = neg_tx;
     Ok(handle)
+}
+
+/// Broadcast a database-change notification to every req-monitor thread.
+fn broadcast_db_change(mon_txs: &[Sender<MonitorMsg>]) {
+    for tx in mon_txs {
+        let _ = tx.send(MonitorMsg::DbChange);
+    }
 }
 
 /// Watch data.mdb for changes made by *other* processes (a co-resident C++
 /// strfry, `wok import`, ...) and poke the req-monitor, mirroring C++
 /// RelayReqMonitor's hoytech::file_change_monitor (100ms debounce). Polling
 /// is used for portability; semantics match.
-fn run_db_watch(env: Env, mon_tx: Sender<MonitorMsg>, shutdown: Arc<AtomicBool>) {
+fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorMsg>>, shutdown: Arc<AtomicBool>) {
     let path = env.path().join("data.mdb");
     let mut last: Option<(std::time::SystemTime, u64)> = None;
     while !shutdown.load(Ordering::Relaxed) {
@@ -459,7 +485,7 @@ fn run_db_watch(env: Env, mon_tx: Sender<MonitorMsg>, shutdown: Arc<AtomicBool>)
                 Some(prev) if prev == cur => {}
                 _ => {
                     last = Some(cur);
-                    let _ = mon_tx.send(MonitorMsg::DbChange);
+                    broadcast_db_change(&mon_txs);
                 }
             }
         }
@@ -508,6 +534,11 @@ fn normalize_relay_url(url: &str) -> String {
     s.to_ascii_lowercase()
 }
 
+fn route_tx<T>(txs: &[Sender<T>], conn_id: u64) -> &Sender<T> {
+    &txs[conn_id as usize % txs.len()]
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_ingester(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -515,9 +546,8 @@ fn run_ingester(
     metrics: Arc<Metrics>,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
     writer_tx: Sender<WriterMsg>,
-    req_tx: Sender<ReqMsg>,
-    _mon_tx: Sender<MonitorMsg>,
-    neg_tx: Sender<NegMsg>,
+    req_txs: Vec<Sender<ReqMsg>>,
+    neg_txs: Vec<Sender<NegMsg>>,
 ) {
     let mut auth: HashMap<u64, AuthSession> = HashMap::new();
     // blocking_recv is only used here, on a dedicated OS thread outside any
@@ -531,8 +561,8 @@ fn run_ingester(
                         .fetch_sub(1, Ordering::Relaxed);
                 }
                 let _ = writer_tx.send(WriterMsg::Close { conn_id });
-                let _ = req_tx.send(ReqMsg::Close { conn_id });
-                let _ = neg_tx.send(NegMsg::Close { conn_id });
+                let _ = route_tx(&req_txs, conn_id).send(ReqMsg::Close { conn_id });
+                let _ = route_tx(&neg_txs, conn_id).send(NegMsg::Close { conn_id });
             }
             IngestMsg::Client {
                 conn_id,
@@ -542,7 +572,7 @@ fn run_ingester(
                 let cfg_snap = cfg.read().clone();
                 handle_client(
                     &env, &cfg_snap, &conns, &metrics, &mut auth, conn_id, ip, &payload,
-                    &writer_tx, &req_tx, &neg_tx,
+                    &writer_tx, &req_txs, &neg_txs,
                 );
             }
         }
@@ -560,8 +590,8 @@ fn handle_client(
     ip: Vec<u8>,
     payload: &str,
     writer_tx: &Sender<WriterMsg>,
-    req_tx: &Sender<ReqMsg>,
-    neg_tx: &Sender<NegMsg>,
+    req_txs: &[Sender<ReqMsg>],
+    neg_txs: &[Sender<NegMsg>],
 ) {
     let cmd = match ClientCommand::parse(payload) {
         Ok(c) => c,
@@ -578,25 +608,50 @@ fn handle_client(
         }
         ClientCommand::Auth(v) => {
             metrics.client_auth.fetch_add(1, Ordering::Relaxed);
-            ingest_auth(cfg, conns, metrics, auth, conn_id, v, req_tx, neg_tx);
+            ingest_auth(
+                cfg,
+                conns,
+                metrics,
+                auth,
+                conn_id,
+                v,
+                route_tx(req_txs, conn_id),
+                route_tx(neg_txs, conn_id),
+            );
         }
         ClientCommand::Req { sub_id, filters } => {
             metrics.client_req.fetch_add(1, Ordering::Relaxed);
             ingest_req(
-                cfg, conns, metrics, auth, conn_id, sub_id, filters, false, req_tx,
+                cfg,
+                conns,
+                metrics,
+                auth,
+                conn_id,
+                sub_id,
+                filters,
+                false,
+                route_tx(req_txs, conn_id),
             );
         }
         ClientCommand::Count { sub_id, filters } => {
             metrics.client_count.fetch_add(1, Ordering::Relaxed);
             ingest_req(
-                cfg, conns, metrics, auth, conn_id, sub_id, filters, true, req_tx,
+                cfg,
+                conns,
+                metrics,
+                auth,
+                conn_id,
+                sub_id,
+                filters,
+                true,
+                route_tx(req_txs, conn_id),
             );
         }
         ClientCommand::Close { sub_id } => {
             metrics.client_close.fetch_add(1, Ordering::Relaxed);
             match SubId::new(&sub_id) {
                 Ok(sid) => {
-                    let _ = req_tx.send(ReqMsg::RemoveSub {
+                    let _ = route_tx(req_txs, conn_id).send(ReqMsg::RemoveSub {
                         conn_id,
                         sub_id: sid,
                     });
@@ -633,7 +688,7 @@ fn handle_client(
                 Some(filter),
                 &payload_hex,
                 true,
-                neg_tx,
+                route_tx(neg_txs, conn_id),
             ) {
                 conns.send(
                     conn_id,
@@ -664,7 +719,7 @@ fn handle_client(
                 None,
                 &payload_hex,
                 false,
-                neg_tx,
+                route_tx(neg_txs, conn_id),
             ) {
                 conns.send(
                     conn_id,
@@ -684,7 +739,7 @@ fn handle_client(
             }
             match SubId::new(&sub_id) {
                 Ok(sid) => {
-                    let _ = neg_tx.send(NegMsg::CloseSub {
+                    let _ = route_tx(neg_txs, conn_id).send(NegMsg::CloseSub {
                         conn_id,
                         sub_id: sid,
                     });
@@ -1172,7 +1227,7 @@ fn run_writer(
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     rx: Receiver<WriterMsg>,
-    mon_tx: Sender<MonitorMsg>,
+    mon_txs: Vec<Sender<MonitorMsg>>,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
     while let Ok(msg) = rx.recv() {
@@ -1311,7 +1366,7 @@ fn run_writer(
                 &metrics,
             );
         }
-        let _ = mon_tx.send(MonitorMsg::DbChange);
+        broadcast_db_change(&mon_txs);
     }
 }
 
@@ -1332,7 +1387,7 @@ fn run_req_worker(
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     rx: Receiver<ReqMsg>,
-    mon_tx: Sender<MonitorMsg>,
+    mon_txs: Vec<Sender<MonitorMsg>>,
 ) {
     let mut queries = QueryScheduler::new(cfg.read().relay.max_subs_per_connection);
     let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
@@ -1373,19 +1428,20 @@ fn run_req_worker(
                     authed: pk,
                 } => {
                     authed.insert(conn_id, pk);
-                    let _ = mon_tx.send(MonitorMsg::SetAuth {
+                    let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::SetAuth {
                         conn_id,
                         authed: pk,
                     });
                 }
                 ReqMsg::RemoveSub { conn_id, sub_id } => {
                     queries.remove_sub(conn_id, &sub_id);
-                    let _ = mon_tx.send(MonitorMsg::RemoveSub { conn_id, sub_id });
+                    let _ =
+                        route_tx(&mon_txs, conn_id).send(MonitorMsg::RemoveSub { conn_id, sub_id });
                 }
                 ReqMsg::Close { conn_id } => {
                     authed.remove(&conn_id);
                     queries.close_conn(conn_id);
-                    let _ = mon_tx.send(MonitorMsg::Close { conn_id });
+                    let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::Close { conn_id });
                 }
             }
         }
@@ -1453,7 +1509,7 @@ fn run_req_worker(
                     },
                     &metrics,
                 );
-                let _ = mon_tx.send(MonitorMsg::NewSub(sub));
+                let _ = route_tx(&mon_txs, sub.conn_id).send(MonitorMsg::NewSub(sub));
             }
         }
     }

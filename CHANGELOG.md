@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configurable structured JSON tracing for log collectors, richer correlation
   fields, and hard-bounded in-memory operational metric history for the admin
   UI, alongside the existing Prometheus exporter.
+- An optional operator dashboard with NIP-98/NIP-07 authentication, bounded
+  replay protection, operational charts, and atomic writes for a deliberately
+  small, validated subset of live-reloadable TOML settings.
 
 ### Fixed
 

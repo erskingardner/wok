@@ -1,3 +1,13 @@
+[admin]
+# The static shell is served at /admin when enabled. Every data/API request
+# requires a fresh NIP-98 event signed by one of these pubkeys.
+enabled = false
+public_url = ""
+pubkeys = []
+auth_window_secs = 60
+# Enables only the typed, validated settings exposed by the dashboard.
+allow_config_writes = false
+
 [database]
 path = "./wok-db/"
 max_readers = 256

@@ -86,6 +86,9 @@ identical semantics. Before starting Wok, review at least:
   translate and are enabled with documented Wok defaults;
 - relative filesystem paths, because the generated config has a new location;
 - listener, reverse-proxy, AUTH, and NIP-11 settings;
+- restricted-read defaults: an explicit source value is preserved, while Wok's
+  native default protects kinds 4 and 1059 and reports unusable AUTH during
+  preflight;
 - Unix socket ownership and access settings if enabling Wok's Unix transport;
 - any key not documented in [config.md](config.md).
 

@@ -45,10 +45,14 @@ impl ReadRestrictor {
             return true;
         }
         for f in &fg.filters {
-            let Some(kinds) = &f.kinds else {
-                continue;
-            };
-            let has_restricted = kinds.iter().any(|k| self.restricted_kinds.contains(&k));
+            // COUNT has no per-event delivery filter. A filter without kinds
+            // can include restricted records, so it must be authenticated and
+            // scoped just like an explicit restricted-kind count.
+            let has_restricted = f
+                .kinds
+                .as_ref()
+                .map(|kinds| kinds.iter().any(|k| self.restricted_kinds.contains(&k)))
+                .unwrap_or(true);
             if !has_restricted {
                 continue;
             }
@@ -123,5 +127,18 @@ mod tests {
         assert!(r.should_send_to_subscriber(ev.view(), Some(&[9u8; 32])));
         assert!(r.should_send_to_subscriber(ev.view(), Some(&[2u8; 32])));
         assert!(!r.should_send_to_subscriber(ev.view(), Some(&[3u8; 32])));
+    }
+
+    #[test]
+    fn count_without_kinds_cannot_leak_restricted_population() {
+        let r = ReadRestrictor::new(vec![4, 1059], true);
+        let broad = NostrFilterGroup::from_value(&json!({}), 500, 3).unwrap();
+        assert!(!r.is_filter_allowed_to_count(&broad, None));
+        assert!(!r.is_filter_allowed_to_count(&broad, Some(&[9u8; 32])));
+
+        let scoped =
+            NostrFilterGroup::from_value(&json!({"authors":[hex::encode([9u8; 32])]}), 500, 3)
+                .unwrap();
+        assert!(r.is_filter_allowed_to_count(&scoped, Some(&[9u8; 32])));
     }
 }

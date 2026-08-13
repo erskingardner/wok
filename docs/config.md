@@ -12,6 +12,14 @@ derived from relay behavior and the settings that actually enable conditional
 features; accepting an operator-supplied replacement would allow the relay to
 advertise behavior it does not implement.
 
+Kinds 4 and 1059 are restricted reads by default. Until `relay.auth.service_url`
+is set to the relay's public URL, those reads fail closed because clients cannot
+complete NIP-42 AUTH. Set the URL before serving private traffic. Clearing
+`relay.auth.restricted_read_kinds` explicitly restores unrestricted historical
+reads, but Wok then stops advertising NIP-59. NIP-59 is advertised only when
+AUTH is usable, kind 1059 is restricted to its author or first `p`-tag recipient,
+and ephemeral kind 21059 is live-only.
+
 `events.ephemeral_persistence` defaults to `"live_only"`: accepted kinds
 20000-29999 pass normal validation, AUTH, and write-policy checks and are sent
 to matching active subscriptions, but never enter LMDB, historical queries, or

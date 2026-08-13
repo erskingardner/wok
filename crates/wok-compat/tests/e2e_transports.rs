@@ -594,7 +594,7 @@ async fn nip11_http_document() {
         .any(|n| n == 1));
     assert_eq!(
         client["supported_nips"],
-        json!([1, 9, 11, 13, 40, 45, 50, 59, 70, 77])
+        json!([1, 9, 11, 13, 40, 45, 50, 70, 77])
     );
     assert_eq!(client["limitation"]["max_event_tags"], 2000);
     assert_eq!(client["limitation"]["created_at_lower_limit"], u64::MAX / 4);

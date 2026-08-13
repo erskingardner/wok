@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live subscription matching, automatic migration backfill, integrity/reindex
   coverage, and correctness-checked scale benchmarks.
 
+### Fixed
+
+- Private kinds 4 and 1059 now fail closed by default, broad COUNT requests
+  cannot leak restricted-event populations, and NIP-59 is advertised only
+  when AUTH, recipient filtering, gift-wrap deletion, and live-only kind 21059
+  behavior are all usable.
+
 ## [0.1.0] - 2026-08-13
 
 ### Added

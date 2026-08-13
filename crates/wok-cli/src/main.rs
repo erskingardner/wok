@@ -363,6 +363,9 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 }
 
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
+    if let Some(warning) = cfg.auth_configuration_warning() {
+        tracing::warn!("{warning}; restricted reads fail closed");
+    }
     wok_relay::apply_nofiles_limit(cfg.relay.nofiles).map_err(anyhow::Error::msg)?;
     let env = open_env(&cfg)?;
     let bind: SocketAddr = format!("{}:{}", cfg.relay.bind, cfg.relay.port).parse()?;

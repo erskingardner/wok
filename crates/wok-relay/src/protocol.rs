@@ -73,29 +73,59 @@ pub enum RelayMessage {
     },
 }
 
+/// How an inbound message failure maps to a reply, matching the catch sites
+/// in C++ `RelayIngester.cpp`.
+#[derive(Debug, Clone)]
+pub enum ParseFailure {
+    /// `bad msg: ...` -> NOTICE (envelope-level failures, unknown commands)
+    BadMsg(String),
+    /// `bad req: ...` -> NOTICE (REQ/COUNT failures before the sub id is known)
+    BadReq(String),
+    /// `bad close: ...` -> NOTICE
+    BadClose(String),
+    /// `negentropy error: ...` -> NOTICE
+    Neg(String),
+}
+
+impl ParseFailure {
+    pub fn into_message(self) -> RelayMessage {
+        match self {
+            Self::BadMsg(e) => RelayMessage::notice_error(format!("bad msg: {e}")),
+            Self::BadReq(e) => RelayMessage::notice_error(format!("bad req: {e}")),
+            Self::BadClose(e) => RelayMessage::notice_error(format!("bad close: {e}")),
+            Self::Neg(e) => RelayMessage::notice_error(format!("negentropy error: {e}")),
+        }
+    }
+}
+
 impl ClientCommand {
-    pub fn parse(text: &str) -> Result<Self, String> {
-        if text == "\n" || text.is_empty() {
+    pub fn parse(text: &str) -> Result<Self, ParseFailure> {
+        // C++ treats exactly "\n" as a no-op keepalive; anything else that is
+        // not a JSON array is an error.
+        if text == "\n" {
             return Ok(Self::Newline);
         }
         if !text.starts_with('[') {
-            return Err("unparseable message".into());
+            return Err(ParseFailure::BadMsg("unparseable message".into()));
         }
-        let v: Value = wok_event::json::parse_strict(text).map_err(|e| e.to_string())?;
-        let arr = v.as_array().ok_or("message is not an array")?;
+        let v: Value = wok_event::json::parse_strict(text)
+            .map_err(|e| ParseFailure::BadMsg(e.to_string()))?;
+        let arr = v
+            .as_array()
+            .ok_or_else(|| ParseFailure::BadMsg("message is not an array".into()))?;
         if arr.len() < 2 {
-            return Err("too few array elements".into());
+            return Err(ParseFailure::BadMsg("too few array elements".into()));
         }
         let cmd = arr[0]
             .as_str()
-            .ok_or("first element not a command like REQ")?;
+            .ok_or_else(|| ParseFailure::BadMsg("first element not a command like REQ".into()))?;
         match cmd {
             "EVENT" => Ok(Self::Event(arr[1].clone())),
             "AUTH" => Ok(Self::Auth(arr[1].clone())),
             "REQ" | "COUNT" => {
                 let sub = arr[1]
                     .as_str()
-                    .ok_or("subscription id was not a string")?
+                    .ok_or_else(|| ParseFailure::BadReq("subscription id was not a string".into()))?
                     .to_string();
                 Ok(if cmd == "COUNT" {
                     Self::Count {
@@ -111,53 +141,69 @@ impl ClientCommand {
             }
             "CLOSE" => {
                 if arr.len() != 2 {
-                    return Err("arr too small/big".into());
+                    return Err(ParseFailure::BadClose("arr too small/big".into()));
                 }
                 Ok(Self::Close {
                     sub_id: arr[1]
                         .as_str()
-                        .ok_or("CLOSE subscription id was not a string")?
+                        .ok_or_else(|| {
+                            ParseFailure::BadClose("CLOSE subscription id was not a string".into())
+                        })?
                         .to_string(),
                 })
             }
             "NEG-OPEN" => {
                 if arr.len() < 4 {
-                    return Err("negentropy query missing elements".into());
+                    return Err(ParseFailure::Neg(
+                        "negentropy query missing elements".into(),
+                    ));
                 }
                 Ok(Self::NegOpen {
                     sub_id: arr[1]
                         .as_str()
-                        .ok_or("NEG subscription id was not a string")?
+                        .ok_or_else(|| {
+                            ParseFailure::Neg("NEG subscription id was not a string".into())
+                        })?
                         .to_string(),
                     filter: arr[2].clone(),
                     payload_hex: arr[3]
                         .as_str()
-                        .ok_or("negentropy payload not a string")?
+                        .ok_or_else(|| {
+                            ParseFailure::Neg("negentropy payload not a string".into())
+                        })?
                         .to_string(),
                 })
             }
             "NEG-MSG" => {
                 if arr.len() < 3 {
-                    return Err("negentropy message missing elements".into());
+                    return Err(ParseFailure::Neg(
+                        "negentropy message missing elements".into(),
+                    ));
                 }
                 Ok(Self::NegMsg {
                     sub_id: arr[1]
                         .as_str()
-                        .ok_or("NEG subscription id was not a string")?
+                        .ok_or_else(|| {
+                            ParseFailure::Neg("NEG subscription id was not a string".into())
+                        })?
                         .to_string(),
                     payload_hex: arr[2]
                         .as_str()
-                        .ok_or("negentropy payload not a string")?
+                        .ok_or_else(|| {
+                            ParseFailure::Neg("negentropy payload not a string".into())
+                        })?
                         .to_string(),
                 })
             }
             "NEG-CLOSE" => Ok(Self::NegClose {
                 sub_id: arr[1]
                     .as_str()
-                    .ok_or("NEG subscription id was not a string")?
+                    .ok_or_else(|| {
+                        ParseFailure::Neg("NEG subscription id was not a string".into())
+                    })?
                     .to_string(),
             }),
-            _ => Err("unknown cmd".into()),
+            _ => Err(ParseFailure::BadMsg("unknown cmd".into())),
         }
     }
 }

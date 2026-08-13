@@ -424,17 +424,16 @@ fn run_ingester(
                 payload,
             } => {
                 let cfg_snap = cfg.read().clone();
-                if let Err(e) = handle_client(
+                handle_client(
                     &env, &cfg_snap, &conns, &metrics, &mut auth, conn_id, ip, &payload,
                     &writer_tx, &req_tx, &neg_tx,
-                ) {
-                    conns.send(conn_id, RelayMessage::notice_error(e), &metrics);
-                }
+                );
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_client(
     env: &Env,
     cfg: &Config,
@@ -447,38 +446,53 @@ fn handle_client(
     writer_tx: &Sender<WriterMsg>,
     req_tx: &Sender<ReqMsg>,
     neg_tx: &Sender<NegMsg>,
-) -> Result<(), String> {
-    let cmd = ClientCommand::parse(payload)?;
+) {
+    let cmd = match ClientCommand::parse(payload) {
+        Ok(c) => c,
+        Err(e) => {
+            conns.send(conn_id, e.into_message(), metrics);
+            return;
+        }
+    };
     match cmd {
-        ClientCommand::Newline => Ok(()),
+        ClientCommand::Newline => {}
         ClientCommand::Event(v) => {
             metrics.client_event.fetch_add(1, Ordering::Relaxed);
-            ingest_event(env, cfg, conns, metrics, auth, conn_id, ip, v, writer_tx)
+            ingest_event(env, cfg, conns, metrics, auth, conn_id, ip, v, writer_tx);
         }
         ClientCommand::Auth(v) => {
             metrics.client_auth.fetch_add(1, Ordering::Relaxed);
-            ingest_auth(cfg, conns, metrics, auth, conn_id, v, req_tx, neg_tx)
+            ingest_auth(cfg, conns, metrics, auth, conn_id, v, req_tx, neg_tx);
         }
         ClientCommand::Req { sub_id, filters } => {
             metrics.client_req.fetch_add(1, Ordering::Relaxed);
             ingest_req(
                 cfg, conns, metrics, auth, conn_id, sub_id, filters, false, req_tx,
-            )
+            );
         }
         ClientCommand::Count { sub_id, filters } => {
             metrics.client_count.fetch_add(1, Ordering::Relaxed);
             ingest_req(
                 cfg, conns, metrics, auth, conn_id, sub_id, filters, true, req_tx,
-            )
+            );
         }
         ClientCommand::Close { sub_id } => {
             metrics.client_close.fetch_add(1, Ordering::Relaxed);
-            let sid = SubId::new(&sub_id).map_err(|e| format!("bad close: {e}"))?;
-            let _ = req_tx.send(ReqMsg::RemoveSub {
-                conn_id,
-                sub_id: sid,
-            });
-            Ok(())
+            match SubId::new(&sub_id) {
+                Ok(sid) => {
+                    let _ = req_tx.send(ReqMsg::RemoveSub {
+                        conn_id,
+                        sub_id: sid,
+                    });
+                }
+                Err(e) => {
+                    conns.send(
+                        conn_id,
+                        RelayMessage::notice_error(format!("bad close: {e}")),
+                        metrics,
+                    );
+                }
+            }
         }
         ClientCommand::NegOpen {
             sub_id,
@@ -486,9 +500,14 @@ fn handle_client(
             payload_hex,
         } => {
             if !cfg.relay.negentropy_enabled {
-                return Err("negentropy disabled".into());
+                conns.send(
+                    conn_id,
+                    RelayMessage::notice_error("bad msg: negentropy disabled"),
+                    metrics,
+                );
+                return;
             }
-            ingest_neg(
+            if let Err(e) = ingest_neg(
                 cfg,
                 conns,
                 metrics,
@@ -499,16 +518,27 @@ fn handle_client(
                 &payload_hex,
                 true,
                 neg_tx,
-            )
+            ) {
+                conns.send(
+                    conn_id,
+                    RelayMessage::notice_error(format!("negentropy error: {e}")),
+                    metrics,
+                );
+            }
         }
         ClientCommand::NegMsg {
             sub_id,
             payload_hex,
         } => {
             if !cfg.relay.negentropy_enabled {
-                return Err("negentropy disabled".into());
+                conns.send(
+                    conn_id,
+                    RelayMessage::notice_error("bad msg: negentropy disabled"),
+                    metrics,
+                );
+                return;
             }
-            ingest_neg(
+            if let Err(e) = ingest_neg(
                 cfg,
                 conns,
                 metrics,
@@ -519,18 +549,38 @@ fn handle_client(
                 &payload_hex,
                 false,
                 neg_tx,
-            )
+            ) {
+                conns.send(
+                    conn_id,
+                    RelayMessage::notice_error(format!("negentropy error: {e}")),
+                    metrics,
+                );
+            }
         }
         ClientCommand::NegClose { sub_id } => {
             if !cfg.relay.negentropy_enabled {
-                return Err("negentropy disabled".into());
+                conns.send(
+                    conn_id,
+                    RelayMessage::notice_error("bad msg: negentropy disabled"),
+                    metrics,
+                );
+                return;
             }
-            let sid = SubId::new(&sub_id).map_err(|e| e.to_string())?;
-            let _ = neg_tx.send(NegMsg::CloseSub {
-                conn_id,
-                sub_id: sid,
-            });
-            Ok(())
+            match SubId::new(&sub_id) {
+                Ok(sid) => {
+                    let _ = neg_tx.send(NegMsg::CloseSub {
+                        conn_id,
+                        sub_id: sid,
+                    });
+                }
+                Err(e) => {
+                    conns.send(
+                        conn_id,
+                        RelayMessage::notice_error(format!("negentropy error: {e}")),
+                        metrics,
+                    );
+                }
+            }
         }
     }
 }
@@ -545,7 +595,7 @@ fn ingest_event(
     ip: Vec<u8>,
     orig: Value,
     writer_tx: &Sender<WriterMsg>,
-) -> Result<(), String> {
+) {
     let policy = TimestampPolicy::from_now(
         cfg.events.reject_newer_than_secs,
         cfg.events.reject_older_than_secs,
@@ -569,7 +619,7 @@ fn ingest_event(
                 },
                 metrics,
             );
-            return Ok(());
+            return;
         }
     };
     let packed = parsed.packed.view();
@@ -591,7 +641,7 @@ fn ingest_event(
             },
             metrics,
         );
-        return Ok(());
+        return;
     }
 
     let mut found_protected = false;
@@ -615,7 +665,7 @@ fn ingest_event(
                 },
                 metrics,
             );
-            return Ok(());
+            return;
         }
         match auth.get(&conn_id) {
             None => {
@@ -637,7 +687,7 @@ fn ingest_event(
                     },
                     metrics,
                 );
-                return Ok(());
+                return;
             }
             Some(asess) if asess.authed.is_none() => {
                 conns.send(
@@ -649,7 +699,7 @@ fn ingest_event(
                     },
                     metrics,
                 );
-                return Ok(());
+                return;
             }
             Some(asess) => {
                 let pk = asess.authed.unwrap();
@@ -663,7 +713,7 @@ fn ingest_event(
                         },
                         metrics,
                     );
-                    return Ok(());
+                    return;
                 }
                 authed = Some(pk);
             }
@@ -671,21 +721,39 @@ fn ingest_event(
     }
 
     {
-        let txn = env.begin_ro().map_err(|e| e.to_string())?;
-        if lookup_event_by_id_ro(&txn, packed.id())
-            .map_err(|e| e.to_string())?
-            .is_some()
-        {
-            conns.send(
-                conn_id,
-                RelayMessage::Ok {
-                    event_id: id_hex,
-                    accepted: true,
-                    message: "duplicate: have this event".into(),
-                },
-                metrics,
-            );
-            return Ok(());
+        // C++ maps any failure in the event path to OK false "invalid: ...".
+        let dup = (|| -> Result<bool, String> {
+            let txn = env.begin_ro().map_err(|e| e.to_string())?;
+            Ok(lookup_event_by_id_ro(&txn, packed.id())
+                .map_err(|e| e.to_string())?
+                .is_some())
+        })();
+        match dup {
+            Ok(true) => {
+                conns.send(
+                    conn_id,
+                    RelayMessage::Ok {
+                        event_id: id_hex,
+                        accepted: true,
+                        message: "duplicate: have this event".into(),
+                    },
+                    metrics,
+                );
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                conns.send(
+                    conn_id,
+                    RelayMessage::Ok {
+                        event_id: id_hex,
+                        accepted: false,
+                        message: format!("invalid: {e}"),
+                    },
+                    metrics,
+                );
+                return;
+            }
         }
     }
 
@@ -696,7 +764,6 @@ fn ingest_event(
         json: parsed.json,
         authed,
     });
-    Ok(())
 }
 
 fn ingest_auth(
@@ -708,7 +775,53 @@ fn ingest_auth(
     event_json: Value,
     req_tx: &Sender<ReqMsg>,
     neg_tx: &Sender<NegMsg>,
-) -> Result<(), String> {
+) {
+    // C++ RelayIngester answers every AUTH failure with
+    // OK <id|"?"> false "error: ...".
+    let event_id = event_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    match ingest_auth_inner(cfg, auth, conn_id, &event_json, req_tx, neg_tx) {
+        Ok(packed_id) => {
+            metrics.auth_success_total.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .authenticated_connections
+                .fetch_add(1, Ordering::Relaxed);
+            conns.send(
+                conn_id,
+                RelayMessage::Ok {
+                    event_id: to_hex(&packed_id),
+                    accepted: true,
+                    message: "successfully authenticated".into(),
+                },
+                metrics,
+            );
+        }
+        Err(e) => {
+            metrics.auth_failure_total.fetch_add(1, Ordering::Relaxed);
+            conns.send(
+                conn_id,
+                RelayMessage::Ok {
+                    event_id,
+                    accepted: false,
+                    message: format!("error: {e}"),
+                },
+                metrics,
+            );
+        }
+    }
+}
+
+fn ingest_auth_inner(
+    cfg: &Config,
+    auth: &mut HashMap<u64, AuthSession>,
+    conn_id: u64,
+    event_json: &Value,
+    req_tx: &Sender<ReqMsg>,
+    neg_tx: &Sender<NegMsg>,
+) -> Result<[u8; 32], String> {
     if cfg.relay.auth.service_url.is_empty() {
         return Err("relay needs serviceUrl to be configured before AUTH can work".into());
     }
@@ -717,12 +830,8 @@ fn ingest_auth(
         cfg.events.reject_older_than_secs,
         cfg.events.reject_ephemeral_older_than_secs,
     );
-    let parsed =
-        parse_and_verify_event(&event_json, &cfg.event_limits(), Some(&policy), true, true)
-            .map_err(|e| {
-                metrics.auth_failure_total.fetch_add(1, Ordering::Relaxed);
-                format!("error: {e}")
-            })?;
+    let parsed = parse_and_verify_event(event_json, &cfg.event_limits(), Some(&policy), true, true)
+        .map_err(|e| e.to_string())?;
     let packed = parsed.packed.view();
     if packed.kind() != AUTH_KIND {
         return Err("wrong event kind, expected 22242".into());
@@ -771,22 +880,12 @@ fn ingest_auth(
         conn_id,
         authed: pk,
     });
-    metrics.auth_success_total.fetch_add(1, Ordering::Relaxed);
-    metrics
-        .authenticated_connections
-        .fetch_add(1, Ordering::Relaxed);
-    conns.send(
-        conn_id,
-        RelayMessage::Ok {
-            event_id: to_hex(packed.id()),
-            accepted: true,
-            message: "successfully authenticated".into(),
-        },
-        metrics,
-    );
-    Ok(())
+    let mut id = [0u8; 32];
+    id.copy_from_slice(packed.id());
+    Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_req(
     cfg: &Config,
     conns: &ConnTable,
@@ -797,17 +896,35 @@ fn ingest_req(
     filters: Vec<Value>,
     count_only: bool,
     req_tx: &Sender<ReqMsg>,
-) -> Result<(), String> {
+) {
+    // C++ RelayIngester: errors raised before the sub id is known go out as
+    // NOTICE "ERROR: bad req: ..."; everything after as CLOSED with the same
+    // payload. The sub id is always known here (protocol.rs extracted it),
+    // except for the "arr too small" case which C++ raises first.
+    let fail_closed = |e: String| {
+        conns.send(
+            conn_id,
+            RelayMessage::closed_error(&sub_id, format!("bad req: {e}")),
+            metrics,
+        );
+    };
     if filters.is_empty() {
-        return Err("arr too small".into());
+        conns.send(
+            conn_id,
+            RelayMessage::notice_error("bad req: arr too small"),
+            metrics,
+        );
+        return;
     }
     if filters.len() as u64 > cfg.relay.max_req_filter_size as u64 {
-        return Err("arr too big".into());
+        fail_closed("arr too big".into());
+        return;
     }
     let max_limit = if count_only {
         let m = cfg.relay.max_filter_limit_count + 1;
         if m == 1 {
-            return Err("COUNT disabled".into());
+            fail_closed("COUNT disabled".into());
+            return;
         }
         m
     } else {
@@ -815,11 +932,17 @@ fn ingest_req(
     };
     let mut arr = vec![json!("REQ"), json!(sub_id)];
     arr.extend(filters);
-    let fg = NostrFilterGroup::from_req(&arr, max_limit, cfg.relay.max_tags_per_filter)
-        .map_err(|e| format!("bad req: {e}"))?;
-    filter_validator(cfg)
-        .validate(&fg)
-        .map_err(|e| format!("filter validation failed: {e}"))?;
+    let fg = match NostrFilterGroup::from_req(&arr, max_limit, cfg.relay.max_tags_per_filter) {
+        Ok(fg) => fg,
+        Err(e) => {
+            fail_closed(e.to_string());
+            return;
+        }
+    };
+    if let Err(e) = filter_validator(cfg).validate(&fg) {
+        fail_closed(format!("filter validation failed: {e}"));
+        return;
+    }
 
     let authed = auth.get(&conn_id).and_then(|a| a.authed);
     let r = restrictor(cfg);
@@ -845,12 +968,17 @@ fn ingest_req(
             ),
             metrics,
         );
-        return Ok(());
+        return;
     }
-    let sid = SubId::new(&sub_id).map_err(|e| e.to_string())?;
+    let sid = match SubId::new(&sub_id) {
+        Ok(s) => s,
+        Err(e) => {
+            fail_closed(e.to_string());
+            return;
+        }
+    };
     let sub = Subscription::new(conn_id, sid, fg, count_only);
     let _ = req_tx.send(ReqMsg::NewSub(sub));
-    Ok(())
 }
 
 fn ingest_neg(

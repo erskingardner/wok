@@ -253,6 +253,10 @@ fn cmd_import(
     if no_verify {
         tracing::warn!("not verifying event IDs or signatures!");
     }
+    if fried && cfg!(target_endian = "big") {
+        // Matches the C++ cmd_import guard.
+        bail!("--fried currently only supported on little-endian CPUs");
+    }
     let env = open_env(cfg)?;
     let batch_size = write_batch.unwrap_or(if fried { 100_000 } else { 10_000 }) as usize;
     let stdin = std::io::stdin();
@@ -265,7 +269,9 @@ fn cmd_import(
     for (i, line) in stdin.lock().lines().enumerate() {
         let line = line?;
         total_processed += 1;
-        if line.len() > cfg.events.max_event_size {
+        // C++ counts the newline in its getline length check, so a line of
+        // exactly maxEventSize chars is rejected there.
+        if line.len() + 1 > cfg.events.max_event_size {
             bail!("Line larger than configured maxEventSize on line {}", i + 1);
         }
         match parse_import_line(&line, fried, no_verify, &limits) {
@@ -371,6 +377,7 @@ fn cmd_export(cfg: &Config, since: u64, until: u64, reverse: bool, fried: bool) 
     let mut decomp = Decompressor::new();
     let start = if reverse { until } else { since };
     let start_dup = if reverse { u64::MAX } else { 0 };
+    let mut export_err: Option<anyhow::Error> = None;
     wok_db::foreach_created_at(&txn, start, start_dup, reverse, |created, lev| {
         if reverse {
             if created < since {
@@ -379,22 +386,43 @@ fn cmd_export(cfg: &Config, since: u64, until: u64, reverse: bool, fried: bool) 
         } else if created > until {
             return false;
         }
-        if let Ok(json) = event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size) {
-            if fried {
-                if let Ok(Some(packed)) = wok_db::get_packed_ro(&txn, lev) {
-                    let mut o = json;
-                    o.pop();
-                    o.push_str(",\"fried\":\"");
-                    o.push_str(&hex::encode(packed));
-                    o.push_str("\"}");
-                    println!("{o}");
+        // C++ getEventJson/lookupEventByLevId abort the export on a missing
+        // or undecodable record; do the same instead of silently skipping.
+        match event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size) {
+            Ok(json) => {
+                if fried {
+                    match wok_db::get_packed_ro(&txn, lev) {
+                        Ok(Some(packed)) => {
+                            let mut o = json;
+                            o.pop();
+                            o.push_str(",\"fried\":\"");
+                            o.push_str(&hex::encode(packed));
+                            o.push_str("\"}");
+                            println!("{o}");
+                        }
+                        Ok(None) => {
+                            export_err = Some(anyhow::anyhow!("unable to lookup event by levId"));
+                            return false;
+                        }
+                        Err(e) => {
+                            export_err = Some(e.into());
+                            return false;
+                        }
+                    }
+                } else {
+                    println!("{json}");
                 }
-            } else {
-                println!("{json}");
+            }
+            Err(e) => {
+                export_err = Some(e.into());
+                return false;
             }
         }
         true
     })?;
+    if let Some(e) = export_err {
+        return Err(e);
+    }
     Ok(())
 }
 

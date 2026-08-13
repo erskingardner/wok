@@ -418,10 +418,44 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
             .map_err(|e| e.to_string())?;
     }
 
+    {
+        let env = env.clone();
+        let mon_tx = mon_tx.clone();
+        let shutdown = shutdown.clone();
+        thread::Builder::new()
+            .name("db-watch".into())
+            .spawn(move || run_db_watch(env, mon_tx, shutdown))
+            .map_err(|e| e.to_string())?;
+    }
+
     let _ = writer_tx;
     let _ = req_tx;
     let _ = neg_tx;
     Ok(handle)
+}
+
+/// Watch data.mdb for changes made by *other* processes (a co-resident C++
+/// strfry, `wok import`, ...) and poke the req-monitor, mirroring C++
+/// RelayReqMonitor's hoytech::file_change_monitor (100ms debounce). Polling
+/// is used for portability; semantics match.
+fn run_db_watch(env: Env, mon_tx: Sender<MonitorMsg>, shutdown: Arc<AtomicBool>) {
+    let path = env.path().join("data.mdb");
+    let mut last: Option<(std::time::SystemTime, u64)> = None;
+    while !shutdown.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(100));
+        let cur = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+        if let Some(cur) = cur {
+            match last {
+                Some(prev) if prev == cur => {}
+                _ => {
+                    last = Some(cur);
+                    let _ = mon_tx.send(MonitorMsg::DbChange);
+                }
+            }
+        }
+    }
 }
 
 fn restrictor(cfg: &Config) -> ReadRestrictor {
@@ -1428,10 +1462,6 @@ fn run_req_monitor(
     let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
     let mut curr_event_id = u64::MAX;
     let mut decomp = Decompressor::new();
-    let db_path = env.path().join("data.mdb");
-    let mon_wakeup = rx.clone();
-    let _watcher = spawn_db_watch(db_path, mon_wakeup);
-
     while let Ok(msg) = rx.recv() {
         let mut batch = vec![msg];
         while let Ok(more) = rx.try_recv() {
@@ -1535,10 +1565,6 @@ fn run_req_monitor(
             }
         }
     }
-}
-
-fn spawn_db_watch(_path: std::path::PathBuf, _tx: Receiver<MonitorMsg>) -> Option<()> {
-    None
 }
 
 fn run_negentropy(

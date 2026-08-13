@@ -6,8 +6,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne};
 use wok_db::{
-    search_bigram_posting_exists, search_posting_count, search_posting_exists, search_postings,
-    RoTxn, SearchQuery,
+    is_event_vanished_ro, search_bigram_posting_exists, search_posting_count,
+    search_posting_exists, search_postings, RoTxn, SearchQuery,
 };
 use wok_event::PackedEventView;
 
@@ -711,6 +711,14 @@ impl DbQuery {
         self.sent_events_full.len() as u64
     }
 
+    fn event_is_visible(txn: &RoTxn<'_>, lev_id: u64) -> Result<bool, wok_db::DbError> {
+        let Some(raw) = txn.get_u64(txn.env().dbis().event, lev_id)? else {
+            return Ok(false);
+        };
+        let packed = PackedEventView::new(raw)?;
+        Ok(!is_event_vanished_ro(txn, packed)?)
+    }
+
     /// Returns true when the scan is complete.
     pub fn process<F>(
         &mut self,
@@ -728,12 +736,21 @@ impl DbQuery {
             };
             let mut sent = std::mem::take(&mut self.sent_events_full);
             let mut hits = Vec::new();
+            let mut visibility_error = None;
             let complete = group.process(
                 txn,
                 &self.sub.filter_group.filters,
                 self.sub.latest_event_id,
                 time_budget_us,
                 |lev_id| {
+                    match Self::event_is_visible(txn, lev_id) {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(error) => {
+                            visibility_error = Some(error);
+                            return;
+                        }
+                    }
                     if (self.max_total_events == 0 || (sent.len() as u64) < self.max_total_events)
                         && sent.insert(lev_id)
                     {
@@ -741,6 +758,9 @@ impl DbQuery {
                     }
                 },
             )?;
+            if let Some(error) = visibility_error {
+                return Err(error);
+            }
             self.sent_events_full = sent;
             for lev_id in hits {
                 cb(&self.sub, lev_id);
@@ -770,12 +790,21 @@ impl DbQuery {
             let mut sent_curr = std::mem::take(&mut self.sent_events_curr);
             let mut last_work = self.last_work_checked;
             let mut hits: Vec<u64> = Vec::new();
+            let mut visibility_error = None;
             let mut handle = |lev_id| {
                 if f.limit == 0 {
                     return true;
                 }
                 if lev_id > latest {
                     return false;
+                }
+                match Self::event_is_visible(txn, lev_id) {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(error) => {
+                        visibility_error = Some(error);
+                        return true;
+                    }
                 }
                 if sent_full.insert(lev_id) {
                     hits.push(lev_id);
@@ -800,6 +829,9 @@ impl DbQuery {
                     scanner.scan(txn, &f, latest, time_budget_us, &mut handle)?
                 }
             };
+            if let Some(error) = visibility_error {
+                return Err(error);
+            }
             self.sent_events_full = sent_full;
             self.sent_events_curr = sent_curr;
             self.last_work_checked = last_work;

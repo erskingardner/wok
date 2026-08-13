@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use wok_db::{write_events, Decompressor, Env, EventToWrite};
-use wok_event::{parse_and_verify_event, PackedEventView, TimestampPolicy};
+use wok_db::{Decompressor, Env, EventToWrite};
+use wok_event::{parse_and_verify_event, PackedEventView};
 use wok_query::NostrFilterGroup;
 use wok_relay::plugin::{PluginEventSifter, PluginResult};
 use wok_relay::Config;
@@ -581,13 +581,10 @@ fn load_router_config(path: &Path) -> Result<RouterConfig> {
 
 fn flush_router_batch(env: &Env, cfg: &Config, batch: &mut Vec<Value>) -> Result<()> {
     let limits = cfg.event_limits();
-    let policy = TimestampPolicy::from_now(
-        cfg.events.reject_newer_than_secs,
-        cfg.events.reject_older_than_secs,
-        cfg.events.reject_ephemeral_older_than_secs,
-    );
     let mut evs = Vec::with_capacity(batch.len());
     for v in batch.drain(..) {
+        let policy = cfg
+            .timestamp_policy_for_kind(v.get("kind").and_then(Value::as_u64).unwrap_or(u64::MAX));
         match parse_and_verify_event(&v, &limits, Some(&policy), true, true) {
             Ok(p) => evs.push(EventToWrite::new(p.packed.into_bytes(), p.json)),
             Err(e) => tracing::warn!("router: downloaded event rejected: {e}"),
@@ -598,7 +595,7 @@ fn flush_router_batch(env: &Env, cfg: &Config, batch: &mut Vec<Value>) -> Result
     }
     let mut txn = env.begin_rw()?;
     let mut sink = wok_negentropy::DeferredSink::default();
-    write_events(&mut txn, &mut sink, &mut evs, false)?;
+    wok_db::write_events_with_policy(&mut txn, &mut sink, &mut evs, false, &cfg.vanish_policy())?;
     let mut cache = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
     sink.apply(&mut cache, &mut txn)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;

@@ -163,7 +163,7 @@ fn nip50_search_filter_and_extensions() {
 fn nip11_software_not_strfry_when_unconfigured() {
     let cfg = wok_relay::Config::default();
     let nips = wok_relay::supported_nips(&cfg);
-    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 70, 77]);
+    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 62, 70, 77]);
     assert!(!nips.contains(&2), "client-side NIP-02 is not advertised");
     assert!(!nips.contains(&4), "client-side NIP-04 is not advertised");
     assert!(!nips.contains(&28), "client-side NIP-28 is not advertised");
@@ -221,6 +221,14 @@ fn nip59_gift_wrap_kinds() {
 }
 
 #[test]
+fn nip62_is_enabled_by_default_and_can_be_disabled() {
+    let mut cfg = wok_relay::Config::default();
+    assert!(wok_relay::supported_nips(&cfg).contains(&62));
+    cfg.relay.nip62.enabled = false;
+    assert!(!wok_relay::supported_nips(&cfg).contains(&62));
+}
+
+#[test]
 fn nip77_neg_open_parse() {
     let c = ClientCommand::parse(r#"["NEG-OPEN","s",{"kinds":[1]},"61"]"#).unwrap();
     assert!(matches!(c, ClientCommand::NegOpen { .. }));
@@ -235,7 +243,7 @@ fn nip77_payload_hex_has_no_prefix_or_half_byte() {
 
 #[test]
 fn advertised_nips_are_subset_of_tested() {
-    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 70, 77];
+    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 70, 77];
     assert_eq!(
         wok_relay::RELAY_CAPABILITY_CATALOG
             .iter()

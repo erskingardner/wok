@@ -18,6 +18,7 @@ arbitrary list.
 | 45 | COUNT | REQ worker | `nip_conformance.rs` | `maxFilterLimitCount > 0` |
 | 50 | Search capability | transactional LMDB term/bigram index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs` | always |
 | 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, restricted kind 1059 with involved-pubkey enforcement, and `events.ephemeral_persistence = "live_only"` |
+| 62 | Request to Vanish | persistent maximum-timestamp markers, immediate query/rebroadcast suppression, gift-wrap recipient cleanup, and bounded physical deletion | `nip62_vanish.rs`, relay e2e | `relay.nip62.enabled` |
 | 70 | Protected events | `-` tag + AUTH | `nip_conformance.rs` | always |
 | 77 | Negentropy | `wok-negentropy` | protocol unit tests | `negentropy.enabled` |
 
@@ -32,3 +33,10 @@ NIP-50 matches normalized search terms against event `content`, intersects
 them with every other supplied filter field, ranks before applying `limit`,
 and supports matching live events after EOSE. See
 [NIP-50 search](nip50-search.md) for exact query and scoring semantics.
+
+NIP-62 accepts a signed kind 62 request containing either a matching
+`["relay", "<public relay URL>"]` tag or `["relay", "ALL_RELAYS"]`. The
+relay immediately suppresses qualifying authored events and gift wraps for the
+requesting recipient, prevents rebroadcast, then physically deletes them in
+bounded background batches. The request itself remains stored and cannot be
+deleted with kind 5. See `relay.nip62` in the sample configuration.

@@ -150,6 +150,27 @@ fn check_metadata_tables(txn: &RoTxn<'_>, report: &mut IntegrityReport) -> Resul
         }
         true
     })?;
+    if let Some(vanish_pubkey) = dbis.vanish_pubkey {
+        txn.foreach_full(vanish_pubkey, &[], &[], false, |key, value| {
+            if key.len() != 32 {
+                report.malformed_records += 1;
+                report.issue(
+                    "malformed-key",
+                    "vanish_pubkey",
+                    format!("key has {} bytes, expected 32", key.len()),
+                );
+            }
+            if value.len() != 8 {
+                report.malformed_records += 1;
+                report.issue(
+                    "malformed-value",
+                    "vanish_pubkey",
+                    format!("value has {} bytes, expected 8", value.len()),
+                );
+            }
+            true
+        })?;
+    }
     Ok(())
 }
 

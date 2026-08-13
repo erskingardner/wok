@@ -63,6 +63,9 @@ pub fn rebuild_primary_and_event_indices(
     if let Some(event_search) = target_dbis.event_search {
         dbis_to_clear.push(event_search);
     }
+    if let Some(vanish_pubkey) = target_dbis.vanish_pubkey {
+        dbis_to_clear.push(vanish_pubkey);
+    }
     for dbi in dbis_to_clear {
         target.clear(dbi)?;
     }
@@ -80,6 +83,11 @@ pub fn rebuild_primary_and_event_indices(
         source_dbis.compression_dictionary,
         target_dbis.compression_dictionary,
     )?;
+    if let (Some(source_vanish), Some(target_vanish)) =
+        (source_dbis.vanish_pubkey, target_dbis.vanish_pubkey)
+    {
+        copy_table(source, target, source_vanish, target_vanish)?;
+    }
     let payloads = copy_table(
         source,
         target,

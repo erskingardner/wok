@@ -19,6 +19,7 @@ pub mod reindex;
 pub mod schema;
 pub mod search;
 pub mod txn;
+pub mod vanish;
 pub mod write;
 
 pub use env::{Env, EnvOptions, EnvironmentStats};
@@ -49,7 +50,12 @@ pub use search::{
     MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TERMS,
 };
 pub use txn::{RoTxn, RwTxn};
+pub use vanish::{
+    backfill_vanish_markers, is_event_vanished_ro, is_event_vanished_rw, mark_vanished,
+    sweep_vanished_events, vanish_timestamp_ro, vanish_timestamp_rw, VanishPolicy, ALL_RELAYS,
+    VANISH_KIND,
+};
 pub use write::{
     delete_event_basic, delete_events, lookup_event_by_id, most_recent_levid, write_events,
-    EventToWrite, EventWriteStatus, NegentropySink, NoopNegentropy,
+    write_events_with_policy, EventToWrite, EventWriteStatus, NegentropySink, NoopNegentropy,
 };

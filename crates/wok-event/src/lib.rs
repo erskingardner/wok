@@ -3,6 +3,7 @@
 //! Byte layouts and validation rules follow C++ strfry at
 //! `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`.
 
+mod bech32;
 mod error;
 mod hash;
 pub mod json;
@@ -11,6 +12,7 @@ mod packed;
 mod parse;
 mod validate;
 
+pub use bech32::decode_npub;
 pub use error::EventError;
 pub use hash::{event_id_hash, sha256, verify_id, verify_sig};
 pub use kinds::{is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag};

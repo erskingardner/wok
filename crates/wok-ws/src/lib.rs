@@ -70,6 +70,19 @@ async fn dispatch(
     handle: Arc<RelayHandle>,
     peer: SocketAddr,
 ) -> Response<Full<Bytes>> {
+    // Honor relay.realIpHeader for reverse-proxied deployments (C++ strfry
+    // uses the header value as the client IP).
+    let real_ip_header = handle.config.read().relay.real_ip_header.clone();
+    let peer = if real_ip_header.is_empty() {
+        peer
+    } else {
+        req.headers()
+            .get(real_ip_header.as_str())
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+            .map(|ip| SocketAddr::new(ip, 0))
+            .unwrap_or(peer)
+    };
     let is_ws_upgrade = req
         .headers()
         .get(UPGRADE)
@@ -137,6 +150,16 @@ async fn dispatch(
     html_response(&landing(&cfg, &handle))
 }
 
+fn maybe_npub(s: &str) -> String {
+    // NIP-11 accepts npub or hex; C++ converts npub to hex.
+    if s.starts_with("npub1") {
+        if let Ok(pk) = wok_event::decode_npub(s) {
+            return hex::encode(pk);
+        }
+    }
+    s.to_string()
+}
+
 fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
     let mut v = serde_json::json!({
         "supported_nips": supported_nips(cfg),
@@ -149,20 +172,33 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "max_limit": cfg.relay.max_filter_limit,
         }
     });
-    if !cfg.relay.info.name.is_empty() {
-        v["name"] = serde_json::json!(cfg.relay.info.name);
+    let info = &cfg.relay.info;
+    if !info.name.is_empty() {
+        v["name"] = serde_json::json!(info.name);
     }
-    if !cfg.relay.info.description.is_empty() {
-        v["description"] = serde_json::json!(cfg.relay.info.description);
+    if !info.description.is_empty() {
+        v["description"] = serde_json::json!(info.description);
     }
-    if !cfg.relay.info.contact.is_empty() {
-        v["contact"] = serde_json::json!(cfg.relay.info.contact);
+    if !info.contact.is_empty() {
+        v["contact"] = serde_json::json!(info.contact);
     }
-    if !cfg.relay.info.pubkey.is_empty() {
-        v["pubkey"] = serde_json::json!(cfg.relay.info.pubkey);
+    if !info.pubkey.is_empty() {
+        v["pubkey"] = serde_json::json!(maybe_npub(&info.pubkey));
     }
-    if !cfg.relay.info.icon.is_empty() {
-        v["icon"] = serde_json::json!(cfg.relay.info.icon);
+    if !info.icon.is_empty() {
+        v["icon"] = serde_json::json!(info.icon);
+    }
+    if !info.banner.is_empty() {
+        v["banner"] = serde_json::json!(info.banner);
+    }
+    if !info.self_pk.is_empty() {
+        v["self"] = serde_json::json!(maybe_npub(&info.self_pk));
+    }
+    if !info.privacy.is_empty() {
+        v["privacy_policy"] = serde_json::json!(info.privacy);
+    }
+    if !info.terms.is_empty() {
+        v["terms_of_service"] = serde_json::json!(info.terms);
     }
     let _ = handle;
     v

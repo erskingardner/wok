@@ -7,6 +7,7 @@ description = "WebSocket and HTTP transport for wok"
 
 [dependencies]
 futures-util = "0.3"
+hex.workspace = true
 bytes.workspace = true
 flate2.workspace = true
 http-body-util.workspace = true

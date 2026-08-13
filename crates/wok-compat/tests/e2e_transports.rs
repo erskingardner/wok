@@ -316,7 +316,10 @@ async fn nip11_http_document() {
     let dir = tempfile::tempdir().unwrap();
     let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
     env.ensure_initialized().unwrap();
-    let cfg = test_cfg(dir.path());
+    let mut cfg = test_cfg(dir.path());
+    cfg.relay.info.pubkey =
+        "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6".into();
+    cfg.relay.info.terms = "https://example.com/tos".into();
     let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -332,6 +335,12 @@ async fn nip11_http_document() {
         .iter()
         .any(|n| n == 1));
     assert_eq!(client["software"], "git+https://github.com/jeff/wok.git");
+    // npub is converted to hex like C++.
+    assert_eq!(
+        client["pubkey"],
+        "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+    );
+    assert_eq!(client["terms_of_service"], "https://example.com/tos");
     handle.request_shutdown();
 }
 

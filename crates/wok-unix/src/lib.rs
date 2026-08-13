@@ -137,7 +137,9 @@ async fn handle_conn(
         .active_connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let max_frame = cfg.relay.unix.max_frame_bytes;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(256);
+    // Outbound's byte accounting is the single queue bound. Keeping a second
+    // message-count ceiling makes small historical frames fail prematurely.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
     let outbound = Outbound::new(tx, cfg.relay.unix.max_pending_outbound_bytes);
     let killed = outbound.killed();
     handle.register(conn_id, outbound).await;

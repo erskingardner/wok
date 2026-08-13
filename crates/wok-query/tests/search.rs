@@ -6,7 +6,7 @@ use wok_db::{
     NoopNegentropy,
 };
 use wok_event::{parse_and_verify_event, EventLimits};
-use wok_query::foreach_by_filter;
+use wok_query::{foreach_by_filter, DbQuery, NostrFilterGroup, SubId, Subscription};
 
 fn sign(kind: u64, content: &str, created_at: u64) -> EventToWrite {
     let mut rng = rand::thread_rng();
@@ -175,4 +175,24 @@ fn multiple_search_filters_are_merged_by_quality() {
         contents(&env, &hits),
         vec!["rarest result", "common second"]
     );
+
+    let group = NostrFilterGroup::from_value(
+        &json!([
+            {"search":"common", "limit":2},
+            {"search":"rarest", "limit":1}
+        ]),
+        100,
+        3,
+    )
+    .unwrap();
+    let txn = env.begin_ro().unwrap();
+    let mut capped = DbQuery::new(
+        Subscription::new(1, SubId::new("search-cap").unwrap(), group, false),
+        1,
+    );
+    let mut capped_hits = Vec::new();
+    assert!(capped
+        .process(&txn, |_, lev| capped_hits.push(lev), u64::MAX)
+        .unwrap());
+    assert_eq!(capped_hits.len(), 1);
 }

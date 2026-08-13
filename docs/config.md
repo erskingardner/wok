@@ -36,6 +36,10 @@ separate per-connection concurrency limit. Set
 quota. A rate or burst of zero disables that individual token bucket;
 `max_query_cost = 0` and `max_stored_events_per_pubkey = 0` mean unlimited.
 `max_concurrent_historical_queries = 0` disables new historical queries.
+`relay.max_total_events_per_req` caps the deduplicated EVENT records emitted by
+one multi-filter REQ across all filters (default 2000, zero = unlimited). COUNT
+uses its separate `max_filter_limit_count`, and negentropy uses
+`max_sync_events`.
 
 `min_pow_difficulty` is optional NIP-13 enforcement. At zero Wok neither
 requires proof of work nor advertises NIP-13. A nonzero value rejects events

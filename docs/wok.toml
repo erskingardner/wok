@@ -21,6 +21,7 @@ nofiles = 524288
 max_websocket_payload_size = 131072
 max_filter_limit = 500
 max_filter_limit_count = 1000000
+max_total_events_per_req = 2000
 max_subs_per_connection = 200
 max_pending_outbound_bytes = 33554432
 negentropy_enabled = true

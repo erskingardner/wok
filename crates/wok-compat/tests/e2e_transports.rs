@@ -600,6 +600,7 @@ async fn nip11_http_document() {
     assert_eq!(client["limitation"]["created_at_lower_limit"], u64::MAX / 4);
     assert_eq!(client["limitation"]["created_at_upper_limit"], 900);
     assert_eq!(client["limitation"]["default_limit"], 500);
+    assert_eq!(client["limitation"]["max_total_events_per_req"], 2000);
     assert_eq!(client["limitation"]["min_pow_difficulty"], 20);
     assert_eq!(client["limitation"]["max_query_cost"], 1000);
     assert_eq!(

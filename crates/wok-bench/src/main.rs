@@ -86,6 +86,8 @@ fn main() -> Result<()> {
             "ws_publish_1conn",
             "ws_publish_8conn",
             "ws_query_latency",
+            "deep_history_pagination",
+            "mixed_read_write",
             "nip50_search",
             "live_fanout",
             "duplicate_import",
@@ -100,8 +102,22 @@ fn main() -> Result<()> {
             "nip50_search",
         ]
     };
+    let known_scenarios = [
+        "import",
+        "export",
+        "negentropy_build",
+        "ws_publish_1conn",
+        "ws_publish_8conn",
+        "ws_query_latency",
+        "deep_history_pagination",
+        "mixed_read_write",
+        "nip50_search",
+        "live_fanout",
+        "duplicate_import",
+        "cold_start",
+    ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
-        if !profile_scenarios.contains(&scenario) {
+        if !known_scenarios.contains(&scenario) {
             anyhow::bail!("unknown benchmark scenario: {scenario}");
         }
         vec![scenario]
@@ -290,6 +306,36 @@ fn run_trial(
                 }
             }
         }
+        "deep_history_pagination" => {
+            match deep_history_trial(rt, bin, dir.path(), n, n_queries, args.seed, &mut hist) {
+                Ok((qps, nts, good, miss)) => {
+                    throughput = qps;
+                    notes = nts;
+                    ok = good;
+                    mismatches += miss;
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e}");
+                }
+            }
+        }
+        "mixed_read_write" => {
+            match mixed_read_write_trial(rt, bin, dir.path(), n, n_queries, args.seed, &mut hist) {
+                Ok((qps, nts, good, miss)) => {
+                    throughput = qps;
+                    notes = nts;
+                    ok = good;
+                    mismatches += miss;
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e}");
+                }
+            }
+        }
         "nip50_search" => {
             match ws_search_trial(rt, bin, dir.path(), n, n_queries, args.seed, &mut hist) {
                 Ok((qps, nts, good, miss)) => {
@@ -440,6 +486,37 @@ fn generate_values(n: u64, seed: u64) -> Result<Vec<Value>> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     Ok((0..n).map(|i| event_at(i, now, &mut rng)).collect())
+}
+
+/// Build a dense single-author history so pagination exercises the same
+/// author+kind+until cursor shape reported by large relay operators.
+fn generate_author_history(dir: &Path, n: u64, seed: u64) -> Result<(PathBuf, String)> {
+    use rand::SeedableRng;
+    use secp256k1::{Keypair, SECP256K1};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let key = Keypair::new(SECP256K1, &mut rng);
+    let (pubkey, _) = key.x_only_public_key();
+    let pubkey = hex::encode(pubkey.serialize());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let path = dir.join("author-history.jsonl");
+    let mut file = std::fs::File::create(&path)?;
+    for i in 0..n {
+        let mut event = json!({
+            "created_at": now.saturating_sub(n).saturating_add(i),
+            "kind": 1,
+            "tags": [],
+            "content": format!("historical page event {i}"),
+            "pubkey": pubkey.clone(),
+        });
+        let id = wok_event::event_id_hash(&event)?;
+        event["id"] = json!(hex::encode(id));
+        let signature = SECP256K1.sign_schnorr(&id, &key);
+        event["sig"] = json!(hex::encode(signature.as_ref()));
+        writeln!(file, "{}", wok_event::json::to_tao_string(&event))?;
+    }
+    Ok((path, pubkey))
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +797,277 @@ fn ws_query_trial(
     let miss = if done == 0 || results == 0 { 1 } else { 0 };
     let notes = format!("{done} mixed REQs, {results} events returned");
     Ok((qps, notes, miss == 0, miss))
+}
+
+/// Repeated author+kind+until pagination into progressively older history.
+/// This is the workload from strfry issue #157, where later pages can degrade
+/// from sub-second to tens of seconds on fragmented, production-sized stores.
+fn deep_history_trial(
+    rt: &tokio::runtime::Runtime,
+    bin: &Path,
+    dbdir: &Path,
+    n: u64,
+    queries: u64,
+    seed: u64,
+    hist: &mut Histogram<u64>,
+) -> Result<(f64, String, bool, u64)> {
+    let n = n.max(1);
+    let (jsonl, author) = generate_author_history(dbdir, n, seed)?;
+    if !import_with(bin, dbdir, &jsonl, false) {
+        anyhow::bail!("deep-history import failed");
+    }
+    let imported = export_count(bin, dbdir);
+    if imported != n {
+        anyhow::bail!("deep-history import retained {imported}/{n} events");
+    }
+    let page_size = 500u64;
+    let available_pages = n.div_ceil(page_size);
+    let pages = queries.max(1).min(available_pages);
+    let port = free_port();
+    let mut child = spawn_relay(bin, dbdir, port)?;
+    let out = rt.block_on(async {
+        use futures_util::{SinkExt, StreamExt};
+        use std::collections::HashSet;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let url = format!("ws://127.0.0.1:{port}/");
+        let mut socket = connect_retry(&url).await?;
+        let mut until = u64::MAX;
+        let mut seen = HashSet::new();
+        let mut mismatches = 0u64;
+        let mut latencies = Vec::new();
+        let started_all = Instant::now();
+        for page in 0..pages {
+            let started = Instant::now();
+            socket
+                .send(Message::Text(
+                    json!(["REQ", "deep", {
+                        "authors":[author],
+                        "kinds":[1],
+                        "until":until,
+                        "limit":page_size
+                    }])
+                    .to_string()
+                    .into(),
+                ))
+                .await?;
+            let mut page_events = 0u64;
+            let mut oldest = until;
+            let mut saw_eose = false;
+            while let Ok(Some(Ok(message))) =
+                tokio::time::timeout(Duration::from_secs(60), socket.next()).await
+            {
+                let text = message.to_text().unwrap_or("");
+                let parsed: Value = match serde_json::from_str(text) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        mismatches += 1;
+                        continue;
+                    }
+                };
+                match parsed.get(0).and_then(Value::as_str) {
+                    Some("EVENT") => {
+                        page_events += 1;
+                        if let Some(event) = parsed.get(2) {
+                            let created = event
+                                .get("created_at")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(u64::MAX);
+                            oldest = oldest.min(created);
+                            if let Some(id) = event.get("id").and_then(Value::as_str) {
+                                if !seen.insert(id.to_string()) {
+                                    mismatches += 1;
+                                }
+                            } else {
+                                mismatches += 1;
+                            }
+                        }
+                    }
+                    Some("EOSE") => {
+                        saw_eose = true;
+                        break;
+                    }
+                    Some("CLOSED") => {
+                        mismatches += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            latencies.push(started.elapsed().as_micros().max(1) as u64);
+            let expected_page = page_size.min(n.saturating_sub(page * page_size));
+            if !saw_eose || page_events != expected_page || oldest == u64::MAX {
+                mismatches += 1;
+                break;
+            }
+            until = oldest.saturating_sub(1);
+        }
+        let elapsed = started_all.elapsed();
+        let _ = socket.close(None).await;
+        Ok::<_, anyhow::Error>((seen.len() as u64, mismatches, elapsed, latencies))
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    let (seen, mut mismatches, elapsed, latencies) = out?;
+    for latency in latencies {
+        hist.record(latency)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    let expected = n.min(pages * page_size);
+    if seen != expected {
+        mismatches += 1;
+    }
+    let qps = pages as f64 / elapsed.as_secs_f64();
+    let notes = format!(
+        "{pages} progressive 500-event pages over {n} single-author events; {seen} unique events"
+    );
+    Ok((qps, notes, mismatches == 0, mismatches))
+}
+
+/// Measure historical REQ latency while a second connection continuously
+/// publishes accepted events. This catches cursor/refill regressions that are
+/// invisible in a read-only corpus.
+fn mixed_read_write_trial(
+    rt: &tokio::runtime::Runtime,
+    bin: &Path,
+    dbdir: &Path,
+    n: u64,
+    queries: u64,
+    seed: u64,
+    hist: &mut Histogram<u64>,
+) -> Result<(f64, String, bool, u64)> {
+    let n = n.max(1);
+    let base_events = generate_values(n, seed)?;
+    let jsonl = dbdir.join("mixed-base.jsonl");
+    {
+        let mut file = std::fs::File::create(&jsonl)?;
+        for event in &base_events {
+            writeln!(file, "{}", wok_event::json::to_tao_string(event))?;
+        }
+    }
+    if !import_with(bin, dbdir, &jsonl, false) {
+        anyhow::bail!("mixed-load import failed");
+    }
+    let imported = export_count(bin, dbdir);
+    if imported != n {
+        anyhow::bail!("mixed-load import retained {imported}/{n} events");
+    }
+    let query_count = queries.max(1);
+    let write_count = query_count.max(50).min(n);
+    let new_events = generate_values(write_count, seed.wrapping_add(10_000))?;
+    let port = free_port();
+    let mut child = spawn_relay(bin, dbdir, port)?;
+    let out = rt.block_on(async {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let url = format!("ws://127.0.0.1:{port}/");
+        let mut query_socket = connect_retry(&url).await?;
+        let mut write_socket = connect_retry(&url).await?;
+        let query_future = async {
+            let started_all = Instant::now();
+            let mut completed = 0u64;
+            let mut results = 0u64;
+            let mut mismatches = 0u64;
+            let mut latencies = Vec::new();
+            for query_number in 0..query_count {
+                let started = Instant::now();
+                let subscription_id = format!("mixed-{query_number}");
+                query_socket
+                    .send(Message::Text(
+                        json!(["REQ", subscription_id, {
+                            "kinds":[1],
+                            "limit":100,
+                            "until":u64::MAX.saturating_sub(query_number)
+                        }])
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                let mut query_results = 0u64;
+                let mut saw_eose = false;
+                while let Ok(Some(Ok(message))) =
+                    tokio::time::timeout(Duration::from_secs(30), query_socket.next()).await
+                {
+                    let text = message.to_text().unwrap_or("");
+                    if let Ok(frame) = serde_json::from_str::<Value>(text) {
+                        let command = frame.get(0).and_then(Value::as_str);
+                        let frame_sub = frame.get(1).and_then(Value::as_str);
+                        if frame_sub != Some(subscription_id.as_str()) {
+                            continue;
+                        }
+                        match command {
+                            Some("EVENT") => query_results += 1,
+                            Some("CLOSED") => {
+                                mismatches += 1;
+                                break;
+                            }
+                            Some("EOSE") => {
+                                saw_eose = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                query_socket
+                    .send(Message::Text(
+                        json!(["CLOSE", subscription_id]).to_string().into(),
+                    ))
+                    .await?;
+                latencies.push(started.elapsed().as_micros().max(1) as u64);
+                // Up to `limit` records come from the historical snapshot.
+                // Events committed after that snapshot are deliberately
+                // caught up before EOSE, so concurrent writes may add to it.
+                if !saw_eose || query_results == 0 || query_results > 100 + write_count {
+                    mismatches += 1;
+                }
+                results += query_results;
+                completed += 1;
+            }
+            let elapsed = started_all.elapsed();
+            let _ = query_socket.close(None).await;
+            Ok::<_, anyhow::Error>((completed, results, mismatches, elapsed, latencies))
+        };
+        let write_future = async {
+            let mut accepted = 0u64;
+            for event in &new_events {
+                write_socket
+                    .send(Message::Text(json!(["EVENT", event]).to_string().into()))
+                    .await?;
+                while let Ok(Some(Ok(message))) =
+                    tokio::time::timeout(Duration::from_secs(30), write_socket.next()).await
+                {
+                    let text = message.to_text().unwrap_or("");
+                    if text.contains("\"OK\"") {
+                        if text.contains("true") {
+                            accepted += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            let _ = write_socket.close(None).await;
+            Ok::<_, anyhow::Error>(accepted)
+        };
+        let (query_result, write_result) = tokio::join!(query_future, write_future);
+        Ok::<_, anyhow::Error>((query_result?, write_result?))
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    let ((completed, results, mut mismatches, elapsed, latencies), accepted) = out?;
+    for latency in latencies {
+        hist.record(latency)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    if accepted != write_count || completed != query_count {
+        mismatches += 1;
+    }
+    let qps = completed as f64 / elapsed.as_secs_f64();
+    let notes = format!(
+        "{completed} historical REQs returned {results} events while {accepted}/{write_count} writes succeeded"
+    );
+    Ok((qps, notes, mismatches == 0, mismatches))
 }
 
 /// Preload a deterministic vocabulary, then exercise rare and common+rare

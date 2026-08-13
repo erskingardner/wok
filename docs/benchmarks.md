@@ -18,7 +18,9 @@ all scenarios (20k events default; use `--events`/`--queries` to tune).
 Scenarios: `import` (signature-verifying bulk import), `export`,
 `negentropy_build`, `ws_publish_1conn`/`ws_publish_8conn` (per-publish OK
 latency + rate), `ws_query_latency` (mixed REQs: id, author+kind, time
-window, tag), `live_fanout` (1 publisher x 32 subscribers, delivery
+window, tag), `deep_history_pagination` (progressively older 500-event
+author+kind+until pages), `mixed_read_write` (historical REQs while another
+connection continuously publishes), `live_fanout` (1 publisher x 32 subscribers, delivery
 completeness), `duplicate_import`, `cold_start`, and Wok-only
 `nip50_search` (rare, intersected, and full-corpus ranked searches with
 result/limit verification). Use `--scenario <name>` to isolate one scenario.

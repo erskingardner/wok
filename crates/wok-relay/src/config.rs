@@ -65,6 +65,7 @@ const STRFRY_TRANSLATED_KEYS: &[&str] = &[
     "relay.logging.invalidEvents",
     "relay.maxFilterLimit",
     "relay.maxFilterLimitCount",
+    "relay.maxTotalEventsPerReq",
     "relay.maxPendingOutboundBytes",
     "relay.maxReqFilterSize",
     "relay.maxSubsPerConnection",
@@ -147,6 +148,7 @@ pub struct RelayConfig {
     pub max_filter_limit: u64,
     pub max_tags_per_filter: usize,
     pub max_filter_limit_count: u64,
+    pub max_total_events_per_req: u64,
     pub max_subs_per_connection: usize,
     pub max_pending_outbound_bytes: usize,
     pub write_policy_plugin: String,
@@ -286,6 +288,7 @@ impl Default for Config {
                 max_filter_limit: 500,
                 max_tags_per_filter: 3,
                 max_filter_limit_count: 1_000_000,
+                max_total_events_per_req: 2_000,
                 max_subs_per_connection: 200,
                 max_pending_outbound_bytes: 33_554_432,
                 write_policy_plugin: String::new(),
@@ -567,6 +570,10 @@ impl Config {
         })?;
         assign_u64(&map, "relay.maxFilterLimitCount", |n| {
             cfg.relay.max_filter_limit_count = n;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.maxTotalEventsPerReq", |n| {
+            cfg.relay.max_total_events_per_req = n;
             Ok(())
         })?;
         assign_u64(&map, "relay.maxSubsPerConnection", |n| {
@@ -1029,6 +1036,7 @@ mod tests {
                     nips = "[1,2]"
                 }
                 maxReqFilterSize = 7
+                maxTotalEventsPerReq = 4321
                 autoPingSeconds = 30
                 enableTcpKeepalive = true
                 queryTimesliceBudgetMicroseconds = 5000
@@ -1089,6 +1097,7 @@ mod tests {
         assert_eq!(c.relay.info.self_pk, "cafe");
         assert_eq!(c.relay.info.terms, "https://example.com/t");
         assert_eq!(c.relay.max_req_filter_size, 7);
+        assert_eq!(c.relay.max_total_events_per_req, 4321);
         assert_eq!(c.relay.auto_ping_seconds, 30);
         assert!(c.relay.enable_tcp_keepalive);
         assert_eq!(c.relay.query_timeslice_budget_us, 5000);

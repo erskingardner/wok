@@ -13,9 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indexing, relevance ordering before limits, structured-filter intersection,
   live subscription matching, automatic migration backfill, integrity/reindex
   coverage, and correctness-checked scale benchmarks.
+- A reloadable, request-wide EVENT result ceiling across multi-filter REQs,
+  independent of COUNT and negentropy limits.
 
 ### Fixed
 
+- Historical result bursts no longer hit an undocumented 256-message queue
+  and disconnect healthy clients before the configured pending-byte budget;
+  deep author pagination and mixed read/write workloads now guard this path.
 - Private kinds 4 and 1059 now fail closed by default, broad COUNT requests
   cannot leak restricted-event populations, and NIP-59 is advertised only
   when AUTH, recipient filtering, gift-wrap deletion, and live-only kind 21059

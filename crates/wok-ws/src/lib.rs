@@ -195,6 +195,7 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "max_message_length": cfg.relay.max_websocket_payload_size,
             "max_subscriptions": cfg.relay.max_subs_per_connection,
             "max_limit": cfg.relay.max_filter_limit,
+            "max_total_events_per_req": cfg.relay.max_total_events_per_req,
             "max_event_tags": cfg.events.max_num_tags,
             "created_at_lower_limit": cfg.events.reject_older_than_secs,
             "created_at_upper_limit": cfg.events.reject_newer_than_secs,
@@ -408,7 +409,10 @@ async fn handle_ws<S>(
         std::net::IpAddr::V6(v) => v.octets().to_vec(),
     };
     let auto_ping = handle.config.read().relay.auto_ping_seconds;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(256);
+    // Pending memory is bounded by max_pending_outbound_bytes in Outbound.
+    // A second message-count bound incorrectly disconnected healthy clients
+    // during bursty historical responses with many small events.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
     let max_pending = handle.config.read().relay.max_pending_outbound_bytes;
     let outbound = Outbound::new(tx, max_pending);
     let killed = outbound.killed();

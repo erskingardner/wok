@@ -10,10 +10,11 @@ pub struct QueryScheduler {
     free: Vec<usize>,
     running: VecDeque<usize>,
     max_subs_per_connection: usize,
+    max_total_events_per_req: u64,
 }
 
 impl QueryScheduler {
-    pub fn new(max_subs_per_connection: usize) -> Self {
+    pub fn new(max_subs_per_connection: usize, max_total_events_per_req: u64) -> Self {
         Self {
             ensure_exists: true,
             conns: HashMap::new(),
@@ -21,6 +22,7 @@ impl QueryScheduler {
             free: Vec::new(),
             running: VecDeque::new(),
             max_subs_per_connection,
+            max_total_events_per_req,
         }
     }
 
@@ -35,7 +37,7 @@ impl QueryScheduler {
         if conn.len() >= self.max_subs_per_connection {
             return Ok(false);
         }
-        let q = DbQuery::new(sub);
+        let q = DbQuery::new(sub, self.max_total_events_per_req);
         // Reuse slots of finished/dead queries instead of growing forever.
         let idx = match self.free.pop() {
             Some(i) => {
@@ -142,5 +144,9 @@ impl QueryScheduler {
 
     pub fn set_max_subs_per_connection(&mut self, maximum: usize) {
         self.max_subs_per_connection = maximum;
+    }
+
+    pub fn set_max_total_events_per_req(&mut self, maximum: u64) {
+        self.max_total_events_per_req = maximum;
     }
 }

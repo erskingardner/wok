@@ -62,14 +62,14 @@ impl Drop for OutboundFrame {
 /// terminates the slow client (`maxPendingOutboundBytes`, 0 = unlimited).
 #[derive(Clone)]
 pub struct Outbound {
-    tx: tokio::sync::mpsc::Sender<OutboundFrame>,
+    tx: tokio::sync::mpsc::UnboundedSender<OutboundFrame>,
     pending: Arc<AtomicU64>,
     limit: usize,
     kill: Arc<tokio::sync::Notify>,
 }
 
 impl Outbound {
-    pub fn new(tx: tokio::sync::mpsc::Sender<OutboundFrame>, limit: usize) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<OutboundFrame>, limit: usize) -> Self {
         Self {
             tx,
             pending: Arc::new(AtomicU64::new(0)),
@@ -78,21 +78,21 @@ impl Outbound {
         }
     }
 
-    pub fn try_send(&self, msg: String) -> bool {
+    fn try_send(&self, msg: String) -> Result<(), OutboundSendError> {
         let len = msg.len() as u64;
         let prev = self.pending.fetch_add(len, Ordering::Relaxed);
         if self.limit != 0 && prev.saturating_add(len) > self.limit as u64 {
             self.pending.fetch_sub(len, Ordering::Relaxed);
-            return false;
+            return Err(OutboundSendError::OverByteLimit);
         }
         // On failure the frame drops here, undoing the accounting.
         self.tx
-            .try_send(OutboundFrame {
+            .send(OutboundFrame {
                 len: msg.len() as u64,
                 text: msg,
                 pending: self.pending.clone(),
             })
-            .is_ok()
+            .map_err(|_| OutboundSendError::Closed)
     }
 
     /// Signal the owning transport to close the connection.
@@ -104,6 +104,12 @@ impl Outbound {
     pub fn killed(&self) -> Arc<tokio::sync::Notify> {
         self.kill.clone()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundSendError {
+    OverByteLimit,
+    Closed,
 }
 
 struct ConnTable {
@@ -127,13 +133,16 @@ impl ConnTable {
     fn deliver(&self, conn_id: u64, payload: String, metrics: &Metrics) {
         let mut map = self.map.lock();
         if let Some(out) = map.get(&conn_id) {
-            if !out.try_send(payload) {
-                metrics
-                    .slow_client_terminations
-                    .fetch_add(1, Ordering::Relaxed);
-                let out = map.remove(&conn_id);
-                if let Some(out) = out {
-                    out.kill();
+            if let Err(error) = out.try_send(payload) {
+                if error == OutboundSendError::OverByteLimit {
+                    metrics
+                        .slow_client_terminations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(out) = map.remove(&conn_id) {
+                    if error == OutboundSendError::OverByteLimit {
+                        out.kill();
+                    }
                 }
             }
         }
@@ -1698,7 +1707,12 @@ fn run_req_worker(
     rx: Receiver<ReqMsg>,
     mon_txs: Vec<Sender<MonitorMsg>>,
 ) {
-    let mut queries = QueryScheduler::new(cfg.read().relay.abuse.max_concurrent_historical_queries);
+    let initial_cfg = cfg.read();
+    let mut queries = QueryScheduler::new(
+        initial_cfg.relay.abuse.max_concurrent_historical_queries,
+        initial_cfg.relay.max_total_events_per_req,
+    );
+    drop(initial_cfg);
     let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
     let mut decomp = Decompressor::new();
     loop {
@@ -1716,6 +1730,7 @@ fn run_req_worker(
         };
         let cfg_snap = cfg.read();
         queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
+        queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
         let r = restrictor(&cfg_snap);
         let txn = match env.begin_ro() {
             Ok(t) => t,
@@ -2008,7 +2023,12 @@ fn run_negentropy(
     rx: Receiver<NegMsg>,
 ) {
     let mut views: HashMap<(u64, String), NegView> = HashMap::new();
-    let mut queries = QueryScheduler::new(cfg.read().relay.abuse.max_concurrent_historical_queries);
+    let initial_cfg = cfg.read();
+    let mut queries = QueryScheduler::new(
+        initial_cfg.relay.abuse.max_concurrent_historical_queries,
+        initial_cfg.relay.max_sync_events,
+    );
+    drop(initial_cfg);
     queries.ensure_exists = false;
     let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
     let max_subs = cfg.read().relay.max_subs_per_connection;
@@ -2027,6 +2047,7 @@ fn run_negentropy(
         };
         let cfg_snap = cfg.read().clone();
         queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
+        queries.set_max_total_events_per_req(cfg_snap.relay.max_sync_events);
         let txn = match env.begin_ro() {
             Ok(t) => t,
             Err(_) => continue,
@@ -2411,7 +2432,7 @@ mod tests {
         ev
     }
 
-    async fn recv_outbound(rx: &mut tokio::sync::mpsc::Receiver<OutboundFrame>) -> String {
+    async fn recv_outbound(rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>) -> String {
         tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("outbound timeout")
@@ -2428,18 +2449,21 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_byte_accounting_and_kill() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let out = Outbound::new(tx, 100);
         let killed = out.killed();
 
-        assert!(out.try_send("x".repeat(60)));
-        assert!(out.try_send("y".repeat(30)));
+        assert_eq!(out.try_send("x".repeat(60)), Ok(()));
+        assert_eq!(out.try_send("y".repeat(30)), Ok(()));
         // 60 + 30 + 20 > 100: over budget, rejected.
-        assert!(!out.try_send("z".repeat(20)));
+        assert_eq!(
+            out.try_send("z".repeat(20)),
+            Err(OutboundSendError::OverByteLimit)
+        );
 
         // Draining one frame releases its bytes.
         drop(rx.recv().await.unwrap());
-        assert!(out.try_send("z".repeat(20)));
+        assert_eq!(out.try_send("z".repeat(20)), Ok(()));
 
         // Kill notification reaches the transport.
         out.kill();
@@ -2448,11 +2472,23 @@ mod tests {
             .expect("kill notification");
 
         // Limit 0 means unlimited.
-        let (tx2, _rx2) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let out2 = Outbound::new(tx2, 0);
         for _ in 0..8 {
-            assert!(out2.try_send("q".repeat(1000)));
+            assert_eq!(out2.try_send("q".repeat(1000)), Ok(()));
         }
+
+        // The byte budget, not an incidental message count, bounds bursts.
+        let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let out3 = Outbound::new(tx3, 10_000);
+        for _ in 0..500 {
+            assert_eq!(out3.try_send("event".into()), Ok(()));
+        }
+        let mut received = 0;
+        while rx3.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, 500);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2464,7 +2500,7 @@ mod tests {
         cfg.db = dir.path().to_path_buf();
         cfg.relay.auth.enabled = false;
         let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(32);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
         let ev = sign_event(json!({
@@ -2505,7 +2541,7 @@ mod tests {
         cfg.relay.auth.enabled = false;
         cfg.relay.abuse.min_pow_difficulty = 255;
         let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
         let event = sign_event(json!({
@@ -2538,7 +2574,7 @@ mod tests {
         cfg.relay.auth.enabled = false;
         cfg.relay.abuse.max_query_cost = 10;
         let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
         handle
@@ -2568,7 +2604,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
         let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
         handle
@@ -2600,7 +2636,7 @@ mod tests {
         cfg.relay.max_subs_per_connection = 200;
         cfg.relay.abuse.max_concurrent_historical_queries = 0;
         let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
         handle
@@ -2632,7 +2668,7 @@ mod tests {
         cfg.relay.auth.enabled = false;
         cfg.relay.abuse.max_stored_events_per_pubkey = 1;
         let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
         let mut rng = rand::thread_rng();

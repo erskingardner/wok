@@ -678,10 +678,12 @@ pub struct DbQuery {
     sent_events_full: HashSet<u64>,
     sent_events_curr: HashSet<u64>,
     last_work_checked: u64,
+    max_total_events: u64,
 }
 
 impl DbQuery {
-    pub fn new(sub: Subscription) -> Self {
+    pub fn new(sub: Subscription, max_total_events: u64) -> Self {
+        let max_total_events = if sub.count_only { 0 } else { max_total_events };
         let all_filters_search = !sub.filter_group.filters.is_empty()
             && sub
                 .filter_group
@@ -698,6 +700,10 @@ impl DbQuery {
             sent_events_full: HashSet::new(),
             sent_events_curr: HashSet::new(),
             last_work_checked: 0,
+            // COUNT needs the exact deduplicated count up to its separate
+            // max_filter_limit_count. The request-wide delivery ceiling is
+            // for EVENT responses.
+            max_total_events,
         }
     }
 
@@ -728,7 +734,9 @@ impl DbQuery {
                 self.sub.latest_event_id,
                 time_budget_us,
                 |lev_id| {
-                    if sent.insert(lev_id) {
+                    if (self.max_total_events == 0 || (sent.len() as u64) < self.max_total_events)
+                        && sent.insert(lev_id)
+                    {
                         hits.push(lev_id);
                     }
                 },
@@ -736,6 +744,11 @@ impl DbQuery {
             self.sent_events_full = sent;
             for lev_id in hits {
                 cb(&self.sub, lev_id);
+            }
+            if self.max_total_events != 0
+                && self.sent_events_full.len() as u64 >= self.max_total_events
+            {
+                return Ok(true);
             }
             if !complete {
                 self.search_group = Some(group);
@@ -769,6 +782,8 @@ impl DbQuery {
                 }
                 sent_curr.insert(lev_id);
                 sent_curr.len() as u64 >= f.limit
+                    || (self.max_total_events != 0
+                        && sent_full.len() as u64 >= self.max_total_events)
             };
             let complete = match &mut scanner {
                 QueryScanner::Chronological(scanner) => {
@@ -790,6 +805,11 @@ impl DbQuery {
             self.last_work_checked = last_work;
             for lev in hits {
                 cb(&self.sub, lev);
+            }
+            if self.max_total_events != 0
+                && self.sent_events_full.len() as u64 >= self.max_total_events
+            {
+                return Ok(true);
             }
             if !complete {
                 self.scanner = Some(scanner);
@@ -815,7 +835,7 @@ where
 {
     let fg = crate::filter::NostrFilterGroup::from_value(filter, max_limit, max_tags)?;
     let sub = Subscription::new(1, crate::subid::SubId::new(".").unwrap(), fg, false);
-    let mut q = DbQuery::new(sub);
+    let mut q = DbQuery::new(sub, 0);
     q.process(txn, |_, lev| cb(lev), u64::MAX)
         .map_err(|e| crate::subid::QueryError::msg(e.to_string()))?;
     Ok(())

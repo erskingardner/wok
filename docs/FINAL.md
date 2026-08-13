@@ -56,7 +56,8 @@ Suite: `crates/wok-compat/tests/nip_conformance.rs` (independent of C++).
 Covered relay behavior: NIP-01 structure/ID/sig/filters/EOSE/malformed and
 unknown commands; NIP-09 deletion; NIP-11 advertisement; NIP-40 expiration;
 NIP-42 AUTH (advertised only with `serviceUrl`); NIP-45 COUNT; NIP-59
-gift-wrap access/deletion behavior; NIP-70 protected events; and NIP-77
+gift-wrap access/deletion behavior and live-only kind 21059 delivery; NIP-70
+protected events; and NIP-77
 NEG-OPEN. Client/application NIPs are not advertised merely because Wok can
 store their event kinds.
 

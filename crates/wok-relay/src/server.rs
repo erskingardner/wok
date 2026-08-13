@@ -6,7 +6,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::field_reassign_with_default)]
 
-use crate::config::Config;
+use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{ClientCommand, RelayMessage};
@@ -240,11 +240,26 @@ enum ReqMsg {
 }
 
 enum MonitorMsg {
-    NewSub(Subscription),
-    SetAuth { conn_id: u64, authed: [u8; 32] },
-    RemoveSub { conn_id: u64, sub_id: SubId },
-    Close { conn_id: u64 },
+    NewSub {
+        sub: Subscription,
+        ready: Sender<()>,
+    },
+    SetAuth {
+        conn_id: u64,
+        authed: [u8; 32],
+    },
+    RemoveSub {
+        conn_id: u64,
+        sub_id: SubId,
+    },
+    Close {
+        conn_id: u64,
+    },
     DbChange,
+    Ephemeral {
+        packed: Vec<u8>,
+        json: String,
+    },
 }
 
 enum NegMsg {
@@ -454,6 +469,15 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
 fn broadcast_db_change(mon_txs: &[Sender<MonitorMsg>]) {
     for tx in mon_txs {
         let _ = tx.send(MonitorMsg::DbChange);
+    }
+}
+
+fn broadcast_ephemeral(mon_txs: &[Sender<MonitorMsg>], packed: &[u8], json: &str) {
+    for tx in mon_txs {
+        let _ = tx.send(MonitorMsg::Ephemeral {
+            packed: packed.to_vec(),
+            json: json.to_string(),
+        });
     }
 }
 
@@ -1239,7 +1263,7 @@ fn run_writer(
             }
         }
         let cfg_snap = cfg.read().clone();
-        let mut events: Vec<(u64, EventToWrite, Option<[u8; 32]>)> = Vec::new();
+        let mut events: Vec<(u64, EventToWrite)> = Vec::new();
         for m in batch {
             if let WriterMsg::AddEvent {
                 conn_id,
@@ -1273,7 +1297,31 @@ fn run_writer(
                     &mut ok_msg,
                 );
                 if res == PluginResult::Accept {
-                    events.push((conn_id, EventToWrite::new(packed, json), authed));
+                    let is_live_only = cfg_snap.events.ephemeral_persistence
+                        == EphemeralPersistence::LiveOnly
+                        && PackedEventView::new(&packed)
+                            .map(|event| event.expiration() == 1)
+                            .unwrap_or(false);
+                    if is_live_only {
+                        let id_hex = PackedEventView::new(&packed)
+                            .map(|event| to_hex(event.id()))
+                            .unwrap_or_else(|_| "?".into());
+                        broadcast_ephemeral(&mon_txs, &packed, &json);
+                        metrics
+                            .ephemeral_events_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        conns.send(
+                            conn_id,
+                            RelayMessage::Ok {
+                                event_id: id_hex,
+                                accepted: true,
+                                message: String::new(),
+                            },
+                            &metrics,
+                        );
+                    } else {
+                        events.push((conn_id, EventToWrite::new(packed, json)));
+                    }
                 } else {
                     let id_hex = PackedEventView::new(&packed)
                         .map(|p| to_hex(p.id()))
@@ -1297,7 +1345,7 @@ fn run_writer(
         // Move the events out instead of cloning each packed/json pair.
         let mut evs: Vec<EventToWrite> = Vec::with_capacity(events.len());
         let mut meta: Vec<u64> = Vec::with_capacity(events.len());
-        for (conn_id, ev, _) in events.drain(..) {
+        for (conn_id, ev) in events.drain(..) {
             meta.push(conn_id);
             evs.push(ev);
         }
@@ -1494,6 +1542,21 @@ fn run_req_worker(
                     &metrics,
                 );
             } else {
+                let (ready_tx, ready_rx) = bounded(1);
+                let installed = route_tx(&mon_txs, sub.conn_id)
+                    .send(MonitorMsg::NewSub {
+                        sub: sub.clone(),
+                        ready: ready_tx,
+                    })
+                    .is_ok()
+                    && ready_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+                if !installed {
+                    conns.send(
+                        sub.conn_id,
+                        RelayMessage::notice_error("live subscription monitor unavailable"),
+                        &metrics,
+                    );
+                }
                 conns.send(
                     sub.conn_id,
                     RelayMessage::Eose {
@@ -1501,7 +1564,6 @@ fn run_req_worker(
                     },
                     &metrics,
                 );
-                let _ = route_tx(&mon_txs, sub.conn_id).send(MonitorMsg::NewSub(sub));
             }
         }
     }
@@ -1535,7 +1597,7 @@ fn run_req_monitor(
         }
         for msg in batch {
             match msg {
-                MonitorMsg::NewSub(mut sub) => {
+                MonitorMsg::NewSub { mut sub, ready } => {
                     let conn = sub.conn_id;
                     let pk = authed.get(&conn).map(|a| a.as_slice());
                     let start = sub.latest_event_id.saturating_add(1);
@@ -1567,6 +1629,7 @@ fn run_req_monitor(
                             &metrics,
                         );
                     }
+                    let _ = ready.send(());
                 }
                 MonitorMsg::SetAuth {
                     conn_id,
@@ -1613,6 +1676,22 @@ fn run_req_monitor(
                         true
                     });
                     curr_event_id = latest;
+                }
+                MonitorMsg::Ephemeral { packed, json } => {
+                    if let Ok(packed) = PackedEventView::new(&packed) {
+                        let recipients = monitors.process_ephemeral(packed);
+                        let filtered: Vec<(u64, SubId)> = recipients
+                            .into_iter()
+                            .filter(|recipient| {
+                                let pk = authed
+                                    .get(&recipient.conn_id)
+                                    .map(|authed| authed.as_slice());
+                                r.should_send_to_subscriber(packed, pk)
+                            })
+                            .map(|recipient| (recipient.conn_id, recipient.sub_id))
+                            .collect();
+                        conns.send_event_batch(&filtered, &json, &metrics);
+                    }
                 }
             }
         }

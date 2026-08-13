@@ -40,8 +40,16 @@ pub struct EventsConfig {
     pub reject_older_than_secs: u64,
     pub reject_ephemeral_older_than_secs: u64,
     pub ephemeral_lifetime_secs: u64,
+    pub ephemeral_persistence: EphemeralPersistence,
     pub max_num_tags: usize,
     pub max_tag_val_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EphemeralPersistence {
+    LiveOnly,
+    Ttl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +151,7 @@ impl Default for Config {
                 reject_older_than_secs: 94_608_000,
                 reject_ephemeral_older_than_secs: 60,
                 ephemeral_lifetime_secs: 300,
+                ephemeral_persistence: EphemeralPersistence::LiveOnly,
                 max_num_tags: 2000,
                 max_tag_val_size: 1024,
             },
@@ -1007,6 +1016,20 @@ mod tests {
     fn native_toml_rejects_manual_nip_advertisement() {
         let error = Config::parse_toml("[relay.info]\nnips = [1, 2]\n").unwrap_err();
         assert!(error.contains("unknown field `nips`"), "{error}");
+    }
+
+    #[test]
+    fn native_toml_selects_ephemeral_persistence_policy() {
+        let default = Config::parse_toml("").unwrap();
+        assert_eq!(
+            default.events.ephemeral_persistence,
+            EphemeralPersistence::LiveOnly
+        );
+        let ttl = Config::parse_toml("[events]\nephemeral_persistence = \"ttl\"\n").unwrap();
+        assert_eq!(ttl.events.ephemeral_persistence, EphemeralPersistence::Ttl);
+        assert!(
+            Config::parse_toml("[events]\nephemeral_persistence = \"something_else\"\n").is_err()
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ arbitrary list.
 | 40 | Expiration | packed expiration + cron | `nip_conformance.rs` | always |
 | 42 | AUTH | ingest AUTH | unit + e2e when serviceUrl set | AUTH enabled and serviceUrl set |
 | 45 | COUNT | REQ worker | `nip_conformance.rs` | `maxFilterLimitCount > 0` |
-| 59 | Gift wrap | recipient-only restricted reads and recipient-authorized deletion | restrict + db write tests | always |
+| 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | `events.ephemeral_persistence = "live_only"` |
 | 70 | Protected events | `-` tag + AUTH | `nip_conformance.rs` | always |
 | 77 | Negentropy | `wok-negentropy` | protocol unit tests | `negentropy.enabled` |
 

@@ -5,6 +5,7 @@
 //! protocol or storage behavior.
 
 use crate::Config;
+use crate::EphemeralPersistence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayCapability {
@@ -19,6 +20,7 @@ pub enum CapabilityCondition {
     AuthConfigured,
     CountEnabled,
     NegentropyEnabled,
+    EphemeralLiveOnly,
 }
 
 impl CapabilityCondition {
@@ -30,6 +32,9 @@ impl CapabilityCondition {
             }
             Self::CountEnabled => cfg.relay.max_filter_limit_count > 0,
             Self::NegentropyEnabled => cfg.relay.negentropy_enabled,
+            Self::EphemeralLiveOnly => {
+                cfg.events.ephemeral_persistence == EphemeralPersistence::LiveOnly
+            }
         }
     }
 }
@@ -69,7 +74,7 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
     RelayCapability {
         nip: 59,
         name: "Gift wrap",
-        enabled_when: CapabilityCondition::Always,
+        enabled_when: CapabilityCondition::EphemeralLiveOnly,
     },
     RelayCapability {
         nip: 70,
@@ -117,6 +122,7 @@ mod tests {
         cfg.relay.auth.service_url = "wss://relay.example.com/".into();
         cfg.relay.max_filter_limit_count = 0;
         cfg.relay.negentropy_enabled = false;
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 59, 70]);
+        cfg.events.ephemeral_persistence = EphemeralPersistence::Ttl;
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 70]);
     }
 }

@@ -78,6 +78,20 @@ impl ActiveMonitors {
     }
 
     pub fn process(&mut self, lev_id: u64, packed: PackedEventView<'_>) -> Vec<Recipient> {
+        self.process_inner(Some(lev_id), packed)
+    }
+
+    /// Match a live-only event without advancing a subscription's persisted
+    /// local-event cursor. This keeps later DB-backed delivery monotonic.
+    pub fn process_ephemeral(&mut self, packed: PackedEventView<'_>) -> Vec<Recipient> {
+        self.process_inner(None, packed)
+    }
+
+    fn process_inner(
+        &mut self,
+        lev_id: Option<u64>,
+        packed: PackedEventView<'_>,
+    ) -> Vec<Recipient> {
         let mut recipients = Vec::new();
         let mut candidates: Vec<(u64, SubId)> = Vec::new();
         let mut id = [0u8; 32];
@@ -123,11 +137,15 @@ impl ActiveMonitors {
                 .get_mut(&conn_id)
                 .and_then(|m| m.get_mut(&sub_id))
             {
-                if sub.latest_event_id >= lev_id {
-                    continue;
+                if let Some(lev_id) = lev_id {
+                    if sub.latest_event_id >= lev_id {
+                        continue;
+                    }
                 }
                 if sub.filter_group.does_match(packed) {
-                    sub.latest_event_id = lev_id;
+                    if let Some(lev_id) = lev_id {
+                        sub.latest_event_id = lev_id;
+                    }
                     recipients.push(Recipient { conn_id, sub_id });
                 }
             }

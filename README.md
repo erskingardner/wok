@@ -27,6 +27,8 @@ quirk. It also provides an additional Unix-domain socket transport.
 - **NIP-42 AUTH, NIP-45 COUNT, NIP-70 protected events, NIP-59 gift-wrap
   deletion semantics, NIP-77 negentropy set reconciliation** (persistent
   LMDB B-tree, tree-backed multi-round sync sessions).
+- **Standards-first ephemeral delivery**: ephemeral kinds are live-only by
+  default, with an explicit persisted TTL compatibility mode.
 - **permessage-deflate** via an in-house RFC 6455/7692 codec (no Rust WS
   library offers it); mirrors uWS negotiation as strfry configures it.
 - **Unix `SOCK_STREAM` transport** (wok extension): 4-byte big-endian

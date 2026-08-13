@@ -59,6 +59,9 @@ identical semantics. Before starting Wok, review at least:
 
 - write-policy plugin commands, users, permissions, and timeouts;
 - `relay.info.nips`, which Wok replaces with its runtime capability catalog;
+- ephemeral-event policy: migrated records remain intact and age out normally,
+  while newly accepted ephemeral kinds are live-only unless you explicitly set
+  `events.ephemeral_persistence = "ttl"`;
 - relative filesystem paths, because the generated config has a new location;
 - listener, reverse-proxy, AUTH, and NIP-11 settings;
 - Unix socket ownership and access settings if enabling Wok's Unix transport;

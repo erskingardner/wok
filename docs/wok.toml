@@ -10,6 +10,7 @@ reject_newer_than_secs = 900
 reject_older_than_secs = 94608000
 reject_ephemeral_older_than_secs = 60
 ephemeral_lifetime_secs = 300
+ephemeral_persistence = "live_only"
 max_num_tags = 2000
 max_tag_val_size = 1024
 

@@ -152,6 +152,7 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
             "The copied database is Wok-owned and must not be opened by strfry.",
             "Review plugin, write-policy, and socket paths before cutover.",
             "Only supported strfry settings were translated into Wok TOML.",
+            "New ephemeral events are live-only by default; set events.ephemeral_persistence = \"ttl\" for strfry-compatible retention.",
         ],
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;

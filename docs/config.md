@@ -12,6 +12,12 @@ derived from relay behavior and the settings that actually enable conditional
 features; accepting an operator-supplied replacement would allow the relay to
 advertise behavior it does not implement.
 
+`events.ephemeral_persistence` defaults to `"live_only"`: accepted kinds
+20000-29999 pass normal validation, AUTH, and write-policy checks and are sent
+to matching active subscriptions, but never enter LMDB, historical queries, or
+negentropy. Set it to `"ttl"` only for strfry-compatible persisted-then-expired
+behavior; `events.ephemeral_lifetime_secs` controls that retention window.
+
 Unix-only keys:
 
 | key | default | meaning |

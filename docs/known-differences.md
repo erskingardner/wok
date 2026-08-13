@@ -24,6 +24,10 @@ it is not a promise to reproduce upstream bugs.
 
 ## Intentional protocol and operational differences
 
+- Ephemeral kinds are live-only by default: after validation, AUTH, and policy
+  checks they reach matching active subscriptions without being written to
+  LMDB or negentropy. Operators can explicitly select `ttl` compatibility mode,
+  and migrated historical ephemeral records continue to age out through cron.
 - Restricted reads require completed NIP-42 authentication. Wok also delivers
   authenticated state to the negentropy worker and keeps one usable challenge
   per session; the pinned strfry implementation does not complete those paths
@@ -45,12 +49,7 @@ it is not a promise to reproduce upstream bugs.
   negentropy layouts. This makes the first migration lossless, but is not a
   commitment that later Wok versions retain those internal layouts.
 
-## Inherited behavior queued for review or correction
-
-- Ephemeral-event persistence and expiration policy remains inherited and needs
-  an explicit Wok product/spec decision.
-
-Each correction should cite a pinned NIP or a Wok safety requirement and add a
+Each correction cites a pinned NIP or a Wok safety requirement and adds a
 regression test. Differential parity alone is not a reason to retain it.
 
 ## Corrected after adopting this policy

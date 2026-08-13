@@ -2,6 +2,7 @@
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::json;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message;
 use wok_compat::sign_event;
@@ -111,6 +112,153 @@ async fn ws_publish_and_subscribe() {
         "expected COUNT, got {msgs:?}"
     );
 
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ephemeral_events_are_live_only_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let probe = env.clone();
+    let cfg = test_cfg(dir.path());
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let url = format!("ws://{addr}/");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws.send(Message::Text(
+        json!(["REQ", "live-ephemeral", {"kinds":[21000]}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let initial = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+    assert!(initial.iter().any(|text| text.contains("EOSE")));
+
+    let event = sign_event(json!({
+        "created_at": now_secs(),
+        "kind": 21000,
+        "tags": [],
+        "content": "live-but-not-stored",
+    }));
+    ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+        .await
+        .unwrap();
+    let mut got_ok = false;
+    let mut got_event = false;
+    let mut messages = Vec::new();
+    for _ in 0..20 {
+        if let Ok(Some(Ok(message))) = tokio::time::timeout(Duration::from_secs(2), ws.next()).await
+        {
+            let text = message.to_text().unwrap_or("").to_string();
+            got_ok |= text.contains("\"OK\"") && text.contains("true");
+            got_event |= text.contains("live-but-not-stored");
+            messages.push(text);
+            if got_ok && got_event {
+                break;
+            }
+        }
+    }
+    assert!(got_ok && got_event, "got {messages:?}");
+
+    let (mut historical, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    historical
+        .send(Message::Text(
+            json!(["REQ", "history", {"kinds":[21000]}])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let history = recv_until(&mut historical, |text| text.contains("EOSE")).await;
+    assert!(history.iter().any(|text| text.contains("EOSE")));
+    assert!(!history
+        .iter()
+        .any(|text| text.contains("live-but-not-stored")));
+
+    let integrity = wok_db::check_integrity(&probe.begin_ro().unwrap()).unwrap();
+    assert_eq!(integrity.events, 0);
+    assert_eq!(integrity.payloads, 0);
+    assert_eq!(
+        handle
+            .metrics
+            .ephemeral_events_total
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        handle.metrics.written_events_total.load(Ordering::Relaxed),
+        0
+    );
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ttl_compatibility_mode_persists_ephemeral_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let probe = env.clone();
+    let mut cfg = test_cfg(dir.path());
+    cfg.events.ephemeral_persistence = wok_relay::EphemeralPersistence::Ttl;
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .unwrap();
+    let event = sign_event(json!({
+        "created_at": now_secs(),
+        "kind": 21000,
+        "tags": [],
+        "content": "ttl-compatibility",
+    }));
+    ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+        .await
+        .unwrap();
+    let accepted = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+    assert!(accepted
+        .iter()
+        .any(|text| text.contains("\"OK\"") && text.contains("true")));
+
+    ws.send(Message::Text(
+        json!(["REQ", "ttl-history", {"kinds":[21000]}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let history = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+    assert!(history
+        .iter()
+        .any(|text| text.contains("ttl-compatibility")));
+    let integrity = wok_db::check_integrity(&probe.begin_ro().unwrap()).unwrap();
+    assert_eq!(integrity.events, 1);
+    assert_eq!(
+        handle
+            .metrics
+            .ephemeral_events_total
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        handle.metrics.written_events_total.load(Ordering::Relaxed),
+        1
+    );
     handle.request_shutdown();
 }
 

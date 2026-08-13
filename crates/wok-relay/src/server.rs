@@ -28,9 +28,7 @@ use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
     AUTH_KIND, PROTECTED_TAG, REPOST_KINDS,
 };
-use wok_negentropy::{
-    DeferredSink, Negentropy, NegentropyFilterCache, Storage, Vector, PROTOCOL_VERSION,
-};
+use wok_negentropy::{DeferredSink, Negentropy, NegentropyFilterCache, Vector};
 use wok_query::{
     ActiveMonitors, FilterValidator, NostrFilterGroup, QueryScheduler, SubId, Subscription,
 };
@@ -1463,11 +1461,11 @@ fn run_negentropy(
     metrics: Arc<Metrics>,
     rx: Receiver<NegMsg>,
 ) {
-    let mut views: HashMap<(u64, String), Vector> = HashMap::new();
-    let mut pending: HashMap<(u64, String), Vec<u8>> = HashMap::new();
+    let mut views: HashMap<(u64, String), NegView> = HashMap::new();
     let mut queries = QueryScheduler::new(cfg.read().relay.max_subs_per_connection);
     queries.ensure_exists = false;
     let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
+    let max_subs = cfg.read().relay.max_subs_per_connection;
     loop {
         let msg = if queries.has_running() {
             match rx.try_recv() {
@@ -1495,6 +1493,9 @@ fn run_negentropy(
                 } => {
                     let conn = sub.conn_id;
                     let sid = sub.sub_id.to_string();
+                    let key = (conn, sid.clone());
+                    // C++ replaces any existing view with the same handle.
+                    views.remove(&key);
                     let mut tree_id = None;
                     let _ = wok_db::foreach_negentropy_filter(&txn, |id, f| {
                         if f == filter_str {
@@ -1505,69 +1506,46 @@ fn run_negentropy(
                         }
                     });
                     if let Some(tid) = tree_id {
-                        if let Ok(mut tree) = wok_negentropy::open_ro(&txn, tid) {
-                            let since = sub
-                                .filter_group
-                                .filters
-                                .first()
-                                .map(|f| f.since)
-                                .unwrap_or(0);
-                            let until = sub
-                                .filter_group
-                                .filters
-                                .first()
-                                .map(|f| f.until)
-                                .unwrap_or(u64::MAX);
-                            let lower = wok_negentropy::Bound::timestamp(since);
-                            let upper = wok_negentropy::Bound::timestamp(if until == u64::MAX {
-                                u64::MAX
-                            } else {
-                                until.saturating_add(1)
-                            });
-                            let mut sub_store =
-                                wok_negentropy::SubRange::new(&mut tree, &lower, &upper);
-                            let mut snap = Vector::new();
-                            let n = sub_store.size() as usize;
-                            for i in 0..n {
-                                let item = sub_store.get_item(i);
-                                let _ = snap.insert(item.timestamp, item.get_id());
-                            }
-                            let _ = snap.seal();
-                            if let Ok(mut ne) = Negentropy::new(snap, 500_000) {
-                                match ne.reconcile(&payload) {
-                                    Ok(resp) => {
-                                        conns.send(
-                                            conn,
-                                            RelayMessage::NegMsg {
-                                                sub_id: sid.clone(),
-                                                payload_hex: hex::encode(resp),
-                                            },
-                                            &metrics,
-                                        );
-                                    }
-                                    Err(_) => {
-                                        conns.send(
-                                            conn,
-                                            RelayMessage::NegErr {
-                                                sub_id: sid.clone(),
-                                                message: "PROTOCOL-ERROR".into(),
-                                                extra: None,
-                                            },
-                                            &metrics,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        pending.insert((conn, sid.clone()), payload);
-                        views.insert((conn, sid), Vector::new());
-                        if !queries.add_sub(&txn, sub).unwrap_or(false) {
+                        reconcile_stateless(
+                            &txn, &conns, &metrics, conn, &sid, tid, &sub, &payload,
+                        );
+                        // C++ keeps the stateless view even if the first
+                        // reconcile failed (handleReconcile runs before
+                        // addStatelessView), so insert unconditionally.
+                        if count_conn_views(&views, conn) >= max_subs {
+                            views.remove(&key);
                             conns.send(
                                 conn,
-                                RelayMessage::notice_error("too many concurrent REQs"),
+                                RelayMessage::notice_error("too many concurrent NEG requests"),
                                 &metrics,
                             );
+                        } else {
+                            views.insert(key, NegView::Stateless { sub, tree_id: tid });
+                        }
+                    } else if count_conn_views(&views, conn) >= max_subs {
+                        conns.send(
+                            conn,
+                            RelayMessage::notice_error("too many concurrent NEG requests"),
+                            &metrics,
+                        );
+                    } else {
+                        match queries.add_sub(&txn, sub) {
+                            Ok(true) => {
+                                views.insert(
+                                    key,
+                                    NegView::Memory {
+                                        initial: payload,
+                                        vec: Vector::new(),
+                                    },
+                                );
+                            }
+                            _ => {
+                                conns.send(
+                                    conn,
+                                    RelayMessage::notice_error("too many concurrent REQs"),
+                                    &metrics,
+                                );
+                            }
                         }
                     }
                 }
@@ -1577,51 +1555,67 @@ fn run_negentropy(
                     payload,
                 } => {
                     let key = (conn_id, sub_id.to_string());
-                    if let Some(store) = views.get_mut(&key) {
-                        if !store.is_sealed() {
-                            conns.send(
-                                conn_id,
-                                RelayMessage::notice_error(
-                                    "negentropy error: got NEG-MSG before NEG-OPEN complete",
-                                ),
-                                &metrics,
-                            );
-                        } else if let Ok(mut ne) = Negentropy::new(store.clone(), 500_000) {
-                            match ne.reconcile(&payload) {
-                                Ok(resp) => {
-                                    conns.send(
-                                        conn_id,
-                                        RelayMessage::NegMsg {
-                                            sub_id: sub_id.to_string(),
-                                            payload_hex: hex::encode(resp),
-                                        },
-                                        &metrics,
-                                    );
-                                }
-                                Err(_) => {
-                                    conns.send(
-                                        conn_id,
-                                        RelayMessage::NegErr {
-                                            sub_id: sub_id.to_string(),
-                                            message: "PROTOCOL-ERROR".into(),
-                                            extra: None,
-                                        },
-                                        &metrics,
-                                    );
-                                    views.remove(&key);
+                    match views.get(&key) {
+                        Some(NegView::Memory { vec, .. }) => {
+                            if !vec.is_sealed() {
+                                conns.send(
+                                    conn_id,
+                                    RelayMessage::notice_error(
+                                        "negentropy error: got NEG-MSG before NEG-OPEN complete",
+                                    ),
+                                    &metrics,
+                                );
+                            } else {
+                                match reconcile_vector(vec.clone(), &payload) {
+                                    Ok(resp) => {
+                                        conns.send(
+                                            conn_id,
+                                            RelayMessage::NegMsg {
+                                                sub_id: sub_id.to_string(),
+                                                payload_hex: hex::encode(resp),
+                                            },
+                                            &metrics,
+                                        );
+                                    }
+                                    Err(_) => {
+                                        send_neg_protocol_error(
+                                            &conns,
+                                            &metrics,
+                                            conn_id,
+                                            &sub_id.to_string(),
+                                        );
+                                        views.remove(&key);
+                                    }
                                 }
                             }
                         }
-                    } else {
-                        conns.send(
-                            conn_id,
-                            RelayMessage::NegErr {
-                                sub_id: sub_id.to_string(),
-                                message: "closed: unknown subscription handle".into(),
-                                extra: None,
-                            },
-                            &metrics,
-                        );
+                        Some(NegView::Stateless { sub, tree_id }) => {
+                            let tid = *tree_id;
+                            let ok = reconcile_stateless(
+                                &txn,
+                                &conns,
+                                &metrics,
+                                conn_id,
+                                &sub_id.to_string(),
+                                tid,
+                                sub,
+                                &payload,
+                            );
+                            if !ok {
+                                views.remove(&key);
+                            }
+                        }
+                        None => {
+                            conns.send(
+                                conn_id,
+                                RelayMessage::NegErr {
+                                    sub_id: sub_id.to_string(),
+                                    message: "closed: unknown subscription handle".into(),
+                                    extra: None,
+                                },
+                                &metrics,
+                            );
+                        }
                     }
                 }
                 NegMsg::SetAuth {
@@ -1633,27 +1627,25 @@ fn run_negentropy(
                 NegMsg::CloseSub { conn_id, sub_id } => {
                     queries.remove_sub(conn_id, &sub_id);
                     views.remove(&(conn_id, sub_id.to_string()));
-                    pending.remove(&(conn_id, sub_id.to_string()));
                 }
                 NegMsg::Close { conn_id } => {
                     queries.close_conn(conn_id);
                     views.retain(|k, _| k.0 != conn_id);
-                    pending.retain(|k, _| k.0 != conn_id);
                     authed.remove(&conn_id);
                 }
             }
         }
         let r = restrictor(&cfg_snap);
         let mut lev_hits: Vec<(Subscription, u64)> = Vec::new();
-        let mut done: Vec<Subscription> = Vec::new();
+        let mut done: Vec<(Subscription, u64)> = Vec::new();
         let _ = queries.process(
             &txn,
             cfg_snap.relay.query_timeslice_budget_us,
             |sub, lev, _| {
                 lev_hits.push((sub.clone(), lev));
             },
-            |sub, _| {
-                done.push(sub.clone());
+            |sub, total| {
+                done.push((sub.clone(), total));
             },
         );
         for (sub, lev) in lev_hits {
@@ -1661,47 +1653,126 @@ fn run_negentropy(
                 if let Ok(packed) = PackedEventView::new(&buf) {
                     let pk = authed.get(&sub.conn_id).map(|a| a.as_slice());
                     if r.should_send_to_subscriber(packed, pk) {
-                        if let Some(v) = views.get_mut(&(sub.conn_id, sub.sub_id.to_string())) {
-                            let _ = v.insert(packed.created_at(), packed.id());
+                        if let Some(NegView::Memory { vec, .. }) =
+                            views.get_mut(&(sub.conn_id, sub.sub_id.to_string()))
+                        {
+                            let _ = vec.insert(packed.created_at(), packed.id());
                         }
                     }
                 }
             }
         }
-        for sub in done {
+        for (sub, total) in done {
             let key = (sub.conn_id, sub.sub_id.to_string());
-            if let Some(mut v) = views.remove(&key) {
-                if v.size_checked().unwrap_or(0) > cfg_snap.relay.max_sync_events {
+            let Some(NegView::Memory { initial, vec }) = views.get_mut(&key) else {
+                continue;
+            };
+            // C++ counts matched levIds before the ReadRestrictor filter.
+            if total > cfg_snap.relay.max_sync_events {
+                conns.send(
+                    sub.conn_id,
+                    RelayMessage::NegErr {
+                        sub_id: sub.sub_id.to_string(),
+                        message: "blocked: too many query results".into(),
+                        extra: Some(json!(cfg_snap.relay.max_sync_events)),
+                    },
+                    &metrics,
+                );
+                views.remove(&key);
+                continue;
+            }
+            let _ = vec.seal();
+            let initial = std::mem::take(initial);
+            match reconcile_vector(vec.clone(), &initial) {
+                Ok(resp) => {
                     conns.send(
                         sub.conn_id,
-                        RelayMessage::NegErr {
+                        RelayMessage::NegMsg {
                             sub_id: sub.sub_id.to_string(),
-                            message: "blocked: too many query results".into(),
-                            extra: Some(json!(cfg_snap.relay.max_sync_events)),
+                            payload_hex: hex::encode(resp),
                         },
                         &metrics,
                     );
-                    pending.remove(&key);
-                    continue;
                 }
-                let _ = v.seal();
-                let initial = pending.remove(&key).unwrap_or_default();
-                if let Ok(mut ne) = Negentropy::new(v.clone(), 500_000) {
-                    if let Ok(resp) = ne.reconcile(&initial) {
-                        conns.send(
-                            sub.conn_id,
-                            RelayMessage::NegMsg {
-                                sub_id: sub.sub_id.to_string(),
-                                payload_hex: hex::encode(resp),
-                            },
-                            &metrics,
-                        );
-                    }
+                Err(_) => {
+                    send_neg_protocol_error(&conns, &metrics, sub.conn_id, &sub.sub_id.to_string());
+                    views.remove(&key);
                 }
-                views.insert(key, v);
             }
         }
-        let _ = PROTOCOL_VERSION;
+    }
+}
+
+enum NegView {
+    Memory { initial: Vec<u8>, vec: Vector },
+    Stateless { sub: Subscription, tree_id: u64 },
+}
+
+fn count_conn_views(views: &HashMap<(u64, String), NegView>, conn: u64) -> usize {
+    views.keys().filter(|k| k.0 == conn).count()
+}
+
+fn reconcile_vector(store: Vector, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut ne = Negentropy::new(store, 500_000).map_err(|e| e.to_string())?;
+    ne.reconcile(payload).map_err(|e| e.to_string())
+}
+
+fn send_neg_protocol_error(conns: &ConnTable, metrics: &Metrics, conn: u64, sid: &str) {
+    conns.send(
+        conn,
+        RelayMessage::NegErr {
+            sub_id: sid.to_string(),
+            message: "PROTOCOL-ERROR".into(),
+            extra: None,
+        },
+        metrics,
+    );
+}
+
+/// Reconcile one message against a precomputed tree ("stateless" view in
+/// C++). Returns false on protocol error (caller removes the view).
+#[allow(clippy::too_many_arguments)]
+fn reconcile_stateless(
+    txn: &wok_db::RoTxn<'_>,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    conn: u64,
+    sid: &str,
+    tree_id: u64,
+    sub: &Subscription,
+    payload: &[u8],
+) -> bool {
+    let resp = (|| -> Result<Vec<u8>, String> {
+        let mut tree = wok_negentropy::open_ro(txn, tree_id).map_err(|e| e.to_string())?;
+        let f = sub.filter_group.filters.first();
+        let since = f.map(|f| f.since).unwrap_or(0);
+        let until = f.map(|f| f.until).unwrap_or(u64::MAX);
+        let lower = wok_negentropy::Bound::timestamp(since);
+        let upper = wok_negentropy::Bound::timestamp(if until == u64::MAX {
+            u64::MAX
+        } else {
+            until.saturating_add(1)
+        });
+        let sub_store = wok_negentropy::SubRange::new(&mut tree, &lower, &upper);
+        let mut ne = Negentropy::new(sub_store, 500_000).map_err(|e| e.to_string())?;
+        ne.reconcile(payload).map_err(|e| e.to_string())
+    })();
+    match resp {
+        Ok(r) => {
+            conns.send(
+                conn,
+                RelayMessage::NegMsg {
+                    sub_id: sid.to_string(),
+                    payload_hex: hex::encode(r),
+                },
+                metrics,
+            );
+            true
+        }
+        Err(_) => {
+            send_neg_protocol_error(conns, metrics, conn, sid);
+            false
+        }
     }
 }
 

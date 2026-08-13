@@ -2367,6 +2367,7 @@ dependencies = [
  "tokio-tungstenite",
  "wok-db",
  "wok-event",
+ "wok-negentropy",
  "wok-query",
  "wok-relay",
  "wok-unix",

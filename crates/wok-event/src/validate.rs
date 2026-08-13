@@ -2,9 +2,7 @@ use serde_json::Value;
 
 use crate::hash::{verify_id, verify_sig};
 use crate::packed::PackedEventView;
-use crate::parse::{
-    normalize_event_json, nostr_json_to_packed_event, EventLimits, ParsedEvent,
-};
+use crate::parse::{normalize_event_json, nostr_json_to_packed_event, EventLimits, ParsedEvent};
 use crate::EventError;
 
 // Re-export helper used by validate; keep json_get_string crate-private in parse

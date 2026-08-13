@@ -13,6 +13,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 wok-db = { path = "../wok-db" }
 wok-event = { path = "../wok-event" }
+wok-negentropy = { path = "../wok-negentropy" }
 wok-query = { path = "../wok-query" }
 wok-relay = { path = "../wok-relay" }
 

@@ -477,10 +477,7 @@ mod tests {
         assert_eq!(parse_strict("null").unwrap(), Value::Null);
         assert_eq!(parse_strict("true").unwrap(), Value::Bool(true));
         assert_eq!(parse_strict("[1,2]").unwrap(), json!([1, 2]));
-        assert_eq!(
-            parse_strict(r#"{"k":"v"}"#).unwrap(),
-            json!({"k": "v"})
-        );
+        assert_eq!(parse_strict(r#"{"k":"v"}"#).unwrap(), json!({"k": "v"}));
         assert!(parse_strict("{").is_err());
         assert!(parse_strict("[1,]").is_err());
         assert!(parse_strict("").is_err());
@@ -511,7 +508,10 @@ mod tests {
     fn numbers() {
         assert_eq!(parse_strict("0").unwrap(), json!(0));
         assert_eq!(parse_strict("-5").unwrap(), json!(-5));
-        assert_eq!(parse_strict("18446744073709551615").unwrap(), json!(u64::MAX));
+        assert_eq!(
+            parse_strict("18446744073709551615").unwrap(),
+            json!(u64::MAX)
+        );
         assert_eq!(
             parse_strict("-9223372036854775808").unwrap(),
             json!(i64::MIN)
@@ -593,7 +593,8 @@ mod tests {
 
     #[test]
     fn tao_roundtrip_parse_serialize() {
-        let src = r#"{"content":"héllo","created_at":1700000000,"tags":[["e","abc"],["x",1.5,-3]]}"#;
+        let src =
+            r#"{"content":"héllo","created_at":1700000000,"tags":[["e","abc"],["x",1.5,-3]]}"#;
         let v = parse_strict(src).unwrap();
         assert_eq!(to_tao_string(&v), src);
     }

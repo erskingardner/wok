@@ -108,8 +108,8 @@ impl ClientCommand {
         if !text.starts_with('[') {
             return Err(ParseFailure::BadMsg("unparseable message".into()));
         }
-        let v: Value = wok_event::json::parse_strict(text)
-            .map_err(|e| ParseFailure::BadMsg(e.to_string()))?;
+        let v: Value =
+            wok_event::json::parse_strict(text).map_err(|e| ParseFailure::BadMsg(e.to_string()))?;
         let arr = v
             .as_array()
             .ok_or_else(|| ParseFailure::BadMsg("message is not an array".into()))?;
@@ -168,9 +168,7 @@ impl ClientCommand {
                     filter: arr[2].clone(),
                     payload_hex: arr[3]
                         .as_str()
-                        .ok_or_else(|| {
-                            ParseFailure::Neg("negentropy payload not a string".into())
-                        })?
+                        .ok_or_else(|| ParseFailure::Neg("negentropy payload not a string".into()))?
                         .to_string(),
                 })
             }
@@ -189,9 +187,7 @@ impl ClientCommand {
                         .to_string(),
                     payload_hex: arr[2]
                         .as_str()
-                        .ok_or_else(|| {
-                            ParseFailure::Neg("negentropy payload not a string".into())
-                        })?
+                        .ok_or_else(|| ParseFailure::Neg("negentropy payload not a string".into()))?
                         .to_string(),
                 })
             }

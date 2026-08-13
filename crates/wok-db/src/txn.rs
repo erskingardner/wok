@@ -427,10 +427,9 @@ fn position_forward_dup<'txn>(
         }
     }
     if cursor.get(Some(start_key), None, MDB_SET)?.is_some() {
-        if let Some(dup) = cursor.get(None, None, MDB_FIRST_DUP)? {
-            return Ok(Some(dup));
-        }
-        return cursor.get(Some(start_key), None, MDB_SET);
+        // The exact key exists but every duplicate sorts before `start_dup`.
+        // C++ `generic_foreachFull` skips to the next key with MDB_NEXT_NODUP.
+        return cursor.get(None, None, MDB_NEXT_NODUP);
     }
     if let Some(kv) = cursor.get(Some(start_key), None, MDB_SET_RANGE)? {
         if let Some(dup) = cursor.get(None, None, MDB_FIRST_DUP)? {

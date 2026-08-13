@@ -783,8 +783,12 @@ fn cmd_monitor(cfg: &Config) -> Result<()> {
     wok_db::foreach_event_from(&txn, 0, |lev, packed| {
         if let Ok(p) = wok_event::PackedEventView::new(packed) {
             if let Ok(json) = event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size) {
-                let content = wok_db::event_content(&json).unwrap_or_default();
-                let recips = monitors.process(lev, p, &content);
+                let search_terms = if monitors.requires_content() {
+                    Some(wok_db::event_search_terms(&json).unwrap_or_default())
+                } else {
+                    None
+                };
+                let recips = monitors.process(lev, p, search_terms.as_ref());
                 if let Some((cid, sid)) = &interest {
                     if recips
                         .iter()

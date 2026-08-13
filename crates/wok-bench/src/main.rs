@@ -101,7 +101,7 @@ fn main() -> Result<()> {
         ]
     };
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
-        if !profile_scenarios.contains(&scenario) && scenario != "nip50_search" {
+        if !profile_scenarios.contains(&scenario) {
             anyhow::bail!("unknown benchmark scenario: {scenario}");
         }
         vec![scenario]

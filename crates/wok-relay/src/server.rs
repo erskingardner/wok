@@ -1887,12 +1887,12 @@ fn run_req_monitor(
                                     decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
                                 {
                                     if requires_content {
-                                        let content =
-                                            wok_db::event_content(json).unwrap_or_default();
-                                        if !sub
-                                            .filter_group
-                                            .does_match_with_content(packed, &content)
-                                        {
+                                        let search_terms =
+                                            wok_db::event_search_terms(json).unwrap_or_default();
+                                        if !sub.filter_group.does_match_with_search_terms(
+                                            packed,
+                                            Some(&search_terms),
+                                        ) {
                                             return true;
                                         }
                                     }
@@ -1933,7 +1933,7 @@ fn run_req_monitor(
                             let packed_recipients = if requires_content {
                                 None
                             } else {
-                                let recipients = monitors.process(lev, packed, "");
+                                let recipients = monitors.process(lev, packed, None);
                                 if recipients.is_empty() {
                                     return true;
                                 }
@@ -1950,9 +1950,9 @@ fn run_req_monitor(
                                     let recips = if let Some(recipients) = packed_recipients {
                                         recipients
                                     } else {
-                                        let content =
-                                            wok_db::event_content(json).unwrap_or_default();
-                                        monitors.process(lev, packed, &content)
+                                        let search_terms =
+                                            wok_db::event_search_terms(json).unwrap_or_default();
+                                        monitors.process(lev, packed, Some(&search_terms))
                                     };
                                     if recips.is_empty() {
                                         return true;
@@ -1976,12 +1976,12 @@ fn run_req_monitor(
                 }
                 MonitorMsg::Ephemeral { packed, json } => {
                     if let Ok(packed) = PackedEventView::new(&packed) {
-                        let content = if monitors.requires_content() {
-                            wok_db::event_content(&json).unwrap_or_default()
+                        let search_terms = if monitors.requires_content() {
+                            Some(wok_db::event_search_terms(&json).unwrap_or_default())
                         } else {
-                            String::new()
+                            None
                         };
-                        let recipients = monitors.process_ephemeral(packed, &content);
+                        let recipients = monitors.process_ephemeral(packed, search_terms.as_ref());
                         let filtered: Vec<(u64, SubId)> = recipients
                             .into_iter()
                             .filter(|recipient| {

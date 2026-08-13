@@ -3,7 +3,7 @@
 use crate::subid::QueryError;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use wok_db::{normalize_search_terms, parse_search_query, SearchQuery};
+use wok_db::{parse_search_query, search_term_set, SearchQuery, SearchTermSet};
 use wok_event::{from_lower_hex_exact, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE};
 
 #[derive(Debug, Clone)]
@@ -287,14 +287,25 @@ impl NostrFilter {
     }
 
     pub fn does_match_with_content(&self, ev: PackedEventView<'_>, content: &str) -> bool {
+        let terms = search_term_set(content);
+        self.does_match_with_search_terms(ev, Some(&terms))
+    }
+
+    pub fn does_match_with_search_terms(
+        &self,
+        ev: PackedEventView<'_>,
+        search_terms: Option<&SearchTermSet>,
+    ) -> bool {
         if !self.does_match_without_search(ev) {
             return false;
         }
         let Some(query) = &self.search else {
             return true;
         };
-        let terms: HashSet<_> = normalize_search_terms(content).into_iter().collect();
-        query.terms.iter().all(|term| terms.contains(term))
+        let Some(search_terms) = search_terms else {
+            return false;
+        };
+        query.terms.iter().all(|term| search_terms.contains(term))
     }
 
     pub fn is_full_db_query(&self) -> bool {
@@ -359,9 +370,18 @@ impl NostrFilterGroup {
     }
 
     pub fn does_match_with_content(&self, ev: PackedEventView<'_>, content: &str) -> bool {
+        let terms = search_term_set(content);
+        self.does_match_with_search_terms(ev, Some(&terms))
+    }
+
+    pub fn does_match_with_search_terms(
+        &self,
+        ev: PackedEventView<'_>,
+        search_terms: Option<&SearchTermSet>,
+    ) -> bool {
         self.filters
             .iter()
-            .any(|filter| filter.does_match_with_content(ev, content))
+            .any(|filter| filter.does_match_with_search_terms(ev, search_terms))
     }
 
     pub fn requires_content(&self) -> bool {
@@ -549,5 +569,16 @@ mod tests {
         assert_eq!(broad.estimated_cost(false), 1_000);
         assert_eq!(broad.estimated_cost(true), 2_000);
         assert_eq!(targeted.estimated_cost(false), 2);
+    }
+
+    #[test]
+    fn search_matching_accepts_precomputed_event_terms() {
+        let filter = NostrFilter::parse(&json!({"search":"café nostr"}), 500, 3).unwrap();
+        let event = packed_note(1, 2, 15, 1, &[]);
+        let terms = search_term_set("A NOSTR relay with Café support");
+
+        assert!(!filter.does_match(event.view()));
+        assert!(!filter.does_match_with_search_terms(event.view(), None));
+        assert!(filter.does_match_with_search_terms(event.view(), Some(&terms)));
     }
 }

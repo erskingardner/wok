@@ -2,7 +2,7 @@
 //! event secondary index from PackedEvent again.
 
 use crate::write::event_index_entries;
-use crate::{index_event_search, payload::Decompressor, search::note_search_indexed_through};
+use crate::{index_event_search, payload::Decompressor, search::initialize_search_index_state};
 use crate::{DbError, RoTxn, RwTxn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,7 +146,7 @@ pub fn rebuild_primary_and_event_indices(
     if let Some(error) = error {
         return Err(error);
     }
-    note_search_indexed_through(target, last_lev_id)?;
+    initialize_search_index_state(target, last_lev_id)?;
     Ok(ReindexStats {
         events,
         payloads,

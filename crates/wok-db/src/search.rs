@@ -7,8 +7,9 @@
 
 use crate::{DbError, Decompressor, Env, RoTxn, RwTxn};
 use lmdb_sys::{MDB_GET_BOTH, MDB_NODUPDATA, MDB_SET};
-use serde_json::Value;
-use std::collections::BTreeSet;
+use serde::Deserialize;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashSet};
 
 const TERM_PREFIX: u8 = 1;
 const BIGRAM_PREFIX: u8 = 2;
@@ -22,6 +23,7 @@ pub const MAX_SEARCH_QUERY_BYTES: usize = 1_024;
 pub const MAX_SEARCH_TERMS: usize = 16;
 
 type SearchIndexEntry = (Vec<u8>, Vec<u8>);
+pub type SearchTermSet = HashSet<String>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchQuery {
@@ -63,6 +65,10 @@ fn normalize_search_terms_with_overflow(text: &str) -> (Vec<String>, bool) {
 /// query parsing, live matching, and scoring.
 pub fn normalize_search_terms(text: &str) -> Vec<String> {
     normalize_search_terms_with_overflow(text).0
+}
+
+pub fn search_term_set(content: &str) -> SearchTermSet {
+    normalize_search_terms(content).into_iter().collect()
 }
 
 /// Parse the free-text portion of a NIP-50 query. `key:value` extension words
@@ -107,14 +113,26 @@ pub fn parse_search_query(input: &str) -> Result<SearchQuery, DbError> {
     })
 }
 
-pub fn event_content(json: &str) -> Result<String, DbError> {
-    let event: Value = serde_json::from_str(json)
+#[derive(Deserialize)]
+struct EventContent<'a> {
+    #[serde(borrow)]
+    content: Cow<'a, str>,
+}
+
+fn parse_event_content(json: &str) -> Result<Cow<'_, str>, DbError> {
+    let event: EventContent<'_> = serde_json::from_str(json)
         .map_err(|error| DbError::msg(format!("event JSON parse failed: {error}")))?;
-    event
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| DbError::msg("event JSON has no string content"))
+    Ok(event.content)
+}
+
+pub fn event_content(json: &str) -> Result<String, DbError> {
+    parse_event_content(json).map(Cow::into_owned)
+}
+
+/// Extract only the event content field and normalize it once for all live
+/// search subscriptions. This avoids building a full JSON DOM per event.
+pub fn event_search_terms(json: &str) -> Result<SearchTermSet, DbError> {
+    Ok(search_term_set(&parse_event_content(json)?))
 }
 
 fn term_key(term: &str) -> Vec<u8> {
@@ -261,7 +279,7 @@ where
     Ok(!callback_stopped)
 }
 
-fn set_indexed_through(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<(), DbError> {
+fn set_search_schema(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
     let dbi = search_dbi_rw(txn)?;
     txn.del(dbi, SEARCH_SCHEMA_KEY, None)?;
     txn.put(
@@ -270,9 +288,22 @@ fn set_indexed_through(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<(), DbError> 
         &SEARCH_SCHEMA_VERSION.to_ne_bytes(),
         0,
     )?;
+    Ok(())
+}
+
+fn set_indexed_through(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<(), DbError> {
+    let dbi = search_dbi_rw(txn)?;
     txn.del(dbi, INDEXED_THROUGH_KEY, None)?;
     txn.put(dbi, INDEXED_THROUGH_KEY, &lev_id.to_ne_bytes(), 0)?;
     Ok(())
+}
+
+pub(crate) fn initialize_search_index_state(
+    txn: &mut RwTxn<'_>,
+    lev_id: u64,
+) -> Result<(), DbError> {
+    set_search_schema(txn)?;
+    set_indexed_through(txn, lev_id)
 }
 
 pub(crate) fn note_search_indexed_through(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<(), DbError> {
@@ -295,7 +326,7 @@ pub(crate) fn ensure_search_index(env: &Env) -> Result<(), DbError> {
     if schema_version != Some(SEARCH_SCHEMA_VERSION) {
         let mut txn = env.begin_rw()?;
         txn.clear(dbi)?;
-        set_indexed_through(&mut txn, 0)?;
+        initialize_search_index_state(&mut txn, 0)?;
         txn.commit()?;
     }
     loop {
@@ -353,6 +384,7 @@ pub(crate) fn ensure_search_index(env: &Env) -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EnvOptions;
 
     #[test]
     fn normalization_is_unicode_case_insensitive() {
@@ -373,5 +405,38 @@ mod tests {
     fn adversarial_term_counts_and_lengths_are_rejected() {
         assert!(parse_search_query(&vec!["term"; MAX_SEARCH_TERMS + 1].join(" ")).is_err());
         assert!(parse_search_query(&"x".repeat(MAX_INDEXED_TERM_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn event_terms_parse_only_content_and_handle_escapes() {
+        let terms =
+            event_search_terms(r#"{"content":"A CAF\u00c9\nNostr","ignored":{"nested":[1,2,3]}}"#)
+                .unwrap();
+        assert_eq!(terms, search_term_set("A CAFÉ\nNostr"));
+    }
+
+    #[test]
+    fn progress_updates_do_not_rewrite_the_search_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+        let dbi = env.dbis().event_search.unwrap();
+        let sentinel_schema = 99_u64;
+
+        let mut txn = env.begin_rw().unwrap();
+        txn.del(dbi, SEARCH_SCHEMA_KEY, None).unwrap();
+        txn.put(dbi, SEARCH_SCHEMA_KEY, &sentinel_schema.to_ne_bytes(), 0)
+            .unwrap();
+        note_search_indexed_through(&mut txn, 42).unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(
+            txn.get(dbi, SEARCH_SCHEMA_KEY).unwrap(),
+            Some(sentinel_schema.to_ne_bytes().as_slice())
+        );
+        assert_eq!(
+            txn.get(dbi, INDEXED_THROUGH_KEY).unwrap(),
+            Some(42_u64.to_ne_bytes().as_slice())
+        );
     }
 }

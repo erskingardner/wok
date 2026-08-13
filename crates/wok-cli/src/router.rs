@@ -38,6 +38,15 @@ pub struct StreamSpec {
     pub urls: Vec<String>,
 }
 
+fn compile_router_filter(name: &str, filter: &Value) -> Result<NostrFilterGroup> {
+    let filter_group = NostrFilterGroup::from_value(filter, u64::MAX, 64)
+        .map_err(|error| anyhow::anyhow!("stream {name}: bad filter: {error}"))?;
+    if filter_group.requires_content() {
+        bail!("stream {name}: router filters do not support content search");
+    }
+    Ok(filter_group)
+}
+
 enum Stmt {
     Open(String),
     Close,
@@ -311,9 +320,7 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig> {
             .map(|_| ())
             .and_then(|_| {
                 // Validate the filter compiles.
-                NostrFilterGroup::from_value(&cfg.streams[name].filter, u64::MAX, 64)
-                    .map(|_| ())
-                    .map_err(|e| anyhow::anyhow!("stream {name}: bad filter: {e}"))
+                compile_router_filter(name, &cfg.streams[name].filter).map(|_| ())
             })
     }
 
@@ -622,10 +629,10 @@ fn reconcile(cfg: &Config, router_cfg: &RouterConfig, groups: &mut HashMap<Strin
         }
     }
     for (name, spec) in &router_cfg.streams {
-        let filter_group = match NostrFilterGroup::from_value(&spec.filter, u64::MAX, 64) {
+        let filter_group = match compile_router_filter(name, &spec.filter) {
             Ok(fg) => fg,
             Err(e) => {
-                tracing::error!("stream {name}: bad filter, skipped: {e}");
+                tracing::error!("{e}; skipped");
                 continue;
             }
         };
@@ -938,6 +945,14 @@ mod tests {
         );
         // unknown top-level key
         assert!(parse_router_config("unknown = 1\nstreams {}").is_err());
+        // content is unavailable in the router's packed-event matcher
+        let error = parse_router_config(
+            "streams { x { dir = \"up\" filter = { \"search\": \"nostr\" } urls = [\"wss://a\"] } }",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("router filters do not support content search"));
     }
 
     #[test]

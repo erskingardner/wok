@@ -506,25 +506,33 @@ fn broadcast_ephemeral(mon_txs: &[Sender<MonitorMsg>], packed: &[u8], json: &str
 /// is used for portability; semantics match.
 fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorMsg>>, shutdown: Arc<AtomicBool>) {
     let path = env.path().join("data.mdb");
-    // Establish the baseline before sleeping. If the first external commit
-    // lands during that initial sleep, comparing against `None` would absorb
-    // the change without ever notifying the monitors.
+    // Reconcile once after establishing the baseline so a commit that lands
+    // before this thread is first scheduled cannot be absorbed as baseline.
     let mut last = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let mut last_event_id = env
+        .begin_ro()
+        .ok()
+        .and_then(|txn| most_recent_levid_ro(&txn).ok())
+        .unwrap_or(0);
+    broadcast_db_change(&mon_txs);
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
         let cur = std::fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
-        if let Some(cur) = cur {
-            match last {
-                Some(prev) if prev == cur => {}
-                _ => {
-                    last = Some(cur);
-                    broadcast_db_change(&mon_txs);
-                }
-            }
+        let current_event_id = env
+            .begin_ro()
+            .ok()
+            .and_then(|txn| most_recent_levid_ro(&txn).ok())
+            .unwrap_or(last_event_id);
+        let metadata_changed = cur.is_some() && cur != last;
+        let events_changed = current_event_id != last_event_id;
+        if metadata_changed || events_changed {
+            last = cur;
+            last_event_id = current_event_id;
+            broadcast_db_change(&mon_txs);
         }
     }
 }

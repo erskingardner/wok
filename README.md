@@ -112,9 +112,9 @@ All C++ subcommands exist:
 | `doctor [--json]` | Config, storage, index, payload, negentropy, capacity, and runtime-path diagnostics |
 | `reindex --confirm-relay-stopped [--backup <dir>]` | Stage and verify rebuilt indexes, atomically promote them, and retain the original DB |
 | `dict stats/train/compress/decompress` | zstd dictionary management (ZDICT training included) |
-| `negentropy list/add/build` | persistent negentropy trees |
+| `negentropy list/add/build` | persistent trees; build uses bounded, restart-safe batches |
 | `router <file>` | mesh replication with hot reconfig |
-| `stream`, `sync`, `upload`, `download` | mesh transfers |
+| `stream`, `sync`, `upload`, `download` | mesh transfers; stream reconnects with bounded backoff |
 
 Before cutover or after an unclean shutdown, run `wok --config wok.toml
 doctor`. It validates every event-derived index semantically, decompresses
@@ -233,6 +233,7 @@ Summary:
 - [Configuration](docs/config.md)
 - [Observability](docs/observability.md)
 - [Operator dashboard](docs/admin-dashboard.md)
+- [Mesh and maintenance](docs/mesh-and-maintenance.md)
 - [Cutover / rollback](docs/cutover.md)
 - [Security](docs/security.md)
 - [Known differences](docs/known-differences.md)

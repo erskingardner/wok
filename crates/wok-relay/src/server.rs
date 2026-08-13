@@ -1057,12 +1057,15 @@ fn run_writer(
     mon_tx: Sender<MonitorMsg>,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
-    let mut closed = std::collections::HashSet::new();
     while let Ok(msg) = rx.recv() {
         let mut batch = vec![msg];
         while let Ok(more) = rx.try_recv() {
             batch.push(more);
         }
+        // Filter out events from connections closed within this batch, like
+        // C++ RelayWriter (a per-batch set; a persistent set would leak one
+        // entry per closed connection for the life of the process).
+        let mut closed = std::collections::HashSet::new();
         for m in &batch {
             if let WriterMsg::Close { conn_id } = m {
                 closed.insert(*conn_id);

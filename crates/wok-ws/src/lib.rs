@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use wok_relay::{supported_nips, Config, Outbound, OutboundFrame, RelayHandle};
 
-const SOFTWARE: &str = "git+https://github.com/jeff/wok.git";
+const SOFTWARE: &str = "git+https://github.com/erskingardner/wok.git";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub async fn serve(handle: RelayHandle, bind: SocketAddr) -> Result<(), std::io::Error> {
@@ -134,8 +134,8 @@ async fn dispatch(
             "software": {
                 "name": "wok",
                 "version": VERSION,
-                "repository": "https://github.com/jeff/wok",
-                "homepage": "https://github.com/jeff/wok",
+                "repository": "https://github.com/erskingardner/wok",
+                "homepage": "https://github.com/erskingardner/wok",
             },
             "protocols": ["nostr"],
             "services": { "inbound": [], "outbound": [] },

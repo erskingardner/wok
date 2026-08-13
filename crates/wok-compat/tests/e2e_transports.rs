@@ -334,7 +334,10 @@ async fn nip11_http_document() {
         .unwrap()
         .iter()
         .any(|n| n == 1));
-    assert_eq!(client["software"], "git+https://github.com/jeff/wok.git");
+    assert_eq!(
+        client["software"],
+        "git+https://github.com/erskingardner/wok.git"
+    );
     // npub is converted to hex like C++.
     assert_eq!(
         client["pubkey"],

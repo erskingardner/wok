@@ -35,7 +35,7 @@
 ## Deliberate C++ bug-compatibility kept
 
 - Stored event JSON, id-hash preimage, and all index bytes match tao::json
-  output exactly: duplicate object keys rejected, U+007F escaped as ``,
+  output exactly: duplicate object keys rejected, U+007F escaped as `\u007f`,
   ryu f64 formatting (`1e300`, `1000.0`, decimal for -6 < exp < 22).
 - `from_hex` strips a `0x` prefix and pads odd-length input where C++ does;
   event ids/pubkeys/sigs/e/p tag values and filter byte sets use the strict

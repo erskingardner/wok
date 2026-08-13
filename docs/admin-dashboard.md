@@ -15,7 +15,9 @@ allow_config_writes = false
 
 `public_url` must be the exact public HTTP(S) origin, without a path. Wok uses
 it to verify the NIP-98 `u` tag instead of trusting a proxy-controlled `Host`
-header. Each authorization must have kind 27235, empty content, exactly one
+header. The origin is canonicalized (including IDN and default-port handling)
+to match the browser-visible absolute URL. Each authorization must have kind
+27235, empty content, exactly one
 matching `u` and `method` tag, and a timestamp within the configured window.
 Non-empty requests also require the exact SHA-256 `payload` tag. The signature
 must belong to a configured administrator and an authorization event can be

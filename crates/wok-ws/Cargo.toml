@@ -6,6 +6,7 @@ license.workspace = true
 description = "WebSocket and HTTP transport for wok"
 
 [dependencies]
+base64.workspace = true
 futures-util = "0.3"
 hex.workspace = true
 bytes.workspace = true
@@ -14,12 +15,11 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tungstenite.workspace = true
-tokio-tungstenite.workspace = true
 wok-event = { path = "../wok-event" }
 wok-relay = { path = "../wok-relay" }
 

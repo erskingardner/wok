@@ -2496,6 +2496,7 @@ dependencies = [
 name = "wok-ws"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "flate2",
  "futures-util",
@@ -2504,13 +2505,12 @@ dependencies = [
  "hyper",
  "hyper-util",
  "serde_json",
+ "sha1",
  "socket2 0.5.10",
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-tungstenite",
  "tracing",
- "tungstenite",
  "wok-event",
  "wok-relay",
 ]

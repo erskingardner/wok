@@ -49,4 +49,8 @@ creation flags on the private snapshot.
 
 ## Integrity
 
-`wok integrity` reports missing payloads, orphan payloads, packed parse errors, and id-index count drift.
+`wok integrity` verifies metadata and payload envelopes and compares every
+expected event-derived secondary-index entry with the actual indexes in both
+directions. `wok doctor` additionally decompresses payloads, checks payload ID
+identity, opens negentropy trees, and diagnoses version, endianness, capacity,
+config, plugin, and socket-path problems.

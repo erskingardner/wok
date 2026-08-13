@@ -66,6 +66,17 @@ pub struct Dbis {
     pub negentropy: MDB_dbi,
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct EnvironmentStats {
+    pub map_size: usize,
+    pub used_bytes: u64,
+    pub page_size: u32,
+    pub last_page_number: usize,
+    pub entries: usize,
+    pub readers: u32,
+    pub max_readers: u32,
+}
+
 pub struct EnvInner {
     pub env: *mut MDB_env,
     pub dbis: Dbis,
@@ -282,6 +293,29 @@ impl Env {
             None => Ok(0),
             Some(raw) => Ok(decode_meta(raw)?.db_version),
         }
+    }
+
+    pub fn db_meta(&self) -> Result<Option<Meta>, DbError> {
+        let txn = self.begin_ro()?;
+        txn.get_u64(self.dbis().meta, 1)?
+            .map(decode_meta)
+            .transpose()
+    }
+
+    pub fn stats(&self) -> Result<EnvironmentStats, DbError> {
+        let mut info: MDB_envinfo = unsafe { std::mem::zeroed() };
+        let mut stat: MDB_stat = unsafe { std::mem::zeroed() };
+        check(unsafe { mdb_env_info(self.inner.env, &mut info) })?;
+        check(unsafe { mdb_env_stat(self.inner.env, &mut stat) })?;
+        Ok(EnvironmentStats {
+            map_size: info.me_mapsize,
+            used_bytes: (info.me_last_pgno as u64 + 1).saturating_mul(stat.ms_psize as u64),
+            page_size: stat.ms_psize,
+            last_page_number: info.me_last_pgno,
+            entries: stat.ms_entries,
+            readers: info.me_numreaders,
+            max_readers: info.me_maxreaders,
+        })
     }
 
     pub fn compact_to_fd(&self, fd: i32) -> Result<(), DbError> {

@@ -19,7 +19,7 @@ pub mod schema;
 pub mod txn;
 pub mod write;
 
-pub use env::{Env, EnvOptions};
+pub use env::{Env, EnvOptions, EnvironmentStats};
 pub use error::DbError;
 pub use fbs::{
     decode_compression_dictionary, decode_meta, decode_negentropy_filter,

@@ -88,10 +88,18 @@ All C++ subcommands exist:
 | `relay` | WS (+ optional Unix) relay |
 | `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse` |
 | `scan`, `event <levId>`, `info`, `delete`, `compact`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |
+| `doctor [--json]` | Config, storage, index, payload, negentropy, capacity, and runtime-path diagnostics |
 | `dict stats/train/compress/decompress` | zstd dictionary management (ZDICT training included) |
 | `negentropy list/add/build` | persistent negentropy trees |
 | `router <file>` | mesh replication with hot reconfig |
 | `stream`, `sync`, `upload`, `download` | mesh transfers |
+
+Before cutover or after an unclean shutdown, run `wok --config wok.toml
+doctor`. It validates every event-derived index semantically, decompresses
+payloads and matches their IDs to packed records, opens every negentropy tree,
+checks the Wok database marker and host endianness, reports LMDB map/disk
+capacity, and verifies configured plugin and Unix-socket paths. `--json` emits
+the complete machine-readable report; failures exit nonzero.
 
 ## Architecture
 

@@ -39,7 +39,10 @@ event identity requires compatibility. See `docs/compatibility-policy.md`,
   refuses write transactions on strfry v3.
 - `wok migrate strfry` proves source `data.mdb` remains unchanged, promotes a
   v4 snapshot, and compares complete event-record fingerprints before/after.
-- Integrity tool: `wok integrity` reports missing payloads, orphans, packed parse errors, and id-index count drift.
+- Integrity tooling verifies metadata, payload envelopes, and every
+  event-derived index in both directions. `wok doctor` adds decoded payload-ID
+  checks, negentropy traversal, capacity, version/endianness, config, plugin,
+  and socket-path diagnostics with human or JSON output.
 
 C++ reference source was not modified. Final `git status` in `/Users/jeff/code/strfry` was clean at the pin above.
 

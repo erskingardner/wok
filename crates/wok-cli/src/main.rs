@@ -9,6 +9,7 @@ use wok_db::{
 };
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_negentropy::Storage;
+mod doctor;
 mod migrate;
 mod router;
 
@@ -47,6 +48,12 @@ enum Command {
     },
     Relay,
     Info,
+    /// Diagnose configuration, storage, indexes, payloads, and runtime paths
+    Doctor {
+        /// Emit the complete machine-readable report
+        #[arg(long)]
+        json: bool,
+    },
     Import {
         #[arg(long)]
         show_rejected: bool,
@@ -233,6 +240,7 @@ async fn main() -> Result<()> {
         Command::Migrate { .. } => unreachable!("migration was dispatched before config load"),
         Command::Relay => cmd_relay(cfg, config).await,
         Command::Info => cmd_info(&cfg),
+        Command::Doctor { json } => cmd_doctor(&cfg, &config, json),
         Command::Import {
             show_rejected,
             no_verify,
@@ -375,6 +383,19 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
 fn cmd_info(cfg: &Config) -> Result<()> {
     let env = open_env(cfg)?;
     println!("DB version: {}", env.db_version()?);
+    Ok(())
+}
+
+fn cmd_doctor(cfg: &Config, config_path: &Path, json: bool) -> Result<()> {
+    let report = doctor::run(cfg, config_path);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.render_human());
+    }
+    if !report.ok {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

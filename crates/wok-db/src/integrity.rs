@@ -7,18 +7,19 @@ use crate::txn::RoTxn;
 use crate::write::{event_index_entries, EventIndexEntry};
 use crate::DbError;
 use lmdb_sys::MDB_dbi;
+use serde::Serialize;
 use wok_event::PackedEventView;
 
 const MAX_REPORTED_ISSUES: usize = 100;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntegrityIssue {
     pub category: &'static str,
     pub table: &'static str,
     pub detail: String,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct IntegrityReport {
     pub events: u64,
     pub payloads: u64,

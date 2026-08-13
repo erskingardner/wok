@@ -9,6 +9,8 @@ use wok_db::{
 };
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_negentropy::Storage;
+mod router;
+
 use wok_relay::Config;
 
 fn foreach_by_filter_scan(
@@ -127,8 +129,8 @@ enum Command {
         filter: Option<String>,
     },
     Router {
-        #[arg(long)]
-        config: Option<PathBuf>,
+        /// Router config file (taocpp::config format)
+        router_config_file: PathBuf,
     },
 }
 
@@ -252,10 +254,7 @@ async fn main() -> Result<()> {
         Command::Stream { url, dir } => cmd_stream(&cfg, url, dir).await,
         Command::Upload { url, pipeline } => cmd_upload(url, pipeline).await,
         Command::Download { url, filter } => cmd_download(url, filter).await,
-        Command::Router { .. } => {
-            tracing::warn!("router is a compatibility stub; use stream/sync for mesh");
-            Ok(())
-        }
+        Command::Router { router_config_file } => router::run_router(cfg, router_config_file).await,
     }
 }
 

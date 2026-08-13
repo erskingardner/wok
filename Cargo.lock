@@ -2347,6 +2347,7 @@ dependencies = [
  "futures-util",
  "hex",
  "notify",
+ "parking_lot",
  "rand 0.8.7",
  "serde_json",
  "tempfile",

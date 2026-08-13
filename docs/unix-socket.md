@@ -18,7 +18,10 @@ Multiple requests and asynchronous EVENT/EOSE/OK/COUNT/AUTH/NEG-* frames share o
 - `chmod` to the configured mode after bind, before accept.
 - Optional UID/GID allow-lists via `getpeereid`.
 - Unlink the socket on orderly shutdown.
+- Per-connection outbound byte cap (`relay.unix.maxPendingOutboundBytes`); slow clients are disconnected, like the WS transport.
 - No admin commands on this protocol.
+
+Connections on this transport report `sourceType: "unix"` (with empty `sourceInfo`) to write-policy plugins.
 
 ## Client example (Python)
 

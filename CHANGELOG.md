@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-13
+
 ### Added
 
 - NIP-50 content search with transactional Unicode-normalized term and phrase
@@ -29,24 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   small, validated subset of live-reloadable TOML settings.
 - Bounded, idempotent negentropy tree builds with configurable scan batches,
   short write transactions, and progress checkpoints.
-
-### Fixed
-
-- Historical result bursts no longer hit an undocumented 256-message queue
-  and disconnect healthy clients before the configured pending-byte budget;
-  deep author pagination and mixed read/write workloads now guard this path.
-- Private kinds 4 and 1059 now fail closed by default, broad COUNT requests
-  cannot leak restricted-event populations, and NIP-59 is advertised only
-  when AUTH, recipient filtering, gift-wrap deletion, and live-only kind 21059
-  behavior are all usable.
-- `wok stream` now reconnects after connection failures and remote closes with
-  non-blocking capped exponential backoff, while retrying the first local event
-  whose WebSocket send did not complete.
-
-## [0.1.0] - 2026-08-13
-
-### Added
-
 - Initial Wok release: a Rust Nostr relay with WebSocket and optional
   length-prefixed Unix-socket transports.
 - Verified, one-way migration from strfry LMDB v3 into a Wok-owned v4
@@ -78,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Historical result bursts no longer hit an undocumented 256-message queue
+  and disconnect healthy clients before the configured pending-byte budget;
+  deep author pagination and mixed read/write workloads now guard this path.
+- Private kinds 4 and 1059 now fail closed by default, broad COUNT requests
+  cannot leak restricted-event populations, and NIP-59 is advertised only
+  when AUTH, recipient filtering, gift-wrap deletion, and live-only kind 21059
+  behavior are all usable.
+- `wok stream` now reconnects after connection failures and remote closes with
+  non-blocking capped exponential backoff, while retrying the first local event
+  whose WebSocket send did not complete.
 - Hardened malformed LMDB comparator handling and semantic verification of
   every derived event index.
 - Corrected subscription installation ordering so immediate live events cannot

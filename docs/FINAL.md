@@ -198,6 +198,6 @@ Final local gates passed with zero failures:
   reported `ok=true`, with zero errors and zero mismatches
 
 No `v0.1.0` tag or GitHub Release existed at audit time. Because this is still
-the first release, the post-parity `Unreleased` entries must be folded into the
+the first release, the post-parity `Unreleased` entries were folded into the
 dated `0.1.0` section in a dedicated release commit after the complete PR stack
-is merged. Only that exact green commit should receive the `v0.1.0` tag.
+was merged. Only that exact green commit should receive the `v0.1.0` tag.

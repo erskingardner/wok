@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart-safe physical deletion.
 - Mergeable NIP-45 HyperLogLog sketches for canonical single-target COUNT
   filters, including hex, address, and arbitrary-string offset derivation.
+- Configurable structured JSON tracing for log collectors, richer correlation
+  fields, and hard-bounded in-memory operational metric history for the admin
+  UI, alongside the existing Prometheus exporter.
 
 ### Fixed
 

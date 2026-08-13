@@ -239,13 +239,13 @@ fn load_cfg(path: &Path) -> Result<Config> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("wok=info".parse().unwrap()),
-        )
-        .init();
     let Cli { config, cmd } = Cli::parse();
+    let startup_cfg = if config.exists() {
+        Config::load(&config).ok()
+    } else {
+        None
+    };
+    init_tracing(startup_cfg.as_ref())?;
     let cmd = match cmd {
         Command::Migrate { cmd } => {
             return match cmd {
@@ -327,6 +327,38 @@ async fn main() -> Result<()> {
         Command::Download { url, filter } => cmd_download(url, filter).await,
         Command::Router { router_config_file } => router::run_router(cfg, router_config_file).await,
     }
+}
+
+fn init_tracing(config: Option<&Config>) -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+
+    let configured_filter = config
+        .map(|cfg| cfg.observability.log_filter.as_str())
+        .filter(|filter| !filter.trim().is_empty())
+        .unwrap_or("wok=info");
+    let filter = match std::env::var(EnvFilter::DEFAULT_ENV) {
+        Ok(value) => EnvFilter::try_new(value)?,
+        Err(std::env::VarError::NotPresent) => EnvFilter::try_new(configured_filter)?,
+        Err(error) => return Err(error.into()),
+    };
+    let format = config
+        .map(|cfg| cfg.observability.log_format)
+        .unwrap_or(wok_relay::config::LogFormat::Pretty);
+    match format {
+        wok_relay::config::LogFormat::Pretty => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+        wok_relay::config::LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_env_filter(filter)
+                .init();
+        }
+    }
+    Ok(())
 }
 
 /// Watch the config file and live-reload the reloadable subset, like golpe

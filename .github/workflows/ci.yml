@@ -4,19 +4,35 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --workspace --exclude wok-bench
+        run: cargo test --workspace --exclude wok-bench --locked
       - name: conformance smoke
-        run: cargo test -p wok-compat --test nip_conformance --test e2e_transports
+        run: cargo test -p wok-compat --test nip_conformance --test e2e_transports --locked
+
+  msrv:
+    name: rust 1.85 minimum version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Check workspace at declared MSRV
+        run: cargo check --workspace --all-targets --locked

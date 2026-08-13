@@ -1,0 +1,123 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release contract and tests
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.contract.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - id: contract
+        name: Match tag, Cargo version, changelog, and commit
+        run: scripts/check-release.sh "$GITHUB_REF_NAME"
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --exclude wok-bench --locked
+      - name: Conformance smoke
+        run: cargo test -p wok-compat --test nip_conformance --test e2e_transports --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build Wok
+        run: cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli
+      - name: Verify embedded version
+        run: 'target/${{ matrix.target }}/release/wok --version | grep -Fx "wok ${{ needs.validate.outputs.version }}"'
+      - name: Package release archive
+        env:
+          COPYFILE_DISABLE: '1'
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="wok-${VERSION}-${TARGET}"
+          mkdir -p "package/${archive}" dist
+          install -m 0755 "target/${TARGET}/release/wok" "package/${archive}/wok"
+          cp README.md CHANGELOG.md LICENSE docs/wok.toml "package/${archive}/"
+          tar -C package -czf "dist/${archive}.tar.gz" "$archive"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums and release notes
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cd ..
+          scripts/release-notes.sh "$VERSION" > release-notes.md
+      - name: Attest release archives
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Publish tag release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag \
+            --title "Wok $VERSION" \
+            --notes-file release-notes.md

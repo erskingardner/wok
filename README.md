@@ -54,6 +54,14 @@ crates, so no system libraries are needed beyond a C toolchain.
 ## Migrate from strfry
 
 ```bash
+# Read-only preflight: no snapshot or output directory is created.
+./target/release/wok migrate strfry \
+  --db /var/lib/strfry \
+  --config /etc/strfry.conf \
+  --output /var/lib/wok \
+  --check
+
+# After reviewing the report and stopping strfry, perform the migration.
 ./target/release/wok migrate strfry \
   --db /var/lib/strfry \
   --config /etc/strfry.conf \
@@ -86,7 +94,7 @@ All C++ subcommands exist:
 
 | Command | Notes |
 |---|---|
-| `migrate strfry --db <dir> --config <file> --output <dir>` | Verified, one-way migration into a Wok-owned database |
+| `migrate strfry --db <dir> --config <file> --output <dir> [--check]` | Read-only preflight or verified, one-way migration into a Wok-owned database (`--json` with `--check`) |
 | `relay` | WS (+ optional Unix) relay |
 | `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse` |
 | `scan`, `event <levId>`, `info`, `delete`, `compact`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |

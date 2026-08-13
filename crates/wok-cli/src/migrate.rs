@@ -4,9 +4,13 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use wok_db::{check_integrity, event_fingerprint, snapshot_lmdb_readonly, Env, EnvOptions};
-use wok_relay::Config;
+use wok_db::{
+    check_integrity, event_fingerprint, snapshot_lmdb_readonly, Env, EnvOptions, EnvironmentStats,
+    IntegrityReport,
+};
+use wok_relay::{Config, StrfryConfigTranslation};
 
 const MANIFEST_NAME: &str = "migration-manifest.json";
 
@@ -27,6 +31,8 @@ struct MigrationManifest {
     target_data_sha256: String,
     source_config_sha256: String,
     output_config_sha256: String,
+    translated_config_keys: Vec<String>,
+    ignored_config_keys: Vec<String>,
     verification: Verification,
     warnings: Vec<&'static str>,
 }
@@ -38,22 +44,147 @@ struct Verification {
     target_opens_as_wok: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MigrationPreflight {
+    pub ok: bool,
+    pub source_db: String,
+    pub source_config: String,
+    pub output: String,
+    pub output_available: bool,
+    pub source_db_version: u64,
+    pub expected_source_db_version: u64,
+    pub event_count: u64,
+    pub source_data_bytes: u64,
+    pub estimated_output_bytes: u64,
+    pub available_output_bytes: Option<u64>,
+    pub lmdb: EnvironmentStats,
+    pub source_integrity: IntegrityReport,
+    pub translated_keys: Vec<String>,
+    pub ignored_keys: Vec<String>,
+    pub external_paths: Vec<ExternalPathCheck>,
+    pub source_use_probe: String,
+    pub active_source_processes: Vec<SourceProcess>,
+    pub generated_toml: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExternalPathCheck {
+    pub name: &'static str,
+    pub ok: bool,
+    pub path: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceProcess {
+    pub pid: u32,
+    pub command: String,
+}
+
+struct PreparedMigration {
+    report: MigrationPreflight,
+    source_db: PathBuf,
+    source_config: PathBuf,
+    output: PathBuf,
+    source_config_bytes: Vec<u8>,
+    source_cfg: Config,
+}
+
+impl MigrationPreflight {
+    fn render_human(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Migration preflight: {}\n",
+            if self.ok { "PASS" } else { "FAIL" }
+        ));
+        out.push_str(&format!(
+            "Source: {} (LMDB v{}, {} events, {} bytes)\n",
+            self.source_db, self.source_db_version, self.event_count, self.source_data_bytes
+        ));
+        out.push_str(&format!(
+            "Integrity: {}\n",
+            if self.source_integrity.ok() {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        ));
+        match self.available_output_bytes {
+            Some(available) => out.push_str(&format!(
+                "Capacity: {} bytes estimated, {} bytes available\n",
+                self.estimated_output_bytes, available
+            )),
+            None => out.push_str("Capacity: unavailable\n"),
+        }
+        out.push_str(&format!(
+            "Config keys: {} translated, {} ignored\n",
+            self.translated_keys.len(),
+            self.ignored_keys.len()
+        ));
+        for key in &self.translated_keys {
+            out.push_str(&format!("  translated: {key}\n"));
+        }
+        for key in &self.ignored_keys {
+            out.push_str(&format!("  ignored: {key}\n"));
+        }
+        for check in &self.external_paths {
+            out.push_str(&format!(
+                "  {} {}: {}\n",
+                if check.ok { "PASS" } else { "FAIL" },
+                check.name,
+                check.detail
+            ));
+        }
+        out.push_str(&format!("Source-use probe: {}\n", self.source_use_probe));
+        for process in &self.active_source_processes {
+            out.push_str(&format!(
+                "  active: pid {} {}\n",
+                process.pid, process.command
+            ));
+        }
+        for warning in &self.warnings {
+            out.push_str(&format!("WARN: {warning}\n"));
+        }
+        out.push_str("\nGenerated wok.toml:\n");
+        out.push_str(&self.generated_toml);
+        out
+    }
+}
+
+pub fn check_strfry(
+    source_db: &Path,
+    source_config: &Path,
+    output: &Path,
+    json: bool,
+) -> Result<()> {
+    let prepared = prepare_strfry(source_db, source_config, output)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&prepared.report)?);
+    } else {
+        print!("{}", prepared.report.render_human());
+    }
+    if !prepared.report.ok {
+        bail!("migration preflight failed");
+    }
+    Ok(())
+}
+
 pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> Result<()> {
-    let source_db = absolute_existing(source_db, "source database")?;
-    let source_config = absolute_existing(source_config, "source config")?;
-    if !source_db.is_dir() {
+    let prepared = prepare_strfry(source_db, source_config, output)?;
+    if !prepared.report.ok {
         bail!(
-            "source database '{}' is not a directory",
-            source_db.display()
+            "migration preflight failed; run `wok migrate strfry --check` for the complete report"
         );
     }
-    let output = std::path::absolute(output).context("resolve output path")?;
-    if output.exists() {
-        bail!(
-            "output '{}' already exists; refusing to overwrite it",
-            output.display()
-        );
-    }
+    let PreparedMigration {
+        report,
+        source_db,
+        source_config,
+        output,
+        source_config_bytes,
+        source_cfg,
+    } = prepared;
     let output_parent = output
         .parent()
         .context("output path has no parent directory")?;
@@ -63,12 +194,6 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
             output_parent.display()
         )
     })?;
-
-    let source_config_bytes = std::fs::read(&source_config)
-        .with_context(|| format!("read source config '{}'", source_config.display()))?;
-    let source_config_text =
-        std::str::from_utf8(&source_config_bytes).context("strfry config is not valid UTF-8")?;
-    let source_cfg = Config::parse_strfry(source_config_text).map_err(anyhow::Error::msg)?;
 
     let staging = tempfile::Builder::new()
         .prefix(".wok-migrate-")
@@ -142,6 +267,8 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
         target_data_sha256: sha256_file(&staging_db.join("data.mdb"))?,
         source_config_sha256: sha256_bytes(&source_config_bytes),
         output_config_sha256: sha256_bytes(translated_config.as_bytes()),
+        translated_config_keys: report.translated_keys,
+        ignored_config_keys: report.ignored_keys,
         verification: Verification {
             source_integrity_ok: true,
             event_records_unchanged: true,
@@ -175,6 +302,241 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
     println!("Manifest: {}", output.join(MANIFEST_NAME).display());
     println!("Source files were not modified.");
     Ok(())
+}
+
+fn prepare_strfry(
+    source_db: &Path,
+    source_config: &Path,
+    output: &Path,
+) -> Result<PreparedMigration> {
+    let source_db = absolute_existing(source_db, "source database")?;
+    let source_config = absolute_existing(source_config, "source config")?;
+    if !source_db.is_dir() {
+        bail!(
+            "source database '{}' is not a directory",
+            source_db.display()
+        );
+    }
+    let output = std::path::absolute(output).context("resolve output path")?;
+    let source_config_bytes = std::fs::read(&source_config)
+        .with_context(|| format!("read source config '{}'", source_config.display()))?;
+    let source_config_text =
+        std::str::from_utf8(&source_config_bytes).context("strfry config is not valid UTF-8")?;
+    let StrfryConfigTranslation {
+        config: source_cfg,
+        translated_keys,
+        ignored_keys,
+    } = Config::translate_strfry(source_config_text).map_err(anyhow::Error::msg)?;
+
+    let final_db = output.join("db");
+    let generated_toml = translated_config(&source_cfg, &final_db)?;
+    Config::parse_toml(&generated_toml).map_err(anyhow::Error::msg)?;
+
+    let (source_use_probe, active_source_processes) = probe_source_processes(&source_db);
+    let env = Env::open(
+        &source_db,
+        EnvOptions {
+            max_readers: source_cfg.db_maxreaders,
+            map_size: source_cfg.db_mapsize,
+            no_read_ahead: source_cfg.db_no_read_ahead,
+            create_dir: false,
+            create_dbis: false,
+            read_only: true,
+            ..EnvOptions::default()
+        },
+    )
+    .context("open strfry source read-only")?;
+    let source_db_version = env.db_version()?;
+    let lmdb = env.stats()?;
+    let source_integrity = check_integrity(&env.begin_ro()?)?;
+    drop(env);
+
+    let source_data_bytes = std::fs::metadata(source_db.join("data.mdb"))
+        .context("inspect source data.mdb")?
+        .len();
+    // The compact LMDB snapshot is normally smaller than data.mdb. Use the
+    // existing file size plus fixed metadata/config headroom as a conservative
+    // capacity estimate rather than promising compaction savings.
+    let estimated_output_bytes = source_data_bytes.saturating_add(64 * 1024 * 1024);
+    let available_output_bytes =
+        nearest_existing_parent(&output).and_then(|path| crate::doctor::available_bytes(path).ok());
+    let external_paths = external_path_checks(&source_cfg);
+    let output_available = !output.exists();
+    let mut warnings = Vec::new();
+    if !output_available {
+        warnings.push(format!(
+            "output {} already exists and will not be overwritten",
+            output.display()
+        ));
+    }
+    if !ignored_keys.is_empty() {
+        warnings.push(format!(
+            "{} unsupported config keys will be ignored",
+            ignored_keys.len()
+        ));
+    }
+    if !active_source_processes.is_empty() {
+        warnings.push(
+            "the source database is open by another process; stop strfry before cutover".into(),
+        );
+    }
+    if source_use_probe.starts_with("unavailable") {
+        warnings.push("could not determine whether strfry is using the source database".into());
+    }
+    if lmdb.map_size > 0 {
+        let utilization = lmdb.used_bytes as f64 / lmdb.map_size as f64;
+        if utilization >= 0.75 {
+            warnings.push(format!(
+                "LMDB map is {:.1}% full; increase database.map_size before growth",
+                utilization * 100.0
+            ));
+        }
+    }
+    if let Some(available) = available_output_bytes {
+        if available < estimated_output_bytes {
+            warnings.push(format!(
+                "only {available} bytes are available for an estimated {estimated_output_bytes}-byte output"
+            ));
+        }
+    } else {
+        warnings.push("could not determine free space for the output filesystem".into());
+    }
+    let ok = output_available
+        && source_db_version == wok_event::STRFRY_DB_VERSION
+        && source_integrity.ok()
+        && external_paths.iter().all(|check| check.ok)
+        && available_output_bytes
+            .map(|available| available >= estimated_output_bytes)
+            .unwrap_or(false);
+    let report = MigrationPreflight {
+        ok,
+        source_db: source_db.display().to_string(),
+        source_config: source_config.display().to_string(),
+        output: output.display().to_string(),
+        output_available,
+        source_db_version,
+        expected_source_db_version: wok_event::STRFRY_DB_VERSION,
+        event_count: source_integrity.events,
+        source_data_bytes,
+        estimated_output_bytes,
+        available_output_bytes,
+        lmdb,
+        source_integrity,
+        translated_keys,
+        ignored_keys,
+        external_paths,
+        source_use_probe,
+        active_source_processes,
+        generated_toml,
+        warnings,
+    };
+    Ok(PreparedMigration {
+        report,
+        source_db,
+        source_config,
+        output,
+        source_config_bytes,
+        source_cfg,
+    })
+}
+
+fn nearest_existing_parent(path: &Path) -> Option<&Path> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn external_path_checks(cfg: &Config) -> Vec<ExternalPathCheck> {
+    let mut checks = Vec::new();
+    if !cfg.relay.write_policy_plugin.is_empty() {
+        let executable = cfg
+            .relay
+            .write_policy_plugin
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        let found = crate::doctor::find_executable(executable);
+        checks.push(ExternalPathCheck {
+            name: "write-policy",
+            ok: found.is_some(),
+            path: executable.into(),
+            detail: found
+                .map(|path| format!("executable {}", path.display()))
+                .unwrap_or_else(|| format!("cannot find executable {executable:?}")),
+        });
+    }
+    if cfg.relay.unix.enabled {
+        let path = &cfg.relay.unix.path;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let exists = parent.is_dir();
+        let writable = exists
+            && unsafe {
+                let Ok(cpath) = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes())
+                else {
+                    return checks;
+                };
+                libc::access(cpath.as_ptr(), libc::W_OK) == 0
+            };
+        checks.push(ExternalPathCheck {
+            name: "unix-socket",
+            ok: exists && writable,
+            path: path.display().to_string(),
+            detail: if !exists {
+                format!("parent {} does not exist", parent.display())
+            } else if !writable {
+                format!("parent {} is not writable", parent.display())
+            } else {
+                format!("parent {} is writable", parent.display())
+            },
+        });
+    }
+    checks
+}
+
+fn probe_source_processes(source_db: &Path) -> (String, Vec<SourceProcess>) {
+    let data = source_db.join("data.mdb");
+    let output = match Command::new("lsof")
+        .args(["-F", "pc", "--"])
+        .arg(&data)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return (format!("unavailable: {error}"), Vec::new()),
+    };
+    // lsof exits 1 when no files match, which is a successful empty probe.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return (
+            format!(
+                "unavailable: lsof exited {}",
+                output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "by signal".into())
+            ),
+            Vec::new(),
+        );
+    }
+    let mut processes = Vec::new();
+    let mut pid = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            pid = value.parse::<u32>().ok();
+        } else if let (Some(value), Some(pid)) = (line.strip_prefix('c'), pid.take()) {
+            if pid != std::process::id() {
+                processes.push(SourceProcess {
+                    pid,
+                    command: value.to_string(),
+                });
+            }
+        }
+    }
+    ("available (lsof)".into(), processes)
 }
 
 fn absolute_existing(path: &Path, label: &str) -> Result<PathBuf> {
@@ -272,12 +634,28 @@ mod tests {
         std::fs::write(
             &source_config,
             format!(
-                "db = \"{}\"\nrelay {{ port = 7777 }}\n",
+                "db = \"{}\"\nrelay {{ port = 7777\n info {{ nips = \"1,2,3\" }} }}\n",
                 source_db.display()
             ),
         )
         .unwrap();
         let source_data_before = sha256_file(&source_db.join("data.mdb")).unwrap();
+
+        let preflight = prepare_strfry(&source_db, &source_config, &output).unwrap();
+        assert!(preflight.report.ok, "{:#?}", preflight.report);
+        assert_eq!(preflight.report.event_count, 1);
+        assert!(preflight
+            .report
+            .translated_keys
+            .contains(&"relay.port".to_string()));
+        assert_eq!(preflight.report.ignored_keys, ["relay.info.nips"]);
+        assert!(preflight.report.generated_toml.contains("[database]"));
+        assert!(!output.exists(), "preflight created its output directory");
+        assert_eq!(
+            sha256_file(&source_db.join("data.mdb")).unwrap(),
+            source_data_before,
+            "preflight modified the source data.mdb"
+        );
 
         migrate_strfry(&source_db, &source_config, &output).unwrap();
 
@@ -302,6 +680,12 @@ mod tests {
         assert_eq!(manifest["source_db_version"], 3);
         assert_eq!(manifest["target_db_version"], 4);
         assert_eq!(manifest["verification"]["event_records_unchanged"], true);
+        assert_eq!(manifest["ignored_config_keys"], json!(["relay.info.nips"]));
+        assert!(manifest["translated_config_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "relay.port"));
     }
 
     fn signed_event() -> wok_event::ParsedEvent {

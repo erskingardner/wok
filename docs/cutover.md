@@ -2,14 +2,15 @@
 
 ## Cutover (strfry → wok)
 
-1. Stop C++ strfry.
-2. Run `wok migrate strfry --db <strfry-db> --config <strfry.conf> --output <new-wok-dir>`.
-3. Inspect `<new-wok-dir>/migration-manifest.json` and review the generated
+1. Run `wok migrate strfry --db <strfry-db> --config <strfry.conf> --output <new-wok-dir> --check` and review every ignored key, path, capacity, and active-process warning.
+2. Stop C++ strfry.
+3. Rerun the command without `--check` to create the verified Wok-owned output.
+4. Inspect `<new-wok-dir>/migration-manifest.json` and review the generated
    `wok.toml`, especially plugin, policy, and socket paths.
-4. Start `wok --config <new-wok-dir>/wok.toml relay`.
-5. Confirm NIP-11, a REQ, a publish, and (if used) AUTH and negentropy.
-6. Switch clients / reverse proxy to Wok.
-7. Keep the stopped strfry database and config untouched until soak is done.
+5. Start `wok --config <new-wok-dir>/wok.toml relay`.
+6. Confirm NIP-11, a REQ, a publish, and (if used) AUTH and negentropy.
+7. Switch clients / reverse proxy to Wok.
+8. Keep the stopped strfry database and config untouched until soak is done.
 
 ## Rollback (wok → strfry)
 

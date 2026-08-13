@@ -170,6 +170,12 @@ enum MigrateCmd {
         /// New directory to create with db/, wok.toml, and a manifest
         #[arg(long)]
         output: PathBuf,
+        /// Inspect source, translation, capacity, and runtime use without copying
+        #[arg(long)]
+        check: bool,
+        /// Emit a machine-readable preflight report (requires --check)
+        #[arg(long, requires = "check")]
+        json: bool,
     },
 }
 
@@ -243,7 +249,18 @@ async fn main() -> Result<()> {
     let cmd = match cmd {
         Command::Migrate { cmd } => {
             return match cmd {
-                MigrateCmd::Strfry { db, output } => migrate::migrate_strfry(&db, &config, &output),
+                MigrateCmd::Strfry {
+                    db,
+                    output,
+                    check,
+                    json,
+                } => {
+                    if check {
+                        migrate::check_strfry(&db, &config, &output, json)
+                    } else {
+                        migrate::migrate_strfry(&db, &config, &output)
+                    }
+                }
             };
         }
         cmd => cmd,

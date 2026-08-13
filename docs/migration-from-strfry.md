@@ -6,7 +6,25 @@ and safe to abandon before cutover.
 
 ## Command
 
-Stop strfry first so the eventual cutover has a clear event boundary, then run:
+Run the no-write preflight first; it does not create a snapshot or output
+directory and may be run while strfry is serving traffic:
+
+```bash
+wok migrate strfry \
+  --db /var/lib/strfry \
+  --config /etc/strfry.conf \
+  --output /var/lib/wok \
+  --check
+```
+
+The report includes source version and full integrity results, event count,
+source and estimated output sizes, free space and LMDB map utilization, every
+translated and ignored config key, external executable/socket path checks, any
+process holding `data.mdb` open, and the exact generated TOML. Add `--json` for
+machine-readable output.
+
+After reviewing the report, stop strfry so the cutover has a clear event
+boundary, then run:
 
 ```bash
 wok migrate strfry \
@@ -15,7 +33,8 @@ wok migrate strfry \
   --output /var/lib/wok
 ```
 
-The source paths must exist and the output path must not. Wok builds the result
+The source paths must exist and the output path must not. The migration repeats
+the preflight before doing any work. Wok builds the result
 in a sibling staging directory and renames it into place only after every check
 passes.
 

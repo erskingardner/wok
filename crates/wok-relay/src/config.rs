@@ -103,7 +103,6 @@ pub struct InfoConfig {
     pub banner: String,
     pub privacy: String,
     pub terms: String,
-    pub nips: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +168,6 @@ impl Default for Config {
                     banner: String::new(),
                     privacy: String::new(),
                     terms: String::new(),
-                    nips: String::new(),
                 },
                 max_websocket_payload_size: 131072,
                 max_req_filter_size: 200,
@@ -386,9 +384,6 @@ impl Config {
         }
         if let Some(v) = map.get("relay.info.terms") {
             cfg.relay.info.terms = v.clone();
-        }
-        if let Some(v) = map.get("relay.info.nips") {
-            cfg.relay.info.nips = v.clone();
         }
         assign_u64(&map, "relay.maxWebsocketPayloadSize", |n| {
             cfg.relay.max_websocket_payload_size = n as usize;
@@ -1006,6 +1001,12 @@ mod tests {
         assert_eq!(decoded.db, expected.db);
         assert_eq!(decoded.relay.port, expected.relay.port);
         assert_eq!(decoded.relay.unix.mode, expected.relay.unix.mode);
+    }
+
+    #[test]
+    fn native_toml_rejects_manual_nip_advertisement() {
+        let error = Config::parse_toml("[relay.info]\nnips = [1, 2]\n").unwrap_err();
+        assert!(error.contains("unknown field `nips`"), "{error}");
     }
 
     #[test]

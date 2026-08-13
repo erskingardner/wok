@@ -34,7 +34,6 @@ restrict_read_to_involved_pubkey = true
 [relay.info]
 name = "wok"
 description = "This is a wok instance."
-nips = ""
 
 [relay.unix]
 enabled = false

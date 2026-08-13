@@ -47,7 +47,12 @@ C++ reference source was not modified. Final `git status` in `/Users/jeff/code/s
 
 Suite: `crates/wok-compat/tests/nip_conformance.rs` (independent of C++).
 
-Covered: NIP-01 structure/ID/sig/filters/EOSE/malformed/unknown cmds; NIP-02 replaceable kind 3; NIP-09 deletion kind; NIP-11 advertisement; NIP-40 expiration; NIP-42 AUTH kind (advertised only with `serviceUrl`); NIP-45 COUNT encoding; NIP-59 gift-wrap kinds; NIP-70 protected tag; NIP-77 NEG-OPEN parse. Advertised NIP set is a subset of this list.
+Covered relay behavior: NIP-01 structure/ID/sig/filters/EOSE/malformed and
+unknown commands; NIP-09 deletion; NIP-11 advertisement; NIP-40 expiration;
+NIP-42 AUTH (advertised only with `serviceUrl`); NIP-45 COUNT; NIP-59
+gift-wrap access/deletion behavior; NIP-70 protected events; and NIP-77
+NEG-OPEN. Client/application NIPs are not advertised merely because Wok can
+store their event kinds.
 
 Live NIP-11 HTTP: `e2e_transports::nip11_http_document`.
 

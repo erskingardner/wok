@@ -58,6 +58,7 @@ config. Unsupported keys are not copied, and external integrations may not have
 identical semantics. Before starting Wok, review at least:
 
 - write-policy plugin commands, users, permissions, and timeouts;
+- `relay.info.nips`, which Wok replaces with its runtime capability catalog;
 - relative filesystem paths, because the generated config has a new location;
 - listener, reverse-proxy, AUTH, and NIP-11 settings;
 - Unix socket ownership and access settings if enabling Wok's Unix transport;

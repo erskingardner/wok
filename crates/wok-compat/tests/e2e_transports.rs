@@ -335,6 +335,14 @@ async fn nip11_http_document() {
         .iter()
         .any(|n| n == 1));
     assert_eq!(
+        client["supported_nips"],
+        json!([1, 9, 11, 40, 45, 59, 70, 77])
+    );
+    assert_eq!(client["limitation"]["max_event_tags"], 2000);
+    assert_eq!(client["limitation"]["created_at_lower_limit"], u64::MAX / 4);
+    assert_eq!(client["limitation"]["created_at_upper_limit"], 900);
+    assert_eq!(client["limitation"]["default_limit"], 500);
+    assert_eq!(
         client["software"],
         "git+https://github.com/erskingardner/wok.git"
     );

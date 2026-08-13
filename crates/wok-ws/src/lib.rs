@@ -180,6 +180,10 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "max_message_length": cfg.relay.max_websocket_payload_size,
             "max_subscriptions": cfg.relay.max_subs_per_connection,
             "max_limit": cfg.relay.max_filter_limit,
+            "max_event_tags": cfg.events.max_num_tags,
+            "created_at_lower_limit": cfg.events.reject_older_than_secs,
+            "created_at_upper_limit": cfg.events.reject_newer_than_secs,
+            "default_limit": cfg.relay.max_filter_limit,
         }
     });
     let info = &cfg.relay.info;

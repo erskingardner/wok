@@ -144,17 +144,10 @@ fn nip45_count_encoding() {
 fn nip11_software_not_strfry_when_unconfigured() {
     let cfg = wok_relay::Config::default();
     let nips = wok_relay::supported_nips(&cfg);
-    assert!(nips.contains(&1));
-    assert!(nips.contains(&11));
-    assert!(nips.contains(&9));
-    assert!(nips.contains(&40));
-    assert!(nips.contains(&70));
-    assert!(nips.contains(&45));
-    assert!(nips.contains(&77));
-    assert!(
-        !nips.contains(&42),
-        "NIP-42 only when AUTH serviceUrl is set"
-    );
+    assert_eq!(nips, vec![1, 9, 11, 40, 45, 59, 70, 77]);
+    assert!(!nips.contains(&2), "client-side NIP-02 is not advertised");
+    assert!(!nips.contains(&4), "client-side NIP-04 is not advertised");
+    assert!(!nips.contains(&28), "client-side NIP-28 is not advertised");
 }
 
 #[test]
@@ -223,7 +216,14 @@ fn nip77_payload_hex_has_no_prefix_or_half_byte() {
 
 #[test]
 fn advertised_nips_are_subset_of_tested() {
-    let tested = [1u64, 2, 4, 9, 11, 28, 40, 42, 45, 59, 70, 77];
+    let tested = [1u64, 9, 11, 40, 42, 45, 59, 70, 77];
+    assert_eq!(
+        wok_relay::RELAY_CAPABILITY_CATALOG
+            .iter()
+            .map(|capability| capability.nip)
+            .collect::<Vec<_>>(),
+        tested
+    );
     let cfg = wok_relay::Config::default();
     for n in wok_relay::supported_nips(&cfg) {
         assert!(

@@ -11,6 +11,7 @@ use crate::metrics::Metrics;
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{ClientCommand, RelayMessage};
 use crate::restrict::ReadRestrictor;
+use crate::supported_nips;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
 use rand::Rng;
@@ -328,27 +329,6 @@ impl RelayHandle {
         let cfg = self.config.read();
         supported_nips(&cfg)
     }
-}
-
-pub fn supported_nips(cfg: &Config) -> Vec<u64> {
-    let mut nips = vec![1, 2, 4, 9, 11, 28, 40, 59, 70];
-    if cfg.relay.auth.enabled && !cfg.relay.auth.service_url.is_empty() {
-        nips.push(42);
-    }
-    if cfg.relay.max_filter_limit_count > 0 {
-        nips.push(45);
-    }
-    if cfg.relay.negentropy_enabled {
-        nips.push(77);
-    }
-    nips.sort_unstable();
-    nips.dedup();
-    if !cfg.relay.info.nips.is_empty() {
-        if let Ok(v) = serde_json::from_str::<Vec<u64>>(&cfg.relay.info.nips) {
-            return v;
-        }
-    }
-    nips
 }
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {

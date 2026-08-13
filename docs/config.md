@@ -7,6 +7,11 @@ defaults; unknown keys, wrong types, and out-of-range values are errors.
 The legacy HOCON-subset parser is used only to read the source config during an
 explicit strfry migration. Normal Wok commands and live reload read TOML.
 
+`relay.info.nips` is intentionally not a Wok setting. NIP-11 capabilities are
+derived from relay behavior and the settings that actually enable conditional
+features; accepting an operator-supplied replacement would allow the relay to
+advertise behavior it does not implement.
+
 Unix-only keys:
 
 | key | default | meaning |

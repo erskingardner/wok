@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message;
 use wok_compat::{sign_event, sign_event_with_key};
 use wok_db::{Env, EnvOptions};
+use wok_query::{HyperLogLog, NostrFilter};
 use wok_relay::Config;
 
 fn now_secs() -> u64 {
@@ -234,6 +235,132 @@ async fn nip62_vanish_is_immediate_and_blocks_rebroadcast() {
     assert!(request
         .iter()
         .any(|text| text.contains("ALL_RELAYS") && text.contains("\"EVENT\"")));
+
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip45_count_returns_mergeable_hll_for_canonical_tag_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let cfg = test_cfg(dir.path());
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let relay = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(relay, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .unwrap();
+    let keys: Vec<Keypair> = {
+        let mut rng = rand::thread_rng();
+        (0..4).map(|_| Keypair::new(SECP256K1, &mut rng)).collect()
+    };
+    let target = sign_event(json!({
+        "created_at": now_secs() - 20,
+        "kind": 1,
+        "tags": [],
+        "content": "hll-target",
+    }));
+    let target_id = target["id"].as_str().unwrap().to_string();
+    ws.send(Message::Text(json!(["EVENT", target]).to_string().into()))
+        .await
+        .unwrap();
+    let _ = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+
+    for (index, key) in keys.iter().enumerate() {
+        let reaction = sign_event_with_key(
+            json!({
+                "created_at": now_secs() - 10 + index as u64,
+                "kind": 7,
+                "tags": [["e", target_id]],
+                "content": "+",
+            }),
+            key,
+        );
+        ws.send(Message::Text(json!(["EVENT", reaction]).to_string().into()))
+            .await
+            .unwrap();
+        let accepted = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+        assert!(accepted.iter().any(|text| text.contains("true")));
+    }
+    let repeated_author = sign_event_with_key(
+        json!({
+            "created_at": now_secs(),
+            "kind": 7,
+            "tags": [["e", target_id]],
+            "content": "second reaction from one author",
+        }),
+        &keys[0],
+    );
+    ws.send(Message::Text(
+        json!(["EVENT", repeated_author]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let accepted = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+    assert!(accepted.iter().any(|text| text.contains("true")));
+
+    let count_filter = json!({"#e":[target_id], "kinds":[7]});
+    ws.send(Message::Text(
+        json!(["COUNT", "hll", count_filter]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let response = recv_until(&mut ws, |text| text.contains("\"COUNT\"")).await;
+    let body = response
+        .iter()
+        .find_map(|text| {
+            serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(|value| value[0] == "COUNT")
+                .map(|value| value[2].clone())
+        })
+        .expect("COUNT body");
+    assert_eq!(body["count"], 5);
+    let actual = body["hll"].as_str().expect("HLL response");
+    assert_eq!(actual.len(), 512);
+
+    let parsed_filter = NostrFilter::parse(&count_filter, 500, 3).unwrap();
+    let mut expected = HyperLogLog::for_filter(&parsed_filter).unwrap();
+    for key in &keys {
+        let (pubkey, _) = key.x_only_public_key();
+        expected.add_pubkey(&pubkey.serialize());
+    }
+    assert_eq!(actual, expected.encode_hex());
+
+    let empty_target = "00".repeat(32);
+    ws.send(Message::Text(
+        json!(["COUNT", "empty-hll", {"#e":[empty_target], "kinds":[7]}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let empty = recv_until(&mut ws, |text| text.contains("empty-hll")).await;
+    assert!(empty
+        .iter()
+        .any(|text| text.contains(&format!("\"hll\":\"{}\"", "00".repeat(256)))));
+
+    ws.send(Message::Text(
+        json!(["COUNT", "ambiguous-hll", {
+            "#e":[target_id], "#p":["11".repeat(32)], "kinds":[7]
+        }])
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let ambiguous = recv_until(&mut ws, |text| text.contains("ambiguous-hll")).await;
+    assert!(ambiguous
+        .iter()
+        .filter(|text| text.contains("\"COUNT\""))
+        .all(|text| !text.contains("\"hll\"")));
 
     handle.request_shutdown();
 }

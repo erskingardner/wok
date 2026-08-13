@@ -24,9 +24,9 @@ quirk. It also provides an additional Unix-domain socket transport.
 - **Nostr-first protocol behavior.** EVENT/REQ/CLOSE/COUNT/EOSE/OK/NOTICE/
   CLOSED/AUTH and NEG-* are tested against pinned NIPs. Differential tests are
   migration and regression evidence, not a promise to retain upstream bugs.
-- **NIP-42 AUTH, NIP-45 COUNT, NIP-50 ranked content search, NIP-62
-  restart-safe Request to Vanish, NIP-70 protected events, NIP-59 gift-wrap
-  deletion semantics, NIP-77 negentropy set
+- **NIP-42 AUTH, NIP-45 COUNT with mergeable HyperLogLog sketches, NIP-50
+  ranked content search, NIP-62 restart-safe Request to Vanish, NIP-70
+  protected events, NIP-59 gift-wrap deletion semantics, NIP-77 negentropy set
   reconciliation** (persistent LMDB B-tree, tree-backed multi-round sync
   sessions).
 - **Standards-first ephemeral delivery**: ephemeral kinds are live-only by

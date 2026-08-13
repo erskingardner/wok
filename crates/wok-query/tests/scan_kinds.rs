@@ -179,7 +179,7 @@ fn deep_author_kind_pages_are_complete_and_non_overlapping() {
                 &txn,
                 10_000,
                 |_, lev, _| scheduled.push(lev),
-                |_, total| completions.push(total),
+                |_, total, _hll| completions.push(total),
             )
             .unwrap();
     }

@@ -11,6 +11,8 @@ use wok_db::{
 };
 use wok_event::PackedEventView;
 
+use crate::HyperLogLog;
+
 #[derive(Clone, Debug)]
 struct CandidateEvent {
     packed: u64,
@@ -679,11 +681,17 @@ pub struct DbQuery {
     sent_events_curr: HashSet<u64>,
     last_work_checked: u64,
     max_total_events: u64,
+    hll: Option<HyperLogLog>,
 }
 
 impl DbQuery {
     pub fn new(sub: Subscription, max_total_events: u64) -> Self {
         let max_total_events = if sub.count_only { 0 } else { max_total_events };
+        let hll = if sub.count_only && sub.filter_group.filters.len() == 1 {
+            HyperLogLog::for_filter(&sub.filter_group.filters[0])
+        } else {
+            None
+        };
         let all_filters_search = !sub.filter_group.filters.is_empty()
             && sub
                 .filter_group
@@ -704,6 +712,7 @@ impl DbQuery {
             // max_filter_limit_count. The request-wide delivery ceiling is
             // for EVENT responses.
             max_total_events,
+            hll,
         }
     }
 
@@ -711,12 +720,24 @@ impl DbQuery {
         self.sent_events_full.len() as u64
     }
 
-    fn event_is_visible(txn: &RoTxn<'_>, lev_id: u64) -> Result<bool, wok_db::DbError> {
+    pub fn hll_hex(&self) -> Option<String> {
+        self.hll.as_ref().map(HyperLogLog::encode_hex)
+    }
+
+    fn visible_event_pubkey(
+        txn: &RoTxn<'_>,
+        lev_id: u64,
+    ) -> Result<Option<[u8; 32]>, wok_db::DbError> {
         let Some(raw) = txn.get_u64(txn.env().dbis().event, lev_id)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let packed = PackedEventView::new(raw)?;
-        Ok(!is_event_vanished_ro(txn, packed)?)
+        if is_event_vanished_ro(txn, packed)? {
+            return Ok(None);
+        }
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(packed.pubkey());
+        Ok(Some(pubkey))
     }
 
     /// Returns true when the scan is complete.
@@ -743,18 +764,18 @@ impl DbQuery {
                 self.sub.latest_event_id,
                 time_budget_us,
                 |lev_id| {
-                    match Self::event_is_visible(txn, lev_id) {
-                        Ok(true) => {}
-                        Ok(false) => return,
+                    let pubkey = match Self::visible_event_pubkey(txn, lev_id) {
+                        Ok(Some(pubkey)) => pubkey,
+                        Ok(None) => return,
                         Err(error) => {
                             visibility_error = Some(error);
                             return;
                         }
-                    }
+                    };
                     if (self.max_total_events == 0 || (sent.len() as u64) < self.max_total_events)
                         && sent.insert(lev_id)
                     {
-                        hits.push(lev_id);
+                        hits.push((lev_id, pubkey));
                     }
                 },
             )?;
@@ -762,7 +783,10 @@ impl DbQuery {
                 return Err(error);
             }
             self.sent_events_full = sent;
-            for lev_id in hits {
+            for (lev_id, pubkey) in hits {
+                if let Some(hll) = &mut self.hll {
+                    hll.add_pubkey(&pubkey);
+                }
                 cb(&self.sub, lev_id);
             }
             if self.max_total_events != 0
@@ -789,7 +813,7 @@ impl DbQuery {
             let mut sent_full = std::mem::take(&mut self.sent_events_full);
             let mut sent_curr = std::mem::take(&mut self.sent_events_curr);
             let mut last_work = self.last_work_checked;
-            let mut hits: Vec<u64> = Vec::new();
+            let mut hits: Vec<(u64, [u8; 32])> = Vec::new();
             let mut visibility_error = None;
             let mut handle = |lev_id| {
                 if f.limit == 0 {
@@ -798,16 +822,16 @@ impl DbQuery {
                 if lev_id > latest {
                     return false;
                 }
-                match Self::event_is_visible(txn, lev_id) {
-                    Ok(true) => {}
-                    Ok(false) => return false,
+                let pubkey = match Self::visible_event_pubkey(txn, lev_id) {
+                    Ok(Some(pubkey)) => pubkey,
+                    Ok(None) => return false,
                     Err(error) => {
                         visibility_error = Some(error);
                         return true;
                     }
-                }
+                };
                 if sent_full.insert(lev_id) {
-                    hits.push(lev_id);
+                    hits.push((lev_id, pubkey));
                 }
                 sent_curr.insert(lev_id);
                 sent_curr.len() as u64 >= f.limit
@@ -835,7 +859,10 @@ impl DbQuery {
             self.sent_events_full = sent_full;
             self.sent_events_curr = sent_curr;
             self.last_work_checked = last_work;
-            for lev in hits {
+            for (lev, pubkey) in hits {
+                if let Some(hll) = &mut self.hll {
+                    hll.add_pubkey(&pubkey);
+                }
                 cb(&self.sub, lev);
             }
             if self.max_total_events != 0

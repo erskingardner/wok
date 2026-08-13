@@ -134,10 +134,21 @@ fn nip45_count_encoding() {
         sub_id: "c".into(),
         count: 3,
         limited: true,
+        hll: Some("00".repeat(256)),
     }
     .to_json();
     assert!(s.contains("\"count\":3"));
     assert!(s.contains("\"limited\":true"));
+    assert!(!s.contains("\"hll\""));
+
+    let s = RelayMessage::Count {
+        sub_id: "c".into(),
+        count: 0,
+        limited: false,
+        hll: Some("00".repeat(256)),
+    }
+    .to_json();
+    assert!(s.contains("\"hll\""));
 }
 
 #[test]

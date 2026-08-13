@@ -55,6 +55,7 @@ pub enum RelayMessage {
         sub_id: String,
         count: u64,
         limited: bool,
+        hll: Option<String>,
     },
     Notice {
         message: String,
@@ -221,10 +222,14 @@ impl RelayMessage {
                 sub_id,
                 count,
                 limited,
+                hll,
             } => {
                 let mut body = json!({ "count": count });
                 if *limited {
                     body["limited"] = json!(true);
+                }
+                if let (false, Some(hll)) = (*limited, hll) {
+                    body["hll"] = json!(hll);
                 }
                 json!(["COUNT", sub_id, body]).to_string()
             }

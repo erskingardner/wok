@@ -1920,7 +1920,7 @@ fn run_req_worker(
                 }
             }
         }
-        let mut completed: Vec<(Subscription, u64)> = Vec::new();
+        let mut completed: Vec<(Subscription, u64, Option<String>)> = Vec::new();
         // Events are framed and delivered inside the scan callback: no
         // per-event Subscription clone, no intermediate collection, and the
         // payload JSON is copied exactly once (into the frame).
@@ -1946,12 +1946,12 @@ fn run_req_worker(
                     }
                 }
             },
-            |sub, total| {
-                completed.push((sub.clone(), total));
+            |sub, total, hll| {
+                completed.push((sub.clone(), total, hll));
             },
         );
         drop(txn);
-        for (sub, total) in completed {
+        for (sub, total, hll) in completed {
             if sub.count_only {
                 let mut count = total;
                 let mut limited = false;
@@ -1965,6 +1965,7 @@ fn run_req_worker(
                         sub_id: sub.sub_id.to_string(),
                         count,
                         limited,
+                        hll: if limited { None } else { hll },
                     },
                     &metrics,
                 );
@@ -2368,7 +2369,7 @@ fn run_negentropy(
             |sub, lev, _| {
                 lev_hits.push((sub.clone(), lev));
             },
-            |sub, total| {
+            |sub, total, _hll| {
                 done.push((sub.clone(), total));
             },
         );

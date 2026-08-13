@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maximum-timestamp markers, immediate query and rebroadcast suppression,
   recipient gift-wrap cleanup, undeletable request records, and bounded
   restart-safe physical deletion.
+- Mergeable NIP-45 HyperLogLog sketches for canonical single-target COUNT
+  filters, including hex, address, and arbitrary-string offset derivation.
 
 ### Fixed
 

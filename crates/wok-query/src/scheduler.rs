@@ -86,7 +86,7 @@ impl QueryScheduler {
     ) -> Result<(), wok_db::DbError>
     where
         F: FnMut(&Subscription, u64, Option<&[u8]>),
-        C: FnMut(&Subscription, u64),
+        C: FnMut(&Subscription, u64, Option<String>),
     {
         let Some(idx) = self.running.pop_front() else {
             return Ok(());
@@ -131,7 +131,7 @@ impl QueryScheduler {
             let q = self.queries[idx].take().unwrap();
             self.free.push(idx);
             self.remove_sub(q.sub.conn_id, &q.sub.sub_id);
-            on_complete(&q.sub, q.sent_count());
+            on_complete(&q.sub, q.sent_count(), q.hll_hex());
         } else {
             self.running.push_back(idx);
         }

@@ -15,7 +15,7 @@ arbitrary list.
 | 13 | Proof of work | leading-zero validation + NIP-11 minimum | relay tests | `relay.abuse.enabled` and `min_pow_difficulty > 0` |
 | 40 | Expiration | packed expiration + cron | `nip_conformance.rs` | always |
 | 42 | AUTH | ingest AUTH | unit + e2e when serviceUrl set | AUTH enabled and serviceUrl set |
-| 45 | COUNT | REQ worker | `nip_conformance.rs` | `maxFilterLimitCount > 0` |
+| 45 | COUNT + mergeable HyperLogLog | REQ worker + `wok-query` HLL | `nip_conformance.rs`, `e2e_transports.rs`, HLL unit vectors | `maxFilterLimitCount > 0` |
 | 50 | Search capability | transactional LMDB term/bigram index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs` | always |
 | 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, restricted kind 1059 with involved-pubkey enforcement, and `events.ephemeral_persistence = "live_only"` |
 | 62 | Request to Vanish | persistent maximum-timestamp markers, immediate query/rebroadcast suppression, gift-wrap recipient cleanup, and bounded physical deletion | `nip62_vanish.rs`, relay e2e | `relay.nip62.enabled` |
@@ -33,6 +33,12 @@ NIP-50 matches normalized search terms against event `content`, intersects
 them with every other supplied filter field, ranks before applying `limit`,
 and supports matching live events after EOSE. See
 [NIP-50 search](nip50-search.md) for exact query and scoring semantics.
+
+NIP-45 responses include a 512-character HLL register value for a single
+filter containing exactly one tag attribute with one target. Offset derivation
+implements all specified target forms: raw event/pubkey hex, an address's
+pubkey, or SHA-256 of any other string. Multi-filter, multi-target, and limited
+counts omit HLL because their sketches would be ambiguous or incomplete.
 
 NIP-62 accepts a signed kind 62 request containing either a matching
 `["relay", "<public relay URL>"]` tag or `["relay", "ALL_RELAYS"]`. The

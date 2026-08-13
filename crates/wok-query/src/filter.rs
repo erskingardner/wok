@@ -3,7 +3,7 @@
 use crate::subid::QueryError;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use wok_event::{from_hex, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE};
+use wok_event::{from_hex_exact, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE};
 
 #[derive(Debug, Clone)]
 pub struct FilterSetBytes {
@@ -29,7 +29,8 @@ impl FilterSetBytes {
                 .as_str()
                 .ok_or_else(|| QueryError::msg("filter item not a string"))?;
             let bytes = if hex_decode {
-                from_hex(s).map_err(|e| QueryError::msg(e.to_string()))?
+                // C++ FilterSetBytes uses from_hex(..., false).
+                from_hex_exact(s).map_err(|e| QueryError::msg(e.to_string()))?
             } else {
                 s.as_bytes().to_vec()
             };

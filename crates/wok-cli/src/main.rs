@@ -312,7 +312,7 @@ fn parse_import_line(
         let (packed, json) = parse_fried(line)?;
         return Ok(EventToWrite::new(packed, json));
     }
-    let v: serde_json::Value = serde_json::from_str(line)?;
+    let v: serde_json::Value = wok_event::json::parse_strict(line)?;
     let parsed = parse_and_verify_event(&v, limits, None, !no_verify, false)?;
     Ok(EventToWrite::new(parsed.packed.into_bytes(), parsed.json))
 }

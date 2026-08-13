@@ -5,6 +5,7 @@
 
 mod error;
 mod hash;
+pub mod json;
 mod kinds;
 mod packed;
 mod parse;
@@ -18,7 +19,8 @@ pub use packed::{
     PackedEventTagBuilder, PackedEventView,
 };
 pub use parse::{
-    from_hex, normalize_event_json, nostr_json_to_packed_event, to_hex, EventLimits, ParsedEvent,
+    from_hex, from_hex_exact, normalize_event_json, nostr_json_to_packed_event, to_hex,
+    EventLimits, ParsedEvent,
 };
 pub use validate::{
     parse_and_verify_event, verify_event_json_size, verify_event_timestamp, verify_nostr_event,

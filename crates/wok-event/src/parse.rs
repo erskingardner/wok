@@ -30,9 +30,28 @@ pub struct ParsedEvent {
     pub value: Value,
 }
 
+/// Matches hoytech `from_hex` with the default `allowUnevenSize = true`:
+/// strips a `"0x"` prefix and left-pads a single `0` nibble on odd length.
 pub fn from_hex(s: &str) -> Result<Vec<u8>, EventError> {
+    from_hex_impl(s, true)
+}
+
+/// Matches hoytech `from_hex(s, false)`: strips a `"0x"` prefix but rejects
+/// odd-length input.
+pub fn from_hex_exact(s: &str) -> Result<Vec<u8>, EventError> {
+    from_hex_impl(s, false)
+}
+
+fn from_hex_impl(s: &str, allow_uneven: bool) -> Result<Vec<u8>, EventError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
     if !s.len().is_multiple_of(2) {
-        return Err(EventError::msg("odd hex length"));
+        if !allow_uneven {
+            return Err(EventError::msg("uneven size input to from_hex"));
+        }
+        let mut padded = String::with_capacity(s.len() + 1);
+        padded.push('0');
+        padded.push_str(s);
+        return hex::decode(padded).map_err(|e| EventError::msg(format!("hex decode: {e}")));
     }
     hex::decode(s).map_err(|e| EventError::msg(format!("hex decode: {e}")))
 }
@@ -70,11 +89,11 @@ pub fn nostr_json_to_packed_event(
     if !v.is_object() {
         return Err(EventError::msg("event is not an object"));
     }
-    let id = from_hex(json_get_string(
+    let id = from_hex_exact(json_get_string(
         v.get("id").ok_or_else(|| EventError::msg("missing id"))?,
         "event id field was not a string",
     )?)?;
-    let pubkey = from_hex(json_get_string(
+    let pubkey = from_hex_exact(json_get_string(
         v.get("pubkey")
             .ok_or_else(|| EventError::msg("missing pubkey"))?,
         "event pubkey field was not a string",
@@ -144,7 +163,7 @@ pub fn nostr_json_to_packed_event(
                         "unexpected size for fixed-size tag: {tag_name}"
                     )));
                 }
-                let raw = from_hex(&tag_val)?;
+                let raw = from_hex_exact(&tag_val)?;
                 if raw.len() <= MAX_INDEXED_TAG_VAL_SIZE {
                     tag_builder.add(tag_name.chars().next().unwrap(), &raw)?;
                 }
@@ -181,14 +200,18 @@ pub fn nostr_json_to_packed_event(
     PackedEventBuilder::build(&id, &pubkey, created_at, kind, expiration, &tag_builder)
 }
 
+/// Matches C++ `parseUint64`: every character must be an ASCII digit and the
+/// value must fit in u64 (so `+100` and whitespace are rejected).
 fn parse_uint64(s: &str) -> Result<u64, EventError> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(EventError::msg(format!("invalid uint64: {s}")));
+    }
     s.parse::<u64>()
         .map_err(|_| EventError::msg(format!("invalid uint64: {s}")))
 }
 
-/// Rebuild JSON with only authenticated top-level fields, keys in insertion
-/// order matching C++ `tao::json` initializer which uses a sorted map:
-/// content, created_at, id, kind, pubkey, sig, tags.
+/// Rebuild JSON with only authenticated top-level fields, keys in
+/// alphabetical order, serialized exactly like C++ `tao::json`.
 pub fn normalize_event_json(orig: &Value) -> Result<String, EventError> {
     let mut map = Map::new();
     for key in [
@@ -205,7 +228,7 @@ pub fn normalize_event_json(orig: &Value) -> Result<String, EventError> {
             .ok_or_else(|| EventError::msg(format!("missing {key}")))?;
         map.insert(key.to_string(), v.clone());
     }
-    serde_json::to_string(&Value::Object(map)).map_err(|e| EventError::msg(e.to_string()))
+    Ok(crate::json::to_tao_string(&Value::Object(map)))
 }
 
 #[cfg(test)]
@@ -217,7 +240,27 @@ mod tests {
     fn hex_roundtrip() {
         assert_eq!(to_hex(&from_hex("0a0b").unwrap()), "0a0b");
         assert!(from_hex("zz").is_err());
-        assert!(from_hex("a").is_err());
+        // hoytech semantics: uneven input is left-padded, "0x" is stripped.
+        assert_eq!(from_hex("a").unwrap(), vec![0x0a]);
+        assert_eq!(from_hex("0x0a0b").unwrap(), vec![0x0a, 0x0b]);
+        assert!(from_hex_exact("a").is_err());
+        assert_eq!(from_hex_exact("0x0a0b").unwrap(), vec![0x0a, 0x0b]);
+    }
+
+    #[test]
+    fn uint64_digits_only() {
+        let tags = serde_json::json!([["expiration", "+100"]]);
+        let v = serde_json::json!({
+            "id": "11".repeat(32),
+            "pubkey": "22".repeat(32),
+            "created_at": 1,
+            "kind": 1,
+            "content": "",
+            "tags": tags,
+            "sig": "00".repeat(64),
+        });
+        // C++ parseUint64 rejects the '+' sign.
+        assert!(nostr_json_to_packed_event(&v, &EventLimits::default()).is_err());
     }
 
     #[test]

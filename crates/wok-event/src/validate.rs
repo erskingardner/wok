@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::hash::{verify_id, verify_sig};
 use crate::packed::PackedEventView;
 use crate::parse::{
-    from_hex, normalize_event_json, nostr_json_to_packed_event, EventLimits, ParsedEvent,
+    normalize_event_json, nostr_json_to_packed_event, EventLimits, ParsedEvent,
 };
 use crate::EventError;
 
@@ -48,7 +48,7 @@ pub fn verify_nostr_event(packed: PackedEventView<'_>, orig: &Value) -> Result<(
             .ok_or_else(|| EventError::msg("missing sig"))?,
         "event sig was not a string",
     )?;
-    let sig = from_hex(sig_hex)?;
+    let sig = crate::from_hex_exact(sig_hex)?;
     let valid = verify_sig(&sig, packed.id(), packed.pubkey())?;
     if !valid {
         return Err(EventError::msg("bad signature"));

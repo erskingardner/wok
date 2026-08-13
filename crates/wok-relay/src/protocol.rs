@@ -81,7 +81,7 @@ impl ClientCommand {
         if !text.starts_with('[') {
             return Err("unparseable message".into());
         }
-        let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let v: Value = wok_event::json::parse_strict(text).map_err(|e| e.to_string())?;
         let arr = v.as_array().ok_or("message is not an array")?;
         if arr.len() < 2 {
             return Err("too few array elements".into());

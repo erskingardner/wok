@@ -30,7 +30,7 @@ pub fn event_id_hash(orig: &Value) -> Result<[u8; 32], EventError> {
             .cloned()
             .ok_or_else(|| EventError::msg("missing content"))?,
     ]);
-    let encoded = serde_json::to_string(&arr).map_err(|e| EventError::msg(e.to_string()))?;
+    let encoded = crate::json::to_tao_string(&arr);
     Ok(sha256(encoded.as_bytes()))
 }
 

@@ -57,6 +57,14 @@ NIP-11 `limitation.min_pow_difficulty`. Unix-socket connections bypass only the
 IP/connection buckets; query, author, storage, and proof-of-work policies still
 apply.
 
+`observability.log_format` selects human-readable `pretty` logs or newline
+delimited `json` suitable for a collector. `RUST_LOG` overrides
+`observability.log_filter`. Connection lifecycle, validated event, query, and
+maintenance records carry structured fields rather than requiring text
+parsing. The in-process time series is controlled by `history_enabled`,
+`history_interval_secs`, and `history_max_points`; it is memory-only and has an
+absolute 100,000-point ceiling. See [Observability](observability.md).
+
 Unix-only keys:
 
 | key | default | meaning |
@@ -73,4 +81,5 @@ Unix-only keys:
 
 Reload: the relay watches the TOML file and live-reloads everything except the
 frozen database, bind, port, Unix socket, pool-size, `nofiles`, and
-per-connection socket settings. See known-differences.
+per-connection socket settings. Log format/filter also require a restart;
+history bounds reload live. See known-differences.

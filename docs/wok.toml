@@ -14,6 +14,16 @@ ephemeral_persistence = "live_only"
 max_num_tags = 2000
 max_tag_val_size = 1024
 
+[observability]
+# pretty for humans; json for Loki, Vector, Fluent Bit, or another collector.
+log_format = "pretty"
+# RUST_LOG takes precedence when set.
+log_filter = "wok=info"
+history_enabled = true
+history_interval_secs = 15
+# 24 hours at 15-second resolution. Memory use is strictly bounded.
+history_max_points = 5760
+
 [relay]
 bind = "127.0.0.1"
 port = 7777

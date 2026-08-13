@@ -417,7 +417,7 @@ async fn handle_ws<S>(
     let outbound = Outbound::new(tx, max_pending);
     let killed = outbound.killed();
     handle.register(conn_id, outbound).await;
-    tracing::info!("[{conn_id}] Connect from {peer}");
+    tracing::info!(conn_id, peer = %peer, transport = "websocket", "client connected");
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut parser = WsParser::new(
         max_message,
@@ -439,7 +439,7 @@ async fn handle_ws<S>(
     'outer: loop {
         tokio::select! {
             _ = killed.notified() => {
-                tracing::info!("[{conn_id}] Terminated slow client");
+                tracing::info!(conn_id, peer = %peer, reason = "slow_client", "client terminated");
                 break;
             }
             _ = ping.tick(), if auto_ping > 0 => {
@@ -501,5 +501,5 @@ async fn handle_ws<S>(
         .metrics
         .active_connections
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!("[{conn_id}] Disconnect from {peer}");
+    tracing::info!(conn_id, peer = %peer, transport = "websocket", "client disconnected");
 }

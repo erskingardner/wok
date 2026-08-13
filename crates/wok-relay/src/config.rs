@@ -12,6 +12,7 @@ pub struct Config {
     pub db_mapsize: usize,
     pub db_no_read_ahead: bool,
     pub events: EventsConfig,
+    pub observability: ObservabilityConfig,
     pub relay: RelayConfig,
 }
 
@@ -100,6 +101,7 @@ const STRFRY_TRANSLATED_KEYS: &[&str] = &[
 struct TomlConfig {
     database: DatabaseConfig,
     events: EventsConfig,
+    observability: ObservabilityConfig,
     relay: RelayConfig,
 }
 
@@ -123,6 +125,23 @@ pub struct EventsConfig {
     pub ephemeral_persistence: EphemeralPersistence,
     pub max_num_tags: usize,
     pub max_tag_val_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    pub log_format: LogFormat,
+    pub log_filter: String,
+    pub history_enabled: bool,
+    pub history_interval_secs: u64,
+    pub history_max_points: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    Pretty,
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +285,13 @@ impl Default for Config {
                 max_num_tags: 2000,
                 max_tag_val_size: 1024,
             },
+            observability: ObservabilityConfig {
+                log_format: LogFormat::Pretty,
+                log_filter: "wok=info".into(),
+                history_enabled: true,
+                history_interval_secs: 15,
+                history_max_points: 5_760,
+            },
             relay: RelayConfig {
                 bind: "127.0.0.1".into(),
                 port: 7777,
@@ -372,6 +398,7 @@ impl From<Config> for TomlConfig {
                 no_read_ahead: config.db_no_read_ahead,
             },
             events: config.events,
+            observability: config.observability,
             relay: config.relay,
         }
     }
@@ -385,6 +412,7 @@ impl From<TomlConfig> for Config {
             db_mapsize: config.database.map_size,
             db_no_read_ahead: config.database.no_read_ahead,
             events: config.events,
+            observability: config.observability,
             relay: config.relay,
         }
     }
@@ -467,6 +495,16 @@ impl Config {
         let parsed: TomlConfig = merged
             .try_into()
             .map_err(|e: toml::de::Error| e.to_string())?;
+        if parsed.observability.history_interval_secs == 0 {
+            return Err("observability.history_interval_secs must be at least 1".into());
+        }
+        if parsed.observability.history_max_points > crate::metrics::MAX_HISTORY_POINTS {
+            return Err(format!(
+                "observability.history_max_points cannot exceed {}",
+                crate::metrics::MAX_HISTORY_POINTS
+            ));
+        }
+        tracing_subscriber_filter_syntax(&parsed.observability.log_filter)?;
         Ok(parsed.into())
     }
 
@@ -767,7 +805,27 @@ impl Config {
         self.relay.req_monitor_threads = old.relay.req_monitor_threads;
         self.relay.negentropy_threads = old.relay.negentropy_threads;
         self.relay.unix = old.relay.unix;
+        // Subscriber construction is process-global. Log encoding/filter
+        // changes take effect after restart, while history bounds reload live.
+        self.observability.log_format = old.observability.log_format;
+        self.observability.log_filter = old.observability.log_filter;
     }
+}
+
+fn tracing_subscriber_filter_syntax(filter: &str) -> Result<(), String> {
+    if filter.trim().is_empty() {
+        return Err("observability.log_filter cannot be empty".into());
+    }
+    // Keep this crate independent of tracing-subscriber. Its directive
+    // grammar is intentionally simple enough to reject the common invalid
+    // cases here; the CLI performs the authoritative parse at startup.
+    if filter
+        .split(',')
+        .any(|directive| directive.trim().is_empty())
+    {
+        return Err("observability.log_filter contains an empty directive".into());
+    }
+    Ok(())
 }
 
 fn assign_u64(
@@ -1168,11 +1226,33 @@ mod tests {
 
     #[test]
     fn reload_keeps_frozen_keys() {
-        let mut cfg = Config::parse_toml("[relay]\nport = 7777\nmax_filter_limit = 500\n").unwrap();
-        let new = Config::parse_toml("[relay]\nport = 9999\nmax_filter_limit = 123\n").unwrap();
+        let mut cfg = Config::parse_toml(
+            "[relay]\nport = 7777\nmax_filter_limit = 500\n\n[observability]\nlog_format = \"pretty\"\nhistory_max_points = 10\n",
+        )
+        .unwrap();
+        let new = Config::parse_toml(
+            "[relay]\nport = 9999\nmax_filter_limit = 123\n\n[observability]\nlog_format = \"json\"\nhistory_max_points = 20\n",
+        )
+        .unwrap();
         cfg.apply_reload(new);
         assert_eq!(cfg.relay.port, 7777, "port is restart-required");
         assert_eq!(cfg.relay.max_filter_limit, 123, "limits reload live");
+        assert_eq!(cfg.observability.log_format, LogFormat::Pretty);
+        assert_eq!(cfg.observability.history_max_points, 20);
+    }
+
+    #[test]
+    fn observability_history_is_hard_bounded() {
+        assert!(
+            Config::parse_toml("[observability]\nhistory_max_points = 100001\n")
+                .unwrap_err()
+                .contains("cannot exceed")
+        );
+        assert!(
+            Config::parse_toml("[observability]\nhistory_interval_secs = 0\n")
+                .unwrap_err()
+                .contains("at least 1")
+        );
     }
 
     #[test]

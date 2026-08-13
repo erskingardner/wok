@@ -40,8 +40,9 @@ quirk. It also provides an additional Unix-domain socket transport.
 - **Operational continuity**: worker pools (`numThreads.*`), single LMDB writer,
   bounded queues with backpressure, slow-client termination
   (`max_pending_outbound_bytes`), config hot-reload, graceful shutdown
-  (SIGUSR1/SIGINT), write-policy plugins, Prometheus metrics, and migration of
-  the supported `strfry.conf` subset.
+  (SIGUSR1/SIGINT), write-policy plugins, Prometheus metrics, structured JSON
+  tracing for Grafana/Loki pipelines, hard-bounded local chart history, and
+  migration of the supported `strfry.conf` subset.
 - **Native abuse resistance**: per-IP and per-pubkey token buckets, separate
   connection/EVENT/REQ/COUNT budgets, pre-scan query costing, historical-query
   concurrency limits, optional author storage quotas, rejection metrics, and
@@ -230,6 +231,7 @@ Summary:
 - [Unix socket protocol](docs/unix-socket.md)
 - [Supported NIPs](docs/nips.md)
 - [Configuration](docs/config.md)
+- [Observability](docs/observability.md)
 - [Cutover / rollback](docs/cutover.md)
 - [Security](docs/security.md)
 - [Known differences](docs/known-differences.md)

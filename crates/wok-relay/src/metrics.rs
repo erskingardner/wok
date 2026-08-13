@@ -1,4 +1,74 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use parking_lot::Mutex;
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const MAX_HISTORY_POINTS: usize = 100_000;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsSnapshot {
+    pub timestamp: u64,
+    pub active_connections: u64,
+    pub authenticated_connections: u64,
+    pub written_events_total: u64,
+    pub ephemeral_events_total: u64,
+    pub rejected_events_total: u64,
+    pub client_messages_total: u64,
+    pub relay_messages_total: u64,
+    pub abuse_rejections_total: u64,
+}
+
+pub struct MetricsHistory {
+    enabled: AtomicBool,
+    max_points: AtomicU64,
+    points: Mutex<VecDeque<MetricsSnapshot>>,
+}
+
+impl Default for MetricsHistory {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            max_points: AtomicU64::new(5_760),
+            points: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+impl MetricsHistory {
+    pub fn configure(&self, enabled: bool, max_points: usize) {
+        let max_points = max_points.min(MAX_HISTORY_POINTS);
+        self.enabled.store(enabled, Ordering::Relaxed);
+        self.max_points
+            .store(max_points.try_into().unwrap_or(u64::MAX), Ordering::Relaxed);
+        let mut points = self.points.lock();
+        while points.len() > max_points {
+            points.pop_front();
+        }
+        if !enabled || max_points == 0 {
+            points.clear();
+        }
+    }
+
+    fn push(&self, snapshot: MetricsSnapshot) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let maximum = self.max_points.load(Ordering::Relaxed) as usize;
+        if maximum == 0 {
+            return;
+        }
+        let mut points = self.points.lock();
+        while points.len() >= maximum {
+            points.pop_front();
+        }
+        points.push_back(snapshot);
+    }
+
+    pub fn snapshots(&self) -> Vec<MetricsSnapshot> {
+        self.points.lock().iter().cloned().collect()
+    }
+}
 
 #[derive(Default)]
 pub struct Metrics {
@@ -30,9 +100,54 @@ pub struct Metrics {
     pub relay_ok: AtomicU64,
     pub relay_notice: AtomicU64,
     pub relay_closed: AtomicU64,
+    pub history: MetricsHistory,
 }
 
 impl Metrics {
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let g = |n: &AtomicU64| n.load(Ordering::Relaxed);
+        MetricsSnapshot {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            active_connections: g(&self.active_connections),
+            authenticated_connections: g(&self.authenticated_connections),
+            written_events_total: g(&self.written_events_total),
+            ephemeral_events_total: g(&self.ephemeral_events_total),
+            rejected_events_total: g(&self.rejected_events_total),
+            client_messages_total: g(&self.client_event)
+                + g(&self.client_req)
+                + g(&self.client_count)
+                + g(&self.client_close)
+                + g(&self.client_auth),
+            relay_messages_total: g(&self.relay_event)
+                + g(&self.relay_eose)
+                + g(&self.relay_ok)
+                + g(&self.relay_notice)
+                + g(&self.relay_closed),
+            abuse_rejections_total: g(&self.abuse_connection_rejections)
+                + g(&self.abuse_event_rate_rejections)
+                + g(&self.abuse_req_rate_rejections)
+                + g(&self.abuse_count_rate_rejections)
+                + g(&self.abuse_pow_rejections)
+                + g(&self.abuse_query_cost_rejections)
+                + g(&self.abuse_query_concurrency_rejections)
+                + g(&self.abuse_pubkey_quota_rejections),
+        }
+    }
+
+    pub fn record_history(&self) {
+        self.history.push(self.snapshot());
+    }
+
+    pub fn history_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "current": self.snapshot(),
+            "points": self.history.snapshots(),
+        })
+    }
+
     pub fn render(&self) -> String {
         let g = |n: &AtomicU64| n.load(Ordering::Relaxed);
         format!(
@@ -109,5 +224,33 @@ impl Metrics {
             g(&self.relay_notice),
             g(&self.relay_closed),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_is_fifo_and_hard_bounded() {
+        let metrics = Metrics::default();
+        metrics.history.configure(true, 2);
+        metrics.active_connections.store(1, Ordering::Relaxed);
+        metrics.record_history();
+        metrics.active_connections.store(2, Ordering::Relaxed);
+        metrics.record_history();
+        metrics.active_connections.store(3, Ordering::Relaxed);
+        metrics.record_history();
+        let points = metrics.history.snapshots();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].active_connections, 2);
+        assert_eq!(points[1].active_connections, 3);
+
+        metrics.history.configure(false, usize::MAX);
+        assert!(metrics.history.snapshots().is_empty());
+        assert_eq!(
+            metrics.history.max_points.load(Ordering::Relaxed),
+            MAX_HISTORY_POINTS as u64
+        );
     }
 }

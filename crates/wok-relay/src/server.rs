@@ -387,6 +387,13 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let config = Arc::new(parking_lot::RwLock::new(config));
     let conns = Arc::new(ConnTable::new());
     let metrics = Arc::new(Metrics::default());
+    {
+        let cfg = config.read();
+        metrics.history.configure(
+            cfg.observability.history_enabled,
+            cfg.observability.history_max_points,
+        );
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
     let abuse = Arc::new(AbuseController::default());
 
@@ -433,6 +440,15 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
                     env, cfg, conns, metrics, abuse, ingest_rx, writer_tx, req_txs, neg_txs,
                 )
             })
+            .map_err(|e| e.to_string())?;
+    }
+    {
+        let cfg = config.clone();
+        let metrics = metrics.clone();
+        let shutdown = shutdown.clone();
+        thread::Builder::new()
+            .name("metrics-history".into())
+            .spawn(move || run_metrics_history(cfg, metrics, shutdown))
             .map_err(|e| e.to_string())?;
     }
     {
@@ -498,6 +514,30 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
 
     let _ = writer_tx;
     Ok(handle)
+}
+
+fn run_metrics_history(
+    cfg: Arc<parking_lot::RwLock<Config>>,
+    metrics: Arc<Metrics>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        let observability = cfg.read().observability.clone();
+        metrics.history.configure(
+            observability.history_enabled,
+            observability.history_max_points,
+        );
+        if observability.history_enabled && observability.history_max_points > 0 {
+            metrics.record_history();
+        }
+        let seconds = observability.history_interval_secs.max(1);
+        for _ in 0..seconds {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
 }
 
 /// Broadcast a database-change notification to every req-monitor thread.
@@ -926,6 +966,13 @@ fn ingest_event(
     };
     let packed = parsed.packed.view();
     let id_hex = to_hex(packed.id());
+    tracing::debug!(
+        conn_id,
+        event_id = %id_hex,
+        pubkey = %to_hex(packed.pubkey()),
+        kind = packed.kind(),
+        "validated inbound event"
+    );
     let is_vanish_request = packed.kind() == VANISH_KIND;
     if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
         conns.send(
@@ -1952,6 +1999,14 @@ fn run_req_worker(
         );
         drop(txn);
         for (sub, total, hll) in completed {
+            tracing::debug!(
+                conn_id = sub.conn_id,
+                sub_id = %sub.sub_id,
+                count_only = sub.count_only,
+                matched_events = total,
+                hll = hll.is_some(),
+                "historical query completed"
+            );
             if sub.count_only {
                 let mut count = total;
                 let mut limited = false;

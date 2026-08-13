@@ -143,6 +143,7 @@ async fn handle_conn(
     let outbound = Outbound::new(tx, cfg.relay.unix.max_pending_outbound_bytes);
     let killed = outbound.killed();
     handle.register(conn_id, outbound).await;
+    tracing::info!(conn_id, transport = "unix", "client connected");
     let mut len_buf = [0u8; 4];
     let result = async {
         loop {
@@ -181,6 +182,7 @@ async fn handle_conn(
         .metrics
         .active_connections
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(conn_id, transport = "unix", "client disconnected");
     result
 }
 

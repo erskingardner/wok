@@ -84,12 +84,8 @@ Approximate unit/integration count from the last workspace run: 86 non-empty tes
 
 See `docs/known-differences.md` for the full, current list. Highlights:
 
-- WebSocket permessage-deflate is not implemented (tungstenite 0.26 has no deflate feature).
-- Config file hot-reload is not wired; restart to apply config.
-- No graceful-shutdown drain; listeners abort on shutdown.
-- `dict train/compress/decompress` reads compressed payloads but does not train dictionaries.
-- `router` is a compatibility stub; `stream`/`sync` do not persist events.
-- Ingester/req/monitor/negentropy thread *counts* are parsed; this build runs one thread per pool plus a single writer.
+- Mesh client connections (router/stream/sync) don't offer permessage-deflate (server side supports it).
+- NIP-11 software string is wok's URL.
 - ID/author filters are exact 32 bytes (C++), not NIP-01 prefixes.
 - Historical restricted-kind REQ filtering uses PackedEvent from the Event table (intentional; C++ ReqWorker currently views payload bytes).
 
@@ -121,11 +117,27 @@ A full second review against the C++ source produced these fix commits:
   single LMDB writer.
 - A polling `data.mdb` watcher notifies live subscriptions of writes made by
   other processes (C++ `file_change_monitor` parity).
-- `crates/wok-compat/tests/cpp_negentropy.rs`: wok-built negentropy trees
-  produce identical size + full-range fingerprint under C++ `strfry
-  negentropy list`, and C++-built trees read identically under wok.
 - CLI: `wok event <levId>`; import/export byte-level fidelity with C++
   (abort-on-error export, import size accounting, fried endianness guards).
+
+## Third pass: remaining gaps closed
+
+- Worker pools per `numThreads.*` with C++ ThreadPool conn-hashed dispatch
+  (single LMDB writer preserved).
+- Graceful shutdown on SIGUSR1/SIGINT with connection drain and socket
+  unlink; `nofiles` rlimit applied; unix socket owner/group chown.
+- Config hot-reload on file change with golpe-noReload + listener-bound keys
+  frozen.
+- `dict train/compress/decompress` (ZDICT training; verified
+  cross-implementation with the C++ binary).
+- `stream` persists downloads (verified like WriterPipeline) and streams
+  uploads; `sync` does the full C++ two-phase negentropy transfer (verified
+  150/150 events both directions against the C++ relay).
+- `router` with tao-config parsing, per-URL reconnecting clients, hot
+  reconfig, and plugin gating (validated live against the C++ relay).
+- permessage-deflate via an in-house RFC 6455/7692 codec (the Rust WS
+  ecosystem has no extension support); negotiation mirrors uWS, with a
+  raw-socket e2e proving compressed frames both directions.
 
 ## Recommended production soak and cutover
 

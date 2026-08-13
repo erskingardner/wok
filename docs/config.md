@@ -11,11 +11,11 @@ Unix-only keys:
 | `relay.unix.enabled` | false | listen on a Unix socket |
 | `relay.unix.path` | `./strfry-db/wok.sock` | socket path |
 | `relay.unix.mode` | 384 (`0o600`) | permission bits; octal (`0600`/`0o600`) or decimal |
-| `relay.unix.owner` | empty | parsed, not yet applied (no chown) |
-| `relay.unix.group` | empty | parsed, not yet applied (no chown) |
+| `relay.unix.owner` | empty | chown socket user after bind |
+| `relay.unix.group` | empty | chown socket group after bind |
 | `relay.unix.authUids` | empty | comma-separated UIDs; empty = any |
 | `relay.unix.authGids` | empty | comma-separated GIDs; empty = any |
 | `relay.unix.maxFrameBytes` | 131072 | max JSON frame |
 | `relay.unix.maxPendingOutboundBytes` | 33554432 | slow-client byte cap, then disconnect |
 
-Reload: send the process a new config by restarting. File-watch hot reload is not yet wired; C++ watches the config file. See known-differences.
+Reload: the relay watches the config file and live-reloads everything except the frozen keys (db, dbParams.*, bind, port, unix.*, pool sizes, nofiles, and per-connection socket options), like golpe's noReload set. See known-differences.

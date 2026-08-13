@@ -48,26 +48,26 @@
 - CLOSED messages carry C++'s non-NIP-compliant `ERROR: auth-required: ...`
   prefix where C++ emits it.
 
-## Not yet implemented (documented gaps)
+## Deliberate smaller differences
 
-- **WebSocket permessage-deflate**: C++ enables it by default; wok never
-  negotiates it (tungstenite 0.26 in this tree has no deflate feature).
-  Interop-safe but a bandwidth divergence; the `compression.*` config keys
-  parse but have no effect.
-- **Config hot-reload** via file watch is not wired; restart to apply config.
-- **Graceful shutdown drain** (C++ SIGUSR1 + stopListening) is not
-  implemented; shutdown aborts listeners.
-- **Worker pools run one thread per stage** (ingester/req-worker/req-monitor/
-  negentropy) plus the single LMDB writer; `numThreads.*` is parsed but the
-  pools are not scaled out. The sole-writer invariant is preserved.
-- **`nofiles`** rlimit is parsed but not applied (no setrlimit call).
-- **`dict train/compress/decompress`** are stubs; wok reads zstd-dictionary
-  payloads, training uses C++ strfry.
-- **`router`** is a compatibility stub. **`stream`** prints received events
-  but does not persist them and has no up direction; **`sync`** is
-  initiator-only and does not persist results.
 - **NIP-11 software** string is wok's URL, not
   `git+https://github.com/hoytech/strfry.git`.
+- **Mesh client connections (router/stream/sync) do not offer
+  permessage-deflate** (the tungstenite client stack has no extension
+  support). The wok *server* negotiates and serves permessage-deflate like
+  C++; this is a bandwidth-only difference on client links.
+- permessage-deflate uses wok's own RFC 6455/7692 codec server-side
+  (tungstenite/fastwebsockets have no extension support); semantics mirror
+  uWS as strfry configures it.
+
+## Resolved in the second and third passes
+
+Worker pools (`numThreads.*`), graceful shutdown (SIGUSR1/SIGINT drain),
+config hot-reload (frozen keys kept), `nofiles` rlimit, unix socket
+owner/group chown, `dict train/compress/decompress`, `stream` (persist + up
+direction), `sync` (full two-phase transfer), `router`, and
+permessage-deflate are all implemented and validated against the C++ binary
+where applicable.
 
 When C++ and a NIP disagree, wok preserves C++ compatibility for storage and
 filter matching, documents the gap, and does not advertise unsupported

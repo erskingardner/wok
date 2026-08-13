@@ -56,7 +56,12 @@ See `docs/known-differences.md` as it is filled in. Initial decisions:
 
 ## Status
 
-Phases 1–6 are implemented. See `docs/FINAL.md` for gates, evidence, and remaining production soak work. A full second-pass review against the C++ source landed additional correctness fixes; see the "Post-review hardening" section of `docs/FINAL.md`.
+Phases 1–6 are implemented, plus all originally-deferred roadmap items:
+worker pools, graceful shutdown, config hot-reload, dict training,
+stream/sync transfers, router, and permessage-deflate. See `docs/FINAL.md`
+for gates, evidence, and remaining production soak work. Two review passes
+against the C++ source landed additional correctness fixes; see the
+"Post-review hardening" and "Third pass" sections of `docs/FINAL.md`.
 
 ## Non-goals
 

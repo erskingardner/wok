@@ -206,13 +206,26 @@ fn peer_allowed(stream: &UnixStream, cfg: &Config) -> Result<bool, UnixError> {
     if cfg.relay.unix.auth_uids.is_empty() && cfg.relay.unix.auth_gids.is_empty() {
         return Ok(true);
     }
-    let (uid, gid) = nix::unistd::getpeereid(stream)
-        .map_err(|e| UnixError::Message(format!("getpeereid: {e}")))?;
-    let uid = uid.as_raw();
-    let gid = gid.as_raw();
+    let (uid, gid) = peer_creds(stream)?;
     let uid_ok = cfg.relay.unix.auth_uids.is_empty() || cfg.relay.unix.auth_uids.contains(&uid);
     let gid_ok = cfg.relay.unix.auth_gids.is_empty() || cfg.relay.unix.auth_gids.contains(&gid);
     Ok(uid_ok && gid_ok)
+}
+
+/// (uid, gid) of the peer process.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_creds(stream: &UnixStream) -> Result<(u32, u32), UnixError> {
+    let creds = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map_err(|e| UnixError::Message(format!("SO_PEERCRED: {e}")))?;
+    Ok((creds.uid(), creds.gid()))
+}
+
+/// (uid, gid) of the peer process.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_creds(stream: &UnixStream) -> Result<(u32, u32), UnixError> {
+    let (uid, gid) = nix::unistd::getpeereid(stream)
+        .map_err(|e| UnixError::Message(format!("getpeereid: {e}")))?;
+    Ok((uid.as_raw(), gid.as_raw()))
 }
 
 /// Client helper: connect and send one JSON message, reading frames until timeout-free EOSE/OK.

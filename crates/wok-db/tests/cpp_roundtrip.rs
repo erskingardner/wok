@@ -11,6 +11,20 @@ fn strfry_bin() -> PathBuf {
     )
 }
 
+/// Differential tests are skipped when no C++ binary is available (e.g. CI).
+fn strfry_available() -> bool {
+    strfry_bin().is_file()
+}
+
+macro_rules! require_strfry {
+    () => {
+        if !strfry_available() {
+            eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
+            return;
+        }
+    };
+}
+
 fn make_cpp_db() -> (TempDir, PathBuf) {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
@@ -31,6 +45,7 @@ fn make_cpp_db() -> (TempDir, PathBuf) {
 
 #[test]
 fn open_cpp_created_database() {
+    require_strfry!();
     let (_tmp, db) = make_cpp_db();
     let env = Env::open(&db, EnvOptions::default()).unwrap();
     assert_eq!(env.db_version().unwrap(), 3);
@@ -43,6 +58,7 @@ fn open_cpp_created_database() {
 
 #[test]
 fn rust_init_readable_by_cpp() {
+    require_strfry!();
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
     let env = Env::open(&db, EnvOptions::default()).unwrap();
@@ -87,6 +103,7 @@ fn sign_kind1(content: &str, created_at: u64) -> (Vec<u8>, String) {
 
 #[test]
 fn rust_write_cpp_export() {
+    require_strfry!();
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
     let env = Env::open(&db, EnvOptions::default()).unwrap();

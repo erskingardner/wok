@@ -12,7 +12,7 @@
 
 use crate::error::NegError;
 use crate::storage::{Fingerprint, Storage};
-use crate::types::{Accumulator, Bound, Item, ID_SIZE};
+use crate::types::{Accumulator, Bound, Item};
 
 pub const MIN_ITEMS: usize = 30;
 pub const REBALANCE_THRESHOLD: usize = 60;
@@ -602,7 +602,6 @@ impl<B: BTreeBackend> BTreeCore<B> {
     ) -> Result<(), NegError> {
         self.check_bounds(begin, end)?;
         let num = end - begin;
-        let mut items: Vec<(Item, usize)> = Vec::new();
         let mut first_node = Node::default();
         let mut first_index = 0usize;
         let mut got = false;
@@ -624,7 +623,6 @@ impl<B: BTreeBackend> BTreeCore<B> {
             if !cb(&curr.items[index].item, begin + i) {
                 return Ok(());
             }
-            items.push((curr.items[index].item, begin + i));
             index += 1;
             if index >= curr.num_items as usize {
                 if curr.next_sibling == 0 {
@@ -634,7 +632,6 @@ impl<B: BTreeBackend> BTreeCore<B> {
                 index = 0;
             }
         }
-        let _ = items;
         Ok(())
     }
 
@@ -719,5 +716,3 @@ impl<B: BTreeBackend> BTreeCore<B> {
         Ok(accum)
     }
 }
-
-const _: usize = ID_SIZE;

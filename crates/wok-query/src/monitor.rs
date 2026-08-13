@@ -13,16 +13,15 @@ pub struct Recipient {
 struct MonitorItem {
     conn_id: u64,
     sub_id: SubId,
-    latest_event_id: u64,
 }
 
 pub struct ActiveMonitors {
     conns: HashMap<u64, HashMap<SubId, Subscription>>,
-    all_ids: HashMap<[u8; 32], Vec<(usize, MonitorItem)>>,
-    all_authors: HashMap<[u8; 32], Vec<(usize, MonitorItem)>>,
-    all_tags: HashMap<Vec<u8>, Vec<(usize, MonitorItem)>>,
-    all_kinds: HashMap<u64, Vec<(usize, MonitorItem)>>,
-    all_others: Vec<(usize, MonitorItem)>,
+    all_ids: HashMap<[u8; 32], Vec<MonitorItem>>,
+    all_authors: HashMap<[u8; 32], Vec<MonitorItem>>,
+    all_tags: HashMap<Vec<u8>, Vec<MonitorItem>>,
+    all_kinds: HashMap<u64, Vec<MonitorItem>>,
+    all_others: Vec<MonitorItem>,
     max_subs: usize,
 }
 
@@ -39,7 +38,7 @@ impl ActiveMonitors {
         }
     }
 
-    pub fn add_sub(&mut self, sub: Subscription, curr_event_id: u64) -> bool {
+    pub fn add_sub(&mut self, sub: Subscription, _curr_event_id: u64) -> bool {
         self.remove_sub(sub.conn_id, &sub.sub_id);
         let conn = self.conns.entry(sub.conn_id).or_default();
         if conn.len() >= self.max_subs {
@@ -55,33 +54,25 @@ impl ActiveMonitors {
             .get(&sub_id)
             .unwrap()
             .clone();
-        self.install(&installed, curr_event_id);
+        self.install(&installed);
         true
     }
 
     pub fn remove_sub(&mut self, conn_id: u64, sub_id: &SubId) {
-        let removed = self
-            .conns
-            .get_mut(&conn_id)
-            .and_then(|map| map.remove(sub_id))
-            .is_some();
-        if removed {
-            if self
-                .conns
-                .get(&conn_id)
-                .map(|m| m.is_empty())
-                .unwrap_or(false)
-            {
-                self.conns.remove(&conn_id);
+        if let Some(map) = self.conns.get_mut(&conn_id) {
+            if let Some(sub) = map.remove(sub_id) {
+                if map.is_empty() {
+                    self.conns.remove(&conn_id);
+                }
+                self.uninstall(&sub);
             }
-            self.uninstall(conn_id, sub_id);
         }
     }
 
     pub fn close_conn(&mut self, conn_id: u64) {
         if let Some(map) = self.conns.remove(&conn_id) {
-            for sub_id in map.keys() {
-                self.uninstall(conn_id, sub_id);
+            for (_, sub) in map {
+                self.uninstall(&sub);
             }
         }
     }
@@ -92,14 +83,14 @@ impl ActiveMonitors {
         let mut id = [0u8; 32];
         id.copy_from_slice(packed.id());
         if let Some(items) = self.all_ids.get(&id) {
-            for (_, it) in items {
+            for it in items {
                 candidates.push((it.conn_id, it.sub_id.clone()));
             }
         }
         let mut pk = [0u8; 32];
         pk.copy_from_slice(packed.pubkey());
         if let Some(items) = self.all_authors.get(&pk) {
-            for (_, it) in items {
+            for it in items {
                 candidates.push((it.conn_id, it.sub_id.clone()));
             }
         }
@@ -108,18 +99,18 @@ impl ActiveMonitors {
             spec.push(name as u8);
             spec.extend_from_slice(val);
             if let Some(items) = self.all_tags.get(&spec) {
-                for (_, it) in items {
+                for it in items {
                     candidates.push((it.conn_id, it.sub_id.clone()));
                 }
             }
             true
         });
         if let Some(items) = self.all_kinds.get(&packed.kind()) {
-            for (_, it) in items {
+            for it in items {
                 candidates.push((it.conn_id, it.sub_id.clone()));
             }
         }
-        for (_, it) in &self.all_others {
+        for it in &self.all_others {
             candidates.push((it.conn_id, it.sub_id.clone()));
         }
 
@@ -144,81 +135,87 @@ impl ActiveMonitors {
         recipients
     }
 
-    fn install(&mut self, sub: &Subscription, curr: u64) {
-        for (fi, f) in sub.filter_group.filters.iter().enumerate() {
-            let item = MonitorItem {
+    fn install(&mut self, sub: &Subscription) {
+        for f in &sub.filter_group.filters {
+            let item = || MonitorItem {
                 conn_id: sub.conn_id,
                 sub_id: sub.sub_id.clone(),
-                latest_event_id: curr,
             };
             if let Some(ids) = &f.ids {
                 for i in 0..ids.size() {
                     let mut id = [0u8; 32];
                     id.copy_from_slice(ids.at(i));
-                    self.all_ids
-                        .entry(id)
-                        .or_default()
-                        .push((fi, item_clone(&item)));
+                    self.all_ids.entry(id).or_default().push(item());
                 }
             } else if let Some(authors) = &f.authors {
                 for i in 0..authors.size() {
                     let mut a = [0u8; 32];
                     a.copy_from_slice(authors.at(i));
-                    self.all_authors
-                        .entry(a)
-                        .or_default()
-                        .push((fi, item_clone(&item)));
+                    self.all_authors.entry(a).or_default().push(item());
                 }
             } else if !f.tags.is_empty() {
                 for (name, set) in &f.tags {
                     for i in 0..set.size() {
                         let mut spec = vec![*name as u8];
                         spec.extend_from_slice(set.at(i));
-                        self.all_tags
-                            .entry(spec)
-                            .or_default()
-                            .push((fi, item_clone(&item)));
+                        self.all_tags.entry(spec).or_default().push(item());
                     }
                 }
             } else if let Some(kinds) = &f.kinds {
                 for i in 0..kinds.size() {
-                    self.all_kinds
-                        .entry(kinds.at(i))
-                        .or_default()
-                        .push((fi, item_clone(&item)));
+                    self.all_kinds.entry(kinds.at(i)).or_default().push(item());
                 }
             } else {
-                self.all_others.push((fi, item));
+                self.all_others.push(item());
             }
         }
     }
 
-    fn uninstall(&mut self, conn_id: u64, sub_id: &SubId) {
-        let pred = |it: &MonitorItem| it.conn_id == conn_id && it.sub_id == *sub_id;
-        for v in self.all_ids.values_mut() {
-            v.retain(|(_, it)| !pred(it));
+    /// Remove exactly the lookup keys `install` added for this subscription,
+    /// like C++ `uninstallLookups`: O(filter size), not O(index size).
+    fn uninstall(&mut self, sub: &Subscription) {
+        let pred = |it: &MonitorItem| it.conn_id == sub.conn_id && it.sub_id == sub.sub_id;
+        for f in &sub.filter_group.filters {
+            if let Some(ids) = &f.ids {
+                for i in 0..ids.size() {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(ids.at(i));
+                    remove_where(&mut self.all_ids, &id, &pred);
+                }
+            } else if let Some(authors) = &f.authors {
+                for i in 0..authors.size() {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(authors.at(i));
+                    remove_where(&mut self.all_authors, &a, &pred);
+                }
+            } else if !f.tags.is_empty() {
+                for (name, set) in &f.tags {
+                    for i in 0..set.size() {
+                        let mut spec = vec![*name as u8];
+                        spec.extend_from_slice(set.at(i));
+                        remove_where(&mut self.all_tags, &spec, &pred);
+                    }
+                }
+            } else if let Some(kinds) = &f.kinds {
+                for i in 0..kinds.size() {
+                    remove_where(&mut self.all_kinds, &kinds.at(i), &pred);
+                }
+            } else {
+                self.all_others.retain(|it| !pred(it));
+            }
         }
-        self.all_ids.retain(|_, v| !v.is_empty());
-        for v in self.all_authors.values_mut() {
-            v.retain(|(_, it)| !pred(it));
-        }
-        self.all_authors.retain(|_, v| !v.is_empty());
-        for v in self.all_tags.values_mut() {
-            v.retain(|(_, it)| !pred(it));
-        }
-        self.all_tags.retain(|_, v| !v.is_empty());
-        for v in self.all_kinds.values_mut() {
-            v.retain(|(_, it)| !pred(it));
-        }
-        self.all_kinds.retain(|_, v| !v.is_empty());
-        self.all_others.retain(|(_, it)| !pred(it));
     }
 }
 
-fn item_clone(item: &MonitorItem) -> MonitorItem {
-    MonitorItem {
-        conn_id: item.conn_id,
-        sub_id: item.sub_id.clone(),
-        latest_event_id: item.latest_event_id,
+fn remove_where<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, Vec<MonitorItem>>,
+    key: &K,
+    pred: &dyn Fn(&MonitorItem) -> bool,
+) {
+    if let Some(v) = map.get_mut(key) {
+        v.retain(|it| !pred(it));
+        if v.is_empty() {
+            map.remove(key);
+        }
     }
 }

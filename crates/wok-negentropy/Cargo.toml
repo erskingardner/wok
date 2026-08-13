@@ -11,6 +11,7 @@ lmdb-sys.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 wok-db = { path = "../wok-db" }
 wok-event = { path = "../wok-event" }
 wok-query = { path = "../wok-query" }

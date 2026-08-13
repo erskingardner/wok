@@ -1207,7 +1207,7 @@ fn run_writer(
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
             write_events(&mut txn, &mut sink, &mut evs, false)?;
-            let mut cache = NegentropyFilterCache::new();
+            let mut cache = NegentropyFilterCache::new(cfg.read().relay.max_tags_per_filter);
             sink.apply(&mut cache, &mut txn)
                 .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
             txn.commit()?;
@@ -1913,7 +1913,7 @@ fn run_cron(env: Env, cfg: Arc<parking_lot::RwLock<Config>>, shutdown: Arc<Atomi
         if let Ok(mut txn) = env.begin_rw() {
             let mut sink = DeferredSink::default();
             let _ = wok_db::delete_events(&mut txn, &mut sink, expired);
-            let mut cache = NegentropyFilterCache::new();
+            let mut cache = NegentropyFilterCache::new(cfg.read().relay.max_tags_per_filter);
             let _ = sink.apply(&mut cache, &mut txn);
             let _ = txn.commit();
         }

@@ -14,19 +14,22 @@ struct FilterInfo {
 pub struct NegentropyFilterCache {
     filters: Vec<FilterInfo>,
     modification_counter: u64,
+    max_tags_per_filter: usize,
 }
 
 impl Default for NegentropyFilterCache {
     fn default() -> Self {
-        Self::new()
+        // C++ uses cfg().relay__maxTagsPerFilter (default 3).
+        Self::new(3)
     }
 }
 
 impl NegentropyFilterCache {
-    pub fn new() -> Self {
+    pub fn new(max_tags_per_filter: usize) -> Self {
         Self {
             filters: Vec::new(),
             modification_counter: 0,
+            max_tags_per_filter,
         }
     }
 
@@ -39,19 +42,31 @@ impl NegentropyFilterCache {
             return Ok(());
         }
         self.filters.clear();
+        let mut parse_err: Option<NegError> = None;
+        let max_tags = self.max_tags_per_filter;
         lookup::foreach_negentropy_filter(txn, |id, filter_str| {
-            if let Ok(f) = NostrFilter::parse(
-                &serde_json::from_str(filter_str).unwrap_or(serde_json::json!({})),
-                u64::MAX,
-                64,
-            ) {
-                self.filters.push(FilterInfo {
+            // C++ tao::json::from_string throws on a corrupt filter row;
+            // propagate instead of silently substituting a match-all {}.
+            match wok_event::json::parse_strict(filter_str)
+                .map_err(|e| NegError::msg(e.to_string()))
+                .and_then(|v| {
+                    NostrFilter::parse(&v, u64::MAX, max_tags)
+                        .map_err(|e| NegError::msg(e.to_string()))
+                }) {
+                Ok(f) => self.filters.push(FilterInfo {
                     filter: f,
                     tree_id: id,
-                });
+                }),
+                Err(e) => {
+                    parse_err = Some(e);
+                    return false;
+                }
             }
             true
         })?;
+        if let Some(e) = parse_err {
+            return Err(e);
+        }
         self.modification_counter = meta.negentropy_modification_counter;
         Ok(())
     }
@@ -65,27 +80,30 @@ impl NegentropyFilterCache {
             return Ok(());
         }
         self.filters.clear();
+        let mut parse_err: Option<NegError> = None;
+        let max_tags = self.max_tags_per_filter;
         lookup::foreach_negentropy_filter_rw(txn, |id, filter_str| {
-            if let Ok(f) = NostrFilter::parse(
-                &serde_json::from_str(filter_str).unwrap_or(serde_json::json!({})),
-                u64::MAX,
-                64,
-            ) {
-                self.filters.push(FilterInfo {
+            match wok_event::json::parse_strict(filter_str)
+                .map_err(|e| NegError::msg(e.to_string()))
+                .and_then(|v| {
+                    NostrFilter::parse(&v, u64::MAX, max_tags)
+                        .map_err(|e| NegError::msg(e.to_string()))
+                }) {
+                Ok(f) => self.filters.push(FilterInfo {
                     filter: f,
                     tree_id: id,
-                });
+                }),
+                Err(e) => {
+                    parse_err = Some(e);
+                    return false;
+                }
             }
             true
         })?;
+        if let Some(e) = parse_err {
+            return Err(e);
+        }
         self.modification_counter = meta.negentropy_modification_counter;
-        Ok(())
-    }
-}
-
-impl wok_db::NegentropySink for NegentropyFilterCache {
-    fn update(&mut self, packed: PackedEventView<'_>, insert: bool) -> Result<(), wok_db::DbError> {
-        let _ = (packed, insert);
         Ok(())
     }
 }
@@ -119,35 +137,6 @@ impl NegentropyFilterCache {
 
     pub fn freshen_ro(&mut self, txn: &RoTxn<'_>) -> Result<(), NegError> {
         self.freshen(txn)
-    }
-
-    pub fn matching_tree(&self, filter_str: &str) -> Option<u64> {
-        // C++ compares canonical JSON of the filter with since/until stripped.
-        self.filters.iter().find_map(|f| {
-            let compiled = serde_json::to_string(&serde_json::json!({})).ok()?;
-            let _ = compiled;
-            let _ = f;
-            let _ = filter_str;
-            None
-        })
-    }
-}
-
-/// Sink that updates trees during `write_events`.
-#[allow(dead_code)]
-pub struct UpdatingSink<'a, 'env> {
-    cache: &'a mut NegentropyFilterCache,
-    // Held only for the duration of a write_events call; trees are opened per update.
-    _marker: std::marker::PhantomData<&'env ()>,
-}
-
-impl<'a> UpdatingSink<'a, '_> {
-    #[allow(dead_code)]
-    pub fn new(cache: &'a mut NegentropyFilterCache) -> Self {
-        Self {
-            cache,
-            _marker: std::marker::PhantomData,
-        }
     }
 }
 

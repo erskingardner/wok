@@ -292,7 +292,11 @@ fn get_minimal_bound(prev: &Item, curr: &Item) -> Bound {
         while shared < ID_SIZE && curr.id[shared] == prev.id[shared] {
             shared += 1;
         }
-        Bound::with_id_prefix(curr.timestamp, &curr.id[..shared + 1]).unwrap()
+        // shared+1 can only exceed ID_SIZE for duplicate items, which sealed
+        // storage never contains; fall back to a timestamp-only bound (C++
+        // substr clamps) rather than panicking.
+        Bound::with_id_prefix(curr.timestamp, &curr.id[..(shared + 1).min(ID_SIZE)])
+            .unwrap_or_else(|_| Bound::timestamp(curr.timestamp))
     }
 }
 

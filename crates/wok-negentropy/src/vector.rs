@@ -65,14 +65,24 @@ impl Vector {
 
 impl Storage for Vector {
     fn size(&mut self) -> u64 {
+        // C++ Vector::size() throws (checkSealed) when unsealed. All relay
+        // paths seal before use; treat a violation as a loud bug, matching
+        // the C++ failure instead of silently answering with wrong data.
+        self.check_sealed().expect("negentropy Vector not sealed");
         self.items.len() as u64
     }
 
     fn get_item(&mut self, i: usize) -> Item {
+        self.check_sealed().expect("negentropy Vector not sealed");
+        self.check_bounds(i, i + 1)
+            .expect("negentropy Vector out of bounds");
         self.items[i]
     }
 
     fn iterate<F: FnMut(&Item, usize) -> bool>(&mut self, begin: usize, end: usize, mut cb: F) {
+        self.check_sealed().expect("negentropy Vector not sealed");
+        self.check_bounds(begin, end)
+            .expect("negentropy Vector out of bounds");
         for i in begin..end {
             if !cb(&self.items[i], i) {
                 break;
@@ -81,10 +91,16 @@ impl Storage for Vector {
     }
 
     fn find_lower_bound(&mut self, begin: usize, end: usize, bound: &Bound) -> usize {
+        self.check_sealed().expect("negentropy Vector not sealed");
+        self.check_bounds(begin, end)
+            .expect("negentropy Vector out of bounds");
         begin + self.items[begin..end].partition_point(|item| *item < bound.item)
     }
 
     fn fingerprint(&mut self, begin: usize, end: usize) -> Fingerprint {
+        self.check_sealed().expect("negentropy Vector not sealed");
+        self.check_bounds(begin, end)
+            .expect("negentropy Vector out of bounds");
         let mut out = Accumulator::default();
         for item in &self.items[begin..end] {
             out.add_item(item);

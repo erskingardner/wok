@@ -2429,6 +2429,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tracing",
  "wok-db",
  "wok-event",
  "wok-query",

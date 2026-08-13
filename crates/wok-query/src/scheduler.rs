@@ -7,6 +7,7 @@ pub struct QueryScheduler {
     pub ensure_exists: bool,
     conns: HashMap<u64, HashMap<SubId, usize>>,
     queries: Vec<Option<DbQuery>>,
+    free: Vec<usize>,
     running: VecDeque<usize>,
     max_subs_per_connection: usize,
 }
@@ -17,6 +18,7 @@ impl QueryScheduler {
             ensure_exists: true,
             conns: HashMap::new(),
             queries: Vec::new(),
+            free: Vec::new(),
             running: VecDeque::new(),
             max_subs_per_connection,
         }
@@ -34,9 +36,18 @@ impl QueryScheduler {
             return Ok(false);
         }
         let q = DbQuery::new(sub);
-        let idx = self.queries.len();
-        conn.insert(q.sub.sub_id.clone(), idx);
-        self.queries.push(Some(q));
+        // Reuse slots of finished/dead queries instead of growing forever.
+        let idx = match self.free.pop() {
+            Some(i) => {
+                self.queries[i] = Some(q);
+                i
+            }
+            None => {
+                self.queries.push(Some(q));
+                self.queries.len() - 1
+            }
+        };
+        conn.insert(self.queries[idx].as_ref().unwrap().sub.sub_id.clone(), idx);
         self.running.push_front(idx);
         Ok(true)
     }
@@ -86,6 +97,7 @@ impl QueryScheduler {
             .unwrap_or(true);
         if dead {
             self.queries[idx] = None;
+            self.free.push(idx);
             return Ok(());
         }
         let mut events: Vec<(Subscription, u64, Option<Vec<u8>>)> = Vec::new();
@@ -115,6 +127,7 @@ impl QueryScheduler {
         }
         if complete {
             let q = self.queries[idx].take().unwrap();
+            self.free.push(idx);
             self.remove_sub(q.sub.conn_id, &q.sub.sub_id);
             on_complete(&q.sub, q.sent_count());
         } else {

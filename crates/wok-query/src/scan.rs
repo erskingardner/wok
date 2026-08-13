@@ -405,8 +405,9 @@ impl DbQuery {
     where
         F: FnMut(&Subscription, u64),
     {
-        let start = std::time::Instant::now();
         while self.filter_group_index < self.sub.filter_group.filters.len() {
+            // C++ DBQuery resets the timeslice clock per filter.
+            let start = std::time::Instant::now();
             let f = self.sub.filter_group.filters[self.filter_group_index].clone();
             let mut scanner = match self.scanner.take() {
                 Some(s) => s,

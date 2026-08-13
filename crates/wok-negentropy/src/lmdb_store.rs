@@ -149,7 +149,11 @@ impl<'a, 'env> LmdbRwBackend<'a, 'env> {
 
 impl Drop for LmdbRwBackend<'_, '_> {
     fn drop(&mut self) {
-        let _ = self.flush();
+        // C++'s BTreeLMDB dtor flushes too; at least don't lose the error
+        // silently when callers forgot the explicit flush.
+        if let Err(e) = self.flush() {
+            tracing::error!("negentropy store drop-flush failed: {e}");
+        }
     }
 }
 

@@ -33,6 +33,12 @@ service_url = ""
 restricted_read_kinds = [4, 1059]
 restrict_read_to_involved_pubkey = true
 
+[relay.nip62]
+enabled = true
+# Falls back to relay.auth.service_url when empty; ALL_RELAYS always matches.
+service_url = ""
+deletion_batch_size = 1000
+
 [relay.info]
 name = "wok"
 description = "This is a wok instance."

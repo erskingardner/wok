@@ -4,8 +4,8 @@ use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use wok_db::{
-    check_integrity, delete_events, event_json_owned, write_events, Decompressor, Env, EnvOptions,
-    EventToWrite, NoopNegentropy,
+    check_integrity, delete_events, event_json_owned, write_events_with_policy, Decompressor, Env,
+    EnvOptions, EventToWrite, NoopNegentropy,
 };
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_negentropy::Storage;
@@ -495,6 +495,7 @@ fn cmd_import(
         }
         if batch.len() >= batch_size {
             commit_import(
+                cfg,
                 &env,
                 &mut batch,
                 &mut total_written,
@@ -506,6 +507,7 @@ fn cmd_import(
     }
     if !batch.is_empty() {
         commit_import(
+            cfg,
             &env,
             &mut batch,
             &mut total_written,
@@ -554,6 +556,7 @@ fn parse_fried(line: &str) -> Result<(Vec<u8>, String)> {
 }
 
 fn commit_import(
+    cfg: &Config,
     env: &Env,
     batch: &mut Vec<EventToWrite>,
     written: &mut u64,
@@ -563,7 +566,7 @@ fn commit_import(
 ) -> Result<()> {
     let mut txn = env.begin_rw()?;
     let mut sink = NoopNegentropy;
-    write_events(&mut txn, &mut sink, batch, false)?;
+    write_events_with_policy(&mut txn, &mut sink, batch, false, &cfg.vanish_policy())?;
     txn.commit()?;
     for ev in batch.drain(..) {
         match ev.status {
@@ -1127,13 +1130,13 @@ fn write_downloaded(
         return Ok(());
     }
     let limits = cfg.event_limits();
-    let policy = wok_event::TimestampPolicy::from_now(
-        cfg.events.reject_newer_than_secs,
-        cfg.events.reject_older_than_secs,
-        cfg.events.reject_ephemeral_older_than_secs,
-    );
     let mut evs = Vec::with_capacity(batch.len());
     for v in batch.drain(..) {
+        let policy = cfg.timestamp_policy_for_kind(
+            v.get("kind")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+        );
         match parse_and_verify_event(&v, &limits, Some(&policy), true, true) {
             Ok(p) => evs.push(EventToWrite::new(p.packed.into_bytes(), p.json)),
             Err(e) => tracing::warn!("downloaded event rejected: {e}"),
@@ -1144,7 +1147,7 @@ fn write_downloaded(
     }
     let mut txn = env.begin_rw()?;
     let mut sink = wok_negentropy::DeferredSink::default();
-    write_events(&mut txn, &mut sink, &mut evs, false)?;
+    write_events_with_policy(&mut txn, &mut sink, &mut evs, false, &cfg.vanish_policy())?;
     let mut cache = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
     sink.apply(&mut cache, &mut txn)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;

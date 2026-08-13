@@ -20,6 +20,15 @@ reads, but Wok then stops advertising NIP-59. NIP-59 is advertised only when
 AUTH is usable, kind 1059 is restricted to its author or first `p`-tag recipient,
 and ephemeral kind 21059 is live-only.
 
+`relay.nip62.enabled` defaults to true. A valid NIP-62 kind 62 request must
+target `ALL_RELAYS` or the public URL in `relay.nip62.service_url`; when that
+setting is empty it falls back to `relay.auth.service_url`. Matching data is
+hidden immediately and deleted in restart-safe batches of
+`relay.nip62.deletion_batch_size` records. Existing vanish markers remain
+enforced if the feature is later disabled, and vanish requests bypass ordinary
+AUTH, write-policy, rate, proof-of-work, and storage-quota gates so operators
+cannot accidentally prevent the required deletion path.
+
 `events.ephemeral_persistence` defaults to `"live_only"`: accepted kinds
 20000-29999 pass normal validation, AUTH, and write-policy checks and are sent
 to matching active subscriptions, but never enter LMDB, historical queries, or

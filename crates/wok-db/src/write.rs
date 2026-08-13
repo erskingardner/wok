@@ -7,6 +7,7 @@ use crate::keys::{
 use crate::payload::{encode_raw_payload, Decompressor};
 use crate::search::{index_event_search, note_search_indexed_through, remove_event_search};
 use crate::txn::RwTxn;
+use crate::vanish::{is_event_vanished_rw, mark_vanished, VanishPolicy, VANISH_KIND};
 use crate::DbError;
 use lmdb_sys::{MDB_dbi, MDB_APPEND, MDB_NOOVERWRITE};
 use wok_event::{
@@ -371,6 +372,16 @@ pub fn write_events<N: NegentropySink>(
     evs: &mut [EventToWrite],
     _log_deletions: bool,
 ) -> Result<(), DbError> {
+    write_events_with_policy(txn, ne, evs, _log_deletions, &VanishPolicy::disabled())
+}
+
+pub fn write_events_with_policy<N: NegentropySink>(
+    txn: &mut RwTxn<'_>,
+    ne: &mut N,
+    evs: &mut [EventToWrite],
+    _log_deletions: bool,
+    vanish_policy: &VanishPolicy,
+) -> Result<(), DbError> {
     evs.sort_by(|a, b| {
         let pa = PackedEventView::new(&a.packed).ok();
         let pb = PackedEventView::new(&b.packed).ok();
@@ -396,7 +407,23 @@ pub fn write_events<N: NegentropySink>(
             continue;
         }
 
-        if deletion_exists(txn, packed.id(), packed.pubkey())? {
+        let is_vanish_request = packed.kind() == VANISH_KIND;
+        if is_vanish_request
+            && vanish_policy.enabled
+            && !vanish_policy.targets_this_relay_json(&evs[i].json)
+        {
+            evs[i].status = EventWriteStatus::Deleted;
+            continue;
+        }
+
+        if !is_vanish_request && is_event_vanished_rw(txn, packed)? {
+            evs[i].status = EventWriteStatus::Deleted;
+            continue;
+        }
+
+        // NIP-62 requests cannot be removed or preemptively tombstoned by a
+        // kind 5 event. Validity and duplicate checks still apply.
+        if !is_vanish_request && deletion_exists(txn, packed.id(), packed.pubkey())? {
             evs[i].status = EventWriteStatus::Deleted;
             continue;
         }
@@ -521,7 +548,8 @@ pub fn write_events<N: NegentropySink>(
                     match lookup_event_by_id(txn, tag_val) {
                         Ok(Some((lev, buf))) => match PackedEventView::new(&buf) {
                             Ok(other) => {
-                                let mut can_delete = other.pubkey() == packed.pubkey();
+                                let mut can_delete = other.kind() != VANISH_KIND
+                                    && other.pubkey() == packed.pubkey();
                                 if !can_delete && GIFT_WRAP_KINDS.contains(&other.kind()) {
                                     other.foreach_tag(|on, ov| {
                                         if on == 'p' && ov == packed.pubkey() {
@@ -596,6 +624,9 @@ pub fn write_events<N: NegentropySink>(
         }
 
         if evs[i].status == EventWriteStatus::Pending {
+            if is_vanish_request && vanish_policy.enabled {
+                mark_vanished(txn, packed.pubkey(), packed.created_at())?;
+            }
             let json = evs[i].json.clone();
             let lev_id = insert_event(txn, &packed_bytes, &json)?;
             evs[i].lev_id = lev_id;

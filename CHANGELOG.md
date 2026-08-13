@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coverage, and correctness-checked scale benchmarks.
 - A reloadable, request-wide EVENT result ceiling across multi-filter REQs,
   independent of COUNT and negentropy limits.
+- NIP-62 Request to Vanish with strict relay targeting, persistent
+  maximum-timestamp markers, immediate query and rebroadcast suppression,
+  recipient gift-wrap cleanup, undeletable request records, and bounded
+  restart-safe physical deletion.
 
 ### Fixed
 

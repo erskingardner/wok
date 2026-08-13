@@ -1,11 +1,12 @@
 //! End-to-end WebSocket and Unix interoperability.
 
 use futures_util::{SinkExt, Stream, StreamExt};
+use secp256k1::{Keypair, SECP256K1};
 use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message;
-use wok_compat::sign_event;
+use wok_compat::{sign_event, sign_event_with_key};
 use wok_db::{Env, EnvOptions};
 use wok_relay::Config;
 
@@ -111,6 +112,128 @@ async fn ws_publish_and_subscribe() {
         msgs.iter().any(|t| t.contains("COUNT")),
         "expected COUNT, got {msgs:?}"
     );
+
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip62_vanish_is_immediate_and_blocks_rebroadcast() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let cfg = test_cfg(dir.path());
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let relay = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(relay, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .unwrap();
+    let author = {
+        let mut rng = rand::thread_rng();
+        Keypair::new(SECP256K1, &mut rng)
+    };
+    let now = now_secs();
+    let old = sign_event_with_key(
+        json!({
+            "created_at": now - 60, "kind": 1, "tags": [], "content": "must-vanish"
+        }),
+        &author,
+    );
+    ws.send(Message::Text(json!(["EVENT", old]).to_string().into()))
+        .await
+        .unwrap();
+    let accepted = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+    assert!(accepted.iter().any(|text| text.contains("true")));
+
+    let invalid = sign_event_with_key(
+        json!({
+            "created_at": now - 20, "kind": 62, "tags": [], "content": ""
+        }),
+        &author,
+    );
+    ws.send(Message::Text(json!(["EVENT", invalid]).to_string().into()))
+        .await
+        .unwrap();
+    let rejected = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+    assert!(rejected
+        .iter()
+        .any(|text| text.contains("false") && text.contains("not targeting")));
+
+    let vanish = sign_event_with_key(
+        json!({
+            "created_at": now - 10,
+            "kind": 62,
+            "tags": [["relay", "ALL_RELAYS"], ["-"]],
+            "content": ""
+        }),
+        &author,
+    );
+    ws.send(Message::Text(json!(["EVENT", vanish]).to_string().into()))
+        .await
+        .unwrap();
+    let accepted = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+    assert!(accepted.iter().any(|text| text.contains("true")));
+
+    ws.send(Message::Text(
+        json!(["REQ", "after-vanish", {"kinds":[1]}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let history = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+    assert!(history.iter().any(|text| text.contains("EOSE")));
+    assert!(history.iter().all(|text| !text.contains("must-vanish")));
+
+    ws.send(Message::Text(
+        json!(["COUNT", "after-vanish-count", {"kinds":[1]}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let count = recv_until(&mut ws, |text| text.contains("\"COUNT\"")).await;
+    assert!(
+        count.iter().any(|text| text.contains("\"count\":0")),
+        "{count:?}"
+    );
+
+    let rebroadcast = sign_event_with_key(
+        json!({
+            "created_at": now - 30,
+            "kind": 1,
+            "tags": [["x", "new-id"]],
+            "content": "must-stay-gone"
+        }),
+        &author,
+    );
+    ws.send(Message::Text(
+        json!(["EVENT", rebroadcast]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let rejected = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+    assert!(rejected
+        .iter()
+        .any(|text| text.contains("false") && text.contains("requested vanish")));
+
+    ws.send(Message::Text(
+        json!(["REQ", "request-record", {"kinds":[62]}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let request = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+    assert!(request
+        .iter()
+        .any(|text| text.contains("ALL_RELAYS") && text.contains("\"EVENT\"")));
 
     handle.request_shutdown();
 }
@@ -594,7 +717,7 @@ async fn nip11_http_document() {
         .any(|n| n == 1));
     assert_eq!(
         client["supported_nips"],
-        json!([1, 9, 11, 13, 40, 45, 50, 70, 77])
+        json!([1, 9, 11, 13, 40, 45, 50, 62, 70, 77])
     );
     assert_eq!(client["limitation"]["max_event_tags"], 2000);
     assert_eq!(client["limitation"]["created_at_lower_limit"], u64::MAX / 4);

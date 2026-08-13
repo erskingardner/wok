@@ -21,6 +21,7 @@ pub enum CapabilityCondition {
     CountEnabled,
     NegentropyEnabled,
     Nip59Safe,
+    Nip62Enabled,
     PowRequired,
 }
 
@@ -40,6 +41,7 @@ impl CapabilityCondition {
                     && cfg.relay.auth.restricted_read_kinds.contains(&1059)
                     && cfg.relay.auth.restrict_read_to_involved_pubkey
             }
+            Self::Nip62Enabled => cfg.relay.nip62.enabled,
             Self::PowRequired => cfg.relay.abuse.enabled && cfg.relay.abuse.min_pow_difficulty > 0,
         }
     }
@@ -93,6 +95,11 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
         enabled_when: CapabilityCondition::Nip59Safe,
     },
     RelayCapability {
+        nip: 62,
+        name: "Request to Vanish",
+        enabled_when: CapabilityCondition::Nip62Enabled,
+    },
+    RelayCapability {
         nip: 70,
         name: "Protected events",
         enabled_when: CapabilityCondition::Always,
@@ -133,16 +140,16 @@ mod tests {
     #[test]
     fn conditional_capabilities_follow_runtime_configuration() {
         let mut cfg = Config::default();
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 45, 50, 70, 77]);
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 45, 50, 62, 70, 77]);
 
         cfg.relay.auth.service_url = "wss://relay.example.com/".into();
         cfg.relay.max_filter_limit_count = 0;
         cfg.relay.negentropy_enabled = false;
         cfg.events.ephemeral_persistence = EphemeralPersistence::Ttl;
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 50, 70]);
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 50, 62, 70]);
 
         cfg.relay.abuse.min_pow_difficulty = 20;
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 13, 40, 42, 50, 70]);
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 13, 40, 42, 50, 62, 70]);
     }
 
     #[test]

@@ -23,12 +23,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use wok_db::{
-    lookup_event_by_id_ro, most_recent_levid_ro, write_events, Decompressor, Env, EventToWrite,
-    EventWriteStatus,
+    backfill_vanish_markers, is_event_vanished_ro, lookup_event_by_id_ro, most_recent_levid_ro,
+    sweep_vanished_events, write_events_with_policy, Decompressor, Env, EventToWrite,
+    EventWriteStatus, VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
-    AUTH_KIND, PROTECTED_TAG, REPOST_KINDS,
+    AUTH_KIND, GIFT_WRAP_KINDS, PROTECTED_TAG, REPOST_KINDS,
 };
 use wok_negentropy::{DeferredSink, Negentropy, NegentropyFilterCache, Vector};
 use wok_query::{
@@ -373,6 +374,12 @@ impl RelayHandle {
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     env.ensure_initialized().map_err(|e| e.to_string())?;
+    let backfilled =
+        backfill_vanish_markers(&env, &config.vanish_policy(), config.events.max_event_size)
+            .map_err(|e| format!("NIP-62 marker backfill failed: {e}"))?;
+    if backfilled > 0 {
+        tracing::info!(backfilled, "materialized existing NIP-62 vanish markers");
+    }
     let n_ingester = config.relay.ingester_threads.max(1);
     let n_req_worker = config.relay.req_worker_threads.max(1);
     let n_req_monitor = config.relay.req_monitor_threads.max(1);
@@ -894,11 +901,8 @@ fn ingest_event(
     orig: Value,
     writer_tx: &Sender<WriterMsg>,
 ) {
-    let policy = TimestampPolicy::from_now(
-        cfg.events.reject_newer_than_secs,
-        cfg.events.reject_older_than_secs,
-        cfg.events.reject_ephemeral_older_than_secs,
-    );
+    let requested_kind = orig.get("kind").and_then(Value::as_u64).unwrap_or(u64::MAX);
+    let policy = cfg.timestamp_policy_for_kind(requested_kind);
     let parsed = match parse_and_verify_event(&orig, &cfg.event_limits(), Some(&policy), true, true)
     {
         Ok(p) => p,
@@ -922,8 +926,25 @@ fn ingest_event(
     };
     let packed = parsed.packed.view();
     let id_hex = to_hex(packed.id());
+    let is_vanish_request = packed.kind() == VANISH_KIND;
+    if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
+        conns.send(
+            conn_id,
+            RelayMessage::Ok {
+                event_id: id_hex,
+                accepted: false,
+                message: if cfg.relay.nip62.enabled {
+                    "blocked: vanish request not targeting this relay".into()
+                } else {
+                    "blocked: NIP-62 is disabled".into()
+                },
+            },
+            metrics,
+        );
+        return;
+    }
 
-    if cfg.relay.abuse.enabled {
+    if cfg.relay.abuse.enabled && !is_vanish_request {
         if leading_zero_bits(packed.id()) < cfg.relay.abuse.min_pow_difficulty as u16 {
             metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
             conns.send(
@@ -988,7 +1009,7 @@ fn ingest_event(
     });
 
     let mut authed = None;
-    if found_protected {
+    if found_protected && !is_vanish_request {
         if !cfg.relay.auth.enabled || cfg.relay.auth.service_url.is_empty() {
             conns.send(
                 conn_id,
@@ -1451,6 +1472,35 @@ fn run_writer(
             }
         }
         let cfg_snap = cfg.read().clone();
+        let vanish_policy = cfg_snap.vanish_policy();
+        // A valid vanish request and an ephemeral gift wrap can arrive in the
+        // same drained writer batch. Compute the batch markers up front so a
+        // live-only event cannot be broadcast immediately before its request
+        // is persisted later in that batch.
+        let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
+        for m in &batch {
+            let WriterMsg::AddEvent {
+                conn_id,
+                packed,
+                json,
+                ..
+            } = m
+            else {
+                continue;
+            };
+            if closed.contains(conn_id) || !vanish_policy.targets_this_relay_json(json) {
+                continue;
+            }
+            let Ok(event) = PackedEventView::new(packed) else {
+                continue;
+            };
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(event.pubkey());
+            batch_vanish
+                .entry(pubkey)
+                .and_modify(|timestamp| *timestamp = (*timestamp).max(event.created_at()))
+                .or_insert(event.created_at());
+        }
         let mut events: Vec<(u64, EventToWrite)> = Vec::new();
         let mut quota_counts: HashMap<[u8; 32], u64> = HashMap::new();
         for m in batch {
@@ -1477,15 +1527,73 @@ fn run_writer(
                 let source_info = render_ip(&ip);
                 let ev_json: Value = serde_json::from_str(&json).unwrap_or(json!({}));
                 let mut ok_msg = String::new();
-                let res = plugin.accept_event(
-                    &cfg_snap.relay.write_policy_plugin,
-                    &ev_json,
-                    source_type,
-                    &source_info,
-                    authed.as_ref().map(|a| a.as_slice()),
-                    &mut ok_msg,
-                );
+                let is_vanish_request =
+                    PackedEventView::new(&packed).is_ok_and(|event| event.kind() == VANISH_KIND);
+                let res = if is_vanish_request {
+                    PluginResult::Accept
+                } else {
+                    plugin.accept_event(
+                        &cfg_snap.relay.write_policy_plugin,
+                        &ev_json,
+                        source_type,
+                        &source_info,
+                        authed.as_ref().map(|a| a.as_slice()),
+                        &mut ok_msg,
+                    )
+                };
                 if res == PluginResult::Accept {
+                    if !is_vanish_request {
+                        let packed_view = match PackedEventView::new(&packed) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                conns.send(
+                                    conn_id,
+                                    RelayMessage::Ok {
+                                        event_id: "?".into(),
+                                        accepted: false,
+                                        message: format!("invalid: {error}"),
+                                    },
+                                    &metrics,
+                                );
+                                continue;
+                            }
+                        };
+                        let stored_suppression = env
+                            .begin_ro()
+                            .and_then(|txn| is_event_vanished_ro(&txn, packed_view));
+                        let suppressed = match stored_suppression {
+                            Ok(value) => {
+                                value || event_matches_vanish_markers(packed_view, &batch_vanish)
+                            }
+                            Err(error) => {
+                                conns.send(
+                                    conn_id,
+                                    RelayMessage::Ok {
+                                        event_id: to_hex(packed_view.id()),
+                                        accepted: false,
+                                        message: format!("Write error: {error}"),
+                                    },
+                                    &metrics,
+                                );
+                                continue;
+                            }
+                        };
+                        if suppressed {
+                            let id_hex = PackedEventView::new(&packed)
+                                .map(|event| to_hex(event.id()))
+                                .unwrap_or_else(|_| "?".into());
+                            conns.send(
+                                conn_id,
+                                RelayMessage::Ok {
+                                    event_id: id_hex,
+                                    accepted: false,
+                                    message: "blocked: author or recipient requested vanish".into(),
+                                },
+                                &metrics,
+                            );
+                            continue;
+                        }
+                    }
                     let is_live_only = cfg_snap.events.ephemeral_persistence
                         == EphemeralPersistence::LiveOnly
                         && PackedEventView::new(&packed)
@@ -1509,7 +1617,8 @@ fn run_writer(
                             &metrics,
                         );
                     } else {
-                        if cfg_snap.relay.abuse.enabled
+                        if !is_vanish_request
+                            && cfg_snap.relay.abuse.enabled
                             && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0
                         {
                             let packed_view = match PackedEventView::new(&packed) {
@@ -1601,7 +1710,7 @@ fn run_writer(
         }
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
-            write_events(&mut txn, &mut sink, &mut evs, false)?;
+            write_events_with_policy(&mut txn, &mut sink, &mut evs, false, &vanish_policy)?;
             let mut cache = NegentropyFilterCache::new(cfg.read().relay.max_tags_per_filter);
             sink.apply(&mut cache, &mut txn)
                 .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
@@ -1666,6 +1775,40 @@ fn run_writer(
         }
         broadcast_db_change(&mon_txs);
     }
+}
+
+fn event_matches_vanish_markers(
+    packed: PackedEventView<'_>,
+    markers: &HashMap<[u8; 32], u64>,
+) -> bool {
+    if packed.kind() != VANISH_KIND {
+        let mut author = [0u8; 32];
+        author.copy_from_slice(packed.pubkey());
+        if markers
+            .get(&author)
+            .is_some_and(|timestamp| packed.created_at() <= *timestamp)
+        {
+            return true;
+        }
+    }
+    if GIFT_WRAP_KINDS.contains(&packed.kind()) {
+        let mut matched = false;
+        packed.foreach_tag(|name, value| {
+            if name == 'p' && value.len() == 32 {
+                let mut recipient = [0u8; 32];
+                recipient.copy_from_slice(value);
+                if markers.contains_key(&recipient) {
+                    matched = true;
+                    return false;
+                }
+            }
+            true
+        });
+        if matched {
+            return true;
+        }
+    }
+    false
 }
 
 fn stored_event_count(env: &Env, pubkey: &[u8; 32]) -> Result<u64, wok_db::DbError> {
@@ -1888,7 +2031,8 @@ fn run_req_monitor(
                     let requires_content = sub.filter_group.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if !r.should_send_to_subscriber(packed, pk)
+                            if is_event_vanished_ro(&txn, packed).unwrap_or(true)
+                                || !r.should_send_to_subscriber(packed, pk)
                                 || (!requires_content && !sub.filter_group.does_match(packed))
                             {
                                 return true;
@@ -1945,6 +2089,9 @@ fn run_req_monitor(
                     let requires_content = monitors.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
+                            if is_event_vanished_ro(&txn, packed).unwrap_or(true) {
+                                return true;
+                            }
                             let packed_recipients = if requires_content {
                                 None
                             } else {
@@ -2354,8 +2501,9 @@ fn reconcile_stateless(
 }
 
 fn run_cron(env: Env, cfg: Arc<parking_lot::RwLock<Config>>, shutdown: Arc<AtomicBool>) {
+    let mut vanish_cursor = Vec::new();
     while !shutdown.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(9));
+        thread::sleep(Duration::from_secs(2));
         let cfg_snap = cfg.read().clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2397,15 +2545,26 @@ fn run_cron(env: Env, cfg: Arc<parking_lot::RwLock<Config>>, shutdown: Arc<Atomi
                 },
             );
         }
-        if expired.is_empty() {
-            continue;
-        }
         if let Ok(mut txn) = env.begin_rw() {
             let mut sink = DeferredSink::default();
-            let _ = wok_db::delete_events(&mut txn, &mut sink, expired);
+            let expired_deleted = wok_db::delete_events(&mut txn, &mut sink, expired).unwrap_or(0);
+            let vanished_deleted = sweep_vanished_events(
+                &mut txn,
+                &mut sink,
+                cfg_snap.relay.nip62.deletion_batch_size,
+                &mut vanish_cursor,
+            )
+            .unwrap_or(0);
             let mut cache = NegentropyFilterCache::new(cfg.read().relay.max_tags_per_filter);
             let _ = sink.apply(&mut cache, &mut txn);
             let _ = txn.commit();
+            if expired_deleted > 0 || vanished_deleted > 0 {
+                tracing::info!(
+                    expired_deleted,
+                    vanished_deleted,
+                    "relay maintenance deleted events"
+                );
+            }
         }
     }
 }
@@ -2415,6 +2574,7 @@ mod tests {
     use super::*;
     use secp256k1::{Keypair, SECP256K1};
     use wok_db::EnvOptions;
+    use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
 
     fn sign_event(ev: Value) -> Value {
         let mut rng = rand::thread_rng();
@@ -2445,6 +2605,27 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    #[test]
+    fn batch_vanish_markers_block_old_authored_events_and_all_gift_wraps() {
+        let author = [1u8; 32];
+        let mut markers = HashMap::new();
+        markers.insert(author, 200);
+        let tags = PackedEventTagBuilder::default();
+        let old = PackedEventBuilder::build(&[2; 32], &author, 100, 1, 0, &tags).unwrap();
+        let newer = PackedEventBuilder::build(&[3; 32], &author, 201, 1, 0, &tags).unwrap();
+        let request =
+            PackedEventBuilder::build(&[4; 32], &author, 200, VANISH_KIND, 0, &tags).unwrap();
+        assert!(event_matches_vanish_markers(old.view(), &markers));
+        assert!(!event_matches_vanish_markers(newer.view(), &markers));
+        assert!(!event_matches_vanish_markers(request.view(), &markers));
+
+        let mut gift_tags = PackedEventTagBuilder::default();
+        gift_tags.add('p', &author).unwrap();
+        let gift =
+            PackedEventBuilder::build(&[5; 32], &[6; 32], 999, 21059, 0, &gift_tags).unwrap();
+        assert!(event_matches_vanish_markers(gift.view(), &markers));
     }
 
     #[tokio::test]

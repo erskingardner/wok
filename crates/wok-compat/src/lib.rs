@@ -18,14 +18,18 @@ pub fn strfry_available() -> bool {
     strfry_bin().is_file()
 }
 
-pub fn sign_event(mut ev: Value) -> Value {
+pub fn sign_event(ev: Value) -> Value {
     let mut rng = rand::thread_rng();
     let kp = Keypair::new(SECP256K1, &mut rng);
+    sign_event_with_key(ev, &kp)
+}
+
+pub fn sign_event_with_key(mut ev: Value, kp: &Keypair) -> Value {
     let (xonly, _) = kp.x_only_public_key();
     ev["pubkey"] = json!(hex::encode(xonly.serialize()));
     let id = wok_event::event_id_hash(&ev).unwrap();
     ev["id"] = json!(hex::encode(id));
-    let sig = SECP256K1.sign_schnorr(&id, &kp);
+    let sig = SECP256K1.sign_schnorr(&id, kp);
     ev["sig"] = json!(hex::encode(sig.as_ref()));
     ev
 }

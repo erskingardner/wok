@@ -14,7 +14,9 @@ use crate::comparators::{
 };
 use crate::error::check;
 use crate::fbs::{decode_meta, encode_meta, encode_negentropy_filter, Meta};
-use crate::schema::{dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_META};
+use crate::schema::{
+    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_META, DBI_VANISH_PUBKEY,
+};
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
 use lmdb_sys::*;
@@ -69,6 +71,8 @@ pub struct Dbis {
     pub negentropy: MDB_dbi,
     /// Absent only while inspecting an unmodified strfry v3 source.
     pub event_search: Option<MDB_dbi>,
+    /// Absent only while inspecting an unmodified strfry v3 source.
+    pub vanish_pubkey: Option<MDB_dbi>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -187,7 +191,8 @@ impl Env {
         for spec in dbi_specs() {
             let cname = CString::new(spec.name).unwrap();
             let mut dbi: MDB_dbi = 0;
-            let foreign_source = spec.name == DBI_EVENT_SEARCH && !opened.is_empty() && {
+            let wok_only = matches!(spec.name, DBI_EVENT_SEARCH | DBI_VANISH_PUBKEY);
+            let foreign_source = wok_only && !opened.is_empty() && {
                 let version = match meta_version_in_open_txn(txn, opened[0]) {
                     Ok(version) => version,
                     Err(error) => {
@@ -204,10 +209,7 @@ impl Env {
                 spec.flags & !MDB_CREATE
             };
             let rc = unsafe { mdb_dbi_open(txn, cname.as_ptr(), dbi_flags, &mut dbi) };
-            if rc == MDB_NOTFOUND
-                && spec.name == DBI_EVENT_SEARCH
-                && (!opts.create_dbis || foreign_source)
-            {
+            if rc == MDB_NOTFOUND && wok_only && (!opts.create_dbis || foreign_source) {
                 opened.push(0);
                 continue;
             }
@@ -262,6 +264,7 @@ impl Env {
             event_payload: opened[14],
             negentropy: opened[15],
             event_search: (opened[16] != 0).then_some(opened[16]),
+            vanish_pubkey: (opened[17] != 0).then_some(opened[17]),
         };
 
         if let Err(e) = unsafe { check(mdb_txn_commit(txn)) } {

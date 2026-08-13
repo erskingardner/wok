@@ -73,6 +73,7 @@ const STRFRY_TRANSLATED_KEYS: &[&str] = &[
     "relay.maxWebsocketPayloadSize",
     "relay.negentropy.enabled",
     "relay.negentropy.maxSyncEvents",
+    "relay.nip62.enabled",
     "relay.nofiles",
     "relay.numThreads.ingester",
     "relay.numThreads.negentropy",
@@ -166,6 +167,7 @@ pub struct RelayConfig {
     pub negentropy_threads: usize,
     pub negentropy_enabled: bool,
     pub max_sync_events: u64,
+    pub nip62: Nip62Config,
     pub filter_validation: FilterValidationConfig,
     pub abuse: AbuseConfig,
     pub unix: UnixConfig,
@@ -189,6 +191,14 @@ pub struct AbuseConfig {
     pub max_query_cost: u64,
     pub max_stored_events_per_pubkey: u64,
     pub min_pow_difficulty: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Nip62Config {
+    pub enabled: bool,
+    pub service_url: String,
+    pub deletion_batch_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +316,11 @@ impl Default for Config {
                 negentropy_threads: 2,
                 negentropy_enabled: true,
                 max_sync_events: 1_000_000,
+                nip62: Nip62Config {
+                    enabled: true,
+                    service_url: String::new(),
+                    deletion_batch_size: 1_000,
+                },
                 filter_validation: FilterValidationConfig {
                     enabled: false,
                     max_filters_per_req: 3,
@@ -393,6 +408,29 @@ fn merge_toml(base: &mut toml::Value, supplied: toml::Value) {
 }
 
 impl Config {
+    pub fn timestamp_policy_for_kind(&self, kind: u64) -> wok_event::TimestampPolicy {
+        wok_event::TimestampPolicy::from_now(
+            self.events.reject_newer_than_secs,
+            if kind == wok_db::VANISH_KIND {
+                u64::MAX
+            } else {
+                self.events.reject_older_than_secs
+            },
+            self.events.reject_ephemeral_older_than_secs,
+        )
+    }
+
+    pub fn vanish_policy(&self) -> wok_db::VanishPolicy {
+        wok_db::VanishPolicy {
+            enabled: self.relay.nip62.enabled,
+            service_url: if self.relay.nip62.service_url.is_empty() {
+                self.relay.auth.service_url.clone()
+            } else {
+                self.relay.nip62.service_url.clone()
+            },
+        }
+    }
+
     /// Explain when restricted reads are deliberately failing closed because
     /// the relay cannot complete NIP-42 authentication.
     pub fn auth_configuration_warning(&self) -> Option<String> {
@@ -575,6 +613,9 @@ impl Config {
         assign_u64(&map, "relay.maxTotalEventsPerReq", |n| {
             cfg.relay.max_total_events_per_req = n;
             Ok(())
+        })?;
+        assign_bool(&map, "relay.nip62.enabled", |enabled| {
+            cfg.relay.nip62.enabled = enabled
         })?;
         assign_u64(&map, "relay.maxSubsPerConnection", |n| {
             cfg.relay.max_subs_per_connection = n as usize;

@@ -6,6 +6,22 @@ use wok_db::{lookup, RoTxn, RwTxn};
 use wok_event::PackedEventView;
 use wok_query::NostrFilter;
 
+fn parse_negentropy_filter(
+    filter_str: &str,
+    max_tags_per_filter: usize,
+) -> Result<NostrFilter, NegError> {
+    let value = wok_event::json::parse_strict(filter_str)
+        .map_err(|error| NegError::msg(error.to_string()))?;
+    let filter = NostrFilter::parse(&value, u64::MAX, max_tags_per_filter)
+        .map_err(|error| NegError::msg(error.to_string()))?;
+    if filter.search.is_some() {
+        return Err(NegError::msg(
+            "negentropy filters do not support content search",
+        ));
+    }
+    Ok(filter)
+}
+
 struct FilterInfo {
     filter: NostrFilter,
     tree_id: u64,
@@ -47,12 +63,7 @@ impl NegentropyFilterCache {
         lookup::foreach_negentropy_filter(txn, |id, filter_str| {
             // C++ tao::json::from_string throws on a corrupt filter row;
             // propagate instead of silently substituting a match-all {}.
-            match wok_event::json::parse_strict(filter_str)
-                .map_err(|e| NegError::msg(e.to_string()))
-                .and_then(|v| {
-                    NostrFilter::parse(&v, u64::MAX, max_tags)
-                        .map_err(|e| NegError::msg(e.to_string()))
-                }) {
+            match parse_negentropy_filter(filter_str, max_tags) {
                 Ok(f) => self.filters.push(FilterInfo {
                     filter: f,
                     tree_id: id,
@@ -83,12 +94,7 @@ impl NegentropyFilterCache {
         let mut parse_err: Option<NegError> = None;
         let max_tags = self.max_tags_per_filter;
         lookup::foreach_negentropy_filter_rw(txn, |id, filter_str| {
-            match wok_event::json::parse_strict(filter_str)
-                .map_err(|e| NegError::msg(e.to_string()))
-                .and_then(|v| {
-                    NostrFilter::parse(&v, u64::MAX, max_tags)
-                        .map_err(|e| NegError::msg(e.to_string()))
-                }) {
+            match parse_negentropy_filter(filter_str, max_tags) {
                 Ok(f) => self.filters.push(FilterInfo {
                     filter: f,
                     tree_id: id,
@@ -166,5 +172,18 @@ impl DeferredSink {
             cache.apply(txn, packed, insert)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_search_filters_without_event_content() {
+        let error = parse_negentropy_filter(r#"{"search":"nostr"}"#, 3).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("negentropy filters do not support content search"));
     }
 }

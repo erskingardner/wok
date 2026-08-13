@@ -16,6 +16,7 @@ arbitrary list.
 | 40 | Expiration | packed expiration + cron | `nip_conformance.rs` | always |
 | 42 | AUTH | ingest AUTH | unit + e2e when serviceUrl set | AUTH enabled and serviceUrl set |
 | 45 | COUNT | REQ worker | `nip_conformance.rs` | `maxFilterLimitCount > 0` |
+| 50 | Search capability | transactional LMDB term/bigram index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs` | always |
 | 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | `events.ephemeral_persistence = "live_only"` |
 | 70 | Protected events | `-` tag + AUTH | `nip_conformance.rs` | always |
 | 77 | Negentropy | `wok-negentropy` | protocol unit tests | `negentropy.enabled` |
@@ -26,3 +27,8 @@ capabilities.
 
 ID and author filter values must be exactly 64 lowercase hexadecimal
 characters, as required by current NIP-01. Prefix filters are rejected.
+
+NIP-50 matches normalized search terms against event `content`, intersects
+them with every other supplied filter field, ranks before applying `limit`,
+and supports matching live events after EOSE. See
+[NIP-50 search](nip50-search.md) for exact query and scoring semantics.

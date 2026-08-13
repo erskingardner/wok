@@ -32,6 +32,9 @@ struct Args {
     /// Scenarios: smoke (quick) or full
     #[arg(long, default_value = "smoke")]
     profile: String,
+    /// Run one scenario instead of the selected profile (for example nip50_search)
+    #[arg(long)]
+    scenario: Option<String>,
     /// Output directory for JSONL + markdown
     #[arg(long, default_value = "bench-results")]
     out: PathBuf,
@@ -75,7 +78,7 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     std::fs::create_dir_all(&args.out)?;
-    let scenarios: Vec<&str> = if args.profile == "full" {
+    let profile_scenarios: Vec<&str> = if args.profile == "full" {
         vec![
             "import",
             "export",
@@ -83,12 +86,27 @@ fn main() -> Result<()> {
             "ws_publish_1conn",
             "ws_publish_8conn",
             "ws_query_latency",
+            "nip50_search",
             "live_fanout",
             "duplicate_import",
             "cold_start",
         ]
     } else {
-        vec!["import", "export", "ws_publish_1conn", "ws_query_latency"]
+        vec![
+            "import",
+            "export",
+            "ws_publish_1conn",
+            "ws_query_latency",
+            "nip50_search",
+        ]
+    };
+    let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
+        if !profile_scenarios.contains(&scenario) {
+            anyhow::bail!("unknown benchmark scenario: {scenario}");
+        }
+        vec![scenario]
+    } else {
+        profile_scenarios
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -98,7 +116,12 @@ fn main() -> Result<()> {
 
     let mut trials = Vec::new();
     for scenario in &scenarios {
-        for relay in RELAYS {
+        let relays: &[&str] = if *scenario == "nip50_search" {
+            &["wok"]
+        } else {
+            &RELAYS
+        };
+        for relay in relays {
             let t = run_trial(&rt, &args, relay, scenario);
             match t {
                 Ok(t) => trials.push(t),
@@ -267,6 +290,21 @@ fn run_trial(
                 }
             }
         }
+        "nip50_search" => {
+            match ws_search_trial(rt, bin, dir.path(), n, n_queries, args.seed, &mut hist) {
+                Ok((qps, nts, good, miss)) => {
+                    throughput = qps;
+                    notes = nts;
+                    ok = good;
+                    mismatches += miss;
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e}");
+                }
+            }
+        }
         "live_fanout" => {
             match live_fanout_trial(rt, bin, dir.path(), 200, 32, args.seed, &mut hist) {
                 Ok((eps, nts, good, miss)) => {
@@ -364,7 +402,12 @@ fn event_at(i: u64, now: u64, rng: &mut rand::rngs::StdRng) -> Value {
         "created_at": now.saturating_sub(100_000) + i,
         "kind": 1,
         "tags": [["t", format!("tag-{}", i % 64)]],
-        "content": format!("bench event {i} {}", "x".repeat((i % 24) as usize)),
+        "content": format!(
+            "common benchmark event {i} needle{} category{} {}",
+            i % 1024,
+            i % 32,
+            "x".repeat((i % 24) as usize)
+        ),
         "pubkey": hex::encode(xonly.serialize()),
     });
     let id = wok_event::event_id_hash(&ev).unwrap();
@@ -403,20 +446,26 @@ fn generate_values(n: u64, seed: u64) -> Result<Vec<Value>> {
 // CLI helpers
 // ---------------------------------------------------------------------------
 
-fn write_conf(dbdir: &Path, port: u16) -> PathBuf {
+fn write_conf(bin: &Path, dbdir: &Path, port: u16) -> PathBuf {
     let conf = dbdir.join("strfry.conf");
-    let _ = std::fs::write(
-        &conf,
+    let is_wok = bin.file_name().and_then(|name| name.to_str()) == Some("wok");
+    let rendered = if is_wok {
+        format!(
+            "[database]\npath = \"{}\"\n\n[relay]\nbind = \"127.0.0.1\"\nport = {port}\n\n[relay.auth]\nenabled = false\n\n[relay.abuse]\nenabled = false\n",
+            dbdir.display()
+        )
+    } else {
         format!(
             "db = \"{}\"\nrelay {{\n    bind = \"127.0.0.1\"\n    port = {port}\n    auth {{ enabled = false }}\n}}\n",
             dbdir.display()
-        ),
-    );
+        )
+    };
+    let _ = std::fs::write(&conf, rendered);
     conf
 }
 
 fn import_with(bin: &Path, dbdir: &Path, jsonl: &Path, verify: bool) -> bool {
-    let conf = write_conf(dbdir, 0);
+    let conf = write_conf(bin, dbdir, 0);
     let file = std::fs::File::open(jsonl).ok();
     let mut cmd = Command::new(bin);
     cmd.arg("--config").arg(&conf).arg("import");
@@ -433,7 +482,7 @@ fn import_with(bin: &Path, dbdir: &Path, jsonl: &Path, verify: bool) -> bool {
 }
 
 fn export_count(bin: &Path, dbdir: &Path) -> u64 {
-    let conf = write_conf(dbdir, 0);
+    let conf = write_conf(bin, dbdir, 0);
     let out = Command::new(bin)
         .arg("--config")
         .arg(&conf)
@@ -450,7 +499,7 @@ fn export_count(bin: &Path, dbdir: &Path) -> u64 {
 }
 
 fn negentropy_build(bin: &Path, dbdir: &Path) -> bool {
-    let conf = write_conf(dbdir, 0);
+    let conf = write_conf(bin, dbdir, 0);
     Command::new(bin)
         .arg("--config")
         .arg(&conf)
@@ -476,7 +525,7 @@ fn free_port() -> u16 {
 }
 
 fn spawn_relay(bin: &Path, dbdir: &Path, port: u16) -> Result<Child> {
-    let conf = write_conf(dbdir, port);
+    let conf = write_conf(bin, dbdir, port);
     let child = Command::new(bin)
         .arg("--config")
         .arg(&conf)
@@ -671,6 +720,111 @@ fn ws_query_trial(
     let miss = if done == 0 || results == 0 { 1 } else { 0 };
     let notes = format!("{done} mixed REQs, {results} events returned");
     Ok((qps, notes, miss == 0, miss))
+}
+
+/// Preload a deterministic vocabulary, then exercise rare and common+rare
+/// NIP-50 queries. Every returned event is checked for the requested term and
+/// every response must honor the post-ranking limit.
+fn ws_search_trial(
+    rt: &tokio::runtime::Runtime,
+    bin: &Path,
+    dbdir: &Path,
+    n: u64,
+    queries: u64,
+    seed: u64,
+    hist: &mut Histogram<u64>,
+) -> Result<(f64, String, bool, u64)> {
+    let events = generate_values(n.max(1), seed)?;
+    let jsonl = dbdir.join("events.jsonl");
+    {
+        let mut file = std::fs::File::create(&jsonl)?;
+        for event in &events {
+            writeln!(file, "{}", wok_event::json::to_tao_string(event))?;
+        }
+    }
+    if !import_with(bin, dbdir, &jsonl, false) {
+        anyhow::bail!("search corpus import failed");
+    }
+
+    let port = free_port();
+    let mut child = spawn_relay(bin, dbdir, port)?;
+    let out = rt.block_on(async {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let url = format!("ws://127.0.0.1:{port}/");
+        let mut sockets = Vec::new();
+        for _ in 0..4 {
+            sockets.push(connect_retry(&url).await?);
+        }
+        let queries = queries.max(1);
+        let warmup = (queries / 10).clamp(1, 20);
+        let total = queries + warmup;
+        let mut done = 0u64;
+        let mut returned = 0u64;
+        let mut mismatches = 0u64;
+        let measured_start = Instant::now();
+
+        for query_number in 0..total {
+            let needle = format!("needle{}", (query_number * 17) % 1024);
+            let (search, required_term) = match query_number % 3 {
+                0 => (needle.clone(), needle.as_str()),
+                1 => (format!("common {needle}"), needle.as_str()),
+                _ => ("common".to_string(), "common"),
+            };
+            let socket_index = query_number as usize % sockets.len();
+            let socket = &mut sockets[socket_index];
+            let started = Instant::now();
+            socket
+                .send(Message::Text(
+                    json!(["REQ", "nip50-bench", {"search":search, "kinds":[1], "limit":20}])
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+            let mut query_results = 0u64;
+            let mut saw_eose = false;
+            while let Ok(Some(Ok(message))) =
+                tokio::time::timeout(Duration::from_secs(10), socket.next()).await
+            {
+                let text = message.to_text().unwrap_or("");
+                if text.contains("\"EVENT\"") {
+                    query_results += 1;
+                    if !text.contains(required_term) {
+                        mismatches += 1;
+                    }
+                }
+                if text.contains("\"CLOSED\"") {
+                    mismatches += 1;
+                    break;
+                }
+                if text.contains("EOSE") {
+                    saw_eose = true;
+                    break;
+                }
+            }
+            if !saw_eose || query_results > 20 {
+                mismatches += 1;
+            }
+            if query_number >= warmup {
+                hist.record(started.elapsed().as_micros().max(1) as u64)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                done += 1;
+                returned += query_results;
+            }
+        }
+        let elapsed = measured_start.elapsed();
+        for socket in &mut sockets {
+            let _ = socket.close(None).await;
+        }
+        Ok::<_, anyhow::Error>((done, returned, mismatches, elapsed))
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    let (done, returned, mismatches, elapsed) = out?;
+    let qps = done as f64 / elapsed.as_secs_f64();
+    let notes = format!("{done} ranked NIP-50 REQs over {n} events, {returned} verified results");
+    Ok((qps, notes, mismatches == 0, mismatches))
 }
 
 /// 1 publisher, `subs` subscribers; measures per-event delivery latency and

@@ -2,9 +2,13 @@
 
 use crate::filter::NostrFilter;
 use crate::subid::Subscription;
-use std::collections::{HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne};
-use wok_db::RoTxn;
+use wok_db::{
+    search_bigram_posting_exists, search_posting_count, search_posting_exists, search_postings,
+    RoTxn, SearchQuery,
+};
 use wok_event::PackedEventView;
 
 #[derive(Clone, Debug)]
@@ -155,6 +159,302 @@ pub struct DbScan {
     pub approx_work: u64,
     since: u64,
     until: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SearchHit {
+    lev_id: u64,
+    score: u64,
+    created_at: u64,
+    id: [u8; 32],
+}
+
+impl Ord for SearchHit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| self.created_at.cmp(&other.created_at))
+            // A lexically smaller event id is the deterministic better result.
+            .then_with(|| other.id.cmp(&self.id))
+            .then_with(|| self.lev_id.cmp(&other.lev_id))
+    }
+}
+
+impl PartialOrd for SearchHit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Resumable NIP-50 posting intersection and relevance ranking.
+struct SearchScan {
+    query: SearchQuery,
+    primary_term: String,
+    term_document_counts: HashMap<String, usize>,
+    resume_lev_id: u64,
+    gathering_complete: bool,
+    top_hits: BinaryHeap<Reverse<SearchHit>>,
+    ranked_hits: Vec<SearchHit>,
+    max_hits: usize,
+    emit_index: usize,
+    approx_work: u64,
+}
+
+struct SearchGroupScan {
+    scans: Vec<SearchScan>,
+    gather_index: usize,
+    ranked_hits: Vec<SearchHit>,
+    emit_index: usize,
+    merged: bool,
+}
+
+impl SearchGroupScan {
+    fn new(filters: &[NostrFilter], txn: &RoTxn<'_>) -> Result<Self, wok_db::DbError> {
+        let scans = filters
+            .iter()
+            .map(|filter| SearchScan::new(filter, txn))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            scans,
+            gather_index: 0,
+            ranked_hits: Vec::new(),
+            emit_index: 0,
+            merged: false,
+        })
+    }
+
+    fn process<H>(
+        &mut self,
+        txn: &RoTxn<'_>,
+        filters: &[NostrFilter],
+        latest_event_id: u64,
+        time_budget_us: u64,
+        mut handle_event: H,
+    ) -> Result<bool, wok_db::DbError>
+    where
+        H: FnMut(u64),
+    {
+        if !self.merged {
+            let started = std::time::Instant::now();
+            while self.gather_index < self.scans.len() {
+                let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let remaining_us = time_budget_us.saturating_sub(elapsed_us);
+                let complete = self.scans[self.gather_index].gather(
+                    txn,
+                    &filters[self.gather_index],
+                    latest_event_id,
+                    remaining_us,
+                )?;
+                if !complete {
+                    return Ok(false);
+                }
+                self.gather_index += 1;
+                if self.gather_index < self.scans.len()
+                    && started.elapsed().as_micros() >= u128::from(time_budget_us)
+                {
+                    return Ok(false);
+                }
+            }
+
+            let mut best_by_event = HashMap::<u64, SearchHit>::new();
+            for scan in &mut self.scans {
+                for hit in scan.ranked_hits.drain(..) {
+                    match best_by_event.entry(hit.lev_id) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(hit);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            if hit > *entry.get() {
+                                entry.insert(hit);
+                            }
+                        }
+                    }
+                }
+            }
+            self.ranked_hits = best_by_event.into_values().collect();
+            self.ranked_hits.sort_by(|a, b| b.cmp(a));
+            self.merged = true;
+        }
+
+        while self.emit_index < self.ranked_hits.len() {
+            handle_event(self.ranked_hits[self.emit_index].lev_id);
+            self.emit_index += 1;
+        }
+        Ok(true)
+    }
+}
+
+impl SearchScan {
+    fn new(filter: &NostrFilter, txn: &RoTxn<'_>) -> Result<Self, wok_db::DbError> {
+        let query = filter
+            .search
+            .clone()
+            .ok_or_else(|| wok_db::DbError::msg("search scanner requires search filter"))?;
+        let mut term_document_counts = HashMap::new();
+        for term in &query.terms {
+            term_document_counts.insert(term.clone(), search_posting_count(txn, term)?);
+        }
+        let primary_term = query
+            .terms
+            .iter()
+            .min_by_key(|term| term_document_counts.get(*term).copied().unwrap_or(0))
+            .cloned()
+            .unwrap();
+        Ok(Self {
+            query,
+            primary_term,
+            term_document_counts,
+            resume_lev_id: 0,
+            gathering_complete: false,
+            top_hits: BinaryHeap::new(),
+            ranked_hits: Vec::new(),
+            max_hits: usize::try_from(filter.limit).unwrap_or(usize::MAX),
+            emit_index: 0,
+            approx_work: 0,
+        })
+    }
+
+    fn base_score(&self) -> u64 {
+        let mut score = 0u64;
+        for term in &self.query.terms {
+            let document_count = self.term_document_counts[term] as u64;
+            let rarity = 1_000_000_000u64 / document_count.saturating_add(1);
+            score = score.saturating_add(rarity.saturating_mul(100));
+        }
+        score
+    }
+
+    // `is_multiple_of` is not available at Wok's Rust 1.85 MSRV.
+    #[allow(clippy::manual_is_multiple_of)]
+    fn gather(
+        &mut self,
+        txn: &RoTxn<'_>,
+        filter: &NostrFilter,
+        latest_event_id: u64,
+        time_budget_us: u64,
+    ) -> Result<bool, wok_db::DbError> {
+        if self.gathering_complete {
+            return Ok(true);
+        }
+        if self.term_document_counts[&self.primary_term] == 0 {
+            self.gathering_complete = true;
+            return Ok(true);
+        }
+
+        let start = std::time::Instant::now();
+        let primary = self.primary_term.clone();
+        let other_terms: Vec<_> = self
+            .query
+            .terms
+            .iter()
+            .filter(|term| **term != primary)
+            .cloned()
+            .collect();
+        let phrase_pairs: Vec<_> = self
+            .query
+            .phrase_terms
+            .windows(2)
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+            .collect();
+        let base_score = self.base_score();
+        let mut error = None;
+        let completed = search_postings(txn, &primary, self.resume_lev_id, |lev_id| {
+            self.resume_lev_id = lev_id.saturating_add(1);
+            self.approx_work = self.approx_work.saturating_add(1);
+            if lev_id > latest_event_id {
+                return true;
+            }
+            for term in &other_terms {
+                match search_posting_exists(txn, term, lev_id) {
+                    Ok(true) => {}
+                    Ok(false) => return true,
+                    Err(err) => {
+                        error = Some(err);
+                        return false;
+                    }
+                }
+            }
+            let packed_raw = match txn.get_u64(txn.env().dbis().event, lev_id) {
+                Ok(Some(raw)) => raw,
+                Ok(None) => return true,
+                Err(err) => {
+                    error = Some(err);
+                    return false;
+                }
+            };
+            let packed = match PackedEventView::new(packed_raw) {
+                Ok(packed) => packed,
+                Err(_) => return true,
+            };
+            if !filter.does_match_without_search(packed) {
+                return true;
+            }
+            let mut score = base_score;
+            for (first, second) in &phrase_pairs {
+                match search_bigram_posting_exists(txn, first, second, lev_id) {
+                    Ok(true) => score = score.saturating_add(2_000_000_000),
+                    Ok(false) => {}
+                    Err(err) => {
+                        error = Some(err);
+                        return false;
+                    }
+                }
+            }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(packed.id());
+            if self.max_hits != 0 {
+                self.top_hits.push(Reverse(SearchHit {
+                    lev_id,
+                    score,
+                    created_at: packed.created_at(),
+                    id,
+                }));
+                if self.top_hits.len() > self.max_hits {
+                    self.top_hits.pop();
+                }
+            }
+
+            self.approx_work % 128 != 0 || start.elapsed().as_micros() as u64 <= time_budget_us
+        })?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if completed {
+            self.gathering_complete = true;
+            self.ranked_hits = self.top_hits.drain().map(|Reverse(hit)| hit).collect();
+            self.ranked_hits.sort_by(|a, b| b.cmp(a));
+        }
+        Ok(completed)
+    }
+
+    fn scan<H>(
+        &mut self,
+        txn: &RoTxn<'_>,
+        filter: &NostrFilter,
+        latest_event_id: u64,
+        time_budget_us: u64,
+        mut handle_event: H,
+    ) -> Result<bool, wok_db::DbError>
+    where
+        H: FnMut(u64) -> bool,
+    {
+        if !self.gather(txn, filter, latest_event_id, time_budget_us)? {
+            return Ok(false);
+        }
+        while self.emit_index < self.ranked_hits.len() {
+            let lev_id = self.ranked_hits[self.emit_index].lev_id;
+            self.emit_index += 1;
+            if handle_event(lev_id) {
+                return Ok(true);
+            }
+        }
+        Ok(true)
+    }
+}
+
+enum QueryScanner {
+    Chronological(DbScan),
+    Search(SearchScan),
 }
 
 impl DbScan {
@@ -370,7 +670,9 @@ impl DbScan {
 
 pub struct DbQuery {
     pub sub: Subscription,
-    scanner: Option<DbScan>,
+    scanner: Option<QueryScanner>,
+    search_group: Option<SearchGroupScan>,
+    all_filters_search: bool,
     filter_group_index: usize,
     pub dead: bool,
     sent_events_full: HashSet<u64>,
@@ -380,9 +682,17 @@ pub struct DbQuery {
 
 impl DbQuery {
     pub fn new(sub: Subscription) -> Self {
+        let all_filters_search = !sub.filter_group.filters.is_empty()
+            && sub
+                .filter_group
+                .filters
+                .iter()
+                .all(|filter| filter.search.is_some());
         Self {
             sub,
             scanner: None,
+            search_group: None,
+            all_filters_search,
             filter_group_index: 0,
             dead: false,
             sent_events_full: HashSet::new(),
@@ -405,44 +715,76 @@ impl DbQuery {
     where
         F: FnMut(&Subscription, u64),
     {
+        if self.all_filters_search {
+            let mut group = match self.search_group.take() {
+                Some(group) => group,
+                None => SearchGroupScan::new(&self.sub.filter_group.filters, txn)?,
+            };
+            let mut sent = std::mem::take(&mut self.sent_events_full);
+            let mut hits = Vec::new();
+            let complete = group.process(
+                txn,
+                &self.sub.filter_group.filters,
+                self.sub.latest_event_id,
+                time_budget_us,
+                |lev_id| {
+                    if sent.insert(lev_id) {
+                        hits.push(lev_id);
+                    }
+                },
+            )?;
+            self.sent_events_full = sent;
+            for lev_id in hits {
+                cb(&self.sub, lev_id);
+            }
+            if !complete {
+                self.search_group = Some(group);
+            }
+            return Ok(complete);
+        }
+
         while self.filter_group_index < self.sub.filter_group.filters.len() {
             // C++ DBQuery resets the timeslice clock per filter.
             let start = std::time::Instant::now();
             let f = self.sub.filter_group.filters[self.filter_group_index].clone();
             let mut scanner = match self.scanner.take() {
-                Some(s) => s,
-                None => DbScan::new(&f, txn),
+                Some(scanner) => scanner,
+                None if f.search.is_some() => QueryScanner::Search(SearchScan::new(&f, txn)?),
+                None => QueryScanner::Chronological(DbScan::new(&f, txn)),
             };
             let latest = self.sub.latest_event_id;
             let mut sent_full = std::mem::take(&mut self.sent_events_full);
             let mut sent_curr = std::mem::take(&mut self.sent_events_curr);
             let mut last_work = self.last_work_checked;
             let mut hits: Vec<u64> = Vec::new();
-            let complete = scanner.scan(
-                txn,
-                &f,
-                |lev_id| {
-                    if f.limit == 0 {
-                        return true;
-                    }
-                    if lev_id > latest {
-                        return false;
-                    }
-                    if sent_full.insert(lev_id) {
-                        hits.push(lev_id);
-                    }
-                    sent_curr.insert(lev_id);
-                    sent_curr.len() as u64 >= f.limit
-                },
-                |approx_work| {
-                    if approx_work > last_work + 2000 {
-                        last_work = approx_work;
-                        start.elapsed().as_micros() as u64 > time_budget_us
-                    } else {
-                        false
-                    }
-                },
-            )?;
+            let mut handle = |lev_id| {
+                if f.limit == 0 {
+                    return true;
+                }
+                if lev_id > latest {
+                    return false;
+                }
+                if sent_full.insert(lev_id) {
+                    hits.push(lev_id);
+                }
+                sent_curr.insert(lev_id);
+                sent_curr.len() as u64 >= f.limit
+            };
+            let complete = match &mut scanner {
+                QueryScanner::Chronological(scanner) => {
+                    scanner.scan(txn, &f, &mut handle, |approx_work| {
+                        if approx_work > last_work + 2000 {
+                            last_work = approx_work;
+                            start.elapsed().as_micros() as u64 > time_budget_us
+                        } else {
+                            false
+                        }
+                    })?
+                }
+                QueryScanner::Search(scanner) => {
+                    scanner.scan(txn, &f, latest, time_budget_us, &mut handle)?
+                }
+            };
             self.sent_events_full = sent_full;
             self.sent_events_curr = sent_curr;
             self.last_work_checked = last_work;

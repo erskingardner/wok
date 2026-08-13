@@ -506,25 +506,33 @@ fn broadcast_ephemeral(mon_txs: &[Sender<MonitorMsg>], packed: &[u8], json: &str
 /// is used for portability; semantics match.
 fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorMsg>>, shutdown: Arc<AtomicBool>) {
     let path = env.path().join("data.mdb");
-    // Establish the baseline before sleeping. If the first external commit
-    // lands during that initial sleep, comparing against `None` would absorb
-    // the change without ever notifying the monitors.
+    // Reconcile once after establishing the baseline so a commit that lands
+    // before this thread is first scheduled cannot be absorbed as baseline.
     let mut last = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let mut last_event_id = env
+        .begin_ro()
+        .ok()
+        .and_then(|txn| most_recent_levid_ro(&txn).ok())
+        .unwrap_or(0);
+    broadcast_db_change(&mon_txs);
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
         let cur = std::fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
-        if let Some(cur) = cur {
-            match last {
-                Some(prev) if prev == cur => {}
-                _ => {
-                    last = Some(cur);
-                    broadcast_db_change(&mon_txs);
-                }
-            }
+        let current_event_id = env
+            .begin_ro()
+            .ok()
+            .and_then(|txn| most_recent_levid_ro(&txn).ok())
+            .unwrap_or(last_event_id);
+        let metadata_changed = cur.is_some() && cur != last;
+        let events_changed = current_event_id != last_event_id;
+        if metadata_changed || events_changed {
+            last = cur;
+            last_event_id = current_event_id;
+            broadcast_db_change(&mon_txs);
         }
     }
 }
@@ -1862,21 +1870,33 @@ fn run_req_monitor(
                     let conn = sub.conn_id;
                     let pk = authed.get(&conn).map(|a| a.as_slice());
                     let start = sub.latest_event_id.saturating_add(1);
+                    let requires_content = sub.filter_group.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if sub.filter_group.does_match(packed)
-                                && r.should_send_to_subscriber(packed, pk)
+                            if !r.should_send_to_subscriber(packed, pk)
+                                || (!requires_content && !sub.filter_group.does_match(packed))
                             {
-                                if let Some(raw) = txn
-                                    .get_u64(txn.env().dbis().event_payload, lev)
-                                    .ok()
-                                    .flatten()
+                                return true;
+                            }
+                            if let Some(raw) = txn
+                                .get_u64(txn.env().dbis().event_payload, lev)
+                                .ok()
+                                .flatten()
+                            {
+                                if let Ok(json) =
+                                    decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
                                 {
-                                    if let Ok(json) =
-                                        decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
-                                    {
-                                        conns.send_event(conn, sub.sub_id.as_str(), json, &metrics);
+                                    if requires_content {
+                                        let search_terms =
+                                            wok_db::event_search_terms(json).unwrap_or_default();
+                                        if !sub.filter_group.does_match_with_search_terms(
+                                            packed,
+                                            Some(&search_terms),
+                                        ) {
+                                            return true;
+                                        }
                                     }
+                                    conns.send_event(conn, sub.sub_id.as_str(), json, &metrics);
                                 }
                             }
                         }
@@ -1907,12 +1927,18 @@ fn run_req_monitor(
                 }
                 MonitorMsg::DbChange => {
                     let start = curr_event_id.saturating_add(1);
+                    let requires_content = monitors.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            let recips = monitors.process(lev, packed);
-                            if recips.is_empty() {
-                                return true;
-                            }
+                            let packed_recipients = if requires_content {
+                                None
+                            } else {
+                                let recipients = monitors.process(lev, packed, None);
+                                if recipients.is_empty() {
+                                    return true;
+                                }
+                                Some(recipients)
+                            };
                             if let Some(raw) = txn
                                 .get_u64(txn.env().dbis().event_payload, lev)
                                 .ok()
@@ -1921,6 +1947,16 @@ fn run_req_monitor(
                                 if let Ok(json) =
                                     decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
                                 {
+                                    let recips = if let Some(recipients) = packed_recipients {
+                                        recipients
+                                    } else {
+                                        let search_terms =
+                                            wok_db::event_search_terms(json).unwrap_or_default();
+                                        monitors.process(lev, packed, Some(&search_terms))
+                                    };
+                                    if recips.is_empty() {
+                                        return true;
+                                    }
                                     let filtered: Vec<(u64, SubId)> = recips
                                         .into_iter()
                                         .filter(|recip| {
@@ -1940,7 +1976,12 @@ fn run_req_monitor(
                 }
                 MonitorMsg::Ephemeral { packed, json } => {
                     if let Ok(packed) = PackedEventView::new(&packed) {
-                        let recipients = monitors.process_ephemeral(packed);
+                        let search_terms = if monitors.requires_content() {
+                            Some(wok_db::event_search_terms(&json).unwrap_or_default())
+                        } else {
+                            None
+                        };
+                        let recipients = monitors.process_ephemeral(packed, search_terms.as_ref());
                         let filtered: Vec<(u64, SubId)> = recipients
                             .into_iter()
                             .filter(|recipient| {

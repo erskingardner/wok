@@ -21,6 +21,8 @@ it is not a promise to reproduce upstream bugs.
   `sourceType: "unix"` for those connections.
 - `wok event <levId>` prints one event by local event ID.
 - NIP-11 reports Wok's repository as the software implementation.
+- Wok implements NIP-50 ranked content search using a Wok-owned derived LMDB
+  index. The pinned strfry revision has no NIP-50 implementation.
 
 ## Intentional protocol and operational differences
 

@@ -17,6 +17,7 @@ pub mod migration;
 pub mod payload;
 pub mod reindex;
 pub mod schema;
+pub mod search;
 pub mod txn;
 pub mod write;
 
@@ -41,6 +42,12 @@ pub use payload::{
 };
 pub use reindex::{rebuild_primary_and_event_indices, ReindexStats};
 pub use schema::{dbi_specs, DBI_NAMES};
+pub use search::{
+    event_content, event_search_terms, index_event_search, normalize_search_terms,
+    parse_search_query, remove_event_search, search_bigram_posting_exists, search_posting_count,
+    search_posting_exists, search_postings, search_term_set, SearchQuery, SearchTermSet,
+    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TERMS,
+};
 pub use txn::{RoTxn, RwTxn};
 pub use write::{
     delete_event_basic, delete_events, lookup_event_by_id, most_recent_levid, write_events,

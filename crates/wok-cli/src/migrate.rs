@@ -671,6 +671,18 @@ mod tests {
         target.ensure_initialized().unwrap();
         assert_eq!(target.db_version().unwrap(), wok_event::WOK_DB_VERSION);
         assert_eq!(event_fingerprint(&target).unwrap(), source_fingerprint);
+        let txn = target.begin_ro().unwrap();
+        let mut search_hits = Vec::new();
+        wok_query::foreach_by_filter(
+            &txn,
+            &json!({"search":"migration fixture"}),
+            100,
+            3,
+            |lev_id| search_hits.push(lev_id),
+        )
+        .unwrap();
+        assert_eq!(search_hits.len(), 1, "migrated event was not searchable");
+        drop(txn);
 
         let output_cfg = Config::load(output.join("wok.toml")).unwrap();
         assert_eq!(output_cfg.db, output.join("db"));

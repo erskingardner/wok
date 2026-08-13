@@ -4,7 +4,8 @@ use crate::env::Dbis;
 use crate::keys::{
     make_key_string_u64, make_key_string_u64_u64, make_key_u64_u64, parse_key_string_u64,
 };
-use crate::payload::encode_raw_payload;
+use crate::payload::{encode_raw_payload, Decompressor};
+use crate::search::{index_event_search, note_search_indexed_through, remove_event_search};
 use crate::txn::RwTxn;
 use crate::DbError;
 use lmdb_sys::{MDB_dbi, MDB_APPEND, MDB_NOOVERWRITE};
@@ -322,9 +323,22 @@ fn del_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
 
 pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbError> {
     let dbis = txn.env().dbis();
+    let json = if let Some(raw) = txn.get_u64(dbis.event_payload, lev_id)?.map(<[u8]>::to_vec) {
+        let mut decompressor = Decompressor::new();
+        Some(
+            decompressor
+                .decode_rw(txn, &raw, 16 * 1024 * 1024)?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     // C++ deleteEventBasic: payload row first; the return value reports
     // whether a payload existed, independent of the primary record.
     let deleted = txn.del_u64(dbis.event_payload, lev_id, None)?;
+    if let Some(json) = json {
+        remove_event_search(txn, lev_id, &json)?;
+    }
     if let Some(buf) = txn.get_u64(dbis.event, lev_id)?.map(|b| b.to_vec()) {
         let packed = PackedEventView::new(&buf)?;
         let idx = index_event(packed);
@@ -346,6 +360,8 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
     let view = PackedEventView::new(packed)?;
     let idx = index_event(view);
     put_indices(txn, lev_id, &idx)?;
+    index_event_search(txn, lev_id, json)?;
+    note_search_indexed_through(txn, lev_id)?;
     Ok(lev_id)
 }
 

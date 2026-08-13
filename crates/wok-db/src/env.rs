@@ -14,7 +14,7 @@ use crate::comparators::{
 };
 use crate::error::check;
 use crate::fbs::{decode_meta, encode_meta, encode_negentropy_filter, Meta};
-use crate::schema::{dbi_specs, ComparatorKind, DBI_EVENT, DBI_META};
+use crate::schema::{dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_META};
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
 use lmdb_sys::*;
@@ -67,6 +67,8 @@ pub struct Dbis {
     pub compression_dictionary: MDB_dbi,
     pub event_payload: MDB_dbi,
     pub negentropy: MDB_dbi,
+    /// Absent only while inspecting an unmodified strfry v3 source.
+    pub event_search: Option<MDB_dbi>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -99,6 +101,25 @@ impl Drop for EnvInner {
 #[derive(Clone)]
 pub struct Env {
     pub inner: Arc<EnvInner>,
+}
+
+fn meta_version_in_open_txn(txn: *mut MDB_txn, meta_dbi: MDB_dbi) -> Result<u64, DbError> {
+    let mut key_bytes = 1u64.to_ne_bytes();
+    let mut key = MDB_val {
+        mv_size: key_bytes.len(),
+        mv_data: key_bytes.as_mut_ptr().cast(),
+    };
+    let mut value = MDB_val {
+        mv_size: 0,
+        mv_data: ptr::null_mut(),
+    };
+    let rc = unsafe { mdb_get(txn, meta_dbi, &mut key, &mut value) };
+    if rc == MDB_NOTFOUND {
+        return Ok(0);
+    }
+    check(rc)?;
+    let raw = unsafe { std::slice::from_raw_parts(value.mv_data.cast::<u8>(), value.mv_size) };
+    Ok(decode_meta(raw)?.db_version)
 }
 
 impl Env {
@@ -166,16 +187,38 @@ impl Env {
         for spec in dbi_specs() {
             let cname = CString::new(spec.name).unwrap();
             let mut dbi: MDB_dbi = 0;
-            let dbi_flags = if opts.create_dbis {
+            let foreign_source = spec.name == DBI_EVENT_SEARCH && !opened.is_empty() && {
+                let version = match meta_version_in_open_txn(txn, opened[0]) {
+                    Ok(version) => version,
+                    Err(error) => {
+                        unsafe { mdb_txn_abort(txn) };
+                        unsafe { mdb_env_close(env) };
+                        return Err(error);
+                    }
+                };
+                version != 0 && version != wok_event::WOK_DB_VERSION
+            };
+            let dbi_flags = if opts.create_dbis && !foreign_source {
                 spec.flags
             } else {
                 spec.flags & !MDB_CREATE
             };
             let rc = unsafe { mdb_dbi_open(txn, cname.as_ptr(), dbi_flags, &mut dbi) };
+            if rc == MDB_NOTFOUND
+                && spec.name == DBI_EVENT_SEARCH
+                && (!opts.create_dbis || foreign_source)
+            {
+                opened.push(0);
+                continue;
+            }
             if rc != 0 {
                 unsafe { mdb_txn_abort(txn) };
                 unsafe { mdb_env_close(env) };
                 return Err(DbError::from_rc(rc));
+            }
+            if foreign_source {
+                opened.push(0);
+                continue;
             }
             let cmp_rc = match spec.comparator {
                 ComparatorKind::Default => 0,
@@ -218,6 +261,7 @@ impl Env {
             compression_dictionary: opened[13],
             event_payload: opened[14],
             negentropy: opened[15],
+            event_search: (opened[16] != 0).then_some(opened[16]),
         };
 
         if let Err(e) = unsafe { check(mdb_txn_commit(txn)) } {
@@ -299,6 +343,7 @@ impl Env {
             }
         }
         txn.commit()?;
+        crate::search::ensure_search_index(self)?;
         Ok(())
     }
 

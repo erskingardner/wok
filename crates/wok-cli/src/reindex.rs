@@ -388,6 +388,14 @@ mod tests {
         )
         .unwrap();
         assert!(check_integrity(&repaired.begin_ro().unwrap()).unwrap().ok());
+        let txn = repaired.begin_ro().unwrap();
+        let mut search_hits = Vec::new();
+        wok_query::foreach_by_filter(&txn, &json!({"search":"repair me"}), 100, 3, |lev_id| {
+            search_hits.push(lev_id)
+        })
+        .unwrap();
+        assert_eq!(search_hits.len(), 1, "reindexed event was not searchable");
+        drop(txn);
         let original = Env::open(
             &backup,
             EnvOptions {

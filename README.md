@@ -24,9 +24,10 @@ quirk. It also provides an additional Unix-domain socket transport.
 - **Nostr-first protocol behavior.** EVENT/REQ/CLOSE/COUNT/EOSE/OK/NOTICE/
   CLOSED/AUTH and NEG-* are tested against pinned NIPs. Differential tests are
   migration and regression evidence, not a promise to retain upstream bugs.
-- **NIP-42 AUTH, NIP-45 COUNT, NIP-70 protected events, NIP-59 gift-wrap
-  deletion semantics, NIP-77 negentropy set reconciliation** (persistent
-  LMDB B-tree, tree-backed multi-round sync sessions).
+- **NIP-42 AUTH, NIP-45 COUNT, NIP-50 ranked content search, NIP-70 protected
+  events, NIP-59 gift-wrap deletion semantics, NIP-77 negentropy set
+  reconciliation** (persistent LMDB B-tree, tree-backed multi-round sync
+  sessions).
 - **Standards-first ephemeral delivery**: ephemeral kinds are live-only by
   default, with an explicit persisted TTL compatibility mode.
 - **permessage-deflate** via an in-house RFC 6455/7692 codec (no Rust WS
@@ -181,6 +182,7 @@ cargo build --release -p wok-cli -p wok-bench
 Details and methodology: [docs/benchmarks.md](docs/benchmarks.md);
 raw data: [docs/sample-bench-results.jsonl](docs/sample-bench-results.jsonl),
 [docs/sample-bench-summary.md](docs/sample-bench-summary.md).
+NIP-50 design, semantics, and scale results: [docs/nip50-search.md](docs/nip50-search.md).
 
 ## Differences from strfry
 

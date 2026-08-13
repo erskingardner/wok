@@ -782,14 +782,17 @@ fn cmd_monitor(cfg: &Config) -> Result<()> {
     let mut decomp = Decompressor::new();
     wok_db::foreach_event_from(&txn, 0, |lev, packed| {
         if let Ok(p) = wok_event::PackedEventView::new(packed) {
-            let recips = monitors.process(lev, p);
-            if let Some((cid, sid)) = &interest {
-                if recips
-                    .iter()
-                    .any(|r| r.conn_id == *cid && r.sub_id.as_str() == sid)
-                {
-                    if let Ok(json) =
-                        event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size)
+            if let Ok(json) = event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size) {
+                let search_terms = if monitors.requires_content() {
+                    Some(wok_db::event_search_terms(&json).unwrap_or_default())
+                } else {
+                    None
+                };
+                let recips = monitors.process(lev, p, search_terms.as_ref());
+                if let Some((cid, sid)) = &interest {
+                    if recips
+                        .iter()
+                        .any(|r| r.conn_id == *cid && r.sub_id.as_str() == sid)
                     {
                         println!("{json}");
                     }

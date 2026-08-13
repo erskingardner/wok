@@ -2,6 +2,7 @@
 
 use crate::subid::{SubId, Subscription};
 use std::collections::HashMap;
+use wok_db::SearchTermSet;
 use wok_event::PackedEventView;
 
 #[derive(Clone, Debug)]
@@ -77,20 +78,37 @@ impl ActiveMonitors {
         }
     }
 
-    pub fn process(&mut self, lev_id: u64, packed: PackedEventView<'_>) -> Vec<Recipient> {
-        self.process_inner(Some(lev_id), packed)
+    pub fn requires_content(&self) -> bool {
+        self.conns
+            .values()
+            .flat_map(HashMap::values)
+            .any(|subscription| subscription.filter_group.requires_content())
+    }
+
+    pub fn process(
+        &mut self,
+        lev_id: u64,
+        packed: PackedEventView<'_>,
+        search_terms: Option<&SearchTermSet>,
+    ) -> Vec<Recipient> {
+        self.process_inner(Some(lev_id), packed, search_terms)
     }
 
     /// Match a live-only event without advancing a subscription's persisted
     /// local-event cursor. This keeps later DB-backed delivery monotonic.
-    pub fn process_ephemeral(&mut self, packed: PackedEventView<'_>) -> Vec<Recipient> {
-        self.process_inner(None, packed)
+    pub fn process_ephemeral(
+        &mut self,
+        packed: PackedEventView<'_>,
+        search_terms: Option<&SearchTermSet>,
+    ) -> Vec<Recipient> {
+        self.process_inner(None, packed, search_terms)
     }
 
     fn process_inner(
         &mut self,
         lev_id: Option<u64>,
         packed: PackedEventView<'_>,
+        search_terms: Option<&SearchTermSet>,
     ) -> Vec<Recipient> {
         let mut recipients = Vec::new();
         let mut candidates: Vec<(u64, SubId)> = Vec::new();
@@ -142,7 +160,10 @@ impl ActiveMonitors {
                         continue;
                     }
                 }
-                if sub.filter_group.does_match(packed) {
+                if sub
+                    .filter_group
+                    .does_match_with_search_terms(packed, search_terms)
+                {
                     if let Some(lev_id) = lev_id {
                         sub.latest_event_id = lev_id;
                     }

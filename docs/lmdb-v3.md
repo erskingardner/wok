@@ -54,3 +54,10 @@ expected event-derived secondary-index entry with the actual indexes in both
 directions. `wok doctor` additionally decompresses payloads, checks payload ID
 identity, opens negentropy trees, and diagnoses version, endianness, capacity,
 config, plugin, and socket-path problems.
+
+`wok reindex --confirm-relay-stopped` repairs damage confined to derived
+event/negentropy indexes. It copies authoritative Meta, filter, dictionary,
+PackedEvent, and EventPayload records into a sibling staging database, derives
+all indexes again, verifies the event fingerprint and integrity report, then
+renames the original to a retained backup and atomically promotes the staged
+directory. It refuses primary, payload, or metadata corruption.

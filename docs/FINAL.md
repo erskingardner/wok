@@ -43,6 +43,9 @@ event identity requires compatibility. See `docs/compatibility-policy.md`,
   event-derived index in both directions. `wok doctor` adds decoded payload-ID
   checks, negentropy traversal, capacity, version/endianness, config, plugin,
   and socket-path diagnostics with human or JSON output.
+- `wok reindex` rebuilds event and negentropy indexes in a sibling staging
+  database, proves the primary event fingerprint is unchanged, promotes only
+  after verification, and retains the original database as rollback material.
 
 C++ reference source was not modified. Final `git status` in `/Users/jeff/code/strfry` was clean at the pin above.
 

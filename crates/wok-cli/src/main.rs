@@ -11,6 +11,7 @@ use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_negentropy::Storage;
 mod doctor;
 mod migrate;
+mod reindex;
 mod router;
 
 use wok_relay::Config;
@@ -51,6 +52,18 @@ enum Command {
     /// Diagnose configuration, storage, indexes, payloads, and runtime paths
     Doctor {
         /// Emit the complete machine-readable report
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rebuild all derived indexes into a staged database and promote it
+    Reindex {
+        /// Required acknowledgement that no relay or DB utility is using the database
+        #[arg(long)]
+        confirm_relay_stopped: bool,
+        /// Sibling directory that will retain the original database
+        #[arg(long)]
+        backup: Option<PathBuf>,
+        /// Emit the machine-readable outcome
         #[arg(long)]
         json: bool,
     },
@@ -241,6 +254,11 @@ async fn main() -> Result<()> {
         Command::Relay => cmd_relay(cfg, config).await,
         Command::Info => cmd_info(&cfg),
         Command::Doctor { json } => cmd_doctor(&cfg, &config, json),
+        Command::Reindex {
+            confirm_relay_stopped,
+            backup,
+            json,
+        } => cmd_reindex(&cfg, backup.as_deref(), confirm_relay_stopped, json),
         Command::Import {
             show_rejected,
             no_verify,
@@ -395,6 +413,24 @@ fn cmd_doctor(cfg: &Config, config_path: &Path, json: bool) -> Result<()> {
     }
     if !report.ok {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn cmd_reindex(
+    cfg: &Config,
+    backup: Option<&Path>,
+    confirmed_stopped: bool,
+    json: bool,
+) -> Result<()> {
+    let outcome = reindex::run(cfg, backup, confirmed_stopped)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        println!("Reindexed {} events.", outcome.events);
+        println!("Database: {}", outcome.database.display());
+        println!("Original backup: {}", outcome.backup.display());
+        println!("Fingerprint: {}", outcome.event_fingerprint_sha256);
     }
     Ok(())
 }

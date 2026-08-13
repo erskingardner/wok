@@ -137,6 +137,11 @@ impl<'env> RwTxn<'env> {
         self.del(dbi, &key.to_ne_bytes(), val)
     }
 
+    /// Remove every record while retaining the open DBI and its flags.
+    pub fn clear(&mut self, dbi: MDB_dbi) -> Result<(), DbError> {
+        check(unsafe { mdb_drop(self.txn, dbi, 0) })
+    }
+
     pub fn cursor(&self, dbi: MDB_dbi) -> Result<Cursor<'_>, DbError> {
         Cursor::open(self.txn, dbi)
     }

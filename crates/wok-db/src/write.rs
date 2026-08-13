@@ -236,6 +236,15 @@ pub(crate) fn event_index_entries(
     for key in idx.tag {
         push("event_tag", dbis.event_tag, key);
     }
+    // DUPSORT databases store a key/value pair only once. Repeated identical
+    // tags therefore describe one physical index entry.
+    entries.sort_by(|a, b| {
+        a.dbi
+            .cmp(&b.dbi)
+            .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    entries.dedup_by(|a, b| a.dbi == b.dbi && a.key == b.key && a.value == b.value);
     entries
 }
 

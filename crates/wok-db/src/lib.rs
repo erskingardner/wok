@@ -15,6 +15,7 @@ pub mod keys;
 pub mod lookup;
 pub mod migration;
 pub mod payload;
+pub mod reindex;
 pub mod schema;
 pub mod txn;
 pub mod write;
@@ -38,6 +39,7 @@ pub use payload::{
     encode_raw_payload, encode_zstd_payload, event_json_owned, get_event_json, parse_payload,
     Decompressor, PayloadView, PAYLOAD_RAW, PAYLOAD_ZSTD,
 };
+pub use reindex::{rebuild_primary_and_event_indices, ReindexStats};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use txn::{RoTxn, RwTxn};
 pub use write::{

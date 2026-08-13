@@ -130,12 +130,18 @@ enum DictCmd {
     Train {
         #[arg(long)]
         filter: Option<String>,
+        #[arg(long)]
+        limit: Option<u64>,
+        #[arg(long, default_value_t = 100_000)]
+        dict_size: u64,
     },
     Compress {
         #[arg(long)]
         filter: Option<String>,
         #[arg(long)]
         dict_id: Option<u64>,
+        #[arg(long, default_value_t = 3)]
+        level: i32,
     },
     Decompress {
         #[arg(long)]
@@ -665,25 +671,37 @@ fn cmd_monitor(cfg: &Config) -> Result<()> {
 
 fn cmd_dict(cfg: &Config, cmd: DictCmd) -> Result<()> {
     let env = open_env(cfg)?;
-    let filter = match &cmd {
-        DictCmd::Stats { filter }
-        | DictCmd::Train { filter }
-        | DictCmd::Compress { filter, .. }
-        | DictCmd::Decompress { filter } => filter.clone().unwrap_or_else(|| "{}".into()),
+    let (filter, limit, dict_size, dict_id, level) = match &cmd {
+        DictCmd::Stats { filter } => (filter.clone(), None, 0, None, 0),
+        DictCmd::Train {
+            filter,
+            limit,
+            dict_size,
+        } => (filter.clone(), *limit, *dict_size, None, 0),
+        DictCmd::Compress {
+            filter,
+            dict_id,
+            level,
+        } => (filter.clone(), None, 0, *dict_id, *level),
+        DictCmd::Decompress { filter } => (filter.clone(), None, 0, None, 0),
     };
-    let txn = env.begin_ro()?;
-    let filter: serde_json::Value = serde_json::from_str(&filter)?;
+    let filter = filter.unwrap_or_else(|| "{}".into());
     let mut levs = Vec::new();
-    foreach_by_filter_scan(
-        &txn,
-        &filter,
-        u64::MAX,
-        cfg.relay.max_tags_per_filter,
-        |lev| levs.push(lev),
-    )?;
+    {
+        let txn = env.begin_ro()?;
+        let filter: serde_json::Value = wok_event::json::parse_strict(&filter)?;
+        foreach_by_filter_scan(
+            &txn,
+            &filter,
+            u64::MAX,
+            cfg.relay.max_tags_per_filter,
+            |lev| levs.push(lev),
+        )?;
+    }
     tracing::info!("Filter matched {} records", levs.len());
     match cmd {
         DictCmd::Stats { .. } => {
+            let txn = env.begin_ro()?;
             let mut total = 0usize;
             let mut compressed = 0usize;
             let mut n_comp = 0u64;
@@ -703,12 +721,109 @@ fn cmd_dict(cfg: &Config, cmd: DictCmd) -> Result<()> {
             );
         }
         DictCmd::Train { .. } => {
-            tracing::warn!(
-                "dict train requires libzstd dictionary builder; not bundled in this build"
-            );
+            use rand::seq::SliceRandom;
+            let mut levs = levs;
+            if let Some(limit) = limit {
+                if levs.len() as u64 > limit {
+                    tracing::info!("Randomly selecting {limit} records");
+                    let mut rng = rand::thread_rng();
+                    levs.shuffle(&mut rng);
+                    levs.truncate(limit as usize);
+                }
+            }
+            let txn = env.begin_ro()?;
+            let mut decomp = Decompressor::new();
+            let mut training_buf = Vec::new();
+            let mut training_sizes = Vec::new();
+            for lev in &levs {
+                let json = event_json_owned(&txn, &mut decomp, *lev, cfg.events.max_event_size)?;
+                training_sizes.push(json.len());
+                training_buf.extend_from_slice(json.as_bytes());
+            }
+            drop(txn);
+            tracing::info!("Performing zstd training...");
+            let dict =
+                zstd::dict::from_continuous(&training_buf, &training_sizes, dict_size as usize)
+                    .map_err(|e| anyhow::anyhow!("zstd training failed: {e}"))?;
+            let mut txn = env.begin_rw()?;
+            let new_id = wok_db::insert_compression_dictionary(&mut txn, &dict)?;
+            txn.commit()?;
+            println!("Saved new dictionary, dictId = {new_id}");
         }
-        DictCmd::Compress { .. } | DictCmd::Decompress { .. } => {
-            tracing::warn!("dict compress/decompress: use C++ strfry for dictionary training; wok reads compressed payloads");
+        DictCmd::Compress { .. } => {
+            let dict_id = dict_id.context("specify --dict-id")?;
+            let dict = {
+                let txn = env.begin_ro()?;
+                wok_db::get_compression_dictionary_ro(&txn, dict_id)?
+                    .with_context(|| format!("couldn't find dictId {dict_id}"))?
+            };
+            let dict = zstd::dict::EncoderDictionary::copy(&dict, level);
+            let mut orig_sizes = 0u64;
+            let mut compressed_sizes = 0u64;
+            let mut processed = 0u64;
+            let mut txn = env.begin_rw()?;
+            let mut decomp = Decompressor::new();
+            let mut pending_flush = 0u64;
+            for lev in &levs {
+                // C++ skips records that fail to decode.
+                let json = {
+                    let ro = env.begin_ro()?;
+                    match event_json_owned(&ro, &mut decomp, *lev, cfg.events.max_event_size) {
+                        Ok(j) => j,
+                        Err(_) => continue,
+                    }
+                };
+                let mut compressor = zstd::bulk::Compressor::with_prepared_dictionary(&dict)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let compressed = compressor
+                    .compress(json.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("zstd compression failed: {e}"))?;
+                orig_sizes += json.len() as u64;
+                compressed_sizes += compressed.len() as u64;
+                let new_val = if compressed.len() + 4 < json.len() {
+                    wok_db::encode_zstd_payload(dict_id as u32, &compressed)
+                } else {
+                    wok_db::encode_raw_payload(&json)
+                };
+                txn.put_u64(env.dbis().event_payload, *lev, &new_val, 0)?;
+                pending_flush += 1;
+                processed += 1;
+                if pending_flush > 10_000 {
+                    txn.commit()?;
+                    tracing::info!("Progress: {processed}/{}", levs.len());
+                    pending_flush = 0;
+                    txn = env.begin_rw()?;
+                }
+            }
+            txn.commit()?;
+            tracing::info!("Original event sizes: {orig_sizes}");
+            tracing::info!("New event sizes:      {compressed_sizes}");
+        }
+        DictCmd::Decompress { .. } => {
+            let mut processed = 0u64;
+            let mut txn = env.begin_rw()?;
+            let mut decomp = Decompressor::new();
+            let mut pending_flush = 0u64;
+            for lev in &levs {
+                let json = {
+                    let ro = env.begin_ro()?;
+                    match event_json_owned(&ro, &mut decomp, *lev, cfg.events.max_event_size) {
+                        Ok(j) => j,
+                        Err(_) => continue,
+                    }
+                };
+                let new_val = wok_db::encode_raw_payload(&json);
+                txn.put_u64(env.dbis().event_payload, *lev, &new_val, 0)?;
+                pending_flush += 1;
+                processed += 1;
+                if pending_flush > 10_000 {
+                    txn.commit()?;
+                    tracing::info!("Progress: {processed}/{}", levs.len());
+                    pending_flush = 0;
+                    txn = env.begin_rw()?;
+                }
+            }
+            txn.commit()?;
         }
     }
     Ok(())

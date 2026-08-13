@@ -134,6 +134,28 @@ pub fn insert_negentropy_filter(txn: &mut RwTxn<'_>, filter: &str) -> Result<u64
     Ok(id)
 }
 
+pub fn insert_compression_dictionary(txn: &mut RwTxn<'_>, dict: &[u8]) -> Result<u64, DbError> {
+    let id = txn.next_integer_key(txn.env().dbis().compression_dictionary)?;
+    // Same flags as the generated C++ insert_CompressionDictionary.
+    txn.put_u64(
+        txn.env().dbis().compression_dictionary,
+        id,
+        &crate::fbs::encode_compression_dictionary(dict),
+        lmdb_sys::MDB_NOOVERWRITE | lmdb_sys::MDB_APPEND,
+    )?;
+    Ok(id)
+}
+
+pub fn get_compression_dictionary_ro(
+    txn: &RoTxn<'_>,
+    dict_id: u64,
+) -> Result<Option<Vec<u8>>, DbError> {
+    Ok(txn
+        .get_u64(txn.env().dbis().compression_dictionary, dict_id)?
+        .map(|raw| crate::fbs::decode_compression_dictionary(raw).map(|r| r.dict))
+        .transpose()?)
+}
+
 pub fn bump_negentropy_mod_counter(txn: &mut RwTxn<'_>) -> Result<u64, DbError> {
     let raw = txn
         .get_u64(txn.env().dbis().meta, 1)?

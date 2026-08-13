@@ -2347,6 +2347,7 @@ dependencies = [
  "futures-util",
  "hex",
  "notify",
+ "rand 0.8.7",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2361,6 +2362,7 @@ dependencies = [
  "wok-relay",
  "wok-unix",
  "wok-ws",
+ "zstd",
 ]
 
 [[package]]

@@ -1,12 +1,13 @@
 //! Event insert/delete/replace matching `src/events.cpp`.
 
+use crate::env::Dbis;
 use crate::keys::{
     make_key_string_u64, make_key_string_u64_u64, make_key_u64_u64, parse_key_string_u64,
 };
 use crate::payload::encode_raw_payload;
 use crate::txn::RwTxn;
 use crate::DbError;
-use lmdb_sys::{MDB_APPEND, MDB_NOOVERWRITE};
+use lmdb_sys::{MDB_dbi, MDB_APPEND, MDB_NOOVERWRITE};
 use wok_event::{
     is_event_a_before_event_b, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag, sha256,
     to_hex, PackedEventView, GIFT_WRAP_KINDS,
@@ -159,7 +160,7 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
     idx
 }
 
-struct EventIndices {
+pub(crate) struct EventIndices {
     created_at: Option<u64>,
     id: Option<Vec<u8>>,
     pubkey: Option<Vec<u8>>,
@@ -170,6 +171,72 @@ struct EventIndices {
     expiration: Vec<u64>,
     replace: Vec<Vec<u8>>,
     replace_deletion: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventIndexEntry {
+    pub name: &'static str,
+    pub dbi: MDB_dbi,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+pub(crate) fn event_index_entries(
+    dbis: Dbis,
+    lev_id: u64,
+    packed: PackedEventView<'_>,
+) -> Vec<EventIndexEntry> {
+    let idx = index_event(packed);
+    let lev = lev_id.to_ne_bytes().to_vec();
+    let mut entries = Vec::new();
+    let mut push = |name, dbi, key: Vec<u8>| {
+        entries.push(EventIndexEntry {
+            name,
+            dbi,
+            key,
+            value: lev.clone(),
+        });
+    };
+
+    if let Some(key) = idx.created_at {
+        push(
+            "event_created_at",
+            dbis.event_created_at,
+            key.to_ne_bytes().to_vec(),
+        );
+    }
+    for key in idx.deletion {
+        push("event_deletion", dbis.event_deletion, key);
+    }
+    for key in idx.expiration {
+        push(
+            "event_expiration",
+            dbis.event_expiration,
+            key.to_ne_bytes().to_vec(),
+        );
+    }
+    if let Some(key) = idx.id {
+        push("event_id", dbis.event_id, key);
+    }
+    if let Some(key) = idx.kind {
+        push("event_kind", dbis.event_kind, key);
+    }
+    if let Some(key) = idx.pubkey {
+        push("event_pubkey", dbis.event_pubkey, key);
+    }
+    if let Some(key) = idx.pubkey_kind {
+        push("event_pubkey_kind", dbis.event_pubkey_kind, key);
+    }
+    for key in idx.replace {
+        push("event_replace", dbis.event_replace, key);
+    }
+    for key in idx.replace_deletion {
+        push("event_replace_deletion", dbis.event_replace_deletion, key);
+    }
+    for key in idx.tag {
+        push("event_tag", dbis.event_tag, key);
+    }
+    entries
 }
 
 fn put_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(), DbError> {

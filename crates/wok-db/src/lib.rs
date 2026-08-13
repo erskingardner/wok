@@ -26,7 +26,7 @@ pub use fbs::{
     encode_compression_dictionary, encode_meta, encode_negentropy_filter, CompressionDictionaryRec,
     Meta, NegentropyFilterRec,
 };
-pub use integrity::{check_integrity, IntegrityReport};
+pub use integrity::{check_integrity, IntegrityIssue, IntegrityReport};
 pub use lookup::{
     bump_negentropy_mod_counter, foreach_created_at, foreach_event_from, foreach_negentropy_filter,
     foreach_negentropy_filter_rw, get_compression_dictionary_ro, get_packed_ro, get_payload_ro,

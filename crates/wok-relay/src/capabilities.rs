@@ -21,6 +21,7 @@ pub enum CapabilityCondition {
     CountEnabled,
     NegentropyEnabled,
     EphemeralLiveOnly,
+    PowRequired,
 }
 
 impl CapabilityCondition {
@@ -35,6 +36,7 @@ impl CapabilityCondition {
             Self::EphemeralLiveOnly => {
                 cfg.events.ephemeral_persistence == EphemeralPersistence::LiveOnly
             }
+            Self::PowRequired => cfg.relay.abuse.enabled && cfg.relay.abuse.min_pow_difficulty > 0,
         }
     }
 }
@@ -55,6 +57,11 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
         nip: 11,
         name: "Relay information",
         enabled_when: CapabilityCondition::Always,
+    },
+    RelayCapability {
+        nip: 13,
+        name: "Proof of work",
+        enabled_when: CapabilityCondition::PowRequired,
     },
     RelayCapability {
         nip: 40,
@@ -124,5 +131,8 @@ mod tests {
         cfg.relay.negentropy_enabled = false;
         cfg.events.ephemeral_persistence = EphemeralPersistence::Ttl;
         assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 70]);
+
+        cfg.relay.abuse.min_pow_difficulty = 20;
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 13, 40, 42, 70]);
     }
 }

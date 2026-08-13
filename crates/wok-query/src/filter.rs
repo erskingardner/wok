@@ -331,6 +331,36 @@ impl NostrFilterGroup {
     pub fn is_full_db_query(&self) -> bool {
         self.size() == 1 && self.filters[0].is_full_db_query()
     }
+
+    /// Conservative, database-independent admission cost. This intentionally
+    /// estimates index breadth rather than execution time so expensive scans
+    /// can be rejected before an LMDB cursor is opened.
+    pub fn estimated_cost(&self, count_only: bool) -> u64 {
+        let mut cost = 0u64;
+        for filter in &self.filters {
+            let filter_cost = if let Some(ids) = &filter.ids {
+                ids.size() as u64
+            } else if filter.authors.is_some() && filter.kinds.is_some() {
+                5
+            } else if let Some(authors) = &filter.authors {
+                10u64.saturating_mul(authors.size() as u64)
+            } else if !filter.tags.is_empty() {
+                25u64.saturating_mul(filter.tags.len() as u64)
+            } else if let Some(kinds) = &filter.kinds {
+                100u64.saturating_mul(kinds.size() as u64)
+            } else if filter.since != 0 || filter.until != u64::MAX {
+                500
+            } else {
+                1_000
+            };
+            cost = cost.saturating_add(filter_cost.max(1));
+        }
+        if count_only {
+            cost.saturating_mul(2)
+        } else {
+            cost
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -459,5 +489,19 @@ mod tests {
         assert!(f.index_only_scans);
         let f = NostrFilter::parse(&json!({"ids":["11".repeat(32)], "kinds":[1]}), 500, 3).unwrap();
         assert!(!f.index_only_scans);
+    }
+
+    #[test]
+    fn estimates_broad_queries_before_opening_a_cursor() {
+        let broad = NostrFilterGroup::from_value(&json!({}), 500, 3).unwrap();
+        let targeted = NostrFilterGroup::from_value(
+            &json!({"ids":["11".repeat(32), "22".repeat(32)]}),
+            500,
+            3,
+        )
+        .unwrap();
+        assert_eq!(broad.estimated_cost(false), 1_000);
+        assert_eq!(broad.estimated_cost(true), 2_000);
+        assert_eq!(targeted.estimated_cost(false), 2);
     }
 }

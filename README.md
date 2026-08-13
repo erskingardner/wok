@@ -40,6 +40,10 @@ quirk. It also provides an additional Unix-domain socket transport.
   (`max_pending_outbound_bytes`), config hot-reload, graceful shutdown
   (SIGUSR1/SIGINT), write-policy plugins, Prometheus metrics, and migration of
   the supported `strfry.conf` subset.
+- **Native abuse resistance**: per-IP and per-pubkey token buckets, separate
+  connection/EVENT/REQ/COUNT budgets, pre-scan query costing, historical-query
+  concurrency limits, optional author storage quotas, rejection metrics, and
+  optional NIP-13 proof-of-work enforcement advertised through NIP-11.
 
 ## Build
 

@@ -100,6 +100,16 @@ async fn dispatch(
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
     if is_ws_upgrade {
+        let ip = match peer.ip() {
+            std::net::IpAddr::V4(value) => value.octets().to_vec(),
+            std::net::IpAddr::V6(value) => value.octets().to_vec(),
+        };
+        if !handle.admit_connection(&ip) {
+            return text_status_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate-limited: connection budget exhausted",
+            );
+        }
         return upgrade_ws(req, handle, peer).await;
     }
     let path = req.uri().path().to_string();
@@ -171,6 +181,11 @@ fn maybe_npub(s: &str) -> String {
 }
 
 fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
+    let min_pow_difficulty = if cfg.relay.abuse.enabled {
+        cfg.relay.abuse.min_pow_difficulty
+    } else {
+        0
+    };
     let mut v = serde_json::json!({
         "supported_nips": supported_nips(cfg),
         "software": SOFTWARE,
@@ -184,6 +199,9 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "created_at_lower_limit": cfg.events.reject_older_than_secs,
             "created_at_upper_limit": cfg.events.reject_newer_than_secs,
             "default_limit": cfg.relay.max_filter_limit,
+            "min_pow_difficulty": min_pow_difficulty,
+            "max_query_cost": cfg.relay.abuse.max_query_cost,
+            "max_concurrent_historical_queries": cfg.relay.abuse.max_concurrent_historical_queries,
         }
     });
     let info = &cfg.relay.info;
@@ -254,6 +272,16 @@ fn text_response(ct: &str, body: String) -> Response<Full<Bytes>> {
         .header("Server", "wok")
         .body(Full::new(Bytes::from(body)))
         .unwrap_or_else(|_| empty(StatusCode::OK))
+}
+
+fn text_status_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Server", "wok")
+        .body(Full::new(Bytes::copy_from_slice(body.as_bytes())))
+        .unwrap_or_else(|_| empty(status))
 }
 
 fn html_response(body: &str) -> Response<Full<Bytes>> {

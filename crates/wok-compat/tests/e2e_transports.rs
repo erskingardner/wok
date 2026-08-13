@@ -468,6 +468,7 @@ async fn nip11_http_document() {
     cfg.relay.info.pubkey =
         "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6".into();
     cfg.relay.info.terms = "https://example.com/tos".into();
+    cfg.relay.abuse.min_pow_difficulty = 20;
     let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -484,12 +485,14 @@ async fn nip11_http_document() {
         .any(|n| n == 1));
     assert_eq!(
         client["supported_nips"],
-        json!([1, 9, 11, 40, 45, 59, 70, 77])
+        json!([1, 9, 11, 13, 40, 45, 59, 70, 77])
     );
     assert_eq!(client["limitation"]["max_event_tags"], 2000);
     assert_eq!(client["limitation"]["created_at_lower_limit"], u64::MAX / 4);
     assert_eq!(client["limitation"]["created_at_upper_limit"], 900);
     assert_eq!(client["limitation"]["default_limit"], 500);
+    assert_eq!(client["limitation"]["min_pow_difficulty"], 20);
+    assert_eq!(client["limitation"]["max_query_cost"], 1000);
     assert_eq!(
         client["software"],
         "git+https://github.com/erskingardner/wok.git"

@@ -139,4 +139,8 @@ impl QueryScheduler {
     pub fn has_running(&self) -> bool {
         !self.running.is_empty()
     }
+
+    pub fn set_max_subs_per_connection(&mut self, maximum: usize) {
+        self.max_subs_per_connection = maximum;
+    }
 }

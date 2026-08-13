@@ -165,7 +165,28 @@ pub struct RelayConfig {
     pub negentropy_enabled: bool,
     pub max_sync_events: u64,
     pub filter_validation: FilterValidationConfig,
+    pub abuse: AbuseConfig,
     pub unix: UnixConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbuseConfig {
+    pub enabled: bool,
+    pub connection_rate_per_second: u32,
+    pub connection_burst: u32,
+    pub event_rate_per_second: u32,
+    pub event_burst: u32,
+    pub pubkey_event_rate_per_second: u32,
+    pub pubkey_event_burst: u32,
+    pub req_rate_per_second: u32,
+    pub req_burst: u32,
+    pub count_rate_per_second: u32,
+    pub count_burst: u32,
+    pub max_concurrent_historical_queries: usize,
+    pub max_query_cost: u64,
+    pub max_stored_events_per_pubkey: u64,
+    pub min_pow_difficulty: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +309,23 @@ impl Default for Config {
                     max_kinds_per_filter: 3,
                     allowed_kinds: String::new(),
                     require_author_or_tag: false,
+                },
+                abuse: AbuseConfig {
+                    enabled: true,
+                    connection_rate_per_second: 10,
+                    connection_burst: 50,
+                    event_rate_per_second: 50,
+                    event_burst: 100,
+                    pubkey_event_rate_per_second: 25,
+                    pubkey_event_burst: 50,
+                    req_rate_per_second: 20,
+                    req_burst: 40,
+                    count_rate_per_second: 5,
+                    count_burst: 10,
+                    max_concurrent_historical_queries: 8,
+                    max_query_cost: 1_000,
+                    max_stored_events_per_pubkey: 0,
+                    min_pow_difficulty: 0,
                 },
                 unix: UnixConfig {
                     enabled: false,

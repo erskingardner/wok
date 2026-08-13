@@ -36,6 +36,23 @@ restrict_read_to_involved_pubkey = true
 name = "wok"
 description = "This is a wok instance."
 
+[relay.abuse]
+enabled = true
+connection_rate_per_second = 10
+connection_burst = 50
+event_rate_per_second = 50
+event_burst = 100
+pubkey_event_rate_per_second = 25
+pubkey_event_burst = 50
+req_rate_per_second = 20
+req_burst = 40
+count_rate_per_second = 5
+count_burst = 10
+max_concurrent_historical_queries = 8
+max_query_cost = 1000
+max_stored_events_per_pubkey = 0
+min_pow_difficulty = 0
+
 [relay.unix]
 enabled = false
 path = "./wok-db/wok.sock"

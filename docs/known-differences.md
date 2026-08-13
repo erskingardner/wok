@@ -28,6 +28,11 @@ it is not a promise to reproduce upstream bugs.
   checks they reach matching active subscriptions without being written to
   LMDB or negentropy. Operators can explicitly select `ttl` compatibility mode,
   and migrated historical ephemeral records continue to age out through cron.
+- Wok has native, reloadable abuse controls rather than delegating every
+  admission decision to a write-policy plugin: IP/pubkey token buckets,
+  pre-scan query costing, historical-query concurrency, author storage quotas,
+  and optional NIP-13 proof of work. Migrated configs receive the documented
+  Wok defaults and the preflight prints them for review.
 - Restricted reads require completed NIP-42 authentication. Wok also delivers
   authenticated state to the negentropy worker and keeps one usable challenge
   per session; the pinned strfry implementation does not complete those paths

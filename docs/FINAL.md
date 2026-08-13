@@ -54,7 +54,8 @@ C++ reference source was not modified. Final `git status` in `/Users/jeff/code/s
 Suite: `crates/wok-compat/tests/nip_conformance.rs` (independent of C++).
 
 Covered relay behavior: NIP-01 structure/ID/sig/filters/EOSE/malformed and
-unknown commands; NIP-09 deletion; NIP-11 advertisement; NIP-40 expiration;
+unknown commands; NIP-09 deletion; NIP-11 advertisement; optional NIP-13
+proof-of-work admission; NIP-40 expiration;
 NIP-42 AUTH (advertised only with `serviceUrl`); NIP-45 COUNT; NIP-59
 gift-wrap access/deletion behavior and live-only kind 21059 delivery; NIP-70
 protected events; and NIP-77

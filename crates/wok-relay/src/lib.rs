@@ -1,5 +1,6 @@
 //! Transport-neutral Nostr relay core.
 
+pub mod abuse;
 pub mod capabilities;
 pub mod config;
 pub mod metrics;

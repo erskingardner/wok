@@ -12,6 +12,7 @@ arbitrary list.
 | 01 | Basic protocol | `wok-event`, `wok-relay`, `wok-query` | `nip_conformance.rs`, `e2e_transports.rs` | always |
 | 09 | Event deletion | `wok-db` write kind 5 | db write tests | always |
 | 11 | Relay information | `wok-ws` | `nip_conformance.rs` | always |
+| 13 | Proof of work | leading-zero validation + NIP-11 minimum | relay tests | `relay.abuse.enabled` and `min_pow_difficulty > 0` |
 | 40 | Expiration | packed expiration + cron | `nip_conformance.rs` | always |
 | 42 | AUTH | ingest AUTH | unit + e2e when serviceUrl set | AUTH enabled and serviceUrl set |
 | 45 | COUNT | REQ worker | `nip_conformance.rs` | `maxFilterLimitCount > 0` |

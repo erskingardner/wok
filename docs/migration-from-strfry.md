@@ -81,6 +81,9 @@ identical semantics. Before starting Wok, review at least:
 - ephemeral-event policy: migrated records remain intact and age out normally,
   while newly accepted ephemeral kinds are live-only unless you explicitly set
   `events.ephemeral_persistence = "ttl"`;
+- native `relay.abuse` budgets, query-cost/concurrency limits, optional storage
+  quotas, and NIP-13 difficulty; these are Wok settings with no strfry key to
+  translate and are enabled with documented Wok defaults;
 - relative filesystem paths, because the generated config has a new location;
 - listener, reverse-proxy, AUTH, and NIP-11 settings;
 - Unix socket ownership and access settings if enabling Wok's Unix transport;

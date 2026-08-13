@@ -280,6 +280,7 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
             "Review plugin, write-policy, and socket paths before cutover.",
             "Only supported strfry settings were translated into Wok TOML.",
             "New ephemeral events are live-only by default; set events.ephemeral_persistence = \"ttl\" for strfry-compatible retention.",
+            "Wok native abuse controls are enabled by default; review relay.abuse budgets and quotas before cutover.",
         ],
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;

@@ -18,6 +18,24 @@ to matching active subscriptions, but never enter LMDB, historical queries, or
 negentropy. Set it to `"ttl"` only for strfry-compatible persisted-then-expired
 behavior; `events.ephemeral_lifetime_secs` controls that retention window.
 
+`relay.abuse` is enabled by default. It provides independent token buckets for
+connection opens, EVENT, REQ, and COUNT by network address; authenticated
+clients also consume pubkey budgets, while all valid events consume their
+author pubkey's publication budget. Historical queries are assigned a
+conservative index-breadth cost before any LMDB cursor opens and have a
+separate per-connection concurrency limit. Set
+`max_stored_events_per_pubkey` to a nonzero value for a hard author storage
+quota. A rate or burst of zero disables that individual token bucket;
+`max_query_cost = 0` and `max_stored_events_per_pubkey = 0` mean unlimited.
+`max_concurrent_historical_queries = 0` disables new historical queries.
+
+`min_pow_difficulty` is optional NIP-13 enforcement. At zero Wok neither
+requires proof of work nor advertises NIP-13. A nonzero value rejects events
+whose ID has fewer leading zero bits and publishes the effective value as
+NIP-11 `limitation.min_pow_difficulty`. Unix-socket connections bypass only the
+IP/connection buckets; query, author, storage, and proof-of-work policies still
+apply.
+
 Unix-only keys:
 
 | key | default | meaning |

@@ -6,6 +6,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::field_reassign_with_default)]
 
+use crate::abuse::{leading_zero_bits, AbuseController, BudgetKind};
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
 use crate::plugin::{PluginEventSifter, PluginResult};
@@ -206,6 +207,7 @@ pub struct RelayHandle {
     pub config: Arc<parking_lot::RwLock<Config>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
+    abuse: Arc<AbuseController>,
 }
 
 pub enum IngestMsg {
@@ -307,6 +309,20 @@ impl RelayHandle {
         self.conns.insert(conn_id, out);
     }
 
+    /// Apply the connection-opening budget before a WebSocket upgrade.
+    pub fn admit_connection(&self, ip: &[u8]) -> bool {
+        let cfg = self.config.read();
+        let admitted = self
+            .abuse
+            .admit_ip(ip, BudgetKind::Connection, &cfg.relay.abuse);
+        if !admitted {
+            self.metrics
+                .abuse_connection_rejections
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
+    }
+
     pub async fn client_message(&self, conn_id: u64, ip: Vec<u8>, payload: String) {
         let _ = self
             .ingest_route(conn_id)
@@ -356,6 +372,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let conns = Arc::new(ConnTable::new());
     let metrics = Arc::new(Metrics::default());
     let shutdown = Arc::new(AtomicBool::new(false));
+    let abuse = Arc::new(AbuseController::default());
 
     // One channel per worker thread. Connections are pinned to a worker by
     // conn_id % pool_size, exactly like C++ ThreadPool dispatch, so all
@@ -381,6 +398,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         config: config.clone(),
         shutdown: shutdown.clone(),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        abuse: abuse.clone(),
     };
 
     for (i, ingest_rx) in ingest_rxs.into_iter().enumerate() {
@@ -391,11 +409,12 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let writer_tx = writer_tx.clone();
         let req_txs = req_txs.clone();
         let neg_txs = neg_txs.clone();
+        let abuse = abuse.clone();
         thread::Builder::new()
             .name(format!("ingester-{i}"))
             .spawn(move || {
                 run_ingester(
-                    env, cfg, conns, metrics, ingest_rx, writer_tx, req_txs, neg_txs,
+                    env, cfg, conns, metrics, abuse, ingest_rx, writer_tx, req_txs, neg_txs,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -562,6 +581,7 @@ fn run_ingester(
     cfg: Arc<parking_lot::RwLock<Config>>,
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
+    abuse: Arc<AbuseController>,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
     writer_tx: Sender<WriterMsg>,
     req_txs: Vec<Sender<ReqMsg>>,
@@ -589,7 +609,7 @@ fn run_ingester(
             } => {
                 let cfg_snap = cfg.read().clone();
                 handle_client(
-                    &env, &cfg_snap, &conns, &metrics, &mut auth, conn_id, ip, &payload,
+                    &env, &cfg_snap, &conns, &metrics, &abuse, &mut auth, conn_id, ip, &payload,
                     &writer_tx, &req_txs, &neg_txs,
                 );
             }
@@ -603,6 +623,7 @@ fn handle_client(
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
+    abuse: &AbuseController,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     ip: Vec<u8>,
@@ -622,7 +643,25 @@ fn handle_client(
         ClientCommand::Newline => {}
         ClientCommand::Event(v) => {
             metrics.client_event.fetch_add(1, Ordering::Relaxed);
-            ingest_event(env, cfg, conns, metrics, auth, conn_id, ip, v, writer_tx);
+            if !abuse.admit_ip(&ip, BudgetKind::Event, &cfg.relay.abuse) {
+                metrics
+                    .abuse_event_rate_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                let id = v.get("id").and_then(Value::as_str).unwrap_or("?");
+                conns.send(
+                    conn_id,
+                    RelayMessage::Ok {
+                        event_id: id.into(),
+                        accepted: false,
+                        message: "rate-limited: EVENT budget exhausted".into(),
+                    },
+                    metrics,
+                );
+                return;
+            }
+            ingest_event(
+                env, cfg, conns, metrics, abuse, auth, conn_id, ip, v, writer_tx,
+            );
         }
         ClientCommand::Auth(v) => {
             metrics.client_auth.fetch_add(1, Ordering::Relaxed);
@@ -639,6 +678,22 @@ fn handle_client(
         }
         ClientCommand::Req { sub_id, filters } => {
             metrics.client_req.fetch_add(1, Ordering::Relaxed);
+            let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
+            if !abuse.admit_ip(&ip, BudgetKind::Req, &cfg.relay.abuse)
+                || pubkey
+                    .as_ref()
+                    .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
+            {
+                metrics
+                    .abuse_req_rate_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                conns.send(
+                    conn_id,
+                    RelayMessage::closed_error(&sub_id, "rate-limited: REQ budget exhausted"),
+                    metrics,
+                );
+                return;
+            }
             ingest_req(
                 cfg,
                 conns,
@@ -653,6 +708,22 @@ fn handle_client(
         }
         ClientCommand::Count { sub_id, filters } => {
             metrics.client_count.fetch_add(1, Ordering::Relaxed);
+            let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
+            if !abuse.admit_ip(&ip, BudgetKind::Count, &cfg.relay.abuse)
+                || pubkey
+                    .as_ref()
+                    .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Count, &cfg.relay.abuse))
+            {
+                metrics
+                    .abuse_count_rate_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                conns.send(
+                    conn_id,
+                    RelayMessage::closed_error(&sub_id, "rate-limited: COUNT budget exhausted"),
+                    metrics,
+                );
+                return;
+            }
             ingest_req(
                 cfg,
                 conns,
@@ -688,6 +759,26 @@ fn handle_client(
             filter,
             payload_hex,
         } => {
+            let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
+            if !abuse.admit_ip(&ip, BudgetKind::Req, &cfg.relay.abuse)
+                || pubkey
+                    .as_ref()
+                    .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
+            {
+                metrics
+                    .abuse_req_rate_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                conns.send(
+                    conn_id,
+                    RelayMessage::NegErr {
+                        sub_id,
+                        message: "rate-limited: NEG-OPEN budget exhausted".into(),
+                        extra: None,
+                    },
+                    metrics,
+                );
+                return;
+            }
             if !cfg.relay.negentropy_enabled {
                 conns.send(
                     conn_id,
@@ -779,6 +870,7 @@ fn ingest_event(
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
+    abuse: &AbuseController,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     ip: Vec<u8>,
@@ -813,6 +905,42 @@ fn ingest_event(
     };
     let packed = parsed.packed.view();
     let id_hex = to_hex(packed.id());
+
+    if cfg.relay.abuse.enabled {
+        if leading_zero_bits(packed.id()) < cfg.relay.abuse.min_pow_difficulty as u16 {
+            metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
+            conns.send(
+                conn_id,
+                RelayMessage::Ok {
+                    event_id: id_hex,
+                    accepted: false,
+                    message: format!(
+                        "pow: difficulty {} required",
+                        cfg.relay.abuse.min_pow_difficulty
+                    ),
+                },
+                metrics,
+            );
+            return;
+        }
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(packed.pubkey());
+        if !abuse.admit_pubkey(&pubkey, BudgetKind::Event, &cfg.relay.abuse) {
+            metrics
+                .abuse_event_rate_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            conns.send(
+                conn_id,
+                RelayMessage::Ok {
+                    event_id: id_hex,
+                    accepted: false,
+                    message: "rate-limited: author EVENT budget exhausted".into(),
+                },
+                metrics,
+            );
+            return;
+        }
+    }
 
     if REPOST_KINDS.contains(&packed.kind())
         && orig
@@ -1132,6 +1260,27 @@ fn ingest_req(
         fail_closed(format!("filter validation failed: {e}"));
         return;
     }
+    let query_cost = fg.estimated_cost(count_only);
+    if cfg.relay.abuse.enabled
+        && cfg.relay.abuse.max_query_cost != 0
+        && query_cost > cfg.relay.abuse.max_query_cost
+    {
+        metrics
+            .abuse_query_cost_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        conns.send(
+            conn_id,
+            RelayMessage::closed_error(
+                &sub_id,
+                format!(
+                    "rate-limited: estimated query cost {query_cost} exceeds {}",
+                    cfg.relay.abuse.max_query_cost
+                ),
+            ),
+            metrics,
+        );
+        return;
+    }
 
     let authed = auth.get(&conn_id).and_then(|a| a.authed);
     let r = restrictor(cfg);
@@ -1193,6 +1342,28 @@ fn ingest_neg(
         let max_limit = cfg.relay.max_sync_events + 1;
         let fg = NostrFilterGroup::from_value(&filter, max_limit, cfg.relay.max_tags_per_filter)
             .map_err(|e| e.to_string())?;
+        let query_cost = fg.estimated_cost(false);
+        if cfg.relay.abuse.enabled
+            && cfg.relay.abuse.max_query_cost != 0
+            && query_cost > cfg.relay.abuse.max_query_cost
+        {
+            metrics
+                .abuse_query_cost_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            conns.send(
+                conn_id,
+                RelayMessage::NegErr {
+                    sub_id: sub_id.to_string(),
+                    message: format!(
+                        "rate-limited: estimated query cost {query_cost} exceeds {}",
+                        cfg.relay.abuse.max_query_cost
+                    ),
+                    extra: None,
+                },
+                metrics,
+            );
+            return Ok(());
+        }
         let r = restrictor(cfg);
         if r.is_filter_group_fully_restricted(&fg)
             && auth.get(&conn_id).and_then(|a| a.authed).is_none()
@@ -1264,6 +1435,7 @@ fn run_writer(
         }
         let cfg_snap = cfg.read().clone();
         let mut events: Vec<(u64, EventToWrite)> = Vec::new();
+        let mut quota_counts: HashMap<[u8; 32], u64> = HashMap::new();
         for m in batch {
             if let WriterMsg::AddEvent {
                 conn_id,
@@ -1320,6 +1492,67 @@ fn run_writer(
                             &metrics,
                         );
                     } else {
+                        if cfg_snap.relay.abuse.enabled
+                            && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0
+                        {
+                            let packed_view = match PackedEventView::new(&packed) {
+                                Ok(packed) => packed,
+                                Err(error) => {
+                                    conns.send(
+                                        conn_id,
+                                        RelayMessage::Ok {
+                                            event_id: "?".into(),
+                                            accepted: false,
+                                            message: format!("invalid: {error}"),
+                                        },
+                                        &metrics,
+                                    );
+                                    continue;
+                                }
+                            };
+                            let mut pubkey = [0u8; 32];
+                            pubkey.copy_from_slice(packed_view.pubkey());
+                            let count = match quota_counts.entry(pubkey) {
+                                std::collections::hash_map::Entry::Occupied(entry) => {
+                                    *entry.into_mut()
+                                }
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    match stored_event_count(&env, &pubkey) {
+                                        Ok(count) => *entry.insert(count),
+                                        Err(error) => {
+                                            conns.send(
+                                                conn_id,
+                                                RelayMessage::Ok {
+                                                    event_id: to_hex(packed_view.id()),
+                                                    accepted: false,
+                                                    message: format!("Write error: {error}"),
+                                                },
+                                                &metrics,
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+                            if count >= cfg_snap.relay.abuse.max_stored_events_per_pubkey {
+                                metrics
+                                    .abuse_pubkey_quota_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
+                                conns.send(
+                                    conn_id,
+                                    RelayMessage::Ok {
+                                        event_id: to_hex(packed_view.id()),
+                                        accepted: false,
+                                        message: "blocked: author storage quota exceeded".into(),
+                                    },
+                                    &metrics,
+                                );
+                                continue;
+                            }
+                            if let Some(count) = quota_counts.get_mut(&pubkey) {
+                                *count = count.saturating_add(1);
+                            }
+                        }
                         events.push((conn_id, EventToWrite::new(packed, json)));
                     }
                 } else {
@@ -1418,6 +1651,26 @@ fn run_writer(
     }
 }
 
+fn stored_event_count(env: &Env, pubkey: &[u8; 32]) -> Result<u64, wok_db::DbError> {
+    let txn = env.begin_ro()?;
+    let start = wok_db::keys::make_key_string_u64(pubkey, 0);
+    let end = wok_db::keys::make_key_string_u64(pubkey, u64::MAX);
+    let mut count = 0u64;
+    txn.foreach_full(
+        txn.env().dbis().event_pubkey,
+        &start,
+        &end,
+        false,
+        |key, _| {
+            if key.starts_with(pubkey) {
+                count = count.saturating_add(1);
+            }
+            true
+        },
+    )?;
+    Ok(count)
+}
+
 fn render_ip(ip: &[u8]) -> String {
     if ip.len() == 4 {
         format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
@@ -1437,7 +1690,7 @@ fn run_req_worker(
     rx: Receiver<ReqMsg>,
     mon_txs: Vec<Sender<MonitorMsg>>,
 ) {
-    let mut queries = QueryScheduler::new(cfg.read().relay.max_subs_per_connection);
+    let mut queries = QueryScheduler::new(cfg.read().relay.abuse.max_concurrent_historical_queries);
     let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
     let mut decomp = Decompressor::new();
     loop {
@@ -1454,6 +1707,7 @@ fn run_req_worker(
             }
         };
         let cfg_snap = cfg.read();
+        queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
         let r = restrictor(&cfg_snap);
         let txn = match env.begin_ro() {
             Ok(t) => t,
@@ -1463,10 +1717,17 @@ fn run_req_worker(
             match msg {
                 ReqMsg::NewSub(sub) => {
                     let conn = sub.conn_id;
+                    let sub_id = sub.sub_id.to_string();
                     if !queries.add_sub(&txn, sub).unwrap_or(false) {
+                        metrics
+                            .abuse_query_concurrency_rejections
+                            .fetch_add(1, Ordering::Relaxed);
                         conns.send(
                             conn,
-                            RelayMessage::notice_error("too many concurrent REQs"),
+                            RelayMessage::closed_error(
+                                &sub_id,
+                                "rate-limited: too many concurrent historical queries",
+                            ),
                             &metrics,
                         );
                     }
@@ -1706,7 +1967,7 @@ fn run_negentropy(
     rx: Receiver<NegMsg>,
 ) {
     let mut views: HashMap<(u64, String), NegView> = HashMap::new();
-    let mut queries = QueryScheduler::new(cfg.read().relay.max_subs_per_connection);
+    let mut queries = QueryScheduler::new(cfg.read().relay.abuse.max_concurrent_historical_queries);
     queries.ensure_exists = false;
     let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
     let max_subs = cfg.read().relay.max_subs_per_connection;
@@ -1724,6 +1985,7 @@ fn run_negentropy(
             }
         };
         let cfg_snap = cfg.read().clone();
+        queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
         let txn = match env.begin_ro() {
             Ok(t) => t,
             Err(_) => continue,
@@ -1784,9 +2046,18 @@ fn run_negentropy(
                                 );
                             }
                             _ => {
+                                metrics
+                                    .abuse_query_concurrency_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
                                 conns.send(
                                     conn,
-                                    RelayMessage::notice_error("too many concurrent REQs"),
+                                    RelayMessage::NegErr {
+                                        sub_id: sid,
+                                        message:
+                                            "rate-limited: too many concurrent historical queries"
+                                                .into(),
+                                        extra: None,
+                                    },
                                     &metrics,
                                 );
                             }
@@ -2083,16 +2354,28 @@ mod tests {
     use secp256k1::{Keypair, SECP256K1};
     use wok_db::EnvOptions;
 
-    fn sign_event(mut ev: Value) -> Value {
+    fn sign_event(ev: Value) -> Value {
         let mut rng = rand::thread_rng();
         let kp = Keypair::new(SECP256K1, &mut rng);
+        sign_event_with_key(ev, &kp)
+    }
+
+    fn sign_event_with_key(mut ev: Value, kp: &Keypair) -> Value {
         let (xonly, _) = kp.x_only_public_key();
         ev["pubkey"] = json!(hex::encode(xonly.serialize()));
         let id = wok_event::event_id_hash(&ev).unwrap();
         ev["id"] = json!(hex::encode(id));
-        let sig = SECP256K1.sign_schnorr(&id, &kp);
+        let sig = SECP256K1.sign_schnorr(&id, kp);
         ev["sig"] = json!(hex::encode(sig.as_ref()));
         ev
+    }
+
+    async fn recv_outbound(rx: &mut tokio::sync::mpsc::Receiver<OutboundFrame>) -> String {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound closed")
+            .into_text()
     }
 
     fn now_secs() -> u64 {
@@ -2168,6 +2451,150 @@ mod tests {
         let msg = got.expect("expected outbound OK");
         assert!(msg.contains("\"OK\""), "got {msg}");
         assert!(msg.contains("true"), "got {msg}");
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pow_policy_rejects_insufficient_event_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        cfg.relay.abuse.min_pow_difficulty = 255;
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "no-pow"
+        }));
+        handle
+            .client_message(
+                conn,
+                vec![127, 0, 0, 1],
+                json!(["EVENT", event]).to_string(),
+            )
+            .await;
+        let response = recv_outbound(&mut rx).await;
+        assert!(response.contains("\"OK\"") && response.contains("false"));
+        assert!(response.contains("pow: difficulty 255 required"));
+        assert_eq!(
+            handle.metrics.abuse_pow_rejections.load(Ordering::Relaxed),
+            1
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_cost_is_rejected_before_scheduling() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        cfg.relay.abuse.max_query_cost = 10;
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        handle
+            .client_message(
+                conn,
+                vec![127, 0, 0, 1],
+                json!(["REQ", "broad", {}]).to_string(),
+            )
+            .await;
+        let response = recv_outbound(&mut rx).await;
+        assert!(response.contains("\"CLOSED\"") && response.contains("query cost 1000"));
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_query_cost_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn historical_query_concurrency_is_independent_from_live_subscription_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        cfg.relay.max_subs_per_connection = 200;
+        cfg.relay.abuse.max_concurrent_historical_queries = 0;
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        handle
+            .client_message(
+                conn,
+                vec![127, 0, 0, 1],
+                json!(["REQ", "limited", {"kinds":[1]}]).to_string(),
+            )
+            .await;
+        let response = recv_outbound(&mut rx).await;
+        assert!(response.contains("\"CLOSED\"") && response.contains("concurrent historical"));
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_query_concurrency_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn author_storage_quota_is_enforced_by_the_single_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        cfg.relay.abuse.max_stored_events_per_pubkey = 1;
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        let mut rng = rand::thread_rng();
+        let key = Keypair::new(SECP256K1, &mut rng);
+        for content in ["first", "second"] {
+            let event = sign_event_with_key(
+                json!({
+                    "created_at": now_secs(), "kind": 1, "tags": [], "content": content
+                }),
+                &key,
+            );
+            handle
+                .client_message(
+                    conn,
+                    vec![127, 0, 0, 1],
+                    json!(["EVENT", event]).to_string(),
+                )
+                .await;
+            let response = recv_outbound(&mut rx).await;
+            if content == "first" {
+                assert!(response.contains("true"), "{response}");
+            } else {
+                assert!(response.contains("false") && response.contains("storage quota"));
+            }
+        }
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_pubkey_quota_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
         handle.request_shutdown();
     }
 }

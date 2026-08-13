@@ -51,10 +51,12 @@ See `docs/known-differences.md` as it is filled in. Initial decisions:
 - **Unix socket** is a wok extension. It is disabled by default and is not advertised as a C++-compatible feature.
 - **NIP advertisement** lists only capabilities covered by conformance tests.
 - **`foreach_full` must not use `MDB_GET_BOTH_RANGE` on non-`DUPSORT` DBIs.** Integer-key tables (Event, Meta, EventPayload, NegentropyFilter) return `MDB_INCOMPATIBLE` otherwise. This blocked the relay write path once the default `{}` negentropy filter caused `DeferredSink` to scan NegentropyFilter.
+- **Auth strictness follows intent, not the letter of C++ @9acdaeb.** Fully-restricted REQ/NEG-OPEN require a *completed* auth (C++: any session); `SetAuth` is dispatched to the negentropy worker (C++ defines but never dispatches); one challenge per session vacancy (C++ re-sends an unstored challenge per restricted REQ). See docs/known-differences.md.
+- **JSON byte parity is with tao::json, not serde_json.** Duplicate keys rejected, U+007F escaped, ryu d2s f64 formatting. All ingress parsing goes through `wok_event::json::parse_strict`; hashing and stored JSON go through `to_tao_string`.
 
 ## Status
 
-Phases 1–6 are implemented. See `docs/FINAL.md` for gates, evidence, and remaining production soak work.
+Phases 1–6 are implemented. See `docs/FINAL.md` for gates, evidence, and remaining production soak work. A full second-pass review against the C++ source landed additional correctness fixes; see the "Post-review hardening" section of `docs/FINAL.md`.
 
 ## Non-goals
 

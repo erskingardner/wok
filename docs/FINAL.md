@@ -82,14 +82,48 @@ Approximate unit/integration count from the last workspace run: 86 non-empty tes
 
 ## Known limitations
 
+See `docs/known-differences.md` for the full, current list. Highlights:
+
 - WebSocket permessage-deflate is not implemented (tungstenite 0.26 has no deflate feature).
 - Config file hot-reload is not wired; restart to apply config.
+- No graceful-shutdown drain; listeners abort on shutdown.
 - `dict train/compress/decompress` reads compressed payloads but does not train dictionaries.
-- `router` is a compatibility stub; use `stream` / `sync`.
-- Ingester/req/monitor/negentropy thread *counts* are accepted; this build runs one thread per pool plus a single writer.
+- `router` is a compatibility stub; `stream`/`sync` do not persist events.
+- Ingester/req/monitor/negentropy thread *counts* are parsed; this build runs one thread per pool plus a single writer.
 - Persistent negentropy B-tree byte identity with C++ is implemented but not proven by a dedicated tree-dump differential.
 - ID/author filters are exact 32 bytes (C++), not NIP-01 prefixes.
 - Historical restricted-kind REQ filtering uses PackedEvent from the Event table (intentional; C++ ReqWorker currently views payload bytes).
+
+## Post-review hardening (second pass)
+
+A full second review against the C++ source produced these fix commits:
+
+- `foreach_full` forward positioning now matches `generic_foreachFull`
+  (`MDB_NEXT_NODUP` skip) with regression tests.
+- tao::json byte parity: duplicate-key rejection, U+007F escaping, and ryu
+  f64 presentation in the id-hash preimage and stored JSON; strict
+  `parseUint64`/`stoull`/`from_hex` semantics.
+- Relay error routing matches `RelayIngester.cpp` exactly (OK for EVENT/AUTH
+  failures, CLOSED for REQ/COUNT failures, prefixed NOTICEs), pinned by an
+  e2e conformance test.
+- Negentropy stateless (tree-backed) sessions survive multiple NEG-MSG
+  rounds; memory-view cleanup, per-conn view caps, and pre-restriction
+  `maxSyncEvents` counting match `RelayNegentropy.cpp`.
+- Writer closed-connection set is batch-local (no conn-id leak).
+- Every strfry.conf key the server reads is parsed (strictly), including
+  filterValidation; the real strfry.conf parses cleanly.
+- Write-path LMDB errors propagate like C++ instead of being swallowed.
+- Transports apply true async backpressure on the ingest queue (no blocking
+  Tokio workers) and terminate slow clients at `maxPendingOutboundBytes`
+  with byte accounting; WS auto-ping, keepalive, version check, and
+  case-insensitive upgrade handling.
+- Write-policy plugin I/O enforces `timeoutSeconds` and the 8192-byte record
+  cap via a dedicated I/O thread; a hung plugin can no longer wedge the
+  single LMDB writer.
+- A polling `data.mdb` watcher notifies live subscriptions of writes made by
+  other processes (C++ `file_change_monitor` parity).
+- CLI: `wok event <levId>`; import/export byte-level fidelity with C++
+  (abort-on-error export, import size accounting, fried endianness guards).
 
 ## Recommended production soak and cutover
 

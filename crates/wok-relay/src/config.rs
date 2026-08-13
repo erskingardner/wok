@@ -131,7 +131,8 @@ impl Default for Config {
                 auth: AuthConfig {
                     enabled: true,
                     service_url: String::new(),
-                    restricted_read_kinds: vec![4, 1059],
+                    // C++ strfry.conf default is "" (no restricted kinds).
+                    restricted_read_kinds: Vec::new(),
                     restrict_read_to_involved_pubkey: true,
                 },
                 info: InfoConfig {
@@ -207,97 +208,237 @@ impl Config {
         if let Some(v) = map.get("db") {
             cfg.db = PathBuf::from(v.clone());
         }
-        if let Some(v) = map.get("dbParams.maxreaders") {
-            cfg.db_maxreaders = v.parse().unwrap_or(cfg.db_maxreaders);
-        }
-        if let Some(v) = map.get("dbParams.mapsize") {
-            cfg.db_mapsize = v.parse().unwrap_or(cfg.db_mapsize);
-        }
-        if let Some(v) = map.get("dbParams.noReadAhead") {
-            cfg.db_no_read_ahead = v == "true";
-        }
+        assign_u64(&map, "dbParams.maxreaders", |n| {
+            cfg.db_maxreaders = n as u32;
+            Ok(())
+        })?;
+        assign_u64(&map, "dbParams.mapsize", |n| {
+            cfg.db_mapsize = n as usize;
+            Ok(())
+        })?;
+        assign_bool(&map, "dbParams.noReadAhead", |b| cfg.db_no_read_ahead = b)?;
         assign_u64(&map, "events.maxEventSize", |n| {
-            cfg.events.max_event_size = n as usize
-        });
+            cfg.events.max_event_size = n as usize;
+            Ok(())
+        })?;
         assign_u64(&map, "events.rejectEventsNewerThanSeconds", |n| {
-            cfg.events.reject_newer_than_secs = n
-        });
+            cfg.events.reject_newer_than_secs = n;
+            Ok(())
+        })?;
         assign_u64(&map, "events.rejectEventsOlderThanSeconds", |n| {
-            cfg.events.reject_older_than_secs = n
-        });
+            cfg.events.reject_older_than_secs = n;
+            Ok(())
+        })?;
         assign_u64(&map, "events.rejectEphemeralEventsOlderThanSeconds", |n| {
-            cfg.events.reject_ephemeral_older_than_secs = n
-        });
+            cfg.events.reject_ephemeral_older_than_secs = n;
+            Ok(())
+        })?;
         assign_u64(&map, "events.ephemeralEventsLifetimeSeconds", |n| {
-            cfg.events.ephemeral_lifetime_secs = n
-        });
+            cfg.events.ephemeral_lifetime_secs = n;
+            Ok(())
+        })?;
         assign_u64(&map, "events.maxNumTags", |n| {
-            cfg.events.max_num_tags = n as usize
-        });
+            cfg.events.max_num_tags = n as usize;
+            Ok(())
+        })?;
         assign_u64(&map, "events.maxTagValSize", |n| {
-            cfg.events.max_tag_val_size = n as usize
-        });
+            cfg.events.max_tag_val_size = n as usize;
+            Ok(())
+        })?;
         if let Some(v) = map.get("relay.bind") {
             cfg.relay.bind = v.clone();
         }
-        assign_u64(&map, "relay.port", |n| cfg.relay.port = n as u16);
-        if let Some(v) = map.get("relay.auth.enabled") {
-            cfg.relay.auth.enabled = v == "true";
+        assign_u64(&map, "relay.port", |n| {
+            if n > u16::MAX as u64 {
+                return Err("relay.port out of range".into());
+            }
+            cfg.relay.port = n as u16;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.nofiles", |n| {
+            cfg.relay.nofiles = n;
+            Ok(())
+        })?;
+        if let Some(v) = map.get("relay.realIpHeader") {
+            cfg.relay.real_ip_header = v.clone();
         }
+        assign_bool(&map, "relay.auth.enabled", |b| cfg.relay.auth.enabled = b)?;
         if let Some(v) = map.get("relay.auth.serviceUrl") {
             cfg.relay.auth.service_url = v.clone();
         }
         if let Some(v) = map.get("relay.auth.restrictedReadKinds") {
-            cfg.relay.auth.restricted_read_kinds = parse_kinds(v);
+            cfg.relay.auth.restricted_read_kinds = parse_kinds(v)?;
         }
-        if let Some(v) = map.get("relay.auth.restrictReadToInvolvedPubkey") {
-            cfg.relay.auth.restrict_read_to_involved_pubkey = v != "false";
-        }
+        assign_bool(&map, "relay.auth.restrictReadToInvolvedPubkey", |b| {
+            cfg.relay.auth.restrict_read_to_involved_pubkey = b
+        })?;
         if let Some(v) = map.get("relay.info.name") {
             cfg.relay.info.name = v.clone();
         }
         if let Some(v) = map.get("relay.info.description") {
             cfg.relay.info.description = v.clone();
         }
+        if let Some(v) = map.get("relay.info.pubkey") {
+            cfg.relay.info.pubkey = v.clone();
+        }
+        if let Some(v) = map.get("relay.info.self") {
+            cfg.relay.info.self_pk = v.clone();
+        }
+        if let Some(v) = map.get("relay.info.contact") {
+            cfg.relay.info.contact = v.clone();
+        }
+        if let Some(v) = map.get("relay.info.icon") {
+            cfg.relay.info.icon = v.clone();
+        }
+        if let Some(v) = map.get("relay.info.banner") {
+            cfg.relay.info.banner = v.clone();
+        }
+        if let Some(v) = map.get("relay.info.privacy") {
+            cfg.relay.info.privacy = v.clone();
+        }
+        if let Some(v) = map.get("relay.info.terms") {
+            cfg.relay.info.terms = v.clone();
+        }
         if let Some(v) = map.get("relay.info.nips") {
             cfg.relay.info.nips = v.clone();
         }
         assign_u64(&map, "relay.maxWebsocketPayloadSize", |n| {
-            cfg.relay.max_websocket_payload_size = n as usize
-        });
+            cfg.relay.max_websocket_payload_size = n as usize;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.maxReqFilterSize", |n| {
+            cfg.relay.max_req_filter_size = n as usize;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.autoPingSeconds", |n| {
+            cfg.relay.auto_ping_seconds = n;
+            Ok(())
+        })?;
+        assign_bool(&map, "relay.enableTcpKeepalive", |b| {
+            cfg.relay.enable_tcp_keepalive = b
+        })?;
+        assign_u64(&map, "relay.queryTimesliceBudgetMicroseconds", |n| {
+            cfg.relay.query_timeslice_budget_us = n;
+            Ok(())
+        })?;
         assign_u64(&map, "relay.maxFilterLimit", |n| {
-            cfg.relay.max_filter_limit = n
-        });
+            cfg.relay.max_filter_limit = n;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.maxTagsPerFilter", |n| {
+            cfg.relay.max_tags_per_filter = n as usize;
+            Ok(())
+        })?;
         assign_u64(&map, "relay.maxFilterLimitCount", |n| {
-            cfg.relay.max_filter_limit_count = n
-        });
+            cfg.relay.max_filter_limit_count = n;
+            Ok(())
+        })?;
         assign_u64(&map, "relay.maxSubsPerConnection", |n| {
-            cfg.relay.max_subs_per_connection = n as usize
-        });
+            cfg.relay.max_subs_per_connection = n as usize;
+            Ok(())
+        })?;
         assign_u64(&map, "relay.maxPendingOutboundBytes", |n| {
-            cfg.relay.max_pending_outbound_bytes = n as usize
-        });
+            cfg.relay.max_pending_outbound_bytes = n as usize;
+            Ok(())
+        })?;
         if let Some(v) = map.get("relay.writePolicy.plugin") {
             cfg.relay.write_policy_plugin = v.clone();
         }
-        if let Some(v) = map.get("relay.negentropy.enabled") {
-            cfg.relay.negentropy_enabled = v != "false";
+        assign_u64(&map, "relay.writePolicy.timeoutSeconds", |n| {
+            cfg.relay.write_policy_timeout_secs = n;
+            Ok(())
+        })?;
+        assign_bool(&map, "relay.compression.enabled", |b| {
+            cfg.relay.compression_enabled = b
+        })?;
+        assign_bool(&map, "relay.compression.slidingWindow", |b| {
+            cfg.relay.compression_sliding_window = b
+        })?;
+        assign_bool(&map, "relay.logging.dumpInAll", |b| {
+            cfg.relay.dump_in_all = b
+        })?;
+        assign_bool(&map, "relay.logging.dumpInEvents", |b| {
+            cfg.relay.dump_in_events = b
+        })?;
+        assign_bool(&map, "relay.logging.dumpInReqs", |b| {
+            cfg.relay.dump_in_reqs = b
+        })?;
+        assign_bool(&map, "relay.logging.dbScanPerf", |b| {
+            cfg.relay.db_scan_perf = b
+        })?;
+        assign_bool(&map, "relay.logging.invalidEvents", |b| {
+            cfg.relay.invalid_events = b
+        })?;
+        assign_u64(&map, "relay.numThreads.ingester", |n| {
+            cfg.relay.ingester_threads = n as usize;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.numThreads.reqWorker", |n| {
+            cfg.relay.req_worker_threads = n as usize;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.numThreads.reqMonitor", |n| {
+            cfg.relay.req_monitor_threads = n as usize;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.numThreads.negentropy", |n| {
+            cfg.relay.negentropy_threads = n as usize;
+            Ok(())
+        })?;
+        assign_bool(&map, "relay.negentropy.enabled", |b| {
+            cfg.relay.negentropy_enabled = b
+        })?;
+        assign_u64(&map, "relay.negentropy.maxSyncEvents", |n| {
+            cfg.relay.max_sync_events = n;
+            Ok(())
+        })?;
+        assign_bool(&map, "relay.filterValidation.enabled", |b| {
+            cfg.relay.filter_validation.enabled = b
+        })?;
+        assign_u64(&map, "relay.filterValidation.maxFiltersPerReq", |n| {
+            cfg.relay.filter_validation.max_filters_per_req = n;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.filterValidation.minFiltersPerReq", |n| {
+            cfg.relay.filter_validation.min_filters_per_req = n;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.filterValidation.maxKindsPerFilter", |n| {
+            cfg.relay.filter_validation.max_kinds_per_filter = n;
+            Ok(())
+        })?;
+        if let Some(v) = map.get("relay.filterValidation.allowedKinds") {
+            cfg.relay.filter_validation.allowed_kinds = v.clone();
         }
-        if let Some(v) = map.get("relay.unix.enabled") {
-            cfg.relay.unix.enabled = v == "true";
-        }
+        assign_bool(&map, "relay.filterValidation.requireAuthorOrTag", |b| {
+            cfg.relay.filter_validation.require_author_or_tag = b
+        })?;
+        assign_bool(&map, "relay.unix.enabled", |b| cfg.relay.unix.enabled = b)?;
         if let Some(v) = map.get("relay.unix.path") {
             cfg.relay.unix.path = PathBuf::from(v);
         }
-        assign_u64(&map, "relay.unix.mode", |n| cfg.relay.unix.mode = n as u32);
+        if let Some(v) = map.get("relay.unix.mode") {
+            cfg.relay.unix.mode = parse_mode(v)?;
+        }
+        if let Some(v) = map.get("relay.unix.owner") {
+            cfg.relay.unix.owner = v.clone();
+        }
+        if let Some(v) = map.get("relay.unix.group") {
+            cfg.relay.unix.group = v.clone();
+        }
         assign_u64(&map, "relay.unix.maxFrameBytes", |n| {
-            cfg.relay.unix.max_frame_bytes = n as usize
-        });
+            cfg.relay.unix.max_frame_bytes = n as usize;
+            Ok(())
+        })?;
+        assign_u64(&map, "relay.unix.maxPendingOutboundBytes", |n| {
+            cfg.relay.unix.max_pending_outbound_bytes = n as usize;
+            Ok(())
+        })?;
         if let Some(v) = map.get("relay.unix.authUids") {
-            cfg.relay.unix.auth_uids = parse_u32s(v);
+            cfg.relay.unix.auth_uids = parse_u32s(v)?;
         }
         if let Some(v) = map.get("relay.unix.authGids") {
-            cfg.relay.unix.auth_gids = parse_u32s(v);
+            cfg.relay.unix.auth_gids = parse_u32s(v)?;
         }
         Ok(cfg)
     }
@@ -311,56 +452,198 @@ impl Config {
     }
 }
 
-fn assign_u64(map: &BTreeMap<String, String>, key: &str, mut f: impl FnMut(u64)) {
+fn assign_u64(
+    map: &BTreeMap<String, String>,
+    key: &str,
+    mut f: impl FnMut(u64) -> Result<(), String>,
+) -> Result<(), String> {
     if let Some(v) = map.get(key) {
-        if let Ok(n) = v.parse() {
-            f(n);
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("config key {key}: not a uint64: {v:?}"))?;
+        f(n)?;
+    }
+    Ok(())
+}
+
+fn assign_bool(
+    map: &BTreeMap<String, String>,
+    key: &str,
+    mut f: impl FnMut(bool),
+) -> Result<(), String> {
+    if let Some(v) = map.get(key) {
+        match v.as_str() {
+            "true" => f(true),
+            "false" => f(false),
+            _ => return Err(format!("config key {key}: not a bool: {v:?}")),
         }
     }
+    Ok(())
 }
 
-fn parse_kinds(s: &str) -> Vec<u64> {
-    s.split(',').filter_map(|p| p.trim().parse().ok()).collect()
+/// `relay.unix.mode`: accepts octal (`0600`, `0o600`) or decimal (`384`).
+fn parse_mode(v: &str) -> Result<u32, String> {
+    if let Some(o) = v.strip_prefix("0o").or_else(|| v.strip_prefix("0O")) {
+        return u32::from_str_radix(o, 8).map_err(|_| format!("invalid unix.mode: {v:?}"));
+    }
+    if v.len() > 1 && v.starts_with('0') {
+        return u32::from_str_radix(&v[1..], 8).map_err(|_| format!("invalid unix.mode: {v:?}"));
+    }
+    v.parse::<u32>()
+        .map_err(|_| format!("invalid unix.mode: {v:?}"))
 }
 
-fn parse_u32s(s: &str) -> Vec<u32> {
-    s.split(',').filter_map(|p| p.trim().parse().ok()).collect()
+fn parse_kinds(s: &str) -> Result<Vec<u64>, String> {
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    s.split(',')
+        .map(|p| {
+            p.trim()
+                .parse()
+                .map_err(|_| format!("invalid kind entry: {p:?}"))
+        })
+        .collect()
 }
 
+fn parse_u32s(s: &str) -> Result<Vec<u32>, String> {
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    s.split(',')
+        .map(|p| {
+            p.trim()
+                .parse()
+                .map_err(|_| format!("invalid id entry: {p:?}"))
+        })
+        .collect()
+}
+
+/// Minimal HOCON-subset tokenizer: quote-aware comment stripping (`#` and
+/// `//`), inline `{`/`}` handling, and quoted string values with backslash
+/// escapes.
 fn parse_hocon(text: &str) -> Result<BTreeMap<String, String>, String> {
     let mut map = BTreeMap::new();
     let mut stack: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "}" {
-            stack.pop();
-            continue;
-        }
-        if let Some(name) = line.strip_suffix('{') {
-            let name = name.trim().trim_end_matches('=').trim();
-            stack.push(name.to_string());
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let key = if stack.is_empty() {
-                k.trim().to_string()
-            } else {
-                format!("{}.{}", stack.join("."), k.trim())
-            };
-            let mut val = v.trim().to_string();
-            if val.ends_with(',') {
-                val.pop();
+    for (lineno, raw) in text.lines().enumerate() {
+        for stmt in split_statements(raw) {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
+                continue;
             }
-            if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
-                val = val[1..val.len() - 1].to_string();
+            if stmt == "}" {
+                if stack.pop().is_none() {
+                    return Err(format!("line {}: unmatched '}}'", lineno + 1));
+                }
+                continue;
             }
-            map.insert(key, val);
+            if let Some(name) = stmt.strip_suffix('{') {
+                let name = name.trim().trim_end_matches('=').trim();
+                if name.is_empty() {
+                    return Err(format!("line {}: empty block name", lineno + 1));
+                }
+                stack.push(name.to_string());
+                continue;
+            }
+            if let Some((k, v)) = stmt.split_once('=') {
+                let key = if stack.is_empty() {
+                    k.trim().to_string()
+                } else {
+                    format!("{}.{}", stack.join("."), k.trim())
+                };
+                let mut val = v.trim().to_string();
+                if val.ends_with(',') {
+                    val.pop();
+                }
+                let val = unquote(&val)?;
+                map.insert(key, val);
+                continue;
+            }
+            return Err(format!("line {}: cannot parse {stmt:?}", lineno + 1));
         }
     }
+    if !stack.is_empty() {
+        return Err(format!("unclosed block: {}", stack.join(".")));
+    }
     Ok(map)
+}
+
+/// Split a line into statements on `{` and `}` (kept as their own
+/// statements), honoring quoted strings and `#`/`//` comments.
+fn split_statements(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            cur.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                cur.push(c);
+            }
+            '#' => break,
+            '/' if chars.peek() == Some(&'/') => break,
+            '{' => {
+                // Block opener stays glued to its name: "relay {".
+                cur.push('{');
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
+                cur.clear();
+            }
+            '}' => {
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
+                cur.clear();
+                out.push("}".to_string());
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+fn unquote(v: &str) -> Result<String, String> {
+    if v.len() >= 2 && v.starts_with('"') {
+        if !v.ends_with('"') {
+            return Err(format!("unterminated string value: {v:?}"));
+        }
+        let inner = &v[1..v.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some(other) => out.push(other),
+                    None => return Err(format!("trailing backslash in value: {v:?}")),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    } else {
+        Ok(v.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -385,5 +668,179 @@ mod tests {
         assert_eq!(c.db, PathBuf::from("/tmp/x"));
         assert_eq!(c.relay.port, 9000);
         assert!(c.relay.unix.enabled);
+    }
+
+    #[test]
+    fn comment_chars_inside_quotes_are_kept() {
+        let c = Config::parse(
+            r#"
+            relay {
+                info {
+                    description = "a #b // c"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.relay.info.description, "a #b // c");
+    }
+
+    #[test]
+    fn inline_braces_and_comments() {
+        let c = Config::parse("relay { port = 9001 } // trailing\n").unwrap();
+        assert_eq!(c.relay.port, 9001);
+        let c = Config::parse("relay {\n port = 9002\n} # close\n").unwrap();
+        assert_eq!(c.relay.port, 9002);
+    }
+
+    #[test]
+    fn strict_value_errors() {
+        assert!(Config::parse("relay { port = \"abc\" }").is_err());
+        assert!(Config::parse("relay { port = 70000 }").is_err());
+        assert!(Config::parse("relay { auth { enabled = \"yes\" } }").is_err());
+        assert!(Config::parse("relay { port = 1").is_err());
+    }
+
+    #[test]
+    fn unix_mode_octal_and_decimal() {
+        assert_eq!(parse_mode("0600").unwrap(), 0o600);
+        assert_eq!(parse_mode("0o600").unwrap(), 0o600);
+        assert_eq!(parse_mode("384").unwrap(), 0o600);
+        assert!(parse_mode("nope").is_err());
+    }
+
+    #[test]
+    fn full_strfry_style_config() {
+        let c = Config::parse(
+            r#"
+            db = "/tmp/db"
+            dbParams {
+                maxreaders = 300
+                mapsize = 10995116277760
+                noReadAhead = false
+            }
+            events {
+                maxEventSize = 70000
+            }
+            relay {
+                bind = "0.0.0.0"
+                port = 7777
+                nofiles = 1000
+                realIpHeader = "x-real-ip"
+                auth {
+                    enabled = true
+                    serviceUrl = "wss://relay.example.com/"
+                    restrictedReadKinds = "4,1059"
+                    restrictReadToInvolvedPubkey = true
+                }
+                info {
+                    name = "test"
+                    pubkey = "deadbeef"
+                    self = "cafe"
+                    contact = "mailto:x@example.com"
+                    icon = "https://example.com/i.png"
+                    banner = "https://example.com/b.png"
+                    privacy = "https://example.com/p"
+                    terms = "https://example.com/t"
+                    nips = "[1,2]"
+                }
+                maxReqFilterSize = 7
+                autoPingSeconds = 30
+                enableTcpKeepalive = true
+                queryTimesliceBudgetMicroseconds = 5000
+                maxTagsPerFilter = 9
+                maxPendingOutboundBytes = 1024
+                writePolicy {
+                    plugin = "/bin/true"
+                    timeoutSeconds = 3
+                }
+                compression {
+                    enabled = false
+                    slidingWindow = false
+                }
+                logging {
+                    dumpInAll = true
+                    invalidEvents = false
+                }
+                numThreads {
+                    ingester = 4
+                    reqWorker = 5
+                    reqMonitor = 6
+                    negentropy = 7
+                }
+                negentropy {
+                    enabled = false
+                    maxSyncEvents = 42
+                }
+                filterValidation {
+                    enabled = true
+                    maxFiltersPerReq = 11
+                    minFiltersPerReq = 2
+                    maxKindsPerFilter = 12
+                    allowedKinds = "1,6"
+                    requireAuthorOrTag = true
+                }
+                unix {
+                    enabled = true
+                    path = "/tmp/w.sock"
+                    mode = 0600
+                    owner = "alice"
+                    group = "staff"
+                    maxFrameBytes = 4096
+                    maxPendingOutboundBytes = 2048
+                    authUids = "501,502"
+                    authGids = "20"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.db_maxreaders, 300);
+        assert_eq!(c.events.max_event_size, 70000);
+        assert_eq!(c.relay.port, 7777);
+        assert_eq!(c.relay.nofiles, 1000);
+        assert_eq!(c.relay.real_ip_header, "x-real-ip");
+        assert_eq!(c.relay.auth.restricted_read_kinds, vec![4, 1059]);
+        assert_eq!(c.relay.info.pubkey, "deadbeef");
+        assert_eq!(c.relay.info.self_pk, "cafe");
+        assert_eq!(c.relay.info.terms, "https://example.com/t");
+        assert_eq!(c.relay.max_req_filter_size, 7);
+        assert_eq!(c.relay.auto_ping_seconds, 30);
+        assert!(c.relay.enable_tcp_keepalive);
+        assert_eq!(c.relay.query_timeslice_budget_us, 5000);
+        assert_eq!(c.relay.max_tags_per_filter, 9);
+        assert_eq!(c.relay.write_policy_timeout_secs, 3);
+        assert!(!c.relay.compression_enabled);
+        assert!(c.relay.dump_in_all);
+        assert!(!c.relay.invalid_events);
+        assert_eq!(c.relay.ingester_threads, 4);
+        assert_eq!(c.relay.req_worker_threads, 5);
+        assert_eq!(c.relay.req_monitor_threads, 6);
+        assert_eq!(c.relay.negentropy_threads, 7);
+        assert!(!c.relay.negentropy_enabled);
+        assert_eq!(c.relay.max_sync_events, 42);
+        assert!(c.relay.filter_validation.enabled);
+        assert_eq!(c.relay.filter_validation.max_filters_per_req, 11);
+        assert_eq!(c.relay.filter_validation.min_filters_per_req, 2);
+        assert_eq!(c.relay.filter_validation.max_kinds_per_filter, 12);
+        assert_eq!(c.relay.filter_validation.allowed_kinds, "1,6");
+        assert!(c.relay.filter_validation.require_author_or_tag);
+        assert_eq!(c.relay.unix.mode, 0o600);
+        assert_eq!(c.relay.unix.owner, "alice");
+        assert_eq!(c.relay.unix.auth_uids, vec![501, 502]);
+        assert_eq!(c.relay.unix.auth_gids, vec![20]);
+        assert_eq!(c.relay.unix.max_pending_outbound_bytes, 2048);
+    }
+
+    #[test]
+    fn empty_restricted_read_kinds() {
+        let c = Config::parse("relay { auth { restrictedReadKinds = \"\" } }").unwrap();
+        assert!(c.relay.auth.restricted_read_kinds.is_empty());
+        // C++ default is no restricted kinds.
+        assert!(Config::default()
+            .relay
+            .auth
+            .restricted_read_kinds
+            .is_empty());
     }
 }

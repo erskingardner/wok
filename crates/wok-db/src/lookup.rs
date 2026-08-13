@@ -150,10 +150,9 @@ pub fn get_compression_dictionary_ro(
     txn: &RoTxn<'_>,
     dict_id: u64,
 ) -> Result<Option<Vec<u8>>, DbError> {
-    Ok(txn
-        .get_u64(txn.env().dbis().compression_dictionary, dict_id)?
+    txn.get_u64(txn.env().dbis().compression_dictionary, dict_id)?
         .map(|raw| crate::fbs::decode_compression_dictionary(raw).map(|r| r.dict))
-        .transpose()?)
+        .transpose()
 }
 
 pub fn bump_negentropy_mod_counter(txn: &mut RwTxn<'_>) -> Result<u64, DbError> {

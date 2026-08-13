@@ -80,10 +80,12 @@ pub fn cmp_memn(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 pub fn cmp_string_u64(a: &[u8], b: &[u8]) -> Ordering {
-    assert!(
-        a.len() >= 8 && b.len() >= 8,
-        "StringUint64 key too short to compare"
-    );
+    match (a.len() >= 8, b.len() >= 8) {
+        (false, false) => return cmp_memn(a, b),
+        (false, true) => return Ordering::Less,
+        (true, false) => return Ordering::Greater,
+        (true, true) => {}
+    }
     let a_s = &a[..a.len() - 8];
     let b_s = &b[..b.len() - 8];
     match cmp_memn(a_s, b_s) {
@@ -93,10 +95,12 @@ pub fn cmp_string_u64(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 pub fn cmp_u64_u64(a: &[u8], b: &[u8]) -> Ordering {
-    assert!(
-        a.len() == 16 && b.len() == 16,
-        "Uint64Uint64 key too short/long to compare"
-    );
+    match (a.len() == 16, b.len() == 16) {
+        (false, false) => return cmp_memn(a, b),
+        (false, true) => return Ordering::Less,
+        (true, false) => return Ordering::Greater,
+        (true, true) => {}
+    }
     match u64_from_ne(&a[0..8]).cmp(&u64_from_ne(&b[0..8])) {
         Ordering::Equal => u64_from_ne(&a[8..16]).cmp(&u64_from_ne(&b[8..16])),
         o => o,
@@ -104,10 +108,12 @@ pub fn cmp_u64_u64(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 pub fn cmp_string_u64_u64(a: &[u8], b: &[u8]) -> Ordering {
-    assert!(
-        a.len() >= 16 && b.len() >= 16,
-        "StringUint64Uint64 key too short to compare"
-    );
+    match (a.len() >= 16, b.len() >= 16) {
+        (false, false) => return cmp_memn(a, b),
+        (false, true) => return Ordering::Less,
+        (true, false) => return Ordering::Greater,
+        (true, true) => {}
+    }
     let a_s = &a[..a.len() - 16];
     let b_s = &b[..b.len() - 16];
     match cmp_memn(a_s, b_s) {
@@ -187,5 +193,20 @@ mod tests {
         let c = make_key_u64_u64(2, 0);
         assert_eq!(cmp_u64_u64(&a, &b), Ordering::Less);
         assert_eq!(cmp_u64_u64(&c, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn malformed_keys_sort_before_valid_keys_without_panicking() {
+        let short = [1, 2, 3];
+        let valid_string = make_key_string_u64(b"x", 1);
+        let valid_pair = make_key_u64_u64(1, 2);
+        let valid_triple = make_key_string_u64_u64(b"x", 1, 2);
+
+        assert_eq!(cmp_string_u64(&short, &valid_string), Ordering::Less);
+        assert_eq!(cmp_u64_u64(&short, &valid_pair), Ordering::Less);
+        assert_eq!(cmp_string_u64_u64(&short, &valid_triple), Ordering::Less);
+        assert_eq!(cmp_string_u64(&short, &short), Ordering::Equal);
+        assert_eq!(cmp_u64_u64(&short, &short), Ordering::Equal);
+        assert_eq!(cmp_string_u64_u64(&short, &short), Ordering::Equal);
     }
 }

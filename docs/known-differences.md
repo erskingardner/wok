@@ -47,8 +47,6 @@ it is not a promise to reproduce upstream bugs.
 
 ## Inherited behavior queued for review or correction
 
-- Malformed LMDB comparator input can abort the process rather than returning a
-  controlled corruption error.
 - Ephemeral-event persistence and expiration policy remains inherited and needs
   an explicit Wok product/spec decision.
 
@@ -65,3 +63,5 @@ regression test. Differential parity alone is not a reason to retain it.
   string, and `a`-tag kind/pubkey parsing follows those same constraints.
 - LMDB no longer accidentally enables `MDB_NOMETASYNC` by passing the
   same-valued DBI-only `MDB_CREATE` flag when opening the environment.
+- Custom LMDB comparators are total for malformed keys and never panic across
+  their C ABI boundary; valid v3/v4 key ordering remains unchanged.

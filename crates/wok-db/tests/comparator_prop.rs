@@ -5,6 +5,28 @@ use wok_db::comparators::{
 
 proptest! {
     #[test]
+    fn comparators_are_total_for_arbitrary_bytes(
+        a in proptest::collection::vec(any::<u8>(), 0..40),
+        b in proptest::collection::vec(any::<u8>(), 0..40),
+        c in proptest::collection::vec(any::<u8>(), 0..40),
+    ) {
+        for cmp in [
+            cmp_string_u64 as fn(&[u8], &[u8]) -> std::cmp::Ordering,
+            cmp_u64_u64,
+            cmp_string_u64_u64,
+        ] {
+            let ab = cmp(&a, &b);
+            prop_assert_eq!(ab, cmp(&b, &a).reverse());
+            prop_assert_eq!(cmp(&a, &a), std::cmp::Ordering::Equal);
+            if ab != std::cmp::Ordering::Greater
+                && cmp(&b, &c) != std::cmp::Ordering::Greater
+            {
+                prop_assert_ne!(cmp(&a, &c), std::cmp::Ordering::Greater);
+            }
+        }
+    }
+
+    #[test]
     fn string_u64_total_order(
         a in proptest::collection::vec(any::<u8>(), 1..24),
         b in proptest::collection::vec(any::<u8>(), 1..24),

@@ -153,9 +153,10 @@ A full second review against the C++ source produced these fix commits:
   frozen.
 - `dict train/compress/decompress` (ZDICT training; verified
   cross-implementation with the C++ binary).
-- `stream` persists downloads (verified like WriterPipeline) and streams
-  uploads; `sync` does the full C++ two-phase negentropy transfer (verified
-  150/150 events both directions against the C++ relay).
+- `stream` persists downloads (verified like WriterPipeline), streams uploads,
+  and reconnects with non-blocking capped backoff; `sync` does the full C++
+  two-phase negentropy transfer (verified 150/150 events both directions
+  against the C++ relay).
 - `router` with tao-config parsing, per-URL reconnecting clients, hot
   reconfig, and plugin gating (validated live against the C++ relay).
 - permessage-deflate via an in-house RFC 6455/7692 codec (the Rust WS

@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An optional operator dashboard with NIP-98/NIP-07 authentication, bounded
   replay protection, operational charts, and atomic writes for a deliberately
   small, validated subset of live-reloadable TOML settings.
+- Bounded, idempotent negentropy tree builds with configurable scan batches,
+  short write transactions, and progress checkpoints.
 
 ### Fixed
 
@@ -37,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot leak restricted-event populations, and NIP-59 is advertised only
   when AUTH, recipient filtering, gift-wrap deletion, and live-only kind 21059
   behavior are all usable.
+- `wok stream` now reconnects after connection failures and remote closes with
+  non-blocking capped exponential backoff, while retrying the first local event
+  whose WebSocket send did not complete.
 
 ## [0.1.0] - 2026-08-13
 

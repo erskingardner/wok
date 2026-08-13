@@ -143,6 +143,12 @@ enum Command {
         url: String,
         #[arg(long, default_value = "down")]
         dir: String,
+        /// Initial non-blocking reconnect delay in seconds
+        #[arg(long, default_value_t = 1)]
+        reconnect_delay: u64,
+        /// Maximum exponential reconnect delay in seconds
+        #[arg(long, default_value_t = 30)]
+        max_reconnect_delay: u64,
     },
     Upload {
         url: String,
@@ -210,8 +216,15 @@ enum DictCmd {
 #[derive(Subcommand)]
 enum NegCmd {
     List,
-    Add { filter: String },
-    Build { tree_id: u64 },
+    Add {
+        filter: String,
+    },
+    Build {
+        tree_id: u64,
+        /// Number of primary event records scanned per read/write cycle
+        #[arg(long, default_value_t = 10_000)]
+        batch_size: usize,
+    },
 }
 
 fn open_env(cfg: &Config) -> Result<Env> {
@@ -322,7 +335,12 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Stream { url, dir } => cmd_stream(&cfg, url, dir).await,
+        Command::Stream {
+            url,
+            dir,
+            reconnect_delay,
+            max_reconnect_delay,
+        } => cmd_stream(&cfg, url, dir, reconnect_delay, max_reconnect_delay).await,
         Command::Upload { url, pipeline } => cmd_upload(url, pipeline).await,
         Command::Download { url, filter } => cmd_download(url, filter).await,
         Command::Router { router_config_file } => router::run_router(cfg, router_config_file).await,
@@ -1026,6 +1044,9 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
             if compiled.filters.is_empty() {
                 bail!("filter will never match");
             }
+            if compiled.requires_content() {
+                bail!("negentropy filters do not support content search");
+            }
             if compiled.filters.len() == 1
                 && (compiled.filters[0].since != 0 || compiled.filters[0].until != u64::MAX)
             {
@@ -1052,42 +1073,128 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
             println!("created tree {id}");
             println!("  to populate, run: wok negentropy build {id}");
         }
-        NegCmd::Build { tree_id } => {
-            let mut recs = Vec::new();
-            {
-                let txn = env.begin_ro()?;
-                let mut filter_str = None;
-                wok_db::foreach_negentropy_filter(&txn, |id, f| {
-                    if id == tree_id {
-                        filter_str = Some(f.to_string());
-                        false
-                    } else {
-                        true
-                    }
-                })?;
-                let filter_str = filter_str.context("couldn't find treeId")?;
-                let filter: serde_json::Value = serde_json::from_str(&filter_str)?;
-                foreach_by_filter_scan(&txn, &filter, u64::MAX, 64, |lev| {
-                    if let Ok(Some(buf)) = wok_db::get_packed_ro(&txn, lev) {
-                        if let Ok(p) = wok_event::PackedEventView::new(&buf) {
-                            recs.push((p.created_at(), p.id().to_vec()));
-                        }
-                    }
-                })?;
-            }
-            let mut txn = env.begin_rw()?;
-            wok_db::bump_negentropy_mod_counter(&mut txn)?;
-            {
-                let mut tree = wok_negentropy::open_rw(&mut txn, tree_id)?;
-                for (ts, id) in recs {
-                    let _ = tree.insert(ts, &id);
-                }
-                tree.backend.flush()?;
-            }
-            txn.commit()?;
-        }
+        NegCmd::Build {
+            tree_id,
+            batch_size,
+        } => build_negentropy_tree(&env, tree_id, batch_size)?,
     }
     Ok(())
+}
+
+/// Populate a tree through bounded primary-table scans and short write
+/// transactions. Inserts are idempotent, so rerunning this after interruption
+/// safely resumes the outcome without requiring a separate progress file.
+fn build_negentropy_tree(env: &Env, tree_id: u64, batch_size: usize) -> Result<()> {
+    if batch_size == 0 {
+        bail!("--batch-size must be at least 1");
+    }
+    let (compiled, target_lev) = {
+        let txn = env.begin_ro()?;
+        let mut filter_str = None;
+        wok_db::foreach_negentropy_filter(&txn, |id, filter| {
+            if id == tree_id {
+                filter_str = Some(filter.to_string());
+                false
+            } else {
+                true
+            }
+        })?;
+        let filter: serde_json::Value =
+            serde_json::from_str(&filter_str.context("couldn't find treeId")?)?;
+        let compiled = wok_query::NostrFilterGroup::from_value(&filter, u64::MAX, 64)?;
+        if compiled.requires_content() {
+            bail!("negentropy filters do not support content search");
+        }
+        (compiled, most_recent_levid_ro_quiet(&txn))
+    };
+
+    let mut next_lev = 1u64;
+    let mut scanned = 0u64;
+    let mut inserted = 0u64;
+    let mut first_batch = true;
+    while first_batch || next_lev <= target_lev {
+        let NegentropyScanBatch {
+            last_scanned,
+            rows,
+            records,
+        } = scan_negentropy_batch(env, &compiled, next_lev, target_lev, batch_size)?;
+        let Some(last_scanned) = last_scanned else {
+            if first_batch {
+                let mut txn = env.begin_rw()?;
+                wok_db::bump_negentropy_mod_counter(&mut txn)?;
+                let mut tree = wok_negentropy::open_rw(&mut txn, tree_id)?;
+                tree.backend.flush()?;
+                drop(tree);
+                txn.commit()?;
+            }
+            break;
+        };
+        let record_count = records.len() as u64;
+        let mut txn = env.begin_rw()?;
+        if first_batch {
+            wok_db::bump_negentropy_mod_counter(&mut txn)?;
+        }
+        {
+            let mut tree = wok_negentropy::open_rw(&mut txn, tree_id)?;
+            for (created_at, id) in records {
+                if tree.insert(created_at, &id)? {
+                    inserted += 1;
+                }
+            }
+            tree.backend.flush()?;
+        }
+        txn.commit()?;
+        scanned += rows as u64;
+        tracing::info!(
+            tree_id,
+            scanned,
+            target_lev,
+            matched = record_count,
+            inserted,
+            "negentropy build checkpoint"
+        );
+        next_lev = last_scanned.saturating_add(1);
+        first_batch = false;
+    }
+    tracing::info!(tree_id, scanned, inserted, "negentropy build complete");
+    Ok(())
+}
+
+struct NegentropyScanBatch {
+    last_scanned: Option<u64>,
+    rows: usize,
+    records: Vec<(u64, Vec<u8>)>,
+}
+
+fn scan_negentropy_batch(
+    env: &Env,
+    compiled: &wok_query::NostrFilterGroup,
+    start_lev: u64,
+    target_lev: u64,
+    batch_size: usize,
+) -> Result<NegentropyScanBatch> {
+    let txn = env.begin_ro()?;
+    let mut rows = 0usize;
+    let mut last = None;
+    let mut records = Vec::new();
+    wok_db::foreach_event_from(&txn, start_lev, |lev, packed_bytes| {
+        if lev > target_lev || rows >= batch_size {
+            return false;
+        }
+        rows += 1;
+        last = Some(lev);
+        if let Ok(packed) = PackedEventView::new(packed_bytes) {
+            if compiled.does_match(packed) {
+                records.push((packed.created_at(), packed.id().to_vec()));
+            }
+        }
+        true
+    })?;
+    Ok(NegentropyScanBatch {
+        last_scanned: last,
+        rows,
+        records,
+    })
 }
 
 fn cmd_integrity(cfg: &Config) -> Result<()> {
@@ -1565,22 +1672,25 @@ async fn cmd_sync(
     Ok(())
 }
 
-async fn cmd_stream(cfg: &Config, url: String, dir: String) -> Result<()> {
+async fn cmd_stream(
+    cfg: &Config,
+    url: String,
+    dir: String,
+    reconnect_delay: u64,
+    max_reconnect_delay: u64,
+) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
     if !["up", "down", "both"].contains(&dir.as_str()) {
         bail!("invalid direction: {dir}. Should be one of up/down/both");
     }
+    if reconnect_delay == 0 || max_reconnect_delay < reconnect_delay {
+        bail!("reconnect delays require 1 <= reconnect-delay <= max-reconnect-delay");
+    }
     tracing::warn!("'wok stream' is deprecated. Please use 'wok router' instead.");
 
     let env = open_env(cfg)?;
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
-    if dir == "down" || dir == "both" {
-        ws.send(Message::Text(r#"["REQ","sub",{"limit":0}]"#.into()))
-            .await?;
-    }
-
     let mut downloaded: std::collections::HashSet<Vec<u8>> = Default::default();
     let mut curr_event_id = {
         let txn = env.begin_ro()?;
@@ -1588,90 +1698,144 @@ async fn cmd_stream(cfg: &Config, url: String, dir: String) -> Result<()> {
     };
     let mut batch: Vec<serde_json::Value> = Vec::new();
     let mut written = 0u64;
+    let initial_delay = std::time::Duration::from_secs(reconnect_delay);
+    let maximum_delay = std::time::Duration::from_secs(max_reconnect_delay);
+    let mut delay = initial_delay;
 
     loop {
-        tokio::select! {
-            msg = ws.next() => {
-                let Some(msg) = msg else { break };
-                let msg = msg?;
-                let txt = match msg {
-                    Message::Text(t) => t.to_string(),
-                    Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-                    _ => continue,
+        tracing::info!(url = %url, "stream connecting");
+        match tokio_tungstenite::connect_async(&url).await {
+            Ok((mut ws, _)) => {
+                tracing::info!(url = %url, "stream connected");
+                delay = initial_delay;
+                let subscription = if dir == "down" || dir == "both" {
+                    Some(
+                        ws.send(Message::Text(r#"["REQ","sub",{"limit":0}]"#.into()))
+                            .await,
+                    )
+                } else {
+                    None
                 };
-                let v: serde_json::Value = match serde_json::from_str(&txt) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                match v[0].as_str().unwrap_or("") {
-                    "EOSE" => {
-                        write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                    }
-                    "NOTICE" => tracing::warn!("NOTICE message: {v}"),
-                    "OK" => {
-                        if v[2].as_bool() == Some(false) {
-                            tracing::warn!("Event not written: {v}");
-                        }
-                    }
-                    "EVENT" => {
-                        if dir == "down" || dir == "both" {
-                            if let Some(ev) = v.get(2) {
-                                if let Some(id) = ev.get("id").and_then(|i| i.as_str()) {
-                                    if let Ok(raw) = wok_event::from_lower_hex_exact(id) {
-                                        downloaded.insert(raw);
+                let disconnect = if let Some(Err(error)) = subscription {
+                    error.to_string()
+                } else {
+                    let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                    let mut upload_tick =
+                        tokio::time::interval(std::time::Duration::from_millis(100));
+                    'connected: loop {
+                        tokio::select! {
+                            msg = ws.next() => {
+                                let Some(msg) = msg else {
+                                    break "remote closed the websocket".to_string();
+                                };
+                                let msg = match msg {
+                                    Ok(message) => message,
+                                    Err(error) => break error.to_string(),
+                                };
+                                let txt = match msg {
+                                    Message::Text(t) => t.to_string(),
+                                    Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                                    Message::Ping(payload) => {
+                                        if let Err(error) = ws.send(Message::Pong(payload)).await {
+                                            break error.to_string();
+                                        }
+                                        continue;
                                     }
-                                }
-                                batch.push(ev.clone());
-                                if batch.len() >= 1000 {
-                                    write_downloaded(&env, cfg, &mut batch, &mut written)?;
+                                    Message::Close(frame) => break format!("remote close: {frame:?}"),
+                                    _ => continue,
+                                };
+                                let v: serde_json::Value = match serde_json::from_str(&txt) {
+                                    Ok(v) => v,
+                                    Err(error) => {
+                                        tracing::warn!(url = %url, %error, "stream ignored invalid JSON");
+                                        continue;
+                                    }
+                                };
+                                match v[0].as_str().unwrap_or("") {
+                                    "EOSE" => write_downloaded(&env, cfg, &mut batch, &mut written)?,
+                                    "NOTICE" => tracing::warn!(url = %url, "NOTICE message: {v}"),
+                                    "OK" if v[2].as_bool() == Some(false) => {
+                                        tracing::warn!(url = %url, "event not written: {v}");
+                                    }
+                                    "EVENT" if dir == "down" || dir == "both" => {
+                                        if let Some(ev) = v.get(2) {
+                                            if dir == "both" {
+                                                if let Some(id) = ev.get("id").and_then(|id| id.as_str()) {
+                                                    if let Ok(raw) = wok_event::from_lower_hex_exact(id) {
+                                                        downloaded.insert(raw);
+                                                    }
+                                                }
+                                            }
+                                            batch.push(ev.clone());
+                                            if batch.len() >= 1000 {
+                                                write_downloaded(&env, cfg, &mut batch, &mut written)?;
+                                            }
+                                        }
+                                    }
+                                    other => tracing::warn!(url = %url, command = other, "stream ignored unexpected relay message"),
                                 }
                             }
-                        } else {
-                            tracing::warn!("Unexpected EVENT");
+                            _ = flush_tick.tick() => {
+                                write_downloaded(&env, cfg, &mut batch, &mut written)?;
+                            }
+                            _ = upload_tick.tick(), if dir != "down" => {
+                                let mut outbound = Vec::new();
+                                {
+                                    let txn = env.begin_ro()?;
+                                    let mut decomp = Decompressor::new();
+                                    let mut rows = 0usize;
+                                    wok_db::foreach_event_from(&txn, curr_event_id.saturating_add(1), |lev, packed_bytes| {
+                                        if rows >= 1_000 {
+                                            return false;
+                                        }
+                                        rows += 1;
+                                        let message = if let Ok(p) = PackedEventView::new(packed_bytes) {
+                                            if downloaded.remove(p.id()) {
+                                                None
+                                            } else {
+                                                event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size)
+                                                    .ok()
+                                                    .map(|json| format!("[\"EVENT\",{json}]"))
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        outbound.push((lev, message));
+                                        true
+                                    })?;
+                                }
+                                for (lev, message) in outbound {
+                                    if let Some(message) = message {
+                                        if let Err(error) = ws.send(Message::Text(message.into())).await {
+                                            break 'connected error.to_string();
+                                        }
+                                    }
+                                    // Advance only after the corresponding send succeeds,
+                                    // so a reconnect retries the first unsent local event.
+                                    curr_event_id = lev;
+                                }
+                            }
                         }
                     }
-                    other => bail!("unexpected first element: {other}"),
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                // WriterPipeline debounce: flush partial batches periodically.
+                };
                 write_downloaded(&env, cfg, &mut batch, &mut written)?;
+                tracing::warn!(url = %url, reason = %disconnect, written, "stream disconnected");
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if dir != "down" => {
-                // Up direction: stream new local events to the remote, like
-                // C++'s file-change-triggered foreach_Event from currEventId+1.
-                let mut to_send = Vec::new();
-                {
-                    let txn = env.begin_ro()?;
-                    let mut decomp = Decompressor::new();
-                    let mut latest = curr_event_id;
-                    let res = wok_db::foreach_event_from(&txn, curr_event_id.saturating_add(1), |lev, packed_bytes| {
-                        latest = lev;
-                        if let Ok(p) = PackedEventView::new(packed_bytes) {
-                            let id = p.id().to_vec();
-                            if downloaded.remove(&id) {
-                                return true;
-                            }
-                            if let Ok(json) = event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size) {
-                                to_send.push(format!("[\"EVENT\",{json}]"));
-                            }
-                        }
-                        true
-                    });
-                    if let Err(e) = res {
-                        tracing::error!("stream up scan: {e}");
-                    }
-                    curr_event_id = latest;
-                }
-                for m in to_send {
-                    ws.send(Message::Text(m.into())).await?;
-                }
+            Err(error) => {
+                tracing::warn!(url = %url, %error, "stream connection failed");
             }
         }
+        tracing::info!(url = %url, delay_secs = delay.as_secs(), "stream reconnect scheduled");
+        tokio::time::sleep(delay).await;
+        delay = next_reconnect_delay(delay, maximum_delay);
     }
-    write_downloaded(&env, cfg, &mut batch, &mut written)?;
-    tracing::info!("stream ended; {written} events written");
-    Ok(())
+}
+
+fn next_reconnect_delay(
+    current: std::time::Duration,
+    maximum: std::time::Duration,
+) -> std::time::Duration {
+    current.saturating_mul(2).min(maximum)
 }
 
 fn most_recent_levid_ro_quiet(txn: &wok_db::RoTxn<'_>) -> u64 {
@@ -1728,4 +1892,109 @@ async fn cmd_download(url: String, filter: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+    use secp256k1::{Keypair, SECP256K1};
+    use serde_json::json;
+    use wok_db::{write_events, EventToWrite, NoopNegentropy};
+    use wok_event::{parse_and_verify_event, EventLimits};
+    use wok_negentropy::Storage;
+
+    fn signed_event(created_at: u64) -> EventToWrite {
+        let mut rng = rand::thread_rng();
+        let key = Keypair::new(SECP256K1, &mut rng);
+        let (pubkey, _) = key.x_only_public_key();
+        let mut event = json!({
+            "created_at": created_at,
+            "kind": 1,
+            "tags": [],
+            "content": format!("event {created_at}"),
+            "pubkey": hex::encode(pubkey.serialize()),
+        });
+        let id = wok_event::event_id_hash(&event).unwrap();
+        event["id"] = json!(hex::encode(id));
+        event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+        let parsed =
+            parse_and_verify_event(&event, &EventLimits::default(), None, true, false).unwrap();
+        EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+    }
+
+    #[test]
+    fn negentropy_build_batches_are_idempotent_and_reject_zero_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let env = Env::open(directory.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut events: Vec<_> = (0..5)
+            .map(|offset| signed_event(1_700_000_000 + offset))
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+
+        let tree_id = {
+            let txn = env.begin_ro().unwrap();
+            let mut tree_id = None;
+            wok_db::foreach_negentropy_filter(&txn, |id, _| {
+                tree_id = Some(id);
+                false
+            })
+            .unwrap();
+            tree_id.unwrap()
+        };
+        build_negentropy_tree(&env, tree_id, 2).unwrap();
+        build_negentropy_tree(&env, tree_id, 1).unwrap();
+        let txn = env.begin_ro().unwrap();
+        let mut tree = wok_negentropy::open_ro(&txn, tree_id).unwrap();
+        assert_eq!(tree.size(), 5);
+        assert!(build_negentropy_tree(&env, tree_id, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("at least 1"));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_exponential_and_capped() {
+        let maximum = std::time::Duration::from_secs(5);
+        assert_eq!(
+            next_reconnect_delay(std::time::Duration::from_secs(1), maximum),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_reconnect_delay(std::time::Duration::from_secs(4), maximum),
+            maximum
+        );
+        assert_eq!(next_reconnect_delay(maximum, maximum), maximum);
+    }
+
+    #[tokio::test]
+    async fn stream_reconnects_after_remote_close_without_blocking_runtime() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                websocket.close(None).await.unwrap();
+            }
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            db: directory.path().join("db"),
+            ..Config::default()
+        };
+        let client = tokio::spawn(async move {
+            cmd_stream(&cfg, format!("ws://{address}"), "down".into(), 1, 1).await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("stream did not reconnect")
+            .unwrap();
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled());
+    }
 }

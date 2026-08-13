@@ -9,4 +9,4 @@ pub mod server;
 
 pub use config::Config;
 pub use protocol::{ClientCommand, RelayMessage};
-pub use server::{start, supported_nips, Outbound, RelayHandle};
+pub use server::{start, supported_nips, Outbound, OutboundFrame, RelayHandle};

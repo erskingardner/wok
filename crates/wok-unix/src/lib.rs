@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use wok_relay::{Config, Outbound, RelayHandle};
+use wok_relay::{Config, Outbound, OutboundFrame, RelayHandle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum UnixError {
@@ -68,7 +68,14 @@ pub async fn serve(handle: RelayHandle, cfg: Config) -> Result<(), UnixError> {
         if handle.is_shutdown() {
             break;
         }
-        let (stream, _addr) = listener.accept().await?;
+        let (stream, _addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("unix accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let handle = handle.clone();
         let cfg = cfg.clone();
         tokio::spawn(async move {
@@ -95,12 +102,18 @@ async fn handle_conn(
         .active_connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let max_frame = cfg.relay.unix.max_frame_bytes;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
-    handle.register(conn_id, Outbound::new(tx));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(256);
+    let outbound = Outbound::new(tx, cfg.relay.unix.max_pending_outbound_bytes);
+    let killed = outbound.killed();
+    handle.register(conn_id, outbound).await;
     let mut len_buf = [0u8; 4];
     let result = async {
         loop {
             tokio::select! {
+                _ = killed.notified() => {
+                    tracing::debug!("[{conn_id}] unix: terminated slow client");
+                    break;
+                }
                 read = stream.read_exact(&mut len_buf) => {
                     read?;
                     let n = u32::from_be_bytes(len_buf) as usize;
@@ -111,12 +124,12 @@ async fn handle_conn(
                     stream.read_exact(&mut body).await?;
                     let text = String::from_utf8(body)
                         .map_err(|_| UnixError::Message("frame not utf-8".into()))?;
-                    handle.client_message(conn_id, Vec::new(), text);
+                    handle.client_message(conn_id, Vec::new(), text).await;
                 }
                 out = rx.recv() => {
                     match out {
-                        Some(msg) => {
-                            write_frame(&mut stream, msg.as_bytes()).await?;
+                        Some(frame) => {
+                            write_frame(&mut stream, frame.into_text().as_bytes()).await?;
                         }
                         None => break,
                     }
@@ -126,7 +139,7 @@ async fn handle_conn(
         Ok::<_, UnixError>(())
     }
     .await;
-    handle.close(conn_id);
+    handle.close(conn_id).await;
     handle
         .metrics
         .active_connections

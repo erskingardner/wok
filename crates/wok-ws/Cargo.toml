@@ -13,6 +13,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 serde_json.workspace = true
+socket2 = { version = "0.5", features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

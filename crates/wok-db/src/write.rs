@@ -484,9 +484,7 @@ pub fn write_events<N: NegentropySink>(
                                                 lev_ids_to_delete.push(lev);
                                             }
                                         }
-                                        Err(e) => {
-                                            scan_err = Some(DbError::msg(e.to_string()))
-                                        }
+                                        Err(e) => scan_err = Some(DbError::msg(e.to_string())),
                                     },
                                     Ok(None) => {
                                         scan_err =

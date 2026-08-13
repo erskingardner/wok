@@ -35,18 +35,72 @@ use wok_query::{
 
 const AUTH_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
+/// One frame queued for a connection. Dropping the frame (after a send, or
+/// when a dead connection's queue is drained) releases its byte accounting.
+pub struct OutboundFrame {
+    pub text: String,
+    len: u64,
+    pending: Arc<AtomicU64>,
+}
+
+impl OutboundFrame {
+    pub fn into_text(mut self) -> String {
+        std::mem::take(&mut self.text)
+    }
+}
+
+impl Drop for OutboundFrame {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.len, Ordering::Relaxed);
+    }
+}
+
+/// Per-connection outbound queue with C++-style pending-byte accounting.
+/// When `limit` bytes are already queued, `try_send` fails and the caller
+/// terminates the slow client (`maxPendingOutboundBytes`, 0 = unlimited).
 #[derive(Clone)]
 pub struct Outbound {
-    tx: tokio::sync::mpsc::Sender<String>,
+    tx: tokio::sync::mpsc::Sender<OutboundFrame>,
+    pending: Arc<AtomicU64>,
+    limit: usize,
+    kill: Arc<tokio::sync::Notify>,
 }
 
 impl Outbound {
-    pub fn new(tx: tokio::sync::mpsc::Sender<String>) -> Self {
-        Self { tx }
+    pub fn new(tx: tokio::sync::mpsc::Sender<OutboundFrame>, limit: usize) -> Self {
+        Self {
+            tx,
+            pending: Arc::new(AtomicU64::new(0)),
+            limit,
+            kill: Arc::new(tokio::sync::Notify::new()),
+        }
     }
 
     pub fn try_send(&self, msg: String) -> bool {
-        self.tx.try_send(msg).is_ok()
+        let len = msg.len() as u64;
+        let prev = self.pending.fetch_add(len, Ordering::Relaxed);
+        if self.limit != 0 && prev.saturating_add(len) > self.limit as u64 {
+            self.pending.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        // On failure the frame drops here, undoing the accounting.
+        self.tx
+            .try_send(OutboundFrame {
+                len: msg.len() as u64,
+                text: msg,
+                pending: self.pending.clone(),
+            })
+            .is_ok()
+    }
+
+    /// Signal the owning transport to close the connection.
+    pub fn kill(&self) {
+        self.kill.notify_one();
+    }
+
+    /// Handle a transport can `select!` on: `killed().notified()`.
+    pub fn killed(&self) -> Arc<tokio::sync::Notify> {
+        self.kill.clone()
     }
 }
 
@@ -69,18 +123,39 @@ impl ConnTable {
     fn send(&self, id: u64, msg: RelayMessage, metrics: &Metrics) {
         bump_relay_metrics(&msg, metrics);
         let json = msg.to_json();
-        let map = self.map.lock();
+        let mut map = self.map.lock();
         if let Some(out) = map.get(&id) {
-            let _ = out.try_send(json);
+            if !out.try_send(json) {
+                // Slow/stalled client over its pending-bytes budget: terminate
+                // it like C++ RelayWebsocket does.
+                metrics
+                    .slow_client_terminations
+                    .fetch_add(1, Ordering::Relaxed);
+                let out = map.remove(&id);
+                if let Some(out) = out {
+                    out.kill();
+                }
+            }
         }
     }
     fn send_event_batch(&self, recipients: &[(u64, String)], ev_json: &str, metrics: &Metrics) {
-        let map = self.map.lock();
+        let mut map = self.map.lock();
+        let mut killed = Vec::new();
         for (conn, sub) in recipients {
             metrics.relay_event.fetch_add(1, Ordering::Relaxed);
             let payload = format!("[\"EVENT\",\"{sub}\",{ev_json}]");
             if let Some(out) = map.get(conn) {
-                let _ = out.try_send(payload);
+                if !out.try_send(payload) {
+                    killed.push(*conn);
+                }
+            }
+        }
+        for conn in killed {
+            metrics
+                .slow_client_terminations
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(out) = map.remove(&conn) {
+                out.kill();
             }
         }
     }
@@ -114,7 +189,7 @@ fn bump_relay_metrics(msg: &RelayMessage, metrics: &Metrics) {
 
 #[derive(Clone)]
 pub struct RelayHandle {
-    ingest: Sender<IngestMsg>,
+    ingest: tokio::sync::mpsc::Sender<IngestMsg>,
     conns: Arc<ConnTable>,
     next_id: Arc<AtomicU64>,
     pub metrics: Arc<Metrics>,
@@ -123,10 +198,6 @@ pub struct RelayHandle {
 }
 
 pub enum IngestMsg {
-    Register {
-        conn_id: u64,
-        out: Outbound,
-    },
     Client {
         conn_id: u64,
         ip: Vec<u8>,
@@ -199,22 +270,26 @@ impl RelayHandle {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn register(&self, conn_id: u64, out: Outbound) {
-        self.conns.insert(conn_id, out.clone());
-        let _ = self.ingest.send(IngestMsg::Register { conn_id, out });
+    /// Register a connection's outbound queue. Async: applies backpressure
+    /// instead of blocking a Tokio worker when the ingest queue is full.
+    pub async fn register(&self, conn_id: u64, out: Outbound) {
+        self.conns.insert(conn_id, out);
     }
 
-    pub fn client_message(&self, conn_id: u64, ip: Vec<u8>, payload: String) {
-        let _ = self.ingest.send(IngestMsg::Client {
-            conn_id,
-            ip,
-            payload,
-        });
+    pub async fn client_message(&self, conn_id: u64, ip: Vec<u8>, payload: String) {
+        let _ = self
+            .ingest
+            .send(IngestMsg::Client {
+                conn_id,
+                ip,
+                payload,
+            })
+            .await;
     }
 
-    pub fn close(&self, conn_id: u64) {
+    pub async fn close(&self, conn_id: u64) {
         self.conns.remove(conn_id);
-        let _ = self.ingest.send(IngestMsg::Close { conn_id });
+        let _ = self.ingest.send(IngestMsg::Close { conn_id }).await;
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -258,7 +333,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let conns = Arc::new(ConnTable::new());
     let metrics = Arc::new(Metrics::default());
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (ingest_tx, ingest_rx) = bounded::<IngestMsg>(4096);
+    let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel::<IngestMsg>(4096);
     let (writer_tx, writer_rx) = bounded::<WriterMsg>(4096);
     let (req_tx, req_rx) = bounded::<ReqMsg>(4096);
     let (mon_tx, mon_rx) = bounded::<MonitorMsg>(4096);
@@ -396,16 +471,17 @@ fn run_ingester(
     cfg: Arc<parking_lot::RwLock<Config>>,
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
-    rx: Receiver<IngestMsg>,
+    mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
     writer_tx: Sender<WriterMsg>,
     req_tx: Sender<ReqMsg>,
     _mon_tx: Sender<MonitorMsg>,
     neg_tx: Sender<NegMsg>,
 ) {
     let mut auth: HashMap<u64, AuthSession> = HashMap::new();
-    while let Ok(msg) = rx.recv() {
+    // blocking_recv is only used here, on a dedicated OS thread outside any
+    // Tokio runtime, so no async executor is stalled.
+    while let Some(msg) = rx.blocking_recv() {
         match msg {
-            IngestMsg::Register { .. } => {}
             IngestMsg::Close { conn_id } => {
                 if auth.remove(&conn_id).and_then(|a| a.authed).is_some() {
                     metrics
@@ -1085,7 +1161,15 @@ fn run_writer(
                 if closed.contains(&conn_id) {
                     continue;
                 }
-                let source_type = if ip.len() == 4 { "IP4" } else { "IP6" };
+                // Unix-socket connections carry no IP; they are reported to
+                // write-policy plugins as sourceType "unix" (wok extension).
+                let source_type = if ip.is_empty() {
+                    "unix"
+                } else if ip.len() == 4 {
+                    "IP4"
+                } else {
+                    "IP6"
+                };
                 let source_info = render_ip(&ip);
                 let ev_json: Value = serde_json::from_str(&json).unwrap_or(json!({}));
                 let mut ok_msg = String::new();
@@ -1861,8 +1945,37 @@ mod tests {
             .as_secs()
     }
 
-    #[test]
-    fn event_write_returns_ok() {
+    #[tokio::test]
+    async fn outbound_byte_accounting_and_kill() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let out = Outbound::new(tx, 100);
+        let killed = out.killed();
+
+        assert!(out.try_send("x".repeat(60)));
+        assert!(out.try_send("y".repeat(30)));
+        // 60 + 30 + 20 > 100: over budget, rejected.
+        assert!(!out.try_send("z".repeat(20)));
+
+        // Draining one frame releases its bytes.
+        drop(rx.recv().await.unwrap());
+        assert!(out.try_send("z".repeat(20)));
+
+        // Kill notification reaches the transport.
+        out.kill();
+        tokio::time::timeout(Duration::from_secs(1), killed.notified())
+            .await
+            .expect("kill notification");
+
+        // Limit 0 means unlimited.
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let out2 = Outbound::new(tx2, 0);
+        for _ in 0..8 {
+            assert!(out2.try_send("q".repeat(1000)));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_write_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
         env.ensure_initialized().unwrap();
@@ -1870,25 +1983,27 @@ mod tests {
         cfg.db = dir.path().to_path_buf();
         cfg.relay.auth.enabled = false;
         let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(32);
         let conn = handle.next_conn_id();
-        handle.register(conn, Outbound::new(tx));
+        handle.register(conn, Outbound::new(tx, 0)).await;
         let ev = sign_event(json!({
             "created_at": now_secs(),
             "kind": 1,
             "tags": [],
             "content": "core-ok",
         }));
-        handle.client_message(conn, vec![127, 0, 0, 1], json!(["EVENT", ev]).to_string());
+        handle
+            .client_message(conn, vec![127, 0, 0, 1], json!(["EVENT", ev]).to_string())
+            .await;
         let mut got = None;
         for _ in 0..80 {
             match rx.try_recv() {
-                Ok(msg) => {
-                    got = Some(msg);
+                Ok(frame) => {
+                    got = Some(frame.into_text());
                     break;
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(25));
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 Err(e) => panic!("outbound closed: {e}"),
             }

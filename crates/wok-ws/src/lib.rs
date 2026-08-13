@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
-use wok_relay::{supported_nips, Config, Outbound, RelayHandle};
+use wok_relay::{supported_nips, Config, Outbound, OutboundFrame, RelayHandle};
 
 const SOFTWARE: &str = "git+https://github.com/jeff/wok.git";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -35,7 +35,20 @@ pub async fn serve_listener(
         if handle.is_shutdown() {
             break;
         }
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                // Transient accept failures (e.g. fd exhaustion) must not kill
+                // the listener task.
+                tracing::warn!("ws accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        if handle.config.read().relay.enable_tcp_keepalive {
+            let sock_ref = socket2::SockRef::from(&stream);
+            let _ = sock_ref.set_keepalive(true);
+        }
         let handle = handle.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -57,7 +70,13 @@ async fn dispatch(
     handle: Arc<RelayHandle>,
     peer: SocketAddr,
 ) -> Response<Full<Bytes>> {
-    if req.headers().get(UPGRADE).map(|v| v.as_bytes()) == Some(b"websocket") {
+    let is_ws_upgrade = req
+        .headers()
+        .get(UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if is_ws_upgrade {
         return upgrade_ws(req, handle, peer).await;
     }
     let path = req.uri().path().to_string();
@@ -213,6 +232,15 @@ async fn upgrade_ws(
         Some(k) => k.clone(),
         None => return empty(StatusCode::BAD_REQUEST),
     };
+    // RFC 6455: only version 13 is supported.
+    match req
+        .headers()
+        .get("sec-websocket-version")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("13") => {}
+        _ => return empty(StatusCode::BAD_REQUEST),
+    }
     let cfg_snap = handle.config.read().clone();
     let max = cfg_snap.relay.max_websocket_payload_size;
     tokio::spawn(async move {
@@ -256,23 +284,44 @@ where
         std::net::IpAddr::V4(v) => v.octets().to_vec(),
         std::net::IpAddr::V6(v) => v.octets().to_vec(),
     };
-    let max_pending = handle.config.read().relay.max_pending_outbound_bytes;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
-    handle.register(conn_id, Outbound::new(tx));
+    let (max_pending, auto_ping) = {
+        let cfg = handle.config.read();
+        (
+            cfg.relay.max_pending_outbound_bytes,
+            cfg.relay.auto_ping_seconds,
+        )
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(256);
+    let outbound = Outbound::new(tx, max_pending);
+    let killed = outbound.killed();
+    handle.register(conn_id, outbound).await;
     tracing::info!("[{conn_id}] Connect from {peer}");
+    let mut ping = tokio::time::interval(std::time::Duration::from_secs(auto_ping.max(1)));
+    if auto_ping > 0 {
+        ping.tick().await; // first tick is immediate; skip it
+    }
     loop {
         tokio::select! {
+            _ = killed.notified() => {
+                tracing::info!("[{conn_id}] Terminated slow client");
+                break;
+            }
+            _ = ping.tick(), if auto_ping > 0 => {
+                if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
             incoming = ws.next() => {
                 match incoming {
                     Some(Ok(Message::Text(t))) => {
-                        handle.client_message(conn_id, ip.clone(), t.to_string());
+                        handle.client_message(conn_id, ip.clone(), t.to_string()).await;
                     }
                     Some(Ok(Message::Binary(b))) => {
                         handle.client_message(
                             conn_id,
                             ip.clone(),
                             String::from_utf8_lossy(&b).into_owned(),
-                        );
+                        ).await;
                     }
                     Some(Ok(Message::Ping(p))) => {
                         let _ = ws.send(Message::Pong(p)).await;
@@ -283,8 +332,8 @@ where
             }
             out = rx.recv() => {
                 match out {
-                    Some(msg) => {
-                        if ws.send(Message::Text(msg.into())).await.is_err() {
+                    Some(frame) => {
+                        if ws.send(Message::Text(frame.into_text().into())).await.is_err() {
                             break;
                         }
                     }
@@ -292,9 +341,8 @@ where
                 }
             }
         }
-        let _ = max_pending;
     }
-    handle.close(conn_id);
+    handle.close(conn_id).await;
     handle
         .metrics
         .active_connections

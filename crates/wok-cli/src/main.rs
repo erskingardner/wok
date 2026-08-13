@@ -66,6 +66,12 @@ enum Command {
         #[arg(long)]
         count: bool,
     },
+    /// Print one event by its local event ID (levId)
+    Event {
+        lev_id: u64,
+        #[arg(long)]
+        fried: bool,
+    },
     Delete {
         #[arg(long)]
         age: Option<u64>,
@@ -194,6 +200,7 @@ async fn main() -> Result<()> {
             fried,
         } => cmd_export(&cfg, since, until.unwrap_or(u64::MAX), reverse, fried),
         Command::Scan { filter, count } => cmd_scan(&cfg, &filter, count),
+        Command::Event { lev_id, fried } => cmd_event(&cfg, lev_id, fried),
         Command::Delete {
             age,
             filter,
@@ -450,6 +457,30 @@ fn cmd_scan(cfg: &Config, filter: &str, count: bool) -> Result<()> {
     )?;
     if count {
         println!("{n}");
+    }
+    Ok(())
+}
+
+fn cmd_event(cfg: &Config, lev_id: u64, fried: bool) -> Result<()> {
+    let env = open_env(cfg)?;
+    let txn = env.begin_ro()?;
+    let mut decomp = Decompressor::new();
+    let json = event_json_owned(&txn, &mut decomp, lev_id, cfg.events.max_event_size)
+        .with_context(|| format!("couldn't find event in EventPayload (levId {lev_id})"))?;
+    if fried {
+        if cfg!(target_endian = "big") {
+            bail!("--fried currently only supported on little-endian CPUs");
+        }
+        let packed = wok_db::get_packed_ro(&txn, lev_id)?
+            .with_context(|| format!("unable to lookup event by levId {lev_id}"))?;
+        let mut o = json;
+        o.pop();
+        o.push_str(",\"fried\":\"");
+        o.push_str(&hex::encode(packed));
+        o.push_str("\"}");
+        println!("{o}");
+    } else {
+        println!("{json}");
     }
     Ok(())
 }

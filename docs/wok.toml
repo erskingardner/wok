@@ -1,0 +1,44 @@
+[database]
+path = "./wok-db/"
+max_readers = 256
+map_size = 10995116277760
+no_read_ahead = false
+
+[events]
+max_event_size = 65536
+reject_newer_than_secs = 900
+reject_older_than_secs = 94608000
+reject_ephemeral_older_than_secs = 60
+ephemeral_lifetime_secs = 300
+max_num_tags = 2000
+max_tag_val_size = 1024
+
+[relay]
+bind = "127.0.0.1"
+port = 7777
+nofiles = 524288
+max_websocket_payload_size = 131072
+max_filter_limit = 500
+max_filter_limit_count = 1000000
+max_subs_per_connection = 200
+max_pending_outbound_bytes = 33554432
+negentropy_enabled = true
+max_sync_events = 1000000
+
+[relay.auth]
+enabled = true
+service_url = ""
+restricted_read_kinds = [4, 1059]
+restrict_read_to_involved_pubkey = true
+
+[relay.info]
+name = "wok"
+description = "This is a wok instance."
+nips = ""
+
+[relay.unix]
+enabled = false
+path = "./wok-db/wok.sock"
+mode = 0o600
+max_frame_bytes = 131072
+max_pending_outbound_bytes = 33554432

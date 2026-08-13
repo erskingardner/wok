@@ -3,7 +3,7 @@
 use crate::subid::QueryError;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use wok_event::{from_hex_exact, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE};
+use wok_event::{from_lower_hex_exact, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE};
 
 #[derive(Debug, Clone)]
 pub struct FilterSetBytes {
@@ -29,8 +29,7 @@ impl FilterSetBytes {
                 .as_str()
                 .ok_or_else(|| QueryError::msg("filter item not a string"))?;
             let bytes = if hex_decode {
-                // C++ FilterSetBytes uses from_hex(..., false).
-                from_hex_exact(s).map_err(|e| QueryError::msg(e.to_string()))?
+                from_lower_hex_exact(s).map_err(|e| QueryError::msg(e.to_string()))?
             } else {
                 s.as_bytes().to_vec()
             };
@@ -85,6 +84,9 @@ impl FilterSetUint {
             let n = i
                 .as_u64()
                 .ok_or_else(|| QueryError::msg("kind not an unsigned integer"))?;
+            if n > u16::MAX as u64 {
+                return Err(QueryError::msg("kind must be between 0 and 65535"));
+            }
             items.push(n);
         }
         items.sort_unstable();
@@ -118,7 +120,6 @@ pub struct NostrFilter {
     pub since: u64,
     pub until: u64,
     pub limit: u64,
-    pub never_match: bool,
     pub index_only_scans: bool,
 }
 
@@ -139,7 +140,6 @@ impl NostrFilter {
             since: 0,
             until: u64::MAX,
             limit: u64::MAX,
-            never_match: false,
             index_only_scans: false,
         };
         let mut num_major = 0u64;
@@ -150,8 +150,7 @@ impl NostrFilter {
                     return Err(QueryError::msg("ids not an array"));
                 }
                 if v.as_array().unwrap().is_empty() {
-                    f.never_match = true;
-                    continue;
+                    return Err(QueryError::msg("ids array must not be empty"));
                 }
                 num_major += 1;
                 f.ids = Some(
@@ -163,8 +162,7 @@ impl NostrFilter {
                     return Err(QueryError::msg("authors not an array"));
                 }
                 if v.as_array().unwrap().is_empty() {
-                    f.never_match = true;
-                    continue;
+                    return Err(QueryError::msg("authors array must not be empty"));
                 }
                 num_major += 1;
                 f.authors = Some(
@@ -176,8 +174,7 @@ impl NostrFilter {
                     return Err(QueryError::msg("kinds not an array"));
                 }
                 if v.as_array().unwrap().is_empty() {
-                    f.never_match = true;
-                    continue;
+                    return Err(QueryError::msg("kinds array must not be empty"));
                 }
                 num_major += 1;
                 f.kinds = Some(
@@ -189,12 +186,11 @@ impl NostrFilter {
                     return Err(QueryError::msg(format!("{k} not an array")));
                 }
                 if v.as_array().unwrap().is_empty() {
-                    f.never_match = true;
-                    continue;
+                    return Err(QueryError::msg(format!("{k} array must not be empty")));
                 }
                 num_major += 1;
-                if k.len() == 2 {
-                    let tag = k.chars().nth(1).unwrap();
+                if k.len() == 2 && k.as_bytes()[1].is_ascii_alphabetic() {
+                    let tag = k.as_bytes()[1] as char;
                     let set = if tag == 'p' || tag == 'e' {
                         FilterSetBytes::parse(v, true, 32, 32)
                     } else {
@@ -237,9 +233,6 @@ impl NostrFilter {
     }
 
     pub fn does_match(&self, ev: PackedEventView<'_>) -> bool {
-        if self.never_match {
-            return false;
-        }
         if !self.does_match_times(ev.created_at()) {
             return false;
         }
@@ -323,9 +316,7 @@ impl NostrFilterGroup {
         max_tags: usize,
     ) -> Result<(), QueryError> {
         let f = NostrFilter::parse(item, max_filter_limit, max_tags)?;
-        if !f.never_match {
-            self.filters.push(f);
-        }
+        self.filters.push(f);
         Ok(())
     }
 
@@ -430,9 +421,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_ids_never_match_dropped() {
-        let fg = NostrFilterGroup::from_value(&json!({"ids": []}), 500, 3).unwrap();
-        assert_eq!(fg.size(), 0);
+    fn empty_filter_lists_are_rejected() {
+        assert!(NostrFilterGroup::from_value(&json!({"ids": []}), 500, 3).is_err());
+        assert!(NostrFilterGroup::from_value(&json!({"authors": []}), 500, 3).is_err());
+        assert!(NostrFilterGroup::from_value(&json!({"kinds": []}), 500, 3).is_err());
+        assert!(NostrFilterGroup::from_value(&json!({"#p": []}), 500, 3).is_err());
     }
 
     #[test]

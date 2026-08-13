@@ -7,10 +7,11 @@ This file is the living plan. Update it when discoveries change the work.
 
 ## Source-of-truth order
 
-1. Actual C++ behavior at the pinned commit.
-2. Canonical NIPs at `656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab` (nostr-protocol/nips HEAD when this plan was written).
-3. strfry tests, fixtures, generated DB code, and configuration.
-4. Explicit decisions in this file and `docs/`.
+1. Canonical NIPs at the revision pinned by the conformance suite.
+2. Explicit Wok safety, storage, and product decisions in this file and `docs/`.
+3. Lossless migration and event-identity requirements.
+4. Actual C++ behavior at the pinned commit, plus its tests and fixtures, as a
+   historical and differential reference.
 
 ## Architecture
 
@@ -19,7 +20,7 @@ Cargo workspace crates:
 | Crate | Ownership |
 | --- | --- |
 | `wok-event` | Event JSON, NIP-01 hashing, Schnorr, PackedEvent, kind helpers |
-| `wok-db` | Exact LMDB v3 environment, DBI contract, transactions, integrity |
+| `wok-db` | Wok-owned LMDB, read-only strfry v3 migration, transactions, integrity |
 | `wok-query` | Filters, DBScan, QueryScheduler, ActiveMonitors |
 | `wok-negentropy` | NIP-77 protocol, Vector storage, persistent BTreeLMDB |
 | `wok-relay` | Transport-neutral commands, write path, AUTH, plugins, cron |
@@ -34,7 +35,7 @@ Tokio owns network I/O. Dedicated OS threads own LMDB. Transactions, cursors, an
 ## Phases
 
 1. Workspace + event/packed/filter unit tests.
-2. LMDB v3 open/read/write against disposable C++ databases.
+2. LMDB v3 differential implementation and fixtures (historical parity phase).
 3. Query engine + write semantics (replace/delete/expire).
 4. Relay core + WebSocket + Unix.
 5. Negentropy + CLI parity.
@@ -63,6 +64,14 @@ for gates, evidence, and remaining production soak work. Two review passes
 against the C++ source landed additional correctness fixes; see the
 "Post-review hardening" and "Third pass" sections of `docs/FINAL.md`.
 
+The current evolution phase replaces shared writable database compatibility
+with `wok migrate strfry`: a read-only v3 snapshot is verified, assigned Wok's
+v4 ownership marker, and promoted atomically with translated config and a
+manifest. Protocol work now follows the NIPs-first policy in
+`docs/compatibility-policy.md`; inherited strfry bugs are candidates for fixes,
+not permanent compatibility requirements.
+
 ## Non-goals
 
-No CBOR. No new storage format. No silent DB migration. No mutation of user/production strfry databases.
+No CBOR. No implicit migration during normal commands. No mutation of
+user/production strfry databases. No mixed strfry/Wok writers.

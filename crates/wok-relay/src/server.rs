@@ -483,7 +483,12 @@ fn broadcast_db_change(mon_txs: &[Sender<MonitorMsg>]) {
 /// is used for portability; semantics match.
 fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorMsg>>, shutdown: Arc<AtomicBool>) {
     let path = env.path().join("data.mdb");
-    let mut last: Option<(std::time::SystemTime, u64)> = None;
+    // Establish the baseline before sleeping. If the first external commit
+    // lands during that initial sleep, comparing against `None` would absorb
+    // the change without ever notifying the monitors.
+    let mut last = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
         let cur = std::fs::metadata(&path)
@@ -1078,13 +1083,13 @@ fn ingest_req(
     req_tx: &Sender<ReqMsg>,
 ) {
     // C++ RelayIngester: errors raised before the sub id is known go out as
-    // NOTICE "ERROR: bad req: ..."; everything after as CLOSED with the same
-    // payload. The sub id is always known here (protocol.rs extracted it),
+    // NOTICE "ERROR: bad req: ..."; everything after is a NIP-01 CLOSED with
+    // an `error:` machine-readable prefix. The sub id is known here,
     // except for the "arr too small" case which C++ raises first.
     let fail_closed = |e: String| {
         conns.send(
             conn_id,
-            RelayMessage::closed_error(&sub_id, format!("bad req: {e}")),
+            RelayMessage::closed_error(&sub_id, format!("error: bad req: {e}")),
             metrics,
         );
     };
@@ -1173,7 +1178,7 @@ fn ingest_neg(
     is_open: bool,
     neg_tx: &Sender<NegMsg>,
 ) -> Result<(), String> {
-    let payload = wok_event::from_hex(payload_hex).map_err(|e| e.to_string())?;
+    let payload = wok_event::from_hex_strict(payload_hex).map_err(|e| e.to_string())?;
     if is_open {
         let Some(mut filter) = filter else {
             return Err("negentropy query missing elements".into());

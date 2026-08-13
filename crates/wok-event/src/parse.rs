@@ -42,6 +42,27 @@ pub fn from_hex_exact(s: &str) -> Result<Vec<u8>, EventError> {
     from_hex_impl(s, false)
 }
 
+/// Decode an even-length hex string without accepting a `0x` prefix.
+pub fn from_hex_strict(s: &str) -> Result<Vec<u8>, EventError> {
+    if s.starts_with("0x") || !s.len().is_multiple_of(2) {
+        return Err(EventError::msg(
+            "hex must have an even length and no prefix",
+        ));
+    }
+    hex::decode(s).map_err(|e| EventError::msg(format!("hex decode: {e}")))
+}
+
+/// Decode the lowercase, even-length form required for NIP-01 identifiers.
+pub fn from_lower_hex_exact(s: &str) -> Result<Vec<u8>, EventError> {
+    if !s
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(EventError::msg("hex must be lowercase ASCII"));
+    }
+    from_hex_strict(s)
+}
+
 fn from_hex_impl(s: &str, allow_uneven: bool) -> Result<Vec<u8>, EventError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if !s.len().is_multiple_of(2) {
@@ -89,11 +110,11 @@ pub fn nostr_json_to_packed_event(
     if !v.is_object() {
         return Err(EventError::msg("event is not an object"));
     }
-    let id = from_hex_exact(json_get_string(
+    let id = from_lower_hex_exact(json_get_string(
         v.get("id").ok_or_else(|| EventError::msg("missing id"))?,
         "event id field was not a string",
     )?)?;
-    let pubkey = from_hex_exact(json_get_string(
+    let pubkey = from_lower_hex_exact(json_get_string(
         v.get("pubkey")
             .ok_or_else(|| EventError::msg("missing pubkey"))?,
         "event pubkey field was not a string",
@@ -108,6 +129,9 @@ pub fn nostr_json_to_packed_event(
             .ok_or_else(|| EventError::msg("missing kind"))?,
         "event kind field was not an integer",
     )?;
+    if kind > u16::MAX as u64 {
+        return Err(EventError::msg("event kind must be between 0 and 65535"));
+    }
     json_get_string(
         v.get("content")
             .ok_or_else(|| EventError::msg("missing content"))?,
@@ -143,6 +167,9 @@ pub fn nostr_json_to_packed_event(
         if tag.is_empty() {
             return Err(EventError::msg("too few fields in tag"));
         }
+        if tag.iter().any(|element| !element.is_string()) {
+            return Err(EventError::msg("all tag elements must be strings"));
+        }
         let tag_name = json_get_string(&tag[0], "tag name was not a string")?;
         let tag_val = if tag.len() >= 2 {
             json_get_string(&tag[1], "tag val was not a string")?.to_string()
@@ -163,7 +190,7 @@ pub fn nostr_json_to_packed_event(
                         "unexpected size for fixed-size tag: {tag_name}"
                     )));
                 }
-                let raw = from_hex_exact(&tag_val)?;
+                let raw = from_lower_hex_exact(&tag_val)?;
                 if raw.len() <= MAX_INDEXED_TAG_VAL_SIZE {
                     tag_builder.add(tag_name.chars().next().unwrap(), &raw)?;
                 }
@@ -245,6 +272,11 @@ mod tests {
         assert_eq!(from_hex("0x0a0b").unwrap(), vec![0x0a, 0x0b]);
         assert!(from_hex_exact("a").is_err());
         assert_eq!(from_hex_exact("0x0a0b").unwrap(), vec![0x0a, 0x0b]);
+        assert_eq!(from_hex_strict("0A0b").unwrap(), vec![0x0a, 0x0b]);
+        assert!(from_hex_strict("0x0a").is_err());
+        assert!(from_hex_strict("a").is_err());
+        assert_eq!(from_lower_hex_exact("0a0b").unwrap(), vec![0x0a, 0x0b]);
+        assert!(from_lower_hex_exact("0A0b").is_err());
     }
 
     #[test]

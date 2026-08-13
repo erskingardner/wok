@@ -1,4 +1,4 @@
-//! Exact LMDB v3 compatibility for strfry databases.
+//! Wok's LMDB storage and the read-only strfry v3 migration boundary.
 //!
 //! # Transaction safety
 //!
@@ -13,6 +13,7 @@ pub mod fbs;
 pub mod integrity;
 pub mod keys;
 pub mod lookup;
+pub mod migration;
 pub mod payload;
 pub mod schema;
 pub mod txn;
@@ -32,6 +33,7 @@ pub use lookup::{
     insert_compression_dictionary, insert_negentropy_filter, lookup_event_by_id_ro,
     most_recent_levid_ro,
 };
+pub use migration::{event_fingerprint, snapshot_lmdb_readonly, EventFingerprint};
 pub use payload::{
     encode_raw_payload, encode_zstd_payload, event_json_owned, get_event_json, parse_payload,
     Decompressor, PayloadView, PAYLOAD_RAW, PAYLOAD_ZSTD,

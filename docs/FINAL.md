@@ -1,17 +1,21 @@
-# wok final report
+# Historical parity report and current migration boundary
 
-Rust reimplementation of C++ strfry. This document is the definition-of-done record.
+This records the original Rust reimplementation parity work. That milestone is
+historical evidence, not the current compatibility promise. Wok now supports a
+verified one-way migration from strfry v3 into a Wok-owned v4 database and
+follows [compatibility-policy.md](compatibility-policy.md).
 
 ## Implemented scope
 
-- Exact LMDB v3 open/read/write without migration (`wok-db`).
+- Historical LMDB v3 differential read/write implementation, now used as the
+  read-only migration decoder (`wok-db`).
 - Event validation, NIP-01 IDs, Schnorr, PackedEvent (`wok-event`).
 - Filters, index scans, query scheduler, live monitors (`wok-query`).
 - Negentropy protocol, Vector, persistent BTreeLMDB (`wok-negentropy`).
 - Transport-neutral relay core: EVENT/REQ/CLOSE/COUNT/AUTH/NEG-* (`wok-relay`).
 - WebSocket + HTTP NIP-11/metrics/landing (`wok-ws`).
 - Length-prefixed Unix `SOCK_STREAM` (`wok-unix`).
-- CLI parity for relay, import/export/scan/delete/info/compact/monitor/dict/negentropy/integrity and mesh helpers (`wok-cli`).
+- CLI relay/database/mesh tools plus `migrate strfry` (`wok-cli`).
 - Differential, conformance, e2e, property tests (`wok-compat` and crate tests).
 - Comparative bench harness (`wok-bench`).
 
@@ -23,12 +27,18 @@ Rust reimplementation of C++ strfry. This document is the definition-of-done rec
 | nostr-protocol/nips | `656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab` |
 | LMDB contract | `golpe.yaml` / generated `defaultDb.h` / `PackedEvent.h` |
 
-When C++ and a NIP disagree, wok preserves C++ storage and filter matching, documents the gap, and does not advertise unsupported behavior. See `docs/known-differences.md` and `PLAN.md`.
+When strfry and a NIP disagree, Wok follows the pinned NIP unless migration or
+event identity requires compatibility. See `docs/compatibility-policy.md`,
+`docs/known-differences.md`, and `PLAN.md`.
 
-## Compatibility evidence
+## Historical compatibility evidence
 
-- `crates/wok-db/tests/cpp_roundtrip.rs`: C++-created DB opens as v3; Rust-init DB is readable by C++ `info`; Rust write is present in C++ `export`.
-- `crates/wok-compat/tests/cpp_export.rs`: Rust write → C++ export; C++ import → Rust query; replacement; deletion; alternating C++/Rust writes; integrity after mixed writers; tag roundtrip.
+- C++-created v3 databases and records remain readable for migration fixtures.
+- The former bidirectional tests established the shared layout used by the
+  importer. Current tests instead assert that strfry refuses Wok v4 and Wok
+  refuses write transactions on strfry v3.
+- `wok migrate strfry` proves source `data.mdb` remains unchanged, promotes a
+  v4 snapshot, and compares complete event-record fingerprints before/after.
 - Integrity tool: `wok integrity` reports missing payloads, orphans, packed parse errors, and id-index count drift.
 
 C++ reference source was not modified. Final `git status` in `/Users/jeff/code/strfry` was clean at the pin above.
@@ -109,7 +119,7 @@ A full second review against the C++ source produced these fix commits:
   filterValidation; the real strfry.conf parses cleanly.
 - Write-path LMDB errors propagate like C++ instead of being swallowed.
 - Transports apply true async backpressure on the ingest queue (no blocking
-  Tokio workers) and terminate slow clients at `maxPendingOutboundBytes`
+  Tokio workers) and terminate slow clients at `max_pending_outbound_bytes`
   with byte accounting; WS auto-ping, keepalive, version check, and
   case-insensitive upgrade handling.
 - Write-policy plugin I/O enforces `timeoutSeconds` and the 8192-byte record
@@ -141,9 +151,8 @@ A full second review against the C++ source produced these fix commits:
 
 ## Recommended production soak and cutover
 
-1. Copy a v3 `data.mdb` (never the only production file).
-2. `wok integrity` on the copy.
+1. Stop strfry and run `wok migrate strfry` into a new output directory.
+2. Review the manifest and translated config.
 3. Soak `wok relay` with production-like publish/REQ/COUNT/AUTH/negentropy traffic for at least one retention/expiration cycle.
-4. Compare C++ vs wok export IDs on a disposable snapshot after mixed load.
-5. Cut over DNS/proxy; keep C++ binary and original files for rollback (`docs/cutover.md`).
-6. Run `wok-bench --profile full` on the target host with a real corpus (`--corpus`) before claiming performance.
+4. Cut over DNS/proxy; keep the original v3 database and config untouched for rollback (`docs/cutover.md`).
+5. Run `wok-bench --profile full` on the target host with a real corpus (`--corpus`) before claiming performance.

@@ -18,7 +18,8 @@ Multiple requests and asynchronous EVENT/EOSE/OK/COUNT/AUTH/NEG-* frames share o
 - `chmod` to the configured mode after bind, before accept.
 - Optional UID/GID allow-lists via `getpeereid`.
 - Unlink the socket on orderly shutdown.
-- Per-connection outbound byte cap (`relay.unix.maxPendingOutboundBytes`); slow clients are disconnected, like the WS transport.
+- Per-connection outbound byte cap (`relay.unix.max_pending_outbound_bytes`);
+  slow clients are disconnected, like the WebSocket transport.
 - No admin commands on this protocol.
 
 Connections on this transport report `sourceType: "unix"` (with empty `sourceInfo`) to write-policy plugins.
@@ -28,7 +29,7 @@ Connections on this transport report `sourceType: "unix"` (with empty `sourceInf
 ```python
 import socket, struct, json
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("./strfry-db/wok.sock")
+s.connect("./wok-db/wok.sock")
 def send(obj):
     b = json.dumps(obj).encode()
     s.sendall(struct.pack("!I", len(b)) + b)

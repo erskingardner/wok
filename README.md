@@ -1,9 +1,10 @@
 # wok
 
-A Rust reimplementation of [strfry](https://github.com/hoytech/strfry), the C++
-Nostr relay. Drop-in compatible with existing strfry **v3 LMDB databases** and
-the public Nostr WebSocket/JSON protocol, with an additional Unix-domain socket
-transport.
+A Rust Nostr relay that began as a reimplementation of
+[strfry](https://github.com/hoytech/strfry). Wok provides a verified, one-way
+migration from strfry v3 databases and configs, then owns its database and
+evolves against the Nostr specifications rather than preserving every strfry
+quirk. It also provides an additional Unix-domain socket transport.
 
 [![ci](https://github.com/erskingardner/wok/actions/workflows/ci.yml/badge.svg)](https://github.com/erskingardner/wok/actions/workflows/ci.yml)
 
@@ -12,15 +13,17 @@ transport.
 
 ## Highlights
 
-- **Database parity, proven by differential tests.** Same named DBIs, flags,
-  comparators, native-endian keys, PackedEvent records, FlatBuffers metadata,
-  and zstd payload framing. C++ can open/write wok databases and vice versa,
-  byte-for-byte (`crates/wok-compat`, including negentropy tree fingerprint
-  equality both directions).
-- **Protocol parity.** EVENT/REQ/CLOSE/COUNT/EOSE/OK/NOTICE/CLOSED/AUTH and
-  NEG-* messages match C++ wire behavior, including error message routing and
-  C++ quirks kept deliberately (see
-  [docs/known-differences.md](docs/known-differences.md)).
+- **Verified migration.** `wok migrate strfry` takes a read-only LMDB snapshot,
+  checks its integrity, preserves every packed event and payload byte, rewrites
+  only the database ownership marker, translates the config's database path,
+  translates supported settings into native TOML, and emits a checksummed
+  manifest.
+- **Independent storage ownership.** strfry v3 is an import format. Wok uses a
+  v4 marker so strfry and Wok cannot accidentally become mixed writers, even
+  while the initial Wok layout remains structurally close to v3.
+- **Nostr-first protocol behavior.** EVENT/REQ/CLOSE/COUNT/EOSE/OK/NOTICE/
+  CLOSED/AUTH and NEG-* are tested against pinned NIPs. Differential tests are
+  migration and regression evidence, not a promise to retain upstream bugs.
 - **NIP-42 AUTH, NIP-45 COUNT, NIP-70 protected events, NIP-59 gift-wrap
   deletion semantics, NIP-77 negentropy set reconciliation** (persistent
   LMDB B-tree, tree-backed multi-round sync sessions).
@@ -30,11 +33,11 @@ transport.
   length-prefixed JSON, same dispatcher as WebSocket.
 - **Mesh tooling**: `router` (multi-connection replication with hot reconfig),
   `stream`, `sync` (NIP-77 two-phase transfer), `upload`, `download`.
-- **Operational parity**: worker pools (`numThreads.*`), single LMDB writer,
+- **Operational continuity**: worker pools (`numThreads.*`), single LMDB writer,
   bounded queues with backpressure, slow-client termination
-  (`maxPendingOutboundBytes`), config hot-reload, graceful shutdown
-  (SIGUSR1/SIGINT), write-policy plugins, Prometheus metrics, config compatible
-  with `strfry.conf`.
+  (`max_pending_outbound_bytes`), config hot-reload, graceful shutdown
+  (SIGUSR1/SIGINT), write-policy plugins, Prometheus metrics, and migration of
+  the supported `strfry.conf` subset.
 
 ## Build
 
@@ -46,24 +49,33 @@ The binary is `target/release/wok`. Requires a recent stable Rust (2021
 edition); LMDB and zstd are built from vendored sources by the `lmdb-sys`/`zstd`
 crates, so no system libraries are needed beyond a C toolchain.
 
-## Run
+## Migrate from strfry
 
 ```bash
-cp docs/wok.conf ./strfry.conf   # or reuse an existing strfry.conf
-# Point db= at a *copy* of a v3 database, never your only production file.
-./target/release/wok --config strfry.conf relay
+./target/release/wok migrate strfry \
+  --db /var/lib/strfry \
+  --config /etc/strfry.conf \
+  --output /var/lib/wok
+
+# Review the generated config and manifest, then start Wok.
+./target/release/wok --config /var/lib/wok/wok.toml relay
 ```
+
+The output contains `db/`, `wok.toml`, and `migration-manifest.json`. The source
+database and config are never modified. The output directory must not already
+exist. See [Migration from strfry](docs/migration-from-strfry.md) for cutover,
+verification, and rollback.
+
+For a new relay, start with [docs/wok.toml](docs/wok.toml) and an empty database
+path instead.
 
 Unix socket (disabled by default):
 
-```
-relay {
-    unix {
-        enabled = true
-        path = "./strfry-db/wok.sock"
-        mode = 0600
-    }
-}
+```toml
+[relay.unix]
+enabled = true
+path = "./wok-db/wok.sock"
+mode = 0o600
 ```
 
 ## CLI
@@ -72,8 +84,9 @@ All C++ subcommands exist:
 
 | Command | Notes |
 |---|---|
+| `migrate strfry --db <dir> --config <file> --output <dir>` | Verified, one-way migration into a Wok-owned database |
 | `relay` | WS (+ optional Unix) relay |
-| `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse`; byte-identical to C++ output |
+| `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse` |
 | `scan`, `event <levId>`, `info`, `delete`, `compact`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |
 | `dict stats/train/compress/decompress` | zstd dictionary management (ZDICT training included) |
 | `negentropy list/add/build` | persistent negentropy trees |
@@ -85,7 +98,7 @@ All C++ subcommands exist:
 ```
 crates/
   wok-event       Event JSON, NIP-01 hashing (tao::json-exact), Schnorr, PackedEvent
-  wok-db          Exact LMDB v3 environment, DBI contract, transactions, integrity
+  wok-db          Wok storage, strfry v3 snapshot/import, transactions, integrity
   wok-query       Filters, DBScan, QueryScheduler, ActiveMonitors
   wok-negentropy  NIP-77 protocol, Vector storage, persistent BTreeLMDB
   wok-relay       Transport-neutral dispatcher, writer, AUTH, plugins, cron
@@ -143,7 +156,7 @@ Summary:
 - Unix socket transport (disabled by default).
 - `wok event <levId>` prints one event by local event ID.
 
-**Intentional deviations (reviewed, upstream-wart fixes)**
+**Intentional Wok behavior**
 - Restricted-read REQ/NEG-OPEN requires a *completed* NIP-42 auth (C++ only
   checks a session exists); `SetAuth` is dispatched to the negentropy worker
   (C++ defines but never dispatches it); one AUTH challenge per session
@@ -151,18 +164,19 @@ Summary:
 - Historical restricted-kind REQ filtering uses the PackedEvent from the Event
   table (C++ `RelayReqWorker` currently views EventPayload bytes).
 - JSON nesting capped at 128 levels (DoS hardening; tao has no limit).
-- `wok` creates a missing DB directory; C++ requires it to exist.
-- `export`/`info` refuse non-v3 databases (migrate via the C++ binary).
+- New Wok databases use a Wok-owned v4 marker. strfry v3 is accepted only by
+  `wok migrate strfry`.
+- `wok` creates a missing database directory for new Wok databases.
 - NIP-11 `software` string is wok's repo URL.
 
-**Deliberate C++ bug-compatibility kept**
-- tao::json byte parity: duplicate keys rejected, `U+007F` escaped as `\u007f`,
-  ryu f64 formatting — the id-hash preimage and stored JSON bytes match.
-- `from_hex` `0x`-prefix/odd-length handling, all-digit `parseUint64`,
-  `std::stoull` a-tag parsing.
-- Ephemerals stored with `expiration = 1` and cron-purged, exactly like C++.
-- C++'s non-NIP-compliant `ERROR: auth-required:` CLOSED prefix.
-- Exact 32-byte id/author filters (no NIP-01 prefix matching), like C++.
+**Compatibility is deliberately bounded**
+- Migration preserves logical event records and validates their fingerprints;
+  Wok does not promise an LMDB file that strfry can reopen.
+- Existing strfry-like JSON serialization remains where it affects event IDs or
+  lossless migration. Other inherited quirks are candidates for correction.
+- Supported config settings are translated into strict Wok TOML. Review
+  external plugin, policy, and socket paths; unsupported strfry keys are not
+  carried forward.
 
 **Remaining gaps**
 - Mesh *client* links (router/stream/sync) don't offer permessage-deflate
@@ -172,7 +186,9 @@ Summary:
 ## Documentation
 
 - [Architecture](docs/architecture.md)
-- [LMDB v3 contract](docs/lmdb-v3.md)
+- [Migration from strfry](docs/migration-from-strfry.md)
+- [Compatibility policy](docs/compatibility-policy.md)
+- [strfry LMDB v3 import contract](docs/lmdb-v3.md)
 - [Unix socket protocol](docs/unix-socket.md)
 - [Supported NIPs](docs/nips.md)
 - [Configuration](docs/config.md)

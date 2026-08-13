@@ -257,7 +257,7 @@ impl RelayMessage {
     pub fn closed_error(sub_id: impl Into<String>, payload: impl Into<String>) -> Self {
         Self::Closed {
             sub_id: sub_id.into(),
-            message: format!("ERROR: {}", payload.into()),
+            message: payload.into(),
         }
     }
 }
@@ -290,5 +290,14 @@ mod tests {
         }
         .to_json();
         assert_eq!(s, r#"["OK","ab",true,""]"#);
+    }
+
+    #[test]
+    fn closed_reason_keeps_machine_readable_prefix_first() {
+        let message = RelayMessage::closed_error("sub", "auth-required: authenticate first");
+        assert_eq!(
+            message.to_json(),
+            r#"["CLOSED","sub","auth-required: authenticate first"]"#
+        );
     }
 }

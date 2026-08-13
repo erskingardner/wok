@@ -1,8 +1,16 @@
-# LMDB v3 byte contract
+# strfry LMDB v3 import contract
 
 Derived from C++ `golpe.yaml` / generated `defaultDb.h` at strfry `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`.
 
-Endianness: native (little-endian on supported hosts). `Meta.endianness` must be `1`. `Meta.dbVersion` must be `3`. No silent migration.
+Endianness: native (little-endian on supported hosts). An import source must
+have `Meta.endianness = 1` and `Meta.dbVersion = 3`.
+
+Wok never runs directly on that source. `wok migrate strfry` takes a read-only,
+transactionally consistent copy, verifies the copied records, and changes the
+copy's `Meta.dbVersion` to Wok version 4. Version 4 is an ownership boundary;
+the first Wok format retains the v3 record layout to make migration lossless,
+but future Wok versions may evolve it. There is no implicit migration during
+normal `relay`, `info`, or database utility commands.
 
 ## DBI names, flags, comparators
 
@@ -25,7 +33,8 @@ Endianness: native (little-endian on supported hosts). `Meta.endianness` must be
 | `rasgueadb_defaultDb__CompressionDictionary` | INTEGERKEY | default | dictId | FlatBuffer dict |
 | `negentropy` | REVERSEKEY | default | treeId \|\| nodeId (native u64) | Node / MetaData |
 
-Env: `max_dbs=64`, mode `0664`, `MDB_CREATE`.
+Import/open environment: `max_dbs=64`, mode `0664`; named DBIs use their v3
+creation flags on the private snapshot.
 
 ## PackedEvent
 

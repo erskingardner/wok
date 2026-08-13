@@ -30,6 +30,7 @@ pub struct EnvOptions {
     pub no_read_ahead: bool,
     pub max_dbs: u32,
     pub create_dir: bool,
+    pub create_dbis: bool,
 }
 
 impl Default for EnvOptions {
@@ -40,6 +41,7 @@ impl Default for EnvOptions {
             no_read_ahead: false,
             max_dbs: 64,
             create_dir: true,
+            create_dbis: true,
         }
     }
 }
@@ -99,7 +101,10 @@ impl Env {
             check(mdb_env_set_mapsize(env, opts.map_size))?;
         }
 
-        let mut flags = MDB_CREATE;
+        // MDB_CREATE is a DBI-open flag, not an environment flag. It happens
+        // to share its numeric value with MDB_NOMETASYNC, so passing it here
+        // would silently weaken LMDB durability.
+        let mut flags = 0;
         if opts.no_read_ahead {
             flags |= MDB_NORDAHEAD;
         }
@@ -139,7 +144,12 @@ impl Env {
         for spec in dbi_specs() {
             let cname = CString::new(spec.name).unwrap();
             let mut dbi: MDB_dbi = 0;
-            let rc = unsafe { mdb_dbi_open(txn, cname.as_ptr(), spec.flags, &mut dbi) };
+            let dbi_flags = if opts.create_dbis {
+                spec.flags
+            } else {
+                spec.flags & !MDB_CREATE
+            };
+            let rc = unsafe { mdb_dbi_open(txn, cname.as_ptr(), dbi_flags, &mut dbi) };
             if rc != 0 {
                 unsafe { mdb_txn_abort(txn) };
                 unsafe { mdb_env_close(env) };
@@ -214,6 +224,12 @@ impl Env {
     }
 
     pub fn begin_rw(&self) -> Result<RwTxn<'_>, DbError> {
+        let version = self.db_version()?;
+        if version != 0 && version != wok_event::WOK_DB_VERSION {
+            return Err(DbError::msg(format!(
+                "database version {version} is an import source and is read-only; run `wok migrate strfry`"
+            )));
+        }
         RwTxn::begin(self)
     }
 

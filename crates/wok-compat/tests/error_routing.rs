@@ -1,5 +1,4 @@
-//! Pins the C++ RelayIngester error routing: which failures produce
-//! OK / CLOSED / NOTICE and with what message prefixes.
+//! Pins error routing and NIP-01 machine-readable CLOSED prefixes.
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use std::time::Duration;
@@ -120,7 +119,7 @@ async fn cpp_error_routing() {
     send_and_expect(
         &rig,
         r#"["REQ","s",{},{},{}]"#.into(),
-        |t| t == r#"["CLOSED","s","ERROR: bad req: arr too big"]"#,
+        |t| t == r#"["CLOSED","s","error: bad req: arr too big"]"#,
         "arr too big",
     )
     .await;
@@ -128,7 +127,7 @@ async fn cpp_error_routing() {
     send_and_expect(
         &rig,
         r#"["REQ","s",{"kinds":"nope"}]"#.into(),
-        |t| t.starts_with(r#"["CLOSED","s","ERROR: bad req:"#),
+        |t| t.starts_with(r#"["CLOSED","s","error: bad req:"#),
         "bad filter",
     )
     .await;

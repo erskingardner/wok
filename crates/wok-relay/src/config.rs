@@ -1,10 +1,11 @@
-//! strfry.conf HOCON-subset parser plus wok Unix-socket extensions.
+//! Native TOML configuration plus the legacy strfry HOCON migration parser.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub db: PathBuf,
     pub db_maxreaders: u32,
@@ -15,6 +16,24 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlConfig {
+    database: DatabaseConfig,
+    events: EventsConfig,
+    relay: RelayConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseConfig {
+    path: PathBuf,
+    max_readers: u32,
+    map_size: usize,
+    no_read_ahead: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventsConfig {
     pub max_event_size: usize,
     pub reject_newer_than_secs: u64,
@@ -26,6 +45,7 @@ pub struct EventsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelayConfig {
     pub bind: String,
     pub port: u16,
@@ -63,6 +83,7 @@ pub struct RelayConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub enabled: bool,
     pub service_url: String,
@@ -71,6 +92,7 @@ pub struct AuthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InfoConfig {
     pub name: String,
     pub description: String,
@@ -85,6 +107,7 @@ pub struct InfoConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilterValidationConfig {
     pub enabled: bool,
     pub max_filters_per_req: u64,
@@ -95,6 +118,7 @@ pub struct FilterValidationConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnixConfig {
     pub enabled: bool,
     pub path: PathBuf,
@@ -110,7 +134,7 @@ pub struct UnixConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            db: PathBuf::from("./strfry-db/"),
+            db: PathBuf::from("./wok-db/"),
             db_maxreaders: 256,
             db_mapsize: 10_995_116_277_760,
             db_no_read_ahead: false,
@@ -182,7 +206,7 @@ impl Default for Config {
                 },
                 unix: UnixConfig {
                     enabled: false,
-                    path: PathBuf::from("./strfry-db/wok.sock"),
+                    path: PathBuf::from("./wok-db/wok.sock"),
                     mode: 0o600,
                     owner: String::new(),
                     group: String::new(),
@@ -196,13 +220,77 @@ impl Default for Config {
     }
 }
 
+impl From<Config> for TomlConfig {
+    fn from(config: Config) -> Self {
+        Self {
+            database: DatabaseConfig {
+                path: config.db,
+                max_readers: config.db_maxreaders,
+                map_size: config.db_mapsize,
+                no_read_ahead: config.db_no_read_ahead,
+            },
+            events: config.events,
+            relay: config.relay,
+        }
+    }
+}
+
+impl From<TomlConfig> for Config {
+    fn from(config: TomlConfig) -> Self {
+        Self {
+            db: config.database.path,
+            db_maxreaders: config.database.max_readers,
+            db_mapsize: config.database.map_size,
+            db_no_read_ahead: config.database.no_read_ahead,
+            events: config.events,
+            relay: config.relay,
+        }
+    }
+}
+
+fn merge_toml(base: &mut toml::Value, supplied: toml::Value) {
+    match (base, supplied) {
+        (toml::Value::Table(base), toml::Value::Table(supplied)) => {
+            for (key, value) in supplied {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge_toml(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, supplied) => {
+            *base = supplied;
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let text = std::fs::read_to_string(path.as_ref()).map_err(|e| e.to_string())?;
-        Self::parse(&text)
+        Self::parse_toml(&text)
     }
 
-    pub fn parse(text: &str) -> Result<Self, String> {
+    /// Parse Wok's native TOML format. Omitted settings inherit documented
+    /// defaults, while unknown settings are rejected.
+    pub fn parse_toml(text: &str) -> Result<Self, String> {
+        let mut merged = toml::Value::try_from(TomlConfig::from(Config::default()))
+            .map_err(|e| e.to_string())?;
+        let supplied: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+        merge_toml(&mut merged, supplied);
+        let parsed: TomlConfig = merged
+            .try_into()
+            .map_err(|e: toml::de::Error| e.to_string())?;
+        Ok(parsed.into())
+    }
+
+    pub fn to_toml(&self) -> Result<String, String> {
+        toml::to_string_pretty(&TomlConfig::from(self.clone())).map_err(|e| e.to_string())
+    }
+
+    /// Parse the legacy HOCON subset used by strfry. This exists only for the
+    /// explicit `wok migrate strfry` boundary.
+    pub fn parse_strfry(text: &str) -> Result<Self, String> {
         let map = parse_hocon(text)?;
         let mut cfg = Config::default();
         if let Some(v) = map.get("db") {
@@ -678,7 +766,7 @@ mod tests {
 
     #[test]
     fn parses_nested() {
-        let c = Config::parse(
+        let c = Config::parse_strfry(
             r#"
             db = "/tmp/x"
             relay {
@@ -698,7 +786,7 @@ mod tests {
 
     #[test]
     fn comment_chars_inside_quotes_are_kept() {
-        let c = Config::parse(
+        let c = Config::parse_strfry(
             r#"
             relay {
                 info {
@@ -713,18 +801,18 @@ mod tests {
 
     #[test]
     fn inline_braces_and_comments() {
-        let c = Config::parse("relay { port = 9001 } // trailing\n").unwrap();
+        let c = Config::parse_strfry("relay { port = 9001 } // trailing\n").unwrap();
         assert_eq!(c.relay.port, 9001);
-        let c = Config::parse("relay {\n port = 9002\n} # close\n").unwrap();
+        let c = Config::parse_strfry("relay {\n port = 9002\n} # close\n").unwrap();
         assert_eq!(c.relay.port, 9002);
     }
 
     #[test]
     fn strict_value_errors() {
-        assert!(Config::parse("relay { port = \"abc\" }").is_err());
-        assert!(Config::parse("relay { port = 70000 }").is_err());
-        assert!(Config::parse("relay { auth { enabled = \"yes\" } }").is_err());
-        assert!(Config::parse("relay { port = 1").is_err());
+        assert!(Config::parse_strfry("relay { port = \"abc\" }").is_err());
+        assert!(Config::parse_strfry("relay { port = 70000 }").is_err());
+        assert!(Config::parse_strfry("relay { auth { enabled = \"yes\" } }").is_err());
+        assert!(Config::parse_strfry("relay { port = 1").is_err());
     }
 
     #[test]
@@ -737,7 +825,7 @@ mod tests {
 
     #[test]
     fn full_strfry_style_config() {
-        let c = Config::parse(
+        let c = Config::parse_strfry(
             r#"
             db = "/tmp/db"
             dbParams {
@@ -860,8 +948,8 @@ mod tests {
 
     #[test]
     fn reload_keeps_frozen_keys() {
-        let mut cfg = Config::parse("relay {\n port = 7777\n maxFilterLimit = 500\n}").unwrap();
-        let new = Config::parse("relay {\n port = 9999\n maxFilterLimit = 123\n}").unwrap();
+        let mut cfg = Config::parse_toml("[relay]\nport = 7777\nmax_filter_limit = 500\n").unwrap();
+        let new = Config::parse_toml("[relay]\nport = 9999\nmax_filter_limit = 123\n").unwrap();
         cfg.apply_reload(new);
         assert_eq!(cfg.relay.port, 7777, "port is restart-required");
         assert_eq!(cfg.relay.max_filter_limit, 123, "limits reload live");
@@ -869,7 +957,7 @@ mod tests {
 
     #[test]
     fn empty_restricted_read_kinds() {
-        let c = Config::parse("relay { auth { restrictedReadKinds = \"\" } }").unwrap();
+        let c = Config::parse_toml("[relay.auth]\nrestricted_read_kinds = []\n").unwrap();
         assert!(c.relay.auth.restricted_read_kinds.is_empty());
         // C++ default is no restricted kinds.
         assert!(Config::default()
@@ -877,5 +965,51 @@ mod tests {
             .auth
             .restricted_read_kinds
             .is_empty());
+    }
+
+    #[test]
+    fn native_toml_merges_defaults_and_uses_arrays() {
+        let c = Config::parse_toml(
+            r#"
+            [database]
+            path = "/tmp/wok-db"
+
+            [relay]
+            port = 9000
+
+            [relay.auth]
+            restricted_read_kinds = [4, 1059]
+
+            [relay.unix]
+            mode = 0o640
+            auth_uids = [501, 502]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.db, PathBuf::from("/tmp/wok-db"));
+        assert_eq!(c.relay.port, 9000);
+        assert_eq!(c.relay.auth.restricted_read_kinds, vec![4, 1059]);
+        assert_eq!(c.relay.unix.mode, 0o640);
+        assert_eq!(c.relay.unix.auth_uids, vec![501, 502]);
+        assert_eq!(
+            c.events.max_event_size,
+            Config::default().events.max_event_size
+        );
+    }
+
+    #[test]
+    fn native_toml_rejects_unknown_keys_and_roundtrips() {
+        assert!(Config::parse_toml("[relay]\nunknown_setting = true\n").is_err());
+        let expected = Config::default();
+        let encoded = expected.to_toml().unwrap();
+        let decoded = Config::parse_toml(&encoded).unwrap();
+        assert_eq!(decoded.db, expected.db);
+        assert_eq!(decoded.relay.port, expected.relay.port);
+        assert_eq!(decoded.relay.unix.mode, expected.relay.unix.mode);
+    }
+
+    #[test]
+    fn documented_toml_example_parses() {
+        Config::parse_toml(include_str!("../../../docs/wok.toml")).unwrap();
     }
 }

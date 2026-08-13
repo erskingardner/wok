@@ -1,5 +1,4 @@
-//! Differential proof that wok's negentropy BTreeLMDB storage is readable by
-//! C++ strfry and vice versa: same tree size and full-range fingerprint.
+//! Differential proof of the migration boundary for negentropy storage.
 
 use serde_json::json;
 use std::io::Write;
@@ -107,7 +106,7 @@ fn rust_tree_stats(dir: &Path) -> (u64, String) {
 }
 
 #[test]
-fn rust_built_tree_matches_cpp_listing() {
+fn strfry_refuses_wok_owned_tree_database() {
     if !strfry_available() {
         eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
         return;
@@ -143,15 +142,21 @@ fn rust_built_tree_matches_cpp_listing() {
     }
     drop(env);
     let conf = write_conf(dir.path());
-    let out = strfry_cmd(&conf, &["negentropy", "list"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let (cpp_size, cpp_fp) = parse_list(&stdout, 1);
     let (rust_size, rust_fp) = rust_tree_stats(dir.path());
     assert_eq!(rust_size, 50);
-    assert_eq!(
-        (rust_size, rust_fp.as_str()),
-        (cpp_size, cpp_fp.as_str()),
-        "C++ could not read the wok-built tree identically"
+    assert!(!rust_fp.is_empty());
+    let out = Command::new(strfry_bin())
+        .arg("--config")
+        .arg(&conf)
+        .args(["negentropy", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success()
+            && String::from_utf8_lossy(&out.stderr).contains("Database version too new: 4"),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -161,9 +166,9 @@ fn cpp_built_tree_matches_rust_listing() {
         eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
         return;
     }
-    let (dir, _env) = temp_db();
-    drop(_env);
+    let dir = tempfile::tempdir().unwrap();
     let conf = write_conf(dir.path());
+    strfry_cmd(&conf, &["info"]);
     strfry_import(&conf, &corpus(50));
     strfry_cmd(&conf, &["negentropy", "build", "1"]);
     let out = strfry_cmd(&conf, &["negentropy", "list"]);

@@ -9,6 +9,7 @@ use wok_db::{
 };
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_negentropy::Storage;
+mod migrate;
 mod router;
 
 use wok_relay::Config;
@@ -27,11 +28,11 @@ fn foreach_by_filter_scan(
 #[command(
     name = "wok",
     version,
-    about = "Rust reimplementation of the strfry Nostr relay"
+    about = "Nostr relay with verified migration from strfry"
 )]
 struct Cli {
-    /// Config file (HOCON subset, strfry.conf compatible)
-    #[arg(long, short, global = true, default_value = "strfry.conf")]
+    /// Wok config, or source strfry config during migration
+    #[arg(long, short, global = true, default_value = "wok.toml")]
     config: PathBuf,
     #[command(subcommand)]
     cmd: Command,
@@ -39,6 +40,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a verified Wok-owned database from another relay
+    Migrate {
+        #[command(subcommand)]
+        cmd: MigrateCmd,
+    },
     Relay,
     Info,
     Import {
@@ -135,6 +141,19 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum MigrateCmd {
+    /// Import a strfry LMDB v3 database and config without modifying either
+    Strfry {
+        /// strfry LMDB environment directory
+        #[arg(long)]
+        db: PathBuf,
+        /// New directory to create with db/, wok.toml, and a manifest
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum DictCmd {
     Stats {
         #[arg(long)]
@@ -200,10 +219,19 @@ async fn main() -> Result<()> {
                 .add_directive("wok=info".parse().unwrap()),
         )
         .init();
-    let cli = Cli::parse();
-    let cfg = load_cfg(&cli.config)?;
-    match cli.cmd {
-        Command::Relay => cmd_relay(cfg, cli.config.clone()).await,
+    let Cli { config, cmd } = Cli::parse();
+    let cmd = match cmd {
+        Command::Migrate { cmd } => {
+            return match cmd {
+                MigrateCmd::Strfry { db, output } => migrate::migrate_strfry(&db, &config, &output),
+            };
+        }
+        cmd => cmd,
+    };
+    let cfg = load_cfg(&config)?;
+    match cmd {
+        Command::Migrate { .. } => unreachable!("migration was dispatched before config load"),
+        Command::Relay => cmd_relay(cfg, config).await,
         Command::Info => cmd_info(&cfg),
         Command::Import {
             show_rejected,
@@ -1264,7 +1292,7 @@ async fn cmd_sync(
         match cmd {
             "NEG-MSG" => {
                 received_neg_msg = true;
-                let payload = wok_event::from_hex(v[2].as_str().unwrap_or(""))?;
+                let payload = wok_event::from_hex_strict(v[2].as_str().unwrap_or(""))?;
                 let mut curr_have = Vec::new();
                 let mut curr_need = Vec::new();
                 let next = match reconcile(&env, &payload, &mut curr_have, &mut curr_need) {
@@ -1473,7 +1501,7 @@ async fn cmd_stream(cfg: &Config, url: String, dir: String) -> Result<()> {
                         if dir == "down" || dir == "both" {
                             if let Some(ev) = v.get(2) {
                                 if let Some(id) = ev.get("id").and_then(|i| i.as_str()) {
-                                    if let Ok(raw) = wok_event::from_hex(id) {
+                                    if let Ok(raw) = wok_event::from_lower_hex_exact(id) {
                                         downloaded.insert(raw);
                                     }
                                 }

@@ -89,7 +89,7 @@ impl Drop for RoTxn<'_> {
 }
 
 impl<'env> RwTxn<'env> {
-    pub fn begin(env: &'env Env) -> Result<Self, DbError> {
+    pub(crate) fn begin(env: &'env Env) -> Result<Self, DbError> {
         let mut txn = ptr::null_mut();
         unsafe {
             check(mdb_txn_begin(env.inner.env, ptr::null_mut(), 0, &mut txn))?;

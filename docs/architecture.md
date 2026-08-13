@@ -15,6 +15,8 @@ clients ─Unix─► wok-unix─┼─► RelayHandle (crossbeam) ─► ingest
 
 Invariants:
 
+- strfry v3 is a read-only migration source; Wok runtime databases carry a
+  Wok-owned version marker and are never shared with a strfry writer.
 - LMDB transactions, cursors, and mmap slices never cross `.await`.
 - A single application-level writer thread commits events.
 - Connection-affine ingest uses one ingester in this build (can be sharded later by `conn_id`).

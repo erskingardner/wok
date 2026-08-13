@@ -57,7 +57,7 @@ fn open_cpp_created_database() {
 }
 
 #[test]
-fn rust_init_readable_by_cpp() {
+fn cpp_refuses_wok_owned_database() {
     require_strfry!();
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
@@ -71,13 +71,17 @@ fn rust_init_readable_by_cpp() {
         .args(["--config", conf.to_str().unwrap(), "info"])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success(),
-        "stderr={}",
+        !out.status.success(),
+        "strfry unexpectedly opened a Wok-owned database: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout.contains("DB version: 3"), "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Database version too new: 4"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn sign_kind1(content: &str, created_at: u64) -> (Vec<u8>, String) {
@@ -102,8 +106,7 @@ fn sign_kind1(content: &str, created_at: u64) -> (Vec<u8>, String) {
 }
 
 #[test]
-fn rust_write_cpp_export() {
-    require_strfry!();
+fn wok_owned_event_remains_readable_by_wok() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
     let env = Env::open(&db, EnvOptions::default()).unwrap();
@@ -117,20 +120,7 @@ fn rust_write_cpp_export() {
         assert_eq!(evs[0].status, EventWriteStatus::Written);
         txn.commit().unwrap();
     }
-    drop(env);
-
-    let conf = tmp.path().join("strfry.conf");
-    std::fs::write(&conf, format!("db = \"{}\"\n", db.display())).unwrap();
-    let out = Command::new(strfry_bin())
-        .args(["--config", conf.to_str().unwrap(), "export"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(&id_hex), "{stdout}");
-    assert!(stdout.contains("hello wok"), "{stdout}");
+    let txn = env.begin_ro().unwrap();
+    let found = wok_db::lookup_event_by_id_ro(&txn, &hex::decode(id_hex).unwrap()).unwrap();
+    assert!(found.is_some());
 }

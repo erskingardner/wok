@@ -3,7 +3,7 @@ name = "wok-db"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Exact strfry LMDB v3 compatibility layer"
+description = "Wok LMDB storage and verified strfry v3 migration"
 
 [dependencies]
 flatbuffers.workspace = true

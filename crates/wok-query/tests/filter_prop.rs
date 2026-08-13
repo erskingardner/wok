@@ -19,9 +19,6 @@ fn packed(
 
 /// Independent matcher used only by this property test.
 fn naive_match(filter: &NostrFilter, ev: PackedEventView<'_>) -> bool {
-    if filter.never_match {
-        return false;
-    }
     if ev.created_at() < filter.since || ev.created_at() > filter.until {
         return false;
     }

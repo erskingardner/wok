@@ -25,6 +25,42 @@ fn nip01_malformed_json_rejected() {
 }
 
 #[test]
+fn nip01_kind_is_limited_to_u16() {
+    let ev = sign_event(json!({
+        "created_at": 1_700_000_010u64,
+        "kind": 65536,
+        "tags": [],
+        "content": "kind out of range",
+    }));
+    assert!(parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).is_err());
+}
+
+#[test]
+fn nip01_all_tag_elements_must_be_strings() {
+    let ev = sign_event(json!({
+        "created_at": 1_700_000_010u64,
+        "kind": 1,
+        "tags": [["e", "11".repeat(32), 7]],
+        "content": "invalid tag",
+    }));
+    assert!(parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).is_err());
+}
+
+#[test]
+fn nip01_identifiers_are_lowercase_hex() {
+    let ev = json!({
+        "id": "AA".repeat(32),
+        "pubkey": "22".repeat(32),
+        "created_at": 1,
+        "kind": 1,
+        "content": "",
+        "tags": [],
+        "sig": "00".repeat(64),
+    });
+    assert!(wok_event::nostr_json_to_packed_event(&ev, &EventLimits::default()).is_err());
+}
+
+#[test]
 fn nip01_filter_kinds_since_until_limit() {
     let fg = NostrFilterGroup::from_value(
         &json!({"kinds":[1],"since":10,"until":20,"limit":5}),
@@ -33,6 +69,20 @@ fn nip01_filter_kinds_since_until_limit() {
     )
     .unwrap();
     assert_eq!(fg.filters[0].limit, 5);
+}
+
+#[test]
+fn nip01_filter_ids_and_kinds_use_event_field_grammar() {
+    assert!(NostrFilterGroup::from_value(&json!({"ids":["AA".repeat(32)]}), 500, 3).is_err());
+    assert!(NostrFilterGroup::from_value(
+        &json!({"authors":[format!("0x{}", "11".repeat(32))]}),
+        500,
+        3
+    )
+    .is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"kinds":[65536]}), 500, 3).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"ids":[]}), 500, 3).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"#1":["value"]}), 500, 3).is_err());
 }
 
 #[test]
@@ -120,7 +170,7 @@ fn nip01_invalid_signature_rejected() {
 }
 
 #[test]
-fn nip01_prefix_ids_rejected_like_cpp() {
+fn nip01_filter_ids_are_exact_length() {
     assert!(NostrFilterGroup::from_value(&json!({"ids":["aabb"]}), 500, 3).is_err());
 }
 
@@ -162,6 +212,13 @@ fn nip59_gift_wrap_kinds() {
 fn nip77_neg_open_parse() {
     let c = ClientCommand::parse(r#"["NEG-OPEN","s",{"kinds":[1]},"61"]"#).unwrap();
     assert!(matches!(c, ClientCommand::NegOpen { .. }));
+}
+
+#[test]
+fn nip77_payload_hex_has_no_prefix_or_half_byte() {
+    assert!(wok_event::from_hex_strict("61").is_ok());
+    assert!(wok_event::from_hex_strict("0x61").is_err());
+    assert!(wok_event::from_hex_strict("1").is_err());
 }
 
 #[test]

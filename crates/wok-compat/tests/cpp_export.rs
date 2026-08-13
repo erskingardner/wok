@@ -48,7 +48,7 @@ fn strfry_import(conf: &Path, events: &[Value]) {
 }
 
 #[test]
-fn rust_write_cpp_export() {
+fn cpp_refuses_wok_owned_database() {
     if !strfry_available() {
         eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
         return;
@@ -64,14 +64,14 @@ fn rust_write_cpp_export() {
     drop(env);
     let conf = write_conf(dir.path());
     let out = strfry_cmd(&conf, &["export"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("compat-hello"),
-        "strfry export failed: status={:?} stderr={} stdout={}",
+        !out.status.success(),
+        "strfry unexpectedly opened Wok v4: status={:?} stderr={} stdout={}",
         out.status,
         String::from_utf8_lossy(&out.stderr),
-        stdout
+        String::from_utf8_lossy(&out.stdout)
     );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Database version too new: 4"));
 }
 
 #[test]
@@ -135,11 +135,8 @@ fn cpp_write_rust_read_query() {
 }
 
 #[test]
-fn rust_replace_then_cpp_export() {
-    if !strfry_available() {
-        return;
-    }
-    let (dir, env) = temp_db();
+fn wok_replace_keeps_only_newest_event() {
+    let (_dir, env) = temp_db();
     let mut rng = rand::thread_rng();
     let kp = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rng);
     let (xonly, _) = kp.x_only_public_key();
@@ -160,23 +157,20 @@ fn rust_replace_then_cpp_export() {
     };
     write_event_to_env(&env, &sign(1_700_000_100, "old-profile"));
     write_event_to_env(&env, &sign(1_700_000_200, "new-profile"));
-    drop(env);
-    let conf = write_conf(dir.path());
-    let out = strfry_cmd(&conf, &["export"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("new-profile"), "{stdout}");
-    assert!(
-        !stdout.contains("old-profile"),
-        "replaced event leaked: {stdout}"
-    );
+    let txn = env.begin_ro().unwrap();
+    let mut decomp = Decompressor::new();
+    let mut found = Vec::new();
+    wok_query::foreach_by_filter(&txn, &json!({"kinds":[0]}), 500, 3, |lev| {
+        found.push(event_json_owned(&txn, &mut decomp, lev, 65536).unwrap());
+    })
+    .unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("new-profile"), "{found:?}");
 }
 
 #[test]
-fn rust_delete_then_cpp_export() {
-    if !strfry_available() {
-        return;
-    }
-    let (dir, env) = temp_db();
+fn wok_delete_removes_event_from_queries() {
+    let (_dir, env) = temp_db();
     let note = sign_event(json!({
         "created_at": 1_700_000_300u64,
         "kind": 1,
@@ -185,22 +179,6 @@ fn rust_delete_then_cpp_export() {
     }));
     write_event_to_env(&env, &note);
     let id = note["id"].as_str().unwrap().to_string();
-    let pk = note["pubkey"].as_str().unwrap().to_string();
-    // Deletion must be signed by the same key — reconstruct is hard; use kind 5 from same pubkey via packed write.
-    let del = {
-        let ev = json!({
-            "created_at": 1_700_000_301u64,
-            "kind": 5,
-            "tags": [["e", id]],
-            "content": "",
-            "pubkey": pk,
-        });
-        // Can't sign without the original key. Write a new signed deletion from a different key
-        // would be rejected. Instead delete via wok-db delete_events after lookup.
-        let _ = ev;
-        note.clone()
-    };
-    let _ = del;
     {
         let txn = env.begin_ro().unwrap();
         let mut levs = Vec::new();
@@ -211,18 +189,18 @@ fn rust_delete_then_cpp_export() {
         wok_db::delete_events(&mut txn, &mut NoopNegentropy, levs).unwrap();
         txn.commit().unwrap();
     }
-    drop(env);
-    let conf = write_conf(dir.path());
-    let out = strfry_cmd(&conf, &["export"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let txn = env.begin_ro().unwrap();
+    let mut found = Vec::new();
+    wok_query::foreach_by_filter(&txn, &json!({"ids":[id]}), 500, 3, |lev| found.push(lev))
+        .unwrap();
     assert!(
-        !stdout.contains("please-delete"),
-        "deleted event still exported: {stdout}"
+        found.is_empty(),
+        "deleted event remained queryable: {found:?}"
     );
 }
 
 #[test]
-fn alternating_cpp_rust_writes() {
+fn strfry_v3_database_is_read_only_to_wok() {
     if !strfry_available() {
         return;
     }
@@ -238,28 +216,11 @@ fn alternating_cpp_rust_writes() {
     }));
     strfry_import(&conf, &[a]);
     let env = Env::open(db, EnvOptions::default()).unwrap();
-    let b = sign_event(json!({
-        "created_at": 1_700_000_401u64,
-        "kind": 1,
-        "tags": [],
-        "content": "rust-b",
-    }));
-    write_event_to_env(&env, &b);
-    drop(env);
-    let c = sign_event(json!({
-        "created_at": 1_700_000_402u64,
-        "kind": 1,
-        "tags": [],
-        "content": "cpp-c",
-    }));
-    strfry_import(&conf, &[c]);
-    let out = strfry_cmd(&conf, &["export"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("cpp-a") && stdout.contains("rust-b") && stdout.contains("cpp-c"),
-        "{stdout}"
-    );
-    let env = Env::open(db, EnvOptions::default()).unwrap();
+    let error = match env.begin_rw() {
+        Ok(_) => panic!("Wok unexpectedly opened a write transaction on strfry v3"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("import source and is read-only"));
     let txn = env.begin_ro().unwrap();
     let report = check_integrity(&txn).unwrap();
     assert!(report.ok(), "{report:?}");
@@ -290,11 +251,8 @@ fn rust_scan_order_matches_created_at_desc() {
 }
 
 #[test]
-fn packed_roundtrip_survives_cpp_export() {
-    if !strfry_available() {
-        return;
-    }
-    let (dir, env) = temp_db();
+fn packed_roundtrip_survives_wok_storage() {
+    let (_dir, env) = temp_db();
     let ev = sign_event(json!({
         "created_at": 1_700_000_500u64,
         "kind": 1,
@@ -309,10 +267,10 @@ fn packed_roundtrip_survives_cpp_export() {
         wok_db::write_events(&mut txn, &mut NoopNegentropy, &mut evs, false).unwrap();
         txn.commit().unwrap();
     }
-    drop(env);
-    let conf = write_conf(dir.path());
-    let out = strfry_cmd(&conf, &["export"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(&id), "{stdout}");
-    assert!(stdout.contains("tags-ok"), "{stdout}");
+    let txn = env.begin_ro().unwrap();
+    let (_, packed) = wok_db::lookup_event_by_id_ro(&txn, &hex::decode(id).unwrap())
+        .unwrap()
+        .unwrap();
+    let view = PackedEventView::new(&packed).unwrap();
+    assert_eq!(view.id(), &hex::decode(ev["id"].as_str().unwrap()).unwrap());
 }

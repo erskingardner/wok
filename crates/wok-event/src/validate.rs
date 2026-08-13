@@ -46,7 +46,10 @@ pub fn verify_nostr_event(packed: PackedEventView<'_>, orig: &Value) -> Result<(
             .ok_or_else(|| EventError::msg("missing sig"))?,
         "event sig was not a string",
     )?;
-    let sig = crate::from_hex_exact(sig_hex)?;
+    if sig_hex.len() != 128 {
+        return Err(EventError::msg("unexpected signature size"));
+    }
+    let sig = crate::from_lower_hex_exact(sig_hex)?;
     let valid = verify_sig(&sig, packed.id(), packed.pubkey())?;
     if !valid {
         return Err(EventError::msg("bad signature"));

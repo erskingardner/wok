@@ -90,7 +90,6 @@ See `docs/known-differences.md` for the full, current list. Highlights:
 - `dict train/compress/decompress` reads compressed payloads but does not train dictionaries.
 - `router` is a compatibility stub; `stream`/`sync` do not persist events.
 - Ingester/req/monitor/negentropy thread *counts* are parsed; this build runs one thread per pool plus a single writer.
-- Persistent negentropy B-tree byte identity with C++ is implemented but not proven by a dedicated tree-dump differential.
 - ID/author filters are exact 32 bytes (C++), not NIP-01 prefixes.
 - Historical restricted-kind REQ filtering uses PackedEvent from the Event table (intentional; C++ ReqWorker currently views payload bytes).
 
@@ -122,6 +121,9 @@ A full second review against the C++ source produced these fix commits:
   single LMDB writer.
 - A polling `data.mdb` watcher notifies live subscriptions of writes made by
   other processes (C++ `file_change_monitor` parity).
+- `crates/wok-compat/tests/cpp_negentropy.rs`: wok-built negentropy trees
+  produce identical size + full-range fingerprint under C++ `strfry
+  negentropy list`, and C++-built trees read identically under wok.
 - CLI: `wok event <levId>`; import/export byte-level fidelity with C++
   (abort-on-error export, import size accounting, fried endianness guards).
 

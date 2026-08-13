@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = load_cfg(&cli.config)?;
     match cli.cmd {
-        Command::Relay => cmd_relay(cfg).await,
+        Command::Relay => cmd_relay(cfg, cli.config.clone()).await,
         Command::Info => cmd_info(&cfg),
         Command::Import {
             show_rejected,
@@ -222,12 +222,48 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_relay(cfg: Config) -> Result<()> {
+/// Watch the config file and live-reload the reloadable subset, like golpe
+/// (which watches the config file and applies non-`noReload` keys). Parse
+/// errors keep the old config.
+fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
+    tokio::spawn(async move {
+        let mut last = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if handle.is_shutdown() {
+                break;
+            }
+            let cur = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if cur.is_none() || cur == last {
+                continue;
+            }
+            last = cur;
+            match Config::load(&path) {
+                Ok(new) => {
+                    tracing::info!("config {} changed, reloading", path.display());
+                    handle.config.write().apply_reload(new);
+                }
+                Err(e) => {
+                    tracing::error!("config reload failed, keeping old config: {e}");
+                }
+            }
+        }
+    });
+}
+
+async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     wok_relay::apply_nofiles_limit(cfg.relay.nofiles).map_err(anyhow::Error::msg)?;
     let env = open_env(&cfg)?;
     let bind: SocketAddr = format!("{}:{}", cfg.relay.bind, cfg.relay.port).parse()?;
     let unix_cfg = cfg.clone();
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
+    if config_path.exists() {
+        spawn_config_reload(config_path, handle.clone());
+    }
     let h2 = handle.clone();
     let h3 = handle.clone();
     let ws = tokio::spawn(async move {

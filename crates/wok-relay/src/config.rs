@@ -450,6 +450,32 @@ impl Config {
             max_tag_val_size: self.events.max_tag_val_size,
         }
     }
+
+    /// Replace this config with a freshly parsed one, keeping the values
+    /// that cannot change at runtime. The frozen set matches golpe's
+    /// `noReload` keys plus everything bound to a listener/socket/pool that
+    /// only exists once at startup (documented as "restart required" in
+    /// strfry.conf).
+    pub fn apply_reload(&mut self, new: Config) {
+        let old = std::mem::replace(self, new);
+        self.db = old.db;
+        self.db_maxreaders = old.db_maxreaders;
+        self.db_mapsize = old.db_mapsize;
+        self.db_no_read_ahead = old.db_no_read_ahead;
+        self.relay.bind = old.relay.bind;
+        self.relay.port = old.relay.port;
+        self.relay.nofiles = old.relay.nofiles;
+        self.relay.max_websocket_payload_size = old.relay.max_websocket_payload_size;
+        self.relay.auto_ping_seconds = old.relay.auto_ping_seconds;
+        self.relay.enable_tcp_keepalive = old.relay.enable_tcp_keepalive;
+        self.relay.compression_enabled = old.relay.compression_enabled;
+        self.relay.compression_sliding_window = old.relay.compression_sliding_window;
+        self.relay.ingester_threads = old.relay.ingester_threads;
+        self.relay.req_worker_threads = old.relay.req_worker_threads;
+        self.relay.req_monitor_threads = old.relay.req_monitor_threads;
+        self.relay.negentropy_threads = old.relay.negentropy_threads;
+        self.relay.unix = old.relay.unix;
+    }
 }
 
 fn assign_u64(
@@ -830,6 +856,15 @@ mod tests {
         assert_eq!(c.relay.unix.auth_uids, vec![501, 502]);
         assert_eq!(c.relay.unix.auth_gids, vec![20]);
         assert_eq!(c.relay.unix.max_pending_outbound_bytes, 2048);
+    }
+
+    #[test]
+    fn reload_keeps_frozen_keys() {
+        let mut cfg = Config::parse("relay {\n port = 7777\n maxFilterLimit = 500\n}").unwrap();
+        let new = Config::parse("relay {\n port = 9999\n maxFilterLimit = 123\n}").unwrap();
+        cfg.apply_reload(new);
+        assert_eq!(cfg.relay.port, 7777, "port is restart-required");
+        assert_eq!(cfg.relay.max_filter_limit, 123, "limits reload live");
     }
 
     #[test]

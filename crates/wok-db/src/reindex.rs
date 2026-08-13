@@ -2,6 +2,7 @@
 //! event secondary index from PackedEvent again.
 
 use crate::write::event_index_entries;
+use crate::{index_event_search, payload::Decompressor, search::note_search_indexed_through};
 use crate::{DbError, RoTxn, RwTxn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +42,7 @@ pub fn rebuild_primary_and_event_indices(
 ) -> Result<ReindexStats, DbError> {
     let source_dbis = source.env().dbis();
     let target_dbis = target.env().dbis();
-    for dbi in [
+    let mut dbis_to_clear = vec![
         target_dbis.meta,
         target_dbis.negentropy_filter,
         target_dbis.event,
@@ -58,7 +59,11 @@ pub fn rebuild_primary_and_event_indices(
         target_dbis.compression_dictionary,
         target_dbis.event_payload,
         target_dbis.negentropy,
-    ] {
+    ];
+    if let Some(event_search) = target_dbis.event_search {
+        dbis_to_clear.push(event_search);
+    }
+    for dbi in dbis_to_clear {
         target.clear(dbi)?;
     }
 
@@ -83,8 +88,10 @@ pub fn rebuild_primary_and_event_indices(
     )?;
 
     let mut events = 0u64;
+    let mut last_lev_id = 0u64;
     let mut index_entries = 0u64;
     let mut error = None;
+    let mut decompressor = Decompressor::new();
     source.foreach_full(source_dbis.event, &[], &[], false, |key, packed_bytes| {
         let Some(lev_id) = key.try_into().ok().map(u64::from_ne_bytes) else {
             error = Some(DbError::msg("Event key is not 8 bytes"));
@@ -110,12 +117,36 @@ pub fn rebuild_primary_and_event_indices(
                 }
             }
         }
+        let payload = match source.get_u64(source_dbis.event_payload, lev_id) {
+            Ok(Some(payload)) => payload.to_vec(),
+            Ok(None) => {
+                error = Some(DbError::msg(format!("event {lev_id} has no payload")));
+                return false;
+            }
+            Err(err) => {
+                error = Some(err);
+                return false;
+            }
+        };
+        let json = match decompressor.decode(source, &payload, 16 * 1024 * 1024) {
+            Ok(json) => json.to_owned(),
+            Err(err) => {
+                error = Some(err);
+                return false;
+            }
+        };
+        if let Err(err) = index_event_search(target, lev_id, &json) {
+            error = Some(err);
+            return false;
+        }
         events += 1;
+        last_lev_id = lev_id;
         error.is_none()
     })?;
     if let Some(error) = error {
         return Err(error);
     }
+    note_search_indexed_through(target, last_lev_id)?;
     Ok(ReindexStats {
         events,
         payloads,

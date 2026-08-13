@@ -18,6 +18,9 @@ pub const DBI_EVENT_EXPIRATION: &str = "rasgueadb_defaultDb__Event__expiration";
 pub const DBI_COMPRESSION_DICTIONARY: &str = "rasgueadb_defaultDb__CompressionDictionary";
 pub const DBI_EVENT_PAYLOAD: &str = "rasgueadb_defaultDb__EventPayload";
 pub const DBI_NEGENTROPY: &str = "negentropy";
+/// Wok-owned, rebuildable NIP-50 content-term postings. This DBI is optional
+/// when opening a read-only strfry v3 migration source.
+pub const DBI_EVENT_SEARCH: &str = "wok_Event__search";
 
 pub const DBI_NAMES: &[&str] = &[
     DBI_META,
@@ -36,6 +39,7 @@ pub const DBI_NAMES: &[&str] = &[
     DBI_COMPRESSION_DICTIONARY,
     DBI_EVENT_PAYLOAD,
     DBI_NEGENTROPY,
+    DBI_EVENT_SEARCH,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -137,6 +141,11 @@ pub fn dbi_specs() -> &'static [DbiSpec] {
         DbiSpec {
             name: DBI_NEGENTROPY,
             flags: MDB_CREATE | MDB_REVERSEKEY,
+            comparator: ComparatorKind::Default,
+        },
+        DbiSpec {
+            name: DBI_EVENT_SEARCH,
+            flags: DUP,
             comparator: ComparatorKind::Default,
         },
     ]

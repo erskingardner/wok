@@ -131,7 +131,20 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
     report.add(
         "database-open",
         CheckStatus::Pass,
-        "all expected DBIs opened",
+        "all authoritative DBIs opened",
+    );
+    report.add(
+        "search-index",
+        if env.dbis().event_search.is_some() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        if env.dbis().event_search.is_some() {
+            "NIP-50 derived index is present"
+        } else {
+            "NIP-50 derived index is absent and will be backfilled on the next writable open"
+        },
     );
 
     match env.db_meta() {

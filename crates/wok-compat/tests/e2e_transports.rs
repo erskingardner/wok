@@ -116,6 +116,115 @@ async fn ws_publish_and_subscribe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip50_ranked_historical_and_live_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let cfg = test_cfg(dir.path());
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let relay = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(relay, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .unwrap();
+    let now = now_secs();
+    for event in [
+        sign_event(json!({
+            "created_at": now.saturating_sub(20),
+            "kind": 1,
+            "tags": [],
+            "content": "exact nostr search phrase",
+        })),
+        sign_event(json!({
+            "created_at": now.saturating_sub(10),
+            "kind": 1,
+            "tags": [],
+            "content": "search across the newest nostr event",
+        })),
+        sign_event(json!({
+            "created_at": now,
+            "kind": 0,
+            "tags": [],
+            "content": "nostr search profile must be filtered",
+        })),
+    ] {
+        ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+            .await
+            .unwrap();
+        let replies = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+        assert!(replies.iter().any(|text| text.contains("true")));
+    }
+
+    ws.send(Message::Text(
+        json!(["REQ", "nip50-history", {"search":"nostr search", "kinds":[1], "limit":1}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let history = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+    let events: Vec<_> = history
+        .iter()
+        .filter(|text| text.contains("\"EVENT\""))
+        .collect();
+    assert_eq!(events.len(), 1, "expected post-ranking limit: {history:?}");
+    assert!(
+        events[0].contains("exact nostr search phrase"),
+        "{history:?}"
+    );
+
+    ws.send(Message::Text(
+        json!(["REQ", "nip50-live", {"search":"live needle", "kinds":[1]}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let initial = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+    assert!(initial.iter().any(|text| text.contains("EOSE")));
+
+    let unrelated = sign_event(json!({
+        "created_at": now + 1,
+        "kind": 1,
+        "tags": [],
+        "content": "live haystack only",
+    }));
+    ws.send(Message::Text(
+        json!(["EVENT", unrelated]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let unrelated_replies = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+    assert!(unrelated_replies
+        .iter()
+        .all(|text| !text.contains("live haystack only")));
+
+    let matching = sign_event(json!({
+        "created_at": now + 2,
+        "kind": 1,
+        "tags": [],
+        "content": "a LIVE needle arrived",
+    }));
+    ws.send(Message::Text(json!(["EVENT", matching]).to_string().into()))
+        .await
+        .unwrap();
+    let live = recv_until(&mut ws, |text| text.contains("a LIVE needle arrived")).await;
+    assert!(
+        live.iter()
+            .any(|text| text.contains("a LIVE needle arrived")),
+        "expected matching live event: {live:?}"
+    );
+
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ephemeral_events_are_live_only_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
@@ -485,7 +594,7 @@ async fn nip11_http_document() {
         .any(|n| n == 1));
     assert_eq!(
         client["supported_nips"],
-        json!([1, 9, 11, 13, 40, 45, 59, 70, 77])
+        json!([1, 9, 11, 13, 40, 45, 50, 59, 70, 77])
     );
     assert_eq!(client["limitation"]["max_event_tags"], 2000);
     assert_eq!(client["limitation"]["created_at_lower_limit"], u64::MAX / 4);

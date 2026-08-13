@@ -1862,21 +1862,33 @@ fn run_req_monitor(
                     let conn = sub.conn_id;
                     let pk = authed.get(&conn).map(|a| a.as_slice());
                     let start = sub.latest_event_id.saturating_add(1);
+                    let requires_content = sub.filter_group.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if sub.filter_group.does_match(packed)
-                                && r.should_send_to_subscriber(packed, pk)
+                            if !r.should_send_to_subscriber(packed, pk)
+                                || (!requires_content && !sub.filter_group.does_match(packed))
                             {
-                                if let Some(raw) = txn
-                                    .get_u64(txn.env().dbis().event_payload, lev)
-                                    .ok()
-                                    .flatten()
+                                return true;
+                            }
+                            if let Some(raw) = txn
+                                .get_u64(txn.env().dbis().event_payload, lev)
+                                .ok()
+                                .flatten()
+                            {
+                                if let Ok(json) =
+                                    decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
                                 {
-                                    if let Ok(json) =
-                                        decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
-                                    {
-                                        conns.send_event(conn, sub.sub_id.as_str(), json, &metrics);
+                                    if requires_content {
+                                        let content =
+                                            wok_db::event_content(json).unwrap_or_default();
+                                        if !sub
+                                            .filter_group
+                                            .does_match_with_content(packed, &content)
+                                        {
+                                            return true;
+                                        }
                                     }
+                                    conns.send_event(conn, sub.sub_id.as_str(), json, &metrics);
                                 }
                             }
                         }
@@ -1907,12 +1919,18 @@ fn run_req_monitor(
                 }
                 MonitorMsg::DbChange => {
                     let start = curr_event_id.saturating_add(1);
+                    let requires_content = monitors.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            let recips = monitors.process(lev, packed);
-                            if recips.is_empty() {
-                                return true;
-                            }
+                            let packed_recipients = if requires_content {
+                                None
+                            } else {
+                                let recipients = monitors.process(lev, packed, "");
+                                if recipients.is_empty() {
+                                    return true;
+                                }
+                                Some(recipients)
+                            };
                             if let Some(raw) = txn
                                 .get_u64(txn.env().dbis().event_payload, lev)
                                 .ok()
@@ -1921,6 +1939,16 @@ fn run_req_monitor(
                                 if let Ok(json) =
                                     decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
                                 {
+                                    let recips = if let Some(recipients) = packed_recipients {
+                                        recipients
+                                    } else {
+                                        let content =
+                                            wok_db::event_content(json).unwrap_or_default();
+                                        monitors.process(lev, packed, &content)
+                                    };
+                                    if recips.is_empty() {
+                                        return true;
+                                    }
                                     let filtered: Vec<(u64, SubId)> = recips
                                         .into_iter()
                                         .filter(|recip| {
@@ -1940,7 +1968,12 @@ fn run_req_monitor(
                 }
                 MonitorMsg::Ephemeral { packed, json } => {
                     if let Ok(packed) = PackedEventView::new(&packed) {
-                        let recipients = monitors.process_ephemeral(packed);
+                        let content = if monitors.requires_content() {
+                            wok_db::event_content(&json).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let recipients = monitors.process_ephemeral(packed, &content);
                         let filtered: Vec<(u64, SubId)> = recipients
                             .into_iter()
                             .filter(|recipient| {

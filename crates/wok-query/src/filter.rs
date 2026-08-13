@@ -3,6 +3,7 @@
 use crate::subid::QueryError;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use wok_db::{normalize_search_terms, parse_search_query, SearchQuery};
 use wok_event::{from_lower_hex_exact, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE};
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,7 @@ pub struct NostrFilter {
     pub authors: Option<FilterSetBytes>,
     pub kinds: Option<FilterSetUint>,
     pub tags: BTreeMap<char, FilterSetBytes>,
+    pub search: Option<SearchQuery>,
     pub since: u64,
     pub until: u64,
     pub limit: u64,
@@ -137,6 +139,7 @@ impl NostrFilter {
             authors: None,
             kinds: None,
             tags: BTreeMap::new(),
+            search: None,
             since: 0,
             until: u64::MAX,
             limit: u64::MAX,
@@ -213,6 +216,15 @@ impl NostrFilter {
                 f.limit = v
                     .as_u64()
                     .ok_or_else(|| QueryError::msg("error parsing limit"))?;
+            } else if k == "search" {
+                let query = v
+                    .as_str()
+                    .ok_or_else(|| QueryError::msg("search not a string"))?;
+                f.search =
+                    Some(parse_search_query(query).map_err(|error| {
+                        QueryError::msg(format!("error parsing search: {error}"))
+                    })?);
+                num_major += 1;
             } else {
                 return Err(QueryError::msg(format!("unrecognised filter item: {k}")));
             }
@@ -233,6 +245,13 @@ impl NostrFilter {
     }
 
     pub fn does_match(&self, ev: PackedEventView<'_>) -> bool {
+        if self.search.is_some() {
+            return false;
+        }
+        self.does_match_without_search(ev)
+    }
+
+    pub fn does_match_without_search(&self, ev: PackedEventView<'_>) -> bool {
         if !self.does_match_times(ev.created_at()) {
             return false;
         }
@@ -267,8 +286,23 @@ impl NostrFilter {
         true
     }
 
+    pub fn does_match_with_content(&self, ev: PackedEventView<'_>, content: &str) -> bool {
+        if !self.does_match_without_search(ev) {
+            return false;
+        }
+        let Some(query) = &self.search else {
+            return true;
+        };
+        let terms: HashSet<_> = normalize_search_terms(content).into_iter().collect();
+        query.terms.iter().all(|term| terms.contains(term))
+    }
+
     pub fn is_full_db_query(&self) -> bool {
-        self.ids.is_none() && self.authors.is_none() && self.kinds.is_none() && self.tags.is_empty()
+        self.ids.is_none()
+            && self.authors.is_none()
+            && self.kinds.is_none()
+            && self.tags.is_empty()
+            && self.search.is_none()
     }
 }
 
@@ -324,6 +358,16 @@ impl NostrFilterGroup {
         self.filters.iter().any(|f| f.does_match(ev))
     }
 
+    pub fn does_match_with_content(&self, ev: PackedEventView<'_>, content: &str) -> bool {
+        self.filters
+            .iter()
+            .any(|filter| filter.does_match_with_content(ev, content))
+    }
+
+    pub fn requires_content(&self) -> bool {
+        self.filters.iter().any(|filter| filter.search.is_some())
+    }
+
     pub fn size(&self) -> usize {
         self.filters.len()
     }
@@ -338,7 +382,9 @@ impl NostrFilterGroup {
     pub fn estimated_cost(&self, count_only: bool) -> u64 {
         let mut cost = 0u64;
         for filter in &self.filters {
-            let filter_cost = if let Some(ids) = &filter.ids {
+            let filter_cost = if filter.search.is_some() {
+                250
+            } else if let Some(ids) = &filter.ids {
                 ids.size() as u64
             } else if filter.authors.is_some() && filter.kinds.is_some() {
                 5

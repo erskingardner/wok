@@ -19,7 +19,9 @@ Scenarios: `import` (signature-verifying bulk import), `export`,
 `negentropy_build`, `ws_publish_1conn`/`ws_publish_8conn` (per-publish OK
 latency + rate), `ws_query_latency` (mixed REQs: id, author+kind, time
 window, tag), `live_fanout` (1 publisher x 32 subscribers, delivery
-completeness), `duplicate_import`, `cold_start`.
+completeness), `duplicate_import`, `cold_start`, and Wok-only
+`nip50_search` (rare, intersected, and full-corpus ranked searches with
+result/limit verification). Use `--scenario <name>` to isolate one scenario.
 
 A trial with missing events, unexpected rejections, or dropped deliveries is
 `ok=false` — correctness gates come before speed.
@@ -33,3 +35,6 @@ run-to-run noise after the req-worker marshalling pass (~9.0k vs ~9.7k qps
 for strfry; an earlier revision of this benchmark measured a 35% strfry
 lead, which was traced to per-event allocation churn in wok's query path,
 not the LMDB scan itself).
+
+See [NIP-50 search](nip50-search.md) for the search workload, exact semantics,
+and 100k/1m-event scale results.

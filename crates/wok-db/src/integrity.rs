@@ -2,7 +2,8 @@
 //! event-derived secondary index.
 
 use crate::fbs::{decode_compression_dictionary, decode_meta, decode_negentropy_filter};
-use crate::payload::{parse_payload, PayloadView};
+use crate::payload::{parse_payload, Decompressor, PayloadView};
+use crate::search::{is_search_marker, search_index_entries, search_term_from_key};
 use crate::txn::RoTxn;
 use crate::write::{event_index_entries, EventIndexEntry};
 use crate::DbError;
@@ -212,6 +213,7 @@ fn index_specs(txn: &RoTxn<'_>) -> [(&'static str, MDB_dbi); 10] {
 pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
     let dbis = txn.env().dbis();
     let mut report = IntegrityReport::default();
+    let mut search_decompressor = Decompressor::new();
 
     check_metadata_tables(txn, &mut report)?;
 
@@ -258,6 +260,52 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
                 Err(error) => {
                     report.lookup_errors += 1;
                     report.issue("lookup", entry.name, error.to_string());
+                }
+            }
+        }
+        if let Some(search_dbi) = dbis.event_search {
+            let payload = match txn.get_u64(dbis.event_payload, lev_id) {
+                Ok(Some(payload)) => payload.to_vec(),
+                _ => return true,
+            };
+            let json = match search_decompressor.decode(txn, &payload, 16 * 1024 * 1024) {
+                Ok(json) => json.to_owned(),
+                Err(error) => {
+                    report.payload_parse_errors += 1;
+                    report.issue("decode", "event_search", format!("levId {lev_id}: {error}"));
+                    return true;
+                }
+            };
+            match search_index_entries(lev_id, &json) {
+                Ok(entries) => {
+                    for (key, value) in entries {
+                        let entry = EventIndexEntry {
+                            name: "event_search",
+                            dbi: search_dbi,
+                            key,
+                            value,
+                        };
+                        report.expected_index_entries += 1;
+                        match entry_exists(txn, &entry) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                report.missing_index_entries += 1;
+                                report.issue(
+                                    "missing-index",
+                                    "event_search",
+                                    format!("levId {lev_id}"),
+                                );
+                            }
+                            Err(error) => {
+                                report.lookup_errors += 1;
+                                report.issue("lookup", "event_search", error.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    report.payload_parse_errors += 1;
+                    report.issue("decode", "event_search", format!("levId {lev_id}: {error}"));
                 }
             }
         }
@@ -330,6 +378,71 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
             {
                 report.extra_index_entries += 1;
                 report.issue("unexpected-index", name, format!("levId {lev_id}"));
+            }
+            true
+        })?;
+    }
+
+    if let Some(search_dbi) = dbis.event_search {
+        let mut decompressor = Decompressor::new();
+        txn.foreach_full(search_dbi, &[], &[], false, |key, value| {
+            if is_search_marker(key) {
+                if read_u64(value).is_none() {
+                    report.malformed_records += 1;
+                    report.issue(
+                        "malformed-value",
+                        "event_search",
+                        format!("marker value has {} bytes, expected 8", value.len()),
+                    );
+                }
+                return true;
+            }
+            report.actual_index_entries += 1;
+            let Some(term) = search_term_from_key(key) else {
+                report.malformed_records += 1;
+                report.extra_index_entries += 1;
+                report.issue("malformed-key", "event_search", "invalid term key".into());
+                return true;
+            };
+            let Some(lev_id) = read_u64(value) else {
+                report.malformed_records += 1;
+                report.extra_index_entries += 1;
+                report.issue(
+                    "malformed-value",
+                    "event_search",
+                    format!("value has {} bytes, expected 8", value.len()),
+                );
+                return true;
+            };
+            let payload = match txn.get_u64(dbis.event_payload, lev_id) {
+                Ok(Some(payload)) => payload.to_vec(),
+                Ok(None) => {
+                    report.extra_index_entries += 1;
+                    report.issue("dangling-index", "event_search", format!("levId {lev_id}"));
+                    return true;
+                }
+                Err(error) => {
+                    report.lookup_errors += 1;
+                    report.issue("lookup", "event_search", error.to_string());
+                    return true;
+                }
+            };
+            let valid = decompressor
+                .decode(txn, &payload, 16 * 1024 * 1024)
+                .ok()
+                .and_then(|json| search_index_entries(lev_id, json).ok())
+                .is_some_and(|entries| {
+                    entries.iter().any(|(expected_key, expected_value)| {
+                        expected_key == key && expected_value == value
+                    })
+                });
+            if !valid {
+                report.extra_index_entries += 1;
+                report.issue(
+                    "unexpected-index",
+                    "event_search",
+                    format!("term {term:?}, levId {lev_id}"),
+                );
             }
             true
         })?;

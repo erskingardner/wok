@@ -79,6 +79,11 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
         enabled_when: CapabilityCondition::CountEnabled,
     },
     RelayCapability {
+        nip: 50,
+        name: "Search capability",
+        enabled_when: CapabilityCondition::Always,
+    },
+    RelayCapability {
         nip: 59,
         name: "Gift wrap",
         enabled_when: CapabilityCondition::EphemeralLiveOnly,
@@ -124,15 +129,15 @@ mod tests {
     #[test]
     fn conditional_capabilities_follow_runtime_configuration() {
         let mut cfg = Config::default();
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 45, 59, 70, 77]);
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 45, 50, 59, 70, 77]);
 
         cfg.relay.auth.service_url = "wss://relay.example.com/".into();
         cfg.relay.max_filter_limit_count = 0;
         cfg.relay.negentropy_enabled = false;
         cfg.events.ephemeral_persistence = EphemeralPersistence::Ttl;
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 70]);
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 50, 70]);
 
         cfg.relay.abuse.min_pow_difficulty = 20;
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 13, 40, 42, 70]);
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 13, 40, 42, 50, 70]);
     }
 }

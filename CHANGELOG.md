@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- NIP-50 content search with transactional Unicode-normalized term and phrase
+  indexing, relevance ordering before limits, structured-filter intersection,
+  live subscription matching, automatic migration backfill, integrity/reindex
+  coverage, and correctness-checked scale benchmarks.
+
 ## [0.1.0] - 2026-08-13
 
 ### Added

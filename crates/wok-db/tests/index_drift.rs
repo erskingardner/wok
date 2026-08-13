@@ -131,3 +131,45 @@ fn integrity_handles_malformed_custom_index_keys_without_panicking() {
         .iter()
         .any(|issue| issue.category == "dangling-index"));
 }
+
+#[test]
+fn integrity_detects_search_index_drift() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let (packed, json) = sign(1, "searchable", 1_700_000_100, json!([]));
+    let mut events = vec![EventToWrite::new(packed, json)];
+    let mut txn = env.begin_rw().unwrap();
+    write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+    txn.commit().unwrap();
+
+    let lev = events[0].lev_id.to_ne_bytes();
+    let mut txn = env.begin_rw().unwrap();
+    assert!(txn
+        .del(
+            env.dbis().event_search.unwrap(),
+            b"\x01searchable",
+            Some(&lev),
+        )
+        .unwrap());
+    txn.put(
+        env.dbis().event_search.unwrap(),
+        b"\x01not-in-content",
+        &lev,
+        0,
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    let txn = env.begin_ro().unwrap();
+    let report = check_integrity(&txn).unwrap();
+    assert!(!report.ok());
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.category == "missing-index" && issue.table == "event_search"));
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.category == "unexpected-index" && issue.table == "event_search"));
+}

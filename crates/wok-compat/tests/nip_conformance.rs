@@ -141,10 +141,29 @@ fn nip45_count_encoding() {
 }
 
 #[test]
+fn nip50_search_filter_and_extensions() {
+    let filters = NostrFilterGroup::from_value(
+        &json!({
+            "search":"best nostr apps domain:example.com include:spam",
+            "kinds":[1],
+            "limit":20
+        }),
+        500,
+        3,
+    )
+    .unwrap();
+    let search = filters.filters[0].search.as_ref().unwrap();
+    assert_eq!(search.terms, vec!["apps", "best", "nostr"]);
+    assert_eq!(search.phrase, "best nostr apps");
+    assert_eq!(filters.filters[0].limit, 20);
+    assert!(NostrFilterGroup::from_value(&json!({"search":7}), 500, 3).is_err());
+}
+
+#[test]
 fn nip11_software_not_strfry_when_unconfigured() {
     let cfg = wok_relay::Config::default();
     let nips = wok_relay::supported_nips(&cfg);
-    assert_eq!(nips, vec![1, 9, 11, 40, 45, 59, 70, 77]);
+    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 59, 70, 77]);
     assert!(!nips.contains(&2), "client-side NIP-02 is not advertised");
     assert!(!nips.contains(&4), "client-side NIP-04 is not advertised");
     assert!(!nips.contains(&28), "client-side NIP-28 is not advertised");
@@ -216,7 +235,7 @@ fn nip77_payload_hex_has_no_prefix_or_half_byte() {
 
 #[test]
 fn advertised_nips_are_subset_of_tested() {
-    let tested = [1u64, 9, 11, 13, 40, 42, 45, 59, 70, 77];
+    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 70, 77];
     assert_eq!(
         wok_relay::RELAY_CAPABILITY_CATALOG
             .iter()

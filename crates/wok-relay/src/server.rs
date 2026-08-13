@@ -218,6 +218,7 @@ pub struct RelayHandle {
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     abuse: Arc<AbuseController>,
+    config_path: Arc<parking_lot::RwLock<Option<std::path::PathBuf>>>,
 }
 
 pub enum IngestMsg {
@@ -370,6 +371,14 @@ impl RelayHandle {
         let cfg = self.config.read();
         supported_nips(&cfg)
     }
+
+    pub fn set_config_path(&self, path: std::path::PathBuf) {
+        *self.config_path.write() = Some(path);
+    }
+
+    pub fn config_path(&self) -> Option<std::path::PathBuf> {
+        self.config_path.read().clone()
+    }
 }
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
@@ -422,6 +431,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         shutdown: shutdown.clone(),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         abuse: abuse.clone(),
+        config_path: Arc::new(parking_lot::RwLock::new(None)),
     };
 
     for (i, ingest_rx) in ingest_rxs.into_iter().enumerate() {

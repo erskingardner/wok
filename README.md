@@ -232,6 +232,7 @@ Summary:
 - [Supported NIPs](docs/nips.md)
 - [Configuration](docs/config.md)
 - [Observability](docs/observability.md)
+- [Operator dashboard](docs/admin-dashboard.md)
 - [Cutover / rollback](docs/cutover.md)
 - [Security](docs/security.md)
 - [Known differences](docs/known-differences.md)

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub admin: AdminConfig,
     pub db: PathBuf,
     pub db_maxreaders: u32,
     pub db_mapsize: usize,
@@ -99,10 +100,21 @@ const STRFRY_TRANSLATED_KEYS: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TomlConfig {
+    admin: AdminConfig,
     database: DatabaseConfig,
     events: EventsConfig,
     observability: ObservabilityConfig,
     relay: RelayConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    pub public_url: String,
+    pub pubkeys: Vec<String>,
+    pub auth_window_secs: u64,
+    pub allow_config_writes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +283,13 @@ pub struct UnixConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            admin: AdminConfig {
+                enabled: false,
+                public_url: String::new(),
+                pubkeys: Vec::new(),
+                auth_window_secs: 60,
+                allow_config_writes: false,
+            },
             db: PathBuf::from("./wok-db/"),
             db_maxreaders: 256,
             db_mapsize: 10_995_116_277_760,
@@ -391,6 +410,7 @@ impl Default for Config {
 impl From<Config> for TomlConfig {
     fn from(config: Config) -> Self {
         Self {
+            admin: config.admin,
             database: DatabaseConfig {
                 path: config.db,
                 max_readers: config.db_maxreaders,
@@ -407,6 +427,7 @@ impl From<Config> for TomlConfig {
 impl From<TomlConfig> for Config {
     fn from(config: TomlConfig) -> Self {
         Self {
+            admin: config.admin,
             db: config.database.path,
             db_maxreaders: config.database.max_readers,
             db_mapsize: config.database.map_size,
@@ -492,9 +513,10 @@ impl Config {
             .map_err(|e| e.to_string())?;
         let supplied: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
         merge_toml(&mut merged, supplied);
-        let parsed: TomlConfig = merged
+        let mut parsed: TomlConfig = merged
             .try_into()
             .map_err(|e: toml::de::Error| e.to_string())?;
+        validate_admin_config(&mut parsed.admin)?;
         if parsed.observability.history_interval_secs == 0 {
             return Err("observability.history_interval_secs must be at least 1".into());
         }
@@ -810,6 +832,47 @@ impl Config {
         self.observability.log_format = old.observability.log_format;
         self.observability.log_filter = old.observability.log_filter;
     }
+}
+
+fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {
+    if admin.auth_window_secs == 0 || admin.auth_window_secs > 300 {
+        return Err("admin.auth_window_secs must be between 1 and 300".into());
+    }
+    if !admin.enabled {
+        return Ok(());
+    }
+    let url = url::Url::parse(&admin.public_url)
+        .map_err(|error| format!("admin.public_url is invalid: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err("admin.public_url must be an http(s) origin without credentials, path, query, or fragment".into());
+    }
+    admin.public_url = admin.public_url.trim_end_matches('/').to_string();
+    if admin.pubkeys.is_empty() {
+        return Err("admin.pubkeys must contain at least one admin when enabled".into());
+    }
+    for pubkey in &mut admin.pubkeys {
+        let bytes = if pubkey.starts_with("npub1") {
+            wok_event::decode_npub(pubkey)
+                .map_err(|error| error.to_string())?
+                .to_vec()
+        } else {
+            wok_event::from_lower_hex_exact(pubkey).map_err(|error| error.to_string())?
+        };
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "admin pubkeys must be 32-byte lowercase hex or npub".to_string())?;
+        *pubkey = hex::encode(bytes);
+    }
+    admin.pubkeys.sort();
+    admin.pubkeys.dedup();
+    Ok(())
 }
 
 fn tracing_subscriber_filter_syntax(filter: &str) -> Result<(), String> {
@@ -1253,6 +1316,28 @@ mod tests {
                 .unwrap_err()
                 .contains("at least 1")
         );
+    }
+
+    #[test]
+    fn enabled_admin_requires_a_clean_origin_and_normalizes_pubkeys() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cfg = Config::parse_toml(&format!(
+            "[admin]\nenabled = true\npublic_url = \"https://relay.example/\"\npubkeys = [\"{key}\", \"{key}\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.admin.public_url, "https://relay.example");
+        assert_eq!(cfg.admin.pubkeys, vec![key]);
+
+        assert!(Config::parse_toml(&format!(
+            "[admin]\nenabled = true\npublic_url = \"https://relay.example/admin\"\npubkeys = [\"{key}\"]\n"
+        ))
+        .unwrap_err()
+        .contains("origin"));
+        assert!(Config::parse_toml(
+            "[admin]\nenabled = true\npublic_url = \"https://relay.example\"\npubkeys = []\n"
+        )
+        .unwrap_err()
+        .contains("at least one admin"));
     }
 
     #[test]

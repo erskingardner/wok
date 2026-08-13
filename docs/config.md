@@ -7,6 +7,18 @@ defaults; unknown keys, wrong types, and out-of-range values are errors.
 The legacy HOCON-subset parser is used only to read the source config during an
 explicit strfry migration. Normal Wok commands and live reload read TOML.
 
+The optional operator dashboard is disabled by default. To enable it, set
+`admin.enabled = true`, set `admin.public_url` to the exact public HTTP(S)
+origin of the relay, and list one or more administrator `npub` or lowercase
+hex keys in `admin.pubkeys`. The shell lives at `/admin`; every operational API
+request requires a fresh, method- and URL-bound NIP-98 event from a configured
+key. Non-empty requests must also bind the SHA-256 payload, and authorization
+events cannot be replayed. `admin.allow_config_writes` separately gates the
+small typed subset of live-reloadable settings exposed by the dashboard.
+Accepted changes are validated as a complete config and atomically replace the
+TOML file. The dashboard uses a browser NIP-07 signer and never receives secret
+key material.
+
 `relay.info.nips` is intentionally not a Wok setting. NIP-11 capabilities are
 derived from relay behavior and the settings that actually enable conditional
 features; accepting an operator-supplied replacement would allow the relay to

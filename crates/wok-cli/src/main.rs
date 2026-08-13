@@ -404,6 +404,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     let unix_cfg = cfg.clone();
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     if config_path.exists() {
+        handle.set_config_path(config_path.clone());
         spawn_config_reload(config_path, handle.clone());
     }
     let h2 = handle.clone();

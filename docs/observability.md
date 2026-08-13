@@ -3,6 +3,8 @@
 Wok exposes Prometheus metrics at `/metrics`, emits structured tracing records,
 and keeps a small bounded in-memory history for its authenticated admin UI.
 The local history is not persisted and is not exposed by a public endpoint.
+When the optional operator dashboard is enabled, authenticated administrators
+can view this history at `/admin`; see [Operator dashboard](admin-dashboard.md).
 
 ## Grafana metrics
 

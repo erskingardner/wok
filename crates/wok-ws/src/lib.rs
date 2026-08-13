@@ -4,6 +4,7 @@
 //! (`frame` module) so wok can offer permessage-deflate like C++ uWS
 //! (tungstenite and fastwebsockets have no extension support).
 
+mod admin;
 pub mod frame;
 
 use bytes::Bytes;
@@ -39,6 +40,7 @@ pub async fn serve_listener(
 ) -> Result<(), std::io::Error> {
     tracing::info!("Started websocket server on {}", listener.local_addr()?);
     let handle = Arc::new(handle);
+    let admin_state = Arc::new(admin::AdminState::default());
     let shutdown = handle.shutdown_handle();
     loop {
         let (stream, peer) = tokio::select! {
@@ -59,11 +61,13 @@ pub async fn serve_listener(
             let _ = sock_ref.set_keepalive(true);
         }
         let handle = handle.clone();
+        let admin_state = admin_state.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| {
                 let handle = handle.clone();
-                async move { Ok::<_, Infallible>(dispatch(req, handle, peer).await) }
+                let admin_state = admin_state.clone();
+                async move { Ok::<_, Infallible>(dispatch(req, handle, peer, admin_state).await) }
             });
             let _ = http1::Builder::new()
                 .serve_connection(io, svc)
@@ -79,6 +83,7 @@ async fn dispatch(
     req: Request<Incoming>,
     handle: Arc<RelayHandle>,
     peer: SocketAddr,
+    admin_state: Arc<admin::AdminState>,
 ) -> Response<Full<Bytes>> {
     // Honor relay.realIpHeader for reverse-proxied deployments (C++ strfry
     // uses the header value as the client IP).
@@ -113,6 +118,9 @@ async fn dispatch(
         return upgrade_ws(req, handle, peer).await;
     }
     let path = req.uri().path().to_string();
+    if matches!(path.as_str(), "/admin" | "/admin/") || path.starts_with("/admin/api/") {
+        return admin::dispatch(req, handle, admin_state).await;
+    }
     let host = req
         .headers()
         .get("host")

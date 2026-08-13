@@ -31,6 +31,8 @@ pub struct EnvOptions {
     pub max_dbs: u32,
     pub create_dir: bool,
     pub create_dbis: bool,
+    /// Open the LMDB environment and all transactions without write access.
+    pub read_only: bool,
 }
 
 impl Default for EnvOptions {
@@ -42,6 +44,7 @@ impl Default for EnvOptions {
             max_dbs: 64,
             create_dir: true,
             create_dbis: true,
+            read_only: false,
         }
     }
 }
@@ -81,6 +84,7 @@ pub struct EnvInner {
     pub env: *mut MDB_env,
     pub dbis: Dbis,
     pub path: PathBuf,
+    pub read_only: bool,
 }
 
 unsafe impl Send for EnvInner {}
@@ -119,6 +123,9 @@ impl Env {
         if opts.no_read_ahead {
             flags |= MDB_NORDAHEAD;
         }
+        if opts.read_only {
+            flags |= MDB_RDONLY;
+        }
         let cpath = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| DbError::msg("db path contains NUL"))?;
         let rc = unsafe { mdb_env_open(env, cpath.as_ptr(), flags, 0o664) };
@@ -131,7 +138,9 @@ impl Env {
         // processes, and don't leak the mmap fd into child processes.
         unsafe {
             let mut dead: i32 = 0;
-            check(mdb_reader_check(env, &mut dead))?;
+            if !opts.read_only {
+                check(mdb_reader_check(env, &mut dead))?;
+            }
             let mut fd: libc::c_int = -1;
             let _ = mdb_env_get_fd(env, &mut fd);
             let cur = libc::fcntl(fd, libc::F_GETFD);
@@ -144,9 +153,11 @@ impl Env {
             }
         }
 
-        // Open all DBIs and install comparators in a write txn.
+        // Open all DBIs and install process-local comparators. A read-only
+        // transaction is sufficient when the environment is read-only.
         let mut txn = ptr::null_mut();
-        if let Err(e) = unsafe { check(mdb_txn_begin(env, ptr::null_mut(), 0, &mut txn)) } {
+        let txn_flags = if opts.read_only { MDB_RDONLY } else { 0 };
+        if let Err(e) = unsafe { check(mdb_txn_begin(env, ptr::null_mut(), txn_flags, &mut txn)) } {
             unsafe { mdb_env_close(env) };
             return Err(e);
         }
@@ -218,6 +229,7 @@ impl Env {
             env,
             dbis,
             path: path.to_path_buf(),
+            read_only: opts.read_only,
         });
         Ok(Self { inner })
     }
@@ -235,6 +247,9 @@ impl Env {
     }
 
     pub fn begin_rw(&self) -> Result<RwTxn<'_>, DbError> {
+        if self.inner.read_only {
+            return Err(DbError::msg("database environment was opened read-only"));
+        }
         let version = self.db_version()?;
         if version != 0 && version != wok_event::WOK_DB_VERSION {
             return Err(DbError::msg(format!(
@@ -348,4 +363,37 @@ impl std::fmt::Debug for Env {
 fn _schema_touch() {
     let _ = DBI_EVENT;
     let _ = DBI_META;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_read_only_environment_supports_reads_and_refuses_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let writable = Env::open(temp.path(), EnvOptions::default()).unwrap();
+        writable.ensure_initialized().unwrap();
+        drop(writable);
+
+        let readonly = Env::open(
+            temp.path(),
+            EnvOptions {
+                create_dir: false,
+                create_dbis: false,
+                read_only: true,
+                ..EnvOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(readonly.db_version().unwrap(), wok_event::WOK_DB_VERSION);
+        let error = match readonly.begin_rw() {
+            Ok(_) => panic!("read-only environment unexpectedly allowed a write transaction"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "database environment was opened read-only"
+        );
+    }
 }

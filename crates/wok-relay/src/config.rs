@@ -15,6 +15,84 @@ pub struct Config {
     pub relay: RelayConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct StrfryConfigTranslation {
+    pub config: Config,
+    pub translated_keys: Vec<String>,
+    pub ignored_keys: Vec<String>,
+}
+
+const STRFRY_TRANSLATED_KEYS: &[&str] = &[
+    "db",
+    "dbParams.mapsize",
+    "dbParams.maxreaders",
+    "dbParams.noReadAhead",
+    "events.ephemeralEventsLifetimeSeconds",
+    "events.maxEventSize",
+    "events.maxNumTags",
+    "events.maxTagValSize",
+    "events.rejectEphemeralEventsOlderThanSeconds",
+    "events.rejectEventsNewerThanSeconds",
+    "events.rejectEventsOlderThanSeconds",
+    "relay.auth.enabled",
+    "relay.auth.restrictReadToInvolvedPubkey",
+    "relay.auth.restrictedReadKinds",
+    "relay.auth.serviceUrl",
+    "relay.autoPingSeconds",
+    "relay.bind",
+    "relay.compression.enabled",
+    "relay.compression.slidingWindow",
+    "relay.enableTcpKeepalive",
+    "relay.filterValidation.allowedKinds",
+    "relay.filterValidation.enabled",
+    "relay.filterValidation.maxFiltersPerReq",
+    "relay.filterValidation.maxKindsPerFilter",
+    "relay.filterValidation.minFiltersPerReq",
+    "relay.filterValidation.requireAuthorOrTag",
+    "relay.info.banner",
+    "relay.info.contact",
+    "relay.info.description",
+    "relay.info.icon",
+    "relay.info.name",
+    "relay.info.privacy",
+    "relay.info.pubkey",
+    "relay.info.self",
+    "relay.info.terms",
+    "relay.logging.dbScanPerf",
+    "relay.logging.dumpInAll",
+    "relay.logging.dumpInEvents",
+    "relay.logging.dumpInReqs",
+    "relay.logging.invalidEvents",
+    "relay.maxFilterLimit",
+    "relay.maxFilterLimitCount",
+    "relay.maxPendingOutboundBytes",
+    "relay.maxReqFilterSize",
+    "relay.maxSubsPerConnection",
+    "relay.maxTagsPerFilter",
+    "relay.maxWebsocketPayloadSize",
+    "relay.negentropy.enabled",
+    "relay.negentropy.maxSyncEvents",
+    "relay.nofiles",
+    "relay.numThreads.ingester",
+    "relay.numThreads.negentropy",
+    "relay.numThreads.reqMonitor",
+    "relay.numThreads.reqWorker",
+    "relay.port",
+    "relay.queryTimesliceBudgetMicroseconds",
+    "relay.realIpHeader",
+    "relay.unix.authGids",
+    "relay.unix.authUids",
+    "relay.unix.enabled",
+    "relay.unix.group",
+    "relay.unix.maxFrameBytes",
+    "relay.unix.maxPendingOutboundBytes",
+    "relay.unix.mode",
+    "relay.unix.owner",
+    "relay.unix.path",
+    "relay.writePolicy.plugin",
+    "relay.writePolicy.timeoutSeconds",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TomlConfig {
@@ -298,6 +376,12 @@ impl Config {
     /// Parse the legacy HOCON subset used by strfry. This exists only for the
     /// explicit `wok migrate strfry` boundary.
     pub fn parse_strfry(text: &str) -> Result<Self, String> {
+        Ok(Self::translate_strfry(text)?.config)
+    }
+
+    /// Translate legacy strfry HOCON while retaining an audit trail of every
+    /// supplied leaf key that was translated or deliberately ignored.
+    pub fn translate_strfry(text: &str) -> Result<StrfryConfigTranslation, String> {
         let map = parse_hocon(text)?;
         let mut cfg = Config::default();
         if let Some(v) = map.get("db") {
@@ -532,7 +616,15 @@ impl Config {
         if let Some(v) = map.get("relay.unix.authGids") {
             cfg.relay.unix.auth_gids = parse_u32s(v)?;
         }
-        Ok(cfg)
+        let (translated_keys, ignored_keys): (Vec<_>, Vec<_>) = map
+            .keys()
+            .cloned()
+            .partition(|key| STRFRY_TRANSLATED_KEYS.contains(&key.as_str()));
+        Ok(StrfryConfigTranslation {
+            config: cfg,
+            translated_keys,
+            ignored_keys,
+        })
     }
 
     pub fn event_limits(&self) -> wok_event::EventLimits {
@@ -817,6 +909,20 @@ mod tests {
         assert!(Config::parse_strfry("relay { port = 70000 }").is_err());
         assert!(Config::parse_strfry("relay { auth { enabled = \"yes\" } }").is_err());
         assert!(Config::parse_strfry("relay { port = 1").is_err());
+    }
+
+    #[test]
+    fn strfry_translation_reports_every_supplied_leaf_key() {
+        let translation = Config::translate_strfry(
+            "db = \"legacy\"\nrelay { port = 8888\n info { nips = \"1,2\" }\n mystery = true }\n",
+        )
+        .unwrap();
+        assert_eq!(translation.config.relay.port, 8888);
+        assert_eq!(translation.translated_keys, ["db", "relay.port"]);
+        assert_eq!(
+            translation.ignored_keys,
+            ["relay.info.nips", "relay.mystery"]
+        );
     }
 
     #[test]

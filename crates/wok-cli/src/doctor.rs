@@ -118,6 +118,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             no_read_ahead: cfg.db_no_read_ahead,
             create_dir: false,
             create_dbis: false,
+            read_only: true,
             ..EnvOptions::default()
         },
     ) {
@@ -395,7 +396,7 @@ fn check_external_paths(cfg: &Config, report: &mut DoctorReport) {
     }
 }
 
-fn find_executable(command: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable(command: &str) -> Option<PathBuf> {
     let path = Path::new(command);
     if path.components().count() > 1 {
         return is_executable(path).then(|| path.to_path_buf());
@@ -421,7 +422,7 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn available_bytes(path: &Path) -> Result<u64, String> {
+pub(crate) fn available_bytes(path: &Path) -> Result<u64, String> {
     let path = CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| "database path contains NUL".to_string())?;
     let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };

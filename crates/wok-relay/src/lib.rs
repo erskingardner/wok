@@ -13,7 +13,7 @@ pub use capabilities::{
     relay_capabilities, supported_nips, CapabilityCondition, RelayCapability,
     RELAY_CAPABILITY_CATALOG,
 };
-pub use config::{Config, EphemeralPersistence};
+pub use config::{Config, EphemeralPersistence, StrfryConfigTranslation};
 pub use protocol::{ClientCommand, RelayMessage};
 pub use rlimit::apply_nofiles_limit;
 pub use server::{start, Outbound, OutboundFrame, RelayHandle};

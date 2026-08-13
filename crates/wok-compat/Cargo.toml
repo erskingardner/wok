@@ -18,6 +18,7 @@ wok-query = { path = "../wok-query" }
 wok-relay = { path = "../wok-relay" }
 
 [dev-dependencies]
+base64.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 wok-unix = { path = "../wok-unix" }

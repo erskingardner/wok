@@ -853,7 +853,9 @@ fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {
     {
         return Err("admin.public_url must be an http(s) origin without credentials, path, query, or fragment".into());
     }
-    admin.public_url = admin.public_url.trim_end_matches('/').to_string();
+    // Bind NIP-98 to the browser-visible canonical origin: IDNs become
+    // punycode and default ports/trailing slashes are removed consistently.
+    admin.public_url = url.origin().ascii_serialization();
     if admin.pubkeys.is_empty() {
         return Err("admin.pubkeys must contain at least one admin when enabled".into());
     }
@@ -1327,6 +1329,12 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.admin.public_url, "https://relay.example");
         assert_eq!(cfg.admin.pubkeys, vec![key]);
+
+        let canonical = Config::parse_toml(&format!(
+            "[admin]\nenabled = true\npublic_url = \"https://bücher.example:443/\"\npubkeys = [\"{key}\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(canonical.admin.public_url, "https://xn--bcher-kva.example");
 
         assert!(Config::parse_toml(&format!(
             "[admin]\nenabled = true\npublic_url = \"https://relay.example/admin\"\npubkeys = [\"{key}\"]\n"

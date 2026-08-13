@@ -1,5 +1,6 @@
 //! End-to-end WebSocket and Unix interoperability.
 
+use base64::Engine;
 use futures_util::{SinkExt, Stream, StreamExt};
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::json;
@@ -866,6 +867,66 @@ async fn nip11_http_document() {
     handle.request_shutdown();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip98_admin_http_route_authenticates_and_rejects_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (pubkey, _) = key.x_only_public_key();
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(pubkey.serialize())];
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let shell = raw_http(
+        addr,
+        "GET /admin HTTP/1.1\r\nHost: ignored.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(shell.starts_with("HTTP/1.1 200"));
+    assert!(shell.contains("Wok operator"));
+
+    let unauthorized = raw_http(
+        addr,
+        "GET /admin/api/overview HTTP/1.1\r\nHost: ignored.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(unauthorized.starts_with("HTTP/1.1 401"));
+
+    let absolute_url = format!("http://{addr}/admin/api/overview");
+    let event = sign_event_with_key(
+        json!({
+            "created_at": now_secs(),
+            "kind": 27235,
+            "tags": [["u", absolute_url], ["method", "GET"]],
+            "content": "",
+        }),
+        &key,
+    );
+    let authorization = base64::engine::general_purpose::STANDARD.encode(event.to_string());
+    let request = format!(
+        "GET /admin/api/overview HTTP/1.1\r\nHost: attacker-controlled.example\r\nAuthorization: Nostr {authorization}\r\nConnection: close\r\n\r\n"
+    );
+    let overview = raw_http(addr, &request).await;
+    assert!(overview.starts_with("HTTP/1.1 200"), "{overview}");
+    assert!(overview.contains("\"history\""));
+    assert!(overview.contains("\"can_write_config\":false"));
+
+    let replay = raw_http(addr, &request).await;
+    assert!(replay.starts_with("HTTP/1.1 401"), "{replay}");
+    assert!(replay.contains("already been used"));
+    handle.request_shutdown();
+}
+
 async fn reqwest_get_nip11(addr: std::net::SocketAddr) -> serde_json::Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -877,4 +938,13 @@ async fn reqwest_get_nip11(addr: std::net::SocketAddr) -> serde_json::Value {
     let text = String::from_utf8_lossy(&buf);
     let body = text.split("\r\n\r\n").nth(1).unwrap_or("{}");
     serde_json::from_str(body.trim()).unwrap_or(json!({}))
+}
+
+async fn raw_http(addr: std::net::SocketAddr, request: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8(response).unwrap()
 }

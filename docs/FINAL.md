@@ -170,3 +170,34 @@ A full second review against the C++ source produced these fix commits:
 3. Soak `wok relay` with production-like publish/REQ/COUNT/AUTH/negentropy traffic for at least one retention/expiration cycle.
 4. Cut over DNS/proxy; keep the original v3 database and config untouched for rollback (`docs/cutover.md`).
 5. Run `wok-bench --profile full` on the target host with a real corpus (`--corpus`) before claiming performance.
+
+## Improvement-program audit (2026-08-13)
+
+The post-parity improvement stack was reviewed again as one combined diff,
+rather than relying only on each feature's focused tests. It covers safe
+NIP-59 defaults, request-wide query ceilings and stress benchmarks, NIP-62,
+canonical NIP-45 HLL values, structured/bounded observability, the NIP-98
+operator dashboard, reconnecting stream behavior, and bounded idempotent
+negentropy builds.
+
+The final audit rechecked the current upstream NIP-45, NIP-62, and NIP-98 text;
+capability advertisement; migration/reindex behavior; reload/frozen settings;
+database schema handling; admin authentication and write boundaries; release
+workflows; and every stacked PR base. It added canonical browser-visible admin
+origins plus a real HTTP test covering the public shell, unauthorized API
+access, a valid signature despite a hostile `Host` header, overview data, and
+replay rejection.
+
+Final local gates passed with zero failures:
+
+- `cargo fmt --all -- --check`
+- `cargo test --workspace`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo build --locked --release -p wok-cli`
+- `wok-bench --profile smoke` against the local strfry binary: every scenario
+  reported `ok=true`, with zero errors and zero mismatches
+
+No `v0.1.0` tag or GitHub Release existed at audit time. Because this is still
+the first release, the post-parity `Unreleased` entries must be folded into the
+dated `0.1.0` section in a dedicated release commit after the complete PR stack
+is merged. Only that exact green commit should receive the `v0.1.0` tag.

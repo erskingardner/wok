@@ -9,6 +9,7 @@ description = "Transport-neutral Nostr relay core"
 bytes.workspace = true
 crossbeam-channel.workspace = true
 hex.workspace = true
+libc.workspace = true
 notify.workspace = true
 parking_lot.workspace = true
 rand.workspace = true

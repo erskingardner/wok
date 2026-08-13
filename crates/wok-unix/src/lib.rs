@@ -19,8 +19,14 @@ pub enum UnixError {
 }
 
 /// Bind a Unix socket, replacing a stale socket path only after confirming it
-/// is a socket and that no live listener owns it.
-pub fn bind_unix(path: &Path, mode: u32) -> Result<UnixListener, UnixError> {
+/// is a socket and that no live listener owns it. `owner`/`group` (empty =
+/// skip) chown the socket like a deployment would expect.
+pub fn bind_unix(
+    path: &Path,
+    mode: u32,
+    owner: &str,
+    group: &str,
+) -> Result<UnixListener, UnixError> {
     if path.exists() {
         let meta = std::fs::metadata(path)?;
         if !is_socket(&meta) {
@@ -42,6 +48,30 @@ pub fn bind_unix(path: &Path, mode: u32) -> Result<UnixListener, UnixError> {
     }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    if !owner.is_empty() || !group.is_empty() {
+        let uid = if owner.is_empty() {
+            None
+        } else {
+            Some(
+                nix::unistd::User::from_name(owner)
+                    .map_err(|e| UnixError::Message(format!("unknown unix.owner {owner:?}: {e}")))?
+                    .ok_or_else(|| UnixError::Message(format!("unknown unix.owner {owner:?}")))?
+                    .uid,
+            )
+        };
+        let gid = if group.is_empty() {
+            None
+        } else {
+            Some(
+                nix::unistd::Group::from_name(group)
+                    .map_err(|e| UnixError::Message(format!("unknown unix.group {group:?}: {e}")))?
+                    .ok_or_else(|| UnixError::Message(format!("unknown unix.group {group:?}")))?
+                    .gid,
+            )
+        };
+        nix::unistd::chown(path, uid, gid)
+            .map_err(|e| UnixError::Message(format!("chown {}: {e}", path.display())))?;
+    }
     Ok(listener)
 }
 
@@ -56,25 +86,30 @@ fn live_listener(path: &Path) -> bool {
 
 pub async fn serve(handle: RelayHandle, cfg: Config) -> Result<(), UnixError> {
     if !cfg.relay.unix.enabled {
-        std::future::pending::<()>().await;
         return Ok(());
     }
     let path = cfg.relay.unix.path.clone();
-    let listener = bind_unix(&path, cfg.relay.unix.mode)?;
+    let listener = bind_unix(
+        &path,
+        cfg.relay.unix.mode,
+        &cfg.relay.unix.owner,
+        &cfg.relay.unix.group,
+    )?;
     tracing::info!("Unix socket listening on {}", path.display());
     let handle = Arc::new(handle);
+    let shutdown = handle.shutdown_handle();
     let cfg = Arc::new(cfg);
     loop {
-        if handle.is_shutdown() {
-            break;
-        }
-        let (stream, _addr) = match listener.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::warn!("unix accept error: {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                continue;
-            }
+        let (stream, _addr) = tokio::select! {
+            _ = shutdown.notified() => break,
+            res = listener.accept() => match res {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::warn!("unix accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
         };
         let handle = handle.clone();
         let cfg = cfg.clone();
@@ -194,7 +229,7 @@ mod tests {
     async fn frame_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.sock");
-        let listener = bind_unix(&path, 0o600).unwrap();
+        let listener = bind_unix(&path, 0o600, "", "").unwrap();
         let client = tokio::spawn({
             let path = path.clone();
             async move {
@@ -218,7 +253,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("frag.sock");
-        let listener = bind_unix(&path, 0o600).unwrap();
+        let listener = bind_unix(&path, 0o600, "", "").unwrap();
         let client = tokio::spawn({
             let path = path.clone();
             async move {
@@ -242,7 +277,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file");
         std::fs::write(&path, b"hi").unwrap();
-        assert!(bind_unix(&path, 0o600).is_err());
+        assert!(bind_unix(&path, 0o600, "", "").is_err());
     }
 
     #[tokio::test]
@@ -253,6 +288,6 @@ mod tests {
             let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         }
         assert!(path.exists());
-        bind_unix(&path, 0o600).expect("replace stale socket leftover");
+        bind_unix(&path, 0o600, "", "").expect("replace stale socket leftover");
     }
 }

@@ -223,13 +223,15 @@ async fn main() -> Result<()> {
 }
 
 async fn cmd_relay(cfg: Config) -> Result<()> {
+    wok_relay::apply_nofiles_limit(cfg.relay.nofiles).map_err(anyhow::Error::msg)?;
     let env = open_env(&cfg)?;
     let bind: SocketAddr = format!("{}:{}", cfg.relay.bind, cfg.relay.port).parse()?;
     let unix_cfg = cfg.clone();
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     let h2 = handle.clone();
+    let h3 = handle.clone();
     let ws = tokio::spawn(async move {
-        if let Err(e) = wok_ws::serve(handle, bind).await {
+        if let Err(e) = wok_ws::serve(h3, bind).await {
             tracing::error!("ws server: {e}");
         }
     });
@@ -238,9 +240,35 @@ async fn cmd_relay(cfg: Config) -> Result<()> {
             tracing::error!("unix server: {e}");
         }
     });
-    tokio::signal::ctrl_c().await.ok();
-    ws.abort();
-    unix.abort();
+    // C++ graceful shutdown is SIGUSR1; wok also treats SIGINT the same way.
+    let mut sigusr1 =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT: initiating graceful shutdown"),
+        _ = sigusr1.recv() => tracing::info!("SIGUSR1: initiating graceful shutdown"),
+    }
+    handle.request_shutdown();
+    // Listeners stop accepting and return (the unix server unlinks its
+    // socket); existing connections drain naturally like C++.
+    let _ = ws.await;
+    let _ = unix.await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let n = handle
+            .metrics
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            tracing::info!("All connections closed, shutting down");
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            tracing::warn!("Shutdown deadline reached with {n} connections remaining");
+            break;
+        }
+        tracing::info!("Graceful shutdown in progress: {n} connections remaining");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     Ok(())
 }
 

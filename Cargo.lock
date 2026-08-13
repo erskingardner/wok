@@ -2458,6 +2458,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "hex",
+ "libc",
  "notify",
  "parking_lot",
  "rand 0.8.7",

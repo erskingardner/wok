@@ -195,6 +195,7 @@ pub struct RelayHandle {
     pub metrics: Arc<Metrics>,
     pub config: Arc<parking_lot::RwLock<Config>>,
     shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 pub enum IngestMsg {
@@ -298,6 +299,12 @@ impl RelayHandle {
 
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown_notify.notify_waiters();
+    }
+
+    /// Transports select on this to break out of a blocking accept.
+    pub fn shutdown_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.shutdown_notify.clone()
     }
 
     pub fn supported_nips(&self) -> Vec<u64> {
@@ -346,6 +353,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         metrics: metrics.clone(),
         config: config.clone(),
         shutdown: shutdown.clone(),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
     {

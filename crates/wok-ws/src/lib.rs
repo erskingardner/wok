@@ -31,19 +31,20 @@ pub async fn serve_listener(
 ) -> Result<(), std::io::Error> {
     tracing::info!("Started websocket server on {}", listener.local_addr()?);
     let handle = Arc::new(handle);
+    let shutdown = handle.shutdown_handle();
     loop {
-        if handle.is_shutdown() {
-            break;
-        }
-        let (stream, peer) = match listener.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                // Transient accept failures (e.g. fd exhaustion) must not kill
-                // the listener task.
-                tracing::warn!("ws accept error: {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                continue;
-            }
+        let (stream, peer) = tokio::select! {
+            _ = shutdown.notified() => break,
+            res = listener.accept() => match res {
+                Ok(x) => x,
+                Err(e) => {
+                    // Transient accept failures (e.g. fd exhaustion) must not
+                    // kill the listener task.
+                    tracing::warn!("ws accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
         };
         if handle.config.read().relay.enable_tcp_keepalive {
             let sock_ref = socket2::SockRef::from(&stream);
@@ -62,6 +63,7 @@ pub async fn serve_listener(
                 .await;
         });
     }
+    tracing::info!("Websocket listener stopped");
     Ok(())
 }
 

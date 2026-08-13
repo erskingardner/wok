@@ -111,9 +111,29 @@ impl Env {
             return Err(DbError::from_rc(rc));
         }
 
+        // Match the C++ setup: reclaim stale reader slots left by crashed
+        // processes, and don't leak the mmap fd into child processes.
+        unsafe {
+            let mut dead: i32 = 0;
+            check(mdb_reader_check(env, &mut dead))?;
+            let mut fd: libc::c_int = -1;
+            let _ = mdb_env_get_fd(env, &mut fd);
+            let cur = libc::fcntl(fd, libc::F_GETFD);
+            if cur == -1 || libc::fcntl(fd, libc::F_SETFD, cur | libc::FD_CLOEXEC) == -1 {
+                let e = std::io::Error::last_os_error();
+                mdb_env_close(env);
+                return Err(DbError::msg(format!(
+                    "unable to enable CLOEXEC on LMDB fd: {e}"
+                )));
+            }
+        }
+
         // Open all DBIs and install comparators in a write txn.
         let mut txn = ptr::null_mut();
-        unsafe { check(mdb_txn_begin(env, ptr::null_mut(), 0, &mut txn))? };
+        if let Err(e) = unsafe { check(mdb_txn_begin(env, ptr::null_mut(), 0, &mut txn)) } {
+            unsafe { mdb_env_close(env) };
+            return Err(e);
+        }
 
         let mut opened: Vec<MDB_dbi> = Vec::new();
         for spec in dbi_specs() {
@@ -168,7 +188,10 @@ impl Env {
             negentropy: opened[15],
         };
 
-        unsafe { check(mdb_txn_commit(txn))? };
+        if let Err(e) = unsafe { check(mdb_txn_commit(txn)) } {
+            unsafe { mdb_env_close(env) };
+            return Err(e);
+        }
 
         let inner = Arc::new(EnvInner {
             env,

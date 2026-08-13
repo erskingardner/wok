@@ -124,11 +124,12 @@ where
 
 pub fn insert_negentropy_filter(txn: &mut RwTxn<'_>, filter: &str) -> Result<u64, DbError> {
     let id = txn.next_integer_key(txn.env().dbis().negentropy_filter)?;
+    // Same flags as the generated C++ insert_NegentropyFilter with auto id.
     txn.put_u64(
         txn.env().dbis().negentropy_filter,
         id,
         &crate::fbs::encode_negentropy_filter(filter),
-        0,
+        lmdb_sys::MDB_NOOVERWRITE | lmdb_sys::MDB_APPEND,
     )?;
     Ok(id)
 }

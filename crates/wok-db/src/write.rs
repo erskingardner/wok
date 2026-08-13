@@ -246,15 +246,15 @@ fn del_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
 
 pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbError> {
     let dbis = txn.env().dbis();
-    let Some(buf) = txn.get_u64(dbis.event, lev_id)?.map(|b| b.to_vec()) else {
-        txn.del_u64(dbis.event_payload, lev_id, None)?;
-        return Ok(false);
-    };
-    let packed = PackedEventView::new(&buf)?;
-    let idx = index_event(packed);
-    del_indices(txn, lev_id, &idx)?;
+    // C++ deleteEventBasic: payload row first; the return value reports
+    // whether a payload existed, independent of the primary record.
     let deleted = txn.del_u64(dbis.event_payload, lev_id, None)?;
-    txn.del_u64(dbis.event, lev_id, None)?;
+    if let Some(buf) = txn.get_u64(dbis.event, lev_id)?.map(|b| b.to_vec()) {
+        let packed = PackedEventView::new(&buf)?;
+        let idx = index_event(packed);
+        del_indices(txn, lev_id, &idx)?;
+        txn.del_u64(dbis.event, lev_id, None)?;
+    }
     Ok(deleted)
 }
 
@@ -311,15 +311,29 @@ pub fn write_events<N: NegentropySink>(
 
         if GIFT_WRAP_KINDS.contains(&packed.kind()) {
             let mut recipient_deleted = false;
+            let mut scan_err: Option<DbError> = None;
             packed.foreach_tag(|tag_name, tag_val| {
+                if scan_err.is_some() {
+                    return false;
+                }
                 if tag_name == 'p' {
-                    if let Ok(true) = deletion_exists(txn, packed.id(), tag_val) {
-                        recipient_deleted = true;
-                        return false;
+                    match deletion_exists(txn, packed.id(), tag_val) {
+                        Ok(true) => {
+                            recipient_deleted = true;
+                            return false;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return false;
+                        }
                     }
                 }
                 true
             });
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
             if recipient_deleted {
                 evs[i].status = EventWriteStatus::Deleted;
                 continue;
@@ -333,7 +347,7 @@ pub fn write_events<N: NegentropySink>(
                 search_str.extend_from_slice(&replace);
                 let search_key = make_key_string_u64(&search_str, packed.kind());
 
-                let mut other: Option<(u64, Vec<u8>)> = None;
+                let mut other: Option<u64> = None;
                 txn.foreach_full(
                     txn.env().dbis().event_replace,
                     &search_key,
@@ -344,112 +358,151 @@ pub fn write_events<N: NegentropySink>(
                             return false;
                         }
                         let lev = u64::from_ne_bytes(v.try_into().unwrap());
-                        other = Some((lev, Vec::new()));
+                        other = Some(lev);
                         false
                     },
                 )?;
-                if let Some((lev, _)) = other {
-                    if let Some(buf) = lookup_event_by_levid(txn, lev)? {
-                        let other_packed = PackedEventView::new(&buf)?;
-                        if is_event_a_before_event_b(packed, other_packed) {
-                            evs[i].status = EventWriteStatus::Replaced;
-                        } else {
-                            lev_ids_to_delete.push(lev);
-                        }
+                if let Some(lev) = other {
+                    // C++ lookupEventByLevId throws on a dangling index entry.
+                    let buf = lookup_event_by_levid(txn, lev)?
+                        .ok_or_else(|| DbError::msg("unable to lookup event by levId"))?;
+                    let other_packed = PackedEventView::new(&buf)?;
+                    if is_event_a_before_event_b(packed, other_packed) {
+                        evs[i].status = EventWriteStatus::Replaced;
+                    } else {
+                        lev_ids_to_delete.push(lev);
                     }
                 }
 
                 if is_param_replaceable_kind(packed.kind())
                     && evs[i].status == EventWriteStatus::Pending
                 {
-                    let a_tag = format!(
-                        "{}:{}:{}",
-                        packed.kind(),
-                        to_hex(packed.pubkey()),
-                        String::from_utf8_lossy(&replace)
-                    );
-                    let search_str = sha256(a_tag.as_bytes());
+                    // Hash the raw d-tag bytes, like C++ (no UTF-8 round-trip).
+                    let mut a_tag = Vec::with_capacity(24 + 64 + 1 + replace.len());
+                    a_tag.extend_from_slice(packed.kind().to_string().as_bytes());
+                    a_tag.push(b':');
+                    a_tag.extend_from_slice(to_hex(packed.pubkey()).as_bytes());
+                    a_tag.push(b':');
+                    a_tag.extend_from_slice(&replace);
+                    let search_str = sha256(&a_tag);
                     let search_key = make_key_string_u64(&search_str, u64::MAX);
+                    let mut scan_err: Option<DbError> = None;
                     txn.foreach_full(
                         txn.env().dbis().event_replace_deletion,
                         &search_key,
                         &u64::MAX.to_ne_bytes(),
                         true,
                         |k, _v| {
-                            if let Ok((s, n)) = parse_key_string_u64(k) {
-                                if s != search_str.as_slice() {
-                                    return false;
+                            // C++ ParsedKey_StringUint64 throws on malformed keys.
+                            match parse_key_string_u64(k) {
+                                Ok((s, n)) => {
+                                    if s != search_str.as_slice() {
+                                        return false;
+                                    }
+                                    if n >= packed.created_at() {
+                                        evs[i].status = EventWriteStatus::Deleted;
+                                    }
                                 }
-                                if n >= packed.created_at() {
-                                    evs[i].status = EventWriteStatus::Deleted;
+                                Err(e) => {
+                                    scan_err = Some(e);
                                 }
                             }
                             false
                         },
                     )?;
+                    if let Some(e) = scan_err {
+                        return Err(e);
+                    }
                 }
             }
         }
 
         if packed.kind() == 5 {
+            // LMDB errors abort the write like C++; only malformed a-tags are
+            // skipped (C++ catch(...)).
+            let mut scan_err: Option<DbError> = None;
             packed.foreach_tag(|tag_name, tag_val| {
+                if scan_err.is_some() {
+                    return false;
+                }
                 if tag_name == 'e' {
-                    if let Ok(Some((lev, buf))) = lookup_event_by_id(txn, tag_val) {
-                        if let Ok(other) = PackedEventView::new(&buf) {
-                            let mut can_delete = other.pubkey() == packed.pubkey();
-                            if !can_delete && GIFT_WRAP_KINDS.contains(&other.kind()) {
-                                other.foreach_tag(|on, ov| {
-                                    if on == 'p' && ov == packed.pubkey() {
-                                        can_delete = true;
-                                        return false;
-                                    }
-                                    true
-                                });
-                            }
-                            if can_delete {
-                                lev_ids_to_delete.push(lev);
-                            }
-                        }
-                    }
-                } else if tag_name == 'a' {
-                    if let Ok(s) = std::str::from_utf8(tag_val) {
-                        if let Ok((kind, pubkey, d_tag)) = parse_a_tag(s) {
-                            if is_param_replaceable_kind(kind)
-                                && pubkey.as_slice() == packed.pubkey()
-                            {
-                                let mut search = Vec::new();
-                                search.extend_from_slice(&pubkey);
-                                search.extend_from_slice(d_tag.as_bytes());
-                                let search_key = make_key_string_u64(&search, kind);
-                                let mut hit: Option<u64> = None;
-                                let _ = txn.foreach_full(
-                                    txn.env().dbis().event_replace,
-                                    &search_key,
-                                    &u64::MAX.to_ne_bytes(),
-                                    true,
-                                    |k, v| {
-                                        if k != search_key.as_slice() {
+                    match lookup_event_by_id(txn, tag_val) {
+                        Ok(Some((lev, buf))) => match PackedEventView::new(&buf) {
+                            Ok(other) => {
+                                let mut can_delete = other.pubkey() == packed.pubkey();
+                                if !can_delete && GIFT_WRAP_KINDS.contains(&other.kind()) {
+                                    other.foreach_tag(|on, ov| {
+                                        if on == 'p' && ov == packed.pubkey() {
+                                            can_delete = true;
                                             return false;
                                         }
-                                        hit = Some(u64::from_ne_bytes(v.try_into().unwrap()));
-                                        false
-                                    },
-                                );
-                                if let Some(lev) = hit {
-                                    if let Ok(Some(buf)) = lookup_event_by_levid(txn, lev) {
-                                        if let Ok(other) = PackedEventView::new(&buf) {
+                                        true
+                                    });
+                                }
+                                if can_delete {
+                                    lev_ids_to_delete.push(lev);
+                                }
+                            }
+                            Err(e) => scan_err = Some(DbError::msg(e.to_string())),
+                        },
+                        Ok(None) => {}
+                        Err(e) => scan_err = Some(e),
+                    }
+                } else if tag_name == 'a' {
+                    let parsed = std::str::from_utf8(tag_val)
+                        .ok()
+                        .and_then(|s| parse_a_tag(s).ok());
+                    if let Some((kind, pubkey, d_tag)) = parsed {
+                        if is_param_replaceable_kind(kind) && pubkey.as_slice() == packed.pubkey() {
+                            let mut search = Vec::new();
+                            search.extend_from_slice(&pubkey);
+                            search.extend_from_slice(d_tag.as_bytes());
+                            let search_key = make_key_string_u64(&search, kind);
+                            let mut hit: Option<u64> = None;
+                            let scan_res = txn.foreach_full(
+                                txn.env().dbis().event_replace,
+                                &search_key,
+                                &u64::MAX.to_ne_bytes(),
+                                true,
+                                |k, v| {
+                                    if k != search_key.as_slice() {
+                                        return false;
+                                    }
+                                    hit = Some(u64::from_ne_bytes(v.try_into().unwrap()));
+                                    false
+                                },
+                            );
+                            if let Err(e) = scan_res {
+                                scan_err = Some(e);
+                                return false;
+                            }
+                            if let Some(lev) = hit {
+                                match lookup_event_by_levid(txn, lev) {
+                                    Ok(Some(buf)) => match PackedEventView::new(&buf) {
+                                        Ok(other) => {
                                             if other.created_at() <= packed.created_at() {
                                                 lev_ids_to_delete.push(lev);
                                             }
                                         }
+                                        Err(e) => {
+                                            scan_err = Some(DbError::msg(e.to_string()))
+                                        }
+                                    },
+                                    Ok(None) => {
+                                        scan_err =
+                                            Some(DbError::msg("unable to lookup event by levId"));
                                     }
+                                    Err(e) => scan_err = Some(e),
                                 }
                             }
                         }
                     }
                 }
-                true
+                scan_err.is_none()
             });
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
         }
 
         if evs[i].status == EventWriteStatus::Pending {

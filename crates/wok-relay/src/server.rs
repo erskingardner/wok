@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use wok_db::{
-    event_json_owned, lookup_event_by_id_ro, most_recent_levid_ro, write_events, Decompressor, Env,
-    EventToWrite, EventWriteStatus,
+    lookup_event_by_id_ro, most_recent_levid_ro, write_events, Decompressor, Env, EventToWrite,
+    EventWriteStatus,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
@@ -120,43 +120,52 @@ impl ConnTable {
     fn remove(&self, id: u64) {
         self.map.lock().remove(&id);
     }
-    fn send(&self, id: u64, msg: RelayMessage, metrics: &Metrics) {
-        bump_relay_metrics(&msg, metrics);
-        let json = msg.to_json();
+    /// Deliver a pre-built frame, terminating the connection if it is over
+    /// its pending-bytes budget (C++ slow-client termination).
+    fn deliver(&self, conn_id: u64, payload: String, metrics: &Metrics) {
         let mut map = self.map.lock();
-        if let Some(out) = map.get(&id) {
-            if !out.try_send(json) {
-                // Slow/stalled client over its pending-bytes budget: terminate
-                // it like C++ RelayWebsocket does.
+        if let Some(out) = map.get(&conn_id) {
+            if !out.try_send(payload) {
                 metrics
                     .slow_client_terminations
                     .fetch_add(1, Ordering::Relaxed);
-                let out = map.remove(&id);
+                let out = map.remove(&conn_id);
                 if let Some(out) = out {
                     out.kill();
                 }
             }
         }
     }
-    fn send_event_batch(&self, recipients: &[(u64, String)], ev_json: &str, metrics: &Metrics) {
-        let mut map = self.map.lock();
-        let mut killed = Vec::new();
+
+    fn send(&self, id: u64, msg: RelayMessage, metrics: &Metrics) {
+        bump_relay_metrics(&msg, metrics);
+        let json = msg.to_json();
+        self.deliver(id, json, metrics);
+    }
+
+    /// Build the EVENT frame once (pre-sized) and deliver.
+    fn send_event(&self, conn_id: u64, sub_id: &str, ev_json: &str, metrics: &Metrics) {
+        metrics.relay_event.fetch_add(1, Ordering::Relaxed);
+        let mut payload = String::with_capacity(sub_id.len() + ev_json.len() + 12);
+        payload.push_str("[\"EVENT\",\"");
+        payload.push_str(sub_id);
+        payload.push_str("\",");
+        payload.push_str(ev_json);
+        payload.push(']');
+        self.deliver(conn_id, payload, metrics);
+    }
+
+    fn send_event_batch(&self, recipients: &[(u64, SubId)], ev_json: &str, metrics: &Metrics) {
         for (conn, sub) in recipients {
             metrics.relay_event.fetch_add(1, Ordering::Relaxed);
-            let payload = format!("[\"EVENT\",\"{sub}\",{ev_json}]");
-            if let Some(out) = map.get(conn) {
-                if !out.try_send(payload) {
-                    killed.push(*conn);
-                }
-            }
-        }
-        for conn in killed {
-            metrics
-                .slow_client_terminations
-                .fetch_add(1, Ordering::Relaxed);
-            if let Some(out) = map.remove(&conn) {
-                out.kill();
-            }
+            let sub = sub.as_str();
+            let mut payload = String::with_capacity(sub.len() + ev_json.len() + 12);
+            payload.push_str("[\"EVENT\",\"");
+            payload.push_str(sub);
+            payload.push_str("\",");
+            payload.push_str(ev_json);
+            payload.push(']');
+            self.deliver(*conn, payload, metrics);
         }
     }
 }
@@ -1300,7 +1309,13 @@ fn run_writer(
             continue;
         }
         let mut sink = DeferredSink::default();
-        let mut evs: Vec<EventToWrite> = events.iter().map(|e| e.1.clone()).collect();
+        // Move the events out instead of cloning each packed/json pair.
+        let mut evs: Vec<EventToWrite> = Vec::with_capacity(events.len());
+        let mut meta: Vec<u64> = Vec::with_capacity(events.len());
+        for (conn_id, ev, _) in events.drain(..) {
+            meta.push(conn_id);
+            evs.push(ev);
+        }
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
             write_events(&mut txn, &mut sink, &mut evs, false)?;
@@ -1311,8 +1326,8 @@ fn run_writer(
             Ok::<_, wok_db::DbError>(())
         })();
         if let Err(e) = write_res {
-            for (conn_id, ev, _) in &events {
-                let id_hex = PackedEventView::new(&ev.packed)
+            for (i, conn_id) in meta.iter().enumerate() {
+                let id_hex = PackedEventView::new(&evs[i].packed)
                     .map(|p| to_hex(p.id()))
                     .unwrap_or_else(|_| "?".into());
                 conns.send(
@@ -1327,7 +1342,7 @@ fn run_writer(
             }
             continue;
         }
-        for (i, (conn_id, _, _)) in events.iter().enumerate() {
+        for (i, conn_id) in meta.iter().enumerate() {
             let packed = PackedEventView::new(&evs[i].packed).ok();
             let id_hex = packed
                 .as_ref()
@@ -1405,7 +1420,7 @@ fn run_req_worker(
                 Err(_) => break,
             }
         };
-        let cfg_snap = cfg.read().clone();
+        let cfg_snap = cfg.read();
         let r = restrictor(&cfg_snap);
         let txn = match env.begin_ro() {
             Ok(t) => t,
@@ -1446,7 +1461,9 @@ fn run_req_worker(
             }
         }
         let mut completed: Vec<(Subscription, u64)> = Vec::new();
-        let mut events: Vec<(Subscription, String)> = Vec::new();
+        // Events are framed and delivered inside the scan callback: no
+        // per-event Subscription clone, no intermediate collection, and the
+        // payload JSON is copied exactly once (into the frame).
         let _ = queries.process(
             &txn,
             cfg_snap.relay.query_timeslice_budget_us,
@@ -1455,9 +1472,9 @@ fn run_req_worker(
                     return;
                 }
                 let pk = authed.get(&sub.conn_id).map(|a| a.as_slice());
-                let packed_buf = wok_db::get_packed_ro(&txn, lev).ok().flatten();
-                if let Some(buf) = packed_buf {
-                    if let Ok(packed) = PackedEventView::new(&buf) {
+                // Zero-copy packed lookup for the restriction check.
+                if let Ok(Some(buf)) = txn.get_u64(txn.env().dbis().event, lev) {
+                    if let Ok(packed) = PackedEventView::new(buf) {
                         if !r.should_send_to_subscriber(packed, pk) {
                             return;
                         }
@@ -1465,7 +1482,7 @@ fn run_req_worker(
                 }
                 if let Some(raw) = payload {
                     if let Ok(json) = decomp.decode(&txn, raw, cfg_snap.events.max_event_size) {
-                        events.push((sub.clone(), json.to_string()));
+                        conns.send_event(sub.conn_id, sub.sub_id.as_str(), json, &metrics);
                     }
                 }
             },
@@ -1474,16 +1491,6 @@ fn run_req_worker(
             },
         );
         drop(txn);
-        for (sub, json) in events {
-            conns.send(
-                sub.conn_id,
-                RelayMessage::Event {
-                    sub_id: sub.sub_id.to_string(),
-                    event_json: json,
-                },
-                &metrics,
-            );
-        }
         for (sub, total) in completed {
             if sub.count_only {
                 let mut count = total;
@@ -1531,7 +1538,7 @@ fn run_req_monitor(
         while let Ok(more) = rx.try_recv() {
             batch.push(more);
         }
-        let cfg_snap = cfg.read().clone();
+        let cfg_snap = cfg.read();
         let r = restrictor(&cfg_snap);
         let txn = match env.begin_ro() {
             Ok(t) => t,
@@ -1547,34 +1554,26 @@ fn run_req_monitor(
                     let conn = sub.conn_id;
                     let pk = authed.get(&conn).map(|a| a.as_slice());
                     let start = sub.latest_event_id.saturating_add(1);
-                    let mut catchup = Vec::new();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
                             if sub.filter_group.does_match(packed)
                                 && r.should_send_to_subscriber(packed, pk)
                             {
-                                if let Ok(json) = event_json_owned(
-                                    &txn,
-                                    &mut decomp,
-                                    lev,
-                                    cfg_snap.events.max_event_size,
-                                ) {
-                                    catchup.push((sub.sub_id.to_string(), json));
+                                if let Some(raw) = txn
+                                    .get_u64(txn.env().dbis().event_payload, lev)
+                                    .ok()
+                                    .flatten()
+                                {
+                                    if let Ok(json) =
+                                        decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
+                                    {
+                                        conns.send_event(conn, sub.sub_id.as_str(), json, &metrics);
+                                    }
                                 }
                             }
                         }
                         true
                     });
-                    for (sid, json) in catchup {
-                        conns.send(
-                            conn,
-                            RelayMessage::Event {
-                                sub_id: sid,
-                                event_json: json,
-                            },
-                            &metrics,
-                        );
-                    }
                     sub.latest_event_id = latest;
                     if !monitors.add_sub(sub, latest) {
                         conns.send(
@@ -1605,21 +1604,25 @@ fn run_req_monitor(
                             if recips.is_empty() {
                                 return true;
                             }
-                            if let Ok(json) = event_json_owned(
-                                &txn,
-                                &mut decomp,
-                                lev,
-                                cfg_snap.events.max_event_size,
-                            ) {
-                                let filtered: Vec<(u64, String)> = recips
-                                    .into_iter()
-                                    .filter(|recip| {
-                                        let pk = authed.get(&recip.conn_id).map(|a| a.as_slice());
-                                        r.should_send_to_subscriber(packed, pk)
-                                    })
-                                    .map(|recip| (recip.conn_id, recip.sub_id.to_string()))
-                                    .collect();
-                                conns.send_event_batch(&filtered, &json, &metrics);
+                            if let Some(raw) = txn
+                                .get_u64(txn.env().dbis().event_payload, lev)
+                                .ok()
+                                .flatten()
+                            {
+                                if let Ok(json) =
+                                    decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
+                                {
+                                    let filtered: Vec<(u64, SubId)> = recips
+                                        .into_iter()
+                                        .filter(|recip| {
+                                            let pk =
+                                                authed.get(&recip.conn_id).map(|a| a.as_slice());
+                                            r.should_send_to_subscriber(packed, pk)
+                                        })
+                                        .map(|recip| (recip.conn_id, recip.sub_id))
+                                        .collect();
+                                    conns.send_event_batch(&filtered, json, &metrics);
+                                }
                             }
                         }
                         true

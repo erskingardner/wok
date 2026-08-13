@@ -26,7 +26,10 @@ A trial with missing events, unexpected rejections, or dropped deliveries is
 
 Latest committed run (Apple Silicon aarch64, 10k events, single noisy run —
 do not rank from one run): `docs/sample-bench-summary.md` and
-`docs/sample-bench-results.jsonl`. Headline shape from that run: wok leads
-on DB-path CLI scenarios (import/export/negentropy build/dup import), WS
-publish is round-trip-bound parity, WS query QPS favors strfry in this run
-(~9.1k vs ~6.7k qps; worth re-measuring on your host).
+`docs/sample-bench-results.jsonl`. Headline shape: wok leads on DB-path CLI
+scenarios (import 1.6x, export 3.4x, negentropy build 2.3x, dup import
+4.3x), WS publish is round-trip-bound parity, and WS query QPS is within
+run-to-run noise after the req-worker marshalling pass (~9.0k vs ~9.7k qps
+for strfry; an earlier revision of this benchmark measured a 35% strfry
+lead, which was traced to per-event allocation churn in wok's query path,
+not the LMDB scan itself).

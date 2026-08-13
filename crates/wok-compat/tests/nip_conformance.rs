@@ -163,7 +163,7 @@ fn nip50_search_filter_and_extensions() {
 fn nip11_software_not_strfry_when_unconfigured() {
     let cfg = wok_relay::Config::default();
     let nips = wok_relay::supported_nips(&cfg);
-    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 59, 70, 77]);
+    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 70, 77]);
     assert!(!nips.contains(&2), "client-side NIP-02 is not advertised");
     assert!(!nips.contains(&4), "client-side NIP-04 is not advertised");
     assert!(!nips.contains(&28), "client-side NIP-28 is not advertised");

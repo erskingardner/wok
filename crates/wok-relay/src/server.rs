@@ -2561,6 +2561,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_private_read_fails_closed_until_auth_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        handle
+            .client_message(
+                conn,
+                vec![127, 0, 0, 1],
+                json!(["REQ", "private", {"kinds":[1059]}]).to_string(),
+            )
+            .await;
+
+        let challenge = recv_outbound(&mut rx).await;
+        let closed = recv_outbound(&mut rx).await;
+        assert!(challenge.contains("\"AUTH\""), "{challenge}");
+        assert!(
+            closed.contains("\"CLOSED\"") && closed.contains("auth-required"),
+            "{closed}"
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn historical_query_concurrency_is_independent_from_live_subscription_limit() {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), EnvOptions::default()).unwrap();

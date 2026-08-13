@@ -87,6 +87,15 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         );
     }
 
+    match cfg.auth_configuration_warning() {
+        Some(detail) => report.add("relay-auth", CheckStatus::Warn, detail),
+        None => report.add(
+            "relay-auth",
+            CheckStatus::Pass,
+            "restricted reads have usable NIP-42 authentication or are disabled",
+        ),
+    }
+
     if !cfg.db.is_dir() {
         report.add(
             "database-path",

@@ -364,6 +364,9 @@ fn prepare_strfry(
     let external_paths = external_path_checks(&source_cfg);
     let output_available = !output.exists();
     let mut warnings = Vec::new();
+    if let Some(warning) = source_cfg.auth_configuration_warning() {
+        warnings.push(format!("{warning}; review AUTH before cutover"));
+    }
     if !output_available {
         warnings.push(format!(
             "output {} already exists and will not be overwritten",

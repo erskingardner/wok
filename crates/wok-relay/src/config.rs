@@ -262,8 +262,9 @@ impl Default for Config {
                 auth: AuthConfig {
                     enabled: true,
                     service_url: String::new(),
-                    // C++ strfry.conf default is "" (no restricted kinds).
-                    restricted_read_kinds: Vec::new(),
+                    // Private messages and gift wraps fail closed until the
+                    // operator configures the relay URL required by NIP-42.
+                    restricted_read_kinds: vec![4, 1059],
                     restrict_read_to_involved_pubkey: true,
                 },
                 info: InfoConfig {
@@ -389,6 +390,27 @@ fn merge_toml(base: &mut toml::Value, supplied: toml::Value) {
 }
 
 impl Config {
+    /// Explain when restricted reads are deliberately failing closed because
+    /// the relay cannot complete NIP-42 authentication.
+    pub fn auth_configuration_warning(&self) -> Option<String> {
+        if self.relay.auth.restricted_read_kinds.is_empty() {
+            return None;
+        }
+        if !self.relay.auth.enabled {
+            return Some(format!(
+                "restricted read kinds {:?} cannot be read because relay.auth.enabled is false",
+                self.relay.auth.restricted_read_kinds
+            ));
+        }
+        if self.relay.auth.service_url.is_empty() {
+            return Some(format!(
+                "restricted read kinds {:?} cannot be read until relay.auth.service_url is configured",
+                self.relay.auth.restricted_read_kinds
+            ));
+        }
+        None
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let text = std::fs::read_to_string(path.as_ref()).map_err(|e| e.to_string())?;
         Self::parse_toml(&text)
@@ -1104,15 +1126,29 @@ mod tests {
     }
 
     #[test]
-    fn empty_restricted_read_kinds() {
+    fn restricted_read_kinds_are_private_by_default_but_can_be_disabled() {
         let c = Config::parse_toml("[relay.auth]\nrestricted_read_kinds = []\n").unwrap();
         assert!(c.relay.auth.restricted_read_kinds.is_empty());
-        // C++ default is no restricted kinds.
-        assert!(Config::default()
-            .relay
-            .auth
-            .restricted_read_kinds
-            .is_empty());
+        assert_eq!(
+            Config::default().relay.auth.restricted_read_kinds,
+            vec![4, 1059]
+        );
+    }
+
+    #[test]
+    fn restricted_reads_report_unusable_auth() {
+        let mut c = Config::default();
+        assert!(c
+            .auth_configuration_warning()
+            .unwrap()
+            .contains("service_url"));
+        c.relay.auth.service_url = "wss://relay.example.com/".into();
+        assert_eq!(c.auth_configuration_warning(), None);
+        c.relay.auth.enabled = false;
+        assert!(c
+            .auth_configuration_warning()
+            .unwrap()
+            .contains("enabled is false"));
     }
 
     #[test]

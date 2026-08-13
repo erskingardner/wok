@@ -20,7 +20,7 @@ pub enum CapabilityCondition {
     AuthConfigured,
     CountEnabled,
     NegentropyEnabled,
-    EphemeralLiveOnly,
+    Nip59Safe,
     PowRequired,
 }
 
@@ -33,8 +33,12 @@ impl CapabilityCondition {
             }
             Self::CountEnabled => cfg.relay.max_filter_limit_count > 0,
             Self::NegentropyEnabled => cfg.relay.negentropy_enabled,
-            Self::EphemeralLiveOnly => {
+            Self::Nip59Safe => {
                 cfg.events.ephemeral_persistence == EphemeralPersistence::LiveOnly
+                    && cfg.relay.auth.enabled
+                    && !cfg.relay.auth.service_url.is_empty()
+                    && cfg.relay.auth.restricted_read_kinds.contains(&1059)
+                    && cfg.relay.auth.restrict_read_to_involved_pubkey
             }
             Self::PowRequired => cfg.relay.abuse.enabled && cfg.relay.abuse.min_pow_difficulty > 0,
         }
@@ -86,7 +90,7 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
     RelayCapability {
         nip: 59,
         name: "Gift wrap",
-        enabled_when: CapabilityCondition::EphemeralLiveOnly,
+        enabled_when: CapabilityCondition::Nip59Safe,
     },
     RelayCapability {
         nip: 70,
@@ -129,7 +133,7 @@ mod tests {
     #[test]
     fn conditional_capabilities_follow_runtime_configuration() {
         let mut cfg = Config::default();
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 45, 50, 59, 70, 77]);
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 45, 50, 70, 77]);
 
         cfg.relay.auth.service_url = "wss://relay.example.com/".into();
         cfg.relay.max_filter_limit_count = 0;
@@ -139,5 +143,23 @@ mod tests {
 
         cfg.relay.abuse.min_pow_difficulty = 20;
         assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 13, 40, 42, 50, 70]);
+    }
+
+    #[test]
+    fn nip59_requires_every_private_gift_wrap_safeguard() {
+        let mut cfg = Config::default();
+        cfg.relay.auth.service_url = "wss://relay.example.com/".into();
+        assert!(supported_nips(&cfg).contains(&59));
+
+        cfg.relay.auth.restricted_read_kinds.clear();
+        assert!(!supported_nips(&cfg).contains(&59));
+        cfg.relay.auth.restricted_read_kinds.push(1059);
+
+        cfg.relay.auth.restrict_read_to_involved_pubkey = false;
+        assert!(!supported_nips(&cfg).contains(&59));
+        cfg.relay.auth.restrict_read_to_involved_pubkey = true;
+
+        cfg.relay.auth.enabled = false;
+        assert!(!supported_nips(&cfg).contains(&59));
     }
 }

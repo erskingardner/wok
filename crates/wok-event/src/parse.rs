@@ -27,7 +27,6 @@ impl Default for EventLimits {
 pub struct ParsedEvent {
     pub packed: PackedEvent,
     pub json: String,
-    pub value: Value,
 }
 
 /// Matches hoytech `from_hex` with the default `allowUnevenSize = true`:

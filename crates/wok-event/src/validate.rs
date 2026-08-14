@@ -128,11 +128,7 @@ pub fn parse_and_verify_event(
     if verify_msg {
         verify_event_json_size(&json, limits.max_event_size)?;
     }
-    Ok(ParsedEvent {
-        packed,
-        json,
-        value: orig.clone(),
-    })
+    Ok(ParsedEvent { packed, json })
 }
 
 #[cfg(test)]

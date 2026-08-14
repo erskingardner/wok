@@ -45,6 +45,12 @@ struct Args {
     /// Events in bulk scenarios (smoke default 2000, full default 20000)
     #[arg(long)]
     events: Option<u64>,
+    /// Reuse an existing signed JSONL corpus instead of generating one.
+    #[arg(long)]
+    corpus: Option<PathBuf>,
+    /// Write the corpus and manifest, then exit without running a trial.
+    #[arg(long)]
+    generate_corpus_only: bool,
     /// Queries in query scenarios (default 400)
     #[arg(long)]
     queries: Option<u64>,
@@ -118,7 +124,7 @@ struct CorpusManifest {
     path: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum EventMix {
     /// Kind 1 notes only, preserving the original focused workload.
@@ -126,6 +132,9 @@ enum EventMix {
     /// Weighted notes plus metadata, contacts, reactions, zaps, relay lists,
     /// and long-form content.
     Realistic,
+    /// Notes plus deletion requests and ephemeral events. Intended for live
+    /// publication workloads, not retained-count comparisons.
+    Lifecycle,
 }
 
 #[derive(Serialize)]
@@ -247,28 +256,61 @@ fn main() -> Result<()> {
         && scenarios.iter().any(|scenario| {
             !matches!(
                 *scenario,
-                "ws_publish_scaled" | "live_fanout" | "idle_connections"
+                "ws_publish_scaled"
+                    | "ws_query_latency"
+                    | "deep_history_pagination"
+                    | "mixed_read_write"
+                    | "live_fanout"
+                    | "idle_connections"
             )
         })
     {
         anyhow::bail!(
-            "--target-url supports ws_publish_scaled, live_fanout, and idle_connections; use --profile load or --scenario"
+            "--target-url supports scaled publication, query, mixed read/write, fanout, and idle-connection scenarios"
         );
     }
 
-    let event_count = args.events.unwrap_or(if args.profile == "smoke" {
+    if args.event_mix == EventMix::Lifecycle
+        && scenarios.iter().any(|scenario| {
+            !matches!(
+                *scenario,
+                "ws_publish_1conn"
+                    | "ws_publish_8conn"
+                    | "ws_publish_scaled"
+                    | "live_fanout"
+                    | "idle_connections"
+            )
+        })
+    {
+        anyhow::bail!("--event-mix lifecycle is only valid for live publication scenarios");
+    }
+
+    let default_event_count = if args.profile == "smoke" {
         2_000
     } else {
         20_000
-    });
-    let corpus_path = args.out.join("corpus.jsonl");
-    generate_events(
-        &corpus_path,
-        event_count,
-        args.seed,
-        base_timestamp,
-        args.event_mix,
-    )?;
+    };
+    let (corpus_path, event_count) = if let Some(path) = &args.corpus {
+        let path = std::fs::canonicalize(path)
+            .with_context(|| format!("open corpus {}", path.display()))?;
+        let count = count_jsonl_events(&path)?;
+        if let Some(expected) = args.events {
+            if expected != count {
+                anyhow::bail!(
+                    "--events {expected} does not match {} records in {}",
+                    count,
+                    path.display()
+                );
+            }
+        }
+        (path, count)
+    } else {
+        let count = args.events.unwrap_or(default_event_count);
+        let path = args.out.join("corpus.jsonl");
+        generate_events(&path, count, args.seed, base_timestamp, args.event_mix)?;
+        (path, count)
+    };
+    args.events = Some(event_count);
     let corpus = corpus_manifest(
         &corpus_path,
         event_count,
@@ -296,6 +338,14 @@ fn main() -> Result<()> {
         args.out.join("manifest.json"),
         serde_json::to_vec_pretty(&campaign)?,
     )?;
+    if args.generate_corpus_only {
+        println!(
+            "wrote corpus manifest for {} events at {}",
+            event_count,
+            corpus_path.display()
+        );
+        return Ok(());
+    }
 
     let mut trials = Vec::new();
     for repetition in 1..=args.repetitions {
@@ -407,6 +457,11 @@ fn run_trial(
     };
     let local_bin =
         || bin.ok_or_else(|| anyhow::anyhow!("{scenario} requires locally managed relay binaries"));
+    let target = RelayTarget {
+        bin,
+        url: args.target_url.as_deref(),
+        dbdir: dir.path(),
+    };
     match scenario {
         "import" => {
             let bin = local_bin()?;
@@ -507,25 +562,21 @@ fn run_trial(
                 }
             }
         }
-        "ws_query_latency" => {
-            let bin = local_bin()?;
-            match ws_query_trial(rt, bin, dir.path(), workload, n_queries, &mut hist) {
-                Ok((qps, nts, good, miss)) => {
-                    throughput = qps;
-                    notes = nts;
-                    ok = good;
-                    mismatches += miss;
-                }
-                Err(e) => {
-                    ok = false;
-                    errors += 1;
-                    notes = format!("{e}");
-                }
+        "ws_query_latency" => match ws_query_trial(rt, target, corpus_path, n_queries, &mut hist) {
+            Ok((qps, nts, good, miss)) => {
+                throughput = qps;
+                notes = nts;
+                ok = good;
+                mismatches += miss;
             }
-        }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e}");
+            }
+        },
         "deep_history_pagination" => {
-            let bin = local_bin()?;
-            match deep_history_trial(rt, bin, dir.path(), workload, n_queries, &mut hist) {
+            match deep_history_trial(rt, target, corpus_path, n_queries, &mut hist) {
                 Ok((qps, nts, good, miss)) => {
                     throughput = qps;
                     notes = nts;
@@ -540,8 +591,7 @@ fn run_trial(
             }
         }
         "mixed_read_write" => {
-            let bin = local_bin()?;
-            match mixed_read_write_trial(rt, bin, dir.path(), workload, n_queries, &mut hist) {
+            match mixed_read_write_trial(rt, target, corpus_path, workload, n_queries, &mut hist) {
                 Ok((qps, nts, good, miss)) => {
                     throughput = qps;
                     notes = nts;
@@ -572,11 +622,6 @@ fn run_trial(
             }
         }
         "live_fanout" => {
-            let target = RelayTarget {
-                bin,
-                url: args.target_url.as_deref(),
-                dbdir: dir.path(),
-            };
             let workload = EventWorkload {
                 count: args.fanout_events,
                 ..workload
@@ -596,11 +641,6 @@ fn run_trial(
             }
         }
         "ws_publish_scaled" => {
-            let target = RelayTarget {
-                bin,
-                url: args.target_url.as_deref(),
-                dbdir: dir.path(),
-            };
             match ws_publish_target_trial(rt, target, workload, args.publish_connections, &mut hist)
             {
                 Ok((eps, nts, good, miss)) => {
@@ -746,45 +786,140 @@ fn workload_seed(seed: u64, scenario: &str, repetition: u32) -> u64 {
 // Corpus
 // ---------------------------------------------------------------------------
 
-fn event_at(i: u64, now: u64, mix: EventMix, rng: &mut rand::rngs::StdRng) -> Value {
-    use rand::Rng;
-    use secp256k1::{Keypair, SECP256K1};
-    let kp = Keypair::new(SECP256K1, rng);
-    let (xonly, _) = kp.x_only_public_key();
-    let kind = match mix {
-        EventMix::Kind1 => 1,
-        EventMix::Realistic => match i % 20 {
-            0 => 0,
-            1 => 3,
-            2 => 7,
-            3 => 9735,
-            4 => 10002,
-            5 => 30023,
-            _ => 1,
-        },
-    };
-    let mut tags = vec![json!(["t", format!("tag-{}", i % 64)])];
-    if kind == 30023 {
-        tags.push(json!(["d", format!("article-{i}")]));
+struct EventFactory {
+    rng: rand::rngs::StdRng,
+    actors: Vec<secp256k1::Keypair>,
+    actor_pubkeys: Vec<String>,
+    last_note: Option<(String, String, usize)>,
+}
+
+impl EventFactory {
+    fn new(seed: u64) -> Self {
+        use rand::SeedableRng;
+        use secp256k1::{Keypair, SECP256K1};
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let actors: Vec<Keypair> = (0..32).map(|_| Keypair::new(SECP256K1, &mut rng)).collect();
+        let actor_pubkeys = actors
+            .iter()
+            .map(|key| hex::encode(key.x_only_public_key().0.serialize()))
+            .collect();
+        Self {
+            rng,
+            actors,
+            actor_pubkeys,
+            last_note: None,
+        }
     }
-    let mut ev = json!({
-        "created_at": now.saturating_sub(100_000) + i,
-        "kind": kind,
-        "tags": tags,
-        "content": format!(
-            "common benchmark event {i} needle{} category{} {}",
-            i % 1024,
-            i % 32,
-            "x".repeat((i % 24) as usize)
-        ),
-        "pubkey": hex::encode(xonly.serialize()),
-    });
-    let id = wok_event::event_id_hash(&ev).unwrap();
-    ev["id"] = json!(hex::encode(id));
-    let sig = SECP256K1.sign_schnorr_no_aux_rand(&id, &kp);
-    ev["sig"] = json!(hex::encode(sig.as_ref()));
-    let _ = rng.gen::<u32>();
-    ev
+
+    fn event(&mut self, i: u64, total: u64, now: u64, mix: EventMix) -> Value {
+        use secp256k1::{Keypair, SECP256K1};
+
+        let kind = match mix {
+            EventMix::Kind1 => 1,
+            EventMix::Realistic => match i % 20 {
+                0 => 0,
+                1 => 3,
+                2 => 7,
+                3 => 9735,
+                4 => 10002,
+                5 => 30023,
+                _ => 1,
+            },
+            EventMix::Lifecycle => match i % 10 {
+                0 => 20_001,
+                1 if self.last_note.is_some() => 5,
+                _ => 1,
+            },
+        };
+        let mut actor_index = (i as usize) % self.actors.len();
+        if kind == 5 {
+            actor_index = self
+                .last_note
+                .as_ref()
+                .map(|(_, _, actor)| *actor)
+                .unwrap_or(actor_index);
+        }
+        // Replaceable/addressable events get unique authors in the general
+        // corpus so retained-count comparisons remain exact. Dedicated churn
+        // scenarios can intentionally reuse authors later.
+        let unique_author = matches!(kind, 0 | 3 | 10_002 | 30_023);
+        let key = if unique_author {
+            Keypair::new(SECP256K1, &mut self.rng)
+        } else {
+            self.actors[actor_index]
+        };
+        let pubkey = hex::encode(key.x_only_public_key().0.serialize());
+        let mut tags = vec![json!(["t", format!("tag-{}", i % 64)])];
+        match kind {
+            1 if i.is_multiple_of(5) => {
+                if let Some((event_id, parent_pubkey, _)) = &self.last_note {
+                    tags.push(json!(["e", event_id, "", "reply"]));
+                    tags.push(json!(["p", parent_pubkey]));
+                }
+            }
+            3 => {
+                for contact in self.actor_pubkeys.iter().take(3) {
+                    tags.push(json!(["p", contact]));
+                }
+            }
+            5 | 7 | 9735 => {
+                if let Some((event_id, parent_pubkey, _)) = &self.last_note {
+                    tags.push(json!(["e", event_id]));
+                    tags.push(json!(["p", parent_pubkey]));
+                }
+                if kind == 9735 {
+                    tags.push(json!(["amount", format!("{}000", (i % 100) + 1)]));
+                }
+            }
+            10_002 => {
+                tags.push(json!(["r", "wss://relay.example"]));
+                tags.push(json!(["r", "wss://backup.example", "read"]));
+            }
+            30_023 => tags.push(json!(["d", format!("article-{i}")])),
+            _ => {}
+        }
+        let content = match kind {
+            0 => json!({
+                "name": format!("benchmark-actor-{i}"),
+                "about": format!("deterministic benchmark profile {i}")
+            })
+            .to_string(),
+            3 | 5 | 9735 | 10_002 | 20_001 => String::new(),
+            7 => "+".into(),
+            _ => format!(
+                "common benchmark event {i} needle{} category{} {}",
+                i % 1024,
+                i % 32,
+                "x".repeat((i % 24) as usize)
+            ),
+        };
+        let created_at = if kind == 20_001 {
+            now.saturating_sub(i % 30)
+        } else {
+            now.saturating_sub(total).saturating_add(i)
+        };
+        let mut event = json!({
+            "created_at": created_at,
+            "kind": kind,
+            "tags": tags,
+            "content": content,
+            "pubkey": pubkey,
+        });
+        let id = wok_event::event_id_hash(&event).expect("generated event is valid JSON");
+        let id_hex = hex::encode(id);
+        event["id"] = json!(id_hex);
+        let signature = SECP256K1.sign_schnorr_no_aux_rand(&id, &key);
+        event["sig"] = json!(hex::encode(signature.as_ref()));
+        if kind == 1 {
+            self.last_note = Some((
+                event["id"].as_str().unwrap_or_default().to_string(),
+                pubkey,
+                actor_index,
+            ));
+        }
+        event
+    }
 }
 
 fn unix_timestamp() -> Result<u64> {
@@ -805,6 +940,33 @@ fn sha256_file(path: &Path) -> Result<String> {
         digest.update(&buffer[..read]);
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+fn count_jsonl_events(path: &Path) -> Result<u64> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+    let mut count = 0u64;
+    for line in reader.lines() {
+        if !line?.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn read_event_values(path: &Path) -> Result<Vec<Value>> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+    reader
+        .lines()
+        .filter_map(|line| match line {
+            Ok(line) if line.trim().is_empty() => None,
+            other => Some(other),
+        })
+        .map(|line| Ok(serde_json::from_str(&line?)?))
+        .collect()
 }
 
 fn binary_manifest(path: &Path) -> Option<BinaryManifest> {
@@ -841,58 +1003,23 @@ fn generate_events(
     base_timestamp: u64,
     mix: EventMix,
 ) -> Result<PathBuf> {
-    use rand::SeedableRng;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut factory = EventFactory::new(seed);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut f = std::fs::File::create(path)?;
     for i in 0..n {
-        let ev = event_at(i, base_timestamp, mix, &mut rng);
+        let ev = factory.event(i, n, base_timestamp, mix);
         writeln!(f, "{}", wok_event::json::to_tao_string(&ev))?;
     }
     Ok(path.to_path_buf())
 }
 
 fn generate_values(workload: EventWorkload) -> Result<Vec<Value>> {
-    use rand::SeedableRng;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(workload.seed);
+    let mut factory = EventFactory::new(workload.seed);
     Ok((0..workload.count)
-        .map(|i| event_at(i, workload.base_timestamp, workload.mix, &mut rng))
+        .map(|i| factory.event(i, workload.count, workload.base_timestamp, workload.mix))
         .collect())
-}
-
-/// Build a dense single-author history so pagination exercises the same
-/// author+kind+until cursor shape reported by large relay operators.
-fn generate_author_history(
-    dir: &Path,
-    n: u64,
-    seed: u64,
-    base_timestamp: u64,
-) -> Result<(PathBuf, String)> {
-    use rand::SeedableRng;
-    use secp256k1::{Keypair, SECP256K1};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let key = Keypair::new(SECP256K1, &mut rng);
-    let (pubkey, _) = key.x_only_public_key();
-    let pubkey = hex::encode(pubkey.serialize());
-    let path = dir.join("author-history.jsonl");
-    let mut file = std::fs::File::create(&path)?;
-    for i in 0..n {
-        let mut event = json!({
-            "created_at": base_timestamp.saturating_sub(n).saturating_add(i),
-            "kind": 1,
-            "tags": [],
-            "content": format!("historical page event {i}"),
-            "pubkey": pubkey.clone(),
-        });
-        let id = wok_event::event_id_hash(&event)?;
-        event["id"] = json!(hex::encode(id));
-        let signature = SECP256K1.sign_schnorr_no_aux_rand(&id, &key);
-        event["sig"] = json!(hex::encode(signature.as_ref()));
-        writeln!(file, "{}", wok_event::json::to_tao_string(&event))?;
-    }
-    Ok((path, pubkey))
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,35 +1278,45 @@ fn ws_publish_target_trial(
     ))
 }
 
-/// Preload n events, then run `queries` REQs of mixed shapes; measures
-/// time-to-EOSE per query and aggregate QPS over 4 connections.
+/// Run `queries` REQs of mixed shapes against an exact corpus. Local targets
+/// are preloaded automatically; remote targets must already contain the
+/// supplied `--corpus`.
 fn ws_query_trial(
     rt: &tokio::runtime::Runtime,
-    bin: &Path,
-    dbdir: &Path,
-    workload: EventWorkload,
+    target: RelayTarget<'_>,
+    corpus_path: &Path,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    let events = generate_values(workload)?;
+    let events = read_event_values(corpus_path)?;
+    if events.is_empty() {
+        anyhow::bail!("query corpus is empty");
+    }
+    let note_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.get("kind").and_then(Value::as_u64) == Some(1))
+        .collect();
+    if note_events.is_empty() {
+        anyhow::bail!("query corpus has no kind 1 events");
+    }
     let measured_queries = queries.max(1);
     let total_queries = measured_queries.saturating_add(20);
-    let jsonl = dbdir.join("events.jsonl");
-    {
-        let mut f = std::fs::File::create(&jsonl)?;
-        for ev in &events {
-            writeln!(f, "{}", wok_event::json::to_tao_string(ev))?;
+    if let Some(bin) = target.bin {
+        if !import_with(bin, target.dbdir, corpus_path, false) {
+            anyhow::bail!("pre-import failed");
+        }
+        let retained = export_count(bin, target.dbdir);
+        if retained != events.len() as u64 {
+            anyhow::bail!(
+                "pre-import retained {retained}/{} corpus events",
+                events.len()
+            );
         }
     }
-    if !import_with(bin, dbdir, &jsonl, false) {
-        anyhow::bail!("pre-import failed");
-    }
-    let port = free_port();
-    let mut child = spawn_relay(bin, dbdir, port)?;
+    let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
-        let url = format!("ws://127.0.0.1:{port}/");
         let mut sockets = Vec::new();
         for _ in 0..4 {
             sockets.push(connect_retry(&url).await?);
@@ -1187,12 +1324,13 @@ fn ws_query_trial(
         let filters: Vec<Value> = (0..total_queries)
             .map(|q| {
                 let ev = &events[(q as usize * 7) % events.len()];
+                let note = note_events[(q as usize * 11) % note_events.len()];
                 let id = ev["id"].as_str().unwrap_or("");
-                let pk = ev["pubkey"].as_str().unwrap_or("");
+                let pk = note["pubkey"].as_str().unwrap_or("");
                 match q % 4 {
                     0 => json!({"ids":[id]}),
                     1 => json!({"authors":[pk],"kinds":[1],"limit":50}),
-                    2 => json!({"kinds":[1],"since":ev["created_at"].as_u64().unwrap_or(0),"limit":20}),
+                    2 => json!({"kinds":[1],"since":note["created_at"].as_u64().unwrap_or(0),"limit":20}),
                     _ => json!({"#t":[format!("tag-{}", q % 64)],"limit":50}),
                 }
             })
@@ -1200,51 +1338,71 @@ fn ws_query_trial(
         // Warm-up.
         for (i, f) in filters.iter().take(20).enumerate() {
             let ws = &mut sockets[i % 4];
-            ws.send(Message::Text(json!(["REQ", "w", f]).to_string().into()))
-                .await?;
+            let subscription = format!("warm-{i}");
+            ws.send(Message::Text(
+                json!(["REQ", subscription, f]).to_string().into(),
+            ))
+            .await?;
             while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await
             {
                 if m.to_text().unwrap_or("").contains("EOSE") {
                     break;
                 }
             }
+            ws.send(Message::Text(
+                json!(["CLOSE", subscription]).to_string().into(),
+            ))
+            .await?;
         }
         let start = Instant::now();
         let mut done = 0u64;
         let mut results = 0u64;
+        let mut mismatches = 0u64;
         for (i, f) in filters.iter().skip(20).enumerate() {
             let ws = &mut sockets[i % 4];
+            let subscription = format!("query-{i}");
             let t0 = Instant::now();
-            ws.send(Message::Text(json!(["REQ", "q", f]).to_string().into()))
-                .await?;
+            ws.send(Message::Text(
+                json!(["REQ", subscription, f]).to_string().into(),
+            ))
+            .await?;
+            let mut query_results = 0u64;
+            let mut saw_eose = false;
             while let Ok(Some(Ok(m))) =
                 tokio::time::timeout(Duration::from_secs(10), ws.next()).await
             {
                 let t = m.to_text().unwrap_or("");
                 if t.contains("\"EVENT\"") {
                     results += 1;
+                    query_results += 1;
                 }
                 if t.contains("EOSE") {
+                    saw_eose = true;
                     break;
                 }
             }
+            ws.send(Message::Text(
+                json!(["CLOSE", subscription]).to_string().into(),
+            ))
+            .await?;
             hist.record(t0.elapsed().as_micros().max(1) as u64)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if !saw_eose || query_results == 0 {
+                mismatches += 1;
+            }
             done += 1;
         }
         let elapsed = start.elapsed();
         for ws in &mut sockets {
             let _ = ws.close(None).await;
         }
-        Ok::<_, anyhow::Error>((done, results, elapsed))
+        Ok::<_, anyhow::Error>((done, results, mismatches, elapsed))
     });
-    let _ = child.kill();
-    let _ = child.wait();
-    let (done, results, elapsed) = out?;
+    stop_target(&mut child);
+    let (done, results, mismatches, elapsed) = out?;
     let qps = done as f64 / elapsed.as_secs_f64();
-    let miss = if done == 0 || results == 0 { 1 } else { 0 };
     let notes = format!("{done} mixed REQs, {results} events returned");
-    Ok((qps, notes, miss == 0, miss))
+    Ok((qps, notes, mismatches == 0, mismatches))
 }
 
 /// Repeated author+kind+until pagination into progressively older history.
@@ -1252,33 +1410,47 @@ fn ws_query_trial(
 /// from sub-second to tens of seconds on fragmented, production-sized stores.
 fn deep_history_trial(
     rt: &tokio::runtime::Runtime,
-    bin: &Path,
-    dbdir: &Path,
-    workload: EventWorkload,
+    target: RelayTarget<'_>,
+    corpus_path: &Path,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    let n = workload.count.max(1);
-    let (jsonl, author) =
-        generate_author_history(dbdir, n, workload.seed, workload.base_timestamp)?;
-    if !import_with(bin, dbdir, &jsonl, false) {
-        anyhow::bail!("deep-history import failed");
+    use std::collections::HashMap;
+
+    let events = read_event_values(corpus_path)?;
+    let mut authors = HashMap::<String, u64>::new();
+    for event in &events {
+        if event.get("kind").and_then(Value::as_u64) == Some(1) {
+            if let Some(author) = event.get("pubkey").and_then(Value::as_str) {
+                *authors.entry(author.to_string()).or_default() += 1;
+            }
+        }
     }
-    let imported = export_count(bin, dbdir);
-    if imported != n {
-        anyhow::bail!("deep-history import retained {imported}/{n} events");
+    let (author, n) = authors
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .context("deep-history corpus has no kind 1 author")?;
+    if let Some(bin) = target.bin {
+        if !import_with(bin, target.dbdir, corpus_path, false) {
+            anyhow::bail!("deep-history import failed");
+        }
+        let imported = export_count(bin, target.dbdir);
+        if imported != events.len() as u64 {
+            anyhow::bail!(
+                "deep-history import retained {imported}/{} events",
+                events.len()
+            );
+        }
     }
     let page_size = 500u64;
     let available_pages = n.div_ceil(page_size);
     let pages = queries.max(1).min(available_pages);
-    let port = free_port();
-    let mut child = spawn_relay(bin, dbdir, port)?;
+    let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use futures_util::{SinkExt, StreamExt};
         use std::collections::HashSet;
         use tokio_tungstenite::tungstenite::Message;
 
-        let url = format!("ws://127.0.0.1:{port}/");
         let mut socket = connect_retry(&url).await?;
         let mut until = u64::MAX;
         let mut seen = HashSet::new();
@@ -1354,8 +1526,7 @@ fn deep_history_trial(
         let _ = socket.close(None).await;
         Ok::<_, anyhow::Error>((seen.len() as u64, mismatches, elapsed, latencies))
     });
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_target(&mut child);
     let (seen, mut mismatches, elapsed, latencies) = out?;
     for latency in latencies {
         hist.record(latency)
@@ -1367,7 +1538,7 @@ fn deep_history_trial(
     }
     let qps = pages as f64 / elapsed.as_secs_f64();
     let notes = format!(
-        "{pages} progressive 500-event pages over {n} single-author events; {seen} unique events"
+        "{pages} progressive 500-event pages over {n} events from the corpus's busiest author; {seen} unique events"
     );
     Ok((qps, notes, mismatches == 0, mismatches))
 }
@@ -1377,46 +1548,41 @@ fn deep_history_trial(
 /// invisible in a read-only corpus.
 fn mixed_read_write_trial(
     rt: &tokio::runtime::Runtime,
-    bin: &Path,
-    dbdir: &Path,
+    target: RelayTarget<'_>,
+    corpus_path: &Path,
     workload: EventWorkload,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    let n = workload.count.max(1);
-    let base_events = generate_values(EventWorkload {
-        count: n,
-        ..workload
-    })?;
-    let jsonl = dbdir.join("mixed-base.jsonl");
-    {
-        let mut file = std::fs::File::create(&jsonl)?;
-        for event in &base_events {
-            writeln!(file, "{}", wok_event::json::to_tao_string(event))?;
+    let base_events = read_event_values(corpus_path)?;
+    let n = base_events.len() as u64;
+    if n == 0 {
+        anyhow::bail!("mixed-load corpus is empty");
+    }
+    if let Some(bin) = target.bin {
+        if !import_with(bin, target.dbdir, corpus_path, false) {
+            anyhow::bail!("mixed-load import failed");
         }
-    }
-    if !import_with(bin, dbdir, &jsonl, false) {
-        anyhow::bail!("mixed-load import failed");
-    }
-    let imported = export_count(bin, dbdir);
-    if imported != n {
-        anyhow::bail!("mixed-load import retained {imported}/{n} events");
+        let imported = export_count(bin, target.dbdir);
+        if imported != n {
+            anyhow::bail!("mixed-load import retained {imported}/{n} events");
+        }
     }
     let query_count = queries.max(1);
     let write_count = query_count.max(50).min(n);
     let new_events = generate_values(EventWorkload {
         count: write_count,
         seed: workload.seed.wrapping_add(10_000),
-        base_timestamp: workload.base_timestamp.saturating_add(n).saturating_add(1),
+        // Keep concurrent writes recent but never push them into the future.
+        // The distinct workload seed is sufficient to avoid corpus IDs.
+        base_timestamp: workload.base_timestamp,
         ..workload
     })?;
-    let port = free_port();
-    let mut child = spawn_relay(bin, dbdir, port)?;
+    let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
-        let url = format!("ws://127.0.0.1:{port}/");
         let mut query_socket = connect_retry(&url).await?;
         let mut write_socket = connect_retry(&url).await?;
         let query_future = async {
@@ -1508,8 +1674,7 @@ fn mixed_read_write_trial(
         let (query_result, write_result) = tokio::join!(query_future, write_future);
         Ok::<_, anyhow::Error>((query_result?, write_result?))
     });
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_target(&mut child);
     let ((completed, results, mut mismatches, elapsed, latencies), accepted) = out?;
     for latency in latencies {
         hist.record(latency)
@@ -1653,7 +1818,7 @@ fn live_fanout_trial(
             let mut ws = connect_retry(&url).await?;
             let filter = match workload.mix {
                 EventMix::Kind1 => json!({"kinds":[1]}),
-                EventMix::Realistic => json!({}),
+                EventMix::Realistic | EventMix::Lifecycle => json!({}),
             };
             ws.send(Message::Text(
                 json!(["REQ", format!("s{i}"), filter]).to_string().into(),
@@ -1906,5 +2071,56 @@ mod tests {
             workload_seed(1, "live_fanout", 1),
             workload_seed(1, "ws_publish_scaled", 1)
         );
+    }
+
+    #[test]
+    fn realistic_corpus_has_reused_actors_and_relational_tags() {
+        let events = generate_values(EventWorkload {
+            count: 1_000,
+            seed: 9,
+            base_timestamp: 1_700_000_000,
+            mix: EventMix::Realistic,
+        })
+        .unwrap();
+        let note_authors: std::collections::HashSet<&str> = events
+            .iter()
+            .filter(|event| event["kind"] == 1)
+            .filter_map(|event| event["pubkey"].as_str())
+            .collect();
+        assert_eq!(note_authors.len(), 32);
+        assert!(events.iter().any(|event| {
+            event["kind"] == 7
+                && event["tags"]
+                    .as_array()
+                    .is_some_and(|tags| tags.iter().any(|tag| tag[0] == "e"))
+        }));
+        assert!(events.iter().any(|event| {
+            event["kind"] == 1
+                && event["tags"]
+                    .as_array()
+                    .is_some_and(|tags| tags.iter().any(|tag| tag[0] == "e"))
+        }));
+    }
+
+    #[test]
+    fn lifecycle_corpus_contains_fresh_ephemeral_and_deletion_events() {
+        let base_timestamp = 1_800_000_000;
+        let events = generate_values(EventWorkload {
+            count: 100,
+            seed: 11,
+            base_timestamp,
+            mix: EventMix::Lifecycle,
+        })
+        .unwrap();
+        assert!(events.iter().any(|event| {
+            event["kind"] == 20_001
+                && event["created_at"].as_u64().unwrap_or_default() + 30 >= base_timestamp
+        }));
+        assert!(events.iter().any(|event| {
+            event["kind"] == 5
+                && event["tags"]
+                    .as_array()
+                    .is_some_and(|tags| tags.iter().any(|tag| tag[0] == "e"))
+        }));
     }
 }

@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Comprehensive configuration and Prometheus metric references, including a
   complete commented `wok.toml` and documented dashboard edit boundaries.
+- A guarded two-host Wok/strfry campaign runner with deterministic reusable
+  signed corpora, realistic actor relationships, historical remote queries,
+  lifecycle publication workloads, alternating relay order, and captured
+  provenance and resource evidence.
 
 ### Changed
 

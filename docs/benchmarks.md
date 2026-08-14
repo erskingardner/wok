@@ -30,11 +30,34 @@ and `summary.md`. The timestamp is selected once per campaign rather than once
 per generator. Pass `--base-timestamp` when two machines must create
 byte-identical corpora. Remote repetitions use stable, distinct per-scenario
 workload seeds so a persistent relay does not receive duplicate event IDs.
-The default `--event-mix kind1` preserves the focused historical workload;
-`--event-mix realistic` adds a weighted mix of kind 0 metadata, kind 1 notes,
-kind 3 contacts, kind 7 reactions, kind 9735 zaps, kind 10002 relay lists, and
-kind 30023 long-form content while keeping event IDs and signatures
-deterministic.
+The default `--event-mix kind1` preserves the focused historical workload.
+`--event-mix realistic` uses 32 stable actors and adds a weighted mix of kind 0
+metadata, kind 1 notes and replies, kind 3 contacts, kind 7 reactions, kind
+9735 zaps, kind 10002 relay lists, and kind 30023 long-form content. Relations
+refer to events and authors in the same corpus. Replaceable and addressable
+events are assigned so both databases retain exactly the requested corpus
+size. `--event-mix lifecycle` adds kind 5 deletion requests and kind 20001
+ephemeral events for live publication tests where retained counts are not the
+correct assertion.
+
+Generate a signed corpus without running a relay, or reuse one verbatim:
+
+```bash
+./target/release/wok-bench --generate-corpus-only --events 100000 \
+  --event-mix realistic --seed 4242 --base-timestamp 1700000000 \
+  --out benchmark-corpus
+
+./target/release/wok-bench --scenario ws_query_latency \
+  --target-url ws://10.0.0.3:7777 --target-label wok \
+  --corpus benchmark-corpus/corpus.jsonl --events 100000 \
+  --event-mix realistic --queries 400 --out query-results
+```
+
+When `--corpus` and `--events` are both supplied, the harness rejects a count
+mismatch. Remote historical query scenarios assume the identical corpus has
+already been imported into the target relay; they still verify EOSE,
+non-empty expected results, publication acknowledgements, and delivery
+completeness.
 
 Scenarios: `import` (signature-verifying bulk import), `export`,
 `negentropy_build`, `ws_publish_1conn`/`ws_publish_8conn` (per-publish OK
@@ -63,12 +86,52 @@ already-running relay:
 ```
 
 Run the same command against one clean relay at a time, changing only the URL
-and label. Reset the relay database between Wok and strfry campaigns, preserve
-the result directories, and capture server-side CPU, RSS, disk I/O, network
-traffic, and database size externally. The remote profile deliberately covers
-network publication, fanout, and connection pressure only: historical query
-comparisons require a separately controlled, identical preloaded database
-snapshot and are not silently run against unknown remote state.
+and label. Reset the relay database between Wok and strfry campaigns and
+preserve the result directories.
+
+### Reproducible two-host campaign
+
+`scripts/benchmark-campaign.sh` automates the project benchmark hosts. It:
+
+1. generates one signed realistic corpus on the load generator;
+2. copies and checksum-verifies that exact file on the relay host;
+3. stops both relays, resets only the selected benchmark database, imports
+   with signature verification, and confirms the exported retained count;
+4. starts only the selected relay and captures process, system, socket,
+   network, Prometheus, journal, binary/config hash, import, and database-size
+   evidence;
+5. runs query latency, deep pagination, mixed reads/writes, scaled publication,
+   live fanout, idle connections, and lifecycle publication; and
+6. alternates relay order between repetitions before leaving both stopped.
+
+The relay-side helper refuses database paths outside the fixed
+`/var/lib/relay-bench/{wok,strfry}` roots and artifact paths outside
+`/opt/relay-bench/{campaigns,results}`.
+
+```bash
+# Defaults: 100k corpus, three order-balanced repetitions, 10k idle sockets.
+./scripts/benchmark-campaign.sh
+
+# Short end-to-end validation before a measured campaign.
+CAMPAIGN_ID=shakeout EVENTS=2000 REPETITIONS=1 QUERIES=50 \
+  DEEP_PAGES=2 PUBLISH_CONNECTIONS=16 FANOUT_SUBSCRIBERS=16 \
+  FANOUT_EVENTS=50 IDLE_CONNECTIONS=128 HOLD_SECONDS=2 \
+  LIFECYCLE_EVENTS=200 COOLDOWN_SECONDS=1 \
+  ./scripts/benchmark-campaign.sh
+```
+
+The main environment overrides are `RELAY_SSH`, `LOAD_SSH`, `RELAY_URL`,
+`BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`, `QUERIES`, `DEEP_PAGES`, `REPETITIONS`,
+`PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
+`IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`, `NOFILE_LIMIT`,
+`COOLDOWN_SECONDS`, `SEED`, and `BASE_TIMESTAMP`.
+
+Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
+contain the corpus, campaign metadata, every harness result, `/usr/bin/time`
+output, and a copy of each server-side evidence directory. Server originals
+remain under `/opt/relay-bench/campaigns/<campaign-id>`. Do not compare speed
+for any phase whose `results.jsonl` has `ok=false`, non-zero `errors`, or
+non-zero `mismatches`.
 
 A trial with missing events, unexpected rejections, or dropped deliveries is
 `ok=false` — correctness gates come before speed.

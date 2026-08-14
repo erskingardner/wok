@@ -103,7 +103,7 @@ impl QueryScheduler {
             return Ok(());
         }
         let ensure_exists = self.ensure_exists;
-        let complete = {
+        let result = {
             let q = self.queries[idx].as_mut().unwrap();
             q.process(
                 txn,
@@ -121,7 +121,20 @@ impl QueryScheduler {
                     on_event(sub, lev, payload);
                 },
                 time_budget_us,
-            )?
+            )
+        };
+        let complete = match result {
+            Ok(complete) => complete,
+            Err(e) => {
+                // A mid-scan error must not leak the slot: recycle it and
+                // drop the sub from the conn map exactly like completion,
+                // or the connection's concurrent-query budget is permanently
+                // reduced by one per error.
+                let q = self.queries[idx].take().unwrap();
+                self.free.push(idx);
+                self.remove_sub(q.sub.conn_id, &q.sub.sub_id);
+                return Err(e);
+            }
         };
         if complete {
             let q = self.queries[idx].take().unwrap();

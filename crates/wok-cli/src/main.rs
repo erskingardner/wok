@@ -12,6 +12,7 @@ use wok_db::{
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_negentropy::Storage;
 mod doctor;
+mod mesh;
 mod migrate;
 mod reindex;
 mod router;
@@ -1456,7 +1457,7 @@ async fn cmd_sync(
         }
     };
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    let mut ws = mesh::connect_mesh(&url, cfg.events.max_event_size).await?;
     let init = initiate(&env)?;
     let open = serde_json::json!(["NEG-OPEN", "N", filter_json, hex::encode(init)]);
     ws.send(Message::Text(open.to_string().into())).await?;
@@ -1464,11 +1465,17 @@ async fn cmd_sync(
     const HIGH_WATER_UP: usize = 100;
     const LOW_WATER_UP: usize = 50;
     const BATCH_DOWN: usize = 50;
+    /// A malicious or buggy peer can keep supplying fresh 32-byte IDs forever,
+    /// growing RAM ~3x network speed; cap the tracked have/need ID sets.
+    const MAX_SYNC_IDS: usize = 5_000_000;
 
     let mut have: std::collections::VecDeque<Vec<u8>> = Default::default();
     let mut need: std::collections::VecDeque<Vec<u8>> = Default::default();
     let mut seen_have: std::collections::HashSet<Vec<u8>> = Default::default();
     let mut seen_need: std::collections::HashSet<Vec<u8>> = Default::default();
+    // Only track IDs for directions we actually act on (print-missing needs both).
+    let track_have = do_up || print_missing;
+    let track_need = do_down || print_missing;
     let mut sync_done = false;
     let mut received_neg_msg = false;
     let mut in_flight_up = 0usize;
@@ -1528,23 +1535,21 @@ async fn cmd_sync(
                     }
                 };
                 for id in curr_have {
-                    if seen_have.insert(id.clone()) {
+                    if track_have && seen_have.insert(id.clone()) {
                         have.push_back(id);
                     }
                 }
                 for id in curr_need {
-                    if seen_need.insert(id.clone()) {
+                    if track_need && seen_need.insert(id.clone()) {
                         need.push_back(id);
                     }
                 }
+                if seen_have.len() + seen_need.len() > MAX_SYNC_IDS {
+                    write_downloaded(&env, cfg, &mut batch, &mut written)?;
+                    bail!("Sync aborted: peer supplied more than {MAX_SYNC_IDS} unique ids");
+                }
                 total_haves = seen_have.len();
                 total_needs = seen_need.len();
-                if !do_up {
-                    have.clear();
-                }
-                if !do_down {
-                    need.clear();
-                }
                 match next {
                     Some(next) => {
                         let m = serde_json::json!(["NEG-MSG", "N", hex::encode(next)]);
@@ -1658,6 +1663,15 @@ async fn cmd_sync(
             let req = serde_json::json!(["REQ", "R", { "ids": ids }]);
             ws.send(Message::Text(req.to_string().into())).await?;
             in_flight_down = true;
+        }
+
+        // Once a direction is fully done, drop its dedup state so a long
+        // remaining transfer in the other direction doesn't keep it resident.
+        if !print_missing && sync_done && have.is_empty() && in_flight_up == 0 {
+            seen_have = Default::default();
+        }
+        if !print_missing && sync_done && need.is_empty() && !in_flight_down {
+            seen_need = Default::default();
         }
 
         if sync_done && have.is_empty() && need.is_empty() && in_flight_up == 0 && !in_flight_down {

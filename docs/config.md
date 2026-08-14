@@ -106,7 +106,7 @@ interface or protect the path at the reverse proxy.
 | `relay.write_policy_plugin` | empty | Live | No | External executable for publication decisions; empty disables it. |
 | `relay.write_policy_timeout_secs` | `10` | Live | Yes | Maximum wait for the configured write-policy plugin. |
 | `relay.compression_enabled` | `true` | Restart | Enable permessage-deflate negotiation. |
-| `relay.compression_sliding_window` | `true` | Restart | Reuse compression context between messages. |
+| `relay.compression_sliding_window` | `true` | Restart | Reuse compression context between messages. With context takeover, a connection's compressor can reference bytes from previous messages — the precondition structure for CRIME/BREACH-style oracles when secret and attacker-influenced bytes share a compression context. Relay traffic is essentially all public data, so practical impact is nil for most operators; if you serve auth-bearing or otherwise secret traffic over the same client connections, prefer `false`. |
 | `relay.dump_in_all` | `false` | Live | No | Diagnostic logging for every inbound client message. |
 | `relay.dump_in_events` | `false` | Live | No | Diagnostic logging for inbound EVENT messages. |
 | `relay.dump_in_reqs` | `false` | Live | No | Diagnostic logging for inbound REQ messages. |

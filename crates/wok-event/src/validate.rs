@@ -2,7 +2,10 @@ use serde_json::Value;
 
 use crate::hash::{verify_id, verify_sig};
 use crate::packed::PackedEventView;
-use crate::parse::{normalize_event_json, nostr_json_to_packed_event, EventLimits, ParsedEvent};
+use crate::parse::{
+    from_lower_hex_array, normalize_event_json, nostr_json_to_packed_event, EventLimits,
+    ParsedEvent,
+};
 use crate::EventError;
 
 // Re-export helper used by validate; keep json_get_string crate-private in parse
@@ -49,7 +52,7 @@ pub fn verify_nostr_event(packed: PackedEventView<'_>, orig: &Value) -> Result<(
     if sig_hex.len() != 128 {
         return Err(EventError::msg("unexpected signature size"));
     }
-    let sig = crate::from_lower_hex_exact(sig_hex)?;
+    let sig = from_lower_hex_array::<64>(sig_hex)?;
     let valid = verify_sig(&sig, packed.id(), packed.pubkey())?;
     if !valid {
         return Err(EventError::msg("bad signature"));

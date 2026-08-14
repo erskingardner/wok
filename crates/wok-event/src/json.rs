@@ -319,7 +319,7 @@ pub fn to_tao_string(v: &Value) -> String {
     out
 }
 
-fn write_tao(v: &Value, out: &mut String) {
+pub(crate) fn write_tao(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),

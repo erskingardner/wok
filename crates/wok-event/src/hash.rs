@@ -12,25 +12,22 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
 
 /// NIP-01 event id: SHA-256 of compact JSON `[0, pubkey, created_at, kind, tags, content]`.
 pub fn event_id_hash(orig: &Value) -> Result<[u8; 32], EventError> {
-    let arr = Value::Array(vec![
-        Value::from(0u64),
-        orig.get("pubkey")
-            .cloned()
-            .ok_or_else(|| EventError::msg("missing pubkey"))?,
-        orig.get("created_at")
-            .cloned()
-            .ok_or_else(|| EventError::msg("missing created_at"))?,
-        orig.get("kind")
-            .cloned()
-            .ok_or_else(|| EventError::msg("missing kind"))?,
-        orig.get("tags")
-            .cloned()
-            .ok_or_else(|| EventError::msg("missing tags"))?,
-        orig.get("content")
-            .cloned()
-            .ok_or_else(|| EventError::msg("missing content"))?,
-    ]);
-    let encoded = crate::json::to_tao_string(&arr);
+    let mut encoded = String::with_capacity(256);
+    encoded.push_str("[0");
+    for (key, error) in [
+        ("pubkey", "missing pubkey"),
+        ("created_at", "missing created_at"),
+        ("kind", "missing kind"),
+        ("tags", "missing tags"),
+        ("content", "missing content"),
+    ] {
+        encoded.push(',');
+        crate::json::write_tao(
+            orig.get(key).ok_or_else(|| EventError::msg(error))?,
+            &mut encoded,
+        );
+    }
+    encoded.push(']');
     Ok(sha256(encoded.as_bytes()))
 }
 

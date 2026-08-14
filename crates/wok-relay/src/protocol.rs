@@ -111,9 +111,10 @@ impl ClientCommand {
         }
         let v: Value =
             wok_event::json::parse_strict(text).map_err(|e| ParseFailure::BadMsg(e.to_string()))?;
-        let arr = v
-            .as_array()
-            .ok_or_else(|| ParseFailure::BadMsg("message is not an array".into()))?;
+        let mut arr = match v {
+            Value::Array(arr) => arr,
+            _ => return Err(ParseFailure::BadMsg("message is not an array".into())),
+        };
         if arr.len() < 2 {
             return Err(ParseFailure::BadMsg("too few array elements".into()));
         }
@@ -121,8 +122,11 @@ impl ClientCommand {
             .as_str()
             .ok_or_else(|| ParseFailure::BadMsg("first element not a command like REQ".into()))?;
         match cmd {
-            "EVENT" => Ok(Self::Event(arr[1].clone())),
-            "AUTH" => Ok(Self::Auth(arr[1].clone())),
+            // Move owned values out of the parsed envelope. Cloning an EVENT
+            // here duplicated its content, tags, and every nested string on
+            // every inbound publication.
+            "EVENT" => Ok(Self::Event(arr.swap_remove(1))),
+            "AUTH" => Ok(Self::Auth(arr.swap_remove(1))),
             "REQ" | "COUNT" => {
                 let sub = arr[1]
                     .as_str()
@@ -131,12 +135,12 @@ impl ClientCommand {
                 Ok(if cmd == "COUNT" {
                     Self::Count {
                         sub_id: sub,
-                        filters: arr[2..].to_vec(),
+                        filters: arr.drain(2..).collect(),
                     }
                 } else {
                     Self::Req {
                         sub_id: sub,
-                        filters: arr[2..].to_vec(),
+                        filters: arr.drain(2..).collect(),
                     }
                 })
             }
@@ -166,7 +170,7 @@ impl ClientCommand {
                             ParseFailure::Neg("NEG subscription id was not a string".into())
                         })?
                         .to_string(),
-                    filter: arr[2].clone(),
+                    filter: std::mem::take(&mut arr[2]),
                     payload_hex: arr[3]
                         .as_str()
                         .ok_or_else(|| ParseFailure::Neg("negentropy payload not a string".into()))?
@@ -207,17 +211,21 @@ impl ClientCommand {
 
 impl RelayMessage {
     pub fn to_json(&self) -> String {
+        fn encode<T: serde::Serialize>(value: &T) -> String {
+            // Serialization of these in-memory relay models cannot fail.
+            serde_json::to_string(value).expect("relay message serialization")
+        }
         match self {
             Self::Event { sub_id, event_json } => {
                 format!("[\"EVENT\",\"{sub_id}\",{event_json}]")
             }
-            Self::Eose { sub_id } => json!(["EOSE", sub_id]).to_string(),
+            Self::Eose { sub_id } => encode(&("EOSE", sub_id)),
             Self::Ok {
                 event_id,
                 accepted,
                 message,
-            } => json!(["OK", event_id, accepted, message]).to_string(),
-            Self::Closed { sub_id, message } => json!(["CLOSED", sub_id, message]).to_string(),
+            } => encode(&("OK", event_id, accepted, message)),
+            Self::Closed { sub_id, message } => encode(&("CLOSED", sub_id, message)),
             Self::Count {
                 sub_id,
                 count,
@@ -233,21 +241,21 @@ impl RelayMessage {
                 }
                 json!(["COUNT", sub_id, body]).to_string()
             }
-            Self::Notice { message } => json!(["NOTICE", message]).to_string(),
-            Self::Auth { challenge } => json!(["AUTH", challenge]).to_string(),
+            Self::Notice { message } => encode(&("NOTICE", message)),
+            Self::Auth { challenge } => encode(&("AUTH", challenge)),
             Self::NegMsg {
                 sub_id,
                 payload_hex,
-            } => json!(["NEG-MSG", sub_id, payload_hex]).to_string(),
+            } => encode(&("NEG-MSG", sub_id, payload_hex)),
             Self::NegErr {
                 sub_id,
                 message,
                 extra,
             } => {
                 if let Some(extra) = extra {
-                    json!(["NEG-ERR", sub_id, message, extra]).to_string()
+                    encode(&("NEG-ERR", sub_id, message, extra))
                 } else {
-                    json!(["NEG-ERR", sub_id, message]).to_string()
+                    encode(&("NEG-ERR", sub_id, message))
                 }
             }
         }

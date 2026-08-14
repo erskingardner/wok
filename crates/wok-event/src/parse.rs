@@ -1,4 +1,4 @@
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::kinds::{
     is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag,
@@ -62,6 +62,19 @@ pub fn from_lower_hex_exact(s: &str) -> Result<Vec<u8>, EventError> {
     from_hex_strict(s)
 }
 
+pub(crate) fn from_lower_hex_array<const N: usize>(s: &str) -> Result<[u8; N], EventError> {
+    if !s
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(EventError::msg("hex must be lowercase ASCII"));
+    }
+    let mut decoded = [0u8; N];
+    hex::decode_to_slice(s, &mut decoded)
+        .map_err(|error| EventError::msg(format!("hex decode: {error}")))?;
+    Ok(decoded)
+}
+
 fn from_hex_impl(s: &str, allow_uneven: bool) -> Result<Vec<u8>, EventError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if !s.len().is_multiple_of(2) {
@@ -109,15 +122,23 @@ pub fn nostr_json_to_packed_event(
     if !v.is_object() {
         return Err(EventError::msg("event is not an object"));
     }
-    let id = from_lower_hex_exact(json_get_string(
+    let id_hex = json_get_string(
         v.get("id").ok_or_else(|| EventError::msg("missing id"))?,
         "event id field was not a string",
-    )?)?;
-    let pubkey = from_lower_hex_exact(json_get_string(
+    )?;
+    if id_hex.len() != 64 {
+        return Err(EventError::msg("unexpected id size"));
+    }
+    let id = from_lower_hex_array::<32>(id_hex)?;
+    let pubkey_hex = json_get_string(
         v.get("pubkey")
             .ok_or_else(|| EventError::msg("missing pubkey"))?,
         "event pubkey field was not a string",
-    )?)?;
+    )?;
+    if pubkey_hex.len() != 64 {
+        return Err(EventError::msg("unexpected pubkey size"));
+    }
+    let pubkey = from_lower_hex_array::<32>(pubkey_hex)?;
     let created_at = json_get_unsigned(
         v.get("created_at")
             .ok_or_else(|| EventError::msg("missing created_at"))?,
@@ -136,13 +157,6 @@ pub fn nostr_json_to_packed_event(
             .ok_or_else(|| EventError::msg("missing content"))?,
         "event content field was not a string",
     )?;
-
-    if id.len() != 32 {
-        return Err(EventError::msg("unexpected id size"));
-    }
-    if pubkey.len() != 32 {
-        return Err(EventError::msg("unexpected pubkey size"));
-    }
 
     let mut tag_builder = PackedEventTagBuilder::default();
     let mut expiration = 0u64;
@@ -171,9 +185,9 @@ pub fn nostr_json_to_packed_event(
         }
         let tag_name = json_get_string(&tag[0], "tag name was not a string")?;
         let tag_val = if tag.len() >= 2 {
-            json_get_string(&tag[1], "tag val was not a string")?.to_string()
+            json_get_string(&tag[1], "tag val was not a string")?
         } else {
-            String::new()
+            ""
         };
 
         if tag_name.len() == 1 {
@@ -189,13 +203,13 @@ pub fn nostr_json_to_packed_event(
                         "unexpected size for fixed-size tag: {tag_name}"
                     )));
                 }
-                let raw = from_lower_hex_exact(&tag_val)?;
+                let raw = from_lower_hex_array::<32>(tag_val)?;
                 if raw.len() <= MAX_INDEXED_TAG_VAL_SIZE {
                     tag_builder.add(tag_name.chars().next().unwrap(), &raw)?;
                 }
                 continue;
             } else if tag_name == "a" && kind == 5 {
-                let (tag_kind, tag_pubkey, _d) = parse_a_tag(&tag_val)?;
+                let (tag_kind, tag_pubkey, _d) = parse_a_tag(tag_val)?;
                 let _ = tag_kind;
                 if tag_pubkey.as_slice() != pubkey.as_slice() {
                     return Err(EventError::msg("can't delete other user's events"));
@@ -239,8 +253,9 @@ fn parse_uint64(s: &str) -> Result<u64, EventError> {
 /// Rebuild JSON with only authenticated top-level fields, keys in
 /// alphabetical order, serialized exactly like C++ `tao::json`.
 pub fn normalize_event_json(orig: &Value) -> Result<String, EventError> {
-    let mut map = Map::new();
-    for key in [
+    let mut json = String::with_capacity(512);
+    json.push('{');
+    for (index, key) in [
         "content",
         "created_at",
         "id",
@@ -248,13 +263,23 @@ pub fn normalize_event_json(orig: &Value) -> Result<String, EventError> {
         "pubkey",
         "sig",
         "tags",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let v = orig
             .get(key)
             .ok_or_else(|| EventError::msg(format!("missing {key}")))?;
-        map.insert(key.to_string(), v.clone());
+        if index != 0 {
+            json.push(',');
+        }
+        json.push('"');
+        json.push_str(key);
+        json.push_str("\":");
+        crate::json::write_tao(v, &mut json);
     }
-    Ok(crate::json::to_tao_string(&Value::Object(map)))
+    json.push('}');
+    Ok(json)
 }
 
 #[cfg(test)]

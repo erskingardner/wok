@@ -135,6 +135,13 @@ Private reads fail closed until `service_url` is configured. Clearing
 `restricted_read_kinds` restores unrestricted history, but Wok stops
 advertising NIP-59.
 
+Keep `restrict_read_to_involved_pubkey` at `true` unless you understand the
+interplay: with `false`, the per-event delivery filter is skipped entirely
+and the REQ-level auth gate only fires for filter groups where **every**
+filter is restricted. A mixed REQ such as `[{"kinds":[1]},{"kinds":[1059]}]`
+then returns gift wraps to an unauthenticated client (strfry-compatible
+behavior).
+
 ## Relay information
 
 All fields reload live and are dashboard-editable. They are returned in NIP-11

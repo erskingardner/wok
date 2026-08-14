@@ -1,6 +1,6 @@
 //! Read helpers that work on both `RoTxn` and `RwTxn`.
 
-use crate::keys::{make_key_string_u64, u64_from_ne};
+use crate::keys::{make_key_string_u64, u64_from_ne, u64_from_ne_checked};
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
 
@@ -10,6 +10,7 @@ pub fn lookup_event_by_id_ro(
 ) -> Result<Option<(u64, Vec<u8>)>, DbError> {
     let start = make_key_string_u64(id, 0);
     let mut found = None;
+    let mut scan_err = None;
     txn.foreach_full(
         txn.env().dbis().event_id,
         &start,
@@ -17,11 +18,17 @@ pub fn lookup_event_by_id_ro(
         false,
         |k, v| {
             if k.starts_with(id) {
-                found = Some(u64_from_ne(v));
+                match u64_from_ne_checked(v) {
+                    Ok(lev) => found = Some(lev),
+                    Err(e) => scan_err = Some(e),
+                }
             }
             false
         },
     )?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
     if let Some(lev) = found {
         if let Some(buf) = txn.get_u64(txn.env().dbis().event, lev)? {
             return Ok(Some((lev, buf.to_vec())));

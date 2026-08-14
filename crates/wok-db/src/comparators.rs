@@ -23,6 +23,17 @@ pub fn u64_from_ne(bytes: &[u8]) -> u64 {
     u64::from_ne_bytes(buf)
 }
 
+/// Length-checked variant of `u64_from_ne` for decoding LMDB keys/values on
+/// hot paths: at-rest corruption must surface a `DbError`, not a process abort.
+pub fn u64_from_ne_checked(bytes: &[u8]) -> Result<u64, super::DbError> {
+    if bytes.len() != 8 {
+        return Err(super::DbError::msg(
+            "u64 key/value has unexpected length (corrupt index?)",
+        ));
+    }
+    Ok(u64_from_ne(bytes))
+}
+
 pub fn make_key_string_u64(s: &[u8], n: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(s.len() + 8);
     k.extend_from_slice(s);

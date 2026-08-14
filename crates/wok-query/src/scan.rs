@@ -4,7 +4,7 @@ use crate::filter::NostrFilter;
 use crate::subid::Subscription;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne};
+use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
 use wok_db::{
     is_event_vanished_ro, search_bigram_posting_exists, search_posting_count,
     search_posting_exists, search_postings, RoTxn, SearchQuery,
@@ -93,10 +93,14 @@ impl ScanCursor {
             let start_dup = self.resume_val.to_ne_bytes();
             let mut finished_naturally = true;
             let mut stop = false;
+            let mut scan_err = None;
             txn.foreach_full(index_dbi, &start_key, &start_dup, true, |k, v| {
                 if limit == 0 {
                     self.resume_key = k.to_vec();
-                    self.resume_val = u64_from_ne(v);
+                    match u64_from_ne_checked(v) {
+                        Ok(n) => self.resume_val = n,
+                        Err(e) => scan_err = Some(e),
+                    }
                     finished_naturally = false;
                     stop = true;
                     return false;
@@ -125,12 +129,24 @@ impl ScanCursor {
                     stop = true;
                     return false;
                 }
-                let lev_id = u64_from_ne(v);
-                output.push_back(CandidateEvent::new(lev_id, created, scan_index));
-                added += 1;
-                limit -= 1;
-                true
+                match u64_from_ne_checked(v) {
+                    Ok(lev_id) => {
+                        output.push_back(CandidateEvent::new(lev_id, created, scan_index));
+                        added += 1;
+                        limit -= 1;
+                        true
+                    }
+                    Err(e) => {
+                        scan_err = Some(e);
+                        finished_naturally = false;
+                        stop = true;
+                        false
+                    }
+                }
             })?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
             if finished_naturally {
                 self.resume_key.clear();
             }

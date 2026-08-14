@@ -3,6 +3,7 @@
 use crate::env::Dbis;
 use crate::keys::{
     make_key_string_u64, make_key_string_u64_u64, make_key_u64_u64, parse_key_string_u64,
+    u64_from_ne_checked,
 };
 use crate::payload::{encode_raw_payload, Decompressor};
 use crate::search::{index_event_search, note_search_indexed_through, remove_event_search};
@@ -68,6 +69,7 @@ impl NegentropySink for NoopNegentropy {
 pub fn lookup_event_by_id(txn: &RwTxn<'_>, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>, DbError> {
     let start = make_key_string_u64(id, 0);
     let mut found = None;
+    let mut scan_err = None;
     txn.foreach_full(
         txn.env().dbis().event_id,
         &start,
@@ -75,12 +77,17 @@ pub fn lookup_event_by_id(txn: &RwTxn<'_>, id: &[u8]) -> Result<Option<(u64, Vec
         false,
         |k, v| {
             if k.starts_with(id) {
-                let lev = u64::from_ne_bytes(v.try_into().unwrap());
-                found = Some(lev);
+                match u64_from_ne_checked(v) {
+                    Ok(lev) => found = Some(lev),
+                    Err(e) => scan_err = Some(e),
+                }
             }
             false
         },
     )?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
     if let Some(lev) = found {
         if let Some(buf) = txn.get_u64(txn.env().dbis().event, lev)? {
             return Ok(Some((lev, buf.to_vec())));
@@ -98,16 +105,23 @@ pub fn lookup_event_by_levid(txn: &RwTxn<'_>, lev_id: u64) -> Result<Option<Vec<
 pub fn most_recent_levid(txn: &RwTxn<'_>) -> Result<u64, DbError> {
     // C++ foreach_Event reverse=true, take first.
     let mut lev = 0u64;
+    let mut scan_err = None;
     txn.foreach_full(
         txn.env().dbis().event,
         &u64::MAX.to_ne_bytes(),
         &[],
         true,
         |k, _v| {
-            lev = u64::from_ne_bytes(k.try_into().unwrap());
+            match u64_from_ne_checked(k) {
+                Ok(n) => lev = n,
+                Err(e) => scan_err = Some(e),
+            }
             false
         },
     )?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
     Ok(lev)
 }
 
@@ -485,6 +499,7 @@ pub fn write_events_with_policy<N: NegentropySink>(
                 let search_key = make_key_string_u64(&search_str, packed.kind());
 
                 let mut other: Option<u64> = None;
+                let mut scan_err: Option<DbError> = None;
                 txn.foreach_full(
                     txn.env().dbis().event_replace,
                     &search_key,
@@ -494,11 +509,16 @@ pub fn write_events_with_policy<N: NegentropySink>(
                         if k != search_key.as_slice() {
                             return false;
                         }
-                        let lev = u64::from_ne_bytes(v.try_into().unwrap());
-                        other = Some(lev);
+                        match u64_from_ne_checked(v) {
+                            Ok(lev) => other = Some(lev),
+                            Err(e) => scan_err = Some(e),
+                        }
                         false
                     },
                 )?;
+                if let Some(e) = scan_err {
+                    return Err(e);
+                }
                 if let Some(lev) = other {
                     // C++ lookupEventByLevId throws on a dangling index entry.
                     let buf = lookup_event_by_levid(txn, lev)?
@@ -605,7 +625,10 @@ pub fn write_events_with_policy<N: NegentropySink>(
                                     if k != search_key.as_slice() {
                                         return false;
                                     }
-                                    hit = Some(u64::from_ne_bytes(v.try_into().unwrap()));
+                                    match u64_from_ne_checked(v) {
+                                        Ok(lev) => hit = Some(lev),
+                                        Err(e) => scan_err = Some(e),
+                                    }
                                     false
                                 },
                             );

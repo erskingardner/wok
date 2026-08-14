@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "WebSocket and HTTP transport for wok"
+build = "build.rs"
 
 [dependencies]
 base64.workspace = true

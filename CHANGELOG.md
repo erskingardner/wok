@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Comprehensive configuration and Prometheus metric references, including a
+  complete commented `wok.toml` and documented dashboard edit boundaries.
+
+### Changed
+
+- The relay landing page now presents banner/icon media, operator and relay
+  npubs, contact and policy links, linked and described supported NIPs, and the
+  version with its source revision.
+- The operator dashboard now opens on an explicit signed-out screen and
+  exposes the broad safe set of live-reloadable identity, event, protocol,
+  abuse, filter, NIP-62, and history settings with inline explanations.
+- Dashboard charts now include a labeled, automatically scaled value axis.
+
+### Fixed
+
+- Dashboard NIP-98 requests now include a cryptographically random nonce, so
+  repeated or save-then-refresh actions signed in the same second cannot
+  collide with replay protection.
+
 ## [0.1.0] - 2026-08-13
 
 ### Added

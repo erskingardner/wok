@@ -1,11 +1,15 @@
+# Complete Wok configuration reference with built-in defaults.
+
 [admin]
-# The static shell is served at /admin when enabled. Every data/API request
-# requires a fresh NIP-98 event signed by one of these pubkeys.
+# Serve the signed-out operator shell at /admin.
 enabled = false
+# Exact browser-visible HTTP(S) origin, without a path.
 public_url = ""
+# Administrators as npub or lowercase 64-character hex public keys.
 pubkeys = []
+# Maximum NIP-98 clock skew/freshness window (1-300 seconds).
 auth_window_secs = 60
-# Enables only the typed, validated settings exposed by the dashboard.
+# Allow the dashboard's typed, validated live-configuration editor.
 allow_config_writes = false
 
 [database]
@@ -20,38 +24,74 @@ reject_newer_than_secs = 900
 reject_older_than_secs = 94608000
 reject_ephemeral_older_than_secs = 60
 ephemeral_lifetime_secs = 300
+# "live_only" or "ttl".
 ephemeral_persistence = "live_only"
 max_num_tags = 2000
 max_tag_val_size = 1024
 
 [observability]
-# pretty for humans; json for Loki, Vector, Fluent Bit, or another collector.
+# "pretty" for humans or "json" for log collectors.
 log_format = "pretty"
 # RUST_LOG takes precedence when set.
 log_filter = "wok=info"
 history_enabled = true
 history_interval_secs = 15
-# 24 hours at 15-second resolution. Memory use is strictly bounded.
+# 24 hours at 15-second resolution; hard maximum 100000.
 history_max_points = 5760
 
 [relay]
 bind = "127.0.0.1"
 port = 7777
 nofiles = 524288
+# Trusted reverse-proxy header containing the client IP; empty disables it.
+real_ip_header = ""
 max_websocket_payload_size = 131072
+max_req_filter_size = 200
+# Zero disables automatic ping frames.
+auto_ping_seconds = 55
+enable_tcp_keepalive = false
+query_timeslice_budget_us = 10000
 max_filter_limit = 500
+max_tags_per_filter = 3
 max_filter_limit_count = 1000000
+# Zero means unlimited.
 max_total_events_per_req = 2000
 max_subs_per_connection = 200
 max_pending_outbound_bytes = 33554432
+# Executable path; empty disables the external write-policy plugin.
+write_policy_plugin = ""
+write_policy_timeout_secs = 10
+compression_enabled = true
+compression_sliding_window = true
+dump_in_all = false
+dump_in_events = false
+dump_in_reqs = false
+db_scan_perf = false
+invalid_events = true
+ingester_threads = 3
+req_worker_threads = 3
+req_monitor_threads = 3
+negentropy_threads = 2
 negentropy_enabled = true
 max_sync_events = 1000000
 
 [relay.auth]
 enabled = true
+# Public relay URL used in NIP-42 challenges.
 service_url = ""
 restricted_read_kinds = [4, 1059]
 restrict_read_to_involved_pubkey = true
+
+[relay.info]
+name = "wok default"
+description = "This is a wok instance."
+pubkey = ""
+self_pk = ""
+contact = ""
+icon = ""
+banner = ""
+privacy = ""
+terms = ""
 
 [relay.nip62]
 enabled = true
@@ -59,9 +99,14 @@ enabled = true
 service_url = ""
 deletion_batch_size = 1000
 
-[relay.info]
-name = "wok"
-description = "This is a wok instance."
+[relay.filter_validation]
+enabled = false
+max_filters_per_req = 3
+min_filters_per_req = 1
+max_kinds_per_filter = 3
+# Comma-separated integer kinds; empty allows all kinds.
+allowed_kinds = ""
+require_author_or_tag = false
 
 [relay.abuse]
 enabled = true
@@ -77,12 +122,19 @@ count_rate_per_second = 5
 count_burst = 10
 max_concurrent_historical_queries = 8
 max_query_cost = 1000
+# Zero means unlimited.
 max_stored_events_per_pubkey = 0
+# Zero disables NIP-13 proof-of-work enforcement.
 min_pow_difficulty = 0
 
 [relay.unix]
 enabled = false
 path = "./wok-db/wok.sock"
 mode = 0o600
+owner = ""
+group = ""
+# Empty allowlists accept any local UID/GID.
+auth_uids = []
+auth_gids = []
 max_frame_bytes = 131072
 max_pending_outbound_bytes = 33554432

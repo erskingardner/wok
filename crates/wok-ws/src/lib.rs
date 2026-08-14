@@ -28,6 +28,7 @@ use wok_relay::{supported_nips, Config, Outbound, OutboundFrame, RelayHandle};
 
 const SOFTWARE: &str = "git+https://github.com/erskingardner/wok.git";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_HASH: &str = env!("WOK_GIT_HASH");
 
 pub async fn serve(handle: RelayHandle, bind: SocketAddr) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(bind).await?;
@@ -175,7 +176,7 @@ async fn dispatch(
     if accept == "application/nostr+json" {
         return json_response(&nip11(&cfg, &handle));
     }
-    html_response(&landing(&cfg, &handle))
+    html_response(&landing(&cfg, &handle.supported_nips()))
 }
 
 fn maybe_npub(s: &str) -> String {
@@ -247,19 +248,187 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
 
 const PROTOCOL_NEG: u64 = 1;
 
-fn landing(cfg: &Config, handle: &RelayHandle) -> String {
+fn nip_description(nip: u64) -> Option<&'static str> {
+    match nip {
+        1 => Some("Defines the core event format, filters, and client-relay message flow."),
+        9 => Some("Lets event authors request deletion of their own published events."),
+        11 => Some("Publishes relay metadata, capabilities, limitations, and contact details over HTTP."),
+        13 => Some("Adds verifiable proof of work to events as a configurable spam deterrent."),
+        40 => Some("Allows events to declare an expiration timestamp after which they should not be served."),
+        42 => Some("Authenticates clients to relays with a signed, challenge-bound ephemeral event."),
+        45 => Some("Adds COUNT requests and mergeable HyperLogLog estimates without transferring every event."),
+        50 => Some("Adds full-text search queries and relevance-ordered results to relay filters."),
+        59 => Some("Encapsulates events in encrypted gift wraps to reduce exposed messaging metadata."),
+        62 => Some("Lets a key request complete, durable deletion of its relay-hosted footprint."),
+        70 => Some("Restricts publication of protected events to their authenticated author."),
+        77 => Some("Synchronizes event sets efficiently with the Negentropy reconciliation protocol."),
+        _ => None,
+    }
+}
+
+fn public_npub(value: &str) -> Option<String> {
+    let value = value.trim();
+    if wok_event::decode_npub(value).is_ok() {
+        return Some(value.to_ascii_lowercase());
+    }
+    let bytes = hex::decode(value).ok()?;
+    let pubkey: [u8; 32] = bytes.try_into().ok()?;
+    Some(wok_event::encode_npub(&pubkey))
+}
+
+fn safe_http_url(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let uri = value.parse::<hyper::Uri>().ok()?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+        return None;
+    }
+    Some(value)
+}
+
+fn metadata_row(label: &str, value: &str, href: Option<&str>, code: bool) -> String {
+    let escaped_value = html_escape(value);
+    let display = if code {
+        format!("<code>{escaped_value}</code>")
+    } else {
+        escaped_value
+    };
+    let display = match href {
+        Some(href) => format!("<a href=\"{}\">{display}</a>", html_escape(href)),
+        None => display,
+    };
     format!(
-        "<!doctype html><meta charset=utf-8><title>wok</title><h1>{}</h1><p>{}</p><p>nips: {:?}</p><p>version {VERSION}</p>",
-        html_escape(&cfg.relay.info.name),
-        html_escape(&cfg.relay.info.description),
-        handle.supported_nips(),
+        "<div class=\"metadata-row\"><dt>{}</dt><dd>{display}</dd></div>",
+        html_escape(label)
     )
 }
+
+fn contact_href(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(url) = safe_http_url(value) {
+        return Some(url.to_owned());
+    }
+    if let Some(npub) = public_npub(value) {
+        return Some(format!("nostr:{npub}"));
+    }
+    if value.starts_with("mailto:") {
+        return Some(value.to_owned());
+    }
+    (value.contains('@') && !value.chars().any(char::is_whitespace))
+        .then(|| format!("mailto:{value}"))
+}
+
+fn landing(cfg: &Config, supported_nips: &[u64]) -> String {
+    let info = &cfg.relay.info;
+    let nip_items = supported_nips
+        .iter()
+        .filter_map(|nip| {
+            nip_description(*nip).map(|description| {
+                format!(
+                    "<li><a href=\"https://github.com/nostr-protocol/nips/blob/master/{nip:02}.md\">NIP-{nip:02}</a><span>{description}</span></li>"
+                )
+            })
+        })
+        .collect::<String>();
+    let short_hash = GIT_HASH.get(..8).unwrap_or(GIT_HASH);
+    let revision = if GIT_HASH == "unknown" {
+        "unknown".to_owned()
+    } else {
+        format!(
+            "<a href=\"https://github.com/erskingardner/wok/commit/{GIT_HASH}\">{short_hash}</a>"
+        )
+    };
+    let banner = safe_http_url(&info.banner)
+        .map(|url| {
+            format!(
+                "<img class=\"hero-banner\" src=\"{}\" alt=\"\" referrerpolicy=\"no-referrer\" decoding=\"async\">",
+                html_escape(url)
+            )
+        })
+        .unwrap_or_default();
+    let mark = safe_http_url(&info.icon)
+        .map(|url| {
+            format!(
+                "<img class=\"mark relay-icon\" src=\"{}\" alt=\"{} icon\" referrerpolicy=\"no-referrer\" decoding=\"async\">",
+                html_escape(url),
+                html_escape(&info.name)
+            )
+        })
+        .unwrap_or_else(|| "<span class=\"mark\">W</span>".to_owned());
+
+    let mut metadata = Vec::new();
+    if !info.pubkey.trim().is_empty() {
+        let display = public_npub(&info.pubkey).unwrap_or_else(|| info.pubkey.trim().to_owned());
+        let href = display
+            .starts_with("npub1")
+            .then(|| format!("nostr:{display}"));
+        metadata.push(metadata_row(
+            "Operator npub",
+            &display,
+            href.as_deref(),
+            true,
+        ));
+    }
+    if !info.self_pk.trim().is_empty() {
+        let display = public_npub(&info.self_pk).unwrap_or_else(|| info.self_pk.trim().to_owned());
+        let href = display
+            .starts_with("npub1")
+            .then(|| format!("nostr:{display}"));
+        metadata.push(metadata_row("Relay npub", &display, href.as_deref(), true));
+    }
+    if !info.contact.trim().is_empty() {
+        let contact = info.contact.trim();
+        let href = contact_href(contact);
+        metadata.push(metadata_row("Contact", contact, href.as_deref(), false));
+    }
+    for (label, value) in [
+        ("Icon URL", info.icon.as_str()),
+        ("Banner URL", info.banner.as_str()),
+        ("Privacy policy", info.privacy.as_str()),
+        ("Terms of service", info.terms.as_str()),
+    ] {
+        if !value.trim().is_empty() {
+            metadata.push(metadata_row(
+                label,
+                value.trim(),
+                safe_http_url(value),
+                false,
+            ));
+        }
+    }
+    let metadata = if metadata.is_empty() {
+        "<p class=\"metadata-empty\">No public operator details have been configured.</p>"
+            .to_owned()
+    } else {
+        format!("<dl>{}</dl>", metadata.concat())
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{name} · Wok relay</title><style>{css}</style></head>
+<body><main><header>{banner}<div class="eyebrow">{mark} Wok relay</div>
+<h1>{name}</h1><h2>{description}</h2></header>
+<section class="metadata"><div class="section-heading"><p>About this relay</p><h2>Relay information</h2></div>
+{metadata}</section>
+<section><div class="section-heading"><p>Relay capabilities</p><h2>Supported NIPs</h2></div>
+<ul>{nip_items}</ul></section>
+<footer><span class="status-dot"></span> Wok {VERSION} ({revision})</footer>
+</main></body></html>"#,
+        name = html_escape(&cfg.relay.info.name),
+        description = html_escape(&cfg.relay.info.description),
+        css = LANDING_CSS,
+    )
+}
+
+const LANDING_CSS: &str = r#"
+:root{color-scheme:light;--ink:#17211d;--muted:#617069;--line:#dce4df;--paper:#f7faf8;--card:#fff;--accent:#e36c2f;--accent-soft:#fff0e7;--green:#2d7a5f}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 85% 0,#ffe7d8 0,transparent 31rem),var(--paper);color:var(--ink);font-family:Inter,"SF Pro Text","Segoe UI",system-ui,-apple-system,sans-serif}main{width:min(880px,calc(100% - 40px));margin:0 auto;padding:54px 0 42px}header{margin-bottom:42px}.hero-banner{display:block;width:100%;height:clamp(180px,34vw,300px);margin-bottom:25px;object-fit:cover;border:1px solid var(--line);border-radius:16px;background:#e8efeb;box-shadow:0 20px 55px #243a2f12}.eyebrow{display:flex;align-items:center;gap:11px;margin-bottom:23px;color:var(--green);font-size:13px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.mark{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:var(--accent);color:#fff;font-size:17px;box-shadow:0 8px 24px #e36c2f38}.relay-icon{object-fit:cover;border:1px solid #ffffffb8}h1,h2,p{margin:0}h1{max-width:720px;font-family:"SF Pro Display",Inter,"Segoe UI",system-ui,sans-serif;font-size:clamp(42px,8vw,72px);font-weight:760;letter-spacing:-.055em;line-height:.98}header h2{max-width:680px;margin-top:22px;color:var(--muted);font-family:"SF Pro Display",Inter,"Segoe UI",system-ui,sans-serif;font-size:clamp(19px,3vw,27px);font-weight:430;letter-spacing:-.02em;line-height:1.38}section{overflow:hidden;background:color-mix(in srgb,var(--card) 94%,transparent);border:1px solid var(--line);border-radius:16px;box-shadow:0 20px 55px #243a2f0b}section+section{margin-top:18px}.section-heading{padding:25px 28px 20px;border-bottom:1px solid var(--line)}.section-heading p{margin-bottom:5px;color:var(--accent);font-size:12px;font-weight:750;letter-spacing:.09em;text-transform:uppercase}.section-heading h2{font-size:23px;letter-spacing:-.025em}dl{margin:0}.metadata-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:20px;padding:16px 28px;border-bottom:1px solid #edf1ee}.metadata-row:last-child{border-bottom:0}dt{color:var(--muted);font-size:13px;font-weight:650}dd{min-width:0;margin:0;overflow-wrap:anywhere}dd a{color:var(--green);text-decoration:none}dd a:hover{text-decoration:underline;text-underline-offset:3px}code{font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;line-height:1.55}.metadata-empty{padding:20px 28px;color:var(--muted)}ul{list-style:none;margin:0;padding:0}li{display:grid;grid-template-columns:92px 1fr;gap:18px;padding:17px 28px;border-bottom:1px solid #edf1ee}li:last-child{border-bottom:0}li a{color:var(--green);font-weight:760;text-decoration:none}li a:hover{text-decoration:underline;text-underline-offset:3px}li span{color:var(--muted);line-height:1.55}footer{display:flex;align-items:center;justify-content:center;gap:8px;padding-top:28px;color:#75827c;font-size:13px}footer a{color:inherit;text-decoration-color:#b7c1bc;text-underline-offset:3px}.status-dot{width:7px;height:7px;border-radius:50%;background:#4eb889;box-shadow:0 0 0 4px #4eb88918}@media(max-width:600px){main{width:min(100% - 28px,880px);padding-top:28px}header{margin-bottom:34px}.hero-banner{height:190px;border-radius:12px}.metadata-row,li{grid-template-columns:1fr;gap:6px;padding:16px 20px}.section-heading{padding:21px 20px}.metadata-empty{padding:18px 20px}}
+"#;
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn json_response(v: &serde_json::Value) -> Response<Full<Bytes>> {
@@ -510,4 +679,47 @@ async fn handle_ws<S>(
         .active_connections
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(conn_id, peer = %peer, transport = "websocket", "client disconnected");
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::*;
+
+    #[test]
+    fn landing_has_hierarchy_links_descriptions_and_revision() {
+        let mut cfg = Config::default();
+        cfg.relay.info.name = "A <useful> relay".into();
+        cfg.relay.info.description = "Fast & friendly".into();
+        cfg.relay.info.pubkey =
+            "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d".into();
+        cfg.relay.info.self_pk =
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6".into();
+        cfg.relay.info.contact = "ops@example.com".into();
+        cfg.relay.info.icon = "https://relay.example/icon.png?small=1&square=1".into();
+        cfg.relay.info.banner = "https://relay.example/banner.jpg".into();
+        cfg.relay.info.privacy = "https://relay.example/privacy".into();
+        cfg.relay.info.terms = "javascript:alert('no')".into();
+        let html = landing(&cfg, &[1, 62, 77]);
+
+        assert!(html.contains("<h1>A &lt;useful&gt; relay</h1>"));
+        assert!(html.contains("<h2>Fast &amp; friendly</h2>"));
+        assert!(html.contains("class=\"hero-banner\""));
+        assert!(html.contains("class=\"mark relay-icon\""));
+        assert!(html.contains("icon.png?small=1&amp;square=1"));
+        assert!(html.contains("Relay information"));
+        assert!(html.contains("Operator npub"));
+        assert!(html.contains("npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"));
+        assert!(html.contains("href=\"mailto:ops@example.com\""));
+        assert!(html.contains("href=\"https://relay.example/privacy\""));
+        assert!(html.contains("javascript:alert(&#39;no&#39;)"));
+        assert!(!html.contains("href=\"javascript:"));
+        assert!(html.find("Relay information").unwrap() < html.find("Supported NIPs").unwrap());
+        assert!(html.contains("nostr-protocol/nips/blob/master/01.md"));
+        assert!(html.contains("Defines the core event format"));
+        assert!(html.contains("nostr-protocol/nips/blob/master/62.md"));
+        assert!(html.contains("durable deletion"));
+        assert!(html.contains("nostr-protocol/nips/blob/master/77.md"));
+        assert!(html.contains(&format!("Wok {VERSION}")));
+        assert!(html.contains(GIT_HASH.get(..8).unwrap_or(GIT_HASH)));
+    }
 }

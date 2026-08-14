@@ -362,7 +362,6 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
     let idx = index_event(view);
     put_indices(txn, lev_id, &idx)?;
     index_event_search(txn, lev_id, json)?;
-    note_search_indexed_through(txn, lev_id)?;
     Ok(lev_id)
 }
 
@@ -395,6 +394,7 @@ pub fn write_events_with_policy<N: NegentropySink>(
     });
 
     let mut lev_ids_to_delete: Vec<u64> = Vec::new();
+    let mut indexed_through = None;
 
     for i in 0..evs.len() {
         let packed_bytes = evs[i].packed.clone();
@@ -629,6 +629,7 @@ pub fn write_events_with_policy<N: NegentropySink>(
             }
             let json = evs[i].json.clone();
             let lev_id = insert_event(txn, &packed_bytes, &json)?;
+            indexed_through = Some(lev_id);
             evs[i].lev_id = lev_id;
             ne.update(PackedEventView::new(&packed_bytes)?, true)?;
             evs[i].status = EventWriteStatus::Written;
@@ -644,6 +645,13 @@ pub fn write_events_with_policy<N: NegentropySink>(
         if !lev_ids_to_delete.is_empty() {
             return Err(DbError::msg("unprocessed deletion"));
         }
+    }
+
+    // The search watermark is transaction-level progress. Updating the
+    // DUPSORT metadata key after every event needlessly deletes and reinserts
+    // the same record throughout a batch.
+    if let Some(lev_id) = indexed_through {
+        note_search_indexed_through(txn, lev_id)?;
     }
 
     Ok(())

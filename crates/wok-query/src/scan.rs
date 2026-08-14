@@ -698,15 +698,29 @@ pub struct DbQuery {
     last_work_checked: u64,
     max_total_events: u64,
     hll: Option<HyperLogLog>,
+    count_dedup_budget: u64,
+    count_dedup_limited: bool,
 }
 
 impl DbQuery {
-    pub fn new(sub: Subscription, max_total_events: u64) -> Self {
+    /// `count_dedup_budget` caps the total dedup-set size for COUNT scans
+    /// (0 = no cap). Each filter's limit only bounds its own scan, so a
+    /// multi-filter COUNT could otherwise multiply the shared dedup set
+    /// (hundreds of MB transient per connection). The reported count is
+    /// capped at max_filter_limit_count anyway, so a budget of
+    /// max_filter_limit_count + 1 changes no legitimate result; hitting it
+    /// completes the query with limited: true.
+    pub fn new(sub: Subscription, max_total_events: u64, count_dedup_budget: u64) -> Self {
         let max_total_events = if sub.count_only { 0 } else { max_total_events };
         let hll = if sub.count_only && sub.filter_group.filters.len() == 1 {
             HyperLogLog::for_filter(&sub.filter_group.filters[0])
         } else {
             None
+        };
+        let count_dedup_budget = if sub.count_only {
+            count_dedup_budget
+        } else {
+            0
         };
         let all_filters_search = !sub.filter_group.filters.is_empty()
             && sub
@@ -729,6 +743,8 @@ impl DbQuery {
             // for EVENT responses.
             max_total_events,
             hll,
+            count_dedup_budget,
+            count_dedup_limited: false,
         }
     }
 
@@ -738,6 +754,12 @@ impl DbQuery {
 
     pub fn hll_hex(&self) -> Option<String> {
         self.hll.as_ref().map(HyperLogLog::encode_hex)
+    }
+
+    /// True when a COUNT scan stopped early because the total dedup-set
+    /// budget was exhausted (report `limited: true`).
+    pub fn count_dedup_limited(&self) -> bool {
+        self.count_dedup_limited
     }
 
     fn visible_event_pubkey(
@@ -774,6 +796,8 @@ impl DbQuery {
             let mut sent = std::mem::take(&mut self.sent_events_full);
             let mut hits = Vec::new();
             let mut visibility_error = None;
+            let mut dedup_budget_hit = false;
+            let count_dedup_budget = self.count_dedup_budget;
             let complete = group.process(
                 txn,
                 &self.sub.filter_group.filters,
@@ -788,6 +812,11 @@ impl DbQuery {
                             return;
                         }
                     };
+                    if count_dedup_budget != 0 && sent.len() as u64 >= count_dedup_budget {
+                        // Stop growing the dedup set; reported as limited.
+                        dedup_budget_hit = true;
+                        return;
+                    }
                     if (self.max_total_events == 0 || (sent.len() as u64) < self.max_total_events)
                         && sent.insert(lev_id)
                     {
@@ -804,6 +833,10 @@ impl DbQuery {
                     hll.add_pubkey(&pubkey);
                 }
                 cb(&self.sub, lev_id);
+            }
+            if dedup_budget_hit {
+                self.count_dedup_limited = true;
+                return Ok(true);
             }
             if self.max_total_events != 0
                 && self.sent_events_full.len() as u64 >= self.max_total_events
@@ -831,6 +864,8 @@ impl DbQuery {
             let mut last_work = self.last_work_checked;
             let mut hits: Vec<(u64, [u8; 32])> = Vec::new();
             let mut visibility_error = None;
+            let mut dedup_budget_hit = false;
+            let count_dedup_budget = self.count_dedup_budget;
             let mut handle = |lev_id| {
                 if f.limit == 0 {
                     return true;
@@ -846,6 +881,12 @@ impl DbQuery {
                         return true;
                     }
                 };
+                if count_dedup_budget != 0 && sent_full.len() as u64 >= count_dedup_budget {
+                    // Total dedup-set budget exhausted: stop the scan and
+                    // report limited rather than growing memory further.
+                    dedup_budget_hit = true;
+                    return true;
+                }
                 if sent_full.insert(lev_id) {
                     hits.push((lev_id, pubkey));
                 }
@@ -881,6 +922,10 @@ impl DbQuery {
                 }
                 cb(&self.sub, lev);
             }
+            if dedup_budget_hit {
+                self.count_dedup_limited = true;
+                return Ok(true);
+            }
             if self.max_total_events != 0
                 && self.sent_events_full.len() as u64 >= self.max_total_events
             {
@@ -910,7 +955,7 @@ where
 {
     let fg = crate::filter::NostrFilterGroup::from_value(filter, max_limit, max_tags)?;
     let sub = Subscription::new(1, crate::subid::SubId::new(".").unwrap(), fg, false);
-    let mut q = DbQuery::new(sub, 0);
+    let mut q = DbQuery::new(sub, 0, 0);
     q.process(txn, |_, lev| cb(lev), u64::MAX)
         .map_err(|e| crate::subid::QueryError::msg(e.to_string()))?;
     Ok(())

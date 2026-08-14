@@ -11,10 +11,15 @@ pub struct QueryScheduler {
     running: VecDeque<usize>,
     max_subs_per_connection: usize,
     max_total_events_per_req: u64,
+    count_dedup_budget: u64,
 }
 
 impl QueryScheduler {
-    pub fn new(max_subs_per_connection: usize, max_total_events_per_req: u64) -> Self {
+    pub fn new(
+        max_subs_per_connection: usize,
+        max_total_events_per_req: u64,
+        count_dedup_budget: u64,
+    ) -> Self {
         Self {
             ensure_exists: true,
             conns: HashMap::new(),
@@ -23,6 +28,7 @@ impl QueryScheduler {
             running: VecDeque::new(),
             max_subs_per_connection,
             max_total_events_per_req,
+            count_dedup_budget,
         }
     }
 
@@ -37,7 +43,7 @@ impl QueryScheduler {
         if conn.len() >= self.max_subs_per_connection {
             return Ok(false);
         }
-        let q = DbQuery::new(sub, self.max_total_events_per_req);
+        let q = DbQuery::new(sub, self.max_total_events_per_req, self.count_dedup_budget);
         // Reuse slots of finished/dead queries instead of growing forever.
         let idx = match self.free.pop() {
             Some(i) => {
@@ -86,7 +92,7 @@ impl QueryScheduler {
     ) -> Result<(), wok_db::DbError>
     where
         F: FnMut(&Subscription, u64, Option<&[u8]>),
-        C: FnMut(&Subscription, u64, Option<String>),
+        C: FnMut(&Subscription, u64, Option<String>, bool),
     {
         let Some(idx) = self.running.pop_front() else {
             return Ok(());
@@ -140,7 +146,7 @@ impl QueryScheduler {
             let q = self.queries[idx].take().unwrap();
             self.free.push(idx);
             self.remove_sub(q.sub.conn_id, &q.sub.sub_id);
-            on_complete(&q.sub, q.sent_count(), q.hll_hex());
+            on_complete(&q.sub, q.sent_count(), q.hll_hex(), q.count_dedup_limited());
         } else {
             self.running.push_back(idx);
         }

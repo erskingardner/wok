@@ -2014,6 +2014,7 @@ fn run_req_worker(
     let mut queries = QueryScheduler::new(
         initial_cfg.relay.abuse.max_concurrent_historical_queries,
         initial_cfg.relay.max_total_events_per_req,
+        initial_cfg.relay.max_filter_limit_count.saturating_add(1),
     );
     drop(initial_cfg);
     let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
@@ -2080,7 +2081,7 @@ fn run_req_worker(
                 }
             }
         }
-        let mut completed: Vec<(Subscription, u64, Option<String>)> = Vec::new();
+        let mut completed: Vec<(Subscription, u64, Option<String>, bool)> = Vec::new();
         // Events are framed and delivered inside the scan callback: no
         // per-event Subscription clone, no intermediate collection, and the
         // payload JSON is copied exactly once (into the frame).
@@ -2106,12 +2107,12 @@ fn run_req_worker(
                     }
                 }
             },
-            |sub, total, hll| {
-                completed.push((sub.clone(), total, hll));
+            |sub, total, hll, dedup_limited| {
+                completed.push((sub.clone(), total, hll, dedup_limited));
             },
         );
         drop(txn);
-        for (sub, total, hll) in completed {
+        for (sub, total, hll, dedup_limited) in completed {
             tracing::debug!(
                 conn_id = sub.conn_id,
                 sub_id = %sub.sub_id,
@@ -2122,7 +2123,7 @@ fn run_req_worker(
             );
             if sub.count_only {
                 let mut count = total;
-                let mut limited = false;
+                let mut limited = dedup_limited;
                 if count > cfg_snap.relay.max_filter_limit_count {
                     count = cfg_snap.relay.max_filter_limit_count;
                     limited = true;
@@ -2343,6 +2344,7 @@ fn run_negentropy(
     let mut queries = QueryScheduler::new(
         initial_cfg.relay.abuse.max_concurrent_historical_queries,
         initial_cfg.relay.max_sync_events,
+        initial_cfg.relay.max_filter_limit_count.saturating_add(1),
     );
     drop(initial_cfg);
     queries.ensure_exists = false;
@@ -2537,7 +2539,7 @@ fn run_negentropy(
             |sub, lev, _| {
                 lev_hits.push((sub.clone(), lev));
             },
-            |sub, total, _hll| {
+            |sub, total, _hll, _dedup_limited| {
                 done.push((sub.clone(), total));
             },
         );

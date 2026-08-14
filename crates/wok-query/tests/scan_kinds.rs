@@ -88,6 +88,7 @@ fn request_wide_limit_caps_deduplicated_multi_filter_results_but_not_count() {
     let mut delivery = DbQuery::new(
         Subscription::new(1, SubId::new("multi").unwrap(), group.clone(), false),
         3,
+        0,
     );
     let mut delivered = Vec::new();
     assert!(delivery
@@ -99,9 +100,43 @@ fn request_wide_limit_caps_deduplicated_multi_filter_results_but_not_count() {
     let mut count = DbQuery::new(
         Subscription::new(1, SubId::new("count").unwrap(), group, true),
         3,
+        1_000_001,
     );
     assert!(count.process(&txn, |_, _| {}, u64::MAX).unwrap());
     assert_eq!(count.sent_count(), 6);
+    assert!(!count.count_dedup_limited());
+}
+
+#[test]
+fn count_dedup_budget_caps_multi_filter_scans_as_limited() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut events = Vec::new();
+    for i in 0..5 {
+        let (packed, json, _) = sign(1, &format!("note-{i}"), 1_700_000_000 + i);
+        events.push(EventToWrite::new(packed, json));
+    }
+    for i in 0..5 {
+        let (packed, json, _) = sign(3, &format!("contact-{i}"), 1_700_000_100 + i);
+        events.push(EventToWrite::new(packed, json));
+    }
+    let mut write = env.begin_rw().unwrap();
+    write_events(&mut write, &mut NoopNegentropy, &mut events, false).unwrap();
+    write.commit().unwrap();
+
+    // Two broad filters, each matching 5 events; budget below the total.
+    let request = json!(["COUNT", "c", {"kinds":[1]}, {"kinds":[3]}]);
+    let group = NostrFilterGroup::from_req(request.as_array().unwrap(), 500, 3).unwrap();
+    let txn = env.begin_ro().unwrap();
+    let mut count = DbQuery::new(
+        Subscription::new(1, SubId::new("c").unwrap(), group, true),
+        0,
+        7,
+    );
+    assert!(count.process(&txn, |_, _| {}, u64::MAX).unwrap());
+    assert_eq!(count.sent_count(), 7);
+    assert!(count.count_dedup_limited());
 }
 
 #[test]
@@ -161,7 +196,7 @@ fn deep_author_kind_pages_are_complete_and_non_overlapping() {
         "authors":[pubkey], "kinds":[1], "limit":500
     }]);
     let group = NostrFilterGroup::from_req(request.as_array().unwrap(), 500, 3).unwrap();
-    let mut scheduler = QueryScheduler::new(8, 2_000);
+    let mut scheduler = QueryScheduler::new(8, 2_000, 0);
     assert!(scheduler
         .add_sub(
             &txn,
@@ -179,7 +214,7 @@ fn deep_author_kind_pages_are_complete_and_non_overlapping() {
                 &txn,
                 10_000,
                 |_, lev, _| scheduled.push(lev),
-                |_, total, _hll| completions.push(total),
+                |_, total, _hll, _limited| completions.push(total),
             )
             .unwrap();
     }

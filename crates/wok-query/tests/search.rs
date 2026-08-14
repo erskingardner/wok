@@ -189,6 +189,7 @@ fn multiple_search_filters_are_merged_by_quality() {
     let mut capped = DbQuery::new(
         Subscription::new(1, SubId::new("search-cap").unwrap(), group, false),
         1,
+        0,
     );
     let mut capped_hits = Vec::new();
     assert!(capped

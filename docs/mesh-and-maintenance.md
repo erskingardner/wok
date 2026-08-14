@@ -1,5 +1,15 @@
 # Mesh and maintenance
 
+## Outbound connections
+
+`wok sync`, `wok stream`, `wok router`, `wok upload`, and `wok download`
+dial whatever `ws(s)://` URL the operator (or a router config file) supplies.
+There is no filtering against loopback, link-local (e.g. `169.254.169.254`),
+or private ranges — these commands will happily dial internal addresses, and
+up-directions export your local DB to the configured URL. Treat router
+configs and sync/upload targets as trusted input. TLS verification is always
+on and cannot be disabled.
+
 ## Persistent mesh links
 
 Use `wok router` for new long-running replication setups. It supports multiple

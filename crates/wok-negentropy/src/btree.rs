@@ -171,6 +171,78 @@ mod encoding_tests {
     }
 }
 
+#[cfg(test)]
+mod traversal_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    pub struct MemBackend {
+        nodes: HashMap<u64, Node>,
+        root: u64,
+        next_id: u64,
+    }
+
+    impl MemBackend {
+        pub fn new() -> Self {
+            Self {
+                nodes: HashMap::new(),
+                root: 0,
+                next_id: 0,
+            }
+        }
+    }
+
+    impl BTreeBackend for MemBackend {
+        fn get_node_read(&mut self, node_id: u64) -> Result<NodePtr, NegError> {
+            Ok(match self.nodes.get(&node_id) {
+                Some(&node) => NodePtr {
+                    node,
+                    node_id,
+                    exists: true,
+                },
+                None => NodePtr {
+                    node: Node::default(),
+                    node_id,
+                    exists: false,
+                },
+            })
+        }
+        fn get_node_write(&mut self, node_id: u64) -> Result<NodePtr, NegError> {
+            self.get_node_read(node_id)
+        }
+        fn put_node(&mut self, node_id: u64, node: &Node) -> Result<(), NegError> {
+            self.nodes.insert(node_id, *node);
+            Ok(())
+        }
+        fn make_node(&mut self) -> Result<u64, NegError> {
+            self.next_id += 1;
+            Ok(self.next_id)
+        }
+        fn delete_node(&mut self, node_id: u64) -> Result<(), NegError> {
+            self.nodes.remove(&node_id);
+            Ok(())
+        }
+        fn root_node_id(&self) -> u64 {
+            self.root
+        }
+        fn set_root_node_id(&mut self, id: u64) {
+            self.root = id;
+        }
+    }
+
+    #[test]
+    fn zero_item_node_does_not_underflow_lower_bound() {
+        let mut backend = MemBackend::new();
+        backend.nodes.insert(1, Node::default()); // num_items == 0
+        backend.root = 1;
+        let mut tree = BTreeCore::new(backend);
+        // Must return, not panic on `num_items - 1`.
+        assert!(tree.find_lower_bound_mut(0, 0, &Bound::timestamp(5)).is_ok());
+        assert!(tree.size_mut().is_ok());
+        assert!(tree.iterate_mut(0, 0, |_, _| true).is_ok());
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct NodePtr {
     pub node: Node,
@@ -749,6 +821,12 @@ impl<B: BTreeBackend> BTreeCore<B> {
             return Ok(num_to_left as usize + 1);
         }
         let node = node_ptr.node;
+        if node.num_items == 0 {
+            // A corrupt-at-rest node with zero items has no child to descend
+            // into; treating it like a missing child keeps the traversal
+            // total instead of underflowing the items index.
+            return Ok(num_to_left as usize + 1);
+        }
         for i in 1..node.num_items as usize {
             if value.item <= node.items[i].item {
                 let child = self.backend.get_node_read(node.items[i - 1].node_id)?;

@@ -23,6 +23,11 @@ translated and ignored config key, external executable/socket path checks, any
 process holding `data.mdb` open, and the exact generated TOML. Add `--json` for
 machine-readable output.
 
+The process-holding probe shells out to `lsof`; migration resolves it at a
+well-known absolute path (`/usr/bin/lsof` etc.) before falling back to `PATH`
+lookup. Since migration is the highest-trust operation wok performs, run it
+with a clean `PATH` if your system keeps `lsof` elsewhere.
+
 After reviewing the report, stop strfry so the cutover has a clear event
 boundary, then run:
 

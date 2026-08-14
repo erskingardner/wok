@@ -506,7 +506,15 @@ fn external_path_checks(cfg: &Config) -> Vec<ExternalPathCheck> {
 
 fn probe_source_processes(source_db: &Path) -> (String, Vec<SourceProcess>) {
     let data = source_db.join("data.mdb");
-    let output = match Command::new("lsof")
+    // Migration is the highest-trust operation wok performs: resolve lsof at
+    // a well-known absolute path first so a hijacked PATH can't substitute
+    // arbitrary code; fall back to PATH lookup only if none exist.
+    let lsof = ["/usr/bin/lsof", "/bin/lsof", "/usr/sbin/lsof", "/sbin/lsof"]
+        .iter()
+        .find(|candidate| Path::new(candidate).exists())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "lsof".to_string());
+    let output = match Command::new(lsof)
         .args(["-F", "pc", "--"])
         .arg(&data)
         .output()

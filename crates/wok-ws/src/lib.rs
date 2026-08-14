@@ -359,8 +359,11 @@ fn landing(cfg: &Config, supported_nips: &[u64]) -> String {
     let revision = if GIT_HASH == "unknown" {
         "unknown".to_owned()
     } else {
+        // Build-time input, but escape like every other interpolated value.
         format!(
-            "<a href=\"https://github.com/erskingardner/wok/commit/{GIT_HASH}\">{short_hash}</a>"
+            "<a href=\"https://github.com/erskingardner/wok/commit/{}\">{}</a>",
+            html_escape(GIT_HASH),
+            html_escape(short_hash)
         )
     };
     let banner = safe_http_url(&info.banner)

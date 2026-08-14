@@ -169,24 +169,24 @@ rotated relay order, and correctness gates before speed. Local process
 comparisons, two-host load campaigns, and same-host Unix/WebSocket comparisons
 are separate experiments so network RTT is not confused with transport cost.
 
-Latest controlled transport campaign — Linux x86-64 VM, 100,000 realistic
-events, three order-rotated repetitions, 54/54 correct trials:
+Latest controlled v0.2.0 transport campaign — Linux x86-64 VM, 100,000
+realistic events, three order-rotated repetitions, 54/54 correct trials:
 
 | Median scenario | Wok WebSocket | Wok Unix | strfry WebSocket |
 |---|---:|---:|---:|
-| historical query | 90.3 req/s | **1,859.4 req/s** | 90.5 req/s |
-| mixed read/write | 22.8 req/s | **848.7 req/s** | 22.7 req/s |
-| accepted publication | 2,887 events/s | 2,873 events/s | **3,470 events/s** |
-| fanout delivery | 28,983 deliveries/s | **31,839 deliveries/s** | 28,483 deliveries/s |
-| connection opens | 3,698 conn/s | **16,486 conn/s** | 3,611 conn/s |
-| deep-history pages | 89.1 pages/s | 92.6 pages/s | **106.3 pages/s** |
+| historical query | 90.3 req/s | **2,338.7 req/s** | 90.4 req/s |
+| mixed read/write | 22.7 req/s | **962.1 req/s** | 22.8 req/s |
+| accepted publication | 2,799 events/s | 2,727 events/s | **4,112 events/s** |
+| fanout delivery | **35,359 deliveries/s** | 32,488 deliveries/s | 29,428 deliveries/s |
+| connection opens | 4,054 conn/s | **13,950 conn/s** | 3,790 conn/s |
+| deep-history pages | 120.5 pages/s | 113.6 pages/s | **172.1 pages/s** |
 
 These are same-host transport results, not Internet-facing capacity claims.
 At the 10,000-connection peak, server RSS was 632 MiB for Wok WebSocket,
-459 MiB for Wok Unix, and 292 MiB for strfry WebSocket. The full latency,
-resource, setup, interpretation, limitation, and artifact-provenance tables are
-in the [2026-08-14 transport benchmark
-report](docs/transport-benchmark-2026-08-14.md).
+453 MiB for Wok Unix, and 292 MiB for strfry WebSocket. The full two-host and
+same-host results, before/after comparison, latency, resources, limitations,
+and artifact provenance are in the [v0.2.0 benchmark
+report](docs/benchmark-v0.2.0-2026-08-14.md).
 
 Reproduce:
 
@@ -251,6 +251,7 @@ Summary:
 - [Observability](docs/observability.md)
 - [Operator dashboard](docs/admin-dashboard.md)
 - [Benchmark methodology](docs/benchmarks.md)
+- [Wok v0.2.0 benchmark](docs/benchmark-v0.2.0-2026-08-14.md)
 - [2026-08-14 transport benchmark](docs/transport-benchmark-2026-08-14.md)
 - [Mesh and maintenance](docs/mesh-and-maintenance.md)
 - [Cutover / rollback](docs/cutover.md)

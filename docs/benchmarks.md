@@ -190,13 +190,19 @@ Original artifacts remain under `/opt/relay-bench/campaigns/<campaign-id>` and
 are copied to `/opt/wok-load/results/<campaign-id>` for analysis with the
 two-host campaign results.
 
-### Recorded transport campaign
+### Recorded campaigns
 
-The [2026-08-14 transport report](transport-benchmark-2026-08-14.md) records a
-100,000-event Linux campaign with three order-rotated repetitions. All 54
-trials passed their correctness gates. It includes median throughput and
-latency, peak client/server resources, exact corpus and binary hashes,
-limitations, retained artifact locations, and the next investigations.
+The [v0.2.0 report](benchmark-v0.2.0-2026-08-14.md) records the latest
+100,000-event Linux campaign: a two-host Wok/strfry relay comparison and a
+same-host Wok Unix/WebSocket transport comparison, each with three
+order-rotated repetitions. All 96 result rows passed their correctness gates.
+It includes the before/after comparison to the previous controlled Wok build,
+median throughput and latency, resources, exact corpus and binary hashes,
+limitations, retained artifacts, and next investigations.
+
+The earlier [2026-08-14 transport report](transport-benchmark-2026-08-14.md)
+is the baseline for that comparison. It records 54 correct trials against Wok
+commit `876bce55671120fc65b9a0844d2f4ae9f1d9d229`.
 
 The older `sample-bench-summary.md` and `sample-bench-results.jsonl` remain a
 historical single-run Apple Silicon example of the local process harness. Do

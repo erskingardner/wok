@@ -24,6 +24,7 @@ select_relay() {
             DB_ROOT=$WOK_DB_ROOT
             CONFIG=$WOK_CONFIG
             SERVICE_USER=wokbench
+            SOURCE_CHECKOUT=/opt/relay-bench/src/wok
             BINARY=$(service_binary "$SERVICE")
             ;;
         strfry)
@@ -31,6 +32,7 @@ select_relay() {
             DB_ROOT=$STRFRY_DB_ROOT
             CONFIG=$STRFRY_CONFIG
             SERVICE_USER=strfrybench
+            SOURCE_CHECKOUT=/opt/relay-bench/src/strfry
             BINARY=$(service_binary "$SERVICE")
             ;;
         *)
@@ -78,6 +80,10 @@ reset_import() {
         exit 1
     fi
 
+    local source_checkout_commit
+    source_checkout_commit=$(git -c "safe.directory=$SOURCE_CHECKOUT" \
+        -C "$SOURCE_CHECKOUT" rev-parse HEAD 2>/dev/null || true)
+
     stop_all
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DB_ROOT"
     find "$DB_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
@@ -93,7 +99,8 @@ reset_import() {
         echo "config=$CONFIG"
         echo "corpus=$corpus"
         echo "expected_events=$expected"
-        echo "source_commit=$(git -c safe.directory=/opt/relay-bench/src/wok -C /opt/relay-bench/src/wok rev-parse HEAD 2>/dev/null || true)"
+        echo "source_checkout=$SOURCE_CHECKOUT"
+        echo "source_checkout_commit=$source_checkout_commit"
         uname -a
         lscpu
         free -b

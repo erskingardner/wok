@@ -1328,8 +1328,19 @@ fn ingest_req(
         );
         return;
     }
-    if filters.len() as u64 > cfg.relay.max_req_filter_size as u64 {
+    if filters.len() > cfg.relay.max_filters_per_req {
+        // Preserve strfry's wire error for its legacy filter-count ceiling.
         fail_closed("arr too big".into());
+        return;
+    }
+    let serialized_filter_bytes = filters.iter().fold(0usize, |total, filter| {
+        total.saturating_add(filter.to_string().len())
+    });
+    if serialized_filter_bytes > cfg.relay.max_req_filter_size {
+        fail_closed(format!(
+            "filters exceed {} serialized bytes",
+            cfg.relay.max_req_filter_size
+        ));
         return;
     }
     let max_limit = if count_only {

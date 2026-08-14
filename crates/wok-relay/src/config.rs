@@ -173,7 +173,11 @@ pub struct RelayConfig {
     pub auth: AuthConfig,
     pub info: InfoConfig,
     pub max_websocket_payload_size: usize,
+    /// Maximum combined compact-JSON bytes across all filter objects in one
+    /// REQ or COUNT command.
     pub max_req_filter_size: usize,
+    /// Unconditional protocol ceiling for filter objects in one REQ/COUNT.
+    pub max_filters_per_req: usize,
     pub auto_ping_seconds: u64,
     pub enable_tcp_keepalive: bool,
     pub query_timeslice_budget_us: u64,
@@ -336,7 +340,8 @@ impl Default for Config {
                     terms: String::new(),
                 },
                 max_websocket_payload_size: 131072,
-                max_req_filter_size: 200,
+                max_req_filter_size: 65_536,
+                max_filters_per_req: 200,
                 auto_ping_seconds: 55,
                 enable_tcp_keepalive: false,
                 query_timeslice_budget_us: 10000,
@@ -644,7 +649,10 @@ impl Config {
             Ok(())
         })?;
         assign_u64(&map, "relay.maxReqFilterSize", |n| {
-            cfg.relay.max_req_filter_size = n as usize;
+            // Despite its name, strfry uses this as the maximum number of
+            // filter objects in the request array. Preserve that meaning only
+            // at the legacy migration boundary.
+            cfg.relay.max_filters_per_req = n as usize;
             Ok(())
         })?;
         assign_u64(&map, "relay.autoPingSeconds", |n| {
@@ -1260,7 +1268,8 @@ mod tests {
         assert_eq!(c.relay.info.pubkey, "deadbeef");
         assert_eq!(c.relay.info.self_pk, "cafe");
         assert_eq!(c.relay.info.terms, "https://example.com/t");
-        assert_eq!(c.relay.max_req_filter_size, 7);
+        assert_eq!(c.relay.max_filters_per_req, 7);
+        assert_eq!(c.relay.max_req_filter_size, 65_536);
         assert_eq!(c.relay.max_total_events_per_req, 4321);
         assert_eq!(c.relay.auto_ping_seconds, 30);
         assert!(c.relay.enable_tcp_keepalive);

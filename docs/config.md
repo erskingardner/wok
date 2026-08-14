@@ -85,7 +85,8 @@ See [Observability](observability.md) for every exported metric and label.
 | `relay.nofiles` | `524288` | Restart | Requested process file-descriptor limit. |
 | `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. |
 | `relay.max_websocket_payload_size` | `131072` | Restart | Maximum reassembled WebSocket payload bytes. |
-| `relay.max_req_filter_size` | `200` | Live | Yes | Maximum serialized bytes in one REQ filter. |
+| `relay.max_req_filter_size` | `65536` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. |
+| `relay.max_filters_per_req` | `200` | Live | Yes | Unconditional maximum filter objects in one REQ or COUNT. |
 | `relay.auto_ping_seconds` | `55` | Restart | WebSocket ping interval; zero disables automatic pings. |
 | `relay.enable_tcp_keepalive` | `false` | Restart | Enable TCP keepalive on accepted sockets. |
 | `relay.query_timeslice_budget_us` | `10000` | Live | Yes | Query CPU budget before cooperative yielding. |

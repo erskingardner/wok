@@ -14,7 +14,7 @@ fn test_cfg(dir: &std::path::Path) -> Config {
     cfg.relay.port = 0;
     cfg.relay.unix.enabled = false;
     cfg.relay.auth.enabled = false;
-    cfg.relay.max_req_filter_size = 2;
+    cfg.relay.max_filters_per_req = 2;
     cfg
 }
 
@@ -123,6 +123,16 @@ async fn cpp_error_routing() {
         "arr too big",
     )
     .await;
+    // Compact serialized filter bytes are bounded independently from count.
+    rig.handle.config.write().relay.max_req_filter_size = 10;
+    send_and_expect(
+        &rig,
+        r#"["REQ","s",{"authors":["abcdef"]}]"#.into(),
+        |t| t == r#"["CLOSED","s","error: bad req: filters exceed 10 serialized bytes"]"#,
+        "filter byte limit",
+    )
+    .await;
+    rig.handle.config.write().relay.max_req_filter_size = 65_536;
     // REQ with an invalid filter -> CLOSED.
     send_and_expect(
         &rig,

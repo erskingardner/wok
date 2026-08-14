@@ -46,7 +46,10 @@ nofiles = 524288
 # Trusted reverse-proxy header containing the client IP; empty disables it.
 real_ip_header = ""
 max_websocket_payload_size = 131072
-max_req_filter_size = 200
+# Maximum combined compact-JSON bytes across all filters in one REQ/COUNT.
+max_req_filter_size = 65536
+# Unconditional maximum filter objects in one REQ/COUNT.
+max_filters_per_req = 200
 # Zero disables automatic ping frames.
 auto_ping_seconds = 55
 enable_tcp_keepalive = false

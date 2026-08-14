@@ -474,6 +474,15 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     if let Some(warning) = cfg.auth_configuration_warning() {
         tracing::warn!("{warning}; restricted reads fail closed");
     }
+    if !cfg.relay.real_ip_header.is_empty() {
+        tracing::warn!(
+            "relay.real_ip_header = {:?} is fully trusted for per-IP rate limits: \
+             any client can spoof it (and burn other IPs' budgets) unless the \
+             reverse proxy overwrites that header on every request and no client \
+             can reach the relay directly",
+            cfg.relay.real_ip_header
+        );
+    }
     wok_relay::apply_nofiles_limit(cfg.relay.nofiles).map_err(anyhow::Error::msg)?;
     let env = open_env(&cfg)?;
     let bind: SocketAddr = format!("{}:{}", cfg.relay.bind, cfg.relay.port).parse()?;

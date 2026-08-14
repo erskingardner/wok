@@ -84,7 +84,7 @@ See [Observability](observability.md) for every exported metric and label.
 | `relay.bind` | `127.0.0.1` | Restart | TCP listen address. |
 | `relay.port` | `7777` | Restart | TCP listen port. |
 | `relay.nofiles` | `524288` | Restart | Requested process file-descriptor limit. |
-| `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. |
+| `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-IP budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. |
 | `relay.max_websocket_payload_size` | `131072` | Restart | Maximum reassembled WebSocket payload bytes. |
 | `relay.max_req_filter_size` | `65536` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. |
 | `relay.max_filters_per_req` | `200` | Live | Yes | Unconditional maximum filter objects in one REQ or COUNT. |
@@ -198,8 +198,11 @@ All abuse settings reload live and are dashboard-editable.
 | `relay.abuse.min_pow_difficulty` | `0` | Required NIP-13 leading-zero bits; zero disables it. |
 
 A zero rate or burst disables that individual token bucket. Unix-socket
-connections bypass only IP/connection buckets; query, author, storage, and
-proof-of-work policies still apply.
+connections carry no network address (an empty IP), so by design they bypass
+every per-IP token bucket — connection, EVENT, REQ, and COUNT. Per-author
+publication, storage quotas, query-cost gates, and proof-of-work policies
+still apply to them. Keep the socket on a trusted host with tight
+`mode`/`auth_uids`/`auth_gids`.
 
 ## Unix socket
 

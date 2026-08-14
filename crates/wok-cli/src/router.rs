@@ -505,7 +505,12 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
                         }
                     }
                     ManagerMsg::Log { group, url, text } => {
-                        tracing::info!("{group} / {url}: {text}");
+                        tracing::info!(
+                            group = %group,
+                            url = %url,
+                            message = ?text,
+                            "router peer message"
+                        );
                     }
                 }
             }

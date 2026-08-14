@@ -1584,7 +1584,7 @@ async fn cmd_sync(
             }
             "NOTICE" => {
                 let notice = v[1].as_str().unwrap_or("");
-                tracing::warn!("NOTICE from relay: {notice}");
+                tracing::warn!(message = ?notice, "NOTICE from relay");
                 if !received_neg_msg {
                     let lower = notice.to_ascii_lowercase();
                     for kw in [
@@ -1605,7 +1605,10 @@ async fn cmd_sync(
                     }
                 }
             }
-            _ => tracing::warn!("Unexpected message from relay: {txt:.512}"),
+            _ => {
+                let preview: String = txt.chars().take(512).collect();
+                tracing::warn!(message = ?preview, "unexpected message from relay");
+            }
         }
 
         // Pump uploads (haves) with the C++ water marks.

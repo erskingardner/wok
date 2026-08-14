@@ -81,7 +81,7 @@ impl PluginEventSifter {
                     "reject" => PluginResult::Reject,
                     "shadowReject" => PluginResult::ShadowReject,
                     other => {
-                        tracing::error!("unknown action: {other}");
+                        tracing::error!(action = ?other, "write policy plugin returned unknown action");
                         *ok_msg = "error: internal error".into();
                         self.running = None;
                         PluginResult::Reject
@@ -165,7 +165,10 @@ impl PluginEventSifter {
             let response: Value = match serde_json::from_str(resp_line.trim()) {
                 Ok(v) => v,
                 Err(_) => {
-                    tracing::warn!("Got unparseable line from write policy plugin: {resp_line}");
+                    tracing::warn!(
+                        response = ?resp_line.trim_end(),
+                        "write policy plugin returned unparseable JSON"
+                    );
                     continue;
                 }
             };

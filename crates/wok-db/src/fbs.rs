@@ -35,8 +35,18 @@ fn root_table(buf: &[u8]) -> Result<usize, DbError> {
 }
 
 fn vtable_field_offset(buf: &[u8], table_off: usize, field_id: usize) -> Result<u16, DbError> {
+    if table_off + 4 > buf.len() {
+        return Err(DbError::msg("table soffset out of range"));
+    }
     let soffset = i32::from_le_bytes(buf[table_off..table_off + 4].try_into().unwrap());
-    let vtable_off = (table_off as i32 - soffset) as usize;
+    // Widen to i64 before subtracting: a crafted record with soffset > table_off
+    // would otherwise produce a negative offset that wraps to near usize::MAX and
+    // defeats the range check below.
+    let vtable_off = table_off as i64 - soffset as i64;
+    if vtable_off < 0 || vtable_off as usize > buf.len() {
+        return Err(DbError::msg("vtable out of range"));
+    }
+    let vtable_off = vtable_off as usize;
     if vtable_off + 4 > buf.len() {
         return Err(DbError::msg("vtable out of range"));
     }
@@ -183,5 +193,18 @@ mod tests {
         let hex = "0c00000000000600080004000600000004000000020000007b7d0000";
         let buf = hex::decode(hex).unwrap();
         assert_eq!(decode_negentropy_filter(&buf).unwrap().filter, "{}");
+    }
+
+    #[test]
+    fn crafted_negative_vtable_offset_is_rejected() {
+        // Root table at offset 8 whose soffset is larger than the table offset:
+        // the vtable location goes negative and must be rejected, not wrapped.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&8u32.to_le_bytes()); // root offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // padding
+        buf.extend_from_slice(&i32::MAX.to_le_bytes()); // soffset > table_off
+        assert!(decode_meta(&buf).is_err());
+        assert!(decode_negentropy_filter(&buf).is_err());
+        assert!(decode_compression_dictionary(&buf).is_err());
     }
 }

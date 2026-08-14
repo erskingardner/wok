@@ -529,6 +529,7 @@ impl Config {
             .try_into()
             .map_err(|e: toml::de::Error| e.to_string())?;
         validate_admin_config(&mut parsed.admin)?;
+        clamp_size_class(&mut parsed);
         if parsed.observability.history_interval_secs == 0 {
             return Err("observability.history_interval_secs must be at least 1".into());
         }
@@ -850,8 +851,36 @@ impl Config {
     }
 }
 
-fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {
-    if admin.auth_window_secs == 0 || admin.auth_window_secs > 300 {
+/// Ceiling for size-class settings whose values drive pre-allocation
+/// (decompression buffers, websocket frame buffers). Matches the 16 MiB
+/// hard cap the wok-db deletion/reindex/integrity paths already assume, so a
+/// misconfigured (or dashboard-edited) value can't become an allocation
+/// abort or a per-request memset amplifier.
+pub const MAX_SIZE_CLASS_BYTES: usize = 16 * 1024 * 1024;
+
+fn clamp_size_class(parsed: &mut TomlConfig) {
+    let fields: [(&str, &mut usize); 3] = [
+        ("events.max_event_size", &mut parsed.events.max_event_size),
+        (
+            "relay.max_websocket_payload_size",
+            &mut parsed.relay.max_websocket_payload_size,
+        ),
+        (
+            "relay.unix.max_frame_bytes",
+            &mut parsed.relay.unix.max_frame_bytes,
+        ),
+    ];
+    for (name, value) in fields {
+        if *value > MAX_SIZE_CLASS_BYTES {
+            tracing::warn!(
+                "{name} exceeds the {MAX_SIZE_CLASS_BYTES}-byte ceiling; clamping"
+            );
+            *value = MAX_SIZE_CLASS_BYTES;
+        }
+    }
+}
+
+fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {    if admin.auth_window_secs == 0 || admin.auth_window_secs > 300 {
         return Err("admin.auth_window_secs must be between 1 and 300".into());
     }
     if !admin.enabled {
@@ -1106,6 +1135,29 @@ fn unquote(v: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_class_settings_are_clamped_to_ceiling() {
+        let c = Config::parse_toml(
+            r#"
+            [events]
+            max_event_size = 4611686018427387904
+
+            [relay]
+            max_websocket_payload_size = 1073741824
+
+            [relay.unix]
+            max_frame_bytes = 33554432
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.events.max_event_size, MAX_SIZE_CLASS_BYTES);
+        assert_eq!(c.relay.max_websocket_payload_size, MAX_SIZE_CLASS_BYTES);
+        assert_eq!(c.relay.unix.max_frame_bytes, MAX_SIZE_CLASS_BYTES);
+        // Values under the ceiling pass through untouched.
+        let c = Config::parse_toml("[events]\nmax_event_size = 70000\n").unwrap();
+        assert_eq!(c.events.max_event_size, 70000);
+    }
 
     #[test]
     fn parses_nested() {

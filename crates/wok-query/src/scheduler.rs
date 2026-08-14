@@ -102,31 +102,27 @@ impl QueryScheduler {
             self.free.push(idx);
             return Ok(());
         }
-        let mut events: Vec<(Subscription, u64, Option<Vec<u8>>)> = Vec::new();
+        let ensure_exists = self.ensure_exists;
         let complete = {
             let q = self.queries[idx].as_mut().unwrap();
             q.process(
                 txn,
                 |sub, lev| {
-                    let payload = if self.ensure_exists {
+                    let payload = if ensure_exists {
                         txn.get_u64(txn.env().dbis().event_payload, lev)
                             .ok()
                             .flatten()
-                            .map(|b| b.to_vec())
                     } else {
                         None
                     };
-                    if self.ensure_exists && payload.is_none() {
+                    if ensure_exists && payload.is_none() {
                         return;
                     }
-                    events.push((sub.clone(), lev, payload));
+                    on_event(sub, lev, payload);
                 },
                 time_budget_us,
             )?
         };
-        for (sub, lev, payload) in events {
-            on_event(&sub, lev, payload.as_deref());
-        }
         if complete {
             let q = self.queries[idx].take().unwrap();
             self.free.push(idx);

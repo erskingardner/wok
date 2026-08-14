@@ -397,34 +397,42 @@ pub fn write_events_with_policy<N: NegentropySink>(
     let mut indexed_through = None;
 
     for i in 0..evs.len() {
-        let packed_bytes = evs[i].packed.clone();
-        let packed = PackedEventView::new(&packed_bytes)?;
+        let (previous, current_and_after) = evs.split_at_mut(i);
+        let previous_packed = previous.last().map(|event| event.packed.as_slice());
+        let EventToWrite {
+            packed: packed_bytes,
+            json,
+            status,
+            lev_id,
+        } = &mut current_and_after[0];
+        let packed = PackedEventView::new(packed_bytes)?;
 
         if lookup_event_by_id(txn, packed.id())?.is_some()
-            || (i != 0 && evs[i].packed.get(0..32) == evs[i - 1].packed.get(0..32))
+            || previous_packed
+                .is_some_and(|previous| packed_bytes.get(0..32) == previous.get(0..32))
         {
-            evs[i].status = EventWriteStatus::Duplicate;
+            *status = EventWriteStatus::Duplicate;
             continue;
         }
 
         let is_vanish_request = packed.kind() == VANISH_KIND;
         if is_vanish_request
             && vanish_policy.enabled
-            && !vanish_policy.targets_this_relay_json(&evs[i].json)
+            && !vanish_policy.targets_this_relay_json(json)
         {
-            evs[i].status = EventWriteStatus::Deleted;
+            *status = EventWriteStatus::Deleted;
             continue;
         }
 
         if !is_vanish_request && is_event_vanished_rw(txn, packed)? {
-            evs[i].status = EventWriteStatus::Deleted;
+            *status = EventWriteStatus::Deleted;
             continue;
         }
 
         // NIP-62 requests cannot be removed or preemptively tombstoned by a
         // kind 5 event. Validity and duplicate checks still apply.
         if !is_vanish_request && deletion_exists(txn, packed.id(), packed.pubkey())? {
-            evs[i].status = EventWriteStatus::Deleted;
+            *status = EventWriteStatus::Deleted;
             continue;
         }
 
@@ -454,7 +462,7 @@ pub fn write_events_with_policy<N: NegentropySink>(
                 return Err(e);
             }
             if recipient_deleted {
-                evs[i].status = EventWriteStatus::Deleted;
+                *status = EventWriteStatus::Deleted;
                 continue;
             }
         }
@@ -487,14 +495,13 @@ pub fn write_events_with_policy<N: NegentropySink>(
                         .ok_or_else(|| DbError::msg("unable to lookup event by levId"))?;
                     let other_packed = PackedEventView::new(&buf)?;
                     if is_event_a_before_event_b(packed, other_packed) {
-                        evs[i].status = EventWriteStatus::Replaced;
+                        *status = EventWriteStatus::Replaced;
                     } else {
                         lev_ids_to_delete.push(lev);
                     }
                 }
 
-                if is_param_replaceable_kind(packed.kind())
-                    && evs[i].status == EventWriteStatus::Pending
+                if is_param_replaceable_kind(packed.kind()) && *status == EventWriteStatus::Pending
                 {
                     // Hash the raw d-tag bytes, like C++ (no UTF-8 round-trip).
                     let mut a_tag = Vec::with_capacity(24 + 64 + 1 + replace.len());
@@ -519,7 +526,7 @@ pub fn write_events_with_policy<N: NegentropySink>(
                                         return false;
                                     }
                                     if n >= packed.created_at() {
-                                        evs[i].status = EventWriteStatus::Deleted;
+                                        *status = EventWriteStatus::Deleted;
                                     }
                                 }
                                 Err(e) => {
@@ -623,16 +630,15 @@ pub fn write_events_with_policy<N: NegentropySink>(
             }
         }
 
-        if evs[i].status == EventWriteStatus::Pending {
+        if *status == EventWriteStatus::Pending {
             if is_vanish_request && vanish_policy.enabled {
                 mark_vanished(txn, packed.pubkey(), packed.created_at())?;
             }
-            let json = evs[i].json.clone();
-            let lev_id = insert_event(txn, &packed_bytes, &json)?;
-            indexed_through = Some(lev_id);
-            evs[i].lev_id = lev_id;
-            ne.update(PackedEventView::new(&packed_bytes)?, true)?;
-            evs[i].status = EventWriteStatus::Written;
+            let inserted_lev_id = insert_event(txn, packed_bytes, json)?;
+            indexed_through = Some(inserted_lev_id);
+            *lev_id = inserted_lev_id;
+            ne.update(packed, true)?;
+            *status = EventWriteStatus::Written;
 
             for lev in lev_ids_to_delete.drain(..) {
                 if let Some(buf) = lookup_event_by_levid(txn, lev)? {

@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plugin is configured.
 - NIP-50 search progress bookkeeping is written once per committed event batch
   instead of deleting and reinserting its metadata record for every event.
+- Batched database writes borrow packed events and normalized JSON in place,
+  avoiding two complete event copies per accepted publication.
 - The relay landing page now presents banner/icon media, operator and relay
   npubs, contact and policy links, linked and described supported NIPs, and the
   version with its source revision.

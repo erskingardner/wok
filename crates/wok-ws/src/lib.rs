@@ -35,6 +35,19 @@ pub async fn serve(handle: RelayHandle, bind: SocketAddr) -> Result<(), std::io:
     serve_listener(handle, listener).await
 }
 
+fn configure_accepted_stream(stream: &tokio::net::TcpStream, peer: SocketAddr, keepalive: bool) {
+    // Relay responses are commonly a sequence of small EVENT frames followed
+    // by EOSE. Nagle's algorithm can otherwise combine with delayed ACKs to
+    // add a roughly 40 ms pause between those frames on Linux.
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::warn!(%peer, %error, "failed to enable TCP_NODELAY");
+    }
+    if keepalive {
+        let sock_ref = socket2::SockRef::from(stream);
+        let _ = sock_ref.set_keepalive(true);
+    }
+}
+
 pub async fn serve_listener(
     handle: RelayHandle,
     listener: TcpListener,
@@ -57,10 +70,8 @@ pub async fn serve_listener(
                 }
             },
         };
-        if handle.config.read().relay.enable_tcp_keepalive {
-            let sock_ref = socket2::SockRef::from(&stream);
-            let _ = sock_ref.set_keepalive(true);
-        }
+        let keepalive = handle.config.read().relay.enable_tcp_keepalive;
+        configure_accepted_stream(&stream, peer, keepalive);
         let handle = handle.clone();
         let admin_state = admin_state.clone();
         tokio::spawn(async move {
@@ -721,5 +732,20 @@ mod landing_tests {
         assert!(html.contains("nostr-protocol/nips/blob/master/77.md"));
         assert!(html.contains(&format!("Wok {VERSION}")));
         assert!(html.contains(GIT_HASH.get(..8).unwrap_or(GIT_HASH)));
+    }
+
+    #[tokio::test]
+    async fn accepted_connections_disable_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        let client = client.unwrap();
+        let (server, peer) = accepted.unwrap();
+
+        configure_accepted_stream(&server, peer, false);
+
+        assert!(server.nodelay().unwrap());
+        drop(client);
     }
 }

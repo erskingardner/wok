@@ -86,6 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Accepted WebSocket connections now enable `TCP_NODELAY`, preventing Linux
+  delayed ACKs from adding roughly 40 ms between small EVENT and EOSE frames.
 - Historical result bursts no longer hit an undocumented 256-message queue
   and disconnect healthy clients before the configured pending-byte budget;
   deep author pagination and mixed read/write workloads now guard this path.

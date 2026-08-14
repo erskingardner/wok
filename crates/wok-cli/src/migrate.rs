@@ -381,6 +381,15 @@ fn prepare_strfry(
             ignored_keys.len()
         ));
     }
+    if ignored_keys
+        .iter()
+        .any(|key| key.split('.').next() == Some("plugins") && key.ends_with(".cmd"))
+    {
+        warnings.push(
+            "plugins.* arrays are not translated; set relay.write_policy_plugin to the plugin command"
+                .into(),
+        );
+    }
     if !active_source_processes.is_empty() {
         warnings.push(
             "the source database is open by another process; stop strfry before cutover".into(),

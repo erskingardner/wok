@@ -1165,43 +1165,159 @@ fn parse_u32s(s: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
+#[derive(Debug)]
+enum HoconFrame {
+    /// Named object (`relay {`) or an indexed array element (`0`).
+    Object(String),
+    /// Named array (`accept = [`). `next_index` numbers anonymous `{}` / `[]`
+    /// children so `plugins.accept = [ { cmd = "x" } ]` flattens to
+    /// `plugins.accept.0.cmd`.
+    Array { name: String, next_index: usize },
+}
+
+impl HoconFrame {
+    fn label(&self) -> &str {
+        match self {
+            Self::Object(name) | Self::Array { name, .. } => name,
+        }
+    }
+}
+
+fn hocon_prefix(stack: &[HoconFrame]) -> String {
+    stack
+        .iter()
+        .map(HoconFrame::label)
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn qualify_hocon(stack: &[HoconFrame], leaf: &str) -> String {
+    let prefix = hocon_prefix(stack);
+    if prefix.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{prefix}.{leaf}")
+    }
+}
+
+fn push_anonymous(stack: &mut Vec<HoconFrame>, frame: impl FnOnce(String) -> HoconFrame) {
+    let name = match stack.last_mut() {
+        Some(HoconFrame::Array { next_index, .. }) => {
+            let idx = *next_index;
+            *next_index += 1;
+            idx.to_string()
+        }
+        _ => String::new(),
+    };
+    stack.push(frame(name));
+}
+
+fn open_hocon_block(stack: &mut Vec<HoconFrame>, stmt: &str, opener: char) -> bool {
+    let Some(name) = stmt.strip_suffix(opener) else {
+        return false;
+    };
+    let name = name.trim().trim_end_matches('=').trim();
+    if opener == '{' {
+        if name.is_empty() {
+            push_anonymous(stack, HoconFrame::Object);
+        } else {
+            stack.push(HoconFrame::Object(name.to_string()));
+        }
+    } else if name.is_empty() {
+        push_anonymous(stack, |name| HoconFrame::Array {
+            name,
+            next_index: 0,
+        });
+    } else {
+        stack.push(HoconFrame::Array {
+            name: name.to_string(),
+            next_index: 0,
+        });
+    }
+    true
+}
+
+fn close_hocon_frame(
+    stack: &mut Vec<HoconFrame>,
+    lineno: usize,
+    closer: char,
+    expect_array: bool,
+) -> Result<(), String> {
+    match stack.pop() {
+        Some(HoconFrame::Array { .. }) if expect_array => Ok(()),
+        Some(HoconFrame::Object(_)) if !expect_array => Ok(()),
+        Some(frame) => {
+            let kind = if matches!(frame, HoconFrame::Array { .. }) {
+                "array"
+            } else {
+                "block"
+            };
+            let name = frame.label();
+            let where_ = if name.is_empty() {
+                format!("open {kind}")
+            } else {
+                format!("open {kind} {name}")
+            };
+            Err(format!(
+                "line {}: unmatched '{closer}' ({where_})",
+                lineno + 1
+            ))
+        }
+        None => Err(format!("line {}: unmatched '{closer}'", lineno + 1)),
+    }
+}
+
+fn take_array_index(stack: &mut [HoconFrame]) -> Option<usize> {
+    match stack.last_mut() {
+        Some(HoconFrame::Array { next_index, .. }) => {
+            let idx = *next_index;
+            *next_index += 1;
+            Some(idx)
+        }
+        _ => None,
+    }
+}
+
+fn strip_trailing_comma(mut val: String) -> String {
+    if val.ends_with(',') {
+        val.pop();
+    }
+    val
+}
+
 /// Minimal HOCON-subset tokenizer: quote-aware comment stripping (`#` and
-/// `//`), inline `{`/`}` handling, and quoted string values with backslash
-/// escapes.
+/// `//`), inline `{`/`}`/`[`/`]` handling, anonymous object blocks in
+/// arrays, and quoted string values with backslash escapes.
 fn parse_hocon(text: &str) -> Result<BTreeMap<String, String>, String> {
     let mut map = BTreeMap::new();
-    let mut stack: Vec<String> = Vec::new();
+    let mut stack: Vec<HoconFrame> = Vec::new();
     for (lineno, raw) in text.lines().enumerate() {
         for stmt in split_statements(raw) {
             let stmt = stmt.trim();
-            if stmt.is_empty() {
+            if stmt.is_empty() || stmt == "," {
                 continue;
             }
             if stmt == "}" {
-                if stack.pop().is_none() {
-                    return Err(format!("line {}: unmatched '}}'", lineno + 1));
-                }
+                close_hocon_frame(&mut stack, lineno, '}', false)?;
                 continue;
             }
-            if let Some(name) = stmt.strip_suffix('{') {
-                let name = name.trim().trim_end_matches('=').trim();
-                if name.is_empty() {
-                    return Err(format!("line {}: empty block name", lineno + 1));
-                }
-                stack.push(name.to_string());
+            if stmt == "]" {
+                close_hocon_frame(&mut stack, lineno, ']', true)?;
+                continue;
+            }
+            if open_hocon_block(&mut stack, stmt, '{') || open_hocon_block(&mut stack, stmt, '[') {
                 continue;
             }
             if let Some((k, v)) = stmt.split_once('=') {
-                let key = if stack.is_empty() {
-                    k.trim().to_string()
-                } else {
-                    format!("{}.{}", stack.join("."), k.trim())
-                };
-                let mut val = v.trim().to_string();
-                if val.ends_with(',') {
-                    val.pop();
-                }
-                let val = unquote(&val)?;
+                let key = qualify_hocon(&stack, k.trim());
+                let val = unquote(&strip_trailing_comma(v.trim().to_string()))?;
+                map.insert(key, val);
+                continue;
+            }
+            if let Some(idx) = take_array_index(&mut stack) {
+                let key = qualify_hocon(&stack, &idx.to_string());
+                let val = unquote(&strip_trailing_comma(stmt.to_string()))?;
                 map.insert(key, val);
                 continue;
             }
@@ -1209,13 +1325,13 @@ fn parse_hocon(text: &str) -> Result<BTreeMap<String, String>, String> {
         }
     }
     if !stack.is_empty() {
-        return Err(format!("unclosed block: {}", stack.join(".")));
+        return Err(format!("unclosed block: {}", hocon_prefix(&stack)));
     }
     Ok(map)
 }
 
-/// Split a line into statements on `{` and `}` (kept as their own
-/// statements), honoring quoted strings and `#`/`//` comments.
+/// Split a line into statements on `{`, `}`, `[`, and `]` (kept as their
+/// own statements), honoring quoted strings and `#`/`//` comments.
 fn split_statements(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -1241,20 +1357,20 @@ fn split_statements(line: &str) -> Vec<String> {
             }
             '#' => break,
             '/' if chars.peek() == Some(&'/') => break,
-            '{' => {
-                // Block opener stays glued to its name: "relay {".
-                cur.push('{');
+            '{' | '[' => {
+                // Opener stays glued to its name: "relay {" / "accept = [".
+                cur.push(c);
                 if !cur.trim().is_empty() {
                     out.push(cur.trim().to_string());
                 }
                 cur.clear();
             }
-            '}' => {
+            '}' | ']' => {
                 if !cur.trim().is_empty() {
                     out.push(cur.trim().to_string());
                 }
                 cur.clear();
-                out.push("}".to_string());
+                out.push(c.to_string());
             }
             _ => cur.push(c),
         }
@@ -1382,6 +1498,65 @@ mod tests {
             translation.ignored_keys,
             ["relay.info.nips", "relay.mystery"]
         );
+    }
+
+    #[test]
+    fn anonymous_objects_in_plugin_arrays_are_parsed_and_ignored() {
+        let translation = Config::translate_strfry(
+            r#"
+            db = "/tmp/db"
+            relay {
+                port = 7777
+                writePolicy {
+                    plugin = "/bin/true"
+                }
+            }
+            plugins {
+                accept = [
+                    {
+                        cmd = "./whitelist.js"
+                    },
+                    { cmd = "./rate-limit.js" }
+                ]
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(translation.config.relay.port, 7777);
+        assert_eq!(translation.config.relay.write_policy_plugin, "/bin/true");
+        assert_eq!(
+            translation.translated_keys,
+            ["db", "relay.port", "relay.writePolicy.plugin"]
+        );
+        assert_eq!(
+            translation.ignored_keys,
+            ["plugins.accept.0.cmd", "plugins.accept.1.cmd"]
+        );
+
+        let inline = Config::translate_strfry(
+            r#"plugins.accept = [ { cmd = "./whitelist.js" } ]
+               relay { port = 9000 }
+               "#,
+        )
+        .unwrap();
+        assert_eq!(inline.config.relay.port, 9000);
+        assert!(inline.config.relay.write_policy_plugin.is_empty());
+        assert_eq!(inline.ignored_keys, ["plugins.accept.0.cmd"]);
+    }
+
+    #[test]
+    fn hocon_array_delimiters_must_match() {
+        assert!(
+            Config::parse_strfry("plugins { accept = [ { cmd = \"x\" } }\n")
+                .unwrap_err()
+                .contains("unmatched '}'")
+        );
+        assert!(Config::parse_strfry("relay { port = 1 ]\n")
+            .unwrap_err()
+            .contains("unmatched ']'"));
+        assert!(Config::parse_strfry("plugins { accept = [\n")
+            .unwrap_err()
+            .contains("unclosed block"));
     }
 
     #[test]

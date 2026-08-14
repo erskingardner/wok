@@ -6,7 +6,11 @@ defaults below; unknown keys, wrong types, invalid admin URLs, invalid log
 filters, and out-of-range history settings are rejected.
 
 The legacy HOCON-subset reader is used only for explicit strfry migration.
-Normal startup, validation, dashboard writes, and file watching use TOML.
+It accepts named objects, arrays, and anonymous object blocks inside arrays
+(for example `plugins.accept = [ { cmd = "..." } ]`). Those plugin-array
+entries are reported as ignored keys; Wok translates only
+`relay.writePolicy.plugin` into `relay.write_policy_plugin`. Normal startup,
+validation, dashboard writes, and file watching use TOML.
 
 ## Reload and dashboard boundaries
 

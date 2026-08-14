@@ -81,7 +81,11 @@ Migration parses the supported strfry HOCON subset and writes a strict TOML
 config. Unsupported keys are not copied, and external integrations may not have
 identical semantics. Before starting Wok, review at least:
 
-- write-policy plugin commands, users, permissions, and timeouts;
+- write-policy plugin commands, users, permissions, and timeouts. HOCON
+  arrays of anonymous objects (for example `plugins.accept = [ { cmd = "..." } ]`)
+  parse and appear in the ignored-key list; they are not translated. Wok
+  accepts a single `relay.write_policy_plugin` command, which maps from
+  `relay.writePolicy.plugin`;
 - `relay.info.nips`, which Wok replaces with its runtime capability catalog;
 - ephemeral-event policy: migrated records remain intact and age out normally,
   while newly accepted ephemeral kinds are live-only unless you explicitly set

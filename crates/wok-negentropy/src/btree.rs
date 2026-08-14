@@ -103,9 +103,11 @@ impl Node {
         let accum_count = read_u64();
         let next_sibling = read_u64();
         let prev_sibling = read_u64();
-        if num_items > MAX_ITEMS as u64 {
+        // Zero-item nodes are never persisted (erase deletes them) and larger
+        // counts are impossible: both indicate crafted/corrupt data at rest.
+        if num_items == 0 || num_items > MAX_ITEMS as u64 {
             return Err(NegError::msg(format!(
-                "negentropy node item count {num_items} exceeds {MAX_ITEMS}"
+                "negentropy node item count {num_items} out of range 1..={MAX_ITEMS}"
             )));
         }
         let mut accum = crate::types::Accumulator::default();
@@ -167,6 +169,9 @@ mod encoding_tests {
     fn malformed_persisted_item_count_is_rejected() {
         let mut bytes = Node::default().encode_bytes();
         bytes[..8].copy_from_slice(&((MAX_ITEMS + 1) as u64).to_ne_bytes());
+        assert!(Node::from_bytes(&bytes).is_err());
+        // Zero-item nodes are never persisted and rejected at decode.
+        let bytes = Node::default().encode_bytes();
         assert!(Node::from_bytes(&bytes).is_err());
     }
 }

@@ -143,10 +143,42 @@ fn check_metadata_tables(txn: &RoTxn<'_>, report: &mut IntegrityReport) -> Resul
                 "negentropy",
                 format!("key has {} bytes, expected 16", key.len()),
             );
+            return true;
         }
-        if value.is_empty() {
+        // node_id == 0 is the per-tree metadata record (root || next ids).
+        if u64::from_ne_bytes(key[8..16].try_into().unwrap()) == 0 {
+            if value.len() != 16 {
+                report.malformed_records += 1;
+                report.issue(
+                    "malformed-value",
+                    "negentropy",
+                    format!("metadata value has {} bytes, expected 16", value.len()),
+                );
+            }
+            return true;
+        }
+        // B-tree node record: fixed 3952-byte encoding (32-byte header +
+        // 32-byte accumulator + 81 keys x 48 bytes), num_items in 1..=80 —
+        // zero-item nodes are never persisted and larger counts are rejected
+        // at decode time.
+        const NODE_SIZE: usize = 3952;
+        if value.len() != NODE_SIZE {
             report.malformed_records += 1;
-            report.issue("malformed-value", "negentropy", "empty value".into());
+            report.issue(
+                "malformed-value",
+                "negentropy",
+                format!("node has {} bytes, expected {NODE_SIZE}", value.len()),
+            );
+            return true;
+        }
+        let num_items = u64::from_ne_bytes(value[..8].try_into().unwrap());
+        if !(1..=80).contains(&num_items) {
+            report.malformed_records += 1;
+            report.issue(
+                "malformed-value",
+                "negentropy",
+                format!("node has num_items {num_items}, expected 1..=80"),
+            );
         }
         true
     })?;

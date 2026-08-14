@@ -196,8 +196,10 @@ for repetition in $(seq 1 "$REPETITIONS"); do
 done
 
 remote_command "$LOAD_SSH" mkdir -p "/opt/wok-load/results/$CAMPAIGN_ID"
-scp "${SSH_OPTIONS[@]}" -3 -q -r "$RELAY_SSH:$CAMPAIGN_ROOT/." \
-    "$LOAD_SSH:/opt/wok-load/results/$CAMPAIGN_ID/"
+printf -v source_root '%q' "$CAMPAIGN_ROOT"
+printf -v destination_root '%q' "/opt/wok-load/results/$CAMPAIGN_ID"
+ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" "tar -C $source_root -czf - ." | \
+    ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "tar -C $destination_root -xzf -"
 ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" "$CONTROL_REMOTE status" | \
     ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" \
         "cat > $(printf '%q' "/opt/wok-load/results/$CAMPAIGN_ID/final-relay-status.txt")"

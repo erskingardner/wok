@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Event validation no longer clones the complete parsed JSON value after
   producing the packed event and normalized persistence JSON.
+- The relay writer skips reparsing normalized event JSON when no write-policy
+  plugin is configured.
 - The relay landing page now presents banner/icon media, operator and relay
   npubs, contact and policy links, linked and described supported NIPs, and the
   version with its source revision.

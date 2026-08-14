@@ -1572,23 +1572,25 @@ fn run_writer(
                 if closed.contains(&conn_id) {
                     continue;
                 }
-                // Unix-socket connections carry no IP; they are reported to
-                // write-policy plugins as sourceType "unix" (wok extension).
-                let source_type = if ip.is_empty() {
-                    "unix"
-                } else if ip.len() == 4 {
-                    "IP4"
-                } else {
-                    "IP6"
-                };
-                let source_info = render_ip(&ip);
-                let ev_json: Value = serde_json::from_str(&json).unwrap_or(json!({}));
                 let mut ok_msg = String::new();
                 let is_vanish_request =
                     PackedEventView::new(&packed).is_ok_and(|event| event.kind() == VANISH_KIND);
-                let res = if is_vanish_request {
+                let res = if is_vanish_request || cfg_snap.relay.write_policy_plugin.is_empty() {
                     PluginResult::Accept
                 } else {
+                    // Unix-socket connections carry no IP; they are reported
+                    // to write-policy plugins as sourceType "unix" (wok
+                    // extension). Event JSON is parsed only when a plugin will
+                    // consume it; the normal empty-plugin path remains packed.
+                    let source_type = if ip.is_empty() {
+                        "unix"
+                    } else if ip.len() == 4 {
+                        "IP4"
+                    } else {
+                        "IP6"
+                    };
+                    let source_info = render_ip(&ip);
+                    let ev_json: Value = serde_json::from_str(&json).unwrap_or(json!({}));
                     plugin.accept_event(
                         &cfg_snap.relay.write_policy_plugin,
                         &ev_json,

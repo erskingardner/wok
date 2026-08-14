@@ -7,16 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-14
+
+### Added
+
+- The scheduled fuzz campaign now also covers btree node decoding, the
+  flatbuffers decoders, and non-empty vector handling.
+
 ### Changed
 
+- WebSocket frame handling, the event write pipeline, and event protocol
+  parsing were streamlined to reduce per-frame and per-event allocations.
 - README benchmark results now reflect the complete post-hardening two-host and
   same-host campaign at `fa9b061`.
+- Size-class configuration settings are clamped to a 16 MiB ceiling, abuse
+  budgets and guards now surface "0 = unlimited" instead of failing closed,
+  configuring `real_ip_header` warns loudly, and security-scope changes are
+  warn-logged on hot reload.
+- Security documentation now records that the mesh CLI dials arbitrary URLs by
+  design, that precomputed negentropy trees interact with restricted kinds,
+  the semantics of `restrict_read_to_involved_pubkey = false`, the
+  CRIME/BREACH caveat on `compression_sliding_window`, and that `/metrics` is
+  public and cross-origin readable.
 
 ### Fixed
 
-- Orderly Unix transport shutdown removes its own socket pathname by tracking
-  the pathname's filesystem identity across the atomic bind rename, while
-  preserving a socket that replaced it.
+- Negentropy reconciliation bounds its work and propagates storage errors,
+  rejects zero-item nodes, validates node structure on migration, and no
+  longer underflows on zero-item btree nodes.
+- The Unix transport closes its socket-path race windows and, on orderly
+  shutdown, removes its own socket pathname by tracking the pathname's
+  filesystem identity across the atomic bind rename, while preserving a
+  socket that replaced it.
+- The CLI resolves `lsof` at absolute paths during migration, exits quietly on
+  EPIPE instead of panicking, validates router `connectionTimeout` against a
+  ceiling, splits `parse_mesh_time` on char boundaries, bounds stdin line
+  buffering in import/upload/monitor, bounds stream/router buffering of
+  unverified mesh events, and bounds `wok sync` memory growth from malicious
+  peers.
+- Search scans short-circuit when the limit is 0, COUNT dedup-set growth is
+  bounded by a total budget, and the query scheduler recycles its slot on scan
+  error.
+- LMDB index values are length-checked before u64 conversion, and the fbs
+  decoder rejects negative vtable offsets.
+- `unix.mode` is masked to permission bits, per-pubkey quota memos survive
+  across writer batches, and plugin roundtrips get one overall deadline.
+
+### Security
+
+- The landing page escapes `GIT_HASH` in its template, the admin dashboard
+  pins its inline script by CSP hash and burns replay-cache IDs only after a
+  2xx response, and plain HTTP endpoints are rate-limited through the
+  connection budget.
 
 ## [0.2.0] - 2026-08-14
 
@@ -180,6 +222,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protected-event publishing and restricted reads require the appropriate
   authenticated author or recipient relationship.
 
-[Unreleased]: https://github.com/erskingardner/wok/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/erskingardner/wok/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/erskingardner/wok/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/erskingardner/wok/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/erskingardner/wok/releases/tag/v0.1.0

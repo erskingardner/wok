@@ -1,5 +1,7 @@
 //! Transactions and cursors. mmap slices are valid only for `&self` of the txn.
 
+#![allow(unsafe_code)]
+
 use crate::env::Env;
 use crate::error::check;
 use crate::keys::u64_from_ne;
@@ -7,6 +9,7 @@ use crate::DbError;
 use lmdb_sys::*;
 use std::marker::PhantomData;
 use std::ptr;
+use std::rc::Rc;
 
 type Kv<'a> = (&'a [u8], &'a [u8]);
 
@@ -14,12 +17,16 @@ pub struct RoTxn<'env> {
     pub(crate) txn: *mut MDB_txn,
     pub(crate) env: &'env Env,
     committed: bool,
+    lifetime: (),
+    _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 pub struct RwTxn<'env> {
     pub(crate) txn: *mut MDB_txn,
     pub(crate) env: &'env Env,
     committed: bool,
+    lifetime: (),
+    _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl<'env> RoTxn<'env> {
@@ -37,11 +44,13 @@ impl<'env> RoTxn<'env> {
             txn,
             env,
             committed: false,
+            lifetime: (),
+            _not_send_or_sync: PhantomData,
         })
     }
 
     pub fn get<'a>(&'a self, dbi: MDB_dbi, key: &[u8]) -> Result<Option<&'a [u8]>, DbError> {
-        get_raw(self.txn, dbi, key)
+        get_raw(self.txn, dbi, key, &self.lifetime)
     }
 
     pub fn get_u64(&self, dbi: MDB_dbi, key: u64) -> Result<Option<&[u8]>, DbError> {
@@ -49,7 +58,7 @@ impl<'env> RoTxn<'env> {
     }
 
     pub fn cursor(&self, dbi: MDB_dbi) -> Result<Cursor<'_>, DbError> {
-        Cursor::open(self.txn, dbi)
+        Cursor::open(self.txn, dbi, &self.lifetime)
     }
 
     pub fn env(&self) -> &'env Env {
@@ -58,10 +67,6 @@ impl<'env> RoTxn<'env> {
 
     pub fn entries(&self, dbi: MDB_dbi) -> Result<usize, DbError> {
         dbi_entries(self.txn, dbi)
-    }
-
-    pub fn raw(&self) -> *mut MDB_txn {
-        self.txn
     }
 
     pub fn foreach_full<F>(
@@ -102,11 +107,13 @@ impl<'env> RwTxn<'env> {
             txn,
             env,
             committed: false,
+            lifetime: (),
+            _not_send_or_sync: PhantomData,
         })
     }
 
     pub fn get<'a>(&'a self, dbi: MDB_dbi, key: &[u8]) -> Result<Option<&'a [u8]>, DbError> {
-        get_raw(self.txn, dbi, key)
+        get_raw(self.txn, dbi, key, &self.lifetime)
     }
 
     pub fn get_u64(&self, dbi: MDB_dbi, key: u64) -> Result<Option<&[u8]>, DbError> {
@@ -147,7 +154,7 @@ impl<'env> RwTxn<'env> {
     }
 
     pub fn cursor(&self, dbi: MDB_dbi) -> Result<Cursor<'_>, DbError> {
-        Cursor::open(self.txn, dbi)
+        Cursor::open(self.txn, dbi, &self.lifetime)
     }
 
     pub fn env(&self) -> &'env Env {
@@ -156,10 +163,6 @@ impl<'env> RwTxn<'env> {
 
     pub fn entries(&self, dbi: MDB_dbi) -> Result<usize, DbError> {
         dbi_entries(self.txn, dbi)
-    }
-
-    pub fn raw(&self) -> *mut MDB_txn {
-        self.txn
     }
 
     pub fn foreach_full<F>(
@@ -206,7 +209,7 @@ fn mdb_val(bytes: &[u8]) -> MDB_val {
     }
 }
 
-fn slice_from_val<'a>(v: &MDB_val) -> &'a [u8] {
+fn slice_from_val<'a>(v: &MDB_val, _transaction_lifetime: &'a ()) -> &'a [u8] {
     if v.mv_size == 0 || v.mv_data.is_null() {
         &[]
     } else {
@@ -214,7 +217,12 @@ fn slice_from_val<'a>(v: &MDB_val) -> &'a [u8] {
     }
 }
 
-fn get_raw<'a>(txn: *mut MDB_txn, dbi: MDB_dbi, key: &[u8]) -> Result<Option<&'a [u8]>, DbError> {
+fn get_raw<'a>(
+    txn: *mut MDB_txn,
+    dbi: MDB_dbi,
+    key: &[u8],
+    transaction_lifetime: &'a (),
+) -> Result<Option<&'a [u8]>, DbError> {
     let mut k = mdb_val(key);
     let mut v = MDB_val {
         mv_size: 0,
@@ -225,7 +233,7 @@ fn get_raw<'a>(txn: *mut MDB_txn, dbi: MDB_dbi, key: &[u8]) -> Result<Option<&'a
         return Ok(None);
     }
     check(rc)?;
-    Ok(Some(slice_from_val(&v)))
+    Ok(Some(slice_from_val(&v, transaction_lifetime)))
 }
 
 fn put_raw(
@@ -285,21 +293,28 @@ fn largest_integer_key(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<u64, DbError> 
     if k.mv_size != 8 {
         return Err(DbError::msg("integer key size != 8"));
     }
-    Ok(u64_from_ne(slice_from_val(&k)))
+    let transaction_lifetime = ();
+    Ok(u64_from_ne(slice_from_val(&k, &transaction_lifetime)))
 }
 
 pub struct Cursor<'txn> {
     cursor: *mut MDB_cursor,
-    _marker: PhantomData<&'txn ()>,
+    transaction_lifetime: &'txn (),
+    _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl<'txn> Cursor<'txn> {
-    fn open(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<Self, DbError> {
+    fn open(
+        txn: *mut MDB_txn,
+        dbi: MDB_dbi,
+        transaction_lifetime: &'txn (),
+    ) -> Result<Self, DbError> {
         let mut cursor = ptr::null_mut();
         unsafe { check(mdb_cursor_open(txn, dbi, &mut cursor))? };
         Ok(Self {
             cursor,
-            _marker: PhantomData,
+            transaction_lifetime,
+            _not_send_or_sync: PhantomData,
         })
     }
 
@@ -328,7 +343,10 @@ impl<'txn> Cursor<'txn> {
             return Ok(None);
         }
         check(rc)?;
-        Ok(Some((slice_from_val(&k), slice_from_val(&v))))
+        Ok(Some((
+            slice_from_val(&k, self.transaction_lifetime),
+            slice_from_val(&v, self.transaction_lifetime),
+        )))
     }
 
     pub fn count(&mut self) -> Result<usize, DbError> {
@@ -363,7 +381,7 @@ fn dbi_entries(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<usize, DbError> {
 /// must use `MDB_SET_RANGE` or they return `MDB_INCOMPATIBLE`.
 ///
 /// Returns `Ok(true)` if the scan finished, `Ok(false)` if the callback stopped it.
-pub fn foreach_full<F>(
+fn foreach_full<F>(
     txn: *mut MDB_txn,
     dbi: MDB_dbi,
     start_key: &[u8],
@@ -375,7 +393,9 @@ where
     F: FnMut(&[u8], &[u8]) -> bool,
 {
     let dups = dbi_flags(txn, dbi)? & MDB_DUPSORT != 0;
-    let mut cursor = Cursor::open(txn, dbi)?;
+    // Values are only exposed to the callback while this function is active.
+    let transaction_lifetime = ();
+    let mut cursor = Cursor::open(txn, dbi, &transaction_lifetime)?;
     let first = if reverse {
         if dups {
             position_reverse_dup(&mut cursor, start_key, start_dup)?

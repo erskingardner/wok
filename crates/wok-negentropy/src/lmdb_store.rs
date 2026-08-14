@@ -135,8 +135,12 @@ impl<'a, 'env> LmdbRwBackend<'a, 'env> {
         let dbi = self.txn.env().dbis().negentropy;
         let dirty = std::mem::take(&mut self.dirty);
         for (node_id, node) in &dirty {
-            self.txn
-                .put(dbi, &tree_key(self.tree_id, *node_id), node.as_bytes(), 0)?;
+            self.txn.put(
+                dbi,
+                &tree_key(self.tree_id, *node_id),
+                &node.encode_bytes(),
+                0,
+            )?;
         }
         if self.meta != self.orig_meta {
             self.txn

@@ -1,12 +1,9 @@
 //! Persistent B-tree matching `negentropy/storage/btree/core.h`.
 //!
-//! Node layout is `#[repr(C)]` and must remain byte-compatible with C++ strfry
-//! on little-endian hosts (the only platforms C++ fried/negentropy support).
-//!
-//! # Safety
-//!
-//! `Node::from_bytes` / `as_bytes` transmute a packed C layout. Callers must
-//! only pass buffers of `NODE_SIZE` bytes produced by this crate or C++ strfry.
+//! Node encoding remains byte-compatible with C++ strfry on little-endian
+//! hosts, but fields are encoded explicitly instead of copying Rust struct
+//! memory. This removes layout, padding, alignment, and validity assumptions
+//! from the persistent-data boundary.
 
 #![allow(clippy::field_reassign_with_default)]
 
@@ -18,7 +15,6 @@ pub const MIN_ITEMS: usize = 30;
 pub const REBALANCE_THRESHOLD: usize = 60;
 pub const MAX_ITEMS: usize = 80;
 
-#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Key {
     pub item: Item,
@@ -34,7 +30,6 @@ impl Key {
     }
 }
 
-#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Node {
     pub num_items: u64,
@@ -45,7 +40,11 @@ pub struct Node {
     pub items: [Key; MAX_ITEMS + 1],
 }
 
-pub const NODE_SIZE: usize = std::mem::size_of::<Node>();
+const HEADER_SIZE: usize = 4 * std::mem::size_of::<u64>();
+const ACCUMULATOR_SIZE: usize = 32;
+const ITEM_SIZE: usize = std::mem::size_of::<u64>() + 32;
+const KEY_SIZE: usize = ITEM_SIZE + std::mem::size_of::<u64>();
+pub const NODE_SIZE: usize = HEADER_SIZE + ACCUMULATOR_SIZE + (MAX_ITEMS + 1) * KEY_SIZE;
 
 impl Default for Node {
     fn default() -> Self {
@@ -61,8 +60,30 @@ impl Default for Node {
 }
 
 impl Node {
-    pub fn as_bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self as *const Node as *const u8, NODE_SIZE) }
+    pub fn encode_bytes(&self) -> [u8; NODE_SIZE] {
+        let mut bytes = [0u8; NODE_SIZE];
+        let mut offset = 0;
+        for value in [
+            self.num_items,
+            self.accum_count,
+            self.next_sibling,
+            self.prev_sibling,
+        ] {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+            offset += 8;
+        }
+        bytes[offset..offset + ACCUMULATOR_SIZE].copy_from_slice(&self.accum.buf);
+        offset += ACCUMULATOR_SIZE;
+        for key in &self.items {
+            bytes[offset..offset + 8].copy_from_slice(&key.item.timestamp.to_ne_bytes());
+            offset += 8;
+            bytes[offset..offset + 32].copy_from_slice(&key.item.id);
+            offset += 32;
+            bytes[offset..offset + 8].copy_from_slice(&key.node_id.to_ne_bytes());
+            offset += 8;
+        }
+        debug_assert_eq!(offset, NODE_SIZE);
+        bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NegError> {
@@ -72,15 +93,81 @@ impl Node {
                 bytes.len()
             )));
         }
-        let mut node = Node::default();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                &mut node as *mut Node as *mut u8,
-                NODE_SIZE,
-            );
+        let mut offset = 0;
+        let mut read_u64 = || {
+            let value = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            value
+        };
+        let num_items = read_u64();
+        let accum_count = read_u64();
+        let next_sibling = read_u64();
+        let prev_sibling = read_u64();
+        if num_items > MAX_ITEMS as u64 {
+            return Err(NegError::msg(format!(
+                "negentropy node item count {num_items} exceeds {MAX_ITEMS}"
+            )));
         }
-        Ok(node)
+        let mut accum = crate::types::Accumulator::default();
+        accum
+            .buf
+            .copy_from_slice(&bytes[offset..offset + ACCUMULATOR_SIZE]);
+        offset += ACCUMULATOR_SIZE;
+        let mut items = [Key::default(); MAX_ITEMS + 1];
+        for key in &mut items {
+            key.item.timestamp = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            key.item.id.copy_from_slice(&bytes[offset..offset + 32]);
+            offset += 32;
+            key.node_id = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+        }
+        debug_assert_eq!(offset, NODE_SIZE);
+        Ok(Node {
+            num_items,
+            accum_count,
+            next_sibling,
+            prev_sibling,
+            accum,
+            items,
+        })
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_node_encoding_roundtrips_and_keeps_cpp_size() {
+        assert_eq!(NODE_SIZE, 3_952);
+        let mut node = Node {
+            num_items: 1,
+            accum_count: 9,
+            next_sibling: 12,
+            prev_sibling: 4,
+            ..Node::default()
+        };
+        node.accum.buf = [7; 32];
+        node.items[0] = Key {
+            item: Item::new(123, &[5; 32]).unwrap(),
+            node_id: 456,
+        };
+        let decoded = Node::from_bytes(&node.encode_bytes()).unwrap();
+        assert_eq!(decoded.num_items, node.num_items);
+        assert_eq!(decoded.accum_count, node.accum_count);
+        assert_eq!(decoded.next_sibling, node.next_sibling);
+        assert_eq!(decoded.prev_sibling, node.prev_sibling);
+        assert_eq!(decoded.accum.buf, node.accum.buf);
+        assert_eq!(decoded.items[0].item, node.items[0].item);
+        assert_eq!(decoded.items[0].node_id, node.items[0].node_id);
+    }
+
+    #[test]
+    fn malformed_persisted_item_count_is_rejected() {
+        let mut bytes = Node::default().encode_bytes();
+        bytes[..8].copy_from_slice(&((MAX_ITEMS + 1) as u64).to_ne_bytes());
+        assert!(Node::from_bytes(&bytes).is_err());
     }
 }
 

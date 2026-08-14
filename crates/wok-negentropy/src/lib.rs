@@ -3,6 +3,8 @@
 //! Byte-compatible with C++ strfry's `external/negentropy` at the pinned
 //! reference commit. Protocol version `0x61` (NIP-77 v1).
 
+#![forbid(unsafe_code)]
+
 mod btree;
 mod cache;
 mod encoding;

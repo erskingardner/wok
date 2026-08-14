@@ -11,3 +11,21 @@
   Stop the relay and all DB utilities first; promotion retains the original
   database as a sibling backup rather than modifying it in place.
 - Do not expose the Unix socket on a shared host without UID/GID policy and `0600` mode.
+
+## Memory-safety boundary
+
+Safe crates forbid `unsafe` Rust. Crates that require operating-system or LMDB
+FFI deny it by default and allow it only in the explicitly audited modules.
+`unsafe_op_in_unsafe_fn` is denied so every pointer dereference and FFI
+operation remains visible at the exact call site.
+
+The relay's unavoidable high-risk boundary is LMDB: environment, transaction,
+cursor, comparator, and mmap value pointers. Transaction and cursor wrappers
+are explicitly neither `Send` nor `Sync`; mmap-backed slices are tied to a
+live transaction/cursor anchor and cannot outlive it through the safe API. Raw
+transaction pointers are not exposed. Negentropy nodes use explicit native-
+endian field encoding rather than copying Rust struct memory.
+
+Release builds use `panic = "abort"`, preventing unwinding across C callback
+frames. Comparator functions are total over arbitrary byte strings and have
+property tests for malformed database keys.

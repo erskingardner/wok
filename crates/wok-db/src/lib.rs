@@ -6,6 +6,8 @@
 //! must never cross a Tokio `.await` point. Callers should run database work on
 //! dedicated OS threads and copy results into owned values before awaiting.
 
+#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
+
 pub mod comparators;
 pub mod env;
 pub mod error;

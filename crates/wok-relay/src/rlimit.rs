@@ -1,5 +1,7 @@
 //! Process resource limits, mirroring C++ `onAppStartup.cpp` `setRLimits`.
 
+#![allow(unsafe_code)]
+
 /// Apply `relay.nofiles` (0 = don't attempt). On macOS/FreeBSD the requested
 /// value is clamped to the hard limit like C++; on Linux exceeding the hard
 /// limit is an error.

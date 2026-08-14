@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use serde::Serialize;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};

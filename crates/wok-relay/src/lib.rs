@@ -1,5 +1,7 @@
 //! Transport-neutral Nostr relay core.
 
+#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
+
 pub mod abuse;
 pub mod capabilities;
 pub mod config;

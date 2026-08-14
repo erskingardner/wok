@@ -1,3 +1,5 @@
+#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::BufRead;

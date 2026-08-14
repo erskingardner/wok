@@ -2,6 +2,8 @@
 //!
 //! Frame: 4-byte big-endian payload length + UTF-8 JSON Nostr message.
 
+#![forbid(unsafe_code)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;

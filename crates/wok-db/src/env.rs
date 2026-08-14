@@ -9,6 +9,8 @@
 //! - mmap-backed slices returned by get/cursor are only valid for the
 //!   originating transaction's lifetime and must not cross `.await`.
 
+#![allow(unsafe_code)]
+
 use crate::comparators::{
     lmdb_comparator_string_u64, lmdb_comparator_string_u64_u64, lmdb_comparator_u64_u64,
 };
@@ -93,7 +95,14 @@ pub struct EnvInner {
     pub read_only: bool,
 }
 
+// SAFETY: LMDB permits one environment handle to be shared across threads.
+// Wok never moves transactions or cursors between threads; those wrappers are
+// explicitly !Send and !Sync. `EnvInner::drop` runs only after the final Arc,
+// so no transaction can retain the environment pointer past close.
 unsafe impl Send for EnvInner {}
+// SAFETY: All mutable LMDB operations happen through LMDB transactions, and
+// LMDB serializes writers internally. The immutable DBI/path fields are opened
+// once and remain valid until `mdb_env_close`.
 unsafe impl Sync for EnvInner {}
 
 impl Drop for EnvInner {

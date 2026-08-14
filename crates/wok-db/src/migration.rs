@@ -1,5 +1,7 @@
 //! Read-only snapshot and verification helpers for strfry migration.
 
+#![allow(unsafe_code)]
+
 use crate::{foreach_event_from, DbError, Env, EnvOptions};
 use lmdb_sys::{
     mdb_env_close, mdb_env_copy2, mdb_env_create, mdb_env_open, MDB_CP_COMPACT, MDB_NORDAHEAD,

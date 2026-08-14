@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

@@ -9,6 +9,8 @@
 //! - A trial with missing events, unexpected rejections, or dropped
 //!   deliveries is recorded as `ok=false` (correctness before speed).
 
+#![forbid(unsafe_code)]
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};

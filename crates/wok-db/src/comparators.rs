@@ -7,6 +7,8 @@
 //!
 //! `StringUint64Uint64`: memcmp on the string prefix, then two native-endian u64s.
 
+#![allow(unsafe_code)]
+
 use lmdb_sys::MDB_val;
 use std::cmp::Ordering;
 use std::os::raw::c_int;
@@ -127,14 +129,13 @@ pub fn cmp_string_u64_u64(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
-fn val_slice<'a>(v: *const MDB_val) -> &'a [u8] {
-    unsafe {
-        let v = &*v;
-        if v.mv_size == 0 || v.mv_data.is_null() {
-            &[]
-        } else {
-            std::slice::from_raw_parts(v.mv_data as *const u8, v.mv_size)
-        }
+fn val_slice(v: &MDB_val) -> &[u8] {
+    if v.mv_size == 0 || v.mv_data.is_null() {
+        &[]
+    } else {
+        // SAFETY: the caller obtained `v` from LMDB for the duration of the
+        // comparator callback, and LMDB guarantees `mv_data` spans `mv_size`.
+        unsafe { std::slice::from_raw_parts(v.mv_data as *const u8, v.mv_size) }
     }
 }
 
@@ -150,6 +151,8 @@ fn ord_to_c(o: Ordering) -> c_int {
 /// `a` and `b` must be valid pointers to `MDB_val` values provided by LMDB
 /// for the duration of this call.
 pub unsafe extern "C" fn lmdb_comparator_string_u64(a: *const MDB_val, b: *const MDB_val) -> c_int {
+    // SAFETY: upheld by LMDB's comparator callback contract.
+    let (a, b) = unsafe { (&*a, &*b) };
     ord_to_c(cmp_string_u64(val_slice(a), val_slice(b)))
 }
 
@@ -157,6 +160,8 @@ pub unsafe extern "C" fn lmdb_comparator_string_u64(a: *const MDB_val, b: *const
 /// `a` and `b` must be valid pointers to `MDB_val` values provided by LMDB
 /// for the duration of this call.
 pub unsafe extern "C" fn lmdb_comparator_u64_u64(a: *const MDB_val, b: *const MDB_val) -> c_int {
+    // SAFETY: upheld by LMDB's comparator callback contract.
+    let (a, b) = unsafe { (&*a, &*b) };
     ord_to_c(cmp_u64_u64(val_slice(a), val_slice(b)))
 }
 
@@ -167,6 +172,8 @@ pub unsafe extern "C" fn lmdb_comparator_string_u64_u64(
     a: *const MDB_val,
     b: *const MDB_val,
 ) -> c_int {
+    // SAFETY: upheld by LMDB's comparator callback contract.
+    let (a, b) = unsafe { (&*a, &*b) };
     ord_to_c(cmp_string_u64_u64(val_slice(a), val_slice(b)))
 }
 

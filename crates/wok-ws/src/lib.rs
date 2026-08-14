@@ -4,6 +4,8 @@
 //! (`frame` module) so wok can offer permessage-deflate like C++ uWS
 //! (tungstenite and fastwebsockets have no extension support).
 
+#![forbid(unsafe_code)]
+
 mod admin;
 pub mod frame;
 

@@ -27,7 +27,6 @@ impl TryFrom<u64> for Mode {
     }
 }
 
-#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Item {
     pub timestamp: u64,
@@ -141,7 +140,6 @@ impl Ord for Bound {
     }
 }
 
-#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Accumulator {
     pub buf: [u8; ID_SIZE],

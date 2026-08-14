@@ -1,5 +1,7 @@
 //! Shared helpers for C++/Rust differential tests.
 
+#![forbid(unsafe_code)]
+
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
 use std::path::PathBuf;

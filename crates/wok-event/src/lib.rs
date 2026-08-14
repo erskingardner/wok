@@ -3,6 +3,8 @@
 //! Byte layouts and validation rules follow C++ strfry at
 //! `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`.
 
+#![forbid(unsafe_code)]
+
 mod bech32;
 mod error;
 mod hash;

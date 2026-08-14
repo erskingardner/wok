@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod filter;
 pub mod hll;
 pub mod monitor;

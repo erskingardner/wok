@@ -902,6 +902,58 @@ impl Config {
         changes
     }
 
+    /// Warnings for every zero-valued guard that silently means "unlimited"
+    /// (all editable live through the dashboard). Surfaced on reload so a
+    /// single zero can't silently disarm a guard.
+    pub fn zero_guard_warnings(&self) -> Vec<String> {
+        let a = &self.relay.abuse;
+        let mut warnings = Vec::new();
+        if a.enabled {
+            for (name, rate, burst) in [
+                (
+                    "connection",
+                    a.connection_rate_per_second,
+                    a.connection_burst,
+                ),
+                ("event", a.event_rate_per_second, a.event_burst),
+                (
+                    "pubkey_event",
+                    a.pubkey_event_rate_per_second,
+                    a.pubkey_event_burst,
+                ),
+                ("req", a.req_rate_per_second, a.req_burst),
+                ("count", a.count_rate_per_second, a.count_burst),
+            ] {
+                if rate == 0 || burst == 0 {
+                    warnings.push(format!(
+                        "relay.abuse {name} budget is zero — that token bucket is disabled (unlimited)"
+                    ));
+                }
+            }
+            if a.max_query_cost == 0 {
+                warnings.push("relay.abuse.max_query_cost is zero — unlimited".to_string());
+            }
+            if a.max_stored_events == 0 {
+                warnings.push("relay.abuse.max_stored_events is zero — unlimited".to_string());
+            }
+            if a.max_stored_events_per_pubkey == 0 {
+                warnings.push(
+                    "relay.abuse.max_stored_events_per_pubkey is zero — unlimited".to_string(),
+                );
+            }
+        }
+        if self.relay.max_total_events_per_req == 0 {
+            warnings.push("relay.max_total_events_per_req is zero — unlimited".to_string());
+        }
+        if self.relay.max_pending_outbound_bytes == 0 {
+            warnings.push(
+                "relay.max_pending_outbound_bytes is zero — slow-client queue is unlimited"
+                    .to_string(),
+            );
+        }
+        warnings
+    }
+
     /// Replace this config with a freshly parsed one, keeping the values
     /// that cannot change at runtime. The frozen set matches golpe's
     /// `noReload` keys plus everything bound to a listener/socket/pool that
@@ -910,6 +962,9 @@ impl Config {
     pub fn apply_reload(&mut self, new: Config) {
         for change in self.security_scope_changes(&new) {
             tracing::warn!("config reload: {change}");
+        }
+        for warning in new.zero_guard_warnings() {
+            tracing::warn!("config reload: {warning}");
         }
         let old = std::mem::replace(self, new);
         self.db = old.db;
@@ -1520,6 +1575,46 @@ mod tests {
         let zeroed = Config::parse_toml("[relay.abuse]\nevent_rate_per_second = 0\n").unwrap();
         let changes = full.security_scope_changes(&zeroed);
         assert!(changes.iter().any(|c| c.contains("abuse")), "{changes:?}");
+    }
+
+    #[test]
+    fn zero_guard_warnings_cover_each_unlimited_zero() {
+        // Defaults are all non-zero: no warnings.
+        assert!(Config::default().zero_guard_warnings().is_empty());
+        for field in [
+            "connection_rate_per_second",
+            "connection_burst",
+            "event_rate_per_second",
+            "event_burst",
+            "pubkey_event_rate_per_second",
+            "pubkey_event_burst",
+            "req_rate_per_second",
+            "req_burst",
+            "count_rate_per_second",
+            "count_burst",
+            "max_query_cost",
+            "max_stored_events",
+            "max_stored_events_per_pubkey",
+        ] {
+            let cfg = Config::parse_toml(&format!("[relay.abuse]\n{field} = 0\n")).unwrap();
+            assert!(
+                !cfg.zero_guard_warnings().is_empty(),
+                "{field} = 0 should warn"
+            );
+        }
+        for field in ["max_total_events_per_req", "max_pending_outbound_bytes"] {
+            let cfg = Config::parse_toml(&format!("[relay]\n{field} = 0\n")).unwrap();
+            assert!(
+                !cfg.zero_guard_warnings().is_empty(),
+                "{field} = 0 should warn"
+            );
+        }
+        // With abuse protection disabled entirely, zero budgets are moot.
+        let cfg = Config::parse_toml(
+            "[relay.abuse]\nenabled = false\nevent_rate_per_second = 0\n",
+        )
+        .unwrap();
+        assert!(cfg.zero_guard_warnings().is_empty());
     }
 
     #[test]

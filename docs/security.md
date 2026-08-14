@@ -7,7 +7,11 @@ plugin isolation guidance, and logging policy, see
 - Treat every EVENT as untrusted. IDs and Schnorr signatures are verified unless `--no-verify` import is explicitly used.
 - Input limits: `max_event_size`, tag counts, WebSocket/Unix frame sizes, and
   `max_pending_outbound_bytes`.
-- Unix sockets: bound at a sibling temp path, chmod/chowned there, and atomically renamed into place (no bind→chmod window); stale-path replacement refuses symlinks and non-sockets; shutdown unlinks only after re-verifying the path is this process's own socket (dev+inode); optional UID/GID allow-lists via peer credentials.
+- Unix sockets: bound at a sibling temp path, chmod/chowned there, and
+  atomically renamed into place (no bind→chmod window); stale-path replacement
+  refuses symlinks and non-sockets; shutdown unlinks only after re-verifying
+  the path against the filesystem dev+inode captured before that rename;
+  optional UID/GID allow-lists via peer credentials.
 - AUTH (NIP-42) requires `relay.auth.serviceUrl`. Protected events (NIP-70) are rejected without matching authenticated pubkey.
 - Restricted read kinds (default 4, 1059) are not delivered unless the subscriber is the author or first `p` tag. They fail closed until `relay.auth.service_url` makes NIP-42 usable; broad COUNT requests cannot reveal their population.
 - Write-policy plugins run as `sh -c` with a timeout; plugin failure rejects the event.

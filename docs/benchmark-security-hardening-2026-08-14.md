@@ -10,8 +10,8 @@ same-host Unix query and connection throughput rose 24.4% and 32.4%.
 All 96 measured rows passed their correctness gates with zero errors and zero
 mismatches. Wok still trails strfry on saturated publication, but the
 two-host gap narrowed from 70.5% to 60.0%. A separate shutdown-cleanup defect
-in the new Unix socket race hardening was found after measurement; it does not
-invalidate the transport results and is documented below.
+in the new Unix socket race hardening was found after measurement and fixed in
+commit `ca64980`; it does not invalidate the transport results.
 
 ## Test contract
 
@@ -170,9 +170,15 @@ listener_fd dev=9    inode=1370691
 The listener FD is a socketfs object while the pathname is an ext4 directory
 entry, so the device/inode equality can never hold and normal shutdown cannot
 unlink the path. This is a cleanup regression in commit `2ea2696`, not a
-benchmark correctness failure. No source fix was mixed into this benchmark
-report. After preserving the evidence, the confirmed stale benchmark socket
-was removed manually; it contained no recoverable data.
+benchmark correctness failure. After preserving the evidence, the confirmed
+stale benchmark socket was removed manually; it contained no recoverable data.
+
+Commit `ca64980` fixed the cleanup after the campaign by recording the temp
+pathname's filesystem device/inode immediately before its atomic rename, then
+rechecking the final pathname against that identity during shutdown. Focused
+regressions verify both that the owned socket is removed and that a replacement
+socket is preserved. The measured binary and all benchmark values remain from
+`fa9b061`; the fix was not mixed into the campaign.
 
 ## Retained evidence and reproduction
 

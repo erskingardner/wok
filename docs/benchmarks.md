@@ -197,7 +197,8 @@ records the full 100,000-event rerun at Wok commit `fa9b061` after the
 WebSocket performance work and security-hardening series. All 96 two-host and
 same-host result rows passed. It includes the controlled change from v0.2.0,
 resource measurements, retained artifact hashes, and a Unix socket shutdown
-cleanup defect found after the transport campaign.
+cleanup defect found after the transport campaign and subsequently fixed in
+commit `ca64980` without changing the measured binary or results.
 
 The [2026-08-14 WebSocket optimization report](websocket-performance-2026-08-14.md)
 records the focused profiling and same-build two-host A/B that followed the

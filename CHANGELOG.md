@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- README benchmark results now reflect the complete post-hardening two-host and
+  same-host campaign at `fa9b061`.
+
+### Fixed
+
+- Orderly Unix transport shutdown removes its own socket pathname by tracking
+  the pathname's filesystem identity across the atomic bind rename, while
+  preserving a socket that replaced it.
+
 ## [0.2.0] - 2026-08-14
 
 ### Added

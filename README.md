@@ -169,24 +169,29 @@ rotated relay order, and correctness gates before speed. Local process
 comparisons, two-host load campaigns, and same-host Unix/WebSocket comparisons
 are separate experiments so network RTT is not confused with transport cost.
 
-Latest controlled v0.2.0 transport campaign — Linux x86-64 VM, 100,000
-realistic events, three order-rotated repetitions, 54/54 correct trials:
+Latest controlled post-hardening campaign — Wok `fa9b061`, Linux x86-64,
+100,000 realistic events, and three order-rotated repetitions. All 96 two-host
+and same-host result rows passed their correctness gates:
 
 | Median scenario | Wok WebSocket | Wok Unix | strfry WebSocket |
 |---|---:|---:|---:|
-| historical query | 90.3 req/s | **2,338.7 req/s** | 90.4 req/s |
-| mixed read/write | 22.7 req/s | **962.1 req/s** | 22.8 req/s |
-| accepted publication | 2,799 events/s | 2,727 events/s | **4,112 events/s** |
-| fanout delivery | **35,359 deliveries/s** | 32,488 deliveries/s | 29,428 deliveries/s |
-| connection opens | 4,054 conn/s | **13,950 conn/s** | 3,790 conn/s |
-| deep-history pages | 120.5 pages/s | 113.6 pages/s | **172.1 pages/s** |
+| historical query | 90.6 req/s | **2,909.5 req/s** | 90.6 req/s |
+| mixed read/write | 22.8 req/s | **1,005.6 req/s** | 22.8 req/s |
+| accepted publication | 2,929 events/s | 2,939 events/s | **4,450 events/s** |
+| fanout delivery | **32,865 deliveries/s** | 31,987 deliveries/s | 28,277 deliveries/s |
+| connection opens | 4,319 conn/s | **18,469 conn/s** | 3,837 conn/s |
+| deep-history pages | 104.7 pages/s | **136.0 pages/s** | 115.6 pages/s |
 
-These are same-host transport results, not Internet-facing capacity claims.
-At the 10,000-connection peak, server RSS was 632 MiB for Wok WebSocket,
-453 MiB for Wok Unix, and 292 MiB for strfry WebSocket. The full two-host and
-same-host results, before/after comparison, latency, resources, limitations,
-and artifact provenance are in the [v0.2.0 benchmark
-report](docs/benchmark-v0.2.0-2026-08-14.md).
+The table is the same-host transport experiment, not an Internet-facing
+capacity claim. In the two-host experiment, Wok WebSocket publication reached
+2,963 events/s: 5.1% above the v0.2.0 campaign while the strfry control moved
+down 1.4%, narrowing the publication gap from 70.5% to 60.0%. Wok fanout improved
+13.7% and ran 15.8% ahead of strfry. At the 10,000-connection same-host peak,
+server RSS was 478 MiB for Wok WebSocket, 455 MiB for Wok Unix, and 292 MiB for
+strfry WebSocket. Full latency, resource, limitation, and artifact provenance
+details are in the [post-hardening benchmark
+report](docs/benchmark-security-hardening-2026-08-14.md); the focused A/B is in
+the [WebSocket optimization report](docs/websocket-performance-2026-08-14.md).
 
 Reproduce:
 
@@ -251,6 +256,8 @@ Summary:
 - [Observability](docs/observability.md)
 - [Operator dashboard](docs/admin-dashboard.md)
 - [Benchmark methodology](docs/benchmarks.md)
+- [Post-hardening benchmark](docs/benchmark-security-hardening-2026-08-14.md)
+- [WebSocket optimization report](docs/websocket-performance-2026-08-14.md)
 - [Wok v0.2.0 benchmark](docs/benchmark-v0.2.0-2026-08-14.md)
 - [2026-08-14 transport benchmark](docs/transport-benchmark-2026-08-14.md)
 - [Mesh and maintenance](docs/mesh-and-maintenance.md)

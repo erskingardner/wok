@@ -15,12 +15,14 @@ const TERM_PREFIX: u8 = 1;
 const BIGRAM_PREFIX: u8 = 2;
 const INDEXED_THROUGH_KEY: &[u8] = b"\0indexed-through";
 const SEARCH_SCHEMA_KEY: &[u8] = b"\0schema";
-const SEARCH_SCHEMA_VERSION: u64 = 1;
+const SEARCH_SCHEMA_VERSION: u64 = 2;
 const MAX_INDEXED_TERM_BYTES: usize = 64;
 const BACKFILL_BATCH_SIZE: usize = 10_000;
 
 pub const MAX_SEARCH_QUERY_BYTES: usize = 1_024;
 pub const MAX_SEARCH_TERMS: usize = 16;
+pub const MAX_INDEXED_UNIQUE_TERMS: usize = 256;
+pub const MAX_INDEXED_BIGRAMS: usize = 256;
 
 type SearchIndexEntry = (Vec<u8>, Vec<u8>);
 pub type SearchTermSet = HashSet<String>;
@@ -156,19 +158,56 @@ pub(crate) fn search_index_entries(
     json: &str,
 ) -> Result<Vec<SearchIndexEntry>, DbError> {
     let content = event_content(json)?;
-    let ordered = normalize_search_terms(&content);
     let value = lev_id.to_ne_bytes().to_vec();
-    let mut keys: BTreeSet<Vec<u8>> = ordered
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|term| term_key(&term))
-        .collect();
-    for pair in ordered.windows(2) {
-        keys.insert(bigram_key(&pair[0], &pair[1]));
-    }
+    let keys = bounded_index_keys(&content);
     Ok(keys.into_iter().map(|key| (key, value.clone())).collect())
+}
+
+/// Build a deterministic, bounded index for untrusted event content.
+///
+/// The event itself remains bounded by `events.max_event_size`, but without
+/// these separate limits one small event containing many distinct words can
+/// amplify into thousands of LMDB writes. We retain the first unique terms
+/// and bigrams in document order, then stop adding new postings while still
+/// scanning the bounded input.
+fn bounded_index_keys(content: &str) -> BTreeSet<Vec<u8>> {
+    let mut keys = BTreeSet::new();
+    let mut term_count = 0;
+    let mut bigram_count = 0;
+    let mut current = String::new();
+    let mut previous = String::new();
+
+    let mut finish = |term: &mut String| {
+        if term.is_empty() {
+            return;
+        }
+        if term.len() <= MAX_INDEXED_TERM_BYTES {
+            if term_count < MAX_INDEXED_UNIQUE_TERMS && keys.insert(term_key(term)) {
+                term_count += 1;
+            }
+            if !previous.is_empty()
+                && bigram_count < MAX_INDEXED_BIGRAMS
+                && keys.insert(bigram_key(&previous, term))
+            {
+                bigram_count += 1;
+            }
+            previous.clear();
+            previous.push_str(term);
+        } else {
+            previous.clear();
+        }
+        term.clear();
+    };
+
+    for ch in content.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else {
+            finish(&mut current);
+        }
+    }
+    finish(&mut current);
+    keys
 }
 
 pub(crate) fn search_term_from_key(key: &[u8]) -> Option<&str> {
@@ -413,6 +452,36 @@ mod tests {
             event_search_terms(r#"{"content":"A CAF\u00c9\nNostr","ignored":{"nested":[1,2,3]}}"#)
                 .unwrap();
         assert_eq!(terms, search_term_set("A CAFÉ\nNostr"));
+    }
+
+    #[test]
+    fn event_index_growth_is_bounded() {
+        let content = (0..10_000)
+            .map(|n| format!("term{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let json = serde_json::json!({"content": content}).to_string();
+        let entries = search_index_entries(7, &json).unwrap();
+        let terms = entries
+            .iter()
+            .filter(|(key, _)| key.first() == Some(&TERM_PREFIX))
+            .count();
+        let bigrams = entries
+            .iter()
+            .filter(|(key, _)| key.first() == Some(&BIGRAM_PREFIX))
+            .count();
+        assert_eq!(terms, MAX_INDEXED_UNIQUE_TERMS);
+        assert_eq!(bigrams, MAX_INDEXED_BIGRAMS);
+        assert!(entries.len() <= MAX_INDEXED_UNIQUE_TERMS + MAX_INDEXED_BIGRAMS);
+    }
+
+    #[test]
+    fn duplicate_terms_do_not_consume_the_unique_term_budget() {
+        let mut words = vec!["repeat".to_string(); MAX_INDEXED_UNIQUE_TERMS * 2];
+        words.push("last".into());
+        let json = serde_json::json!({"content": words.join(" ")}).to_string();
+        let entries = search_index_entries(8, &json).unwrap();
+        assert!(entries.iter().any(|(key, _)| key == &term_key("last")));
     }
 
     #[test]

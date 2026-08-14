@@ -158,7 +158,7 @@ pub async fn dispatch(
         Err(error) => return response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
     };
     let absolute_url = format!("{}{}", cfg.admin.public_url, path_and_query);
-    let admin_pubkey = match authorize(
+    let (admin_pubkey, replay_id, replay_created_at) = match authorize(
         authorization.as_deref(),
         &method,
         &absolute_url,
@@ -166,7 +166,7 @@ pub async fn dispatch(
         &cfg,
         &state,
     ) {
-        Ok(pubkey) => pubkey,
+        Ok(ok) => ok,
         Err(error) => return unauthorized(&error),
     };
 
@@ -176,11 +176,15 @@ pub async fn dispatch(
         path = %path,
         "authorized admin request"
     );
-    match (method, path.as_str()) {
+    let resp = match (method.clone(), path.as_str()) {
         (Method::GET, "/admin/api/overview") => overview(&handle),
         (Method::PUT, "/admin/api/config") => update_config(&handle, &body),
         _ => response(StatusCode::NOT_FOUND, "text/plain", "not found"),
+    };
+    if resp.status().is_success() {
+        commit_replay_id(&state, replay_id, replay_created_at, cfg.admin.auth_window_secs);
     }
+    resp
 }
 
 async fn read_body(mut body: Incoming, maximum: usize) -> Result<Vec<u8>, String> {
@@ -204,7 +208,7 @@ fn authorize(
     body: &[u8],
     cfg: &Config,
     state: &AdminState,
-) -> Result<String, String> {
+) -> Result<(String, [u8; 32], u64), String> {
     let encoded = authorization
         .and_then(|value| value.strip_prefix("Nostr "))
         .ok_or_else(|| "missing Nostr authorization".to_string())?;
@@ -261,8 +265,23 @@ fn authorize(
     if used.len() >= MAX_REPLAY_IDS {
         return Err("NIP-98 replay cache is full".into());
     }
-    used.insert(id, packed.created_at());
-    Ok(pubkey)
+    // The ID is NOT burned here: it is committed only after the request
+    // completes with a 2xx, so a retryable failure (validation 400, config
+    // write 500) doesn't force the client to re-sign.
+    Ok((pubkey, id, packed.created_at()))
+}
+
+/// Burn a replay-cache ID after its request completed successfully.
+fn commit_replay_id(state: &AdminState, id: [u8; 32], created_at: u64, window_secs: u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut used = state.used_auth.lock();
+    used.retain(|_, c| c.abs_diff(now) <= window_secs);
+    if used.len() < MAX_REPLAY_IDS {
+        used.insert(id, created_at);
+    }
 }
 
 fn single_tag<'a>(event: &'a serde_json::Value, name: &str) -> Result<&'a str, String> {
@@ -840,6 +859,17 @@ mod tests {
         let state = AdminState::default();
         let body = br#"{"history":{"max_points":10}}"#;
         let header = signed_auth(&key, "https://relay.example/admin/api/config", "PUT", body);
+        let (_, replay_id, replay_created_at) = authorize(
+            Some(&header),
+            &Method::PUT,
+            "https://relay.example/admin/api/config",
+            body,
+            &cfg,
+            &state
+        )
+        .unwrap();
+        // Not yet burned: a retry of a failed request with the same signed
+        // event is still allowed until the 2xx commit.
         assert!(authorize(
             Some(&header),
             &Method::PUT,
@@ -849,6 +879,7 @@ mod tests {
             &state
         )
         .is_ok());
+        commit_replay_id(&state, replay_id, replay_created_at, cfg.admin.auth_window_secs);
         assert!(authorize(
             Some(&header),
             &Method::PUT,

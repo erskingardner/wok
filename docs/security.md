@@ -29,3 +29,12 @@ endian field encoding rather than copying Rust struct memory.
 Release builds use `panic = "abort"`, preventing unwinding across C callback
 frames. Comparator functions are total over arbitrary byte strings and have
 property tests for malformed database keys.
+
+## Dependency policy
+
+CI and a weekly scheduled job run `cargo-deny` against the locked dependency
+graph. Known advisories, yanked packages, unknown registries, unknown Git
+sources, and unapproved licenses fail the gate. Duplicate versions are
+reported as warnings for deliberate review. Informational advisories are fixed
+rather than permanently ignored; the initial audit removed the unmaintained
+`instant` dependency by upgrading `notify`.

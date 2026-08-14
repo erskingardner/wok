@@ -44,3 +44,15 @@ the intended final tree and ignores records already present. Progress logs
 include scanned rows, the fixed high-water mark, matched rows, and new inserts.
 Smaller batches reduce writer hold time; larger batches trade more memory and
 write latency for throughput. A batch size of zero is rejected.
+
+## Precomputed-tree filters and restricted kinds
+
+`wok negentropy add <filter>` registers a persistent tree for a filter.
+Reconciliation against a precomputed (stateless) tree does **not** apply the
+per-item read restrictor: any client that opens a sync matching the tree's
+filter learns the matching event IDs and timestamps, including those of
+`relay.auth.restricted_read_kinds` kinds (event content itself stays gated
+downstream; the in-memory sync path does filter per item). This matches C++
+strfry. If you keep restricted kinds on the relay, build trees only with
+filters narrow enough not to cover them — a broad `wok negentropy add '{}'`
+exposes the existence and timing of every restricted event.

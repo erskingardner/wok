@@ -192,12 +192,19 @@ two-host campaign results.
 
 ### Recorded campaigns
 
+The [post-hardening report](benchmark-security-hardening-2026-08-14.md)
+records the full 100,000-event rerun at Wok commit `fa9b061` after the
+WebSocket performance work and security-hardening series. All 96 two-host and
+same-host result rows passed. It includes the controlled change from v0.2.0,
+resource measurements, retained artifact hashes, and a Unix socket shutdown
+cleanup defect found after the transport campaign.
+
 The [2026-08-14 WebSocket optimization report](websocket-performance-2026-08-14.md)
 records the focused profiling and same-build two-host A/B that followed the
 v0.2.0 campaign. The final zero-delay candidate improved scaled WebSocket
 publication throughput by 22–24% in two order-balanced comparisons.
 
-The [v0.2.0 report](benchmark-v0.2.0-2026-08-14.md) records the latest
+The [v0.2.0 report](benchmark-v0.2.0-2026-08-14.md) records the previous
 100,000-event Linux campaign: a two-host Wok/strfry relay comparison and a
 same-host Wok Unix/WebSocket transport comparison, each with three
 order-rotated repetitions. All 96 result rows passed their correctness gates.

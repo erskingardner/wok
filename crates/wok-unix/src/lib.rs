@@ -23,15 +23,24 @@ pub enum UnixError {
 /// Bind a Unix socket, replacing a stale socket path only after confirming it
 /// is a socket and that no live listener owns it. `owner`/`group` (empty =
 /// skip) chown the socket like a deployment would expect.
+///
+/// The socket is bound at a sibling temp path, chmod/chowned there, and
+/// atomically renamed into place: the final path never exists with
+/// umask-derived permissions (no bind→chmod race window), and the stale
+/// socket is replaced by a single rename syscall rather than a
+/// check-then-remove-then-bind sequence.
 pub fn bind_unix(
     path: &Path,
     mode: u32,
     owner: &str,
     group: &str,
 ) -> Result<UnixListener, UnixError> {
-    if path.exists() {
-        let meta = std::fs::metadata(path)?;
-        if !is_socket(&meta) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Non-following metadata: refuse to replace symlinks or non-sockets.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || !is_socket(&meta) {
             return Err(UnixError::Message(format!(
                 "refusing to replace non-socket path {}",
                 path.display()
@@ -43,13 +52,20 @@ pub fn bind_unix(
                 path.display()
             )));
         }
-        std::fs::remove_file(path)?;
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let tmp = bind_temp_path(path);
+    let _ = std::fs::remove_file(&tmp); // leftover from a previous crash
+    let listener = UnixListener::bind(&tmp)?;
+    // Best-effort cleanup of the temp path on any error below; after the
+    // rename the path no longer exists and this is a no-op.
+    struct TmpGuard<'a>(&'a Path);
+    impl Drop for TmpGuard<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
     }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    let _guard = TmpGuard(&tmp);
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
     if !owner.is_empty() || !group.is_empty() {
         let uid = if owner.is_empty() {
             None
@@ -71,10 +87,20 @@ pub fn bind_unix(
                     .gid,
             )
         };
-        nix::unistd::chown(path, uid, gid)
-            .map_err(|e| UnixError::Message(format!("chown {}: {e}", path.display())))?;
+        nix::unistd::chown(&tmp, uid, gid)
+            .map_err(|e| UnixError::Message(format!("chown {}: {e}", tmp.display())))?;
     }
+    std::fs::rename(&tmp, path)?;
     Ok(listener)
+}
+
+/// Sibling temp path used for bind-then-rename; never the final socket path.
+fn bind_temp_path(path: &Path) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wok.sock".into());
+    path.with_file_name(format!(".{name}.bind-{}", std::process::id()))
 }
 
 fn is_socket(meta: &std::fs::Metadata) -> bool {
@@ -97,6 +123,10 @@ pub async fn serve(handle: RelayHandle, cfg: Config) -> Result<(), UnixError> {
         &cfg.relay.unix.owner,
         &cfg.relay.unix.group,
     )?;
+    // Identity of this process's socket (dev+ino), re-checked before the
+    // shutdown unlink so we never delete a path someone else swapped in.
+    let bound_stat = nix::sys::stat::fstat(std::os::fd::AsRawFd::as_raw_fd(&listener))
+        .map_err(|e| UnixError::Message(format!("fstat listener: {e}")))?;
     tracing::info!("Unix socket listening on {}", path.display());
     let handle = Arc::new(handle);
     let shutdown = handle.shutdown_handle();
@@ -121,7 +151,16 @@ pub async fn serve(handle: RelayHandle, cfg: Config) -> Result<(), UnixError> {
             }
         });
     }
-    let _ = std::fs::remove_file(&path);
+    // Unlink only if the path still refers to this process's socket.
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        use std::os::unix::fs::MetadataExt;
+        if is_socket(&meta)
+            && meta.dev() == bound_stat.st_dev as u64
+            && meta.ino() == bound_stat.st_ino
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
     Ok(())
 }
 
@@ -298,6 +337,33 @@ mod tests {
         let path = dir.path().join("file");
         std::fs::write(&path, b"hi").unwrap();
         assert!(bind_unix(&path, 0o600, "", "").is_err());
+    }
+
+    #[test]
+    fn refuses_symlink_even_pointing_at_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&real).unwrap();
+        let link = dir.path().join("link.sock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(bind_unix(&link, 0o600, "", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn socket_has_requested_mode_and_no_temp_leftovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode.sock");
+        let _listener = bind_unix(&path, 0o640, "", "").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        // The bind-temp sibling must be gone after a successful bind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bind-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp bind paths left behind");
     }
 
     #[tokio::test]

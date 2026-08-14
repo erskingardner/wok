@@ -1,0 +1,36 @@
+name: fuzz
+
+on:
+  pull_request:
+    paths:
+      - 'fuzz/**'
+      - 'crates/wok-event/**'
+      - 'crates/wok-negentropy/**'
+      - 'crates/wok-relay/src/protocol.rs'
+      - 'crates/wok-ws/src/frame.rs'
+      - .github/workflows/fuzz.yml
+  schedule:
+    - cron: '43 3 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}-${{ matrix.sanitizer }}
+  cancel-in-progress: true
+
+jobs:
+  ingress:
+    name: ingress (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Run bounded ingress campaign
+        run: cargo fuzz run ingress --sanitizer '${{ matrix.sanitizer }}' -- -runs=10000 -max_len=131072

@@ -1,0 +1,25 @@
+[package]
+name = "wok-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wok-event = { path = "../crates/wok-event" }
+wok-negentropy = { path = "../crates/wok-negentropy" }
+wok-relay = { path = "../crates/wok-relay" }
+wok-ws = { path = "../crates/wok-ws" }
+
+[[bin]]
+name = "ingress"
+path = "fuzz_targets/ingress.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

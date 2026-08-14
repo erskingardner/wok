@@ -38,3 +38,12 @@ sources, and unapproved licenses fail the gate. Duplicate versions are
 reported as warnings for deliberate review. Informational advisories are fixed
 rather than permanently ignored; the initial audit removed the unmaintained
 `instant` dependency by upgrading `notify`.
+
+## Adversarial testing
+
+Fast property tests feed arbitrary data into strict JSON/event validation,
+protocol envelopes, WebSocket fragmentation and decompression, Negentropy
+frames, and modeled LMDB transaction sequences on every normal test run. A
+separate libFuzzer target composes the public ingress parsers. Scheduled and
+parser-changing pull-request jobs run that target under AddressSanitizer and
+UndefinedBehaviorSanitizer with a persistent crash corpus.

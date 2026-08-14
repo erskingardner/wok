@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::BufRead;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use wok_db::{
@@ -28,6 +29,34 @@ fn foreach_by_filter_scan(
 ) -> Result<(), wok_query::QueryError> {
     wok_query::foreach_by_filter(txn, filter, max_limit, max_tags, cb)
 }
+
+/// Read one line from `reader` into `buf` (newline stripped, like
+/// `BufRead::lines`), buffering at most `max_len + 1` bytes so a newline-free
+/// multi-GB line can't OOM the process before the caller's size check runs.
+/// An oversize line comes back `max_len + 1` bytes long (possibly without a
+/// newline); the caller must reject it. Returns Ok(false) on EOF.
+fn read_line_bounded(
+    reader: &mut impl BufRead,
+    buf: &mut String,
+    max_len: usize,
+) -> std::io::Result<bool> {
+    buf.clear();
+    let n = reader.by_ref().take(max_len as u64 + 1).read_line(buf)?;
+    if n == 0 {
+        return Ok(false);
+    }
+    if buf.ends_with('\n') {
+        buf.pop();
+        if buf.ends_with('\r') {
+            buf.pop();
+        }
+    }
+    Ok(true)
+}
+
+/// Hard ceiling for a single stdin line in `wok upload`, which has no relay
+/// config in scope. Matches the 16 MiB decompression hard cap in wok-db.
+const MAX_UPLOAD_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -532,18 +561,21 @@ fn cmd_import(
     let mut total_rejected = 0u64;
     let mut total_dups = 0u64;
     let limits = cfg.event_limits();
-    for (i, line) in stdin.lock().lines().enumerate() {
-        let line = line?;
+    let mut stdin = stdin.lock();
+    let mut line = String::new();
+    let mut i = 0u64;
+    while read_line_bounded(&mut stdin, &mut line, cfg.events.max_event_size)? {
+        i += 1;
         total_processed += 1;
         // C++ counts the newline in its getline length check, so a line of
         // exactly maxEventSize chars is rejected there.
         if line.len() + 1 > cfg.events.max_event_size {
-            bail!("Line larger than configured maxEventSize on line {}", i + 1);
+            bail!("Line larger than configured maxEventSize on line {i}");
         }
         match parse_import_line(&line, fried, no_verify, &limits) {
             Ok(ev) => batch.push(ev),
             Err(e) => {
-                tracing::warn!("Unable to parse JSON on line {}: {e}", i + 1);
+                tracing::warn!("Unable to parse JSON on line {i}: {e}");
                 continue;
             }
         }
@@ -801,8 +833,12 @@ fn cmd_monitor(cfg: &Config) -> Result<()> {
     let mut monitors = wok_query::ActiveMonitors::new(cfg.relay.max_subs_per_connection);
     let stdin = std::io::stdin();
     let mut interest: Option<(u64, String)> = None;
-    for line in stdin.lock().lines() {
-        let line = line?;
+    let mut stdin = stdin.lock();
+    let mut line = String::new();
+    while read_line_bounded(&mut stdin, &mut line, cfg.events.max_event_size)? {
+        if line.len() + 1 > cfg.events.max_event_size {
+            bail!("monitor: stdin line larger than configured maxEventSize");
+        }
         if line.is_empty() {
             continue;
         }
@@ -1887,18 +1923,22 @@ async fn cmd_upload(url: String, pipeline: u64) -> Result<()> {
     use tokio_tungstenite::tungstenite::Message;
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
     let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
     let mut inflight = 0u64;
-    let mut lines = stdin.lock().lines();
+    let mut line = String::new();
+    let mut eof = false;
     loop {
-        while inflight < pipeline {
-            match lines.next() {
-                Some(Ok(line)) => {
-                    let msg = format!("[\"EVENT\",{line}]");
-                    ws.send(Message::Text(msg.into())).await?;
-                    inflight += 1;
-                }
-                _ => break,
+        while inflight < pipeline && !eof {
+            if !read_line_bounded(&mut stdin, &mut line, MAX_UPLOAD_LINE_BYTES)? {
+                eof = true;
+                break;
             }
+            if line.len() + 1 > MAX_UPLOAD_LINE_BYTES {
+                bail!("upload: stdin line exceeds {MAX_UPLOAD_LINE_BYTES} bytes");
+            }
+            let msg = format!("[\"EVENT\",{line}]");
+            ws.send(Message::Text(msg.into())).await?;
+            inflight += 1;
         }
         if inflight == 0 {
             break;

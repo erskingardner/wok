@@ -530,6 +530,7 @@ impl Config {
             .map_err(|e: toml::de::Error| e.to_string())?;
         validate_admin_config(&mut parsed.admin)?;
         clamp_size_class(&mut parsed);
+        parsed.relay.unix.mode = mask_socket_mode(parsed.relay.unix.mode);
         if parsed.observability.history_interval_secs == 0 {
             return Err("observability.history_interval_secs must be at least 1".into());
         }
@@ -1110,15 +1111,32 @@ fn assign_bool(
 }
 
 /// `relay.unix.mode`: accepts octal (`0600`, `0o600`) or decimal (`384`).
+/// Special bits (setuid/setgid/sticky) are meaningless-to-sloppy on a socket
+/// node and masked off.
 fn parse_mode(v: &str) -> Result<u32, String> {
     if let Some(o) = v.strip_prefix("0o").or_else(|| v.strip_prefix("0O")) {
-        return u32::from_str_radix(o, 8).map_err(|_| format!("invalid unix.mode: {v:?}"));
+        return u32::from_str_radix(o, 8)
+            .map(mask_socket_mode)
+            .map_err(|_| format!("invalid unix.mode: {v:?}"));
     }
     if v.len() > 1 && v.starts_with('0') {
-        return u32::from_str_radix(&v[1..], 8).map_err(|_| format!("invalid unix.mode: {v:?}"));
+        return u32::from_str_radix(&v[1..], 8)
+            .map(mask_socket_mode)
+            .map_err(|_| format!("invalid unix.mode: {v:?}"));
     }
     v.parse::<u32>()
+        .map(mask_socket_mode)
         .map_err(|_| format!("invalid unix.mode: {v:?}"))
+}
+
+/// Mask a unix.mode value to permission bits, warning when special bits
+/// (setuid/setgid/sticky) had to be dropped.
+fn mask_socket_mode(mode: u32) -> u32 {
+    let masked = mode & 0o777;
+    if masked != mode {
+        tracing::warn!("relay.unix.mode {mode:#o} has special bits; masking to {masked:#o}");
+    }
+    masked
 }
 
 fn parse_kinds(s: &str) -> Result<Vec<u64>, String> {
@@ -1615,6 +1633,17 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.zero_guard_warnings().is_empty());
+    }
+
+    #[test]
+    fn unix_mode_is_masked_to_permission_bits() {
+        assert_eq!(parse_mode("0o600").unwrap(), 0o600);
+        assert_eq!(parse_mode("0600").unwrap(), 0o600);
+        assert_eq!(parse_mode("384").unwrap(), 0o600);
+        assert_eq!(parse_mode("0o1130").unwrap(), 0o130);
+        assert_eq!(parse_mode("0o4755").unwrap(), 0o755);
+        let c = Config::parse_toml("[relay.unix]\nmode = 0o5610\n").unwrap();
+        assert_eq!(c.relay.unix.mode, 0o610);
     }
 
     #[test]

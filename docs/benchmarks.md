@@ -129,7 +129,9 @@ The main environment overrides are `RELAY_SSH`, `LOAD_SSH`, `RELAY_URL`,
 Lifecycle publication defaults to one ordered connection because a deletion
 request must follow the event it references. Scaled publication is measured in
 the separate realistic workload; increasing `LIFECYCLE_CONNECTIONS` tests
-cross-stream ingestion ordering as a distinct experiment.
+cross-stream ingestion ordering as a distinct experiment. The historical
+corpus keeps one fixed timestamp and byte-identical signatures; each lifecycle
+phase uses a freshly recorded timestamp so short-lived ephemerals remain valid.
 
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`

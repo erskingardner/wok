@@ -895,7 +895,9 @@ impl EventFactory {
             ),
         };
         let created_at = if kind == 20_001 {
-            now.saturating_sub(i % 30)
+            // Ephemerals are live-only and some relays enforce very short
+            // acceptance windows. Keep the whole generated burst fresh.
+            now
         } else {
             now.saturating_sub(total).saturating_add(i)
         };

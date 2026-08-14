@@ -77,6 +77,12 @@ run_bench() {
     local phase=$3
     shift 3
     local output=$LOAD_ROOT/runs/r${repetition}-${relay}/load/$phase
+    local phase_timestamp=$BASE_TIMESTAMP
+    if [[ $phase == lifecycle ]]; then
+        # Historical inputs use the fixed campaign timestamp. Ephemerals must
+        # instead be fresh when each live lifecycle phase actually begins.
+        phase_timestamp=$(date -u +%s)
+    fi
     remote_command "$LOAD_SSH" mkdir -p "$output"
     local command=(
         /usr/bin/time -v -o "$output/time.txt"
@@ -84,7 +90,7 @@ run_bench() {
         --target-url "$RELAY_URL"
         --target-label "$relay-r$repetition"
         --seed "$SEED"
-        --base-timestamp "$BASE_TIMESTAMP"
+        --base-timestamp "$phase_timestamp"
         --repetitions 1
         --out "$output"
         "$@"

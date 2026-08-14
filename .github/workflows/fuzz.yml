@@ -31,6 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Run bounded ingress campaign
         run: cargo fuzz run ingress --sanitizer '${{ matrix.sanitizer }}' -- -runs=10000 -max_len=131072

@@ -58,6 +58,32 @@ fn read_line_bounded(
 /// config in scope. Matches the 16 MiB decompression hard cap in wok-db.
 const MAX_UPLOAD_LINE_BYTES: usize = 16 * 1024 * 1024;
 
+/// `cli_println!` panics when the stdout write fails, so `wok export | head -1`
+/// (or any downstream consumer closing the pipe) aborts the process with
+/// SIGABRT under panic=abort. These macros treat a broken pipe as a clean
+/// early exit, matching standard CLI behavior.
+macro_rules! cli_println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        if writeln!(lock, $($arg)*).is_err() {
+            std::process::exit(0);
+        }
+    }};
+}
+
+macro_rules! cli_print {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        if write!(lock, $($arg)*).and_then(|_| lock.flush()).is_err() {
+            std::process::exit(0);
+        }
+    }};
+}
+
 #[derive(Parser)]
 #[command(
     name = "wok",
@@ -503,16 +529,16 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
 
 fn cmd_info(cfg: &Config) -> Result<()> {
     let env = open_env(cfg)?;
-    println!("DB version: {}", env.db_version()?);
+    cli_println!("DB version: {}", env.db_version()?);
     Ok(())
 }
 
 fn cmd_doctor(cfg: &Config, config_path: &Path, json: bool) -> Result<()> {
     let report = doctor::run(cfg, config_path);
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        cli_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", report.render_human());
+        cli_print!("{}", report.render_human());
     }
     if !report.ok {
         std::process::exit(1);
@@ -528,12 +554,12 @@ fn cmd_reindex(
 ) -> Result<()> {
     let outcome = reindex::run(cfg, backup, confirmed_stopped)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&outcome)?);
+        cli_println!("{}", serde_json::to_string_pretty(&outcome)?);
     } else {
-        println!("Reindexed {} events.", outcome.events);
-        println!("Database: {}", outcome.database.display());
-        println!("Original backup: {}", outcome.backup.display());
-        println!("Fingerprint: {}", outcome.event_fingerprint_sha256);
+        cli_println!("Reindexed {} events.", outcome.events);
+        cli_println!("Database: {}", outcome.database.display());
+        cli_println!("Original backup: {}", outcome.backup.display());
+        cli_println!("Fingerprint: {}", outcome.event_fingerprint_sha256);
     }
     Ok(())
 }
@@ -699,7 +725,7 @@ fn cmd_export(cfg: &Config, since: u64, until: u64, reverse: bool, fried: bool) 
                             o.push_str(",\"fried\":\"");
                             o.push_str(&hex::encode(packed));
                             o.push_str("\"}");
-                            println!("{o}");
+                            cli_println!("{o}");
                         }
                         Ok(None) => {
                             export_err = Some(anyhow::anyhow!("unable to lookup event by levId"));
@@ -711,7 +737,7 @@ fn cmd_export(cfg: &Config, since: u64, until: u64, reverse: bool, fried: bool) 
                         }
                     }
                 } else {
-                    println!("{json}");
+                    cli_println!("{json}");
                 }
             }
             Err(e) => {
@@ -744,13 +770,13 @@ fn cmd_scan(cfg: &Config, filter: &str, count: bool) -> Result<()> {
                 if let Ok(json) =
                     event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size)
                 {
-                    println!("{json}");
+                    cli_println!("{json}");
                 }
             }
         },
     )?;
     if count {
-        println!("{n}");
+        cli_println!("{n}");
     }
     Ok(())
 }
@@ -772,9 +798,9 @@ fn cmd_event(cfg: &Config, lev_id: u64, fried: bool) -> Result<()> {
         o.push_str(",\"fried\":\"");
         o.push_str(&hex::encode(packed));
         o.push_str("\"}");
-        println!("{o}");
+        cli_println!("{o}");
     } else {
-        println!("{json}");
+        cli_println!("{json}");
     }
     Ok(())
 }
@@ -890,7 +916,7 @@ fn cmd_monitor(cfg: &Config) -> Result<()> {
                         .iter()
                         .any(|r| r.conn_id == *cid && r.sub_id.as_str() == sid)
                     {
-                        println!("{json}");
+                        cli_println!("{json}");
                     }
                 }
             }
@@ -945,7 +971,7 @@ fn cmd_dict(cfg: &Config, cmd: DictCmd) -> Result<()> {
                     }
                 }
             }
-            println!(
+            cli_println!(
                 "records={} bytes={} compressed_records={n_comp} compressed_bytes={compressed}",
                 levs.len(),
                 total
@@ -979,7 +1005,7 @@ fn cmd_dict(cfg: &Config, cmd: DictCmd) -> Result<()> {
             let mut txn = env.begin_rw()?;
             let new_id = wok_db::insert_compression_dictionary(&mut txn, &dict)?;
             txn.commit()?;
-            println!("Saved new dictionary, dictId = {new_id}");
+            cli_println!("Saved new dictionary, dictId = {new_id}");
         }
         DictCmd::Compress { .. } => {
             let dict_id = dict_id.context("specify --dict-id")?;
@@ -1066,13 +1092,13 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
         NegCmd::List => {
             let txn = env.begin_ro()?;
             wok_db::foreach_negentropy_filter(&txn, |id, filter| {
-                println!("tree {id}");
-                println!("  filter: {filter}");
+                cli_println!("tree {id}");
+                cli_println!("  filter: {filter}");
                 if let Ok(mut tree) = wok_negentropy::open_ro(&txn, id) {
                     let size = tree.size();
                     let fp = tree.fingerprint(0, size as usize);
-                    println!("  size: {size}");
-                    println!("  fingerprint: {}", hex::encode(fp));
+                    cli_println!("  size: {size}");
+                    cli_println!("  fingerprint: {}", hex::encode(fp));
                 }
                 true
             })?;
@@ -1109,8 +1135,8 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
             }
             let id = wok_db::insert_negentropy_filter(&mut txn, &filter_str)?;
             txn.commit()?;
-            println!("created tree {id}");
-            println!("  to populate, run: wok negentropy build {id}");
+            cli_println!("created tree {id}");
+            cli_println!("  to populate, run: wok negentropy build {id}");
         }
         NegCmd::Build {
             tree_id,
@@ -1240,7 +1266,7 @@ fn cmd_integrity(cfg: &Config) -> Result<()> {
     let env = open_env(cfg)?;
     let txn = env.begin_ro()?;
     let report = check_integrity(&txn)?;
-    println!("{report:?}");
+    cli_println!("{report:?}");
     if !report.ok() {
         std::process::exit(1);
     }
@@ -1719,10 +1745,10 @@ async fn cmd_sync(
             write_downloaded(&env, cfg, &mut batch, &mut written)?;
             if print_missing {
                 for id in &seen_have {
-                    println!("have,{}", hex::encode(id));
+                    cli_println!("have,{}", hex::encode(id));
                 }
                 for id in &seen_need {
-                    println!("need,{}", hex::encode(id));
+                    cli_println!("need,{}", hex::encode(id));
                 }
             }
             break;
@@ -1973,7 +1999,7 @@ async fn cmd_download(url: String, filter: Option<String>) -> Result<()> {
             break;
         }
         if v[0] == "EVENT" {
-            println!("{}", v[2]);
+            cli_println!("{}", v[2]);
         }
     }
     Ok(())

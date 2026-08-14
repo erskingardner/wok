@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The comparative benchmark now emits replayable signed corpora and SHA-256
+  manifests, supports repeated order-balanced trials, and includes a remote
+  load profile for scaled publication, fanout, and idle connections.
 - Wok treats strfry compatibility as a verified migration boundary rather than
   an ongoing promise to preserve strfry implementation bugs.
 - Ephemeral event kinds are live-only by default, with an explicit persisted

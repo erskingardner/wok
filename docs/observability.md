@@ -23,7 +23,8 @@ scrape_configs:
 ```
 
 If the relay is internet-facing, expose `/metrics` only on a trusted network
-or protect it at the reverse proxy.
+or protect it at the reverse proxy. The endpoint is unauthenticated and sends
+`Access-Control-Allow-Origin: *`, so any web page can read it cross-origin.
 
 ## Metric reference
 

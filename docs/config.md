@@ -77,6 +77,12 @@ All event settings reload live and are available in the dashboard.
 
 See [Observability](observability.md) for every exported metric and label.
 
+Note: the Prometheus endpoint `/metrics` is served on the same public
+listener as client traffic, with `Access-Control-Allow-Origin: *` — any web
+page can read connection, event, auth, and abuse-rejection counters
+cross-origin. If the relay is internet-facing, scrape it over a private
+interface or protect the path at the reverse proxy.
+
 ## Relay listener and protocol
 
 | Key | Default | Reload | Dashboard | Meaning |

@@ -1537,7 +1537,7 @@ fn run_writer(
     let mut closed = std::collections::HashSet::new();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
     let mut events: Vec<(u64, EventToWrite)> = Vec::with_capacity(256);
-    let mut quota_counts: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut quota_counts: HashMap<[u8; 32], PubkeyQuotaMemo> = HashMap::new();
     let mut evs: Vec<EventToWrite> = Vec::with_capacity(256);
     let mut meta: Vec<u64> = Vec::with_capacity(256);
     while let Ok(msg) = rx.recv() {
@@ -1545,7 +1545,9 @@ fn run_writer(
         closed.clear();
         batch_vanish.clear();
         events.clear();
-        quota_counts.clear();
+        if quota_counts.len() > QUOTA_MEMO_MAX_AUTHORS {
+            quota_counts.clear();
+        }
         evs.clear();
         meta.clear();
         batch.push(msg);
@@ -1735,13 +1737,17 @@ fn run_writer(
                             };
                             let mut pubkey = [0u8; 32];
                             pubkey.copy_from_slice(packed_view.pubkey());
-                            let count = match quota_counts.entry(pubkey) {
+                            let memo = match quota_counts.entry(pubkey) {
                                 std::collections::hash_map::Entry::Occupied(entry) => {
-                                    *entry.into_mut()
+                                    entry.into_mut()
                                 }
                                 std::collections::hash_map::Entry::Vacant(entry) => {
                                     match stored_event_count(&env, &pubkey) {
-                                        Ok(count) => *entry.insert(count),
+                                        Ok(count) => entry.insert(PubkeyQuotaMemo {
+                                            baseline: count,
+                                            pending: 0,
+                                            since_recheck: 0,
+                                        }),
                                         Err(error) => {
                                             conns.send(
                                                 conn_id,
@@ -1757,7 +1763,32 @@ fn run_writer(
                                     }
                                 }
                             };
-                            if count >= cfg_snap.relay.abuse.max_stored_events_per_pubkey {
+                            // Periodic bounds-check: re-verify the baseline so
+                            // deletions, replacements, and out-of-band writes
+                            // can't drift the memo without bound.
+                            if memo.since_recheck >= QUOTA_MEMO_RECHECK_EVENTS {
+                                match stored_event_count(&env, &pubkey) {
+                                    Ok(count) => {
+                                        memo.baseline = count;
+                                        memo.since_recheck = 0;
+                                    }
+                                    Err(error) => {
+                                        conns.send(
+                                            conn_id,
+                                            RelayMessage::Ok {
+                                                event_id: to_hex(packed_view.id()),
+                                                accepted: false,
+                                                message: format!("Write error: {error}"),
+                                            },
+                                            &metrics,
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            if memo.baseline.saturating_add(memo.pending)
+                                >= cfg_snap.relay.abuse.max_stored_events_per_pubkey
+                            {
                                 metrics
                                     .abuse_pubkey_quota_rejections
                                     .fetch_add(1, Ordering::Relaxed);
@@ -1772,9 +1803,8 @@ fn run_writer(
                                 );
                                 continue;
                             }
-                            if let Some(count) = quota_counts.get_mut(&pubkey) {
-                                *count = count.saturating_add(1);
-                            }
+                            memo.pending = memo.pending.saturating_add(1);
+                            memo.since_recheck = memo.since_recheck.saturating_add(1);
                         }
                         events.push((conn_id, EventToWrite::new(packed, json)));
                     }
@@ -1803,6 +1833,10 @@ fn run_writer(
                     metrics
                         .abuse_disk_reserve_rejections
                         .fetch_add(events.len() as u64, Ordering::Relaxed);
+                    // Nothing will be written this batch: roll quota pendings back.
+                    for memo in quota_counts.values_mut() {
+                        memo.pending = 0;
+                    }
                     for (conn_id, event) in &events {
                         let id_hex = PackedEventView::new(&event.packed)
                             .map(|event| to_hex(event.id()))
@@ -1823,6 +1857,10 @@ fn run_writer(
                     continue;
                 }
                 Err(error) => {
+                    // Nothing will be written this batch: roll quota pendings back.
+                    for memo in quota_counts.values_mut() {
+                        memo.pending = 0;
+                    }
                     for (conn_id, event) in &events {
                         let id_hex = PackedEventView::new(&event.packed)
                             .map(|event| to_hex(event.id()))
@@ -1878,6 +1916,10 @@ fn run_writer(
             Ok::<_, wok_db::DbError>(())
         })();
         if let Err(error) = write_res {
+            // The transaction aborted; nothing was written this batch.
+            for memo in quota_counts.values_mut() {
+                memo.pending = 0;
+            }
             for (i, conn_id) in meta.iter().enumerate() {
                 let id_hex = PackedEventView::new(&evs[i].packed)
                     .map(|p| to_hex(p.id()))
@@ -1894,8 +1936,25 @@ fn run_writer(
             }
             continue;
         }
+        let quota_enabled = cfg_snap.relay.abuse.enabled
+            && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0;
         for (i, conn_id) in meta.iter().enumerate() {
             let packed = PackedEventView::new(&evs[i].packed).ok();
+            // Reconcile quota memos with actual write outcomes: confirmed
+            // writes move from pending into the baseline; anything else
+            // (duplicate/replaced/deleted/failed) just releases the pending.
+            if quota_enabled {
+                if let Some(p) = &packed {
+                    let mut author = [0u8; 32];
+                    author.copy_from_slice(p.pubkey());
+                    if let Some(memo) = quota_counts.get_mut(&author) {
+                        memo.pending = memo.pending.saturating_sub(1);
+                        if evs[i].status == EventWriteStatus::Written {
+                            memo.baseline = memo.baseline.saturating_add(1);
+                        }
+                    }
+                }
+            }
             let id_hex = packed
                 .as_ref()
                 .map(|p| to_hex(p.id()))
@@ -1969,6 +2028,26 @@ fn event_matches_vanish_markers(
         }
     }
     false
+}
+
+/// Accepted events per author between full stored-count re-verifications.
+/// Bounds quota-memo drift from deletions/replacements and out-of-band
+/// writers while keeping the full prefix rescan off the hot write path.
+const QUOTA_MEMO_RECHECK_EVENTS: u64 = 4096;
+/// Cap on memoized authors; clears (and re-baselines on demand) beyond it.
+const QUOTA_MEMO_MAX_AUTHORS: usize = 100_000;
+
+/// Per-pubkey storage-quota memo, kept across writer batches so a
+/// high-volume author doesn't trigger a full prefix rescan every batch.
+#[derive(Default, Clone, Copy)]
+struct PubkeyQuotaMemo {
+    /// Last verified stored-event count for the author.
+    baseline: u64,
+    /// Events accepted but not yet confirmed written; returns to zero by
+    /// the end of each batch.
+    pending: u64,
+    /// Accepted events since the baseline was verified.
+    since_recheck: u64,
 }
 
 fn stored_event_count(env: &Env, pubkey: &[u8; 32]) -> Result<u64, wok_db::DbError> {

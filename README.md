@@ -234,6 +234,7 @@ Summary:
 - [Unix socket protocol](docs/unix-socket.md)
 - [Supported NIPs](docs/nips.md)
 - [Configuration](docs/config.md)
+- [Production deployment security](docs/production-deployment.md)
 - [Observability](docs/observability.md)
 - [Operator dashboard](docs/admin-dashboard.md)
 - [Benchmark methodology](docs/benchmarks.md)

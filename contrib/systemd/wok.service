@@ -1,0 +1,60 @@
+[Unit]
+Description=Wok Nostr relay
+Documentation=https://github.com/erskingardner/wok
+Wants=network-online.target
+After=network-online.target
+ConditionPathIsReadable=/etc/wok/wok.toml
+
+[Service]
+Type=simple
+User=wok
+Group=wok
+WorkingDirectory=/var/lib/wok
+ExecStart=/usr/local/bin/wok --config /etc/wok/wok.toml relay
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+KillMode=mixed
+
+# systemd creates these with ownership matching User/Group.
+StateDirectory=wok
+StateDirectoryMode=0700
+RuntimeDirectory=wok
+RuntimeDirectoryMode=0700
+UMask=0077
+
+# The relay and its configured write-policy child receive no elevated Linux
+# privileges. ProtectSystem also makes /etc/wok read-only to the service.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Keep the writable surface explicit. The leading '-' permits installations
+# that disable the Unix socket and therefore do not use /run/wok.
+ReadWritePaths=/var/lib/wok
+ReadWritePaths=-/run/wok
+LimitNOFILE=524288
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

@@ -116,7 +116,7 @@ The relay-side helper refuses database paths outside the fixed
 CAMPAIGN_ID=shakeout EVENTS=2000 REPETITIONS=1 QUERIES=50 \
   DEEP_PAGES=2 PUBLISH_CONNECTIONS=16 FANOUT_SUBSCRIBERS=16 \
   FANOUT_EVENTS=50 IDLE_CONNECTIONS=128 HOLD_SECONDS=2 \
-  LIFECYCLE_EVENTS=200 COOLDOWN_SECONDS=1 \
+  LIFECYCLE_EVENTS=200 LIFECYCLE_CONNECTIONS=1 COOLDOWN_SECONDS=1 \
   ./scripts/benchmark-campaign.sh
 ```
 
@@ -124,7 +124,12 @@ The main environment overrides are `RELAY_SSH`, `LOAD_SSH`, `RELAY_URL`,
 `BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`, `QUERIES`, `DEEP_PAGES`, `REPETITIONS`,
 `PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
 `IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`, `NOFILE_LIMIT`,
-`COOLDOWN_SECONDS`, `SEED`, and `BASE_TIMESTAMP`.
+`LIFECYCLE_CONNECTIONS`, `COOLDOWN_SECONDS`, `SEED`, and `BASE_TIMESTAMP`.
+
+Lifecycle publication defaults to one ordered connection because a deletion
+request must follow the event it references. Scaled publication is measured in
+the separate realistic workload; increasing `LIFECYCLE_CONNECTIONS` tests
+cross-stream ingestion ordering as a distinct experiment.
 
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`

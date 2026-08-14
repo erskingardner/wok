@@ -19,6 +19,7 @@ FANOUT_EVENTS=${FANOUT_EVENTS:-500}
 IDLE_CONNECTIONS=${IDLE_CONNECTIONS:-10000}
 HOLD_SECONDS=${HOLD_SECONDS:-15}
 LIFECYCLE_EVENTS=${LIFECYCLE_EVENTS:-10000}
+LIFECYCLE_CONNECTIONS=${LIFECYCLE_CONNECTIONS:-1}
 NOFILE_LIMIT=${NOFILE_LIMIT:-524288}
 COOLDOWN_SECONDS=${COOLDOWN_SECONDS:-10}
 SEED=${SEED:-4242}
@@ -131,7 +132,7 @@ run_one_relay() {
     fi
     if [[ $status -eq 0 ]] && ! run_bench "$relay" "$repetition" lifecycle \
         --scenario ws_publish_scaled --events "$LIFECYCLE_EVENTS" --event-mix lifecycle \
-        --publish-connections "$PUBLISH_CONNECTIONS"; then
+        --publish-connections "$LIFECYCLE_CONNECTIONS"; then
         status=1
     fi
 
@@ -161,6 +162,7 @@ write_campaign_metadata() {
         "idle_connections=$IDLE_CONNECTIONS"
         "hold_seconds=$HOLD_SECONDS"
         "lifecycle_events=$LIFECYCLE_EVENTS"
+        "lifecycle_connections=$LIFECYCLE_CONNECTIONS"
         "seed=$SEED"
         "base_timestamp=$BASE_TIMESTAMP"
     )

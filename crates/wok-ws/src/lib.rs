@@ -121,11 +121,11 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
+    let ip = match peer.ip() {
+        std::net::IpAddr::V4(value) => value.octets().to_vec(),
+        std::net::IpAddr::V6(value) => value.octets().to_vec(),
+    };
     if is_ws_upgrade {
-        let ip = match peer.ip() {
-            std::net::IpAddr::V4(value) => value.octets().to_vec(),
-            std::net::IpAddr::V6(value) => value.octets().to_vec(),
-        };
         if !handle.admit_connection(&ip) {
             return text_status_response(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -133,6 +133,16 @@ async fn dispatch(
             );
         }
         return upgrade_ws(req, handle, peer).await;
+    }
+    // Plain HTTP endpoints (/admin/api/*, /metrics, NIP-11, ...) otherwise
+    // have no per-IP budget: every /admin/api attempt runs a Schnorr
+    // verification before rejection, a straight unauthenticated CPU drain.
+    // Gate them behind the connection budget.
+    if !handle.admit_connection(&ip) {
+        return text_status_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate-limited: connection budget exhausted",
+        );
     }
     let path = req.uri().path().to_string();
     if matches!(path.as_str(), "/admin" | "/admin/") || path.starts_with("/admin/api/") {

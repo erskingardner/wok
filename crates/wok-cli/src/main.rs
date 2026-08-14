@@ -1710,12 +1710,20 @@ async fn cmd_stream(
     tracing::warn!("'wok stream' is deprecated. Please use 'wok router' instead.");
 
     let env = open_env(cfg)?;
+    // Dedup set of remote event IDs we've already downloaded; capped so a
+    // peer feeding invented IDs can't grow RAM without bound. At the cap the
+    // dedup degrades to possible duplicate uploads (harmless).
+    const MAX_DOWNLOADED_IDS: usize = 1_000_000;
+    /// Flush the write batch at this many queued bytes even below the
+    /// per-flush event count.
+    const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
     let mut downloaded: std::collections::HashSet<Vec<u8>> = Default::default();
     let mut curr_event_id = {
         let txn = env.begin_ro()?;
         most_recent_levid_ro_quiet(&txn)
     };
     let mut batch: Vec<serde_json::Value> = Vec::new();
+    let mut batch_bytes = 0usize;
     let mut written = 0u64;
     let initial_delay = std::time::Duration::from_secs(reconnect_delay);
     let maximum_delay = std::time::Duration::from_secs(max_reconnect_delay);
@@ -1723,8 +1731,8 @@ async fn cmd_stream(
 
     loop {
         tracing::info!(url = %url, "stream connecting");
-        match tokio_tungstenite::connect_async(&url).await {
-            Ok((mut ws, _)) => {
+        match mesh::connect_mesh(&url, cfg.events.max_event_size).await {
+            Ok(mut ws) => {
                 tracing::info!(url = %url, "stream connected");
                 delay = initial_delay;
                 let subscription = if dir == "down" || dir == "both" {
@@ -1777,17 +1785,29 @@ async fn cmd_stream(
                                         tracing::warn!(url = %url, "event not written: {v}");
                                     }
                                     "EVENT" if dir == "down" || dir == "both" => {
+                                        // Drop frames that could never hold a valid
+                                        // event before queueing them unverified.
+                                        if txt.len() > cfg.events.max_event_size + 64 {
+                                            tracing::warn!(url = %url, "stream dropped oversize frame");
+                                            continue;
+                                        }
                                         if let Some(ev) = v.get(2) {
                                             if dir == "both" {
                                                 if let Some(id) = ev.get("id").and_then(|id| id.as_str()) {
-                                                    if let Ok(raw) = wok_event::from_lower_hex_exact(id) {
-                                                        downloaded.insert(raw);
+                                                    // Event IDs are 32 bytes hex; longer
+                                                    // "ids" are attacker-controlled padding.
+                                                    if id.len() == 64 && downloaded.len() < MAX_DOWNLOADED_IDS {
+                                                        if let Ok(raw) = wok_event::from_lower_hex_exact(id) {
+                                                            downloaded.insert(raw);
+                                                        }
                                                     }
                                                 }
                                             }
+                                            batch_bytes += txt.len();
                                             batch.push(ev.clone());
-                                            if batch.len() >= 1000 {
+                                            if batch.len() >= 1000 || batch_bytes >= MAX_BATCH_BYTES {
                                                 write_downloaded(&env, cfg, &mut batch, &mut written)?;
+                                                batch_bytes = 0;
                                             }
                                         }
                                     }
@@ -1796,6 +1816,7 @@ async fn cmd_stream(
                             }
                             _ = flush_tick.tick() => {
                                 write_downloaded(&env, cfg, &mut batch, &mut written)?;
+                                batch_bytes = 0;
                             }
                             _ = upload_tick.tick(), if dir != "down" => {
                                 let mut outbound = Vec::new();

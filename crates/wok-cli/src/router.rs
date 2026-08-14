@@ -395,6 +395,8 @@ enum ManagerMsg {
         group: String,
         url: String,
         event: Value,
+        /// Raw frame size; held against the shared queue budget until processed.
+        approx_bytes: usize,
     },
     Log {
         group: String,
@@ -402,6 +404,19 @@ enum ManagerMsg {
         text: String,
     },
 }
+
+/// Approximate cap on queued inbound event bytes between conn tasks and the
+/// manager. The manager does a blocking plugin round-trip per event, so
+/// without a byte bound a lagging manager lets producers queue unbounded
+/// memory behind it. Producers block on the budget (TCP backpressure).
+const MAX_QUEUED_EVENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Flush the manager's write batch at this many queued bytes even if the
+/// event count hasn't reached the per-flush limit.
+const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// Cap the text of log messages crossing the manager channel.
+const MAX_LOG_CHARS: usize = 512;
 
 struct Group {
     spec: StreamSpec,
@@ -445,6 +460,7 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
     )?;
     env.ensure_initialized()?;
     let (manager_tx, mut manager_rx) = mpsc::channel::<ManagerMsg>(4096);
+    let queue_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_EVENT_BYTES));
     let mut groups: HashMap<String, Group> = HashMap::new();
     let mut router_cfg = load_router_config(&router_path)?;
     reconcile(&cfg, &router_cfg, &mut groups);
@@ -456,6 +472,7 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
     let mut last_cfg_mtime = file_mtime(&router_path);
     let mut last_db_mtime = file_mtime(&env.path().join("data.mdb"));
     let mut batch: Vec<Value> = Vec::new();
+    let mut batch_bytes = 0usize;
     let mut flush_tick = tokio::time::interval(Duration::from_secs(1));
     let mut watch_tick = tokio::time::interval(Duration::from_millis(250));
     let mut cron_tick =
@@ -486,7 +503,9 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
                             }
                         }
                     }
-                    ManagerMsg::IncomingEvent { group, url, event } => {
+                    ManagerMsg::IncomingEvent { group, url, event, approx_bytes } => {
+                        // Return the queue budget before doing the work.
+                        queue_budget.add_permits(approx_bytes);
                         if let Some(g) = groups.get_mut(&group) {
                             if g.spec.dir != "up" {
                                 let cmd = g.spec.plugin_down.clone();
@@ -496,9 +515,11 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
                                     g.plugin_down.accept_event(&cmd, &ev, "Stream", &url, None, &mut msg)
                                 });
                                 if res == PluginResult::Accept {
+                                    batch_bytes += approx_bytes;
                                     batch.push(event);
-                                    if batch.len() >= 1000 {
+                                    if batch.len() >= 1000 || batch_bytes >= MAX_BATCH_BYTES {
                                         flush_router_batch(&env, &cfg, &mut batch)?;
+                                        batch_bytes = 0;
                                     }
                                 }
                             }
@@ -517,6 +538,7 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
             _ = flush_tick.tick() => {
                 if !batch.is_empty() {
                     flush_router_batch(&env, &cfg, &mut batch)?;
+                    batch_bytes = 0;
                 }
             }
             _ = watch_tick.tick() => {
@@ -562,8 +584,10 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
                             let url2 = url.clone();
                             let tx = manager_tx.clone();
                             let timeout = router_cfg.connection_timeout;
+                            let max_event_size = cfg.events.max_event_size;
+                            let budget = queue_budget.clone();
                             tokio::spawn(async move {
-                                run_conn(gname2, url2, dir, filter, tx, timeout).await;
+                                run_conn(gname2, url2, dir, filter, tx, timeout, max_event_size, budget).await;
                             });
                         }
                     }
@@ -683,6 +707,7 @@ fn reconcile(cfg: &Config, router_cfg: &RouterConfig, groups: &mut HashMap<Strin
 }
 
 /// One connection task per configured URL.
+#[allow(clippy::too_many_arguments)]
 async fn run_conn(
     group: String,
     url: String,
@@ -690,15 +715,24 @@ async fn run_conn(
     filter: Value,
     tx: mpsc::Sender<ManagerMsg>,
     timeout: Duration,
+    max_event_size: usize,
+    budget: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
     let connect = async {
-        tokio::time::timeout(timeout, tokio_tungstenite::connect_async(&url))
-            .await
-            .map_err(|_| anyhow::anyhow!("timeout"))?
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
+        tokio::time::timeout(
+            timeout,
+            tokio_tungstenite::connect_async_with_config(
+                &url,
+                Some(crate::mesh::mesh_ws_config(max_event_size)),
+                false,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout"))?
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
     };
     let (ws, _) = match connect.await {
         Ok(x) => x,
@@ -741,11 +775,11 @@ async fn run_conn(
             msg = wrx.next() => {
                 match msg {
                     Some(Ok(Message::Text(t))) => {
-                        handle_conn_text(&tx, &group, &url, &t).await;
+                        handle_conn_text(&tx, &group, &url, &t, max_event_size, &budget).await;
                     }
                     Some(Ok(Message::Binary(b))) => {
                         let t = String::from_utf8_lossy(&b).into_owned();
-                        handle_conn_text(&tx, &group, &url, &t).await;
+                        handle_conn_text(&tx, &group, &url, &t, max_event_size, &budget).await;
                     }
                     Some(Ok(Message::Ping(p))) => {
                         let _ = wtx.send(Message::Pong(p)).await;
@@ -771,20 +805,50 @@ async fn run_conn(
     let _ = tx.send(ManagerMsg::Disconnected { group, url }).await;
 }
 
-async fn handle_conn_text(tx: &mpsc::Sender<ManagerMsg>, group: &str, url: &str, t: &str) {
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+async fn handle_conn_text(
+    tx: &mpsc::Sender<ManagerMsg>,
+    group: &str,
+    url: &str,
+    t: &str,
+    max_event_size: usize,
+    budget: &std::sync::Arc<tokio::sync::Semaphore>,
+) {
+    // Reject frames that could never contain a valid event (max_event_size
+    // plus the ["EVENT","sub", ...] envelope) before parsing or queueing.
+    if t.len() > max_event_size.saturating_add(64) {
+        tracing::warn!(url = url, "router: dropped oversize frame from relay");
+        return;
+    }
     let Ok(v) = serde_json::from_str::<Value>(t) else {
         return;
     };
     match v[0].as_str().unwrap_or("") {
         "EVENT" => {
             if let Some(ev) = v.get(2) {
-                let _ = tx
+                // Hold the frame's size against the shared queue budget so a
+                // lagging manager applies backpressure instead of unbounded
+                // queue growth.
+                let bytes = t.len().min(MAX_QUEUED_EVENT_BYTES);
+                let Ok(permit) = budget.clone().acquire_many_owned(bytes as u32).await else {
+                    return;
+                };
+                let sent = tx
                     .send(ManagerMsg::IncomingEvent {
                         group: group.to_string(),
                         url: url.to_string(),
                         event: ev.clone(),
+                        approx_bytes: bytes,
                     })
-                    .await;
+                    .await
+                    .is_ok();
+                if sent {
+                    // The manager releases the budget once it dequeues this.
+                    permit.forget();
+                }
             }
         }
         "NOTICE" => {
@@ -792,7 +856,7 @@ async fn handle_conn_text(tx: &mpsc::Sender<ManagerMsg>, group: &str, url: &str,
                 .send(ManagerMsg::Log {
                     group: group.to_string(),
                     url: url.to_string(),
-                    text: format!("NOTICE: {v}"),
+                    text: truncate_chars(&format!("NOTICE: {v}"), MAX_LOG_CHARS),
                 })
                 .await;
         }
@@ -801,7 +865,7 @@ async fn handle_conn_text(tx: &mpsc::Sender<ManagerMsg>, group: &str, url: &str,
                 .send(ManagerMsg::Log {
                     group: group.to_string(),
                     url: url.to_string(),
-                    text: format!("event not written: {v}"),
+                    text: truncate_chars(&format!("event not written: {v}"), MAX_LOG_CHARS),
                 })
                 .await;
         }

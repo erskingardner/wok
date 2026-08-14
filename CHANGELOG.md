@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provenance and resource evidence.
 - A same-host, order-rotated transport campaign comparing Wok's production
   length-prefixed Unix interface with Wok and strfry WebSockets under identical
-  correctness-gated publish, query, fanout, and connection workloads.
+  correctness-gated publish, query, fanout, and connection workloads, plus a
+  reproducible report of the first 100,000-event, three-repetition campaign.
 
 ### Changed
 

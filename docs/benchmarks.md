@@ -190,15 +190,18 @@ Original artifacts remain under `/opt/relay-bench/campaigns/<campaign-id>` and
 are copied to `/opt/wok-load/results/<campaign-id>` for analysis with the
 two-host campaign results.
 
-Latest committed run (Apple Silicon aarch64, 10k events, single noisy run —
-do not rank from one run): `docs/sample-bench-summary.md` and
-`docs/sample-bench-results.jsonl`. Headline shape: wok leads on DB-path CLI
-scenarios (import 1.6x, export 3.4x, negentropy build 2.3x, dup import
-4.3x), WS publish is round-trip-bound parity, and WS query QPS is within
-run-to-run noise after the req-worker marshalling pass (~9.0k vs ~9.7k qps
-for strfry; an earlier revision of this benchmark measured a 35% strfry
-lead, which was traced to per-event allocation churn in wok's query path,
-not the LMDB scan itself).
+### Recorded transport campaign
+
+The [2026-08-14 transport report](transport-benchmark-2026-08-14.md) records a
+100,000-event Linux campaign with three order-rotated repetitions. All 54
+trials passed their correctness gates. It includes median throughput and
+latency, peak client/server resources, exact corpus and binary hashes,
+limitations, retained artifact locations, and the next investigations.
+
+The older `sample-bench-summary.md` and `sample-bench-results.jsonl` remain a
+historical single-run Apple Silicon example of the local process harness. Do
+not treat that sample as the current controlled VM result or combine it with
+same-host transport and two-host network measurements.
 
 See [NIP-50 search](nip50-search.md) for the search workload, exact semantics,
 and 100k/1m-event scale results.

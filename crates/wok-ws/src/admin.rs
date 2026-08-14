@@ -663,6 +663,20 @@ fn admin_page(cfg: &Config) -> Response<Full<Bytes>> {
     let body = ADMIN_HTML_V2
         .replace("__PUBLIC_URL__", &public_url)
         .replace("__WOK_MARK__", crate::WOK_MARK_SVG);
+    // Pin the single inline <script> by hash instead of allowing all inline
+    // scripts: a future XSS sink in the page then can't execute injected
+    // script while talking to the operator's NIP-07 signer. The hash covers
+    // the final substituted bytes, so config changes can't invalidate it.
+    let script = body
+        .split_once("<script>")
+        .and_then(|(_, rest)| rest.split_once("</script>"))
+        .map(|(js, _)| js)
+        .unwrap_or("");
+    let digest = sha2::Sha256::digest(script.as_bytes());
+    let csp = format!(
+        "default-src 'none'; script-src 'sha256-{}'; style-src 'unsafe-inline'; connect-src 'self'",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/html; charset=utf-8")
@@ -670,10 +684,7 @@ fn admin_page(cfg: &Config) -> Response<Full<Bytes>> {
         .header("X-Frame-Options", "DENY")
         .header("X-Content-Type-Options", "nosniff")
         .header("Referrer-Policy", "no-referrer")
-        .header(
-            "Content-Security-Policy",
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
-        )
+        .header("Content-Security-Policy", csp)
         .body(Full::new(Bytes::from(body)))
         .unwrap()
 }
@@ -1024,5 +1035,39 @@ mod tests {
         assert!(ADMIN_HTML_V2.contains(
             ".card,.panel,.config-group{background:linear-gradient(180deg,#131820,#11151c)"
         ));
+    }
+
+    #[test]
+    fn admin_page_pins_inline_script_by_hash() {
+        use base64::Engine;
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        let resp = admin_page(&cfg);
+        let csp = resp
+            .headers()
+            .get("Content-Security-Policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!csp.contains("script-src 'unsafe-inline'"), "{csp}");
+        let hash = csp
+            .split("script-src 'sha256-")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("script-src must carry a sha256 pin");
+        // The pin must match the exact bytes of the inline script block.
+        let body = ADMIN_HTML_V2
+            .replace("__PUBLIC_URL__", "\"https://relay.example\"")
+            .replace("__WOK_MARK__", crate::WOK_MARK_SVG);
+        let script = body
+            .split_once("<script>")
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .map(|(js, _)| js)
+            .unwrap();
+        let expect = base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(script.as_bytes()));
+        assert_eq!(hash, expect);
     }
 }

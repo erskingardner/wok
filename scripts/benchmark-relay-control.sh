@@ -24,14 +24,14 @@ select_relay() {
             DB_ROOT=$WOK_DB_ROOT
             CONFIG=$WOK_CONFIG
             SERVICE_USER=wokbench
-            BINARY=$(systemctl show "$SERVICE" -p ExecStart --value | awk '{print $1}')
+            BINARY=$(service_binary "$SERVICE")
             ;;
         strfry)
             SERVICE=$STRFRY_SERVICE
             DB_ROOT=$STRFRY_DB_ROOT
             CONFIG=$STRFRY_CONFIG
             SERVICE_USER=strfrybench
-            BINARY=$(systemctl show "$SERVICE" -p ExecStart --value | awk '{print $1}')
+            BINARY=$(service_binary "$SERVICE")
             ;;
         *)
             echo "relay must be wok or strfry" >&2
@@ -42,6 +42,12 @@ select_relay() {
         echo "missing benchmark binary or config for $relay" >&2
         exit 1
     fi
+}
+
+service_binary() {
+    local service=$1
+    systemctl show "$service" -p ExecStart --value | \
+        sed -n 's/^.*path=\([^ ;}]*\).*$/\1/p'
 }
 
 stop_all() {

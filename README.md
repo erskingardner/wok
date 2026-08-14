@@ -155,23 +155,25 @@ per stage (`numThreads.*`) with connections hashed onto workers like C++
 
 ## Benchmarks
 
-Harness: `wok-bench` (disposable temp dirs, identical deterministic corpus for
-both relays, correctness gates before speed). Both binaries optimized
-(C++ `-O3`, wok release + thin LTO).
+Harness: `wok-bench` uses disposable databases, deterministic signed corpora,
+rotated relay order, and correctness gates before speed. Local process
+comparisons, two-host load campaigns, and same-host Unix/WebSocket comparisons
+are separate experiments so network RTT is not confused with transport cost.
 
-Latest committed run — Apple Silicon (aarch64), 10,000 events, seed 1, single
-noisy run (**do not rank from one run**):
+Latest controlled transport campaign — Linux x86-64 VM, 100,000 realistic
+events, three order-rotated repetitions, 54/54 correct trials:
 
-| Scenario | wok | strfry | |
-|---|---|---|---|
-| import (verified) | 34.6k ev/s | 21.6k ev/s | wok 1.6x |
-| export | 626k ev/s | 183k ev/s | wok 3.4x |
-| negentropy build | 378k ev/s | 164k ev/s | wok 2.3x |
-| duplicate import | 170k ev/s | 39k ev/s | wok 4.3x |
-| WS publish (1 / 8 conns) | 201 / 192 ev/s | 189 / 182 ev/s | parity (round-trip bound) |
-| WS query (mixed REQs) | 9.0k qps | 9.7k qps | within noise |
-| live fanout (32 subs x 200) | 6400/6400 | 6400/6400 | parity, complete delivery |
-| cold start | 104 ms | 104 ms | parity |
+| Median scenario | Wok WebSocket | Wok Unix | strfry WebSocket |
+|---|---:|---:|---:|
+| historical query | 90.3 req/s | **1,859.4 req/s** | 90.5 req/s |
+| mixed read/write | 22.8 req/s | **848.7 req/s** | 22.7 req/s |
+| accepted publication | 2,887 events/s | 2,873 events/s | **3,470 events/s** |
+| connection opens | 3,698 conn/s | **16,486 conn/s** | 3,611 conn/s |
+
+These are same-host transport results, not Internet-facing capacity claims.
+The full setup, latency/resource tables, interpretation, limitations, and
+artifact provenance are in the
+[2026-08-14 transport benchmark report](docs/transport-benchmark-2026-08-14.md).
 
 Reproduce:
 
@@ -182,7 +184,8 @@ cargo build --release -p wok-cli -p wok-bench
 ```
 
 Details and methodology: [docs/benchmarks.md](docs/benchmarks.md);
-raw data: [docs/sample-bench-results.jsonl](docs/sample-bench-results.jsonl),
+historical single-run local sample:
+[docs/sample-bench-results.jsonl](docs/sample-bench-results.jsonl),
 [docs/sample-bench-summary.md](docs/sample-bench-summary.md).
 NIP-50 design, semantics, and scale results: [docs/nip50-search.md](docs/nip50-search.md).
 
@@ -233,6 +236,8 @@ Summary:
 - [Configuration](docs/config.md)
 - [Observability](docs/observability.md)
 - [Operator dashboard](docs/admin-dashboard.md)
+- [Benchmark methodology](docs/benchmarks.md)
+- [2026-08-14 transport benchmark](docs/transport-benchmark-2026-08-14.md)
 - [Mesh and maintenance](docs/mesh-and-maintenance.md)
 - [Cutover / rollback](docs/cutover.md)
 - [Security](docs/security.md)

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Comprehensive configuration and Prometheus metric references, including a
+  complete commented `wok.toml` and documented dashboard edit boundaries.
+- A guarded two-host Wok/strfry campaign runner with deterministic reusable
+  signed corpora, realistic actor relationships, historical remote queries,
+  lifecycle publication workloads, alternating relay order, and captured
+  provenance and resource evidence.
+- A same-host, order-rotated transport campaign comparing Wok's production
+  length-prefixed Unix interface with Wok and strfry WebSockets under identical
+  correctness-gated publish, query, fanout, and connection workloads, plus a
+  reproducible report of the first 100,000-event, three-repetition campaign.
+
+### Changed
+
+- The relay landing page now presents banner/icon media, operator and relay
+  npubs, contact and policy links, linked and described supported NIPs, and the
+  version with its source revision.
+- The operator dashboard now opens on an explicit signed-out screen and
+  exposes the broad safe set of live-reloadable identity, event, protocol,
+  abuse, filter, NIP-62, and history settings with inline explanations.
+- Dashboard charts now include a labeled, automatically scaled value axis.
+
+### Fixed
+
+- Dashboard NIP-98 requests now include a cryptographically random nonce, so
+  repeated or save-then-refresh actions signed in the same second cannot
+  collide with replay protection.
+
 ## [0.1.0] - 2026-08-13
 
 ### Added
@@ -53,6 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The comparative benchmark now emits replayable signed corpora and SHA-256
+  manifests, supports repeated order-balanced trials, and includes a remote
+  load profile for scaled publication, fanout, and idle connections.
 - Wok treats strfry compatibility as a verified migration boundary rather than
   an ongoing promise to preserve strfry implementation bugs.
 - Ephemeral event kinds are live-only by default, with an explicit persisted
@@ -62,6 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Accepted WebSocket connections now enable `TCP_NODELAY`, preventing Linux
+  delayed ACKs from adding roughly 40 ms between small EVENT and EOSE frames.
 - Historical result bursts no longer hit an undocumented 256-message queue
   and disconnect healthy clients before the configured pending-byte budget;
   deep author pagination and mixed read/write workloads now guard this path.

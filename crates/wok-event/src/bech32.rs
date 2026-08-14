@@ -88,6 +88,43 @@ pub fn decode_npub(input: &str) -> Result<[u8; 32], EventError> {
     Ok(arr)
 }
 
+/// Encode a 32-byte public key as a lowercase NIP-19 `npub`.
+pub fn encode_npub(pubkey: &[u8; 32]) -> String {
+    let mut payload = Vec::with_capacity(52);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &byte in pubkey {
+        acc = (acc << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            payload.push(((acc >> bits) & 31) as u8);
+        }
+    }
+    if bits > 0 {
+        payload.push(((acc << (5 - bits)) & 31) as u8);
+    }
+
+    let hrp = b"npub";
+    let mut checksum_input = Vec::with_capacity(hrp.len() * 2 + 1 + payload.len() + 6);
+    checksum_input.extend(hrp.iter().map(|byte| byte >> 5));
+    checksum_input.push(0);
+    checksum_input.extend(hrp.iter().map(|byte| byte & 31));
+    checksum_input.extend_from_slice(&payload);
+    checksum_input.extend_from_slice(&[0; 6]);
+    let checksum = polymod(&checksum_input) ^ 1;
+
+    let mut encoded = String::with_capacity(63);
+    encoded.push_str("npub1");
+    for value in payload {
+        encoded.push(CHARSET[value as usize] as char);
+    }
+    for shift in (0..6).rev() {
+        encoded.push(CHARSET[((checksum >> (shift * 5)) & 31) as usize] as char);
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +136,10 @@ mod tests {
         assert_eq!(
             hex::encode(pk),
             "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+        );
+        assert_eq!(
+            encode_npub(&pk),
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
         );
     }
 

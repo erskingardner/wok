@@ -1437,6 +1437,14 @@ mod tests {
 
     #[test]
     fn documented_toml_example_parses() {
-        Config::parse_toml(include_str!("../../../docs/wok.toml")).unwrap();
+        let documented = include_str!("../../../docs/wok.toml");
+        Config::parse_toml(documented).unwrap();
+
+        let documented: toml::Value = toml::from_str(documented).unwrap();
+        let defaults: toml::Value = toml::from_str(&Config::default().to_toml().unwrap()).unwrap();
+        assert_eq!(
+            documented, defaults,
+            "docs/wok.toml must list every default"
+        );
     }
 }

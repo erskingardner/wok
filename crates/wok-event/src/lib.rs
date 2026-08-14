@@ -12,7 +12,7 @@ mod packed;
 mod parse;
 mod validate;
 
-pub use bech32::decode_npub;
+pub use bech32::{decode_npub, encode_npub};
 pub use error::EventError;
 pub use hash::{event_id_hash, sha256, verify_id, verify_sig};
 pub use kinds::{is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag};

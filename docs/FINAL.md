@@ -70,6 +70,10 @@ Live NIP-11 HTTP: `e2e_transports::nip11_http_document`.
 - `unix_publish_and_subscribe`
 - `ws_publish_unix_subscribe`
 - `unix_publish_ws_subscribe`
+- `wok-bench --target-unix` exercises publication, historical query,
+  pagination, mixed read/write, fanout, and connection capacity over the
+  production framing. The three-target campaign and measured evidence are in
+  [transport-benchmark-2026-08-14.md](transport-benchmark-2026-08-14.md).
 
 Protocol: 4-byte big-endian length + UTF-8 JSON. Spec: `docs/unix-socket.md`.
 
@@ -88,7 +92,10 @@ cargo build --release -p wok-cli -p wok-bench
   --wok ./target/release/wok --seed 1
 ```
 
-`--profile full` adds the named 18 scenarios, including live WebSocket catch-up. Unix publish/subscribe correctness is in e2e tests; the smoke unix row is an import/scan stand-in.
+`--profile full` adds the named CLI, WebSocket, and live-delivery scenarios.
+Unix publish/subscribe correctness is covered by both the cross-transport e2e
+tests and the external-target load scenarios; it is no longer represented by
+an import/scan stand-in.
 
 ## Commands run and pass/fail
 

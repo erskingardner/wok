@@ -204,7 +204,8 @@ Final local gates passed with zero failures:
 - `wok-bench --profile smoke` against the local strfry binary: every scenario
   reported `ok=true`, with zero errors and zero mismatches
 
-No `v0.1.0` tag or GitHub Release existed at audit time. Because this is still
-the first release, the post-parity `Unreleased` entries were folded into the
-dated `0.1.0` section in a dedicated release commit after the complete PR stack
-was merged. Only that exact green commit should receive the `v0.1.0` tag.
+No `v0.1.0` tag or GitHub Release existed at the time of this audit. The
+release was subsequently published from commit
+`c5bdc86b4c94aeffd6fc58719687929000c22620`; the historical validation above
+describes the evidence used to prepare that first release. Later releases use
+the contract documented in [releases.md](releases.md).

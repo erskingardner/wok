@@ -641,7 +641,9 @@ fn response(status: StatusCode, content_type: &str, body: &str) -> Response<Full
 
 fn admin_page(cfg: &Config) -> Response<Full<Bytes>> {
     let public_url = serde_json::to_string(&cfg.admin.public_url).unwrap_or_else(|_| "\"\"".into());
-    let body = ADMIN_HTML_V2.replace("__PUBLIC_URL__", &public_url);
+    let body = ADMIN_HTML_V2
+        .replace("__PUBLIC_URL__", &public_url)
+        .replace("__WOK_MARK__", crate::WOK_MARK_SVG);
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/html; charset=utf-8")
@@ -664,7 +666,7 @@ const ADMIN_HTML_V2: &str = r##"<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Wok operator</title>
 <style>
-:root{color-scheme:dark;--bg:#090b0f;--panel:#11151c;--panel2:#151b24;--line:#28303c;--text:#f7f4ed;--muted:#99a4b5;--hot:#ff8a3d;--green:#5bd6a2;--red:#ff7373}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;min-height:100vh;background:radial-gradient(circle at 78% -8%,#1b120f 0,transparent 32rem),var(--bg);color:var(--text);font:15px/1.45 Inter,"SF Pro Text",system-ui,-apple-system,sans-serif}button,input,select{font:inherit}button{border:0;border-radius:10px;padding:10px 14px;background:var(--hot);color:#1e0c02;font-weight:760;cursor:pointer}button.secondary{background:#1c2330;color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.45;cursor:not-allowed}.mark{display:grid;place-items:center;width:46px;height:46px;border-radius:12px;background:var(--hot);color:#1b0c04;font-size:25px;font-weight:900;box-shadow:0 10px 28px #ff8a3d33}.muted{color:var(--muted)}.ok{color:var(--green)}.bad{color:var(--red)}
+:root{color-scheme:dark;--bg:#090b0f;--panel:#11151c;--panel2:#151b24;--line:#28303c;--text:#f7f4ed;--muted:#99a4b5;--hot:#ff8a3d;--green:#5bd6a2;--red:#ff7373}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;min-height:100vh;background:radial-gradient(circle at 78% -8%,#1b120f 0,transparent 32rem),var(--bg);color:var(--text);font:15px/1.45 Inter,"SF Pro Text",system-ui,-apple-system,sans-serif}button,input,select{font:inherit}button{border:0;border-radius:10px;padding:10px 14px;background:var(--hot);color:#1e0c02;font-weight:760;cursor:pointer}button.secondary{background:#1c2330;color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.45;cursor:not-allowed}.mark{display:grid;place-items:center;width:46px;height:46px;background:#090b0f;color:#ff8a3d;box-shadow:0 10px 28px #0006}.mark svg{display:block;width:100%;height:100%}.muted{color:var(--muted)}.ok{color:var(--green)}.bad{color:var(--red)}
 .login{display:grid;place-items:center;min-height:100vh;padding:24px}.login-card{width:min(470px,100%);padding:34px;background:linear-gradient(180deg,#131820,#11151c);border:1px solid var(--line);border-radius:12px;box-shadow:0 24px 70px #0006}.login-card .mark{margin-bottom:28px}.eyebrow{margin:0 0 8px;color:var(--hot);font-size:12px;font-weight:780;letter-spacing:.1em;text-transform:uppercase}.login h1{margin:0;font-size:34px;letter-spacing:-.04em}.login-copy{margin:14px 0 24px;color:var(--muted);font-size:16px;line-height:1.6}.login button{width:100%;padding:13px}.login-note{margin:18px 0 0;color:#7f8998;font-size:12px}.login-status{min-height:22px;margin-top:15px;font-size:13px}
 .dashboard{max-width:1200px;margin:auto;padding:34px 24px 70px}.dashboard>header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:28px}.brand{display:flex;align-items:center;gap:14px}.brand h1{font-size:24px;margin:0}.toolbar{display:flex;gap:9px;align-items:center}.status{padding:9px 12px;border:1px solid var(--line);border-radius:8px;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card,.panel,.config-group{background:linear-gradient(180deg,#131820,#11151c);border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 32px #0003}.card{padding:18px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:29px;font-weight:780;margin-top:8px}.panels{display:grid;grid-template-columns:1.55fr 1fr;gap:16px;margin-top:16px}.panel{padding:20px}.panel h2,.config-header h2{font-size:16px;margin:0}.chart{height:245px;width:100%;margin-top:15px;background:#0b0e13;border-radius:8px;border:1px solid #1e2530}.config{margin-top:16px}.config-intro{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:16px}.config-intro h2{margin:0 0 4px;font-size:20px}.config-intro p{margin:0}.config-groups{display:grid;gap:12px}.config-group{overflow:hidden}.config-group summary{list-style:none;cursor:pointer;padding:18px 20px}.config-group summary::-webkit-details-marker{display:none}.config-header{display:flex;align-items:center;justify-content:space-between;gap:15px}.config-header h2:after{content:"+";display:inline-block;margin-left:9px;color:var(--hot)}details[open] .config-header h2:after{content:"−"}.config-header p{max-width:650px;margin:3px 0 0;color:var(--muted);font-size:13px}.config-fields{display:grid;grid-template-columns:1fr;gap:0;padding:0 20px 4px;border-top:1px solid var(--line)}.field{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,360px);align-items:center;gap:32px;padding:16px 0;border-bottom:1px solid #222a34}.field:last-child{border-bottom:0}.field.wide{grid-column:auto}.field>span{min-width:0}.field-title,.field-help{display:block}.field-title{font-weight:680}.field-help{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.45}.field input,.field select{width:100%;height:42px;justify-self:end;background:#0a0d12;border:1px solid var(--line);border-radius:7px;padding:9px 10px;color:var(--text)}.field input:focus,.field select:focus{outline:2px solid #ff8a3d55;border-color:var(--hot)}.field.checkbox{grid-template-columns:minmax(0,1fr) minmax(220px,360px)}.field.checkbox input{width:20px;height:20px;justify-self:end;accent-color:var(--hot)}.actions{position:sticky;bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:16px;padding:14px 16px;background:#11161ef2;border:1px solid var(--line);border-radius:10px;backdrop-filter:blur(12px)}
 @media(max-width:820px){.grid{grid-template-columns:1fr 1fr}.panels{grid-template-columns:1fr}}@media(max-width:620px){.field:not(.checkbox){grid-template-columns:1fr;gap:10px}.field:not(.checkbox) input,.field:not(.checkbox) select{grid-column:1}.field.checkbox{grid-template-columns:minmax(0,1fr) auto;gap:20px}}@media(max-width:560px){.dashboard{padding:22px 14px}.dashboard>header,.config-intro{align-items:flex-start;flex-direction:column}.toolbar{width:100%;flex-wrap:wrap}.grid{grid-template-columns:1fr}.login-card{padding:27px}.actions{align-items:flex-start;flex-direction:column}.actions button{width:100%}}
@@ -673,7 +675,7 @@ const ADMIN_HTML_V2: &str = r##"<!doctype html>
 <body>
 <section id="loginView" class="login">
   <div class="login-card">
-    <div class="mark">W</div>
+    <div class="mark">__WOK_MARK__</div>
     <p class="eyebrow">Wok operator</p>
     <h1>Sign in to administer this relay</h1>
     <p class="login-copy">Operational data and configuration are private. Use an approved Nostr key to unlock the dashboard.</p>
@@ -684,7 +686,7 @@ const ADMIN_HTML_V2: &str = r##"<!doctype html>
 </section>
 <main id="dashboard" class="dashboard" hidden>
   <header>
-    <div class="brand"><div class="mark">W</div><div><h1>Wok operator</h1><span class="muted">Authenticated relay control surface</span></div></div>
+    <div class="brand"><div class="mark">__WOK_MARK__</div><div><h1>Wok operator</h1><span class="muted">Authenticated relay control surface</span></div></div>
     <div class="toolbar"><span id="status" class="status ok">Authenticated</span><button id="refresh" class="secondary">Refresh</button><button id="logout" class="secondary">Sign out</button></div>
   </header>
   <section class="grid">
@@ -976,6 +978,8 @@ mod tests {
 
     #[test]
     fn admin_shell_starts_logged_out_and_explains_every_field() {
+        assert_eq!(ADMIN_HTML_V2.matches("__WOK_MARK__").count(), 2);
+        assert!(crate::WOK_MARK_SVG.contains("<path fill=\"currentColor\""));
         assert!(ADMIN_HTML_V2.contains("Sign in to administer this relay"));
         assert!(ADMIN_HTML_V2.contains("id=\"dashboard\" class=\"dashboard\" hidden"));
         assert!(ADMIN_HTML_V2.contains("field-help"));

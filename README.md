@@ -1,5 +1,9 @@
 # wok
 
+<p align="center">
+  <img src="docs/wok.svg" alt="Wok logo" width="160">
+</p>
+
 A Rust Nostr relay that began as a reimplementation of
 [strfry](https://github.com/hoytech/strfry). Wok provides a verified, one-way
 migration from strfry v3 databases and configs, then owns its database and
@@ -45,8 +49,13 @@ quirk. It also provides an additional Unix-domain socket transport.
   migration of the supported `strfry.conf` subset.
 - **Native abuse resistance**: per-IP and per-pubkey token buckets, separate
   connection/EVENT/REQ/COUNT budgets, pre-scan query costing, historical-query
-  concurrency limits, optional author storage quotas, rejection metrics, and
-  optional NIP-13 proof-of-work enforcement advertised through NIP-11.
+  concurrency limits, bounded NIP-50 index growth, default global and author
+  storage quotas, a free-disk reserve, rejection metrics, and optional NIP-13
+  proof-of-work enforcement advertised through NIP-11.
+- **Hardened untrusted-input boundary**: safe crates forbid unsafe Rust, LMDB
+  and OS FFI are isolated and documented, and property tests plus scheduled
+  ASan/UBSan fuzzing exercise JSON, events, WebSockets, compression,
+  Negentropy, and database transaction sequences.
 
 ## Build
 
@@ -168,12 +177,16 @@ events, three order-rotated repetitions, 54/54 correct trials:
 | historical query | 90.3 req/s | **1,859.4 req/s** | 90.5 req/s |
 | mixed read/write | 22.8 req/s | **848.7 req/s** | 22.7 req/s |
 | accepted publication | 2,887 events/s | 2,873 events/s | **3,470 events/s** |
+| fanout delivery | 28,983 deliveries/s | **31,839 deliveries/s** | 28,483 deliveries/s |
 | connection opens | 3,698 conn/s | **16,486 conn/s** | 3,611 conn/s |
+| deep-history pages | 89.1 pages/s | 92.6 pages/s | **106.3 pages/s** |
 
 These are same-host transport results, not Internet-facing capacity claims.
-The full setup, latency/resource tables, interpretation, limitations, and
-artifact provenance are in the
-[2026-08-14 transport benchmark report](docs/transport-benchmark-2026-08-14.md).
+At the 10,000-connection peak, server RSS was 632 MiB for Wok WebSocket,
+459 MiB for Wok Unix, and 292 MiB for strfry WebSocket. The full latency,
+resource, setup, interpretation, limitation, and artifact-provenance tables are
+in the [2026-08-14 transport benchmark
+report](docs/transport-benchmark-2026-08-14.md).
 
 Reproduce:
 
@@ -249,15 +262,17 @@ Summary:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --exclude wok-bench --locked
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
 # Optional C++ differential (requires a strfry binary):
 cargo test -p wok-db --test cpp_roundtrip
 cargo test -p wok-compat --test cpp_export --test cpp_negentropy
 ```
 
-Fuzz/property tests live next to the units (`proptest` in `wok-query`).
+Fast property tests live beside the relevant crates. The composed libFuzzer
+target and scheduled sanitizer workflow are documented in
+[Security](docs/security.md).
 
 ## License
 

@@ -15,8 +15,9 @@ in `CHANGELOG.md` must agree.
 5. Tag the exact release commit and push only that tag:
 
    ```bash
-   git tag -a v0.1.0 <release-commit> -m "Wok 0.1.0"
-   git push origin v0.1.0
+   version=0.2.0
+   git tag -a "v$version" <release-commit> -m "Wok $version"
+   git push origin "v$version"
    ```
 
 The tag push starts `.github/workflows/release.yml`. It independently validates
@@ -27,10 +28,11 @@ creates a tag itself.
 
 ## Release assets
 
-Each archive contains `wok`, `README.md`, `CHANGELOG.md`, `LICENSE`, and the
-example `wok.toml`. `SHA256SUMS` covers all published archives. Wok currently
-uses Unix-specific process, signal, and socket APIs, so Windows artifacts are
-not published.
+Each archive contains `wok`, `README.md`, `CHANGELOG.md`, `LICENSE`, the
+example `wok.toml`, and the complete `docs/` tree so README links and the Wok
+logo remain available offline. `SHA256SUMS` covers all published archives. Wok
+currently uses Unix-specific process, signal, and socket APIs, so Windows
+artifacts are not published.
 
 Do not reuse or move a published version tag. If a release needs correction,
 prepare a new patch version and changelog entry.

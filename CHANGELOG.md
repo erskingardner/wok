@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-14
+
 ### Added
 
+- A Wok logo used consistently by the repository README, public relay landing
+  page, and signed-out and authenticated operator dashboard.
 - Comprehensive configuration and Prometheus metric references, including a
   complete commented `wok.toml` and documented dashboard edit boundaries.
 - A guarded two-host Wok/strfry campaign runner with deterministic reusable
@@ -19,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length-prefixed Unix interface with Wok and strfry WebSockets under identical
   correctness-gated publish, query, fanout, and connection workloads, plus a
   reproducible report of the first 100,000-event, three-repetition campaign.
+- Property tests and a scheduled sanitizer-backed libFuzzer campaign covering
+  strict JSON and event validation, protocol envelopes, WebSocket framing and
+  decompression, Negentropy frames, and LMDB transaction sequences.
+- Storage recovery fixtures that exhaust the LMDB map and terminate a writer
+  process before commit, then reopen the database and verify atomicity and
+  complete index integrity.
+- A least-privilege systemd unit and production deployment guide covering
+  filesystem permissions, reverse proxies, plugins, logging, and database
+  operations.
+- Scheduled locked-dependency advisory, source, and license policy checks.
 
 ### Changed
 
@@ -40,12 +54,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposes the broad safe set of live-reloadable identity, event, protocol,
   abuse, filter, NIP-62, and history settings with inline explanations.
 - Dashboard charts now include a labeled, automatically scaled value axis.
+- Release archives now retain the complete documentation tree, including the
+  logo referenced by the packaged README, while keeping `wok.toml` at the
+  archive root for convenience.
+- NIP-50 indexing bounds unique normalized terms and generated bigrams per
+  event, with a schema rebuild for deterministic bounded postings.
+- REQ and COUNT admission now enforce both a combined compact-JSON byte budget
+  and an unconditional filter-count ceiling.
+- New databases default to a 64 GiB LMDB map, a 1 GiB free-disk reserve, and
+  finite global and per-pubkey durable event ceilings.
 
 ### Fixed
 
 - Dashboard NIP-98 requests now include a cryptographically random nonce, so
   repeated or save-then-refresh actions signed in the same second cannot
   collide with replay protection.
+- Untrusted relay notices and plugin diagnostics are emitted as escaped
+  structured fields instead of raw terminal text.
+
+### Security
+
+- Safe crates forbid unsafe Rust. LMDB and operating-system FFI are confined
+  to explicit audited modules, transaction and cursor wrappers cannot cross
+  threads, and Negentropy nodes use validated field encoding instead of raw
+  Rust-struct memory copies.
+- Durable writes fail atomically at the configured disk, LMDB map, global
+  event, or per-author event ceiling, preventing unbounded storage growth.
+- CI continuously checks adversarial parser behavior under AddressSanitizer
+  and UndefinedBehaviorSanitizer and rejects vulnerable, yanked, unapproved,
+  or unknown dependency sources.
 
 ## [0.1.0] - 2026-08-13
 
@@ -132,5 +169,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protected-event publishing and restricted reads require the appropriate
   authenticated author or recipient relationship.
 
-[Unreleased]: https://github.com/erskingardner/wok/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/erskingardner/wok/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/erskingardner/wok/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/erskingardner/wok/releases/tag/v0.1.0

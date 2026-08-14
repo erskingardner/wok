@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+wok-db = { path = "../crates/wok-db" }
 wok-event = { path = "../crates/wok-event" }
 wok-negentropy = { path = "../crates/wok-negentropy" }
 wok-relay = { path = "../crates/wok-relay" }

@@ -1468,6 +1468,7 @@ name = "wok-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "wok-db",
  "wok-event",
  "wok-negentropy",
  "wok-relay",

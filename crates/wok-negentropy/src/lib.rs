@@ -23,4 +23,4 @@ pub use storage::Storage;
 pub use types::{Bound, Item, MAX_U64, PROTOCOL_VERSION};
 pub use vector::{SubRange, Vector};
 
-pub use btree::{MAX_ITEMS, NODE_SIZE};
+pub use btree::{BTreeBackend, BTreeCore, Key, Node, NodePtr, MAX_ITEMS, NODE_SIZE};

@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signed corpora, realistic actor relationships, historical remote queries,
   lifecycle publication workloads, alternating relay order, and captured
   provenance and resource evidence.
+- A same-host, order-rotated transport campaign comparing Wok's production
+  length-prefixed Unix interface with Wok and strfry WebSockets under identical
+  correctness-gated publish, query, fanout, and connection workloads.
 
 ### Changed
 

@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use futures_util::{SinkExt, StreamExt};
 use hdrhistogram::Histogram;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -81,9 +82,26 @@ struct Args {
     /// Run network load against an already-running relay instead of spawning one.
     #[arg(long)]
     target_url: Option<String>,
-    /// Result label used with --target-url.
+    /// Run load over Wok's framed Unix socket instead of spawning a relay.
+    #[arg(long, conflicts_with = "target_url")]
+    target_unix: Option<PathBuf>,
+    /// Result label used with --target-url or --target-unix.
     #[arg(long, default_value = "remote")]
     target_label: String,
+}
+
+impl Args {
+    fn target_endpoint(&self) -> Option<String> {
+        self.target_url.clone().or_else(|| {
+            self.target_unix
+                .as_ref()
+                .map(|path| format!("unix://{}", path.display()))
+        })
+    }
+
+    fn has_external_target(&self) -> bool {
+        self.target_url.is_some() || self.target_unix.is_some()
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -252,7 +270,7 @@ fn main() -> Result<()> {
         .worker_threads(8)
         .build()?;
 
-    if args.target_url.is_some()
+    if args.has_external_target()
         && scenarios.iter().any(|scenario| {
             !matches!(
                 *scenario,
@@ -266,7 +284,7 @@ fn main() -> Result<()> {
         })
     {
         anyhow::bail!(
-            "--target-url supports scaled publication, query, mixed read/write, fanout, and idle-connection scenarios"
+            "external targets support scaled publication, query, mixed read/write, fanout, and idle-connection scenarios"
         );
     }
 
@@ -331,8 +349,10 @@ fn main() -> Result<()> {
         corpus,
         wok: wok_manifest,
         strfry: strfry_manifest,
-        target_url: args.target_url.clone(),
-        target_label: args.target_url.as_ref().map(|_| args.target_label.clone()),
+        target_url: args.target_endpoint(),
+        target_label: args
+            .has_external_target()
+            .then(|| args.target_label.clone()),
     };
     std::fs::write(
         args.out.join("manifest.json"),
@@ -350,7 +370,7 @@ fn main() -> Result<()> {
     let mut trials = Vec::new();
     for repetition in 1..=args.repetitions {
         for scenario in &scenarios {
-            let mut relays: Vec<&str> = if args.target_url.is_some() {
+            let mut relays: Vec<&str> = if args.has_external_target() {
                 vec![args.target_label.as_str()]
             } else if *scenario == "nip50_search" {
                 vec!["wok"]
@@ -418,7 +438,7 @@ fn run_trial(
     let mut notes = String::new();
     let mut throughput = 0.0f64;
 
-    let bin = if args.target_url.is_some() {
+    let bin = if args.has_external_target() {
         None
     } else if relay == "wok" {
         Some(args.wok.as_path())
@@ -457,9 +477,10 @@ fn run_trial(
     };
     let local_bin =
         || bin.ok_or_else(|| anyhow::anyhow!("{scenario} requires locally managed relay binaries"));
+    let target_endpoint = args.target_endpoint();
     let target = RelayTarget {
         bin,
-        url: args.target_url.as_deref(),
+        url: target_endpoint.as_deref(),
         dbdir: dir.path(),
     };
     match scenario {
@@ -660,7 +681,7 @@ fn run_trial(
             match idle_connections_trial(
                 rt,
                 bin,
-                args.target_url.as_deref(),
+                target_endpoint.as_deref(),
                 dir.path(),
                 args.connections,
                 args.hold_seconds,
@@ -1141,15 +1162,75 @@ fn stop_target(child: &mut Option<Child>) {
     }
 }
 
-async fn connect_retry(
-    url: &str,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-> {
+type WebSocketClient =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+enum ClientConnection {
+    WebSocket(Box<WebSocketClient>),
+    Unix(tokio::net::UnixStream),
+}
+
+impl ClientConnection {
+    async fn send(&mut self, message: tokio_tungstenite::tungstenite::Message) -> Result<()> {
+        match self {
+            Self::WebSocket(stream) => stream.send(message).await.context("WebSocket send"),
+            Self::Unix(stream) => {
+                let text = message
+                    .into_text()
+                    .context("Unix transport accepts text frames only")?;
+                wok_unix::write_frame(stream, text.as_bytes())
+                    .await
+                    .context("Unix frame send")
+            }
+        }
+    }
+
+    async fn next(&mut self) -> Option<Result<tokio_tungstenite::tungstenite::Message>> {
+        match self {
+            Self::WebSocket(stream) => stream
+                .next()
+                .await
+                .map(|message| message.map_err(anyhow::Error::from)),
+            Self::Unix(stream) => Some(
+                wok_unix::read_frame(stream, 1_000_000)
+                    .await
+                    .context("Unix frame receive")
+                    .map(|body| {
+                        tokio_tungstenite::tungstenite::Message::Text(
+                            String::from_utf8_lossy(&body).into_owned().into(),
+                        )
+                    }),
+            ),
+        }
+    }
+
+    async fn close(&mut self, _frame: Option<()>) -> Result<()> {
+        match self {
+            Self::WebSocket(stream) => stream.close(None).await.context("WebSocket close"),
+            Self::Unix(stream) => {
+                use tokio::io::AsyncWriteExt;
+                stream.shutdown().await.context("Unix socket close")
+            }
+        }
+    }
+}
+
+async fn connect_retry(endpoint: &str) -> Result<ClientConnection> {
     let mut last_err = None;
     for _ in 0..50 {
-        match tokio_tungstenite::connect_async(url).await {
-            Ok((s, _)) => return Ok(s),
+        let connected = if let Some(path) = endpoint.strip_prefix("unix://") {
+            wok_unix::connect(path)
+                .await
+                .map(ClientConnection::Unix)
+                .map_err(anyhow::Error::from)
+        } else {
+            tokio_tungstenite::connect_async(endpoint)
+                .await
+                .map(|(stream, _)| ClientConnection::WebSocket(Box::new(stream)))
+                .map_err(anyhow::Error::from)
+        };
+        match connected {
+            Ok(stream) => return Ok(stream),
             Err(e) => {
                 last_err = Some(e.to_string());
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1200,7 +1281,7 @@ fn ws_publish_target_trial(
     })?;
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
-        use futures_util::{future::join_all, SinkExt, StreamExt};
+        use futures_util::future::join_all;
         use tokio_tungstenite::tungstenite::Message;
         let mut sockets = Vec::new();
         for _ in 0..conns {
@@ -1336,7 +1417,6 @@ fn ws_query_trial(
     }
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
-        use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         let mut sockets = Vec::new();
         for _ in 0..4 {
@@ -1468,7 +1548,6 @@ fn deep_history_trial(
     let pages = queries.max(1).min(available_pages);
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
-        use futures_util::{SinkExt, StreamExt};
         use std::collections::HashSet;
         use tokio_tungstenite::tungstenite::Message;
 
@@ -1601,7 +1680,6 @@ fn mixed_read_write_trial(
     })?;
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
-        use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
         let mut query_socket = connect_retry(&url).await?;
@@ -1741,7 +1819,6 @@ fn ws_search_trial(
     let port = free_port();
     let mut child = spawn_relay(bin, dbdir, port)?;
     let out = rt.block_on(async {
-        use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
         let url = format!("ws://127.0.0.1:{port}/");
@@ -1832,7 +1909,6 @@ fn live_fanout_trial(
     let events = generate_values(workload)?;
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
-        use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         let mut subscribers = Vec::new();
         for i in 0..subs {
@@ -1941,7 +2017,7 @@ fn idle_connections_trial(
     let mismatches = u64::from(opened != connections);
     let rate = opened as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
     let notes =
-        format!("opened {opened}/{connections} WebSockets and held them for {hold_seconds}s");
+        format!("opened {opened}/{connections} connections and held them for {hold_seconds}s");
     Ok((rate, notes, mismatches == 0, mismatches))
 }
 
@@ -1956,7 +2032,6 @@ fn cold_start_trial(
     let start = Instant::now();
     let mut child = spawn_relay(bin, dbdir, port)?;
     let out = rt.block_on(async {
-        use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         let url = format!("ws://127.0.0.1:{port}/");
         let mut ws = connect_retry(&url).await?;
@@ -1996,9 +2071,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
-    if let Some(target_url) = &args.target_url {
+    if let Some(target_url) = args.target_endpoint() {
         s.push_str(&format!(
-            "remote_target={} ({})\n\n",
+            "external_target={} ({})\n\n",
             args.target_label, target_url
         ));
     }
@@ -2021,9 +2096,26 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             t.notes
         ));
     }
+    let selection = args.scenario.as_ref().map_or_else(
+        || format!("--profile {}", args.profile),
+        |scenario| format!("--scenario {scenario}"),
+    );
+    let target = if let Some(path) = &args.target_unix {
+        format!(
+            " --target-unix \"{}\" --target-label {}",
+            path.display(),
+            args.target_label
+        )
+    } else if let Some(url) = &args.target_url {
+        format!(
+            " --target-url \"{url}\" --target-label {}",
+            args.target_label
+        )
+    } else {
+        " --strfry /path/to/strfry --wok ./target/release/wok".into()
+    };
     s.push_str(&format!(
-        "\nReproduction:\n\n```bash\ncargo build --release -p wok-cli -p wok-bench\n./target/release/wok-bench --profile {} --out bench-results --strfry /path/to/strfry --wok ./target/release/wok --seed {} --base-timestamp {} --event-mix {} --repetitions {}\n```\n",
-        args.profile,
+        "\nReproduction:\n\n```bash\ncargo build --release -p wok-cli -p wok-bench\n./target/release/wok-bench {selection} --out bench-results{target} --seed {} --base-timestamp {} --event-mix {} --repetitions {}\n```\n",
         args.seed,
         args.base_timestamp.unwrap_or_default(),
         args.event_mix.to_possible_value().expect("value enum").get_name(),
@@ -2143,5 +2235,59 @@ mod tests {
                     .as_array()
                     .is_some_and(|tags| tags.iter().any(|tag| tag[0] == "e"))
         }));
+    }
+
+    #[test]
+    fn unix_target_is_an_external_endpoint_and_conflicts_with_url() {
+        let args = Args::try_parse_from([
+            "wok-bench",
+            "--target-unix",
+            "/tmp/wok-bench.sock",
+            "--target-label",
+            "wok-unix",
+        ])
+        .unwrap();
+        assert!(args.has_external_target());
+        assert_eq!(
+            args.target_endpoint().as_deref(),
+            Some("unix:///tmp/wok-bench.sock")
+        );
+        assert!(Args::try_parse_from([
+            "wok-bench",
+            "--target-unix",
+            "/tmp/wok-bench.sock",
+            "--target-url",
+            "ws://127.0.0.1:7777",
+        ])
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn client_connection_uses_length_prefixed_unix_frames() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("bench.sock");
+        let listener = wok_unix::bind_unix(&socket, 0o600, "", "").unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = wok_unix::read_frame(&mut stream, 1024).await.unwrap();
+            assert_eq!(request, br#"["REQ","test",{}]"#);
+            wok_unix::write_frame(&mut stream, br#"["EOSE","test"]"#)
+                .await
+                .unwrap();
+        });
+
+        let mut client = connect_retry(&format!("unix://{}", socket.display()))
+            .await
+            .unwrap();
+        client
+            .send(Message::Text(r#"["REQ","test",{}]"#.into()))
+            .await
+            .unwrap();
+        let response = client.next().await.unwrap().unwrap();
+        assert_eq!(response.to_text().unwrap(), r#"["EOSE","test"]"#);
+        let _ = client.close(None).await;
+        server.await.unwrap();
     }
 }

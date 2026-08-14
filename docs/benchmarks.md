@@ -143,6 +143,53 @@ non-zero `mismatches`.
 A trial with missing events, unexpected rejections, or dropped deliveries is
 `ok=false` — correctness gates come before speed.
 
+## Unix versus WebSocket transports
+
+Wok's Unix transport can run the same publication, query, pagination,
+mixed-read/write, fanout, and connection-capacity scenarios as WebSocket:
+
+```bash
+./target/release/wok-bench --profile load \
+  --target-unix /run/wok/wok.sock --target-label wok-unix \
+  --events 100000 --publish-connections 128 \
+  --fanout-subscribers 128 --fanout-events 500 \
+  --connections 10000 --hold-seconds 15 --out unix-results
+```
+
+`--target-unix` and `--target-url` are mutually exclusive. Unix clients use
+the production four-byte big-endian length plus UTF-8 JSON framing, not a
+benchmark-only protocol.
+
+Do not compare a same-host Unix result directly to a WebSocket client running
+on another VM: that mixes transport overhead with network RTT. The guarded
+`scripts/benchmark-transports.sh` campaign instead runs all three clients on
+the relay VM:
+
+- Wok over WebSocket;
+- Wok over its Unix socket; and
+- strfry over WebSocket.
+
+Each target receives a fresh database imported from the same checksum-verified
+signed corpus. The script rotates the three-target order over its default
+three repetitions, applies the same correctness gates, records both client and
+server resources, and leaves both services stopped. It requires the benchmark
+Wok config to enable `/var/lib/relay-bench/wok/wok.sock`.
+
+```bash
+# Defaults: 100k events, three rotated repetitions.
+./scripts/benchmark-transports.sh
+
+# Fast end-to-end transport shakeout.
+CAMPAIGN_ID=transport-shakeout EVENTS=2000 REPETITIONS=1 QUERIES=40 \
+  PUBLISH_CONNECTIONS=8 FANOUT_SUBSCRIBERS=8 FANOUT_EVENTS=30 \
+  IDLE_CONNECTIONS=64 HOLD_SECONDS=1 COOLDOWN_SECONDS=1 \
+  ./scripts/benchmark-transports.sh
+```
+
+Original artifacts remain under `/opt/relay-bench/campaigns/<campaign-id>` and
+are copied to `/opt/wok-load/results/<campaign-id>` for analysis with the
+two-host campaign results.
+
 Latest committed run (Apple Silicon aarch64, 10k events, single noisy run —
 do not rank from one run): `docs/sample-bench-summary.md` and
 `docs/sample-bench-results.jsonl`. Headline shape: wok leads on DB-path CLI

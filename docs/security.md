@@ -47,3 +47,9 @@ frames, and modeled LMDB transaction sequences on every normal test run. A
 separate libFuzzer target composes the public ingress parsers. Scheduled and
 parser-changing pull-request jobs run that target under AddressSanitizer and
 UndefinedBehaviorSanitizer with a persistent crash corpus.
+
+Storage recovery tests exhaust a deliberately small LMDB map and terminate a
+separate writer process after the event and secondary indexes have been
+modified but before commit. Each fixture reopens the environment and verifies
+that the failed transaction left no partial state; the process-crash fixture
+also runs the full database integrity checker against a committed baseline.

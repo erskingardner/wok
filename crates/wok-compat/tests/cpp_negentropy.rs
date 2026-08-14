@@ -100,8 +100,8 @@ fn rust_tree_stats(dir: &Path) -> (u64, String) {
     .unwrap();
     let txn = env.begin_ro().unwrap();
     let mut tree = wok_negentropy::open_ro(&txn, 1).unwrap();
-    let size = tree.size();
-    let fp = hex::encode(tree.fingerprint(0, size as usize));
+    let size = tree.size().unwrap();
+    let fp = hex::encode(tree.fingerprint(0, size as usize).unwrap());
     (size, fp)
 }
 

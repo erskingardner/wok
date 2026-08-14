@@ -888,6 +888,29 @@ fn handle_client(
             sub_id,
             payload_hex,
         } => {
+            // NEG-MSG shares the REQ token budget: reconciliation messages
+            // each cost a worker round with B-tree descents, and persistent
+            // sessions could otherwise stream them back-to-back forever.
+            let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
+            if !abuse.admit_ip(&ip, BudgetKind::Req, &cfg.relay.abuse)
+                || pubkey
+                    .as_ref()
+                    .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
+            {
+                metrics
+                    .abuse_req_rate_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                conns.send(
+                    conn_id,
+                    RelayMessage::NegErr {
+                        sub_id,
+                        message: "rate-limited: NEG-MSG budget exhausted".into(),
+                        extra: None,
+                    },
+                    metrics,
+                );
+                return;
+            }
             if !cfg.relay.negentropy_enabled {
                 conns.send(
                     conn_id,
@@ -2529,7 +2552,7 @@ fn run_negentropy(
                     payload,
                 } => {
                     let key = (conn_id, sub_id.to_string());
-                    match views.get(&key) {
+                    match views.get_mut(&key) {
                         Some(NegView::Memory { vec, .. }) => {
                             if !vec.is_sealed() {
                                 conns.send(
@@ -2540,7 +2563,7 @@ fn run_negentropy(
                                     &metrics,
                                 );
                             } else {
-                                match reconcile_vector(vec.clone(), &payload) {
+                                match reconcile_vector(vec, &payload) {
                                     Ok(resp) => {
                                         conns.send(
                                             conn_id,
@@ -2657,7 +2680,7 @@ fn run_negentropy(
             }
             let _ = vec.seal();
             let initial = std::mem::take(initial);
-            match reconcile_vector(vec.clone(), &initial) {
+            match reconcile_vector(vec, &initial) {
                 Ok(resp) => {
                     conns.send(
                         sub.conn_id,
@@ -2686,7 +2709,10 @@ fn count_conn_views(views: &HashMap<(u64, String), NegView>, conn: u64) -> usize
     views.keys().filter(|k| k.0 == conn).count()
 }
 
-fn reconcile_vector(store: Vector, payload: &[u8]) -> Result<Vec<u8>, String> {
+fn reconcile_vector(store: &mut Vector, payload: &[u8]) -> Result<Vec<u8>, String> {
+    // Borrow the view instead of cloning it into each reconcile round: a
+    // Memory view can hold up to max_sync_events items (~40 MB), and every
+    // NEG-MSG used to memcpy the whole thing.
     let mut ne = Negentropy::new(store, 500_000).map_err(|e| e.to_string())?;
     ne.reconcile(payload).map_err(|e| e.to_string())
 }
@@ -2727,7 +2753,8 @@ fn reconcile_stateless(
         } else {
             until.saturating_add(1)
         });
-        let sub_store = wok_negentropy::SubRange::new(&mut tree, &lower, &upper);
+        let sub_store = wok_negentropy::SubRange::new(&mut tree, &lower, &upper)
+            .map_err(|e| e.to_string())?;
         let mut ne = Negentropy::new(sub_store, 500_000).map_err(|e| e.to_string())?;
         ne.reconcile(payload).map_err(|e| e.to_string())
     })();

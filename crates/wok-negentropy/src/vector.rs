@@ -64,48 +64,52 @@ impl Vector {
 }
 
 impl Storage for Vector {
-    fn size(&mut self) -> u64 {
-        // C++ Vector::size() throws (checkSealed) when unsealed. All relay
-        // paths seal before use; treat a violation as a loud bug, matching
-        // the C++ failure instead of silently answering with wrong data.
-        self.check_sealed().expect("negentropy Vector not sealed");
-        self.items.len() as u64
+    fn size(&mut self) -> Result<u64, NegError> {
+        self.check_sealed()?;
+        Ok(self.items.len() as u64)
     }
 
-    fn get_item(&mut self, i: usize) -> Item {
-        self.check_sealed().expect("negentropy Vector not sealed");
-        self.check_bounds(i, i + 1)
-            .expect("negentropy Vector out of bounds");
-        self.items[i]
+    fn get_item(&mut self, i: usize) -> Result<Item, NegError> {
+        self.check_sealed()?;
+        self.check_bounds(i, i + 1)?;
+        Ok(self.items[i])
     }
 
-    fn iterate<F: FnMut(&Item, usize) -> bool>(&mut self, begin: usize, end: usize, mut cb: F) {
-        self.check_sealed().expect("negentropy Vector not sealed");
-        self.check_bounds(begin, end)
-            .expect("negentropy Vector out of bounds");
+    fn iterate<F: FnMut(&Item, usize) -> bool>(
+        &mut self,
+        begin: usize,
+        end: usize,
+        mut cb: F,
+    ) -> Result<(), NegError> {
+        self.check_sealed()?;
+        self.check_bounds(begin, end)?;
         for i in begin..end {
             if !cb(&self.items[i], i) {
                 break;
             }
         }
+        Ok(())
     }
 
-    fn find_lower_bound(&mut self, begin: usize, end: usize, bound: &Bound) -> usize {
-        self.check_sealed().expect("negentropy Vector not sealed");
-        self.check_bounds(begin, end)
-            .expect("negentropy Vector out of bounds");
-        begin + self.items[begin..end].partition_point(|item| *item < bound.item)
+    fn find_lower_bound(
+        &mut self,
+        begin: usize,
+        end: usize,
+        bound: &Bound,
+    ) -> Result<usize, NegError> {
+        self.check_sealed()?;
+        self.check_bounds(begin, end)?;
+        Ok(begin + self.items[begin..end].partition_point(|item| *item < bound.item))
     }
 
-    fn fingerprint(&mut self, begin: usize, end: usize) -> Fingerprint {
-        self.check_sealed().expect("negentropy Vector not sealed");
-        self.check_bounds(begin, end)
-            .expect("negentropy Vector out of bounds");
+    fn fingerprint(&mut self, begin: usize, end: usize) -> Result<Fingerprint, NegError> {
+        self.check_sealed()?;
+        self.check_bounds(begin, end)?;
         let mut out = Accumulator::default();
         for item in &self.items[begin..end] {
             out.add_item(item);
         }
-        out.get_fingerprint((end - begin) as u64)
+        Ok(out.get_fingerprint((end - begin) as u64))
     }
 }
 
@@ -135,57 +139,67 @@ pub struct SubRange<'a, S: Storage> {
 }
 
 impl<'a, S: Storage> SubRange<'a, S> {
-    pub fn new(base: &'a mut S, lower: &Bound, upper: &Bound) -> Self {
-        let base_size = base.size() as usize;
+    pub fn new(base: &'a mut S, lower: &Bound, upper: &Bound) -> Result<Self, NegError> {
+        let base_size = base.size()? as usize;
         let sub_begin = if *lower == Bound::timestamp(0) {
             0
         } else {
-            base.find_lower_bound(0, base_size, lower)
+            base.find_lower_bound(0, base_size, lower)?
         };
         let mut sub_end = if *upper == Bound::timestamp(crate::types::MAX_U64) {
             base_size
         } else {
-            base.find_lower_bound(sub_begin, base_size, upper)
+            base.find_lower_bound(sub_begin, base_size, upper)?
         };
-        if sub_end != base_size && Bound::from_item(base.get_item(sub_end)) == *upper {
+        if sub_end != base_size && Bound::from_item(base.get_item(sub_end)?) == *upper {
             sub_end += 1;
         }
-        Self {
+        Ok(Self {
             base,
             sub_begin,
             sub_size: sub_end - sub_begin,
-        }
+        })
     }
 }
 
 impl<S: Storage> Storage for SubRange<'_, S> {
-    fn size(&mut self) -> u64 {
-        self.sub_size as u64
+    fn size(&mut self) -> Result<u64, NegError> {
+        Ok(self.sub_size as u64)
     }
 
-    fn get_item(&mut self, i: usize) -> Item {
+    fn get_item(&mut self, i: usize) -> Result<Item, NegError> {
         self.base.get_item(self.sub_begin + i)
     }
 
-    fn iterate<F: FnMut(&Item, usize) -> bool>(&mut self, begin: usize, end: usize, mut cb: F) {
+    fn iterate<F: FnMut(&Item, usize) -> bool>(
+        &mut self,
+        begin: usize,
+        end: usize,
+        mut cb: F,
+    ) -> Result<(), NegError> {
         let sub_begin = self.sub_begin;
         self.base
             .iterate(sub_begin + begin, sub_begin + end, |item, index| {
                 cb(item, index - sub_begin)
-            });
+            })
     }
 
-    fn find_lower_bound(&mut self, begin: usize, end: usize, bound: &Bound) -> usize {
+    fn find_lower_bound(
+        &mut self,
+        begin: usize,
+        end: usize,
+        bound: &Bound,
+    ) -> Result<usize, NegError> {
         let sub_begin = self.sub_begin;
         let sub_size = self.sub_size;
-        (self
+        Ok((self
             .base
-            .find_lower_bound(sub_begin + begin, sub_begin + end, bound)
+            .find_lower_bound(sub_begin + begin, sub_begin + end, bound)?
             .saturating_sub(sub_begin))
-        .min(sub_size)
+        .min(sub_size))
     }
 
-    fn fingerprint(&mut self, begin: usize, end: usize) -> Fingerprint {
+    fn fingerprint(&mut self, begin: usize, end: usize) -> Result<Fingerprint, NegError> {
         let sub_begin = self.sub_begin;
         self.base.fingerprint(sub_begin + begin, sub_begin + end)
     }

@@ -713,24 +713,34 @@ impl<B: BTreeBackend> BTreeCore<B> {
 }
 
 impl<B: BTreeBackend> Storage for BTreeCore<B> {
-    fn size(&mut self) -> u64 {
-        self.size_mut().unwrap_or(0)
+    fn size(&mut self) -> Result<u64, NegError> {
+        self.size_mut()
     }
 
-    fn get_item(&mut self, i: usize) -> Item {
-        self.get_item_mut(i).unwrap_or_default()
+    fn get_item(&mut self, i: usize) -> Result<Item, NegError> {
+        self.get_item_mut(i)
     }
 
-    fn iterate<F: FnMut(&Item, usize) -> bool>(&mut self, begin: usize, end: usize, cb: F) {
-        let _ = self.iterate_mut(begin, end, cb);
+    fn iterate<F: FnMut(&Item, usize) -> bool>(
+        &mut self,
+        begin: usize,
+        end: usize,
+        cb: F,
+    ) -> Result<(), NegError> {
+        self.iterate_mut(begin, end, cb)
     }
 
-    fn find_lower_bound(&mut self, begin: usize, end: usize, bound: &Bound) -> usize {
-        self.find_lower_bound_mut(begin, end, bound).unwrap_or(end)
+    fn find_lower_bound(
+        &mut self,
+        begin: usize,
+        end: usize,
+        bound: &Bound,
+    ) -> Result<usize, NegError> {
+        self.find_lower_bound_mut(begin, end, bound)
     }
 
-    fn fingerprint(&mut self, begin: usize, end: usize) -> Fingerprint {
-        self.fingerprint_mut(begin, end).unwrap_or([0u8; 16])
+    fn fingerprint(&mut self, begin: usize, end: usize) -> Result<Fingerprint, NegError> {
+        self.fingerprint_mut(begin, end)
     }
 }
 

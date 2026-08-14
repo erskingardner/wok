@@ -1103,11 +1103,17 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
             wok_db::foreach_negentropy_filter(&txn, |id, filter| {
                 cli_println!("tree {id}");
                 cli_println!("  filter: {filter}");
-                if let Ok(mut tree) = wok_negentropy::open_ro(&txn, id) {
-                    let size = tree.size();
-                    let fp = tree.fingerprint(0, size as usize);
-                    cli_println!("  size: {size}");
-                    cli_println!("  fingerprint: {}", hex::encode(fp));
+                let details = wok_negentropy::open_ro(&txn, id).and_then(|mut tree| {
+                    let size = tree.size()?;
+                    let fp = tree.fingerprint(0, size as usize)?;
+                    Ok((size, fp))
+                });
+                match details {
+                    Ok((size, fp)) => {
+                        cli_println!("  size: {size}");
+                        cli_println!("  fingerprint: {}", hex::encode(fp));
+                    }
+                    Err(e) => cli_println!("  error: {e}"),
                 }
                 true
             })?;
@@ -1485,7 +1491,8 @@ async fn cmd_sync(
                 } else {
                     until.saturating_add(1)
                 });
-                let sub = wok_negentropy::SubRange::new(&mut tree, &lower, &upper);
+                let sub = wok_negentropy::SubRange::new(&mut tree, &lower, &upper)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 let mut ne = wok_negentropy::Negentropy::new(sub, frame_size_limit)
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 ne.initiate().map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -1516,7 +1523,8 @@ async fn cmd_sync(
                 } else {
                     until.saturating_add(1)
                 });
-                let sub = wok_negentropy::SubRange::new(&mut tree, &lower, &upper);
+                let sub = wok_negentropy::SubRange::new(&mut tree, &lower, &upper)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 let mut ne = wok_negentropy::Negentropy::new(sub, frame_size_limit)
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 ne.set_initiator();
@@ -2078,7 +2086,7 @@ mod main_tests {
         build_negentropy_tree(&env, tree_id, 1).unwrap();
         let txn = env.begin_ro().unwrap();
         let mut tree = wok_negentropy::open_ro(&txn, tree_id).unwrap();
-        assert_eq!(tree.size(), 5);
+        assert_eq!(tree.size().unwrap(), 5);
         assert!(build_negentropy_tree(&env, tree_id, 0)
             .unwrap_err()
             .to_string()

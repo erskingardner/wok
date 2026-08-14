@@ -5,6 +5,15 @@ use crate::error::NegError;
 use crate::storage::Storage;
 use crate::types::{Bound, Item, Mode, FINGERPRINT_SIZE, ID_SIZE, MAX_U64, PROTOCOL_VERSION};
 
+/// Decoded messages larger than this are rejected before any work. The relay
+/// WS layer already bounds inbound payloads well below this; the cap protects
+/// direct protocol users.
+const MAX_RECONCILE_INPUT_BYTES: usize = 1024 * 1024;
+/// Maximum bound/mode records processed per reconcile round. Each one can
+/// cost a B-tree descent, so unbounded counts let a pathological message pin
+/// a worker; legitimate splits produce a small multiple of 16 per round.
+const MAX_BOUNDS_PER_ROUND: usize = 4096;
+
 pub struct Negentropy<S> {
     storage: S,
     frame_size_limit: u64,
@@ -41,8 +50,8 @@ impl<S: Storage> Negentropy<S> {
         }
         self.is_initiator = true;
         let mut output = vec![PROTOCOL_VERSION];
-        let size = self.storage.size() as usize;
-        output.extend(self.split_range(0, size, Bound::timestamp(MAX_U64)));
+        let size = self.storage.size()? as usize;
+        output.extend(self.split_range(0, size, Bound::timestamp(MAX_U64))?);
         Ok(output)
     }
 
@@ -82,6 +91,9 @@ impl<S: Storage> Negentropy<S> {
         have_ids: &mut Vec<Vec<u8>>,
         need_ids: &mut Vec<Vec<u8>>,
     ) -> Result<Vec<u8>, NegError> {
+        if query.len() > MAX_RECONCILE_INPUT_BYTES {
+            return Err(NegError::msg("negentropy message too large"));
+        }
         self.last_timestamp_in = 0;
         self.last_timestamp_out = 0;
         let mut full_output = vec![PROTOCOL_VERSION];
@@ -100,32 +112,42 @@ impl<S: Storage> Negentropy<S> {
             return Ok(full_output);
         }
 
-        let storage_size = self.storage.size() as usize;
+        let storage_size = self.storage.size()? as usize;
         let mut prev_bound = Bound::default();
         let mut prev_index = 0usize;
         let mut skip = false;
+        let mut bounds_seen = 0usize;
 
         while !query.is_empty() {
+            bounds_seen += 1;
+            if bounds_seen > MAX_BOUNDS_PER_ROUND {
+                return Err(NegError::msg("negentropy message has too many bounds"));
+            }
             let mut o = Vec::new();
             let curr_bound = self.decode_bound(&mut query)?;
             let mode = Mode::try_from(decode_varint(&mut query)?)?;
             let lower = prev_index;
             let mut upper = self
                 .storage
-                .find_lower_bound(prev_index, storage_size, &curr_bound);
+                .find_lower_bound(prev_index, storage_size, &curr_bound)?;
+            // Non-monotonic bound sequences: error out like C++ (its
+            // fingerprint range check throws) instead of wrapping upper-lower.
+            if upper < prev_index {
+                return Err(NegError::msg("negentropy bounds out of order"));
+            }
 
             if mode == Mode::Skip {
                 skip = true;
             } else if mode == Mode::Fingerprint {
                 let their_fp = get_bytes(&mut query, FINGERPRINT_SIZE)?;
-                let our_fp = self.storage.fingerprint(lower, upper);
+                let our_fp = self.storage.fingerprint(lower, upper)?;
                 if their_fp.as_slice() != our_fp.as_slice() {
                     if skip {
                         skip = false;
                         o.extend(self.encode_bound(&prev_bound));
                         o.extend(encode_varint(Mode::Skip as u64));
                     }
-                    o.extend(self.split_range(lower, upper, curr_bound.clone()));
+                    o.extend(self.split_range(lower, upper, curr_bound.clone())?);
                 } else {
                     skip = true;
                 }
@@ -146,7 +168,7 @@ impl<S: Storage> Negentropy<S> {
                             have_ids.push(k);
                         }
                         true
-                    });
+                    })?;
                     for k in their_elems {
                         need_ids.push(k);
                     }
@@ -173,7 +195,7 @@ impl<S: Storage> Negentropy<S> {
                         response_ids.extend_from_slice(item.get_id());
                         num_response_ids += 1;
                         true
-                    });
+                    })?;
                     o.extend(self.encode_bound(&end_bound));
                     o.extend(encode_varint(Mode::IdList as u64));
                     o.extend(encode_varint(num_response_ids));
@@ -183,7 +205,7 @@ impl<S: Storage> Negentropy<S> {
             }
 
             if self.exceeded_frame_size_limit(full_output.len() + o.len()) {
-                let remaining = self.storage.fingerprint(upper, storage_size);
+                let remaining = self.storage.fingerprint(upper, storage_size)?;
                 full_output.extend(self.encode_bound(&Bound::timestamp(MAX_U64)));
                 full_output.extend(encode_varint(Mode::Fingerprint as u64));
                 full_output.extend_from_slice(&remaining);
@@ -197,9 +219,16 @@ impl<S: Storage> Negentropy<S> {
         Ok(full_output)
     }
 
-    fn split_range(&mut self, lower: usize, upper: usize, upper_bound: Bound) -> Vec<u8> {
+    fn split_range(
+        &mut self,
+        lower: usize,
+        upper: usize,
+        upper_bound: Bound,
+    ) -> Result<Vec<u8>, NegError> {
         let mut o = Vec::new();
-        let num_elems = (upper - lower) as u64;
+        let Some(num_elems) = upper.checked_sub(lower).map(|n| n as u64) else {
+            return Err(NegError::msg("negentropy bounds out of order"));
+        };
         const BUCKETS: u64 = 16;
         if num_elems < BUCKETS * 2 {
             o.extend(self.encode_bound(&upper_bound));
@@ -208,14 +237,14 @@ impl<S: Storage> Negentropy<S> {
             self.storage.iterate(lower, upper, |item, _| {
                 o.extend_from_slice(item.get_id());
                 true
-            });
+            })?;
         } else {
             let items_per_bucket = num_elems / BUCKETS;
             let buckets_with_extra = num_elems % BUCKETS;
             let mut curr = lower;
             for i in 0..BUCKETS {
                 let bucket_size = items_per_bucket + u64::from(i < buckets_with_extra);
-                let our_fp = self.storage.fingerprint(curr, curr + bucket_size as usize);
+                let our_fp = self.storage.fingerprint(curr, curr + bucket_size as usize)?;
                 curr += bucket_size as usize;
                 let next_bound = if curr == upper {
                     upper_bound.clone()
@@ -229,7 +258,7 @@ impl<S: Storage> Negentropy<S> {
                             curr_item = *item;
                         }
                         true
-                    });
+                    })?;
                     get_minimal_bound(&prev_item, &curr_item)
                 };
                 o.extend(self.encode_bound(&next_bound));
@@ -237,7 +266,7 @@ impl<S: Storage> Negentropy<S> {
                 o.extend_from_slice(&our_fp);
             }
         }
-        o
+        Ok(o)
     }
 
     fn exceeded_frame_size_limit(&self, n: usize) -> bool {
@@ -303,6 +332,7 @@ fn get_minimal_bound(prev: &Item, curr: &Item) -> Bound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Fingerprint;
     use crate::vector::Vector;
 
     fn item(ts: u64, b: u8) -> (u64, [u8; 32]) {
@@ -348,5 +378,131 @@ mod tests {
         assert!(have.is_empty());
         assert_eq!(need.len(), 1);
         assert_eq!(need[0], id);
+    }
+
+    /// Storage whose lower-bound answers walk backwards (a corrupt tree).
+    struct RegressiveStorage {
+        calls: usize,
+    }
+
+    impl Storage for RegressiveStorage {
+        fn size(&mut self) -> Result<u64, NegError> {
+            Ok(100)
+        }
+        fn get_item(&mut self, i: usize) -> Result<Item, NegError> {
+            Ok(Item::new(i as u64, &[0; 32]).unwrap())
+        }
+        fn iterate<F: FnMut(&Item, usize) -> bool>(
+            &mut self,
+            begin: usize,
+            end: usize,
+            mut cb: F,
+        ) -> Result<(), NegError> {
+            for i in begin..end {
+                if !cb(&Item::new(i as u64, &[0; 32]).unwrap(), i) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        fn find_lower_bound(
+            &mut self,
+            begin: usize,
+            _end: usize,
+            _bound: &Bound,
+        ) -> Result<usize, NegError> {
+            self.calls += 1;
+            // Legit first answer, then below the requested `begin`.
+            Ok(if self.calls == 1 { begin + 5 } else { begin - 1 })
+        }
+        fn fingerprint(&mut self, _begin: usize, _end: usize) -> Result<Fingerprint, NegError> {
+            Ok([0; FINGERPRINT_SIZE])
+        }
+    }
+
+    fn two_bound_query() -> Vec<u8> {
+        // version, then two (timestamp 10, idlen 0) Skip bounds.
+        let mut q = vec![PROTOCOL_VERSION];
+        for _ in 0..2 {
+            q.extend(encode_varint(11)); // timestamp 10 (encoded + 1)
+            q.extend(encode_varint(0)); // no id prefix
+            q.extend(encode_varint(Mode::Skip as u64));
+        }
+        q
+    }
+
+    #[test]
+    fn non_monotonic_bounds_are_rejected() {
+        let mut server = Negentropy::new(RegressiveStorage { calls: 0 }, 0).unwrap();
+        let err = server.reconcile(&two_bound_query()).unwrap_err();
+        assert!(err.to_string().contains("out of order"), "{err}");
+    }
+
+    /// Storage that fails mid-reconcile; the error must propagate, not be
+    /// substituted with a default value.
+    struct FailingStorage;
+
+    impl Storage for FailingStorage {
+        fn size(&mut self) -> Result<u64, NegError> {
+            Ok(1)
+        }
+        fn get_item(&mut self, _i: usize) -> Result<Item, NegError> {
+            Err(NegError::msg("storage gone"))
+        }
+        fn iterate<F: FnMut(&Item, usize) -> bool>(
+            &mut self,
+            _begin: usize,
+            _end: usize,
+            _cb: F,
+        ) -> Result<(), NegError> {
+            Err(NegError::msg("storage gone"))
+        }
+        fn find_lower_bound(
+            &mut self,
+            _begin: usize,
+            _end: usize,
+            _bound: &Bound,
+        ) -> Result<usize, NegError> {
+            Err(NegError::msg("storage gone"))
+        }
+        fn fingerprint(&mut self, _begin: usize, _end: usize) -> Result<Fingerprint, NegError> {
+            Err(NegError::msg("storage gone"))
+        }
+    }
+
+    #[test]
+    fn storage_errors_abort_the_reconcile() {
+        let mut server = Negentropy::new(FailingStorage, 0).unwrap();
+        let err = server.reconcile(&two_bound_query()).unwrap_err();
+        assert!(err.to_string().contains("storage gone"), "{err}");
+        assert!(Negentropy::new(FailingStorage, 0)
+            .unwrap()
+            .initiate()
+            .is_err());
+    }
+
+    #[test]
+    fn too_many_bounds_are_rejected() {
+        let mut q = vec![PROTOCOL_VERSION];
+        for i in 0..(MAX_BOUNDS_PER_ROUND + 1) {
+            q.extend(encode_varint(i as u64 + 2)); // increasing timestamps
+            q.extend(encode_varint(0));
+            q.extend(encode_varint(Mode::Skip as u64));
+        }
+        let mut v = Vector::new();
+        v.seal().unwrap();
+        let mut server = Negentropy::new(v, 0).unwrap();
+        let err = server.reconcile(&q).unwrap_err();
+        assert!(err.to_string().contains("too many bounds"), "{err}");
+    }
+
+    #[test]
+    fn oversize_messages_are_rejected() {
+        let q = vec![PROTOCOL_VERSION; MAX_RECONCILE_INPUT_BYTES + 1];
+        let mut v = Vector::new();
+        v.seal().unwrap();
+        let mut server = Negentropy::new(v, 0).unwrap();
+        let err = server.reconcile(&q).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 }

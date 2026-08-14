@@ -37,6 +37,7 @@ use wok_query::{
 };
 
 const AUTH_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const WRITER_BATCH_MAX: usize = 512;
 
 /// One frame queued for a connection. Dropping the frame (after a send, or
 /// when a dead connection's queue is drained) releases its byte accounting.
@@ -224,7 +225,7 @@ pub struct RelayHandle {
 pub enum IngestMsg {
     Client {
         conn_id: u64,
-        ip: Vec<u8>,
+        ip: Arc<[u8]>,
         payload: String,
     },
     Close {
@@ -235,7 +236,7 @@ pub enum IngestMsg {
 enum WriterMsg {
     AddEvent {
         conn_id: u64,
-        ip: Vec<u8>,
+        ip: Arc<[u8]>,
         packed: Vec<u8>,
         json: String,
         authed: Option<[u8; 32]>,
@@ -334,12 +335,12 @@ impl RelayHandle {
         admitted
     }
 
-    pub async fn client_message(&self, conn_id: u64, ip: Vec<u8>, payload: String) {
+    pub async fn client_message(&self, conn_id: u64, ip: impl Into<Arc<[u8]>>, payload: String) {
         let _ = self
             .ingest_route(conn_id)
             .send(IngestMsg::Client {
                 conn_id,
-                ip,
+                ip: ip.into(),
                 payload,
             })
             .await;
@@ -681,7 +682,10 @@ fn run_ingester(
                 ip,
                 payload,
             } => {
-                let cfg_snap = cfg.read().clone();
+                // Keep the cheap read guard for the duration of one command.
+                // Cloning Config here copied every String, PathBuf, and Vec on
+                // the hottest ingress path even though reloads are rare.
+                let cfg_snap = cfg.read();
                 handle_client(
                     &env, &cfg_snap, &conns, &metrics, &abuse, &mut auth, conn_id, ip, &payload,
                     &writer_tx, &req_txs, &neg_txs,
@@ -700,7 +704,7 @@ fn handle_client(
     abuse: &AbuseController,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
-    ip: Vec<u8>,
+    ip: Arc<[u8]>,
     payload: &str,
     writer_tx: &Sender<WriterMsg>,
     req_txs: &[Sender<ReqMsg>],
@@ -947,7 +951,7 @@ fn ingest_event(
     abuse: &AbuseController,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
-    ip: Vec<u8>,
+    ip: Arc<[u8]>,
     orig: Value,
     writer_tx: &Sender<WriterMsg>,
 ) {
@@ -1133,7 +1137,9 @@ fn ingest_event(
     }
 
     {
-        // C++ maps any failure in the event path to OK false "invalid: ...".
+        // Preserve the cheap duplicate fast path before write-policy plugins
+        // and the single writer. The writer still performs the authoritative
+        // lookup inside its transaction to close the concurrent-insert race.
         let dup = (|| -> Result<bool, String> {
             let txn = env.begin_ro().map_err(|e| e.to_string())?;
             Ok(lookup_event_by_id_ro(&txn, packed.id())
@@ -1154,13 +1160,13 @@ fn ingest_event(
                 return;
             }
             Ok(false) => {}
-            Err(e) => {
+            Err(error) => {
                 conns.send(
                     conn_id,
                     RelayMessage::Ok {
                         event_id: id_hex,
                         accepted: false,
-                        message: format!("invalid: {e}"),
+                        message: format!("invalid: {error}"),
                     },
                     metrics,
                 );
@@ -1525,15 +1531,33 @@ fn run_writer(
     mon_txs: Vec<Sender<MonitorMsg>>,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
+    let mut negentropy_max_tags = cfg.read().relay.max_tags_per_filter;
+    let mut negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
+    let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
+    let mut closed = std::collections::HashSet::new();
+    let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut events: Vec<(u64, EventToWrite)> = Vec::with_capacity(256);
+    let mut quota_counts: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut evs: Vec<EventToWrite> = Vec::with_capacity(256);
+    let mut meta: Vec<u64> = Vec::with_capacity(256);
     while let Ok(msg) = rx.recv() {
-        let mut batch = vec![msg];
-        while let Ok(more) = rx.try_recv() {
-            batch.push(more);
+        batch.clear();
+        closed.clear();
+        batch_vanish.clear();
+        events.clear();
+        quota_counts.clear();
+        evs.clear();
+        meta.clear();
+        batch.push(msg);
+        while batch.len() < WRITER_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(more) => batch.push(more),
+                Err(_) => break,
+            }
         }
         // Filter out events from connections closed within this batch, like
         // C++ RelayWriter (a per-batch set; a persistent set would leak one
         // entry per closed connection for the life of the process).
-        let mut closed = std::collections::HashSet::new();
         for m in &batch {
             if let WriterMsg::Close { conn_id } = m {
                 closed.insert(*conn_id);
@@ -1545,7 +1569,6 @@ fn run_writer(
         // same drained writer batch. Compute the batch markers up front so a
         // live-only event cannot be broadcast immediately before its request
         // is persisted later in that batch.
-        let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
         for m in &batch {
             let WriterMsg::AddEvent {
                 conn_id,
@@ -1556,12 +1579,18 @@ fn run_writer(
             else {
                 continue;
             };
-            if closed.contains(conn_id) || !vanish_policy.targets_this_relay_json(json) {
+            if closed.contains(conn_id) {
                 continue;
             }
             let Ok(event) = PackedEventView::new(packed) else {
                 continue;
             };
+            // Exact JSON tag-name inspection is only needed for kind 62.
+            // Parsing every ordinary event again made publication pay for a
+            // feature-specific slow path before the kind was even checked.
+            if event.kind() != VANISH_KIND || !vanish_policy.targets_this_relay_json(json) {
+                continue;
+            }
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(event.pubkey());
             batch_vanish
@@ -1569,9 +1598,7 @@ fn run_writer(
                 .and_modify(|timestamp| *timestamp = (*timestamp).max(event.created_at()))
                 .or_insert(event.created_at());
         }
-        let mut events: Vec<(u64, EventToWrite)> = Vec::new();
-        let mut quota_counts: HashMap<[u8; 32], u64> = HashMap::new();
-        for m in batch {
+        for m in batch.drain(..) {
             if let WriterMsg::AddEvent {
                 conn_id,
                 ip,
@@ -1815,17 +1842,26 @@ fn run_writer(
                 _ => {}
             }
         }
-        let mut sink = DeferredSink::default();
         // Move the events out instead of cloning each packed/json pair.
-        let mut evs: Vec<EventToWrite> = Vec::with_capacity(events.len());
-        let mut meta: Vec<u64> = Vec::with_capacity(events.len());
+        evs.reserve(events.len());
+        meta.reserve(events.len());
         for (conn_id, ev) in events.drain(..) {
             meta.push(conn_id);
             evs.push(ev);
         }
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
-            write_events_with_policy(&mut txn, &mut sink, &mut evs, false, &vanish_policy)?;
+            if negentropy_max_tags != cfg_snap.relay.max_tags_per_filter {
+                negentropy_max_tags = cfg_snap.relay.max_tags_per_filter;
+                negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
+            }
+            write_events_with_policy(
+                &mut txn,
+                &mut negentropy_cache,
+                &mut evs,
+                false,
+                &vanish_policy,
+            )?;
             if cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events != 0 {
                 let stored = txn.entries(txn.env().dbis().event)? as u64;
                 if stored > cfg_snap.relay.abuse.max_stored_events {
@@ -1838,13 +1874,10 @@ fn run_writer(
                     )));
                 }
             }
-            let mut cache = NegentropyFilterCache::new(cfg.read().relay.max_tags_per_filter);
-            sink.apply(&mut cache, &mut txn)
-                .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
             txn.commit()?;
             Ok::<_, wok_db::DbError>(())
         })();
-        if let Err(e) = write_res {
+        if let Err(error) = write_res {
             for (i, conn_id) in meta.iter().enumerate() {
                 let id_hex = PackedEventView::new(&evs[i].packed)
                     .map(|p| to_hex(p.id()))
@@ -1854,7 +1887,7 @@ fn run_writer(
                     RelayMessage::Ok {
                         event_id: id_hex,
                         accepted: false,
-                        message: format!("Write error: {e}"),
+                        message: format!("Write error: {error}"),
                     },
                     &metrics,
                 );

@@ -44,13 +44,23 @@ impl EventToWrite {
 }
 
 pub trait NegentropySink {
-    fn update(&mut self, packed: PackedEventView<'_>, insert: bool) -> Result<(), DbError>;
+    fn update(
+        &mut self,
+        txn: &mut RwTxn<'_>,
+        packed: PackedEventView<'_>,
+        insert: bool,
+    ) -> Result<(), DbError>;
 }
 
 pub struct NoopNegentropy;
 
 impl NegentropySink for NoopNegentropy {
-    fn update(&mut self, _packed: PackedEventView<'_>, _insert: bool) -> Result<(), DbError> {
+    fn update(
+        &mut self,
+        _txn: &mut RwTxn<'_>,
+        _packed: PackedEventView<'_>,
+        _insert: bool,
+    ) -> Result<(), DbError> {
         Ok(())
     }
 }
@@ -637,12 +647,12 @@ pub fn write_events_with_policy<N: NegentropySink>(
             let inserted_lev_id = insert_event(txn, packed_bytes, json)?;
             indexed_through = Some(inserted_lev_id);
             *lev_id = inserted_lev_id;
-            ne.update(packed, true)?;
+            ne.update(txn, packed, true)?;
             *status = EventWriteStatus::Written;
 
             for lev in lev_ids_to_delete.drain(..) {
                 if let Some(buf) = lookup_event_by_levid(txn, lev)? {
-                    ne.update(PackedEventView::new(&buf)?, false)?;
+                    ne.update(txn, PackedEventView::new(&buf)?, false)?;
                     delete_event_basic(txn, lev)?;
                 }
             }
@@ -671,7 +681,7 @@ pub fn delete_events<N: NegentropySink>(
     let mut n = 0u64;
     for lev in lev_ids {
         if let Some(buf) = lookup_event_by_levid(txn, lev)? {
-            ne.update(PackedEventView::new(&buf)?, false)?;
+            ne.update(txn, PackedEventView::new(&buf)?, false)?;
             if delete_event_basic(txn, lev)? {
                 n += 1;
             }

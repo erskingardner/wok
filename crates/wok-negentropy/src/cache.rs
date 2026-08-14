@@ -114,6 +114,18 @@ impl NegentropyFilterCache {
     }
 }
 
+impl wok_db::NegentropySink for NegentropyFilterCache {
+    fn update(
+        &mut self,
+        txn: &mut RwTxn<'_>,
+        packed: PackedEventView<'_>,
+        insert: bool,
+    ) -> Result<(), wok_db::DbError> {
+        self.apply(txn, packed, insert)
+            .map_err(|error| wok_db::DbError::msg(error.to_string()))
+    }
+}
+
 impl NegentropyFilterCache {
     /// Apply insert/erase against matching trees inside an already-open write txn.
     pub fn apply(
@@ -146,15 +158,20 @@ impl NegentropyFilterCache {
     }
 }
 
-/// Collect packed events then apply after write_events returns, because
-/// `write_events` does not give us the txn inside NegentropySink.
+/// Optional compatibility sink for callers that need to defer tree updates
+/// until after their event-write loop.
 #[derive(Default)]
 pub struct DeferredSink {
     ops: Vec<(Vec<u8>, bool)>,
 }
 
 impl wok_db::NegentropySink for DeferredSink {
-    fn update(&mut self, packed: PackedEventView<'_>, insert: bool) -> Result<(), wok_db::DbError> {
+    fn update(
+        &mut self,
+        _txn: &mut RwTxn<'_>,
+        packed: PackedEventView<'_>,
+        insert: bool,
+    ) -> Result<(), wok_db::DbError> {
         self.ops.push((packed.as_bytes().to_vec(), insert));
         Ok(())
     }

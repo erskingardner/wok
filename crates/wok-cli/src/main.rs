@@ -1253,15 +1253,20 @@ fn parse_mesh_time(s: &str) -> Result<u64> {
     if s.is_empty() {
         bail!("invalid time");
     }
-    let (num, unit) = s.split_at(s.len() - 1);
+    // Split on the last char boundary: byte-indexing s.len()-1 panics when
+    // the unit is a multi-byte char.
+    let Some((unit_idx, unit)) = s.char_indices().next_back() else {
+        bail!("invalid time");
+    };
+    let num = &s[..unit_idx];
     let scale = match unit {
-        "s" => 1.0,
-        "m" => 60.0,
-        "h" => 60.0 * 60.0,
-        "d" => 86400.0,
-        "w" => 86400.0 * 7.0,
-        "M" => 86400.0 * 30.5,
-        "Y" => 86400.0 * 365.2425,
+        's' => 1.0,
+        'm' => 60.0,
+        'h' => 60.0 * 60.0,
+        'd' => 86400.0,
+        'w' => 86400.0 * 7.0,
+        'M' => 86400.0 * 30.5,
+        'Y' => 86400.0 * 365.2425,
         _ => bail!("unknown time unit: {unit}"),
     };
     let v: f64 = num
@@ -1982,6 +1987,16 @@ mod main_tests {
     use wok_db::{write_events, EventToWrite, NoopNegentropy};
     use wok_event::{parse_and_verify_event, EventLimits};
     use wok_negentropy::Storage;
+
+    #[test]
+    fn parse_mesh_time_rejects_multibyte_units_without_panicking() {
+        assert_eq!(parse_mesh_time("1h").unwrap(), 3600);
+        assert_eq!(parse_mesh_time("2d").unwrap(), 2 * 86400);
+        assert!(parse_mesh_time("1€").is_err());
+        assert!(parse_mesh_time("€").is_err());
+        assert!(parse_mesh_time("").is_err());
+        assert!(parse_mesh_time("xh").is_err());
+    }
 
     fn signed_event(created_at: u64) -> EventToWrite {
         let mut rng = rand::thread_rng();

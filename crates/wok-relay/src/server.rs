@@ -1770,6 +1770,51 @@ fn run_writer(
         if events.is_empty() {
             continue;
         }
+        if cfg_snap.db_min_free_disk_bytes != 0 {
+            match env.available_disk_bytes() {
+                Ok(available) if available < cfg_snap.db_min_free_disk_bytes => {
+                    metrics
+                        .abuse_disk_reserve_rejections
+                        .fetch_add(events.len() as u64, Ordering::Relaxed);
+                    for (conn_id, event) in &events {
+                        let id_hex = PackedEventView::new(&event.packed)
+                            .map(|event| to_hex(event.id()))
+                            .unwrap_or_else(|_| "?".into());
+                        conns.send(
+                            *conn_id,
+                            RelayMessage::Ok {
+                                event_id: id_hex,
+                                accepted: false,
+                                message: format!(
+                                    "blocked: disk reserve requires {} free bytes",
+                                    cfg_snap.db_min_free_disk_bytes
+                                ),
+                            },
+                            &metrics,
+                        );
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    for (conn_id, event) in &events {
+                        let id_hex = PackedEventView::new(&event.packed)
+                            .map(|event| to_hex(event.id()))
+                            .unwrap_or_else(|_| "?".into());
+                        conns.send(
+                            *conn_id,
+                            RelayMessage::Ok {
+                                event_id: id_hex,
+                                accepted: false,
+                                message: format!("Write error: disk space check failed: {error}"),
+                            },
+                            &metrics,
+                        );
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
         let mut sink = DeferredSink::default();
         // Move the events out instead of cloning each packed/json pair.
         let mut evs: Vec<EventToWrite> = Vec::with_capacity(events.len());
@@ -1781,6 +1826,18 @@ fn run_writer(
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
             write_events_with_policy(&mut txn, &mut sink, &mut evs, false, &vanish_policy)?;
+            if cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events != 0 {
+                let stored = txn.entries(txn.env().dbis().event)? as u64;
+                if stored > cfg_snap.relay.abuse.max_stored_events {
+                    metrics
+                        .abuse_global_quota_rejections
+                        .fetch_add(evs.len() as u64, Ordering::Relaxed);
+                    return Err(wok_db::DbError::msg(format!(
+                        "global storage quota of {} events exceeded",
+                        cfg_snap.relay.abuse.max_stored_events
+                    )));
+                }
+            }
             let mut cache = NegentropyFilterCache::new(cfg.read().relay.max_tags_per_filter);
             sink.apply(&mut cache, &mut txn)
                 .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
@@ -2958,6 +3015,90 @@ mod tests {
             handle
                 .metrics
                 .abuse_pubkey_quota_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_storage_quota_aborts_the_exceeding_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        cfg.relay.abuse.max_stored_events = 1;
+        cfg.relay.abuse.max_stored_events_per_pubkey = 0;
+        let handle = start(env.clone(), cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+
+        for content in ["first-global", "second-global"] {
+            let event = sign_event(json!({
+                "created_at": now_secs(), "kind": 1, "tags": [], "content": content
+            }));
+            handle
+                .client_message(
+                    conn,
+                    vec![127, 0, 0, 1],
+                    json!(["EVENT", event]).to_string(),
+                )
+                .await;
+            let response = recv_outbound(&mut rx).await;
+            if content == "first-global" {
+                assert!(response.contains("true"), "{response}");
+            } else {
+                assert!(response.contains("false") && response.contains("global storage quota"));
+            }
+        }
+
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event).unwrap(), 1);
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_global_quota_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disk_reserve_rejects_before_opening_a_write_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.db_min_free_disk_bytes = u64::MAX;
+        cfg.relay.auth.enabled = false;
+        let handle = start(env.clone(), cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "reserve"
+        }));
+        handle
+            .client_message(
+                conn,
+                vec![127, 0, 0, 1],
+                json!(["EVENT", event]).to_string(),
+            )
+            .await;
+        let response = recv_outbound(&mut rx).await;
+        assert!(response.contains("false") && response.contains("disk reserve"));
+
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event).unwrap(), 0);
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_disk_reserve_rejections
                 .load(Ordering::Relaxed),
             1
         );

@@ -15,8 +15,10 @@ allow_config_writes = false
 [database]
 path = "./wok-db/"
 max_readers = 256
-map_size = 10995116277760
+map_size = 68719476736
 no_read_ahead = false
+# Stop accepting durable writes before the filesystem is completely full.
+min_free_disk_bytes = 1073741824
 
 [events]
 max_event_size = 65536
@@ -125,8 +127,9 @@ count_rate_per_second = 5
 count_burst = 10
 max_concurrent_historical_queries = 8
 max_query_cost = 1000
-# Zero means unlimited.
-max_stored_events_per_pubkey = 0
+# Zero means unlimited. Secure defaults bound both global and per-author use.
+max_stored_events = 10000000
+max_stored_events_per_pubkey = 100000
 # Zero disables NIP-13 proof-of-work enforcement.
 min_pow_difficulty = 0
 

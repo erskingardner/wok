@@ -90,6 +90,8 @@ pub struct Metrics {
     pub abuse_query_cost_rejections: AtomicU64,
     pub abuse_query_concurrency_rejections: AtomicU64,
     pub abuse_pubkey_quota_rejections: AtomicU64,
+    pub abuse_global_quota_rejections: AtomicU64,
+    pub abuse_disk_reserve_rejections: AtomicU64,
     pub client_event: AtomicU64,
     pub client_req: AtomicU64,
     pub client_count: AtomicU64,
@@ -133,7 +135,9 @@ impl Metrics {
                 + g(&self.abuse_pow_rejections)
                 + g(&self.abuse_query_cost_rejections)
                 + g(&self.abuse_query_concurrency_rejections)
-                + g(&self.abuse_pubkey_quota_rejections),
+                + g(&self.abuse_pubkey_quota_rejections)
+                + g(&self.abuse_global_quota_rejections)
+                + g(&self.abuse_disk_reserve_rejections),
         }
     }
 
@@ -182,6 +186,8 @@ impl Metrics {
                 "wok_abuse_rejections_total{{reason=\"query_cost\"}} {}\n",
                 "wok_abuse_rejections_total{{reason=\"query_concurrency\"}} {}\n",
                 "wok_abuse_rejections_total{{reason=\"pubkey_storage_quota\"}} {}\n",
+                "wok_abuse_rejections_total{{reason=\"global_storage_quota\"}} {}\n",
+                "wok_abuse_rejections_total{{reason=\"disk_reserve\"}} {}\n",
                 "# TYPE wok_client_messages_total counter\n",
                 "wok_client_messages_total{{type=\"EVENT\"}} {}\n",
                 "wok_client_messages_total{{type=\"REQ\"}} {}\n",
@@ -213,6 +219,8 @@ impl Metrics {
             g(&self.abuse_query_cost_rejections),
             g(&self.abuse_query_concurrency_rejections),
             g(&self.abuse_pubkey_quota_rejections),
+            g(&self.abuse_global_quota_rejections),
+            g(&self.abuse_disk_reserve_rejections),
             g(&self.client_event),
             g(&self.client_req),
             g(&self.client_count),

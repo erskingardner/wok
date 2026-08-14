@@ -56,6 +56,10 @@ impl<'env> RoTxn<'env> {
         self.env
     }
 
+    pub fn entries(&self, dbi: MDB_dbi) -> Result<usize, DbError> {
+        dbi_entries(self.txn, dbi)
+    }
+
     pub fn raw(&self) -> *mut MDB_txn {
         self.txn
     }
@@ -148,6 +152,10 @@ impl<'env> RwTxn<'env> {
 
     pub fn env(&self) -> &'env Env {
         self.env
+    }
+
+    pub fn entries(&self, dbi: MDB_dbi) -> Result<usize, DbError> {
+        dbi_entries(self.txn, dbi)
     }
 
     pub fn raw(&self) -> *mut MDB_txn {
@@ -340,6 +348,12 @@ fn dbi_flags(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<u32, DbError> {
     let mut flags = 0u32;
     check(unsafe { mdb_dbi_flags(txn, dbi, &mut flags) })?;
     Ok(flags)
+}
+
+fn dbi_entries(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<usize, DbError> {
+    let mut stat: MDB_stat = unsafe { std::mem::zeroed() };
+    check(unsafe { mdb_stat(txn, dbi, &mut stat) })?;
+    Ok(stat.ms_entries)
 }
 
 /// Iterate a DBI from a starting key/dup, matching C++ `generic_foreachFull`.

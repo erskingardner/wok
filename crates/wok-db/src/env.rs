@@ -381,6 +381,18 @@ impl Env {
         })
     }
 
+    /// Bytes currently available to an unprivileged writer on the filesystem
+    /// containing this LMDB environment.
+    pub fn available_disk_bytes(&self) -> Result<u64, DbError> {
+        let path = CString::new(self.inner.path.to_string_lossy().as_bytes())
+            .map_err(|_| DbError::msg("db path contains NUL"))?;
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+            return Err(DbError::msg(std::io::Error::last_os_error().to_string()));
+        }
+        Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    }
+
     pub fn compact_to_fd(&self, fd: i32) -> Result<(), DbError> {
         check(unsafe { mdb_env_copyfd2(self.inner.env, fd, MDB_CP_COMPACT) })
     }

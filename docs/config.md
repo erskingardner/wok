@@ -46,8 +46,9 @@ Wok never receives private key material.
 |---|---:|---|---|
 | `database.path` | `./wok-db/` | Restart | Wok-owned LMDB directory. |
 | `database.max_readers` | `256` | Restart | LMDB reader-slot ceiling. |
-| `database.map_size` | `10995116277760` | Restart | Maximum LMDB map size in bytes. |
+| `database.map_size` | `68719476736` | Restart | Maximum LMDB map size in bytes; writes fail atomically at the ceiling. |
 | `database.no_read_ahead` | `false` | Restart | Disable LMDB read-ahead for workloads where it is counterproductive. |
+| `database.min_free_disk_bytes` | `1073741824` | Restart | Reject durable event batches before free filesystem space falls below this reserve; zero disables the guard. |
 
 ## Event acceptance
 
@@ -192,7 +193,8 @@ All abuse settings reload live and are dashboard-editable.
 | `relay.abuse.count_burst` | `10` | Per-connection COUNT bucket capacity. |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Historical scans per connection; zero rejects new scans. |
 | `relay.abuse.max_query_cost` | `1000` | Conservative pre-scan filter cost ceiling; zero is unlimited. |
-| `relay.abuse.max_stored_events_per_pubkey` | `0` | Hard author storage quota; zero is unlimited. |
+| `relay.abuse.max_stored_events` | `10000000` | Global durable event ceiling; the entire write transaction aborts before exceeding it. |
+| `relay.abuse.max_stored_events_per_pubkey` | `100000` | Hard author storage quota; zero is unlimited. |
 | `relay.abuse.min_pow_difficulty` | `0` | Required NIP-13 leading-zero bits; zero disables it. |
 
 A zero rate or burst disables that individual token bucket. Unix-socket

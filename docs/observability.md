@@ -55,6 +55,8 @@ or protect it at the reverse proxy.
 | `query_cost` | Estimated historical-query cost exceeded its ceiling. |
 | `query_concurrency` | Historical-query concurrency ceiling reached. |
 | `pubkey_storage_quota` | Author storage quota reached. |
+| `global_storage_quota` | Global durable event quota would be exceeded. |
+| `disk_reserve` | Durable writes stopped to preserve configured free disk space. |
 
 `wok_client_messages_total{type=...}` uses `EVENT`, `REQ`, `COUNT`,
 `CLOSE`, and `AUTH`. `wok_relay_messages_total{type=...}` uses `EVENT`,

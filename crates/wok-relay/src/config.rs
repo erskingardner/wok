@@ -12,6 +12,7 @@ pub struct Config {
     pub db_maxreaders: u32,
     pub db_mapsize: usize,
     pub db_no_read_ahead: bool,
+    pub db_min_free_disk_bytes: u64,
     pub events: EventsConfig,
     pub observability: ObservabilityConfig,
     pub relay: RelayConfig,
@@ -124,6 +125,7 @@ struct DatabaseConfig {
     max_readers: u32,
     map_size: usize,
     no_read_ahead: bool,
+    min_free_disk_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +226,7 @@ pub struct AbuseConfig {
     pub count_burst: u32,
     pub max_concurrent_historical_queries: usize,
     pub max_query_cost: u64,
+    pub max_stored_events: u64,
     pub max_stored_events_per_pubkey: u64,
     pub min_pow_difficulty: u8,
 }
@@ -296,8 +299,9 @@ impl Default for Config {
             },
             db: PathBuf::from("./wok-db/"),
             db_maxreaders: 256,
-            db_mapsize: 10_995_116_277_760,
+            db_mapsize: 68_719_476_736,
             db_no_read_ahead: false,
+            db_min_free_disk_bytes: 1_073_741_824,
             events: EventsConfig {
                 max_event_size: 65536,
                 reject_newer_than_secs: 900,
@@ -393,7 +397,8 @@ impl Default for Config {
                     count_burst: 10,
                     max_concurrent_historical_queries: 8,
                     max_query_cost: 1_000,
-                    max_stored_events_per_pubkey: 0,
+                    max_stored_events: 10_000_000,
+                    max_stored_events_per_pubkey: 100_000,
                     min_pow_difficulty: 0,
                 },
                 unix: UnixConfig {
@@ -421,6 +426,7 @@ impl From<Config> for TomlConfig {
                 max_readers: config.db_maxreaders,
                 map_size: config.db_mapsize,
                 no_read_ahead: config.db_no_read_ahead,
+                min_free_disk_bytes: config.db_min_free_disk_bytes,
             },
             events: config.events,
             observability: config.observability,
@@ -437,6 +443,7 @@ impl From<TomlConfig> for Config {
             db_maxreaders: config.database.max_readers,
             db_mapsize: config.database.map_size,
             db_no_read_ahead: config.database.no_read_ahead,
+            db_min_free_disk_bytes: config.database.min_free_disk_bytes,
             events: config.events,
             observability: config.observability,
             relay: config.relay,
@@ -822,6 +829,7 @@ impl Config {
         self.db_maxreaders = old.db_maxreaders;
         self.db_mapsize = old.db_mapsize;
         self.db_no_read_ahead = old.db_no_read_ahead;
+        self.db_min_free_disk_bytes = old.db_min_free_disk_bytes;
         self.relay.bind = old.relay.bind;
         self.relay.port = old.relay.port;
         self.relay.nofiles = old.relay.nofiles;

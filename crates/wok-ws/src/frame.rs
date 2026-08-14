@@ -15,6 +15,19 @@ pub const OP_CLOSE: u8 = 0x8;
 pub const OP_PING: u8 = 0x9;
 pub const OP_PONG: u8 = 0xA;
 
+fn apply_mask(payload: &mut [u8], mask: [u8; 4]) {
+    let mut chunks = payload.chunks_exact_mut(4);
+    for chunk in &mut chunks {
+        chunk[0] ^= mask[0];
+        chunk[1] ^= mask[1];
+        chunk[2] ^= mask[2];
+        chunk[3] ^= mask[3];
+    }
+    for (byte, mask) in chunks.into_remainder().iter_mut().zip(mask) {
+        *byte ^= mask;
+    }
+}
+
 #[derive(Debug)]
 pub enum WsError {
     Io(std::io::Error),
@@ -198,12 +211,17 @@ impl WsParser {
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<WsEvent>, WsError> {
         self.buf.extend_from_slice(data);
         let mut events = Vec::new();
+        self.drain_events_into(&mut events)?;
+        Ok(events)
+    }
+
+    fn drain_events_into(&mut self, events: &mut Vec<WsEvent>) -> Result<(), WsError> {
         while let Some(frame) = self.try_parse_frame()? {
             if let Some(ev) = self.handle_frame(frame)? {
                 events.push(ev);
             }
         }
-        Ok(events)
+        Ok(())
     }
 
     fn try_parse_frame(&mut self) -> Result<Option<RawFrame>, WsError> {
@@ -282,9 +300,7 @@ impl WsParser {
         };
         let mut payload = b[off..off + len as usize].to_vec();
         if let Some(mask) = mask {
-            for (i, m) in payload.iter_mut().enumerate() {
-                *m ^= mask[i % 4];
-            }
+            apply_mask(&mut payload, mask);
         }
         self.buf.advance(off + len as usize);
         Ok(Some(RawFrame {
@@ -428,9 +444,9 @@ impl WsEncoder {
             self.mask_counter.set(x);
             let mask = x.to_be_bytes();
             out.extend_from_slice(&mask);
-            for (i, b) in payload.iter().enumerate() {
-                out.push(b ^ mask[i % 4]);
-            }
+            let start = out.len();
+            out.extend_from_slice(payload);
+            apply_mask(&mut out[start..], mask);
         } else {
             out.extend_from_slice(payload);
         }
@@ -469,15 +485,28 @@ pub async fn read_events<S: AsyncRead + Unpin>(
     stream: &mut S,
     parser: &mut WsParser,
 ) -> Result<Vec<WsEvent>, WsError> {
-    let mut tmp = [0u8; 16 * 1024];
+    let mut events = Vec::new();
+    read_events_into(stream, parser, &mut events).await?;
+    Ok(events)
+}
+
+pub async fn read_events_into<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    parser: &mut WsParser,
+    events: &mut Vec<WsEvent>,
+) -> Result<(), WsError> {
+    events.clear();
     loop {
-        let n = stream.read(&mut tmp).await?;
+        // Read directly into the parser's retained buffer. The previous
+        // stack-buffer path copied every inbound WebSocket byte a second time
+        // before masking and JSON parsing.
+        let n = stream.read_buf(&mut parser.buf).await?;
         if n == 0 {
             return Err(WsError::Protocol("eof"));
         }
-        let events = parser.feed(&tmp[..n])?;
+        parser.drain_events_into(events)?;
         if !events.is_empty() {
-            return Ok(events);
+            return Ok(());
         }
     }
 }

@@ -11,8 +11,8 @@ pub mod frame;
 
 use bytes::Bytes;
 use frame::{
-    read_events, write_bytes, DeflateCtx, InflateCtx, MessageKind, WsEncoder, WsEvent, WsParser,
-    OP_PING, OP_PONG,
+    read_events_into, write_bytes, DeflateCtx, InflateCtx, MessageKind, WsEncoder, WsEvent,
+    WsParser, OP_PING, OP_PONG,
 };
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -102,16 +102,18 @@ async fn dispatch(
 ) -> Response<Full<Bytes>> {
     // Honor relay.realIpHeader for reverse-proxied deployments (C++ strfry
     // uses the header value as the client IP).
-    let real_ip_header = handle.config.read().relay.real_ip_header.clone();
-    let peer = if real_ip_header.is_empty() {
-        peer
-    } else {
-        req.headers()
-            .get(real_ip_header.as_str())
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
-            .map(|ip| SocketAddr::new(ip, 0))
-            .unwrap_or(peer)
+    let peer = {
+        let cfg = handle.config.read();
+        if cfg.relay.real_ip_header.is_empty() {
+            peer
+        } else {
+            req.headers()
+                .get(cfg.relay.real_ip_header.as_str())
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+                .map(|ip| SocketAddr::new(ip, 0))
+                .unwrap_or(peer)
+        }
     };
     let is_ws_upgrade = req
         .headers()
@@ -546,8 +548,7 @@ async fn upgrade_ws(
             }
         }
     }
-    let cfg_snap = handle.config.read().clone();
-    let max = cfg_snap.relay.max_websocket_payload_size;
+    let max = handle.config.read().relay.max_websocket_payload_size;
     let deflate = ext_response.is_some();
     tokio::spawn(async move {
         match hyper::upgrade::on(&mut req).await {
@@ -595,9 +596,9 @@ async fn handle_ws<S>(
         .metrics
         .active_connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let ip = match peer.ip() {
-        std::net::IpAddr::V4(v) => v.octets().to_vec(),
-        std::net::IpAddr::V6(v) => v.octets().to_vec(),
+    let ip: Arc<[u8]> = match peer.ip() {
+        std::net::IpAddr::V4(v) => Arc::from(v.octets()),
+        std::net::IpAddr::V6(v) => Arc::from(v.octets()),
     };
     let auto_ping = handle.config.read().relay.auto_ping_seconds;
     // Pending memory is bounded by max_pending_outbound_bytes in Outbound.
@@ -623,6 +624,7 @@ async fn handle_ws<S>(
     } else {
         None
     });
+    let mut incoming_events = Vec::with_capacity(4);
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(auto_ping.max(1)));
     if auto_ping > 0 {
         ping.tick().await; // first tick is immediate; skip it
@@ -638,10 +640,10 @@ async fn handle_ws<S>(
                     break;
                 }
             }
-            incoming = read_events(&mut rd, &mut parser) => {
+            incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events) => {
                 match incoming {
-                    Ok(events) => {
-                        for ev in events {
+                    Ok(()) => {
+                        for ev in incoming_events.drain(..) {
                             match ev {
                                 WsEvent::Message(MessageKind::Text, t) => {
                                     match String::from_utf8(t) {

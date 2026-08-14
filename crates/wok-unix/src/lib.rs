@@ -134,6 +134,7 @@ async fn handle_conn(
         return Err(UnixError::Message("peer credentials rejected".into()));
     }
     let conn_id = handle.next_conn_id();
+    let source: Arc<[u8]> = Arc::from([]);
     handle
         .metrics
         .active_connections
@@ -164,7 +165,7 @@ async fn handle_conn(
                     stream.read_exact(&mut body).await?;
                     let text = String::from_utf8(body)
                         .map_err(|_| UnixError::Message("frame not utf-8".into()))?;
-                    handle.client_message(conn_id, Vec::new(), text).await;
+                    handle.client_message(conn_id, source.clone(), text).await;
                 }
                 out = rx.recv() => {
                     match out {

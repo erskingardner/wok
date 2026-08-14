@@ -150,9 +150,17 @@ impl PluginEventSifter {
             .send(line)
             .map_err(|_| "Failed to write event: plugin worker gone".to_string())?;
         let want_id = request["event"]["id"].as_str().unwrap_or("");
-        // C++ gives each read a fresh timeout window.
+        // One overall deadline per request: a broken plugin emitting an
+        // endless stream of garbage lines must not earn a fresh timeout
+        // window per line while the single LMDB writer waits (C++ gives each
+        // read a fresh window; we deliberately diverge).
+        let deadline = std::time::Instant::now() + self.timeout;
         loop {
-            let resp_line = match running.from_worker.recv_timeout(self.timeout) {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+            else {
+                return Err("Failed to read response: timeout".into());
+            };
+            let resp_line = match running.from_worker.recv_timeout(remaining) {
                 Ok(Ok(l)) => l,
                 Ok(Err(e)) => return Err(format!("Failed to read response: {e}")),
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {

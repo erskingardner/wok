@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +18,12 @@ pub enum UnixError {
     Message(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Clone, Copy)]
+struct SocketPathIdentity {
+    dev: u64,
+    ino: u64,
 }
 
 /// Bind a Unix socket, replacing a stale socket path only after confirming it
@@ -35,6 +41,15 @@ pub fn bind_unix(
     owner: &str,
     group: &str,
 ) -> Result<UnixListener, UnixError> {
+    bind_unix_with_identity(path, mode, owner, group).map(|(listener, _)| listener)
+}
+
+fn bind_unix_with_identity(
+    path: &Path,
+    mode: u32,
+    owner: &str,
+    group: &str,
+) -> Result<(UnixListener, SocketPathIdentity), UnixError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -90,8 +105,16 @@ pub fn bind_unix(
         nix::unistd::chown(&tmp, uid, gid)
             .map_err(|e| UnixError::Message(format!("chown {}: {e}", tmp.display())))?;
     }
+    // The listener FD is a socketfs object on Linux, so fstat(listener) does
+    // not identify the filesystem directory entry. Capture that entry while
+    // it is still at the private bind path; rename preserves its identity.
+    let meta = std::fs::symlink_metadata(&tmp)?;
+    let identity = SocketPathIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    };
     std::fs::rename(&tmp, path)?;
-    Ok(listener)
+    Ok((listener, identity))
 }
 
 /// Sibling temp path used for bind-then-rename; never the final socket path.
@@ -112,21 +135,29 @@ fn live_listener(path: &Path) -> bool {
     StdUnixStream::connect(path).is_ok()
 }
 
+fn remove_bound_socket(path: &Path, identity: SocketPathIdentity) -> Result<(), std::io::Error> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if is_socket(&meta) && meta.dev() == identity.dev && meta.ino() == identity.ino {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 pub async fn serve(handle: RelayHandle, cfg: Config) -> Result<(), UnixError> {
     if !cfg.relay.unix.enabled {
         return Ok(());
     }
     let path = cfg.relay.unix.path.clone();
-    let listener = bind_unix(
+    let (listener, bound_path) = bind_unix_with_identity(
         &path,
         cfg.relay.unix.mode,
         &cfg.relay.unix.owner,
         &cfg.relay.unix.group,
     )?;
-    // Identity of this process's socket (dev+ino), re-checked before the
-    // shutdown unlink so we never delete a path someone else swapped in.
-    let bound_stat = nix::sys::stat::fstat(std::os::fd::AsRawFd::as_raw_fd(&listener))
-        .map_err(|e| UnixError::Message(format!("fstat listener: {e}")))?;
     tracing::info!("Unix socket listening on {}", path.display());
     let handle = Arc::new(handle);
     let shutdown = handle.shutdown_handle();
@@ -152,15 +183,7 @@ pub async fn serve(handle: RelayHandle, cfg: Config) -> Result<(), UnixError> {
         });
     }
     // Unlink only if the path still refers to this process's socket.
-    if let Ok(meta) = std::fs::symlink_metadata(&path) {
-        use std::os::unix::fs::MetadataExt;
-        if is_socket(&meta)
-            && meta.dev() == bound_stat.st_dev as u64
-            && meta.ino() == bound_stat.st_ino
-        {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+    remove_bound_socket(&path, bound_path)?;
     Ok(())
 }
 
@@ -281,7 +304,7 @@ pub async fn connect(path: impl AsRef<Path>) -> Result<UnixStream, UnixError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_unix, read_frame, write_frame};
+    use super::{bind_unix, bind_unix_with_identity, read_frame, remove_bound_socket, write_frame};
     use tokio::net::UnixStream;
 
     #[tokio::test]
@@ -375,5 +398,32 @@ mod tests {
         }
         assert!(path.exists());
         bind_unix(&path, 0o600, "", "").expect("replace stale socket leftover");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_removes_bound_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cleanup.sock");
+        let (listener, identity) = bind_unix_with_identity(&path, 0o600, "", "").unwrap();
+        drop(listener);
+
+        remove_bound_socket(&path, identity).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_preserves_replacement_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cleanup.sock");
+        let original = dir.path().join("original.sock");
+        let (listener, identity) = bind_unix_with_identity(&path, 0o600, "", "").unwrap();
+        drop(listener);
+        std::fs::rename(&path, &original).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        remove_bound_socket(&path, identity).unwrap();
+
+        assert!(path.exists());
     }
 }

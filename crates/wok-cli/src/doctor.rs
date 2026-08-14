@@ -98,6 +98,49 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         ),
     }
 
+    // Hot-reload merges the file over factory defaults, so a truncated or
+    // partially-provisioned file silently weakens these scopes; surface
+    // their current state so operators can spot the reversion.
+    report.add(
+        "write-policy-plugin",
+        if cfg.relay.write_policy_plugin.is_empty() {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Pass
+        },
+        if cfg.relay.write_policy_plugin.is_empty() {
+            "no write-policy plugin configured".to_string()
+        } else {
+            format!("write-policy plugin: {}", cfg.relay.write_policy_plugin)
+        },
+    );
+    report.add(
+        "filter-validation",
+        if cfg.relay.filter_validation.enabled {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        if cfg.relay.filter_validation.enabled {
+            "ingress filter validation is enabled".to_string()
+        } else {
+            "ingress filter validation is disabled".to_string()
+        },
+    );
+    report.add(
+        "abuse-limits",
+        if cfg.relay.abuse.enabled {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        if cfg.relay.abuse.enabled {
+            "abuse rate limits and quotas are enabled".to_string()
+        } else {
+            "abuse rate limits and quotas are disabled".to_string()
+        },
+    );
+
     if !cfg.db.is_dir() {
         report.add(
             "database-path",

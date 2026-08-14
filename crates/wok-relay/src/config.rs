@@ -819,12 +819,98 @@ impl Config {
         }
     }
 
+    /// Describe changes to restart-safe security scopes (write-policy plugin,
+    /// filter validation, abuse budgets) between this config and a reload
+    /// candidate. TOML loading merges the supplied file over factory
+    /// defaults, so a valid-but-incomplete file silently reverts omitted
+    /// sections — these diffs are warn-logged on reload so the reversion is
+    /// at least visible in the logs.
+    pub fn security_scope_changes(&self, new: &Config) -> Vec<String> {
+        let mut changes = Vec::new();
+        if self.relay.write_policy_plugin != new.relay.write_policy_plugin {
+            changes.push(format!(
+                "relay.write_policy_plugin changed: {:?} -> {:?}{}",
+                self.relay.write_policy_plugin,
+                new.relay.write_policy_plugin,
+                if new.relay.write_policy_plugin.is_empty() {
+                    " (write-policy plugin now DISABLED)"
+                } else {
+                    ""
+                },
+            ));
+        }
+        if self.relay.write_policy_timeout_secs != new.relay.write_policy_timeout_secs {
+            changes.push(format!(
+                "relay.write_policy_timeout_secs changed: {} -> {}",
+                self.relay.write_policy_timeout_secs, new.relay.write_policy_timeout_secs,
+            ));
+        }
+        let fv = |c: &Config| {
+            let f = &c.relay.filter_validation;
+            (
+                f.enabled,
+                f.max_filters_per_req,
+                f.min_filters_per_req,
+                f.max_kinds_per_filter,
+                f.require_author_or_tag,
+            )
+        };
+        if fv(self) != fv(new)
+            || self.relay.filter_validation.allowed_kinds
+                != new.relay.filter_validation.allowed_kinds
+        {
+            changes.push(format!(
+                "relay.filter_validation changed (enabled {} -> {}): {:?} -> {:?}",
+                self.relay.filter_validation.enabled,
+                new.relay.filter_validation.enabled,
+                self.relay.filter_validation,
+                new.relay.filter_validation,
+            ));
+        }
+        let ab = |c: &Config| {
+            let a = &c.relay.abuse;
+            (
+                (
+                    a.enabled,
+                    a.connection_rate_per_second,
+                    a.connection_burst,
+                    a.event_rate_per_second,
+                    a.event_burst,
+                    a.pubkey_event_rate_per_second,
+                    a.pubkey_event_burst,
+                    a.req_rate_per_second,
+                    a.req_burst,
+                ),
+                (
+                    a.count_rate_per_second,
+                    a.count_burst,
+                    a.max_concurrent_historical_queries,
+                    a.max_query_cost,
+                    a.max_stored_events,
+                    a.max_stored_events_per_pubkey,
+                    a.min_pow_difficulty,
+                ),
+            )
+        };
+        if ab(self) != ab(new) {
+            changes.push(format!(
+                "relay.abuse changed (enabled {} -> {}): {:?} -> {:?}",
+                self.relay.abuse.enabled, new.relay.abuse.enabled, self.relay.abuse,
+                new.relay.abuse,
+            ));
+        }
+        changes
+    }
+
     /// Replace this config with a freshly parsed one, keeping the values
     /// that cannot change at runtime. The frozen set matches golpe's
     /// `noReload` keys plus everything bound to a listener/socket/pool that
     /// only exists once at startup (documented as "restart required" in
     /// strfry.conf).
     pub fn apply_reload(&mut self, new: Config) {
+        for change in self.security_scope_changes(&new) {
+            tracing::warn!("config reload: {change}");
+        }
         let old = std::mem::replace(self, new);
         self.db = old.db;
         self.db_maxreaders = old.db_maxreaders;
@@ -880,7 +966,8 @@ fn clamp_size_class(parsed: &mut TomlConfig) {
     }
 }
 
-fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {    if admin.auth_window_secs == 0 || admin.auth_window_secs > 300 {
+fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {
+    if admin.auth_window_secs == 0 || admin.auth_window_secs > 300 {
         return Err("admin.auth_window_secs must be between 1 and 300".into());
     }
     if !admin.enabled {
@@ -1387,6 +1474,52 @@ mod tests {
                 .unwrap_err()
                 .contains("at least 1")
         );
+    }
+
+    #[test]
+    fn security_scope_changes_flag_silent_reversions() {
+        let full = Config::parse_toml(
+            r#"
+            [relay]
+            write_policy_plugin = "/usr/local/bin/policy"
+            max_filter_limit = 500
+
+            [relay.filter_validation]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        // Identical reload: nothing to report.
+        let same = Config::parse_toml(
+            r#"
+            [relay]
+            write_policy_plugin = "/usr/local/bin/policy"
+            max_filter_limit = 500
+
+            [relay.filter_validation]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(full.security_scope_changes(&same).is_empty());
+        // A valid-but-partial file reverts the plugin and filter validation
+        // to defaults; the diff must surface both.
+        let partial = Config::parse_toml("[relay]\nmax_filter_limit = 500\n").unwrap();
+        let changes = full.security_scope_changes(&partial);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("write_policy_plugin") && c.contains("DISABLED")),
+            "{changes:?}"
+        );
+        assert!(
+            changes.iter().any(|c| c.contains("filter_validation")),
+            "{changes:?}"
+        );
+        // Zeroed abuse budgets are called out as well.
+        let zeroed = Config::parse_toml("[relay.abuse]\nevent_rate_per_second = 0\n").unwrap();
+        let changes = full.security_scope_changes(&zeroed);
+        assert!(changes.iter().any(|c| c.contains("abuse")), "{changes:?}");
     }
 
     #[test]

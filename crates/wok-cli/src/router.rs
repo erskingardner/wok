@@ -28,6 +28,11 @@ pub struct RouterConfig {
     pub streams: BTreeMap<String, StreamSpec>,
 }
 
+/// Parse-time ceiling for `connectionTimeout` (1 day; the default is 20s).
+/// Values above this are rejected so reconnect arithmetic
+/// (`timeout * 2`, `Instant + duration`) can never overflow.
+const MAX_CONNECTION_TIMEOUT_SECS: u64 = 86_400;
+
 #[derive(Debug, Clone)]
 pub struct StreamSpec {
     pub dir: String,
@@ -353,8 +358,16 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig> {
                 } else {
                     match key.as_str() {
                         "connectionTimeout" => {
-                            cfg.connection_timeout =
-                                Duration::from_secs(value.as_u64().context("connectionTimeout")?);
+                            let secs = value.as_u64().context("connectionTimeout")?;
+                            // Reconnect math multiplies this by 2 and adds it
+                            // to Instant::now(); keep it in a range that can't
+                            // overflow Duration or Instant arithmetic.
+                            if secs > MAX_CONNECTION_TIMEOUT_SECS {
+                                bail!(
+                                    "connectionTimeout {secs}s exceeds the {MAX_CONNECTION_TIMEOUT_SECS}s maximum"
+                                );
+                            }
+                            cfg.connection_timeout = Duration::from_secs(secs);
                         }
                         "verbose" => {
                             cfg.verbose = value.as_bool().context("verbose")?;
@@ -946,6 +959,14 @@ async fn router_db_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_timeout_above_ceiling_is_rejected() {
+        assert!(parse_router_config("connectionTimeout = 20").is_ok());
+        assert!(parse_router_config("connectionTimeout = 86400").is_ok());
+        assert!(parse_router_config("connectionTimeout = 86401").is_err());
+        assert!(parse_router_config("connectionTimeout = 18446744073709551615").is_err());
+    }
 
     #[test]
     fn parses_docs_example() {

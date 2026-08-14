@@ -37,7 +37,8 @@ jobs:
           nightly_cargo="$(rustup which --toolchain nightly cargo)"
           nightly_rustc="$(rustup which --toolchain nightly rustc)"
           CARGO="$nightly_cargo" RUSTC="$nightly_rustc" \
-            cargo fuzz run ingress --sanitizer address -- -runs=10000 -max_len=131072
+            cargo fuzz run ingress --target x86_64-unknown-linux-gnu \
+              --sanitizer address -- -runs=10000 -max_len=131072
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@v4

@@ -354,6 +354,12 @@ impl SearchScan {
         if self.gathering_complete {
             return Ok(true);
         }
+        // A limit of 0 means no hits are ranked or emitted, so there is
+        // nothing to gather: don't walk the posting list at all.
+        if self.max_hits == 0 {
+            self.gathering_complete = true;
+            return Ok(true);
+        }
         if self.term_document_counts[&self.primary_term] == 0 {
             self.gathering_complete = true;
             return Ok(true);

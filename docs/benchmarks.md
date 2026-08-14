@@ -192,6 +192,11 @@ two-host campaign results.
 
 ### Recorded campaigns
 
+The [2026-08-14 WebSocket optimization report](websocket-performance-2026-08-14.md)
+records the focused profiling and same-build two-host A/B that followed the
+v0.2.0 campaign. The final zero-delay candidate improved scaled WebSocket
+publication throughput by 22–24% in two order-balanced comparisons.
+
 The [v0.2.0 report](benchmark-v0.2.0-2026-08-14.md) records the latest
 100,000-event Linux campaign: a two-host Wok/strfry relay comparison and a
 same-host Wok Unix/WebSocket transport comparison, each with three

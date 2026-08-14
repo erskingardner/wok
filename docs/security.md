@@ -49,8 +49,11 @@ Fast property tests feed arbitrary data into strict JSON/event validation,
 protocol envelopes, WebSocket fragmentation and decompression, Negentropy
 frames, and modeled LMDB transaction sequences on every normal test run. A
 separate libFuzzer target composes the public ingress parsers. Scheduled and
-parser-changing pull-request jobs run that target under AddressSanitizer and
-UndefinedBehaviorSanitizer with a persistent crash corpus.
+parser-changing pull-request jobs run a bounded AddressSanitizer-backed smoke
+campaign from a fresh corpus. Any crash reproducer is retained as a workflow
+artifact for diagnosis and promotion into a permanent regression test. A
+long-running campaign with a persistent evolving corpus is intentionally a
+separate operational concern from this fast CI gate.
 
 Storage recovery tests exhaust a deliberately small LMDB map and terminate a
 separate writer process after the event and secondary indexes have been

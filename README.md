@@ -54,7 +54,7 @@ quirk. It also provides an additional Unix-domain socket transport.
   proof-of-work enforcement advertised through NIP-11.
 - **Hardened untrusted-input boundary**: safe crates forbid unsafe Rust, LMDB
   and OS FFI are isolated and documented, and property tests plus scheduled
-  ASan/UBSan fuzzing exercise JSON, events, WebSockets, compression,
+  AddressSanitizer-backed fuzzing exercise JSON, events, WebSockets, compression,
   Negentropy, and database transaction sequences.
 
 ## Build

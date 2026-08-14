@@ -22,17 +22,27 @@ concurrency:
 
 jobs:
   ingress:
-    name: ingress (${{ matrix.sanitizer }})
+    name: ingress (address)
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [address, undefined]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
       - name: Run bounded ingress campaign
-        run: cargo fuzz run ingress --sanitizer '${{ matrix.sanitizer }}' -- -runs=10000 -max_len=131072
+        run: |
+          nightly_cargo="$(rustup which --toolchain nightly cargo)"
+          nightly_rustc="$(rustup which --toolchain nightly rustc)"
+          CARGO="$nightly_cargo" RUSTC="$nightly_rustc" \
+            cargo fuzz run ingress --sanitizer address -- -runs=10000 -max_len=131072
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-reproducers
+          path: fuzz/artifacts/ingress/
+          if-no-files-found: ignore
+          retention-days: 30

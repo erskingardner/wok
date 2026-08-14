@@ -80,9 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rust-struct memory copies.
 - Durable writes fail atomically at the configured disk, LMDB map, global
   event, or per-author event ceiling, preventing unbounded storage growth.
-- CI continuously checks adversarial parser behavior under AddressSanitizer
-  and UndefinedBehaviorSanitizer and rejects vulnerable, yanked, unapproved,
-  or unknown dependency sources.
+- CI continuously checks adversarial parser behavior with an
+  AddressSanitizer-backed libFuzzer smoke campaign and rejects vulnerable,
+  yanked, unapproved, or unknown dependency sources.
 
 ## [0.1.0] - 2026-08-13
 

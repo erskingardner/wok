@@ -896,7 +896,9 @@ impl Config {
         if ab(self) != ab(new) {
             changes.push(format!(
                 "relay.abuse changed (enabled {} -> {}): {:?} -> {:?}",
-                self.relay.abuse.enabled, new.relay.abuse.enabled, self.relay.abuse,
+                self.relay.abuse.enabled,
+                new.relay.abuse.enabled,
+                self.relay.abuse,
                 new.relay.abuse,
             ));
         }
@@ -1014,9 +1016,7 @@ fn clamp_size_class(parsed: &mut TomlConfig) {
     ];
     for (name, value) in fields {
         if *value > MAX_SIZE_CLASS_BYTES {
-            tracing::warn!(
-                "{name} exceeds the {MAX_SIZE_CLASS_BYTES}-byte ceiling; clamping"
-            );
+            tracing::warn!("{name} exceeds the {MAX_SIZE_CLASS_BYTES}-byte ceiling; clamping");
             *value = MAX_SIZE_CLASS_BYTES;
         }
     }
@@ -1628,10 +1628,8 @@ mod tests {
             );
         }
         // With abuse protection disabled entirely, zero budgets are moot.
-        let cfg = Config::parse_toml(
-            "[relay.abuse]\nenabled = false\nevent_rate_per_second = 0\n",
-        )
-        .unwrap();
+        let cfg = Config::parse_toml("[relay.abuse]\nenabled = false\nevent_rate_per_second = 0\n")
+            .unwrap();
         assert!(cfg.zero_guard_warnings().is_empty());
     }
 

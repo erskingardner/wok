@@ -182,7 +182,12 @@ pub async fn dispatch(
         _ => response(StatusCode::NOT_FOUND, "text/plain", "not found"),
     };
     if resp.status().is_success() {
-        commit_replay_id(&state, replay_id, replay_created_at, cfg.admin.auth_window_secs);
+        commit_replay_id(
+            &state,
+            replay_id,
+            replay_created_at,
+            cfg.admin.auth_window_secs,
+        );
     }
     resp
 }
@@ -876,7 +881,7 @@ mod tests {
             "https://relay.example/admin/api/config",
             body,
             &cfg,
-            &state
+            &state,
         )
         .unwrap();
         // Not yet burned: a retry of a failed request with the same signed
@@ -890,7 +895,12 @@ mod tests {
             &state
         )
         .is_ok());
-        commit_replay_id(&state, replay_id, replay_created_at, cfg.admin.auth_window_secs);
+        commit_replay_id(
+            &state,
+            replay_id,
+            replay_created_at,
+            cfg.admin.auth_window_secs,
+        );
         assert!(authorize(
             Some(&header),
             &Method::PUT,

@@ -220,7 +220,7 @@ pub fn nostr_json_to_packed_event(
                 tag_builder.add(tag_name.chars().next().unwrap(), tag_val.as_bytes())?;
             }
         } else if tag_name == "expiration" && expiration == 0 {
-            expiration = parse_uint64(&tag_val)?;
+            expiration = parse_uint64(tag_val)?;
             if expiration < 100 {
                 return Err(EventError::msg("invalid expiration"));
             }

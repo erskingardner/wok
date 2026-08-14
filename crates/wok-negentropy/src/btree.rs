@@ -242,7 +242,9 @@ mod traversal_tests {
         backend.root = 1;
         let mut tree = BTreeCore::new(backend);
         // Must return, not panic on `num_items - 1`.
-        assert!(tree.find_lower_bound_mut(0, 0, &Bound::timestamp(5)).is_ok());
+        assert!(tree
+            .find_lower_bound_mut(0, 0, &Bound::timestamp(5))
+            .is_ok());
         assert!(tree.size_mut().is_ok());
         assert!(tree.iterate_mut(0, 0, |_, _| true).is_ok());
     }

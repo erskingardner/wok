@@ -244,7 +244,9 @@ impl<S: Storage> Negentropy<S> {
             let mut curr = lower;
             for i in 0..BUCKETS {
                 let bucket_size = items_per_bucket + u64::from(i < buckets_with_extra);
-                let our_fp = self.storage.fingerprint(curr, curr + bucket_size as usize)?;
+                let our_fp = self
+                    .storage
+                    .fingerprint(curr, curr + bucket_size as usize)?;
                 curr += bucket_size as usize;
                 let next_bound = if curr == upper {
                     upper_bound.clone()
@@ -413,7 +415,11 @@ mod tests {
         ) -> Result<usize, NegError> {
             self.calls += 1;
             // Legit first answer, then below the requested `begin`.
-            Ok(if self.calls == 1 { begin + 5 } else { begin - 1 })
+            Ok(if self.calls == 1 {
+                begin + 5
+            } else {
+                begin - 1
+            })
         }
         fn fingerprint(&mut self, _begin: usize, _end: usize) -> Result<Fingerprint, NegError> {
             Ok([0; FINGERPRINT_SIZE])

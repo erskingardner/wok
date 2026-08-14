@@ -156,8 +156,7 @@ impl PluginEventSifter {
         // read a fresh window; we deliberately diverge).
         let deadline = std::time::Instant::now() + self.timeout;
         loop {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
-            else {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return Err("Failed to read response: timeout".into());
             };
             let resp_line = match running.from_worker.recv_timeout(remaining) {

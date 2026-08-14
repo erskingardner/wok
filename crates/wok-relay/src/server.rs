@@ -1959,8 +1959,8 @@ fn run_writer(
             }
             continue;
         }
-        let quota_enabled = cfg_snap.relay.abuse.enabled
-            && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0;
+        let quota_enabled =
+            cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0;
         for (i, conn_id) in meta.iter().enumerate() {
             let packed = PackedEventView::new(&evs[i].packed).ok();
             // Reconcile quota memos with actual write outcomes: confirmed
@@ -2753,8 +2753,8 @@ fn reconcile_stateless(
         } else {
             until.saturating_add(1)
         });
-        let sub_store = wok_negentropy::SubRange::new(&mut tree, &lower, &upper)
-            .map_err(|e| e.to_string())?;
+        let sub_store =
+            wok_negentropy::SubRange::new(&mut tree, &lower, &upper).map_err(|e| e.to_string())?;
         let mut ne = Negentropy::new(sub_store, 500_000).map_err(|e| e.to_string())?;
         ne.reconcile(payload).map_err(|e| e.to_string())
     })();

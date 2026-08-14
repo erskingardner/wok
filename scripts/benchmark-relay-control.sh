@@ -81,6 +81,9 @@ reset_import() {
     stop_all
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DB_ROOT"
     find "$DB_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    # Both benchmark configs place LMDB inside a `db` child. Wok creates it,
+    # while strfry requires the directory to exist before mdb_env_open.
+    install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DB_ROOT/db"
     install -d -m 0750 "$artifacts"
 
     {
@@ -120,7 +123,9 @@ start_measurement() {
     assert_benchmark_path "$artifacts"
     install -d -m 0750 "$artifacts"
     stop_all
-    systemctl reset-failed "$SERVICE"
+    # Some systemd versions report an inactive, never-failed unit as not
+    # loaded here. Clearing stale failure state is useful but not required.
+    systemctl reset-failed "$SERVICE" 2>/dev/null || true
     systemctl start "$SERVICE"
 
     local ready=0

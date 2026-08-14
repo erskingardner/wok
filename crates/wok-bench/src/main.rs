@@ -1188,6 +1188,9 @@ fn ws_publish_target_trial(
     conns: usize,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
+    if conns == 0 {
+        anyhow::bail!("publication requires at least one connection");
+    }
     let warmup_events = conns.max(50);
     let events = generate_values(EventWorkload {
         count: workload.count.saturating_add(u64::try_from(warmup_events)?),
@@ -1210,7 +1213,23 @@ fn ws_publish_target_trial(
         }
         let mut batches = vec![Vec::new(); conns];
         for (i, event) in events.into_iter().skip(warmup_events).enumerate() {
-            batches[i % conns].push(event);
+            let connection = if workload.mix == EventMix::Lifecycle {
+                // Deletions must follow the referenced event from the same
+                // author. Actor-sticky batches retain that ordering while
+                // still exercising concurrent publisher connections.
+                event
+                    .get("pubkey")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .bytes()
+                    .fold(0usize, |hash, byte| {
+                        hash.wrapping_mul(16777619) ^ usize::from(byte)
+                    })
+                    % conns
+            } else {
+                i % conns
+            };
+            batches[connection].push(event);
         }
         let mut accepted = 0u64;
         let mut rejected = 0u64;

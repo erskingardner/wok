@@ -31,6 +31,11 @@ RELAY_ROOT=/opt/relay-bench/campaigns/$CAMPAIGN_ID
 RELAY_CORPUS=$RELAY_ROOT/corpus.jsonl
 CONTROL_LOCAL=$SCRIPT_DIR/benchmark-relay-control.sh
 CONTROL_REMOTE=/opt/relay-bench/bin/benchmark-relay-control
+SSH_OPTIONS=(
+    -o ControlMaster=auto
+    -o ControlPersist=300
+    -o 'ControlPath=/tmp/wok-bench-%C'
+)
 
 require_local_tools() {
     local tool
@@ -51,7 +56,9 @@ require_local_tools() {
 }
 
 cleanup() {
-    ssh "$RELAY_SSH" "$CONTROL_REMOTE stop-all" >/dev/null 2>&1 || true
+    ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" "$CONTROL_REMOTE stop-all" >/dev/null 2>&1 || true
+    ssh "${SSH_OPTIONS[@]}" -O exit "$RELAY_SSH" >/dev/null 2>&1 || true
+    ssh "${SSH_OPTIONS[@]}" -O exit "$LOAD_SSH" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -60,7 +67,7 @@ remote_command() {
     shift
     local rendered
     printf -v rendered '%q ' "$@"
-    ssh "$host" "$rendered"
+    ssh "${SSH_OPTIONS[@]}" "$host" "$rendered"
 }
 
 run_bench() {
@@ -83,7 +90,7 @@ run_bench() {
     )
     local rendered
     printf -v rendered '%q ' "${command[@]}"
-    ssh "$LOAD_SSH" "ulimit -n $NOFILE_LIMIT; exec $rendered"
+    ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "ulimit -n $NOFILE_LIMIT; exec $rendered"
     remote_command "$LOAD_SSH" jq -e -s 'all(.ok and (.errors == 0) and (.mismatches == 0))' \
         "$output/results.jsonl" >/dev/null
 }
@@ -95,9 +102,9 @@ run_one_relay() {
     local server_artifacts=$RELAY_ROOT/runs/r${repetition}-${relay}/server
     remote_command "$LOAD_SSH" mkdir -p "$run_root/load" "$run_root/server"
 
-    ssh "$RELAY_SSH" \
+    ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" \
         "$CONTROL_REMOTE reset-import $relay $RELAY_CORPUS $EVENTS $server_artifacts"
-    ssh "$RELAY_SSH" "$CONTROL_REMOTE start $relay $server_artifacts"
+    ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" "$CONTROL_REMOTE start $relay $server_artifacts"
 
     local status=0
     if ! run_bench "$relay" "$repetition" query \
@@ -128,8 +135,8 @@ run_one_relay() {
         status=1
     fi
 
-    ssh "$RELAY_SSH" "$CONTROL_REMOTE collect-stop $relay $server_artifacts" || status=1
-    scp -3 -q -r "$RELAY_SSH:$server_artifacts/." "$LOAD_SSH:$run_root/server/" || status=1
+    ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" "$CONTROL_REMOTE collect-stop $relay $server_artifacts" || status=1
+    scp "${SSH_OPTIONS[@]}" -3 -q -r "$RELAY_SSH:$server_artifacts/." "$LOAD_SSH:$run_root/server/" || status=1
     if [[ $status -ne 0 ]]; then
         echo "campaign phase failed for $relay repetition $repetition" >&2
         return "$status"
@@ -160,13 +167,13 @@ write_campaign_metadata() {
     local command=(printf '%s\n' "${lines[@]}")
     local rendered
     printf -v rendered '%q ' "${command[@]}"
-    ssh "$LOAD_SSH" "$rendered > $(printf '%q' "$metadata")"
-    ssh "$LOAD_SSH" \
+    ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "$rendered > $(printf '%q' "$metadata")"
+    ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" \
         "{ uname -a; lscpu; free -b; ip -br address; ip route; sysctl fs.file-max net.ipv4.ip_local_port_range net.core.somaxconn; } > $(printf '%q' "$LOAD_ROOT/load-host.txt")"
 }
 
 require_local_tools
-scp -q "$CONTROL_LOCAL" "$RELAY_SSH:$CONTROL_REMOTE"
+scp "${SSH_OPTIONS[@]}" -q "$CONTROL_LOCAL" "$RELAY_SSH:$CONTROL_REMOTE"
 remote_command "$RELAY_SSH" chmod 0755 "$CONTROL_REMOTE"
 remote_command "$RELAY_SSH" mkdir -p "$RELAY_ROOT/runs"
 remote_command "$LOAD_SSH" mkdir -p "$LOAD_CORPUS_DIR" "$LOAD_ROOT/runs"
@@ -178,10 +185,10 @@ write_campaign_metadata
 remote_command "$LOAD_SSH" "$BENCH_BIN" \
     --generate-corpus-only --events "$EVENTS" --event-mix realistic \
     --seed "$SEED" --base-timestamp "$BASE_TIMESTAMP" --out "$LOAD_CORPUS_DIR"
-scp -3 -q "$LOAD_SSH:$LOAD_CORPUS" "$RELAY_SSH:$RELAY_CORPUS"
+scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$LOAD_CORPUS" "$RELAY_SSH:$RELAY_CORPUS"
 
-load_sha=$(ssh "$LOAD_SSH" "sha256sum $(printf '%q' "$LOAD_CORPUS") | awk '{print \$1}'")
-relay_sha=$(ssh "$RELAY_SSH" "sha256sum $(printf '%q' "$RELAY_CORPUS") | awk '{print \$1}'")
+load_sha=$(ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "sha256sum $(printf '%q' "$LOAD_CORPUS") | awk '{print \$1}'")
+relay_sha=$(ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" "sha256sum $(printf '%q' "$RELAY_CORPUS") | awk '{print \$1}'")
 if [[ $load_sha != "$relay_sha" ]]; then
     echo "corpus checksum mismatch: load=$load_sha relay=$relay_sha" >&2
     exit 1
@@ -199,6 +206,6 @@ for repetition in $(seq 1 "$REPETITIONS"); do
     done
 done
 
-ssh "$RELAY_SSH" "$CONTROL_REMOTE status" | \
-    ssh "$LOAD_SSH" "cat > $(printf '%q' "$LOAD_ROOT/final-relay-status.txt")"
+ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" "$CONTROL_REMOTE status" | \
+    ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "cat > $(printf '%q' "$LOAD_ROOT/final-relay-status.txt")"
 echo "campaign complete: $LOAD_SSH:$LOAD_ROOT"

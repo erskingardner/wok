@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The landing page footer no longer renders `Wok <version> (unknown)` on
+  builds without an embedded commit hash (for example release archives built
+  from a tarball); the revision parenthetical is shown only when a real hash
+  is available.
 - Write-policy plugins that print non-JSON lines to stdout (startup banners,
   debug output) no longer wedge every publication until the round-trip
   deadline and kill the plugin: like C++ `PluginEventSifter`, unparseable

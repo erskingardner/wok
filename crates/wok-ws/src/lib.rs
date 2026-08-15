@@ -355,13 +355,15 @@ fn landing(cfg: &Config, supported_nips: &[u64]) -> String {
             })
         })
         .collect::<String>();
-    let short_hash = GIT_HASH.get(..8).unwrap_or(GIT_HASH);
+    // Only show a revision when the build embedded a real commit hash;
+    // tarball builds without .git fall back to "unknown", which is noise.
     let revision = if GIT_HASH == "unknown" {
-        "unknown".to_owned()
+        String::new()
     } else {
+        let short_hash = GIT_HASH.get(..8).unwrap_or(GIT_HASH);
         // Build-time input, but escape like every other interpolated value.
         format!(
-            "<a href=\"https://github.com/erskingardner/wok/commit/{}\">{}</a>",
+            " (<a href=\"https://github.com/erskingardner/wok/commit/{}\">{}</a>)",
             html_escape(GIT_HASH),
             html_escape(short_hash)
         )
@@ -440,7 +442,7 @@ fn landing(cfg: &Config, supported_nips: &[u64]) -> String {
 {metadata}</section>
 <section><div class="section-heading"><p>Relay capabilities</p><h2>Supported NIPs</h2></div>
 <ul>{nip_items}</ul></section>
-<footer><span class="status-dot"></span> Wok {VERSION} ({revision})</footer>
+<footer><span class="status-dot"></span> Wok {VERSION}{revision}</footer>
 </main></body></html>"#,
         name = html_escape(&cfg.relay.info.name),
         description = html_escape(&cfg.relay.info.description),
@@ -749,7 +751,13 @@ mod landing_tests {
         assert!(html.contains("durable deletion"));
         assert!(html.contains("nostr-protocol/nips/blob/master/77.md"));
         assert!(html.contains(&format!("Wok {VERSION}")));
-        assert!(html.contains(GIT_HASH.get(..8).unwrap_or(GIT_HASH)));
+        if GIT_HASH == "unknown" {
+            // No commit hash embedded (e.g. tarball build): no parenthetical.
+            assert!(!html.contains("(unknown)"));
+            assert!(html.contains(&format!("Wok {VERSION}</footer>")));
+        } else {
+            assert!(html.contains(GIT_HASH.get(..8).unwrap_or(GIT_HASH)));
+        }
     }
 
     #[test]

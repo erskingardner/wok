@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Write-policy plugins that print non-JSON lines to stdout (startup banners,
+  debug output) no longer wedge every publication until the round-trip
+  deadline and kill the plugin: like C++ `PluginEventSifter`, unparseable
+  response lines are logged and skipped while waiting for the response that
+  echoes the request's event id. Previously such a plugin made every EVENT
+  fail with `error: internal error`.
+
 ## [0.3.0] - 2026-08-14
 
 ### Added

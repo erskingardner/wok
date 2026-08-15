@@ -2510,6 +2510,7 @@ dependencies = [
  "rand 0.8.7",
  "secp256k1",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

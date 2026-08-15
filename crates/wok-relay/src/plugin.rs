@@ -31,10 +31,17 @@ pub struct PluginEventSifter {
 
 struct Running {
     child: Child,
-    to_worker: std_mpsc::Sender<String>,
+    to_worker: std_mpsc::Sender<PluginRequest>,
     from_worker: std_mpsc::Receiver<Result<String, String>>,
     cmd: String,
     last_mod: Option<std::time::SystemTime>,
+}
+
+/// One plugin round trip: the serialized request line plus the event id the
+/// response must echo (C++ `id mismatch` check).
+struct PluginRequest {
+    line: String,
+    want_id: String,
 }
 
 impl PluginEventSifter {
@@ -125,7 +132,7 @@ impl PluginEventSifter {
             .map_err(|e| format!("posix_spawn failed to invoke '{cmd}': {e}"))?;
         let stdin = child.stdin.take().ok_or("plugin stdin")?;
         let stdout = child.stdout.take().ok_or("plugin stdout")?;
-        let (req_tx, req_rx) = std_mpsc::channel::<String>();
+        let (req_tx, req_rx) = std_mpsc::channel::<PluginRequest>();
         let (resp_tx, resp_rx) = std_mpsc::channel::<Result<String, String>>();
         std::thread::Builder::new()
             .name("plugin-io".into())
@@ -145,80 +152,91 @@ impl PluginEventSifter {
         let running = self.running.as_mut().ok_or("plugin not running")?;
         let mut line = serde_json::to_string(request).map_err(|e| e.to_string())?;
         line.push('\n');
+        let want_id = request["event"]["id"].as_str().unwrap_or("").to_string();
         running
             .to_worker
-            .send(line)
+            .send(PluginRequest { line, want_id })
             .map_err(|_| "Failed to write event: plugin worker gone".to_string())?;
-        let want_id = request["event"]["id"].as_str().unwrap_or("");
         // One overall deadline per request: a broken plugin emitting an
         // endless stream of garbage lines must not earn a fresh timeout
         // window per line while the single LMDB writer waits (C++ gives each
         // read a fresh window; we deliberately diverge).
         let deadline = std::time::Instant::now() + self.timeout;
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return Err("Failed to read response: timeout".into());
-            };
-            let resp_line = match running.from_worker.recv_timeout(remaining) {
-                Ok(Ok(l)) => l,
-                Ok(Err(e)) => return Err(format!("Failed to read response: {e}")),
-                Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                    return Err("Failed to read response: timeout".into())
-                }
-                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("Failed to read response: eof".into())
-                }
-            };
-            let response: Value = match serde_json::from_str(resp_line.trim()) {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(
-                        response = ?resp_line.trim_end(),
-                        "write policy plugin returned unparseable JSON"
-                    );
-                    continue;
-                }
-            };
-            if response["id"].as_str() != Some(want_id) {
-                return Err("id mismatch".into());
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err("Failed to read response: timeout".into());
+        };
+        let resp_line = match running.from_worker.recv_timeout(remaining) {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) if e == "id mismatch" => return Err("id mismatch".into()),
+            Ok(Err(e)) => return Err(format!("Failed to read response: {e}")),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                return Err("Failed to read response: timeout".into())
             }
-            let action = response["action"]
-                .as_str()
-                .ok_or("missing action")?
-                .to_string();
-            let msg = response["msg"].as_str().unwrap_or("").to_string();
-            return Ok((action, msg));
-        }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Failed to read response: eof".into())
+            }
+        };
+        // The worker only forwards lines that parsed as JSON and echoed the
+        // request's event id, so this parse cannot fail.
+        let response: Value = serde_json::from_str(resp_line.trim())
+            .map_err(|e| format!("validated plugin response unparseable: {e}"))?;
+        let action = response["action"]
+            .as_str()
+            .ok_or("missing action")?
+            .to_string();
+        let msg = response["msg"].as_str().unwrap_or("").to_string();
+        Ok((action, msg))
     }
 }
 
-/// Synchronous body of the plugin I/O worker thread. Writes each request,
-/// then reads response lines until the channel closes or the child dies.
+/// Synchronous body of the plugin I/O worker thread. For each request it
+/// writes the line, then reads response lines until one parses as JSON and
+/// echoes the request's event id — like C++ PluginEventSifter, which logs
+/// and skips unparseable lines instead of failing the request. Reading stops
+/// when the channel closes or the child dies.
 fn plugin_worker(
     mut stdin: ChildStdin,
     stdout: ChildStdout,
-    requests: std_mpsc::Receiver<String>,
+    requests: std_mpsc::Receiver<PluginRequest>,
     responses: std_mpsc::Sender<Result<String, String>>,
 ) {
     let mut reader = BufReader::new(stdout);
-    while let Ok(line) = requests.recv() {
-        if let Err(e) = stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()) {
+    'requests: while let Ok(req) = requests.recv() {
+        if let Err(e) = stdin
+            .write_all(req.line.as_bytes())
+            .and_then(|_| stdin.flush())
+        {
             let _ = responses.send(Err(format!("Failed to write event: {e}")));
             break;
         }
-        match read_record(&mut reader) {
-            Ok(Some(resp)) => {
-                if responses.send(Ok(resp)).is_err() {
-                    break;
+        loop {
+            match read_record(&mut reader) {
+                Ok(Some(resp)) => match serde_json::from_str::<Value>(resp.trim()) {
+                    Ok(v) if v["id"].as_str() == Some(req.want_id.as_str()) => {
+                        if responses.send(Ok(resp)).is_err() {
+                            break 'requests;
+                        }
+                        continue 'requests;
+                    }
+                    Ok(_) => {
+                        let _ = responses.send(Err("id mismatch".into()));
+                        break 'requests;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            response = ?resp.trim_end(),
+                            "write policy plugin returned unparseable JSON"
+                        );
+                    }
+                },
+                Ok(None) => {
+                    let _ = responses.send(Err("eof".into()));
+                    break 'requests;
                 }
-            }
-            Ok(None) => {
-                let _ = responses.send(Err("eof".into()));
-                break;
-            }
-            Err(e) => {
-                let _ = responses.send(Err(e));
-                break;
+                Err(e) => {
+                    let _ = responses.send(Err(e));
+                    break 'requests;
+                }
             }
         }
     }
@@ -310,5 +328,91 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "timeout not enforced: {elapsed:?}"
         );
+    }
+
+    /// C++ PluginEventSifter logs and skips unparseable response lines, then
+    /// keeps reading within the same request. A plugin that prints a banner
+    /// or debug line to stdout must not wedge the round trip.
+    #[test]
+    fn unparseable_lines_are_skipped_not_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("banner.pl");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/perl\n\
+             use strict; use warnings;\n\
+             $| = 1;\n\
+             print \"banner: plugin starting up\\n\";\n\
+             while (my $line = <STDIN>) {\n\
+                 my ($id) = $line =~ /\"id\":\"([0-9a-f]+)\"/;\n\
+                 print \"debug: about to answer $id\\n\";\n\
+                 print \"{\\\"id\\\":\\\"$id\\\",\\\"action\\\":\\\"accept\\\"}\\n\";\n\
+             }\n",
+        )
+        .unwrap();
+        let cmd = format!("perl {}", script.display());
+        let mut sifter = PluginEventSifter::new(3);
+        let ev = json!({"id":"abcd","kind":1});
+        let mut msg = String::new();
+        let start = Instant::now();
+        // Startup banner before request 1, per-request debug line after: both
+        // must be skipped, and the plugin must stay alive across requests.
+        for _ in 0..3 {
+            let res = sifter.accept_event(&cmd, &ev, "IP4", "127.0.0.1", None, &mut msg);
+            assert_eq!(res, PluginResult::Accept);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "garbage lines wedged the round trip: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A response echoing a different event id is fatal (C++ `id mismatch`):
+    /// the request is rejected and the plugin is restarted next time.
+    #[test]
+    fn id_mismatch_rejects_and_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("mismatch.pl");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/perl\n\
+             use strict; use warnings;\n\
+             $| = 1;\n\
+             while (my $line = <STDIN>) {\n\
+                 print \"{\\\"id\\\":\\\"00\\\",\\\"action\\\":\\\"accept\\\"}\\n\";\n\
+             }\n",
+        )
+        .unwrap();
+        let cmd = format!("perl {}", script.display());
+        let mut sifter = PluginEventSifter::new(3);
+        let ev = json!({"id":"abcd","kind":1});
+        let mut msg = String::new();
+        let res = sifter.accept_event(&cmd, &ev, "IP4", "127.0.0.1", None, &mut msg);
+        assert_eq!(res, PluginResult::Reject);
+        assert_eq!(msg, "error: internal error");
+    }
+
+    /// A plugin that never starts (here: script without the executable bit,
+    /// so `sh -c <path>` fails and stdout EOFs immediately) fails closed with
+    /// "error: internal error", exactly like C++.
+    #[test]
+    fn dead_plugin_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("notexec.pl");
+        std::fs::write(&script, "#!/usr/bin/perl\nwhile (<STDIN>) {}\n").unwrap();
+        let mut sifter = PluginEventSifter::new(2);
+        let ev = json!({"id":"abcd","kind":1});
+        let mut msg = String::new();
+        let res = sifter.accept_event(
+            &script.to_string_lossy(),
+            &ev,
+            "IP4",
+            "127.0.0.1",
+            None,
+            &mut msg,
+        );
+        assert_eq!(res, PluginResult::Reject);
+        assert_eq!(msg, "error: internal error");
     }
 }

@@ -821,8 +821,9 @@ impl Config {
     }
 
     /// Describe changes to restart-safe security scopes (write-policy plugin,
-    /// filter validation, abuse budgets) between this config and a reload
-    /// candidate. TOML loading merges the supplied file over factory
+    /// filter validation, abuse budgets, NIP-42 read restriction scope,
+    /// NIP-62 vanish scope, negentropy enable switch) between this config and
+    /// a reload candidate. TOML loading merges the supplied file over factory
     /// defaults, so a valid-but-incomplete file silently reverts omitted
     /// sections — these diffs are warn-logged on reload so the reversion is
     /// at least visible in the logs.
@@ -900,6 +901,51 @@ impl Config {
                 new.relay.abuse.enabled,
                 self.relay.abuse,
                 new.relay.abuse,
+            ));
+        }
+        // NIP-42 read-restriction scope: silently narrowing (or emptying)
+        // restricted_read_kinds is fail-open, so call out dropped kinds
+        // explicitly — those kinds are readable unauthenticated from now on.
+        let prev = &self.relay.auth;
+        let new_auth = &new.relay.auth;
+        if prev.enabled != new_auth.enabled
+            || prev.service_url != new_auth.service_url
+            || prev.restricted_read_kinds != new_auth.restricted_read_kinds
+            || prev.restrict_read_to_involved_pubkey != new_auth.restrict_read_to_involved_pubkey
+        {
+            let dropped: Vec<u64> = prev
+                .restricted_read_kinds
+                .iter()
+                .filter(|k| !new_auth.restricted_read_kinds.contains(k))
+                .copied()
+                .collect();
+            let note = if !dropped.is_empty() {
+                format!(
+                    " (restricted kinds DROPPED: {dropped:?} — previously-restricted kinds are now publicly readable)"
+                )
+            } else if !prev.enabled && new_auth.enabled {
+                " (auth now ENABLED — NIP-42 enforcement mode changed)".to_string()
+            } else {
+                String::new()
+            };
+            changes.push(format!(
+                "relay.auth changed: {:?} -> {:?}{}",
+                prev, new_auth, note,
+            ));
+        }
+        // NIP-62 vanish scope and NEG enable switch can also widen or narrow
+        // who can delete/sync data.
+        let prev62 = &self.relay.nip62;
+        let new62 = &new.relay.nip62;
+        if (prev62.enabled, prev62.service_url.clone())
+            != (new62.enabled, new62.service_url.clone())
+        {
+            changes.push(format!("relay.nip62 changed: {:?} -> {:?}", prev62, new62,));
+        }
+        if self.relay.negentropy_enabled != new.relay.negentropy_enabled {
+            changes.push(format!(
+                "relay.negentropy_enabled changed: {} -> {}",
+                self.relay.negentropy_enabled, new.relay.negentropy_enabled,
             ));
         }
         changes
@@ -1768,6 +1814,71 @@ mod tests {
         let zeroed = Config::parse_toml("[relay.abuse]\nevent_rate_per_second = 0\n").unwrap();
         let changes = full.security_scope_changes(&zeroed);
         assert!(changes.iter().any(|c| c.contains("abuse")), "{changes:?}");
+    }
+
+    #[test]
+    fn security_scope_changes_flags_auth_nip62_and_negentropy() {
+        let base = Config::parse_toml(
+            r#"
+            [relay]
+            negentropy_enabled = true
+
+            [relay.auth]
+            enabled = true
+            restricted_read_kinds = [4]
+
+            [relay.nip62]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        // Identical reload: nothing to report.
+        let same = Config::parse_toml(
+            r#"
+            [relay]
+            negentropy_enabled = true
+
+            [relay.auth]
+            enabled = true
+            restricted_read_kinds = [4]
+
+            [relay.nip62]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(base.security_scope_changes(&same).is_empty());
+        // Narrow the kinds: the DROPPED note points at kind 1059.
+        let widened = Config::parse_toml("[relay.auth]\nrestricted_read_kinds = []\n").unwrap();
+        let changes = base.security_scope_changes(&widened);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("relay.auth changed") && c.contains("DROPPED")),
+            "{changes:?}"
+        );
+        // Removing the kind from restricted scope via a partial file is also flagged.
+        let partial = Config::parse_toml("[relay]\nnegentropy_enabled = true\n").unwrap();
+        let changes = base.security_scope_changes(&partial);
+        assert!(
+            changes.iter().any(|c| c.contains("relay.auth changed")),
+            "{changes:?}"
+        );
+        // Toggling nip62 or negentropy flags is reported too.
+        let no62 = Config::parse_toml("[relay.nip62]\nenabled = false\n").unwrap();
+        let changes = base.security_scope_changes(&no62);
+        assert!(
+            changes.iter().any(|c| c.contains("relay.nip62 changed")),
+            "{changes:?}"
+        );
+        let no_neg = Config::parse_toml("[relay]\nnegentropy_enabled = false\n").unwrap();
+        let changes = base.security_scope_changes(&no_neg);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("negentropy_enabled changed")),
+            "{changes:?}"
+        );
     }
 
     #[test]

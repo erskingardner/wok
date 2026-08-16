@@ -486,7 +486,7 @@ pub async fn read_events<S: AsyncRead + Unpin>(
     parser: &mut WsParser,
 ) -> Result<Vec<WsEvent>, WsError> {
     let mut events = Vec::new();
-    read_events_into(stream, parser, &mut events).await?;
+    read_events_into(stream, parser, &mut events, None).await?;
     Ok(events)
 }
 
@@ -494,13 +494,24 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
     stream: &mut S,
     parser: &mut WsParser,
     events: &mut Vec<WsEvent>,
+    frame_idle_timeout: Option<std::time::Duration>,
 ) -> Result<(), WsError> {
     events.clear();
     loop {
         // Read directly into the parser's retained buffer. The previous
         // stack-buffer path copied every inbound WebSocket byte a second time
         // before masking and JSON parsing.
-        let n = stream.read_buf(&mut parser.buf).await?;
+        //
+        // While a partial frame is buffered, bound the idle gap between
+        // socket reads: a client may otherwise declare a large frame and
+        // dribble its payload, pinning the assembly buffer indefinitely.
+        let n = match frame_idle_timeout.filter(|_| !parser.buf.is_empty()) {
+            Some(gap) => match tokio::time::timeout(gap, stream.read_buf(&mut parser.buf)).await {
+                Ok(res) => res?,
+                Err(_) => return Err(WsError::Protocol("frame read timeout")),
+            },
+            None => stream.read_buf(&mut parser.buf).await?,
+        };
         if n == 0 {
             return Err(WsError::Protocol("eof"));
         }

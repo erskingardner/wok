@@ -98,8 +98,10 @@ interface or protect the path at the reverse proxy.
 | `relay.max_websocket_payload_size` | `131072` | Restart | Maximum reassembled WebSocket payload bytes. |
 | `relay.max_req_filter_size` | `65536` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. |
 | `relay.max_filters_per_req` | `200` | Live | Yes | Unconditional maximum filter objects in one REQ or COUNT. |
-| `relay.auto_ping_seconds` | `55` | Restart | WebSocket ping interval; zero disables automatic pings. |
+| `relay.auto_ping_seconds` | `55` | Restart | WebSocket ping interval; zero disables automatic pings. A ping unanswered for a full interval closes the connection. |
 | `relay.enable_tcp_keepalive` | `false` | Restart | Enable TCP keepalive on accepted sockets. |
+| `relay.handshake_timeout_secs` | `10` | Live (new connections) | No | Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it. |
+| `relay.frame_read_timeout_secs` | `30` | Live (new connections) | No | Maximum idle gap between socket reads while a partial WebSocket frame is buffered (slow-trickle guard); zero disables it. |
 | `relay.query_timeslice_budget_us` | `10000` | Live | Yes | Query CPU budget before cooperative yielding. |
 | `relay.max_filter_limit` | `500` | Live | Yes | Maximum normal REQ filter limit. |
 | `relay.max_tags_per_filter` | `3` | Live | Yes | Maximum tag query keys in one filter. |

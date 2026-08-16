@@ -182,6 +182,12 @@ pub struct RelayConfig {
     pub max_filters_per_req: usize,
     pub auto_ping_seconds: u64,
     pub enable_tcp_keepalive: bool,
+    /// Pre-upgrade HTTP header read deadline (slowloris guard); zero
+    /// disables it.
+    pub handshake_timeout_secs: u64,
+    /// Maximum idle gap between socket reads while a partial WebSocket frame
+    /// is buffered (slow-trickle guard); zero disables it.
+    pub frame_read_timeout_secs: u64,
     pub query_timeslice_budget_us: u64,
     pub max_filter_limit: u64,
     pub max_tags_per_filter: usize,
@@ -348,6 +354,8 @@ impl Default for Config {
                 max_filters_per_req: 200,
                 auto_ping_seconds: 55,
                 enable_tcp_keepalive: false,
+                handshake_timeout_secs: 10,
+                frame_read_timeout_secs: 30,
                 query_timeslice_budget_us: 10000,
                 max_filter_limit: 500,
                 max_tags_per_filter: 3,

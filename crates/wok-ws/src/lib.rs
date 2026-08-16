@@ -20,7 +20,7 @@ use hyper::header::UPGRADE;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use sha1::Digest as _;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -75,6 +75,7 @@ pub async fn serve_listener(
         };
         let keepalive = handle.config.read().relay.enable_tcp_keepalive;
         configure_accepted_stream(&stream, peer, keepalive);
+        let handshake_timeout = handle.config.read().relay.handshake_timeout_secs;
         let handle = handle.clone();
         let admin_state = admin_state.clone();
         tokio::spawn(async move {
@@ -84,10 +85,14 @@ pub async fn serve_listener(
                 let admin_state = admin_state.clone();
                 async move { Ok::<_, Infallible>(dispatch(req, handle, peer, admin_state).await) }
             });
-            let _ = http1::Builder::new()
-                .serve_connection(io, svc)
-                .with_upgrades()
-                .await;
+            let mut builder = http1::Builder::new();
+            builder.timer(TokioTimer::new());
+            // Slowloris guard: bound the pre-upgrade header read. Without a
+            // deadline a client can park partial HTTP headers forever.
+            if handshake_timeout > 0 {
+                builder.header_read_timeout(std::time::Duration::from_secs(handshake_timeout));
+            }
+            let _ = builder.serve_connection(io, svc).with_upgrades().await;
         });
     }
     tracing::info!("Websocket listener stopped");
@@ -616,6 +621,9 @@ async fn handle_ws<S>(
         std::net::IpAddr::V6(v) => Arc::from(v.octets()),
     };
     let auto_ping = handle.config.read().relay.auto_ping_seconds;
+    let frame_read_timeout = handle.config.read().relay.frame_read_timeout_secs;
+    let frame_idle_timeout =
+        (frame_read_timeout > 0).then(|| std::time::Duration::from_secs(frame_read_timeout));
     // Pending memory is bounded by max_pending_outbound_bytes in Outbound.
     // A second message-count bound incorrectly disconnected healthy clients
     // during bursty historical responses with many small events.
@@ -644,6 +652,9 @@ async fn handle_ws<S>(
     if auto_ping > 0 {
         ping.tick().await; // first tick is immediate; skip it
     }
+    // Liveness: a ping unanswered when the next ping interval elapses means
+    // the peer is gone (or deliberately silent) — close the connection.
+    let mut awaiting_pong = false;
     'outer: loop {
         tokio::select! {
             _ = killed.notified() => {
@@ -651,11 +662,16 @@ async fn handle_ws<S>(
                 break;
             }
             _ = ping.tick(), if auto_ping > 0 => {
+                if awaiting_pong {
+                    tracing::info!(conn_id, peer = %peer, reason = "pong_timeout", "client terminated");
+                    break;
+                }
                 if write_bytes(&mut wr, &encoder.encode_control(OP_PING, &[])).await.is_err() {
                     break;
                 }
+                awaiting_pong = true;
             }
-            incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events) => {
+            incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout) => {
                 match incoming {
                     Ok(()) => {
                         for ev in incoming_events.drain(..) {
@@ -677,7 +693,9 @@ async fn handle_ws<S>(
                                         break 'outer;
                                     }
                                 }
-                                WsEvent::Pong(_) => {}
+                                WsEvent::Pong(_) => {
+                                    awaiting_pong = false;
+                                }
                                 WsEvent::Close(c) => {
                                     let _ = write_bytes(&mut wr, &encoder.encode_control(frame::OP_CLOSE, &c)).await;
                                     break 'outer;

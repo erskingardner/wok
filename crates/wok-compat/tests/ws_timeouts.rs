@@ -144,6 +144,29 @@ async fn trickled_partial_frame_is_closed_by_frame_read_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_mid_fragmented_message_is_closed_by_frame_read_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(dir.path());
+    cfg.relay.frame_read_timeout_secs = 1;
+    cfg.relay.auto_ping_seconds = 0; // isolate from ping liveness
+    let addr = start(dir.path(), cfg).await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    ws_handshake(&mut stream).await;
+
+    // A complete, non-final text frame: the parser now holds an unfinished
+    // fragmented message with an empty read buffer, then silence.
+    let mut frame = vec![0x01u8, 0x80 | 5]; // FIN=0, opcode text, masked len 5
+    frame.extend_from_slice(&[1, 2, 3, 4]); // mask key
+    for (i, b) in b"hello".iter().enumerate() {
+        frame.push(b ^ [1u8, 2, 3, 4][i % 4]);
+    }
+    stream.write_all(&frame).await.unwrap();
+
+    expect_closed(&mut stream, Duration::from_secs(10), "mid-fragment idle").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unanswered_ping_closes_connection_but_pong_keeps_it_alive() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_cfg(dir.path());

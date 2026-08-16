@@ -58,8 +58,9 @@ auto_ping_seconds = 55
 enable_tcp_keepalive = false
 # Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it.
 handshake_timeout_secs = 10
-# Maximum idle gap between socket reads while a partial WebSocket frame is
-# buffered (slow-trickle guard); zero disables it.
+# Maximum idle gap between socket reads while a partial WebSocket frame or
+# unfinished fragmented message is buffered (slow-trickle guard); zero
+# disables it.
 frame_read_timeout_secs = 30
 query_timeslice_budget_us = 10000
 max_filter_limit = 500

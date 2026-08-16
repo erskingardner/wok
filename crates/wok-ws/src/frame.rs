@@ -502,10 +502,12 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
         // stack-buffer path copied every inbound WebSocket byte a second time
         // before masking and JSON parsing.
         //
-        // While a partial frame is buffered, bound the idle gap between
-        // socket reads: a client may otherwise declare a large frame and
-        // dribble its payload, pinning the assembly buffer indefinitely.
-        let n = match frame_idle_timeout.filter(|_| !parser.buf.is_empty()) {
+        // While a partial frame or an unfinished fragmented message is
+        // buffered, bound the idle gap between socket reads: a client may
+        // otherwise declare a large frame and dribble its payload, pinning
+        // the assembly buffer indefinitely.
+        let assembly_pending = !parser.buf.is_empty() || parser.frag_opcode.is_some();
+        let n = match frame_idle_timeout.filter(|_| assembly_pending) {
             Some(gap) => match tokio::time::timeout(gap, stream.read_buf(&mut parser.buf)).await {
                 Ok(res) => res?,
                 Err(_) => return Err(WsError::Protocol("frame read timeout")),

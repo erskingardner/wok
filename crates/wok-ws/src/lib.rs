@@ -88,10 +88,13 @@ pub async fn serve_listener(
             let mut builder = http1::Builder::new();
             builder.timer(TokioTimer::new());
             // Slowloris guard: bound the pre-upgrade header read. Without a
-            // deadline a client can park partial HTTP headers forever.
-            if handshake_timeout > 0 {
-                builder.header_read_timeout(std::time::Duration::from_secs(handshake_timeout));
-            }
+            // deadline a client can park partial HTTP headers forever. The
+            // Option must be passed through: installing a timer while
+            // leaving hyper's 30s default in place would keep the guard
+            // active when configured off, and an explicit None disables it.
+            builder.header_read_timeout(
+                (handshake_timeout > 0).then(|| std::time::Duration::from_secs(handshake_timeout)),
+            );
             let _ = builder.serve_connection(io, svc).with_upgrades().await;
         });
     }
@@ -649,6 +652,11 @@ async fn handle_ws<S>(
     });
     let mut incoming_events = Vec::with_capacity(4);
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(auto_ping.max(1)));
+    // Delay (not the Burst default): after the select is stalled elsewhere
+    // for two or more intervals, Burst would fire back-to-back ticks — send
+    // a ping, then immediately close for a pong the peer never got a window
+    // to send. Delay guarantees one full interval per outstanding ping.
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if auto_ping > 0 {
         ping.tick().await; // first tick is immediate; skip it
     }

@@ -923,8 +923,10 @@ impl Config {
                 format!(
                     " (restricted kinds DROPPED: {dropped:?} — previously-restricted kinds are now publicly readable)"
                 )
-            } else if !prev.enabled && new_auth.enabled {
-                " (auth now ENABLED — NIP-42 enforcement mode changed)".to_string()
+            } else if prev.restrict_read_to_involved_pubkey
+                && !new_auth.restrict_read_to_involved_pubkey
+            {
+                " (restrict_read_to_involved_pubkey DISABLED — the per-event filter is skipped; mixed-kind REQs can leak restricted kinds)".to_string()
             } else {
                 String::new()
             };
@@ -1848,20 +1850,27 @@ mod tests {
         )
         .unwrap();
         assert!(base.security_scope_changes(&same).is_empty());
-        // Narrow the kinds: the DROPPED note points at kind 1059.
+        // Emptying restricted_read_kinds drops kind 4 (the access scope widens),
+        // and the note must pin the exact kind that is now publicly readable.
         let widened = Config::parse_toml("[relay.auth]\nrestricted_read_kinds = []\n").unwrap();
         let changes = base.security_scope_changes(&widened);
         assert!(
             changes
                 .iter()
-                .any(|c| c.contains("relay.auth changed") && c.contains("DROPPED")),
+                .any(|c| c.contains("relay.auth changed") && c.contains("DROPPED: [4]")),
             "{changes:?}"
         );
-        // Removing the kind from restricted scope via a partial file is also flagged.
+        // Omitting [relay.auth] merges factory defaults [4, 1059]; starting
+        // from a superset the defaults would drop ([4, 44, 1059]) is the
+        // issue's omit-reverts-to-defaults fail-open path.
+        let superset =
+            Config::parse_toml("[relay.auth]\nrestricted_read_kinds = [4, 44, 1059]\n").unwrap();
         let partial = Config::parse_toml("[relay]\nnegentropy_enabled = true\n").unwrap();
-        let changes = base.security_scope_changes(&partial);
+        let changes = superset.security_scope_changes(&partial);
         assert!(
-            changes.iter().any(|c| c.contains("relay.auth changed")),
+            changes
+                .iter()
+                .any(|c| c.contains("relay.auth changed") && c.contains("DROPPED: [44]")),
             "{changes:?}"
         );
         // Toggling nip62 or negentropy flags is reported too.

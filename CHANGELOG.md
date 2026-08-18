@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-18
+
 ### Added
 
 - Draft NIP-91 `&` tag filters now require every listed tag value for
@@ -16,6 +18,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clauses only for upstreams whose NIP-11 document advertises NIP-91, and
   otherwise fold each `&x` value set into the `#x` compatibility clause and
   apply the exact AND semantics locally.
+- The pinned NIP-86 relay management API is available over authenticated HTTP
+  POST when the operator surface is enabled. It supports persistent pubkey and
+  event bans, IP blocks, write allowlists, kind policy, report queues, and
+  admin/moderator/custom roles. Bans suppress stored events from writes,
+  historical queries, COUNT, and live delivery without deleting them, so
+  unbanning restores the original records.
+
+### Changed
+
+- Outbound WebSocket clients use Rustls instead of the platform-native TLS
+  backend, removing their OpenSSL dependency while retaining native root
+  certificate validation.
+
+### Fixed
+
+- WebSocket connections now bound pre-upgrade HTTP header reads and idle gaps
+  while partial frames or fragmented messages are buffered, and close when an
+  automatic ping remains unanswered for a full ping interval. Both new read
+  deadlines are configurable and can be disabled explicitly.
+- Live config reload warnings now cover NIP-42 read restrictions, NIP-62, and
+  negentropy scope changes, including the exact restricted kinds dropped by a
+  fail-open rewrite.
 
 ## [0.3.1] - 2026-08-15
 
@@ -247,7 +271,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protected-event publishing and restricted reads require the appropriate
   authenticated author or recipient relationship.
 
-[Unreleased]: https://github.com/erskingardner/wok/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/erskingardner/wok/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/erskingardner/wok/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/erskingardner/wok/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/erskingardner/wok/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/erskingardner/wok/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/erskingardner/wok/releases/tag/v0.1.0

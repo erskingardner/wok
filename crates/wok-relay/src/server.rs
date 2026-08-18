@@ -25,8 +25,8 @@ use std::thread;
 use std::time::Duration;
 use wok_db::{
     backfill_vanish_markers, is_event_moderated_ro, is_event_vanished_ro,
-    load_moderation_snapshot_ro, lookup_event_by_id_ro, most_recent_levid_ro, report_event,
-    sweep_vanished_events, write_events_with_policy, Decompressor, Env, EventToWrite,
+    load_moderation_snapshot_ro, lookup_event_by_id_ro, moderation_reason_ro, most_recent_levid_ro,
+    report_event, sweep_vanished_events, write_events_with_policy, Decompressor, Env, EventToWrite,
     EventWriteStatus, ModerationSnapshot, VANISH_KIND,
 };
 use wok_event::{
@@ -1796,7 +1796,7 @@ fn run_writer(
                         let stored_checks = env.begin_ro().and_then(|txn| {
                             Ok::<_, wok_db::DbError>((
                                 is_event_vanished_ro(&txn, packed_view)?,
-                                is_event_moderated_ro(&txn, packed_view)?,
+                                moderation_reason_ro(&txn, packed_view)?,
                                 // Recheck allowlist/role eligibility against
                                 // committed state: a revocation may have
                                 // landed after the ingester's snapshot check.
@@ -1838,10 +1838,26 @@ fn run_writer(
                             );
                             continue;
                         }
-                        if moderated {
-                            metrics
-                                .moderation_banned_author_rejections
-                                .fetch_add(1, Ordering::Relaxed);
+                        if let Some(reason) = moderated {
+                            let (counter, message) = match reason {
+                                wok_db::ModerationReason::BannedEvent => (
+                                    &metrics.moderation_banned_event_rejections,
+                                    "restricted: event is banned by the relay operator".to_string(),
+                                ),
+                                wok_db::ModerationReason::BannedAuthor => (
+                                    &metrics.moderation_banned_author_rejections,
+                                    "restricted: author is banned by the relay operator"
+                                        .to_string(),
+                                ),
+                                wok_db::ModerationReason::KindNotAllowed => (
+                                    &metrics.moderation_kind_rejections,
+                                    format!(
+                                        "restricted: kind {} is not allowed by this relay",
+                                        packed_view.kind()
+                                    ),
+                                ),
+                            };
+                            counter.fetch_add(1, Ordering::Relaxed);
                             let id_hex = PackedEventView::new(&packed)
                                 .map(|event| to_hex(event.id()))
                                 .unwrap_or_else(|_| "?".into());
@@ -1850,7 +1866,7 @@ fn run_writer(
                                 RelayMessage::Ok {
                                     event_id: id_hex,
                                     accepted: false,
-                                    message: "restricted: event or author is banned by the relay operator".into(),
+                                    message,
                                 },
                                 &metrics,
                             );

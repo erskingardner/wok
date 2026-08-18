@@ -1449,6 +1449,10 @@ async fn nip86_ban_suppresses_queued_live_delivery() {
     cfg.admin.enabled = true;
     cfg.admin.public_url = format!("http://{addr}");
     cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
+    // Out-of-band writer, like a co-resident import: bypasses the relay's
+    // ingest enforcement entirely. Clone the handle rather than reopening
+    // the same environment in-process, which LMDB forbids.
+    let env2 = env.clone();
     let handle = wok_relay::start(env, cfg).unwrap();
     let h = handle.clone();
     tokio::spawn(async move {
@@ -1464,17 +1468,6 @@ async fn nip86_ban_suppresses_queued_live_delivery() {
     .await
     .unwrap();
     let _ = recv_until(&mut ws, |t| t.contains("EOSE")).await;
-
-    // Out-of-band writer, like a co-resident import: bypasses the relay's
-    // ingest enforcement entirely.
-    let env2 = Env::open(
-        dir.path(),
-        EnvOptions {
-            create_dir: false,
-            ..EnvOptions::default()
-        },
-    )
-    .unwrap();
     let external_write = |content: &str| {
         let ev = sign_event_with_key(
             json!({"created_at": now_secs(), "kind": 1, "tags": [], "content": content}),

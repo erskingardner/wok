@@ -164,8 +164,11 @@ pub async fn dispatch(
         &body,
         &cfg,
         &state,
-        |signed| signed == absolute_url,
-        true,
+        &AuthzPolicy {
+            url_ok: &|signed| signed == absolute_url,
+            require_config_admin: true,
+            require_payload: false,
+        },
     ) {
         Ok(ok) => ok,
         Err(error) => return unauthorized(&error),
@@ -207,18 +210,25 @@ pub(crate) async fn read_body(mut body: Incoming, maximum: usize) -> Result<Vec<
     Ok(bytes)
 }
 
-/// Verify a NIP-98 authorization event. `url_ok` decides whether the signed
-/// `u` tag names the endpoint being protected; `require_config_admin`
-/// additionally restricts signers to `admin.pubkeys` (NIP-86 instead admits
-/// role-holding pubkeys and checks levels itself).
+/// Policy decisions the caller makes about a NIP-98 authorization.
+pub(crate) struct AuthzPolicy<'a> {
+    /// Whether the signed `u` tag names the endpoint being protected.
+    pub url_ok: &'a (dyn Fn(&str) -> bool + 'a),
+    /// Restrict signers to `admin.pubkeys` (NIP-86 instead admits
+    /// role-holding pubkeys and checks levels itself).
+    pub require_config_admin: bool,
+    /// Demand the `payload` tag even for an empty body (pinned NIP-86).
+    pub require_payload: bool,
+}
+
+/// Verify a NIP-98 authorization event against the caller's policy.
 pub(crate) fn authorize(
     authorization: Option<&str>,
     method: &Method,
     body: &[u8],
     cfg: &Config,
     state: &AdminState,
-    url_ok: impl Fn(&str) -> bool,
-    require_config_admin: bool,
+    policy: &AuthzPolicy<'_>,
 ) -> Result<(String, [u8; 32], u64), String> {
     let encoded = authorization
         .and_then(|value| value.strip_prefix("Nostr "))
@@ -250,20 +260,20 @@ pub(crate) fn authorize(
     if packed.created_at().abs_diff(now) > cfg.admin.auth_window_secs {
         return Err("NIP-98 authorization is outside the accepted time window".into());
     }
-    if !url_ok(single_tag(&event, "u")?) {
+    if !(policy.url_ok)(single_tag(&event, "u")?) {
         return Err("NIP-98 u tag does not match the request URL".into());
     }
     if single_tag(&event, "method")? != method.as_str() {
         return Err("NIP-98 method tag does not match the request method".into());
     }
-    if !body.is_empty() {
+    if !body.is_empty() || policy.require_payload {
         let payload = single_tag(&event, "payload")?;
         if payload != hex::encode(sha2::Sha256::digest(body)) {
             return Err("NIP-98 payload tag does not match the request body".into());
         }
     }
     let pubkey = hex::encode(packed.pubkey());
-    if require_config_admin && !cfg.admin.pubkeys.iter().any(|allowed| allowed == &pubkey) {
+    if policy.require_config_admin && !cfg.admin.pubkeys.iter().any(|allowed| allowed == &pubkey) {
         return Err("NIP-98 signer is not an administrator".into());
     }
     let mut id = [0u8; 32];
@@ -897,8 +907,11 @@ mod tests {
             body,
             &cfg,
             &state,
-            |signed| signed == "https://relay.example/admin/api/config",
-            true,
+            &AuthzPolicy {
+                url_ok: &|signed| signed == "https://relay.example/admin/api/config",
+                require_config_admin: true,
+                require_payload: false,
+            },
         )
         .unwrap();
         // Not yet burned: a retry of a failed request with the same signed
@@ -909,8 +922,11 @@ mod tests {
             body,
             &cfg,
             &state,
-            |signed| signed == "https://relay.example/admin/api/config",
-            true,
+            &AuthzPolicy {
+                url_ok: &|signed| signed == "https://relay.example/admin/api/config",
+                require_config_admin: true,
+                require_payload: false,
+            },
         )
         .is_ok());
         commit_replay_id(
@@ -925,8 +941,11 @@ mod tests {
             body,
             &cfg,
             &state,
-            |signed| signed == "https://relay.example/admin/api/config",
-            true,
+            &AuthzPolicy {
+                url_ok: &|signed| signed == "https://relay.example/admin/api/config",
+                require_config_admin: true,
+                require_payload: false,
+            },
         )
         .unwrap_err()
         .contains("already been used"));
@@ -943,8 +962,11 @@ mod tests {
             body,
             &cfg,
             &AdminState::default(),
-            |signed| signed == "https://relay.example/admin/api/config",
-            true,
+            &AuthzPolicy {
+                url_ok: &|signed| signed == "https://relay.example/admin/api/config",
+                require_config_admin: true,
+                require_payload: false,
+            },
         )
         .unwrap_err()
         .contains("payload"));
@@ -956,8 +978,11 @@ mod tests {
             b"",
             &cfg,
             &AdminState::default(),
-            |signed| signed == "https://relay.example/admin/api/overview",
-            true,
+            &AuthzPolicy {
+                url_ok: &|signed| signed == "https://relay.example/admin/api/overview",
+                require_config_admin: true,
+                require_payload: false,
+            },
         )
         .unwrap_err()
         .contains("u tag does not match"));
@@ -975,8 +1000,11 @@ mod tests {
             b"",
             &cfg,
             &AdminState::default(),
-            |signed| signed == "https://relay.example/admin/api/overview",
-            true,
+            &AuthzPolicy {
+                url_ok: &|signed| signed == "https://relay.example/admin/api/overview",
+                require_config_admin: true,
+                require_payload: false,
+            },
         )
         .unwrap_err()
         .contains("not an administrator"));
@@ -1014,11 +1042,61 @@ mod tests {
                 b"",
                 &cfg,
                 &state,
-                |signed| signed == url,
-                true
+                &AuthzPolicy {
+                    url_ok: &|signed| signed == url,
+                    require_config_admin: true,
+                    require_payload: false,
+                },
             )
             .is_ok());
         }
+    }
+
+    #[test]
+    fn nip86_mode_requires_payload_tag_even_for_empty_body() {
+        let mut rng = rand::thread_rng();
+        let key = Keypair::new(SECP256K1, &mut rng);
+        let (pubkey, _) = key.x_only_public_key();
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        cfg.admin.pubkeys = vec![hex::encode(pubkey.serialize())];
+        let state = AdminState::default();
+        let url = "https://relay.example/";
+        let policy = AuthzPolicy {
+            url_ok: &|signed| signed == url,
+            require_config_admin: false,
+            require_payload: true,
+        };
+
+        // Empty body signed without a payload tag: rejected in NIP-86 mode.
+        let no_payload = signed_auth(&key, url, "POST", b"");
+        let err =
+            authorize(Some(&no_payload), &Method::POST, b"", &cfg, &state, &policy).unwrap_err();
+        assert!(err.contains("payload"), "{err}");
+
+        // With the payload tag bound to SHA-256 of the empty body: accepted.
+        let (pubkey, _) = key.x_only_public_key();
+        let tags = vec![
+            json!(["u", url]),
+            json!(["method", "POST"]),
+            json!(["payload", hex::encode(sha2::Sha256::digest(b""))]),
+        ];
+        let mut event = json!({
+            "pubkey": hex::encode(pubkey.serialize()),
+            "created_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            "kind": 27235,
+            "tags": tags,
+            "content": "",
+        });
+        let id = wok_event::event_id_hash(&event).unwrap();
+        event["id"] = json!(hex::encode(id));
+        event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+        let header = format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(event.to_string())
+        );
+        assert!(authorize(Some(&header), &Method::POST, b"", &cfg, &state, &policy).is_ok());
     }
 
     #[test]

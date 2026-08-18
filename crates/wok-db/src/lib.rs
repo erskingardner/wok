@@ -45,10 +45,10 @@ pub use moderation::{
     ban_pubkey, banned_event_reason_ro, banned_pubkey_reason_ro, block_ip, blocked_ip_reason_ro,
     clear_reported_event, delete_role, disallow_kind, is_event_moderated_ro, kind_policy_ro,
     list_allowed_pubkeys_ro, list_banned_events_ro, list_banned_pubkeys_ro, list_blocked_ips_ro,
-    list_reported_events_ro, list_roles_ro, load_moderation_snapshot_ro, pubkey_roles_ro, put_role,
-    report_event, unallow_pubkey, unassign_role, unban_pubkey, unblock_ip, KindPolicy,
-    ModerationSnapshot, Role, BUILTIN_ROLES, BUILTIN_ROLE_ADMIN, BUILTIN_ROLE_MEMBER,
-    BUILTIN_ROLE_MODERATOR, MAX_REASON_BYTES,
+    list_reported_events_ro, list_roles_ro, load_moderation_snapshot_ro, moderation_reason_ro,
+    pubkey_roles_ro, put_role, report_event, unallow_pubkey, unassign_role, unban_pubkey,
+    unblock_ip, KindPolicy, ModerationReason, ModerationSnapshot, Role, BUILTIN_ROLES,
+    BUILTIN_ROLE_ADMIN, BUILTIN_ROLE_MEMBER, BUILTIN_ROLE_MODERATOR, MAX_REASON_BYTES,
 };
 pub use payload::{
     encode_raw_payload, encode_zstd_payload, event_json_owned, get_event_json, parse_payload,

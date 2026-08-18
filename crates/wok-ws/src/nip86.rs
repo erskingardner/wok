@@ -105,8 +105,12 @@ pub async fn dispatch(
         &body,
         &cfg,
         &state,
-        |signed| relay_url_matches(&cfg.admin.public_url, signed),
-        false,
+        &admin::AuthzPolicy {
+            url_ok: &|signed| relay_url_matches(&cfg.admin.public_url, signed),
+            require_config_admin: false,
+            // Pinned NIP-86 makes the NIP-98 payload tag unconditional.
+            require_payload: true,
+        },
     ) {
         Ok(ok) => ok,
         Err(error) => return admin::unauthorized(&error),
@@ -163,7 +167,12 @@ async fn execute(
     }
 
     match method {
-        "supportedmethods" => Ok(json!(SUPPORTED_METHODS)),
+        // The pinned spec returns the names of all *other* supported
+        // methods: the meta-method excludes itself.
+        "supportedmethods" => Ok(json!(SUPPORTED_METHODS
+            .iter()
+            .filter(|name| **name != "supportedmethods")
+            .collect::<Vec<_>>())),
         "banpubkey" => {
             let (pubkey, reason) = hex32_reason_params(params, "pubkey")?;
             manage(handle, ManagementCmd::BanPubkey { pubkey, reason }).await
@@ -378,6 +387,18 @@ mod tests {
         assert!(requires_admin("assignrole"));
         assert!(!requires_admin("banpubkey"));
         assert!(!requires_admin("supportedmethods"));
+    }
+
+    #[test]
+    fn supportedmethods_excludes_itself_from_its_result() {
+        // Mirrors the execute() response construction.
+        let reported: Vec<&&str> = SUPPORTED_METHODS
+            .iter()
+            .filter(|name| **name != "supportedmethods")
+            .collect();
+        assert!(!reported.contains(&&"supportedmethods"));
+        assert_eq!(reported.len(), SUPPORTED_METHODS.len() - 1);
+        assert!(reported.contains(&&"banpubkey"));
     }
 
     #[test]

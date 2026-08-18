@@ -317,7 +317,9 @@ pub fn pubkey_roles_ro<T: ReadOps>(txn: &T, pubkey: &[u8; 32]) -> Result<Vec<Str
     Ok(serde_json::from_slice(&raw).unwrap_or_default())
 }
 
-/// Load the stored kind policy, if any.
+/// Load the stored kind policy, if any. Used by mutations and snapshot
+/// loads; hot per-event paths use [`moderation_reason_ro`] instead, which
+/// tests the bit directly on the borrowed LMDB value.
 pub fn kind_policy_ro<T: ReadOps>(txn: &T) -> Result<Option<KindPolicy>, DbError> {
     let Some(dbi) = txn.moderation_dbi() else {
         return Ok(None);
@@ -331,32 +333,56 @@ pub fn kind_policy_ro<T: ReadOps>(txn: &T) -> Result<Option<KindPolicy>, DbError
     Ok(Some(KindPolicy(Box::new(bits))))
 }
 
-/// True when the event id, its author, or its kind is moderated. Used by
-/// query scans so moderated events disappear from REQ/COUNT results without
-/// deletion.
-pub fn is_event_moderated_ro(
+/// Why an event is moderated, preserving the cause for metrics and client
+/// error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModerationReason {
+    BannedEvent,
+    BannedAuthor,
+    KindNotAllowed,
+}
+
+/// The moderation state of an event, or `None` when it is clean. Reads are
+/// zero-copy: the kind-policy bit is tested on the borrowed LMDB value, so
+/// per-event scan/monitor checks never allocate. Used by query scans so
+/// moderated events disappear from REQ/COUNT results without deletion.
+pub fn moderation_reason_ro(
     txn: &RoTxn<'_>,
     packed: PackedEventView<'_>,
-) -> Result<bool, DbError> {
+) -> Result<Option<ModerationReason>, DbError> {
     let Some(dbi) = txn.env().dbis().moderation else {
-        return Ok(false);
+        return Ok(None);
     };
     if txn
         .get(dbi, &prefixed(PREFIX_BANNED_EVENT, packed.id()))?
         .is_some()
     {
-        return Ok(true);
+        return Ok(Some(ModerationReason::BannedEvent));
     }
     if txn
         .get(dbi, &prefixed(PREFIX_BANNED_PUBKEY, packed.pubkey()))?
         .is_some()
     {
-        return Ok(true);
+        return Ok(Some(ModerationReason::BannedAuthor));
     }
-    if let Some(policy) = kind_policy_ro(txn)? {
-        return Ok(!policy.allows(packed.kind()));
+    if let Some(bits) = txn.get(dbi, &[PREFIX_KIND_POLICY])? {
+        let kind = packed.kind() as usize;
+        let allowed = bits
+            .get(kind / 8)
+            .is_some_and(|byte| byte & (1 << (kind % 8)) != 0);
+        if !allowed {
+            return Ok(Some(ModerationReason::KindNotAllowed));
+        }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// True when the event id, its author, or its kind is moderated.
+pub fn is_event_moderated_ro(
+    txn: &RoTxn<'_>,
+    packed: PackedEventView<'_>,
+) -> Result<bool, DbError> {
+    Ok(moderation_reason_ro(txn, packed)?.is_some())
 }
 
 pub fn load_moderation_snapshot_ro(txn: &RoTxn<'_>) -> Result<ModerationSnapshot, DbError> {

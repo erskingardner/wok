@@ -30,6 +30,9 @@ async fn external_writer_triggers_live_delivery() {
     cfg.relay.port = 0;
     cfg.relay.unix.enabled = false;
     cfg.relay.auth.enabled = false;
+    // Clone before the relay takes the handle: the external write below
+    // bypasses the relay's writer thread through the same shared MDB_env.
+    let env2 = env.clone();
     let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -55,17 +58,10 @@ async fn external_writer_triggers_live_delivery() {
         }
     }
 
-    // Write directly through a second Env handle, bypassing the relay's
+    // Write directly through the cloned Env handle, bypassing the relay's
     // writer thread entirely (this is what a co-resident C++ strfry or
-    // `wok import` does).
-    let env2 = Env::open(
-        dir.path(),
-        EnvOptions {
-            create_dir: false,
-            ..EnvOptions::default()
-        },
-    )
-    .unwrap();
+    // `wok import` does). LMDB forbids opening the same environment twice
+    // in one process, so the test shares the single handle.
     let ev = sign_event(json!({
         "created_at": now_secs(),
         "kind": 1,

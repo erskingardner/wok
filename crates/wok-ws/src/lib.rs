@@ -663,6 +663,10 @@ async fn handle_ws<S>(
     // Liveness: a ping unanswered when the next ping interval elapses means
     // the peer is gone (or deliberately silent) — close the connection.
     let mut awaiting_pong = false;
+    // Absolute partial-frame deadline, kept here (not inside the read
+    // future) so select! cancellation by outbound traffic or pings cannot
+    // restart it.
+    let mut frame_deadline = None;
     'outer: loop {
         tokio::select! {
             _ = killed.notified() => {
@@ -677,9 +681,13 @@ async fn handle_ws<S>(
                 if write_bytes(&mut wr, &encoder.encode_control(OP_PING, &[])).await.is_err() {
                     break;
                 }
+                // The next tick was scheduled when this one was consumed,
+                // before the write above. Restart the interval so a stalled
+                // write can't eat the peer's pong window.
+                ping.reset();
                 awaiting_pong = true;
             }
-            incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout) => {
+            incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline) => {
                 match incoming {
                     Ok(()) => {
                         for ev in incoming_events.drain(..) {
@@ -806,5 +814,124 @@ mod landing_tests {
 
         assert!(server.nodelay().unwrap());
         drop(client);
+    }
+}
+
+#[cfg(test)]
+mod stalled_write_tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::time::Instant;
+
+    /// Read side pends forever. The first write stalls for a fixed (paused-
+    /// time) duration, then everything flows. Used to prove the pong window
+    /// starts when the ping hits the wire, not when its tick was consumed.
+    struct StalledStream {
+        state: Arc<Mutex<StalledState>>,
+    }
+
+    struct StalledState {
+        stall_for: Duration,
+        release_at: Option<Instant>,
+        wake_task_spawned: bool,
+        waker: Option<Waker>,
+    }
+
+    impl StalledStream {
+        fn new(stall_for: Duration) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(StalledState {
+                    stall_for,
+                    release_at: None,
+                    wake_task_spawned: false,
+                    waker: None,
+                })),
+            }
+        }
+    }
+
+    impl AsyncRead for StalledStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for StalledStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut state = self.state.lock().unwrap();
+            if state.release_at.is_none() && !state.wake_task_spawned {
+                state.release_at = Some(Instant::now() + state.stall_for);
+            }
+            if let Some(release_at) = state.release_at {
+                state.waker = Some(cx.waker().clone());
+                if !state.wake_task_spawned {
+                    state.wake_task_spawned = true;
+                    let state_ref = self.state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep_until(release_at).await;
+                        let mut state = state_ref.lock().unwrap();
+                        state.release_at = None;
+                        if let Some(waker) = state.waker.take() {
+                            waker.wake();
+                        }
+                    });
+                }
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[allow(clippy::field_reassign_with_default)]
+    async fn pong_window_starts_after_stalled_ping_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.unix.enabled = false;
+        cfg.relay.auto_ping_seconds = 2;
+        let handle = Arc::new(wok_relay::start(env, cfg).unwrap());
+
+        let stream = StalledStream::new(Duration::from_secs(3));
+        let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let start = Instant::now();
+        handle_ws(stream, handle, peer, 1 << 20, false, false).await;
+        let elapsed = start.elapsed();
+
+        // Timeline: first ping tick at t=2s, its write stalls until t=5s.
+        // The peer never pongs, so the connection must close — but only
+        // after a full interval measured from the write (t=7s), not from
+        // the consumed tick (which would close immediately at t=5s).
+        assert!(
+            elapsed >= Duration::from_millis(6500),
+            "closed too early after stalled ping write: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "pong liveness never fired: {elapsed:?}"
+        );
     }
 }

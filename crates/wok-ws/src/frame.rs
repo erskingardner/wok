@@ -486,7 +486,8 @@ pub async fn read_events<S: AsyncRead + Unpin>(
     parser: &mut WsParser,
 ) -> Result<Vec<WsEvent>, WsError> {
     let mut events = Vec::new();
-    read_events_into(stream, parser, &mut events, None).await?;
+    let mut no_deadline = None;
+    read_events_into(stream, parser, &mut events, None, &mut no_deadline).await?;
     Ok(events)
 }
 
@@ -495,6 +496,7 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
     parser: &mut WsParser,
     events: &mut Vec<WsEvent>,
     frame_idle_timeout: Option<std::time::Duration>,
+    frame_deadline: &mut Option<tokio::time::Instant>,
 ) -> Result<(), WsError> {
     events.clear();
     loop {
@@ -505,14 +507,30 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
         // While a partial frame or an unfinished fragmented message is
         // buffered, bound the idle gap between socket reads: a client may
         // otherwise declare a large frame and dribble its payload, pinning
-        // the assembly buffer indefinitely.
+        // the assembly buffer indefinitely. The deadline is owned by the
+        // caller so it survives select! cancellation of this future, and it
+        // advances only on an actual socket read — unrelated outbound
+        // traffic waking the select must not restart the guard.
         let assembly_pending = !parser.buf.is_empty() || parser.frag_opcode.is_some();
         let n = match frame_idle_timeout.filter(|_| assembly_pending) {
-            Some(gap) => match tokio::time::timeout(gap, stream.read_buf(&mut parser.buf)).await {
-                Ok(res) => res?,
-                Err(_) => return Err(WsError::Protocol("frame read timeout")),
-            },
-            None => stream.read_buf(&mut parser.buf).await?,
+            Some(gap) => {
+                let deadline =
+                    frame_deadline.get_or_insert_with(|| tokio::time::Instant::now() + gap);
+                match tokio::time::timeout_at(*deadline, stream.read_buf(&mut parser.buf)).await {
+                    Ok(res) => {
+                        let n = res?;
+                        if n > 0 {
+                            *frame_deadline = Some(tokio::time::Instant::now() + gap);
+                        }
+                        n
+                    }
+                    Err(_) => return Err(WsError::Protocol("frame read timeout")),
+                }
+            }
+            None => {
+                *frame_deadline = None;
+                stream.read_buf(&mut parser.buf).await?
+            }
         };
         if n == 0 {
             return Err(WsError::Protocol("eof"));

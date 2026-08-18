@@ -2,11 +2,22 @@
 //! defenses): pre-upgrade HTTP header read deadline, idle-gap deadline while
 //! a partial frame is buffered, and ping/pong liveness.
 
-use std::time::{Duration, Instant};
+use futures_util::SinkExt;
+use serde_json::json;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use wok_compat::sign_event;
 use wok_db::{Env, EnvOptions};
 use wok_relay::Config;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
 
 #[allow(clippy::field_reassign_with_default)]
 fn test_cfg(dir: &std::path::Path) -> Config {
@@ -93,9 +104,26 @@ async fn read_server_frame(stream: &mut TcpStream, within: Duration) -> (u8, Vec
     (opcode, payload)
 }
 
+/// Build one masked client frame (FIN set).
+fn masked_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x80 | opcode];
+    let mask = [1u8, 2, 3, 4];
+    if payload.len() < 126 {
+        out.push(0x80 | payload.len() as u8);
+    } else {
+        out.push(0x80 | 126);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        out.push(b ^ mask[i % 4]);
+    }
+    out
+}
+
 /// A masked client frame with no payload (used for pong).
 fn masked_empty_frame(opcode: u8) -> Vec<u8> {
-    vec![0x80 | opcode, 0x80, 1, 2, 3, 4]
+    masked_client_frame(opcode, &[])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -164,6 +192,63 @@ async fn idle_mid_fragmented_message_is_closed_by_frame_read_timeout() {
     stream.write_all(&frame).await.unwrap();
 
     expect_closed(&mut stream, Duration::from_secs(10), "mid-fragment idle").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outbound_traffic_does_not_reset_partial_frame_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(dir.path());
+    cfg.relay.frame_read_timeout_secs = 1;
+    cfg.relay.auto_ping_seconds = 0; // isolate from ping liveness
+    let addr = start(dir.path(), cfg).await;
+
+    // Subscriber that leaves a partial frame pending, then goes silent.
+    let mut silent = TcpStream::connect(addr).await.unwrap();
+    ws_handshake(&mut silent).await;
+    silent
+        .write_all(&masked_client_frame(0x1, br#"["REQ","s",{}]"#))
+        .await
+        .unwrap();
+    let mut frame = vec![0x81u8, 0x80 | 126]; // masked text, 16-bit length
+    frame.extend_from_slice(&1000u16.to_be_bytes());
+    frame.extend_from_slice(&[1, 2, 3, 4]); // mask key
+    frame.push(b'x' ^ 1); // one masked payload byte, then silence
+    silent.write_all(&frame).await.unwrap();
+
+    // A publisher keeps outbound EVENT traffic flowing to that subscription
+    // for far longer than the frame timeout. Every delivered EVENT cancels
+    // and recreates the read branch of the connection's select loop; the
+    // partial-frame deadline must survive that, not restart.
+    let url = format!("ws://{addr}/");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("publisher connect");
+    let publisher = tokio::spawn(async move {
+        for i in 0..30 {
+            let ev = sign_event(json!({
+                "created_at": now_secs(),
+                "kind": 1,
+                "tags": [],
+                "content": format!("flood-{i}"),
+            }));
+            if ws
+                .send(Message::Text(json!(["EVENT", ev]).to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    expect_closed(
+        &mut silent,
+        Duration::from_secs(4),
+        "partial frame during outbound traffic",
+    )
+    .await;
+    publisher.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

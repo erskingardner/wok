@@ -23,6 +23,7 @@ pub enum CapabilityCondition {
     NegentropyEnabled,
     Nip59Safe,
     Nip62Enabled,
+    Nip91Enabled,
     PowRequired,
 }
 
@@ -44,6 +45,9 @@ impl CapabilityCondition {
                     && cfg.relay.auth.restrict_read_to_involved_pubkey
             }
             Self::Nip62Enabled => cfg.relay.nip62.enabled,
+            Self::Nip91Enabled => {
+                cfg.relay.max_tags_per_filter > 0 && cfg.relay.max_and_entries > 0
+            }
             Self::PowRequired => cfg.relay.abuse.enabled && cfg.relay.abuse.min_pow_difficulty > 0,
         }
     }
@@ -116,6 +120,11 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
         name: "Relay management API",
         enabled_when: CapabilityCondition::AdminEnabled,
     },
+    RelayCapability {
+        nip: 91,
+        name: "AND operator in filters",
+        enabled_when: CapabilityCondition::Nip91Enabled,
+    },
 ];
 
 pub fn relay_capabilities(cfg: &Config) -> Vec<RelayCapability> {
@@ -147,16 +156,25 @@ mod tests {
     #[test]
     fn conditional_capabilities_follow_runtime_configuration() {
         let mut cfg = Config::default();
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 45, 50, 62, 70, 77]);
+        assert_eq!(
+            supported_nips(&cfg),
+            vec![1, 9, 11, 40, 45, 50, 62, 70, 77, 91]
+        );
 
         cfg.relay.auth.service_url = "wss://relay.example.com/".into();
         cfg.relay.max_filter_limit_count = 0;
         cfg.relay.negentropy_enabled = false;
         cfg.events.ephemeral_persistence = EphemeralPersistence::Ttl;
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 50, 62, 70]);
+        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 50, 62, 70, 91]);
 
         cfg.relay.abuse.min_pow_difficulty = 20;
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 13, 40, 42, 50, 62, 70]);
+        assert_eq!(
+            supported_nips(&cfg),
+            vec![1, 9, 11, 13, 40, 42, 50, 62, 70, 91]
+        );
+
+        cfg.relay.max_and_entries = 0;
+        assert!(!supported_nips(&cfg).contains(&91));
     }
 
     #[test]

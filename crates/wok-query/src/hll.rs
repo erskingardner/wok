@@ -55,7 +55,7 @@ impl HyperLogLog {
 /// values have ambiguous merge semantics, so callers deliberately omit HLL
 /// for those shapes.
 pub fn offset_for_filter(filter: &NostrFilter) -> Option<usize> {
-    if filter.tags.len() != 1 {
+    if !filter.and_tags.is_empty() || filter.tags.len() != 1 {
         return None;
     }
     let (tag, values) = filter.tags.first_key_value()?;
@@ -91,7 +91,7 @@ mod tests {
     use serde_json::json;
 
     fn filter(value: serde_json::Value) -> NostrFilter {
-        NostrFilter::parse(&value, 500, 3).unwrap()
+        NostrFilter::parse(&value, 500, 3, 16).unwrap()
     }
 
     #[test]
@@ -138,6 +138,11 @@ mod tests {
         );
         assert!(offset_for_filter(&filter(json!({
             "#e":["00".repeat(32)],
+            "#p":["11".repeat(32)]
+        })))
+        .is_none());
+        assert!(offset_for_filter(&filter(json!({
+            "&p":["11".repeat(32)],
             "#p":["11".repeat(32)]
         })))
         .is_none());

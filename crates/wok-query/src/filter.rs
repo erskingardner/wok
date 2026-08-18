@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashSet};
 use wok_db::{parse_search_query, search_term_set, SearchQuery, SearchTermSet};
 use wok_event::{from_lower_hex_exact, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE};
 
+pub const DEFAULT_MAX_AND_ENTRIES: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct FilterSetBytes {
     items: Vec<Vec<u8>>,
@@ -68,6 +70,10 @@ impl FilterSetBytes {
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
         self.items.iter().map(|v| v.as_slice())
     }
+
+    fn remove_all(&mut self, excluded: &Self) {
+        self.items.retain(|item| !excluded.does_match(item));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +124,7 @@ pub struct NostrFilter {
     pub authors: Option<FilterSetBytes>,
     pub kinds: Option<FilterSetUint>,
     pub tags: BTreeMap<char, FilterSetBytes>,
+    pub and_tags: BTreeMap<char, FilterSetBytes>,
     pub search: Option<SearchQuery>,
     pub since: u64,
     pub until: u64,
@@ -130,6 +137,7 @@ impl NostrFilter {
         filter_obj: &Value,
         max_filter_limit: u64,
         max_tags_per_filter: usize,
+        max_and_entries: usize,
     ) -> Result<Self, QueryError> {
         if !filter_obj.is_object() {
             return Err(QueryError::msg("provided filter is not an object"));
@@ -139,13 +147,14 @@ impl NostrFilter {
             authors: None,
             kinds: None,
             tags: BTreeMap::new(),
+            and_tags: BTreeMap::new(),
             search: None,
             since: 0,
             until: u64::MAX,
             limit: u64::MAX,
             index_only_scans: false,
         };
-        let mut num_major = 0u64;
+        let mut num_major_non_tag = 0u64;
         let obj = filter_obj.as_object().unwrap();
         for (k, v) in obj {
             if k == "ids" {
@@ -155,7 +164,7 @@ impl NostrFilter {
                 if v.as_array().unwrap().is_empty() {
                     return Err(QueryError::msg("ids array must not be empty"));
                 }
-                num_major += 1;
+                num_major_non_tag += 1;
                 f.ids = Some(
                     FilterSetBytes::parse(v, true, 32, 32)
                         .map_err(|e| QueryError::msg(format!("error parsing ids: {e}")))?,
@@ -167,7 +176,7 @@ impl NostrFilter {
                 if v.as_array().unwrap().is_empty() {
                     return Err(QueryError::msg("authors array must not be empty"));
                 }
-                num_major += 1;
+                num_major_non_tag += 1;
                 f.authors = Some(
                     FilterSetBytes::parse(v, true, 32, 32)
                         .map_err(|e| QueryError::msg(format!("error parsing authors: {e}")))?,
@@ -179,7 +188,7 @@ impl NostrFilter {
                 if v.as_array().unwrap().is_empty() {
                     return Err(QueryError::msg("kinds array must not be empty"));
                 }
-                num_major += 1;
+                num_major_non_tag += 1;
                 f.kinds = Some(
                     FilterSetUint::parse(v)
                         .map_err(|e| QueryError::msg(format!("error parsing kinds: {e}")))?,
@@ -191,7 +200,6 @@ impl NostrFilter {
                 if v.as_array().unwrap().is_empty() {
                     return Err(QueryError::msg(format!("{k} array must not be empty")));
                 }
-                num_major += 1;
                 if k.len() == 2 && k.as_bytes()[1].is_ascii_alphabetic() {
                     let tag = k.as_bytes()[1] as char;
                     let set = if tag == 'p' || tag == 'e' {
@@ -203,6 +211,25 @@ impl NostrFilter {
                     f.tags.insert(tag, set);
                 } else {
                     return Err(QueryError::msg("unindexed tag filter"));
+                }
+            } else if k.starts_with('&') {
+                if !v.is_array() {
+                    return Err(QueryError::msg(format!("{k} not an array")));
+                }
+                if v.as_array().unwrap().is_empty() {
+                    return Err(QueryError::msg(format!("{k} array must not be empty")));
+                }
+                if k.len() == 2 && k.as_bytes()[1].is_ascii_alphabetic() {
+                    let tag = k.as_bytes()[1] as char;
+                    let set = if tag == 'p' || tag == 'e' {
+                        FilterSetBytes::parse(v, true, 32, 32)
+                    } else {
+                        FilterSetBytes::parse(v, false, 0, MAX_INDEXED_TAG_VAL_SIZE)
+                    }
+                    .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
+                    f.and_tags.insert(tag, set);
+                } else {
+                    return Err(QueryError::msg("unindexed AND tag filter"));
                 }
             } else if k == "since" {
                 f.since = v
@@ -224,19 +251,38 @@ impl NostrFilter {
                     Some(parse_search_query(query).map_err(|error| {
                         QueryError::msg(format!("error parsing search: {error}"))
                     })?);
-                num_major += 1;
+                num_major_non_tag += 1;
             } else {
                 return Err(QueryError::msg(format!("unrecognised filter item: {k}")));
             }
         }
-        if f.tags.len() > max_tags_per_filter {
+        for (tag, required) in &f.and_tags {
+            if let Some(alternatives) = f.tags.get_mut(tag) {
+                alternatives.remove_all(required);
+            }
+        }
+        f.tags.retain(|_, alternatives| alternatives.size() > 0);
+
+        let tag_key_count = f
+            .tags
+            .keys()
+            .chain(f.and_tags.keys())
+            .copied()
+            .collect::<HashSet<_>>()
+            .len();
+        if tag_key_count > max_tags_per_filter {
             return Err(QueryError::msg("too many tags in filter"));
+        }
+        let and_entry_count: usize = f.and_tags.values().map(FilterSetBytes::size).sum();
+        if and_entry_count > max_and_entries {
+            return Err(QueryError::msg("too many AND entries in filter"));
         }
         if f.limit > max_filter_limit {
             f.limit = max_filter_limit;
         }
-        f.index_only_scans =
-            num_major <= 1 || (num_major == 2 && f.authors.is_some() && f.kinds.is_some());
+        let num_major = num_major_non_tag + tag_key_count as u64;
+        f.index_only_scans = f.and_tags.is_empty()
+            && (num_major <= 1 || (num_major == 2 && f.authors.is_some() && f.kinds.is_some()));
         Ok(f)
     }
 
@@ -283,6 +329,21 @@ impl NostrFilter {
                 return false;
             }
         }
+        for (tag, required) in &self.and_tags {
+            for value in required.iter() {
+                let mut found = false;
+                ev.foreach_tag(|name, candidate| {
+                    if name == *tag && candidate == value {
+                        found = true;
+                        return false;
+                    }
+                    true
+                });
+                if !found {
+                    return false;
+                }
+            }
+        }
         true
     }
 
@@ -313,6 +374,7 @@ impl NostrFilter {
             && self.authors.is_none()
             && self.kinds.is_none()
             && self.tags.is_empty()
+            && self.and_tags.is_empty()
             && self.search.is_none()
     }
 }
@@ -327,13 +389,14 @@ impl NostrFilterGroup {
         arr: &[Value],
         max_filter_limit: u64,
         max_tags: usize,
+        max_and_entries: usize,
     ) -> Result<Self, QueryError> {
         if arr.len() < 3 {
             return Err(QueryError::msg("too small"));
         }
         let mut fg = Self::default();
         for item in arr.iter().skip(2) {
-            fg.add_filter(item, max_filter_limit, max_tags)?;
+            fg.add_filter(item, max_filter_limit, max_tags, max_and_entries)?;
         }
         Ok(fg)
     }
@@ -342,14 +405,15 @@ impl NostrFilterGroup {
         filter: &Value,
         max_filter_limit: u64,
         max_tags: usize,
+        max_and_entries: usize,
     ) -> Result<Self, QueryError> {
         let mut fg = Self::default();
         if filter.is_array() {
             for e in filter.as_array().unwrap() {
-                fg.add_filter(e, max_filter_limit, max_tags)?;
+                fg.add_filter(e, max_filter_limit, max_tags, max_and_entries)?;
             }
         } else {
-            fg.add_filter(filter, max_filter_limit, max_tags)?;
+            fg.add_filter(filter, max_filter_limit, max_tags, max_and_entries)?;
         }
         Ok(fg)
     }
@@ -359,8 +423,9 @@ impl NostrFilterGroup {
         item: &Value,
         max_filter_limit: u64,
         max_tags: usize,
+        max_and_entries: usize,
     ) -> Result<(), QueryError> {
-        let f = NostrFilter::parse(item, max_filter_limit, max_tags)?;
+        let f = NostrFilter::parse(item, max_filter_limit, max_tags, max_and_entries)?;
         self.filters.push(f);
         Ok(())
     }
@@ -402,16 +467,28 @@ impl NostrFilterGroup {
     pub fn estimated_cost(&self, count_only: bool) -> u64 {
         let mut cost = 0u64;
         for filter in &self.filters {
-            let filter_cost = if filter.search.is_some() {
+            let and_surcharge = 25u64.saturating_mul(
+                filter
+                    .and_tags
+                    .values()
+                    .map(|values| values.size() as u64)
+                    .sum(),
+            );
+            let base_cost = if filter.search.is_some() {
                 250
             } else if let Some(ids) = &filter.ids {
                 ids.size() as u64
+            } else if !filter.and_tags.is_empty() {
+                // `DbScan` seeds a single cursor from one required tag value,
+                // whatever else the filter carries; `and_surcharge` covers the
+                // per-event verification the seed then requires.
+                25
+            } else if !filter.tags.is_empty() {
+                25u64.saturating_mul(filter.tags.len() as u64)
             } else if filter.authors.is_some() && filter.kinds.is_some() {
                 5
             } else if let Some(authors) = &filter.authors {
                 10u64.saturating_mul(authors.size() as u64)
-            } else if !filter.tags.is_empty() {
-                25u64.saturating_mul(filter.tags.len() as u64)
             } else if let Some(kinds) = &filter.kinds {
                 100u64.saturating_mul(kinds.size() as u64)
             } else if filter.since != 0 || filter.until != u64::MAX {
@@ -419,7 +496,7 @@ impl NostrFilterGroup {
             } else {
                 1_000
             };
-            cost = cost.saturating_add(filter_cost.max(1));
+            cost = cost.saturating_add(base_cost.saturating_add(and_surcharge).max(1));
         }
         if count_only {
             cost.saturating_mul(2)
@@ -475,12 +552,22 @@ impl FilterValidator {
                     .get(&'p')
                     .map(|t| t.size() == 1)
                     .unwrap_or(false);
+                let has_and_p = filter
+                    .and_tags
+                    .get(&'p')
+                    .map(|t| t.size() == 1)
+                    .unwrap_or(false);
                 let has_e = filter
                     .tags
                     .get(&'e')
                     .map(|t| t.size() == 1)
                     .unwrap_or(false);
-                if !has_author && !has_p && !has_e {
+                let has_and_e = filter
+                    .and_tags
+                    .get(&'e')
+                    .map(|t| t.size() == 1)
+                    .unwrap_or(false);
+                if !has_author && !has_p && !has_e && !has_and_p && !has_and_e {
                     return Err(QueryError::msg(
                         "filter must have exactly one author, p tag, or e tag",
                     ));
@@ -518,16 +605,16 @@ mod tests {
 
     #[test]
     fn empty_filter_lists_are_rejected() {
-        assert!(NostrFilterGroup::from_value(&json!({"ids": []}), 500, 3).is_err());
-        assert!(NostrFilterGroup::from_value(&json!({"authors": []}), 500, 3).is_err());
-        assert!(NostrFilterGroup::from_value(&json!({"kinds": []}), 500, 3).is_err());
-        assert!(NostrFilterGroup::from_value(&json!({"#p": []}), 500, 3).is_err());
+        assert!(NostrFilterGroup::from_value(&json!({"ids": []}), 500, 3, 16).is_err());
+        assert!(NostrFilterGroup::from_value(&json!({"authors": []}), 500, 3, 16).is_err());
+        assert!(NostrFilterGroup::from_value(&json!({"kinds": []}), 500, 3, 16).is_err());
+        assert!(NostrFilterGroup::from_value(&json!({"#p": []}), 500, 3, 16).is_err());
     }
 
     #[test]
     fn kind_and_time_match() {
-        let f =
-            NostrFilter::parse(&json!({"kinds":[1], "since": 10, "until": 20}), 500, 3).unwrap();
+        let f = NostrFilter::parse(&json!({"kinds":[1], "since": 10, "until": 20}), 500, 3, 16)
+            .unwrap();
         let ev = packed_note(1, 2, 15, 1, &[]);
         assert!(f.does_match(ev.view()));
         let ev = packed_note(1, 2, 9, 1, &[]);
@@ -538,32 +625,39 @@ mod tests {
 
     #[test]
     fn rejects_unknown_field() {
-        assert!(NostrFilter::parse(&json!({"foo": 1}), 500, 3).is_err());
+        assert!(NostrFilter::parse(&json!({"foo": 1}), 500, 3, 16).is_err());
     }
 
     #[test]
     fn ids_must_be_32_bytes() {
-        assert!(NostrFilter::parse(&json!({"ids":["aa"]}), 500, 3).is_err());
+        assert!(NostrFilter::parse(&json!({"ids":["aa"]}), 500, 3, 16).is_err());
     }
 
     #[test]
     fn index_only_heuristic() {
-        let f = NostrFilter::parse(&json!({"kinds":[1]}), 500, 3).unwrap();
+        let f = NostrFilter::parse(&json!({"kinds":[1]}), 500, 3, 16).unwrap();
+        assert!(f.index_only_scans);
+        let f = NostrFilter::parse(
+            &json!({"authors":["11".repeat(32)], "kinds":[1]}),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
         assert!(f.index_only_scans);
         let f =
-            NostrFilter::parse(&json!({"authors":["11".repeat(32)], "kinds":[1]}), 500, 3).unwrap();
-        assert!(f.index_only_scans);
-        let f = NostrFilter::parse(&json!({"ids":["11".repeat(32)], "kinds":[1]}), 500, 3).unwrap();
+            NostrFilter::parse(&json!({"ids":["11".repeat(32)], "kinds":[1]}), 500, 3, 16).unwrap();
         assert!(!f.index_only_scans);
     }
 
     #[test]
     fn estimates_broad_queries_before_opening_a_cursor() {
-        let broad = NostrFilterGroup::from_value(&json!({}), 500, 3).unwrap();
+        let broad = NostrFilterGroup::from_value(&json!({}), 500, 3, 16).unwrap();
         let targeted = NostrFilterGroup::from_value(
             &json!({"ids":["11".repeat(32), "22".repeat(32)]}),
             500,
             3,
+            16,
         )
         .unwrap();
         assert_eq!(broad.estimated_cost(false), 1_000);
@@ -573,12 +667,120 @@ mod tests {
 
     #[test]
     fn search_matching_accepts_precomputed_event_terms() {
-        let filter = NostrFilter::parse(&json!({"search":"café nostr"}), 500, 3).unwrap();
+        let filter = NostrFilter::parse(&json!({"search":"café nostr"}), 500, 3, 16).unwrap();
         let event = packed_note(1, 2, 15, 1, &[]);
         let terms = search_term_set("A NOSTR relay with Café support");
 
         assert!(!filter.does_match(event.view()));
         assert!(!filter.does_match_with_search_terms(event.view(), None));
         assert!(filter.does_match_with_search_terms(event.view(), Some(&terms)));
+    }
+
+    #[test]
+    fn nip91_requires_every_and_value_and_preserves_residual_or() {
+        let filter = NostrFilter::parse(
+            &json!({
+                "&t":["meme", "cat"],
+                "#t":["meme", "cat", "black", "white"]
+            }),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert!(!filter.index_only_scans);
+        assert_eq!(filter.and_tags[&'t'].size(), 2);
+        assert_eq!(filter.tags[&'t'].size(), 2);
+
+        let matching = packed_note(
+            1,
+            2,
+            15,
+            1,
+            &[("t", b"meme"), ("t", b"cat"), ("t", b"black")],
+        );
+        let missing_and = packed_note(2, 2, 15, 1, &[("t", b"meme"), ("t", b"black")]);
+        let missing_or = packed_note(3, 2, 15, 1, &[("t", b"meme"), ("t", b"cat")]);
+        assert!(filter.does_match(matching.view()));
+        assert!(!filter.does_match(missing_and.view()));
+        assert!(!filter.does_match(missing_or.view()));
+    }
+
+    #[test]
+    fn nip91_complete_overlap_removes_the_or_clause() {
+        let filter = NostrFilter::parse(
+            &json!({"&t":["meme", "cat"], "#t":["cat", "meme"]}),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert!(filter.tags.is_empty());
+        let event = packed_note(1, 2, 15, 1, &[("t", b"meme"), ("t", b"cat")]);
+        assert!(filter.does_match(event.view()));
+        assert!(!filter.is_full_db_query());
+    }
+
+    #[test]
+    fn nip91_validates_shape_hex_and_limits() {
+        assert!(NostrFilter::parse(&json!({"&t":[]}), 500, 3, 16).is_err());
+        assert!(NostrFilter::parse(&json!({"&t":"meme"}), 500, 3, 16).is_err());
+        assert!(NostrFilter::parse(&json!({"&1":["x"]}), 500, 3, 16).is_err());
+        assert!(NostrFilter::parse(&json!({"&tag":["x"]}), 500, 3, 16).is_err());
+        assert!(NostrFilter::parse(&json!({"&p":["AA".repeat(32)]}), 500, 3, 16).is_err());
+        assert!(NostrFilter::parse(&json!({"&e":["aa"]}), 500, 3, 16).is_err());
+
+        let duplicate =
+            NostrFilter::parse(&json!({"&t":["a", "a", "b"], "#t":["a", "b"]}), 500, 1, 2).unwrap();
+        assert_eq!(duplicate.and_tags[&'t'].size(), 2);
+        assert!(NostrFilter::parse(&json!({"&t":["a", "b", "c"]}), 500, 1, 2,).is_err());
+        assert!(
+            NostrFilter::parse(&json!({"&t":["a"], "#p":["11".repeat(32)]}), 500, 1, 2,).is_err()
+        );
+    }
+
+    #[test]
+    fn nip91_entries_are_always_charged_to_query_cost() {
+        let tags = NostrFilterGroup::from_value(&json!({"&t":["a", "b"]}), 500, 3, 16).unwrap();
+        assert_eq!(tags.estimated_cost(false), 75);
+        assert_eq!(tags.estimated_cost(true), 150);
+
+        let id = NostrFilterGroup::from_value(
+            &json!({"ids":["11".repeat(32)], "&t":["a", "b"]}),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert_eq!(id.estimated_cost(false), 51);
+
+        let author_and = NostrFilterGroup::from_value(
+            &json!({"authors":["11".repeat(32)], "&t":["a", "b"]}),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert_eq!(author_and.estimated_cost(false), 75);
+
+        let author_kind_and = NostrFilterGroup::from_value(
+            &json!({"authors":["11".repeat(32)], "kinds":[1], "&t":["a"]}),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert_eq!(author_kind_and.estimated_cost(false), 50);
+
+        // A required tag seeds one cursor, so the OR alternatives `DbScan`
+        // never opens are not charged; without it they are.
+        let or_and =
+            NostrFilterGroup::from_value(&json!({"#e":["11".repeat(32)], "&t":["a"]}), 500, 3, 16)
+                .unwrap();
+        assert_eq!(or_and.estimated_cost(false), 50);
+        let or_only =
+            NostrFilterGroup::from_value(&json!({"#e":["11".repeat(32)], "#t":["a"]}), 500, 3, 16)
+                .unwrap();
+        assert_eq!(or_only.estimated_cost(false), 50);
     }
 }

@@ -1,6 +1,9 @@
 //! Live subscription inverted index matching `src/ActiveMonitors.h`.
 
-use crate::subid::{SubId, Subscription};
+use crate::{
+    subid::{SubId, Subscription},
+    NostrFilter,
+};
 use std::collections::HashMap;
 use wok_db::SearchTermSet;
 use wok_event::PackedEventView;
@@ -192,13 +195,9 @@ impl ActiveMonitors {
                     a.copy_from_slice(authors.at(i));
                     self.all_authors.entry(a).or_default().push(item());
                 }
-            } else if !f.tags.is_empty() {
-                for (name, set) in &f.tags {
-                    for i in 0..set.size() {
-                        let mut spec = vec![*name as u8];
-                        spec.extend_from_slice(set.at(i));
-                        self.all_tags.entry(spec).or_default().push(item());
-                    }
+            } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
+                for spec in tag_lookup_specs(f) {
+                    self.all_tags.entry(spec).or_default().push(item());
                 }
             } else if let Some(kinds) = &f.kinds {
                 for i in 0..kinds.size() {
@@ -227,13 +226,9 @@ impl ActiveMonitors {
                     a.copy_from_slice(authors.at(i));
                     remove_where(&mut self.all_authors, &a, &pred);
                 }
-            } else if !f.tags.is_empty() {
-                for (name, set) in &f.tags {
-                    for i in 0..set.size() {
-                        let mut spec = vec![*name as u8];
-                        spec.extend_from_slice(set.at(i));
-                        remove_where(&mut self.all_tags, &spec, &pred);
-                    }
+            } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
+                for spec in tag_lookup_specs(f) {
+                    remove_where(&mut self.all_tags, &spec, &pred);
                 }
             } else if let Some(kinds) = &f.kinds {
                 for i in 0..kinds.size() {
@@ -246,6 +241,26 @@ impl ActiveMonitors {
     }
 }
 
+fn tag_lookup_specs(filter: &NostrFilter) -> Vec<Vec<u8>> {
+    if let Some((name, values)) = filter.and_tags.first_key_value() {
+        let mut spec = vec![*name as u8];
+        spec.extend_from_slice(values.at(0));
+        return vec![spec];
+    }
+
+    filter
+        .tags
+        .iter()
+        .flat_map(|(name, values)| {
+            (0..values.size()).map(move |i| {
+                let mut spec = vec![*name as u8];
+                spec.extend_from_slice(values.at(i));
+                spec
+            })
+        })
+        .collect()
+}
+
 fn remove_where<K: std::hash::Hash + Eq>(
     map: &mut HashMap<K, Vec<MonitorItem>>,
     key: &K,
@@ -256,5 +271,51 @@ fn remove_where<K: std::hash::Hash + Eq>(
         if v.is_empty() {
             map.remove(key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NostrFilterGroup;
+    use serde_json::json;
+    use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
+
+    fn event(id: u8, tags: &[&[u8]]) -> wok_event::PackedEvent {
+        let mut builder = PackedEventTagBuilder::default();
+        for value in tags {
+            builder.add('t', value).unwrap();
+        }
+        PackedEventBuilder::build(&[id; 32], &[2; 32], id as u64, 1, 0, &builder).unwrap()
+    }
+
+    #[test]
+    fn nip91_live_monitor_uses_a_seed_then_checks_every_constraint() {
+        let group = NostrFilterGroup::from_value(
+            &json!({
+                "&t":["meme", "cat"],
+                "#t":["meme", "cat", "black"]
+            }),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        let sub_id = SubId::new("nip91").unwrap();
+        let mut sub = Subscription::new(1, sub_id.clone(), group, false);
+        sub.latest_event_id = 0;
+        let mut monitors = ActiveMonitors::new(10);
+        assert!(monitors.add_sub(sub, 0));
+
+        let matching = event(1, &[b"meme", b"cat", b"black"]);
+        assert_eq!(monitors.process(1, matching.view(), None).len(), 1);
+        let missing_or = event(2, &[b"meme", b"cat"]);
+        assert!(monitors.process(2, missing_or.view(), None).is_empty());
+        let missing_and = event(3, &[b"meme", b"black"]);
+        assert!(monitors.process(3, missing_and.view(), None).is_empty());
+
+        monitors.remove_sub(1, &sub_id);
+        let later = event(4, &[b"meme", b"cat", b"black"]);
+        assert!(monitors.process(4, later.view(), None).is_empty());
     }
 }

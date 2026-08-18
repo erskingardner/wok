@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use wok_db::{Decompressor, Env, EventToWrite};
-use wok_event::{parse_and_verify_event, PackedEventView};
+use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_query::NostrFilterGroup;
 use wok_relay::plugin::{PluginEventSifter, PluginResult};
 use wok_relay::Config;
@@ -43,13 +43,28 @@ pub struct StreamSpec {
     pub urls: Vec<String>,
 }
 
-fn compile_router_filter(name: &str, filter: &Value) -> Result<NostrFilterGroup> {
-    let filter_group = NostrFilterGroup::from_value(filter, u64::MAX, 64)
+fn compile_router_filter(
+    name: &str,
+    filter: &Value,
+    max_tags: usize,
+    max_and_entries: usize,
+) -> Result<NostrFilterGroup> {
+    let filter_group = NostrFilterGroup::from_value(filter, u64::MAX, max_tags, max_and_entries)
         .map_err(|error| anyhow::anyhow!("stream {name}: bad filter: {error}"))?;
     if filter_group.requires_content() {
         bail!("stream {name}: router filters do not support content search");
     }
     Ok(filter_group)
+}
+
+fn router_event_matches(
+    filter_group: &NostrFilterGroup,
+    event: &Value,
+    limits: &EventLimits,
+) -> bool {
+    wok_event::nostr_json_to_packed_event(event, limits)
+        .map(|packed| filter_group.does_match(packed.view()))
+        .unwrap_or(false)
 }
 
 enum Stmt {
@@ -325,7 +340,8 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig> {
             .map(|_| ())
             .and_then(|_| {
                 // Validate the filter compiles.
-                compile_router_filter(name, &cfg.streams[name].filter).map(|_| ())
+                compile_router_filter(name, &cfg.streams[name].filter, usize::MAX, usize::MAX)
+                    .map(|_| ())
             })
     }
 
@@ -521,6 +537,14 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
                         queue_budget.add_permits(approx_bytes);
                         if let Some(g) = groups.get_mut(&group) {
                             if g.spec.dir != "up" {
+                                let matches_filter = router_event_matches(
+                                    &g.filter_group,
+                                    &event,
+                                    &cfg.event_limits(),
+                                );
+                                if !matches_filter {
+                                    continue;
+                                }
                                 let cmd = g.spec.plugin_down.clone();
                                 let ev = event.clone();
                                 let res = tokio::task::block_in_place(|| {
@@ -668,7 +692,12 @@ fn reconcile(cfg: &Config, router_cfg: &RouterConfig, groups: &mut HashMap<Strin
         }
     }
     for (name, spec) in &router_cfg.streams {
-        let filter_group = match compile_router_filter(name, &spec.filter) {
+        let filter_group = match compile_router_filter(
+            name,
+            &spec.filter,
+            cfg.relay.max_tags_per_filter,
+            cfg.relay.max_and_entries,
+        ) {
             Ok(fg) => fg,
             Err(e) => {
                 tracing::error!("{e}; skipped");
@@ -747,7 +776,15 @@ async fn run_conn(
         .map_err(|_| anyhow::anyhow!("timeout"))?
         .map_err(|e| anyhow::anyhow!(e.to_string()))
     };
-    let (ws, _) = match connect.await {
+    let remote_filter = async {
+        if dir == "down" || dir == "both" {
+            crate::mesh::outbound_filter_for_relay(&url, &filter).await
+        } else {
+            Ok(filter.clone())
+        }
+    };
+    let (connect_result, remote_filter) = tokio::join!(connect, remote_filter);
+    let (ws, _) = match connect_result {
         Ok(x) => x,
         Err(e) => {
             let _ = tx
@@ -755,6 +792,20 @@ async fn run_conn(
                     group: group.clone(),
                     url: url.clone(),
                     text: format!("error connecting: {e}"),
+                })
+                .await;
+            let _ = tx.send(ManagerMsg::Disconnected { group, url }).await;
+            return;
+        }
+    };
+    let remote_filter = match remote_filter {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tx
+                .send(ManagerMsg::Log {
+                    group: group.clone(),
+                    url: url.clone(),
+                    text: format!("bad filter: {e}"),
                 })
                 .await;
             let _ = tx.send(ManagerMsg::Disconnected { group, url }).await;
@@ -774,7 +825,7 @@ async fn run_conn(
 
     let (mut wtx, mut wrx) = ws.split();
     if dir == "down" || dir == "both" {
-        let mut f = filter.clone();
+        let mut f = remote_filter;
         f["limit"] = json!(0);
         let msg = json!(["REQ", "X", f]).to_string();
         if wtx.send(Message::Text(msg.into())).await.is_err() {
@@ -1053,5 +1104,41 @@ mod tests {
             g.filter_str,
             "{\"authors\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"],\"kinds\":[1]}"
         );
+    }
+
+    #[test]
+    fn nip91_post_filters_fallback_results_from_older_relays() {
+        let filter = compile_router_filter(
+            "nip91",
+            &json!({"&t":["meme", "cat"], "#t":["meme", "cat", "black"]}),
+            3,
+            16,
+        )
+        .unwrap();
+        let event = |tags: Vec<Value>| {
+            json!({
+                "id":"11".repeat(32),
+                "pubkey":"22".repeat(32),
+                "created_at":1,
+                "kind":1,
+                "tags":tags,
+                "content":"",
+                "sig":"33".repeat(64)
+            })
+        };
+        assert!(router_event_matches(
+            &filter,
+            &event(vec![
+                json!(["t", "meme"]),
+                json!(["t", "cat"]),
+                json!(["t", "black"])
+            ]),
+            &EventLimits::default(),
+        ));
+        assert!(!router_event_matches(
+            &filter,
+            &event(vec![json!(["t", "meme"]), json!(["t", "cat"])]),
+            &EventLimits::default(),
+        ));
     }
 }

@@ -192,6 +192,8 @@ pub struct RelayConfig {
     pub query_timeslice_budget_us: u64,
     pub max_filter_limit: u64,
     pub max_tags_per_filter: usize,
+    #[serde(default = "default_max_and_entries")]
+    pub max_and_entries: usize,
     pub max_filter_limit_count: u64,
     pub max_total_events_per_req: u64,
     pub max_subs_per_connection: usize,
@@ -364,6 +366,7 @@ impl Default for Config {
                 query_timeslice_budget_us: 10000,
                 max_filter_limit: 500,
                 max_tags_per_filter: 3,
+                max_and_entries: default_max_and_entries(),
                 max_filter_limit_count: 1_000_000,
                 max_total_events_per_req: 2_000,
                 max_subs_per_connection: 200,
@@ -428,6 +431,10 @@ impl Default for Config {
             },
         }
     }
+}
+
+fn default_max_and_entries() -> usize {
+    wok_query::DEFAULT_MAX_AND_ENTRIES
 }
 
 impl From<Config> for TomlConfig {

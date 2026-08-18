@@ -65,6 +65,8 @@ frame_read_timeout_secs = 30
 query_timeslice_budget_us = 10000
 max_filter_limit = 500
 max_tags_per_filter = 3
+# Maximum distinct values across all NIP-91 & filters in one filter object.
+max_and_entries = 16
 max_filter_limit_count = 1000000
 # Zero means unlimited.
 max_total_events_per_req = 2000

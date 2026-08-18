@@ -1489,7 +1489,12 @@ fn ingest_req(
     };
     let mut arr = vec![json!("REQ"), json!(sub_id)];
     arr.extend(filters);
-    let fg = match NostrFilterGroup::from_req(&arr, max_limit, cfg.relay.max_tags_per_filter) {
+    let fg = match NostrFilterGroup::from_req(
+        &arr,
+        max_limit,
+        cfg.relay.max_tags_per_filter,
+        cfg.relay.max_and_entries,
+    ) {
         Ok(fg) => fg,
         Err(e) => {
             fail_closed(e.to_string());
@@ -1580,8 +1585,13 @@ fn ingest_neg(
             return Err("negentropy filter must be an object".into());
         }
         let max_limit = cfg.relay.max_sync_events + 1;
-        let fg = NostrFilterGroup::from_value(&filter, max_limit, cfg.relay.max_tags_per_filter)
-            .map_err(|e| e.to_string())?;
+        let fg = NostrFilterGroup::from_value(
+            &filter,
+            max_limit,
+            cfg.relay.max_tags_per_filter,
+            cfg.relay.max_and_entries,
+        )
+        .map_err(|e| e.to_string())?;
         let query_cost = fg.estimated_cost(false);
         if cfg.relay.abuse.enabled
             && cfg.relay.abuse.max_query_cost != 0
@@ -3148,7 +3158,8 @@ fn run_cron(env: Env, cfg: Arc<parking_lot::RwLock<Config>>, shutdown: Arc<Atomi
                 &mut vanish_cursor,
             )
             .unwrap_or(0);
-            let mut cache = NegentropyFilterCache::new(cfg.read().relay.max_tags_per_filter);
+            let cfg = cfg.read();
+            let mut cache = NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
             let _ = sink.apply(&mut cache, &mut txn);
             let _ = txn.commit();
             if expired_deleted > 0 || vanished_deleted > 0 {

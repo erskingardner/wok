@@ -66,6 +66,7 @@ fn nip01_filter_kinds_since_until_limit() {
         &json!({"kinds":[1],"since":10,"until":20,"limit":5}),
         500,
         3,
+        16,
     )
     .unwrap();
     assert_eq!(fg.filters[0].limit, 5);
@@ -73,21 +74,22 @@ fn nip01_filter_kinds_since_until_limit() {
 
 #[test]
 fn nip01_filter_ids_and_kinds_use_event_field_grammar() {
-    assert!(NostrFilterGroup::from_value(&json!({"ids":["AA".repeat(32)]}), 500, 3).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"ids":["AA".repeat(32)]}), 500, 3, 16).is_err());
     assert!(NostrFilterGroup::from_value(
         &json!({"authors":[format!("0x{}", "11".repeat(32))]}),
         500,
-        3
+        3,
+        16,
     )
     .is_err());
-    assert!(NostrFilterGroup::from_value(&json!({"kinds":[65536]}), 500, 3).is_err());
-    assert!(NostrFilterGroup::from_value(&json!({"ids":[]}), 500, 3).is_err());
-    assert!(NostrFilterGroup::from_value(&json!({"#1":["value"]}), 500, 3).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"kinds":[65536]}), 500, 3, 16).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"ids":[]}), 500, 3, 16).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"#1":["value"]}), 500, 3, 16).is_err());
 }
 
 #[test]
 fn nip01_unknown_filter_field_rejected() {
-    assert!(NostrFilterGroup::from_value(&json!({"foo":1}), 500, 3).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"foo":1}), 500, 3, 16).is_err());
 }
 
 #[test]
@@ -161,20 +163,21 @@ fn nip50_search_filter_and_extensions() {
         }),
         500,
         3,
+        16,
     )
     .unwrap();
     let search = filters.filters[0].search.as_ref().unwrap();
     assert_eq!(search.terms, vec!["apps", "best", "nostr"]);
     assert_eq!(search.phrase, "best nostr apps");
     assert_eq!(filters.filters[0].limit, 20);
-    assert!(NostrFilterGroup::from_value(&json!({"search":7}), 500, 3).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"search":7}), 500, 3, 16).is_err());
 }
 
 #[test]
 fn nip11_software_not_strfry_when_unconfigured() {
     let cfg = wok_relay::Config::default();
     let nips = wok_relay::supported_nips(&cfg);
-    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 62, 70, 77]);
+    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 62, 70, 77, 91]);
     assert!(!nips.contains(&2), "client-side NIP-02 is not advertised");
     assert!(!nips.contains(&4), "client-side NIP-04 is not advertised");
     assert!(!nips.contains(&28), "client-side NIP-28 is not advertised");
@@ -194,7 +197,7 @@ fn nip01_invalid_signature_rejected() {
 
 #[test]
 fn nip01_filter_ids_are_exact_length() {
-    assert!(NostrFilterGroup::from_value(&json!({"ids":["aabb"]}), 500, 3).is_err());
+    assert!(NostrFilterGroup::from_value(&json!({"ids":["aabb"]}), 500, 3, 16).is_err());
 }
 
 #[test]
@@ -215,6 +218,7 @@ fn nip01_duplicate_filters_still_parse() {
         ],
         500,
         3,
+        16,
     )
     .unwrap();
     assert_eq!(fg.size(), 2);
@@ -253,9 +257,27 @@ fn nip77_payload_hex_has_no_prefix_or_half_byte() {
 }
 
 #[test]
+fn nip91_and_tags_take_precedence_over_compatibility_or_tags() {
+    let filters = NostrFilterGroup::from_value(
+        &json!({
+            "&t":["meme", "cat"],
+            "#t":["meme", "cat", "black", "white"]
+        }),
+        500,
+        3,
+        16,
+    )
+    .unwrap();
+    let filter = &filters.filters[0];
+    assert_eq!(filter.and_tags[&'t'].size(), 2);
+    assert_eq!(filter.tags[&'t'].size(), 2);
+    assert!(!filter.index_only_scans);
+}
+
+#[test]
 fn advertised_nips_are_subset_of_tested() {
     // NIP-86 coverage lives in e2e_transports.rs (management API e2e tests).
-    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 70, 77, 86];
+    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 70, 77, 86, 91];
     assert_eq!(
         wok_relay::RELAY_CAPABILITY_CATALOG
             .iter()

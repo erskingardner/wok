@@ -482,13 +482,19 @@ enum QueryScanner {
 }
 
 impl DbScan {
+    /// Number of index cursors this scan opens. A `&` (AND) tag filter always
+    /// seeds exactly one, whatever the size of its value set.
+    pub fn cursor_count(&self) -> usize {
+        self.cursors.len()
+    }
+
     pub fn new(f: &NostrFilter, txn: &RoTxn<'_>) -> Self {
         let dbis = txn.env().dbis();
         let mut index_only = f.index_only_scans;
         let mut cursors = Vec::new();
         let (index_dbi, desc) = if f.ids.is_some() {
             (dbis.event_id, "ID")
-        } else if !f.tags.is_empty() {
+        } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
             (dbis.event_tag, "Tag")
         } else if f.authors.is_some()
             && f.kinds.is_some()
@@ -519,14 +525,24 @@ impl DbScan {
                     outstanding: 0,
                 });
             }
-        } else if !f.tags.is_empty() {
-            let (tag_name, filter_set) = f
-                .tags
-                .iter()
-                .min_by_key(|(_, s)| s.size())
-                .map(|(k, v)| (*k, v))
-                .unwrap();
-            for i in 0..filter_set.size() {
+        } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
+            // A required (`&`) tag seeds a single cursor because every listed
+            // value must be present, while an OR tag needs one cursor per
+            // alternative, so a required tag always wins on cursor count when
+            // one is available. Index cardinality is not known at planning
+            // time, so cursor count is the only comparable unit: a narrow
+            // `#e:[<id>]` can still lose to a broad `&t:["nostr"]`. That costs
+            // extra scanning, never correctness, because a non-empty `and_tags`
+            // forces every candidate through full-event verification.
+            let and_choice = f.and_tags.iter().min_by_key(|(_, values)| values.size());
+            let or_choice = f.tags.iter().min_by_key(|(_, values)| values.size());
+            let (tag_name, filter_set, from_and) = match (and_choice, or_choice) {
+                (Some((tag, values)), _) => (*tag, values, true),
+                (None, Some((tag, values))) => (*tag, values, false),
+                (None, None) => unreachable!(),
+            };
+            let cursor_count = if from_and { 1 } else { filter_set.size() };
+            for i in 0..cursor_count {
                 let mut search = vec![tag_name as u8];
                 search.extend_from_slice(filter_set.at(i));
                 let mut resume = search.clone();
@@ -957,12 +973,14 @@ pub fn foreach_by_filter<F>(
     filter: &serde_json::Value,
     max_limit: u64,
     max_tags: usize,
+    max_and_entries: usize,
     mut cb: F,
 ) -> Result<(), crate::subid::QueryError>
 where
     F: FnMut(u64),
 {
-    let fg = crate::filter::NostrFilterGroup::from_value(filter, max_limit, max_tags)?;
+    let fg =
+        crate::filter::NostrFilterGroup::from_value(filter, max_limit, max_tags, max_and_entries)?;
     let sub = Subscription::new(1, crate::subid::SubId::new(".").unwrap(), fg, false);
     let mut q = DbQuery::new(sub, 0, 0);
     q.process(txn, |_, lev| cb(lev), u64::MAX)

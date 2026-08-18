@@ -87,7 +87,7 @@ fn rust_open_own_db_and_scan() {
     let txn = env.begin_ro().unwrap();
     let mut decomp = Decompressor::new();
     let mut found = false;
-    wok_query::foreach_by_filter(&txn, &json!({"kinds":[1]}), 500, 3, |lev| {
+    wok_query::foreach_by_filter(&txn, &json!({"kinds":[1]}), 500, 3, 16, |lev| {
         let json = event_json_owned(&txn, &mut decomp, lev, 65536).unwrap();
         if json.contains("scan-me") {
             found = true;
@@ -124,6 +124,7 @@ fn cpp_write_rust_read_query() {
         &json!({"kinds":[1], "#t":["compat"]}),
         500,
         3,
+        16,
         |lev| {
             ids.push(event_json_owned(&txn, &mut decomp, lev, 65536).unwrap());
         },
@@ -160,7 +161,7 @@ fn wok_replace_keeps_only_newest_event() {
     let txn = env.begin_ro().unwrap();
     let mut decomp = Decompressor::new();
     let mut found = Vec::new();
-    wok_query::foreach_by_filter(&txn, &json!({"kinds":[0]}), 500, 3, |lev| {
+    wok_query::foreach_by_filter(&txn, &json!({"kinds":[0]}), 500, 3, 16, |lev| {
         found.push(event_json_owned(&txn, &mut decomp, lev, 65536).unwrap());
     })
     .unwrap();
@@ -182,7 +183,7 @@ fn wok_delete_removes_event_from_queries() {
     {
         let txn = env.begin_ro().unwrap();
         let mut levs = Vec::new();
-        wok_query::foreach_by_filter(&txn, &json!({"ids":[id]}), 500, 3, |lev| levs.push(lev))
+        wok_query::foreach_by_filter(&txn, &json!({"ids":[id]}), 500, 3, 16, |lev| levs.push(lev))
             .unwrap();
         drop(txn);
         let mut txn = env.begin_rw().unwrap();
@@ -191,8 +192,10 @@ fn wok_delete_removes_event_from_queries() {
     }
     let txn = env.begin_ro().unwrap();
     let mut found = Vec::new();
-    wok_query::foreach_by_filter(&txn, &json!({"ids":[id]}), 500, 3, |lev| found.push(lev))
-        .unwrap();
+    wok_query::foreach_by_filter(&txn, &json!({"ids":[id]}), 500, 3, 16, |lev| {
+        found.push(lev)
+    })
+    .unwrap();
     assert!(
         found.is_empty(),
         "deleted event remained queryable: {found:?}"
@@ -241,7 +244,7 @@ fn rust_scan_order_matches_created_at_desc() {
     let txn = env.begin_ro().unwrap();
     let mut decomp = Decompressor::new();
     let mut contents = Vec::new();
-    wok_query::foreach_by_filter(&txn, &json!({"kinds":[1], "limit": 5}), 500, 3, |lev| {
+    wok_query::foreach_by_filter(&txn, &json!({"kinds":[1], "limit": 5}), 500, 3, 16, |lev| {
         let j = event_json_owned(&txn, &mut decomp, lev, 65536).unwrap();
         contents.push(j);
     })

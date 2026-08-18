@@ -253,6 +253,8 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "max_limit": cfg.relay.max_filter_limit,
             "max_total_events_per_req": cfg.relay.max_total_events_per_req,
             "max_event_tags": cfg.events.max_num_tags,
+            "max_tags_per_filter": cfg.relay.max_tags_per_filter,
+            "max_and_entries": cfg.relay.max_and_entries,
             "created_at_lower_limit": cfg.events.reject_older_than_secs,
             "created_at_upper_limit": cfg.events.reject_newer_than_secs,
             "default_limit": cfg.relay.max_filter_limit,
@@ -309,6 +311,7 @@ fn nip_description(nip: u64) -> Option<&'static str> {
         62 => Some("Lets a key request complete, durable deletion of its relay-hosted footprint."),
         70 => Some("Restricts publication of protected events to their authenticated author."),
         77 => Some("Synchronizes event sets efficiently with the Negentropy reconciliation protocol."),
+        91 => Some("Requires every value in an &-prefixed tag filter while preserving compatible #-filter fallback."),
         _ => None,
     }
 }

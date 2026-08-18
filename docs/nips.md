@@ -22,6 +22,7 @@ arbitrary list.
 | 70 | Protected events | `-` tag + AUTH | `nip_conformance.rs` | always |
 | 77 | Negentropy | `wok-negentropy` | protocol unit tests | `negentropy.enabled` |
 | 86 | Relay management API | `wok-ws` RPC + `wok-db` moderation tables + `wok-relay` enforcement | `e2e_transports.rs` | `admin.enabled` with operator pubkeys |
+| 91 | AND operator in filters | `wok-query` compiled AND tags + full-event verification | matcher property tests, historical/live/COUNT conformance | both tag-filter limits are nonzero |
 
 NIP-02, NIP-04, and NIP-28 event kinds are accepted and stored, but those
 client/application semantics are deliberately not advertised as relay
@@ -40,6 +41,24 @@ filter containing exactly one tag attribute with one target. Offset derivation
 implements all specified target forms: raw event/pubkey hex, an address's
 pubkey, or SHA-256 of any other string. Multi-filter, multi-target, and limited
 counts omit HLL because their sketches would be ambiguous or incomplete.
+
+NIP-91 support follows the draft in
+[nostr-protocol/nips#2252](https://github.com/nostr-protocol/nips/pull/2252)
+at head `b93bda29d45998866e81c65e0693616294a78672`. An `&x` filter requires every
+listed value to occur in an `x` tag. Values duplicated in the corresponding
+`#x` compatibility filter are removed from its OR alternatives; if no OR
+alternatives remain, that OR clause is omitted. Historical queries use one
+required value as an index seed and verify the complete packed event. COUNT is
+exact but omits the optional NIP-45 HLL sketch for filters containing `&`.
+
+Outbound filters are adapted to the upstream. Router `REQ`s and `wok sync`
+`NEG-OPEN`s forward `&` clauses only to relays whose NIP-11 document advertises
+NIP-91; the document is cached per relay and is not consulted for anything
+else. For every other upstream — including one that serves no usable NIP-11
+document — each `&x` value set is folded into the `#x` compatibility clause the
+draft requires clients to send, so the remote answers a superset that is then
+narrowed by the exact AND filter locally. The `&` keys are never simply
+dropped, which would turn an `&`-only filter into a match-all request.
 
 NIP-62 accepts a signed kind 62 request containing either a matching
 `["relay", "<public relay URL>"]` tag or `["relay", "ALL_RELAYS"]`. The

@@ -119,6 +119,92 @@ async fn ws_publish_and_subscribe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip91_historical_live_and_count_share_and_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let cfg = test_cfg(dir.path());
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let relay = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(relay, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .unwrap();
+    let now = now_secs();
+    for (content, tags) in [
+        ("nip91-black", vec!["meme", "cat", "black"]),
+        ("nip91-white", vec!["meme", "cat", "white"]),
+        ("nip91-missing-or", vec!["meme", "cat"]),
+        ("nip91-missing-and", vec!["meme", "black"]),
+    ] {
+        let event = sign_event(json!({
+            "created_at":now,
+            "kind":1,
+            "tags":tags.into_iter().map(|value| json!(["t", value])).collect::<Vec<_>>(),
+            "content":content,
+        }));
+        ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+            .await
+            .unwrap();
+        let replies = recv_until(&mut ws, |text| text.contains("\"OK\"")).await;
+        assert!(replies.iter().any(|text| text.contains("true")));
+    }
+
+    let filter = json!({
+        "kinds":[1],
+        "&t":["meme", "cat"],
+        "#t":["meme", "cat", "black", "white"]
+    });
+    ws.send(Message::Text(
+        json!(["REQ", "nip91-live", filter.clone()])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let history = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+    assert!(history.iter().any(|text| text.contains("nip91-black")));
+    assert!(history.iter().any(|text| text.contains("nip91-white")));
+    assert!(history
+        .iter()
+        .all(|text| !text.contains("nip91-missing-or") && !text.contains("nip91-missing-and")));
+
+    ws.send(Message::Text(
+        json!(["COUNT", "nip91-count", filter]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let count = recv_until(&mut ws, |text| text.contains("COUNT")).await;
+    assert!(
+        count.iter().any(|text| text.contains("\"count\":2")),
+        "expected exact NIP-91 count: {count:?}"
+    );
+    assert!(count.iter().all(|text| !text.contains("\"hll\"")));
+
+    let live = sign_event(json!({
+        "created_at":now + 1,
+        "kind":1,
+        "tags":[["t","meme"],["t","cat"],["t","black"]],
+        "content":"nip91-live-match",
+    }));
+    ws.send(Message::Text(json!(["EVENT", live]).to_string().into()))
+        .await
+        .unwrap();
+    let live_replies = recv_until(&mut ws, |text| text.contains("nip91-live-match")).await;
+    assert!(live_replies
+        .iter()
+        .any(|text| text.contains("nip91-live-match")));
+
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip62_vanish_is_immediate_and_blocks_rebroadcast() {
     let dir = tempfile::tempdir().unwrap();
     let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
@@ -327,7 +413,7 @@ async fn nip45_count_returns_mergeable_hll_for_canonical_tag_query() {
     let actual = body["hll"].as_str().expect("HLL response");
     assert_eq!(actual.len(), 512);
 
-    let parsed_filter = NostrFilter::parse(&count_filter, 500, 3).unwrap();
+    let parsed_filter = NostrFilter::parse(&count_filter, 500, 3, 16).unwrap();
     let mut expected = HyperLogLog::for_filter(&parsed_filter).unwrap();
     for key in &keys {
         let (pubkey, _) = key.x_only_public_key();
@@ -845,7 +931,7 @@ async fn nip11_http_document() {
         .any(|n| n == 1));
     assert_eq!(
         client["supported_nips"],
-        json!([1, 9, 11, 13, 40, 45, 50, 62, 70, 77])
+        json!([1, 9, 11, 13, 40, 45, 50, 62, 70, 77, 91])
     );
     assert_eq!(client["limitation"]["max_event_tags"], 2000);
     assert_eq!(client["limitation"]["created_at_lower_limit"], u64::MAX / 4);
@@ -854,6 +940,8 @@ async fn nip11_http_document() {
     assert_eq!(client["limitation"]["max_total_events_per_req"], 2000);
     assert_eq!(client["limitation"]["min_pow_difficulty"], 20);
     assert_eq!(client["limitation"]["max_query_cost"], 1000);
+    assert_eq!(client["limitation"]["max_tags_per_filter"], 3);
+    assert_eq!(client["limitation"]["max_and_entries"], 16);
     assert_eq!(
         client["software"],
         "git+https://github.com/erskingardner/wok.git"

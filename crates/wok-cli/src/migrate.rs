@@ -700,6 +700,7 @@ mod tests {
             &json!({"search":"migration fixture"}),
             100,
             3,
+            16,
             |lev_id| search_hits.push(lev_id),
         )
         .unwrap();

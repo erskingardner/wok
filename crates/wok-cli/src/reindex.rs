@@ -262,13 +262,20 @@ fn rebuild_negentropy(env: &Env) -> Result<(u64, u64)> {
             let txn = env.begin_ro()?;
             let filter: serde_json::Value = serde_json::from_str(filter)?;
             let mut records = Vec::new();
-            wok_query::foreach_by_filter(&txn, &filter, u64::MAX, 64, |lev_id| {
-                if let Ok(Some(packed)) = wok_db::get_packed_ro(&txn, lev_id) {
-                    if let Ok(packed) = wok_event::PackedEventView::new(&packed) {
-                        records.push((packed.created_at(), packed.id().to_vec()));
+            wok_query::foreach_by_filter(
+                &txn,
+                &filter,
+                u64::MAX,
+                usize::MAX,
+                usize::MAX,
+                |lev_id| {
+                    if let Ok(Some(packed)) = wok_db::get_packed_ro(&txn, lev_id) {
+                        if let Ok(packed) = wok_event::PackedEventView::new(&packed) {
+                            records.push((packed.created_at(), packed.id().to_vec()));
+                        }
                     }
-                }
-            })?;
+                },
+            )?;
             records
         };
         let mut txn = env.begin_rw()?;
@@ -390,7 +397,7 @@ mod tests {
         assert!(check_integrity(&repaired.begin_ro().unwrap()).unwrap().ok());
         let txn = repaired.begin_ro().unwrap();
         let mut search_hits = Vec::new();
-        wok_query::foreach_by_filter(&txn, &json!({"search":"repair me"}), 100, 3, |lev_id| {
+        wok_query::foreach_by_filter(&txn, &json!({"search":"repair me"}), 100, 3, 16, |lev_id| {
             search_hits.push(lev_id)
         })
         .unwrap();

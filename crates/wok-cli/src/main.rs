@@ -25,9 +25,10 @@ fn foreach_by_filter_scan(
     filter: &serde_json::Value,
     max_limit: u64,
     max_tags: usize,
+    max_and_entries: usize,
     cb: impl FnMut(u64),
 ) -> Result<(), wok_query::QueryError> {
-    wok_query::foreach_by_filter(txn, filter, max_limit, max_tags, cb)
+    wok_query::foreach_by_filter(txn, filter, max_limit, max_tags, max_and_entries, cb)
 }
 
 /// Read one line from `reader` into `buf` (newline stripped, like
@@ -773,6 +774,7 @@ fn cmd_scan(cfg: &Config, filter: &str, count: bool) -> Result<()> {
         &filter,
         cfg.relay.max_filter_limit,
         cfg.relay.max_tags_per_filter,
+        cfg.relay.max_and_entries,
         |lev| {
             n += 1;
             if !count {
@@ -837,6 +839,7 @@ fn cmd_delete(cfg: &Config, age: Option<u64>, filter: Option<String>, dry_run: b
             &filter,
             u64::MAX,
             cfg.relay.max_tags_per_filter,
+            cfg.relay.max_and_entries,
             |lev| levs.push(lev),
         )?;
     }
@@ -888,6 +891,7 @@ fn cmd_monitor(cfg: &Config) -> Result<()> {
                     &arr[3],
                     cfg.relay.max_filter_limit,
                     cfg.relay.max_tags_per_filter,
+                    cfg.relay.max_and_entries,
                 )?;
                 let mut s =
                     wok_query::Subscription::new(conn, wok_query::SubId::new(sub)?, fg, false);
@@ -961,6 +965,7 @@ fn cmd_dict(cfg: &Config, cmd: DictCmd) -> Result<()> {
             &filter,
             u64::MAX,
             cfg.relay.max_tags_per_filter,
+            cfg.relay.max_and_entries,
             |lev| levs.push(lev),
         )?;
     }
@@ -1120,7 +1125,12 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
         }
         NegCmd::Add { filter } => {
             let v: serde_json::Value = serde_json::from_str(&filter)?;
-            let compiled = wok_query::NostrFilterGroup::from_value(&v, u64::MAX, 64)?;
+            let compiled = wok_query::NostrFilterGroup::from_value(
+                &v,
+                u64::MAX,
+                64,
+                cfg.relay.max_and_entries,
+            )?;
             if compiled.filters.is_empty() {
                 bail!("filter will never match");
             }
@@ -1181,7 +1191,8 @@ fn build_negentropy_tree(env: &Env, tree_id: u64, batch_size: usize) -> Result<(
         })?;
         let filter: serde_json::Value =
             serde_json::from_str(&filter_str.context("couldn't find treeId")?)?;
-        let compiled = wok_query::NostrFilterGroup::from_value(&filter, u64::MAX, 64)?;
+        let compiled =
+            wok_query::NostrFilterGroup::from_value(&filter, u64::MAX, usize::MAX, usize::MAX)?;
         if compiled.requires_content() {
             bail!("negentropy filters do not support content search");
         }
@@ -1343,6 +1354,26 @@ fn process_range_option(range: &str, filter: &mut serde_json::Value) -> Result<(
     Ok(())
 }
 
+fn downloaded_event_matches(
+    filter_group: &wok_query::NostrFilterGroup,
+    event: &serde_json::Value,
+    limits: &EventLimits,
+) -> bool {
+    wok_event::nostr_json_to_packed_event(event, limits)
+        .map(|packed| {
+            if filter_group.requires_content() {
+                event
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|content| filter_group.does_match_with_content(packed.view(), content))
+                    .unwrap_or(false)
+            } else {
+                filter_group.does_match(packed.view())
+            }
+        })
+        .unwrap_or(false)
+}
+
 /// Verify and write a batch of downloaded events, updating negentropy trees
 /// like C++ WriterPipeline (verifyMsg + verifyTime).
 fn write_downloaded(
@@ -1421,6 +1452,7 @@ async fn cmd_sync(
         &filter_json,
         u64::MAX,
         cfg.relay.max_tags_per_filter,
+        cfg.relay.max_and_entries,
     )?;
 
     let env = open_env(cfg)?;
@@ -1457,6 +1489,7 @@ async fn cmd_sync(
                     &filter_json,
                     u64::MAX,
                     cfg.relay.max_tags_per_filter,
+                    cfg.relay.max_and_entries,
                     |lev| levs.push(lev),
                 )?;
                 levs.sort_unstable();
@@ -1541,9 +1574,13 @@ async fn cmd_sync(
         }
     };
 
-    let mut ws = mesh::connect_mesh(&url, cfg.events.max_event_size).await?;
+    let connect = mesh::connect_mesh(&url, cfg.events.max_event_size);
+    let capability_filter = mesh::outbound_filter_for_relay(&url, &filter_json);
+    let (ws, remote_filter) = tokio::join!(connect, capability_filter);
+    let mut ws = ws?;
+    let remote_filter = remote_filter?;
     let init = initiate(&env)?;
-    let open = serde_json::json!(["NEG-OPEN", "N", filter_json, hex::encode(init)]);
+    let open = serde_json::json!(["NEG-OPEN", "N", remote_filter, hex::encode(init)]);
     ws.send(Message::Text(open.to_string().into())).await?;
 
     const HIGH_WATER_UP: usize = 100;
@@ -1657,6 +1694,11 @@ async fn cmd_sync(
             }
             "EVENT" => {
                 if let Some(ev) = v.get(2) {
+                    let matches_filter =
+                        downloaded_event_matches(&filter_group, ev, &cfg.event_limits());
+                    if !matches_filter {
+                        continue;
+                    }
                     batch.push(ev.clone());
                     if batch.len() >= 1000 {
                         write_downloaded(&env, cfg, &mut batch, &mut written)?;
@@ -2105,6 +2147,57 @@ mod main_tests {
             maximum
         );
         assert_eq!(next_reconnect_delay(maximum, maximum), maximum);
+    }
+
+    #[test]
+    fn nip91_sync_post_filters_legacy_relay_results() {
+        let filter = wok_query::NostrFilterGroup::from_value(
+            &json!({"&t":["meme", "cat"], "#t":["meme", "cat", "black"]}),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        let event = |tags: Vec<serde_json::Value>| {
+            json!({
+                "id":"11".repeat(32),
+                "pubkey":"22".repeat(32),
+                "created_at":1,
+                "kind":1,
+                "tags":tags,
+                "content":"",
+                "sig":"33".repeat(64)
+            })
+        };
+        assert!(downloaded_event_matches(
+            &filter,
+            &event(vec![
+                json!(["t", "meme"]),
+                json!(["t", "cat"]),
+                json!(["t", "black"])
+            ]),
+            &EventLimits::default(),
+        ));
+        assert!(!downloaded_event_matches(
+            &filter,
+            &event(vec![json!(["t", "meme"]), json!(["t", "cat"])]),
+            &EventLimits::default(),
+        ));
+
+        let search = wok_query::NostrFilterGroup::from_value(
+            &json!({"search":"needle", "&t":["meme", "cat"]}),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        let mut searchable = event(vec![json!(["t", "meme"]), json!(["t", "cat"])]);
+        searchable["content"] = json!("a sync needle");
+        assert!(downloaded_event_matches(
+            &search,
+            &searchable,
+            &EventLimits::default(),
+        ));
     }
 
     #[tokio::test]

@@ -65,6 +65,7 @@ fn search_is_ranked_then_limited_and_honors_structured_filters() {
         &json!({"search":"nostr search", "kinds":[1], "limit":1}),
         100,
         3,
+        16,
         |lev_id| hits.push(lev_id),
     )
     .unwrap();
@@ -92,6 +93,7 @@ fn search_ignores_extensions_and_is_unicode_case_insensitive() {
         &json!({"search":"café domain:example.com include:spam"}),
         100,
         3,
+        16,
         |lev_id| hits.push(lev_id),
     )
     .unwrap();
@@ -121,6 +123,7 @@ fn delete_removes_search_postings_and_missing_index_is_backfilled() {
         &json!({"search":"backfill sentinel"}),
         100,
         3,
+        16,
         |hit| hits.push(hit),
     )
     .unwrap();
@@ -137,6 +140,7 @@ fn delete_removes_search_postings_and_missing_index_is_backfilled() {
         &json!({"search":"backfill sentinel"}),
         100,
         3,
+        16,
         |hit| hits.push(hit),
     )
     .unwrap();
@@ -167,6 +171,7 @@ fn multiple_search_filters_are_merged_by_quality() {
         ]),
         100,
         3,
+        16,
         |lev_id| hits.push(lev_id),
     )
     .unwrap();
@@ -183,6 +188,7 @@ fn multiple_search_filters_are_merged_by_quality() {
         ]),
         100,
         3,
+        16,
     )
     .unwrap();
     let txn = env.begin_ro().unwrap();

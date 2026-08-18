@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Draft NIP-91 `&` tag filters now require every listed tag value for
+  historical queries, live subscriptions, COUNT, search, router post-filtering,
+  and negentropy. NIP-11 advertises NIP-91 plus the distinct-tag and aggregate
+  AND-entry limits. Outbound router `REQ`s and `wok sync` `NEG-OPEN`s keep `&`
+  clauses only for upstreams whose NIP-11 document advertises NIP-91, and
+  otherwise fold each `&x` value set into the `#x` compatibility clause and
+  apply the exact AND semantics locally.
+
 ## [0.3.1] - 2026-08-15
 
 ### Fixed

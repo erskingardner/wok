@@ -32,7 +32,7 @@ quirk. It also provides an additional Unix-domain socket transport.
   ranked content search, NIP-62 restart-safe Request to Vanish, NIP-70
   protected events, NIP-59 gift-wrap deletion semantics, NIP-77 negentropy set
   reconciliation** (persistent LMDB B-tree, tree-backed multi-round sync
-  sessions).
+  sessions), and **draft NIP-91 AND tag filters**.
 - **Standards-first ephemeral delivery**: ephemeral kinds are live-only by
   default, with an explicit persisted TTL compatibility mode.
 - **permessage-deflate** via an in-house RFC 6455/7692 codec (no Rust WS

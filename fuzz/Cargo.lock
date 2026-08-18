@@ -1471,6 +1471,7 @@ dependencies = [
  "wok-db",
  "wok-event",
  "wok-negentropy",
+ "wok-query",
  "wok-relay",
  "wok-ws",
 ]

@@ -7,7 +7,9 @@ pub mod scan;
 pub mod scheduler;
 pub mod subid;
 
-pub use filter::{dumb_match, FilterValidator, NostrFilter, NostrFilterGroup};
+pub use filter::{
+    dumb_match, FilterValidator, NostrFilter, NostrFilterGroup, DEFAULT_MAX_AND_ENTRIES,
+};
 pub use hll::{offset_for_filter as nip45_hll_offset, HyperLogLog};
 pub use monitor::{ActiveMonitors, Recipient};
 pub use scan::{foreach_by_filter, DbQuery, DbScan};

@@ -205,14 +205,19 @@ fn validate_role_id(id: &str) -> Result<(), DbError> {
 }
 
 /// Parse and canonicalize an IP for use as a moderation key. Connection
-/// admission renders peers with `IpAddr::to_string()`, so storing anything
-/// but the canonical form (e.g. `2001:0db8::1`) would silently never match.
+/// admission uses the same canonical text and collapses IPv4-mapped IPv6
+/// peers onto IPv4, so alternate forms cannot bypass a stored block.
 fn canonicalize_ip(ip: &str) -> Result<String, DbError> {
     let parsed: std::net::IpAddr = ip
         .trim()
         .parse()
         .map_err(|_| DbError::msg(format!("{ip:?} is not a valid IP address")))?;
-    let canonical = parsed.to_string();
+    let canonical = match parsed {
+        std::net::IpAddr::V6(ipv6) => ipv6
+            .to_ipv4_mapped()
+            .map_or_else(|| ipv6.to_string(), |ipv4| ipv4.to_string()),
+        std::net::IpAddr::V4(ipv4) => ipv4.to_string(),
+    };
     if canonical.len() > MAX_IP_BYTES {
         return Err(DbError::msg(format!("ip must be <= {MAX_IP_BYTES} bytes")));
     }
@@ -900,6 +905,8 @@ mod tests {
         let mut txn = env.begin_rw().unwrap();
         // Non-canonical input is stored in the canonical form admission uses.
         block_ip(&mut txn, "2001:0db8:0000::0001", "botnet").unwrap();
+        // IPv4-mapped IPv6 peers use the same key as native IPv4 peers.
+        block_ip(&mut txn, "::ffff:203.0.113.7", "mapped botnet").unwrap();
         assert!(block_ip(&mut txn, "not-an-ip", "").is_err());
         txn.commit().unwrap();
 
@@ -913,14 +920,25 @@ mod tests {
         assert!(blocked_ip_reason_ro(&txn, "2001:0db8:0000::0001")
             .unwrap()
             .is_none());
+        assert_eq!(
+            blocked_ip_reason_ro(&txn, "203.0.113.7")
+                .unwrap()
+                .as_deref(),
+            Some("mapped botnet")
+        );
+        assert!(blocked_ip_reason_ro(&txn, "::ffff:203.0.113.7")
+            .unwrap()
+            .is_none());
         drop(txn);
 
         // Unblock also canonicalizes its input.
         let mut txn = env.begin_rw().unwrap();
         unblock_ip(&mut txn, "2001:0DB8::1").unwrap();
+        unblock_ip(&mut txn, "::ffff:203.0.113.7").unwrap();
         txn.commit().unwrap();
         let txn = env.begin_ro().unwrap();
         assert!(blocked_ip_reason_ro(&txn, "2001:db8::1").unwrap().is_none());
+        assert!(blocked_ip_reason_ro(&txn, "203.0.113.7").unwrap().is_none());
     }
 
     #[test]

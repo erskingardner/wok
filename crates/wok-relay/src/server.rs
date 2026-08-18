@@ -1663,6 +1663,7 @@ fn run_writer(
     let mut negentropy_max_tags = cfg.read().relay.max_tags_per_filter;
     let mut negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
     let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
+    let mut event_batch = Vec::with_capacity(WRITER_BATCH_MAX);
     let mut closed = std::collections::HashSet::new();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
     let mut events: Vec<(u64, EventToWrite)> = Vec::with_capacity(256);
@@ -1671,6 +1672,7 @@ fn run_writer(
     let mut meta: Vec<u64> = Vec::with_capacity(256);
     while let Ok(msg) = rx.recv() {
         batch.clear();
+        event_batch.clear();
         closed.clear();
         batch_vanish.clear();
         events.clear();
@@ -1694,13 +1696,25 @@ fn run_writer(
                 closed.insert(*conn_id);
             }
         }
+        // Management mutations take priority over every event in the drained
+        // batch. This closes the same-batch race where an event queued just
+        // before a ban/revocation could otherwise pass its stored-state
+        // recheck and be committed after the management command returned.
+        for m in batch.drain(..) {
+            if let WriterMsg::Management(msg) = m {
+                let result = apply_management(&env, &moderation, msg.cmd);
+                let _ = msg.reply.send(result);
+            } else {
+                event_batch.push(m);
+            }
+        }
         let cfg_snap = cfg.read().clone();
         let vanish_policy = cfg_snap.vanish_policy();
         // A valid vanish request and an ephemeral gift wrap can arrive in the
         // same drained writer batch. Compute the batch markers up front so a
         // live-only event cannot be broadcast immediately before its request
         // is persisted later in that batch.
-        for m in &batch {
+        for m in &event_batch {
             let WriterMsg::AddEvent {
                 conn_id,
                 packed,
@@ -1729,12 +1743,7 @@ fn run_writer(
                 .and_modify(|timestamp| *timestamp = (*timestamp).max(event.created_at()))
                 .or_insert(event.created_at());
         }
-        for m in batch.drain(..) {
-            if let WriterMsg::Management(msg) = m {
-                let result = apply_management(&env, &moderation, msg.cmd);
-                let _ = msg.reply.send(result);
-                continue;
-            }
+        for m in event_batch.drain(..) {
             if let WriterMsg::AddEvent {
                 conn_id,
                 ip,
@@ -1775,7 +1784,7 @@ fn run_writer(
                     )
                 };
                 if res == PluginResult::Accept {
-                    if !is_vanish_request {
+                    {
                         let packed_view = match PackedEventView::new(&packed) {
                             Ok(event) => event,
                             Err(error) => {
@@ -1795,11 +1804,17 @@ fn run_writer(
                         author.copy_from_slice(packed_view.pubkey());
                         let stored_checks = env.begin_ro().and_then(|txn| {
                             Ok::<_, wok_db::DbError>((
-                                is_event_vanished_ro(&txn, packed_view)?,
+                                if is_vanish_request {
+                                    false
+                                } else {
+                                    is_event_vanished_ro(&txn, packed_view)?
+                                },
                                 moderation_reason_ro(&txn, packed_view)?,
                                 // Recheck allowlist/role eligibility against
-                                // committed state: a revocation may have
+                                // committed state: a ban/revocation may have
                                 // landed after the ingester's snapshot check.
+                                // Vanish requests bypass their own markers,
+                                // but not moderation or write restrictions.
                                 stored_write_permitted(&txn, &cfg_snap, &author)?,
                             ))
                         });
@@ -2389,7 +2404,9 @@ fn render_ip(ip: &[u8]) -> String {
         format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
     } else if ip.len() == 16 {
         let a: [u8; 16] = ip.try_into().unwrap_or([0; 16]);
-        std::net::Ipv6Addr::from(a).to_string()
+        let ipv6 = std::net::Ipv6Addr::from(a);
+        ipv6.to_ipv4_mapped()
+            .map_or_else(|| ipv6.to_string(), |ipv4| ipv4.to_string())
     } else {
         String::new()
     }
@@ -3202,6 +3219,106 @@ mod tests {
         let gift =
             PackedEventBuilder::build(&[5; 32], &[6; 32], 999, 21059, 0, &gift_tags).unwrap();
         assert!(event_matches_vanish_markers(gift.view(), &markers));
+    }
+
+    #[test]
+    fn mapped_ipv6_peers_render_as_ipv4() {
+        assert_eq!(
+            render_ip(
+                &"::ffff:203.0.113.7"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            ),
+            "203.0.113.7"
+        );
+        assert_eq!(
+            render_ip(
+                &"2001:db8::1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            ),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn same_batch_ban_precedes_ordinary_and_vanish_writes() {
+        for kind in [1, VANISH_KIND] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+            env.ensure_initialized().unwrap();
+
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.nip62.enabled = true;
+            config.relay.nip62.service_url = "wss://relay.example.com".into();
+            let config = Arc::new(parking_lot::RwLock::new(config));
+            let conns = Arc::new(ConnTable::new());
+            let metrics = Arc::new(Metrics::default());
+            let moderation = Arc::new(parking_lot::RwLock::new(
+                env.begin_ro()
+                    .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                    .unwrap(),
+            ));
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+
+            let author = [kind as u8; 32];
+            let id = [(kind as u8).saturating_add(1); 32];
+            let tags = PackedEventTagBuilder::default();
+            let packed = PackedEventBuilder::build(&id, &author, 1, kind, 0, &tags).unwrap();
+            let json = json!({
+                "id": to_hex(&id),
+                "pubkey": to_hex(&author),
+                "created_at": 1,
+                "kind": kind,
+                "tags": [["relay", "ALL_RELAYS"]],
+                "content": "",
+                "sig": "00".repeat(64),
+            })
+            .to_string();
+
+            let (writer_tx, writer_rx) = bounded(4);
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    ip: Arc::from([127, 0, 0, 1]),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: None,
+                })
+                .unwrap();
+            let (reply, reply_rx) = tokio::sync::oneshot::channel();
+            writer_tx
+                .send(WriterMsg::Management(ManagementMsg {
+                    cmd: ManagementCmd::BanPubkey {
+                        pubkey: author,
+                        reason: "same batch".into(),
+                    },
+                    reply,
+                }))
+                .unwrap();
+            drop(writer_tx);
+
+            run_writer(
+                env.clone(),
+                config,
+                conns,
+                metrics,
+                writer_rx,
+                Vec::new(),
+                moderation,
+            );
+
+            assert!(reply_rx.blocking_recv().unwrap().is_ok());
+            let response = out_rx.try_recv().unwrap().into_text();
+            assert!(response.contains("false"), "{response}");
+            assert!(response.contains("author is banned"), "{response}");
+            let txn = env.begin_ro().unwrap();
+            assert_eq!(txn.entries(env.dbis().event).unwrap(), 0);
+        }
     }
 
     #[test]

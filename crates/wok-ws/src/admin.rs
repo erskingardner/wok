@@ -161,10 +161,11 @@ pub async fn dispatch(
     let (admin_pubkey, replay_id, replay_created_at) = match authorize(
         authorization.as_deref(),
         &method,
-        &absolute_url,
         &body,
         &cfg,
         &state,
+        |signed| signed == absolute_url,
+        true,
     ) {
         Ok(ok) => ok,
         Err(error) => return unauthorized(&error),
@@ -192,7 +193,7 @@ pub async fn dispatch(
     resp
 }
 
-async fn read_body(mut body: Incoming, maximum: usize) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_body(mut body: Incoming, maximum: usize) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|error| error.to_string())?;
@@ -206,13 +207,18 @@ async fn read_body(mut body: Incoming, maximum: usize) -> Result<Vec<u8>, String
     Ok(bytes)
 }
 
-fn authorize(
+/// Verify a NIP-98 authorization event. `url_ok` decides whether the signed
+/// `u` tag names the endpoint being protected; `require_config_admin`
+/// additionally restricts signers to `admin.pubkeys` (NIP-86 instead admits
+/// role-holding pubkeys and checks levels itself).
+pub(crate) fn authorize(
     authorization: Option<&str>,
     method: &Method,
-    absolute_url: &str,
     body: &[u8],
     cfg: &Config,
     state: &AdminState,
+    url_ok: impl Fn(&str) -> bool,
+    require_config_admin: bool,
 ) -> Result<(String, [u8; 32], u64), String> {
     let encoded = authorization
         .and_then(|value| value.strip_prefix("Nostr "))
@@ -244,8 +250,8 @@ fn authorize(
     if packed.created_at().abs_diff(now) > cfg.admin.auth_window_secs {
         return Err("NIP-98 authorization is outside the accepted time window".into());
     }
-    if single_tag(&event, "u")? != absolute_url {
-        return Err("NIP-98 u tag does not match the absolute request URL".into());
+    if !url_ok(single_tag(&event, "u")?) {
+        return Err("NIP-98 u tag does not match the request URL".into());
     }
     if single_tag(&event, "method")? != method.as_str() {
         return Err("NIP-98 method tag does not match the request method".into());
@@ -257,7 +263,7 @@ fn authorize(
         }
     }
     let pubkey = hex::encode(packed.pubkey());
-    if !cfg.admin.pubkeys.iter().any(|allowed| allowed == &pubkey) {
+    if require_config_admin && !cfg.admin.pubkeys.iter().any(|allowed| allowed == &pubkey) {
         return Err("NIP-98 signer is not an administrator".into());
     }
     let mut id = [0u8; 32];
@@ -277,7 +283,12 @@ fn authorize(
 }
 
 /// Burn a replay-cache ID after its request completed successfully.
-fn commit_replay_id(state: &AdminState, id: [u8; 32], created_at: u64, window_secs: u64) {
+pub(crate) fn commit_replay_id(
+    state: &AdminState,
+    id: [u8; 32],
+    created_at: u64,
+    window_secs: u64,
+) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -395,40 +406,41 @@ fn overview(handle: &RelayHandle) -> Response<Full<Bytes>> {
 }
 
 fn update_config(handle: &RelayHandle, body: &[u8]) -> Response<Full<Bytes>> {
+    match apply_config_patch(handle, body) {
+        Ok(()) => json(StatusCode::OK, serde_json::json!({"saved": true})),
+        Err((status, error)) => response(status, "text/plain", &error),
+    }
+}
+
+/// Validate, atomically persist, and live-reload a configuration patch.
+/// Shared by the dashboard API and the NIP-86 relay-info methods.
+pub(crate) fn apply_config_patch(
+    handle: &RelayHandle,
+    body: &[u8],
+) -> Result<(), (StatusCode, String)> {
     let current = handle.config.read().clone();
     if !current.admin.allow_config_writes {
-        return response(
-            StatusCode::FORBIDDEN,
-            "text/plain",
-            "config writes are disabled",
-        );
+        return Err((StatusCode::FORBIDDEN, "config writes are disabled".into()));
     }
     let Some(path) = handle.config_path() else {
-        return response(
+        return Err((
             StatusCode::CONFLICT,
-            "text/plain",
-            "relay was not started from a writable config file",
-        );
+            "relay was not started from a writable config file".into(),
+        ));
     };
-    let patch: ConfigPatch = match serde_json::from_slice(body) {
-        Ok(patch) => patch,
-        Err(error) => return response(StatusCode::BAD_REQUEST, "text/plain", &error.to_string()),
-    };
+    let patch: ConfigPatch = serde_json::from_slice(body)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let mut next = current;
     apply_patch(&mut next, patch);
-    let encoded = match next.to_toml() {
-        Ok(encoded) => encoded,
-        Err(error) => return response(StatusCode::BAD_REQUEST, "text/plain", &error),
-    };
-    let verified = match Config::parse_toml(&encoded) {
-        Ok(config) => config,
-        Err(error) => return response(StatusCode::BAD_REQUEST, "text/plain", &error),
-    };
-    if let Err(error) = atomic_write_config(&path, encoded.as_bytes()) {
-        return response(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", &error);
-    }
+    let encoded = next
+        .to_toml()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let verified =
+        Config::parse_toml(&encoded).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    atomic_write_config(&path, encoded.as_bytes())
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     handle.config.write().apply_reload(verified);
-    json(StatusCode::OK, serde_json::json!({"saved": true}))
+    Ok(())
 }
 
 fn apply_patch(config: &mut Config, patch: ConfigPatch) {
@@ -639,7 +651,7 @@ fn atomic_write_config(path: &std::path::Path, contents: &[u8]) -> Result<(), St
     Ok(())
 }
 
-fn unauthorized(message: &str) -> Response<Full<Bytes>> {
+pub(crate) fn unauthorized(message: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("Content-Type", "text/plain; charset=utf-8")
@@ -649,11 +661,15 @@ fn unauthorized(message: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-fn json(status: StatusCode, value: serde_json::Value) -> Response<Full<Bytes>> {
+pub(crate) fn json(status: StatusCode, value: serde_json::Value) -> Response<Full<Bytes>> {
     response(status, "application/json", &value.to_string())
 }
 
-fn response(status: StatusCode, content_type: &str, body: &str) -> Response<Full<Bytes>> {
+pub(crate) fn response(
+    status: StatusCode,
+    content_type: &str,
+    body: &str,
+) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header("Content-Type", content_type)
@@ -878,10 +894,11 @@ mod tests {
         let (_, replay_id, replay_created_at) = authorize(
             Some(&header),
             &Method::PUT,
-            "https://relay.example/admin/api/config",
             body,
             &cfg,
             &state,
+            |signed| signed == "https://relay.example/admin/api/config",
+            true,
         )
         .unwrap();
         // Not yet burned: a retry of a failed request with the same signed
@@ -889,10 +906,11 @@ mod tests {
         assert!(authorize(
             Some(&header),
             &Method::PUT,
-            "https://relay.example/admin/api/config",
             body,
             &cfg,
-            &state
+            &state,
+            |signed| signed == "https://relay.example/admin/api/config",
+            true,
         )
         .is_ok());
         commit_replay_id(
@@ -904,10 +922,11 @@ mod tests {
         assert!(authorize(
             Some(&header),
             &Method::PUT,
-            "https://relay.example/admin/api/config",
             body,
             &cfg,
-            &state
+            &state,
+            |signed| signed == "https://relay.example/admin/api/config",
+            true,
         )
         .unwrap_err()
         .contains("already been used"));
@@ -921,10 +940,11 @@ mod tests {
         assert!(authorize(
             Some(&wrong_payload),
             &Method::PUT,
-            "https://relay.example/admin/api/config",
             body,
             &cfg,
-            &AdminState::default()
+            &AdminState::default(),
+            |signed| signed == "https://relay.example/admin/api/config",
+            true,
         )
         .unwrap_err()
         .contains("payload"));
@@ -933,13 +953,14 @@ mod tests {
         assert!(authorize(
             Some(&wrong_url),
             &Method::GET,
-            "https://relay.example/admin/api/overview",
             b"",
             &cfg,
-            &AdminState::default()
+            &AdminState::default(),
+            |signed| signed == "https://relay.example/admin/api/overview",
+            true,
         )
         .unwrap_err()
-        .contains("absolute request URL"));
+        .contains("u tag does not match"));
 
         let other_key = Keypair::new(SECP256K1, &mut rng);
         let unauthorized = signed_auth(
@@ -951,10 +972,11 @@ mod tests {
         assert!(authorize(
             Some(&unauthorized),
             &Method::GET,
-            "https://relay.example/admin/api/overview",
             b"",
             &cfg,
-            &AdminState::default()
+            &AdminState::default(),
+            |signed| signed == "https://relay.example/admin/api/overview",
+            true,
         )
         .unwrap_err()
         .contains("not an administrator"));
@@ -986,7 +1008,16 @@ mod tests {
 
         for nonce in ["first-request", "second-request"] {
             let header = signed_auth_with_nonce(&key, url, "GET", b"", Some(nonce));
-            assert!(authorize(Some(&header), &Method::GET, url, b"", &cfg, &state,).is_ok());
+            assert!(authorize(
+                Some(&header),
+                &Method::GET,
+                b"",
+                &cfg,
+                &state,
+                |signed| signed == url,
+                true
+            )
+            .is_ok());
         }
     }
 

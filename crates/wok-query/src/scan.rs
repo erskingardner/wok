@@ -6,8 +6,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
 use wok_db::{
-    is_event_vanished_ro, search_bigram_posting_exists, search_posting_count,
-    search_posting_exists, search_postings, RoTxn, SearchQuery,
+    is_event_moderated_ro, is_event_vanished_ro, search_bigram_posting_exists,
+    search_posting_count, search_posting_exists, search_postings, RoTxn, SearchQuery,
 };
 use wok_event::PackedEventView;
 
@@ -777,6 +777,9 @@ impl DbQuery {
         };
         let packed = PackedEventView::new(raw)?;
         if is_event_vanished_ro(txn, packed)? {
+            return Ok(None);
+        }
+        if is_event_moderated_ro(txn, packed)? {
             return Ok(None);
         }
         let mut pubkey = [0u8; 32];

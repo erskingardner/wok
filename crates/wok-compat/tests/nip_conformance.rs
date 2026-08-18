@@ -254,7 +254,8 @@ fn nip77_payload_hex_has_no_prefix_or_half_byte() {
 
 #[test]
 fn advertised_nips_are_subset_of_tested() {
-    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 70, 77];
+    // NIP-86 coverage lives in e2e_transports.rs (management API e2e tests).
+    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 70, 77, 86];
     assert_eq!(
         wok_relay::RELAY_CAPABILITY_CATALOG
             .iter()

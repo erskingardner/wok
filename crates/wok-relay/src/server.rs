@@ -9,6 +9,7 @@
 use crate::abuse::{leading_zero_bits, AbuseController, BudgetKind};
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
+use crate::moderation::{write_permitted, ManagementCmd};
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{ClientCommand, RelayMessage};
 use crate::restrict::ReadRestrictor;
@@ -23,9 +24,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use wok_db::{
-    backfill_vanish_markers, is_event_vanished_ro, lookup_event_by_id_ro, most_recent_levid_ro,
+    backfill_vanish_markers, is_event_moderated_ro, is_event_vanished_ro,
+    load_moderation_snapshot_ro, lookup_event_by_id_ro, most_recent_levid_ro, report_event,
     sweep_vanished_events, write_events_with_policy, Decompressor, Env, EventToWrite,
-    EventWriteStatus, VANISH_KIND,
+    EventWriteStatus, ModerationSnapshot, VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
@@ -216,10 +218,14 @@ pub struct RelayHandle {
     next_id: Arc<AtomicU64>,
     pub metrics: Arc<Metrics>,
     pub config: Arc<parking_lot::RwLock<Config>>,
+    /// In-memory copy of the NIP-86 moderation tables, refreshed by the
+    /// writer thread after every management mutation.
+    pub moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     abuse: Arc<AbuseController>,
     config_path: Arc<parking_lot::RwLock<Option<std::path::PathBuf>>>,
+    writer_tx: Sender<WriterMsg>,
 }
 
 pub enum IngestMsg {
@@ -244,6 +250,15 @@ enum WriterMsg {
     Close {
         conn_id: u64,
     },
+    /// NIP-86 mutation plus the reply channel for the HTTP handler. Runs on
+    /// the single writer thread so the LMDB change and the snapshot refresh
+    /// are ordered against event writes.
+    Management(ManagementMsg),
+}
+
+pub struct ManagementMsg {
+    pub cmd: ManagementCmd,
+    pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 enum ReqMsg {
@@ -323,6 +338,15 @@ impl RelayHandle {
 
     /// Apply the connection-opening budget before a WebSocket upgrade.
     pub fn admit_connection(&self, ip: &[u8]) -> bool {
+        if !ip.is_empty() {
+            let rendered = render_ip(ip);
+            if self.moderation.read().blocked_ips.contains_key(&rendered) {
+                self.metrics
+                    .abuse_connection_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
         let cfg = self.config.read();
         let admitted = self
             .abuse
@@ -333,6 +357,17 @@ impl RelayHandle {
                 .fetch_add(1, Ordering::Relaxed);
         }
         admitted
+    }
+
+    /// Apply a NIP-86 management mutation on the writer thread and wait for
+    /// the LMDB commit plus in-memory snapshot refresh.
+    pub async fn manage(&self, cmd: ManagementCmd) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.writer_tx
+            .try_send(WriterMsg::Management(ManagementMsg { cmd, reply }))
+            .map_err(|_| "relay writer queue is full".to_string())?;
+        rx.await
+            .map_err(|_| "relay writer shut down before replying".to_string())?
     }
 
     pub async fn client_message(&self, conn_id: u64, ip: impl Into<Arc<[u8]>>, payload: String) {
@@ -423,16 +458,24 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let (neg_txs, neg_rxs): (Vec<_>, Vec<_>) =
         (0..n_negentropy).map(|_| bounded::<NegMsg>(4096)).unzip();
 
+    let moderation = Arc::new(parking_lot::RwLock::new(
+        env.begin_ro()
+            .and_then(|txn| load_moderation_snapshot_ro(&txn))
+            .map_err(|e| format!("NIP-86 moderation load failed: {e}"))?,
+    ));
+
     let handle = RelayHandle {
         ingest: ingest_txs,
         conns: conns.clone(),
         next_id: Arc::new(AtomicU64::new(1)),
         metrics: metrics.clone(),
         config: config.clone(),
+        moderation: moderation.clone(),
         shutdown: shutdown.clone(),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         abuse: abuse.clone(),
         config_path: Arc::new(parking_lot::RwLock::new(None)),
+        writer_tx: writer_tx.clone(),
     };
 
     for (i, ingest_rx) in ingest_rxs.into_iter().enumerate() {
@@ -444,11 +487,13 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let req_txs = req_txs.clone();
         let neg_txs = neg_txs.clone();
         let abuse = abuse.clone();
+        let moderation = moderation.clone();
         thread::Builder::new()
             .name(format!("ingester-{i}"))
             .spawn(move || {
                 run_ingester(
-                    env, cfg, conns, metrics, abuse, ingest_rx, writer_tx, req_txs, neg_txs,
+                    env, cfg, conns, metrics, abuse, moderation, ingest_rx, writer_tx, req_txs,
+                    neg_txs,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -470,7 +515,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let mon_txs = mon_txs.clone();
         thread::Builder::new()
             .name("writer".into())
-            .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_txs))
+            .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_txs, moderation))
             .map_err(|e| e.to_string())?;
     }
     for (i, req_rx) in req_rxs.into_iter().enumerate() {
@@ -657,6 +702,7 @@ fn run_ingester(
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     abuse: Arc<AbuseController>,
+    moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
     writer_tx: Sender<WriterMsg>,
     req_txs: Vec<Sender<ReqMsg>>,
@@ -687,8 +733,19 @@ fn run_ingester(
                 // the hottest ingress path even though reloads are rare.
                 let cfg_snap = cfg.read();
                 handle_client(
-                    &env, &cfg_snap, &conns, &metrics, &abuse, &mut auth, conn_id, ip, &payload,
-                    &writer_tx, &req_txs, &neg_txs,
+                    &env,
+                    &cfg_snap,
+                    &conns,
+                    &metrics,
+                    &abuse,
+                    &moderation,
+                    &mut auth,
+                    conn_id,
+                    ip,
+                    &payload,
+                    &writer_tx,
+                    &req_txs,
+                    &neg_txs,
                 );
             }
         }
@@ -702,6 +759,7 @@ fn handle_client(
     conns: &ConnTable,
     metrics: &Metrics,
     abuse: &AbuseController,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     ip: Arc<[u8]>,
@@ -738,7 +796,7 @@ fn handle_client(
                 return;
             }
             ingest_event(
-                env, cfg, conns, metrics, abuse, auth, conn_id, ip, v, writer_tx,
+                env, cfg, conns, metrics, abuse, moderation, auth, conn_id, ip, v, writer_tx,
             );
         }
         ClientCommand::Auth(v) => {
@@ -972,6 +1030,7 @@ fn ingest_event(
     conns: &ConnTable,
     metrics: &Metrics,
     abuse: &AbuseController,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     ip: Arc<[u8]>,
@@ -1010,6 +1069,44 @@ fn ingest_event(
         kind = packed.kind(),
         "validated inbound event"
     );
+    {
+        let snap = moderation.read();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(packed.id());
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(packed.pubkey());
+        let rejected = if snap.banned_events.contains_key(&id) {
+            Some((
+                &metrics.moderation_banned_event_rejections,
+                "restricted: event is banned by the relay operator",
+            ))
+        } else if snap.banned_pubkeys.contains_key(&pubkey) {
+            Some((
+                &metrics.moderation_banned_author_rejections,
+                "restricted: author is banned by the relay operator",
+            ))
+        } else if !write_permitted(cfg, &snap, &pubkey) {
+            Some((
+                &metrics.moderation_restricted_write_rejections,
+                "restricted: writes are restricted to allowlisted pubkeys",
+            ))
+        } else {
+            None
+        };
+        if let Some((counter, message)) = rejected {
+            counter.fetch_add(1, Ordering::Relaxed);
+            conns.send(
+                conn_id,
+                RelayMessage::Ok {
+                    event_id: id_hex,
+                    accepted: false,
+                    message: message.into(),
+                },
+                metrics,
+            );
+            return;
+        }
+    }
     let is_vanish_request = packed.kind() == VANISH_KIND;
     if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
         conns.send(
@@ -1552,6 +1649,7 @@ fn run_writer(
     metrics: Arc<Metrics>,
     rx: Receiver<WriterMsg>,
     mon_txs: Vec<Sender<MonitorMsg>>,
+    moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
     let mut negentropy_max_tags = cfg.read().relay.max_tags_per_filter;
@@ -1624,6 +1722,11 @@ fn run_writer(
                 .or_insert(event.created_at());
         }
         for m in batch.drain(..) {
+            if let WriterMsg::Management(msg) = m {
+                let result = apply_management(&env, &moderation, msg.cmd);
+                let _ = msg.reply.send(result);
+                continue;
+            }
             if let WriterMsg::AddEvent {
                 conn_id,
                 ip,
@@ -1680,13 +1783,18 @@ fn run_writer(
                                 continue;
                             }
                         };
-                        let stored_suppression = env
-                            .begin_ro()
-                            .and_then(|txn| is_event_vanished_ro(&txn, packed_view));
-                        let suppressed = match stored_suppression {
-                            Ok(value) => {
-                                value || event_matches_vanish_markers(packed_view, &batch_vanish)
-                            }
+                        let stored_checks = env.begin_ro().and_then(|txn| {
+                            Ok::<_, wok_db::DbError>((
+                                is_event_vanished_ro(&txn, packed_view)?,
+                                is_event_moderated_ro(&txn, packed_view)?,
+                            ))
+                        });
+                        let (vanished, moderated) = match stored_checks {
+                            Ok((vanished, moderated)) => (
+                                vanished
+                                    || event_matches_vanish_markers(packed_view, &batch_vanish),
+                                moderated,
+                            ),
                             Err(error) => {
                                 conns.send(
                                     conn_id,
@@ -1700,7 +1808,7 @@ fn run_writer(
                                 continue;
                             }
                         };
-                        if suppressed {
+                        if vanished {
                             let id_hex = PackedEventView::new(&packed)
                                 .map(|event| to_hex(event.id()))
                                 .unwrap_or_else(|_| "?".into());
@@ -1710,6 +1818,24 @@ fn run_writer(
                                     event_id: id_hex,
                                     accepted: false,
                                     message: "blocked: author or recipient requested vanish".into(),
+                                },
+                                &metrics,
+                            );
+                            continue;
+                        }
+                        if moderated {
+                            metrics
+                                .moderation_banned_author_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            let id_hex = PackedEventView::new(&packed)
+                                .map(|event| to_hex(event.id()))
+                                .unwrap_or_else(|_| "?".into());
+                            conns.send(
+                                conn_id,
+                                RelayMessage::Ok {
+                                    event_id: id_hex,
+                                    accepted: false,
+                                    message: "restricted: event or author is banned by the relay operator".into(),
                                 },
                                 &metrics,
                             );
@@ -1923,6 +2049,7 @@ fn run_writer(
                 false,
                 &vanish_policy,
             )?;
+            let reports = record_reports(&mut txn, &evs);
             if cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events != 0 {
                 let stored = txn.entries(txn.env().dbis().event)? as u64;
                 if stored > cfg_snap.relay.abuse.max_stored_events {
@@ -1936,8 +2063,12 @@ fn run_writer(
                 }
             }
             txn.commit()?;
-            Ok::<_, wok_db::DbError>(())
+            Ok::<_, wok_db::DbError>(reports)
         })();
+        let reports_recorded = match &write_res {
+            Ok(reports) => *reports,
+            Err(_) => 0,
+        };
         if let Err(error) = write_res {
             // The transaction aborted; nothing was written this batch.
             for memo in quota_counts.values_mut() {
@@ -1958,6 +2089,17 @@ fn run_writer(
                 );
             }
             continue;
+        }
+        if reports_recorded > 0 {
+            // New moderation-queue entries committed with this batch; refresh
+            // the snapshot the management API lists from.
+            match env
+                .begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+            {
+                Ok(snap) => *moderation.write() = snap,
+                Err(error) => tracing::warn!(%error, "moderation snapshot refresh failed"),
+            }
         }
         let quota_enabled =
             cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0;
@@ -2017,6 +2159,80 @@ fn run_writer(
         }
         broadcast_db_change(&mon_txs);
     }
+}
+
+/// NIP-56 report kind; accepted reports feed the NIP-86 moderation queue.
+const REPORT_KIND: u64 = 1984;
+/// Most `e` tags harvested from one report event.
+const MAX_REPORT_TARGETS: usize = 64;
+
+/// Record NIP-86 moderation-queue entries for kind 1984 reports written in
+/// this batch. Runs inside the same transaction so a stored report and its
+/// queue entries commit atomically. Queue-cap exhaustion is logged, never
+/// fatal to the event write. Returns how many queue entries were recorded.
+fn record_reports(txn: &mut wok_db::RwTxn<'_>, evs: &[EventToWrite]) -> usize {
+    let mut recorded = 0usize;
+    for ev in evs {
+        if ev.status != EventWriteStatus::Written {
+            continue;
+        }
+        let Ok(packed) = PackedEventView::new(&ev.packed) else {
+            continue;
+        };
+        if packed.kind() != REPORT_KIND {
+            continue;
+        }
+        let content = serde_json::from_str::<Value>(&ev.json)
+            .ok()
+            .and_then(|event| {
+                event
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let snippet: String = content.chars().take(200).collect();
+        let reason = if snippet.is_empty() {
+            format!("reported by {}", to_hex(packed.pubkey()))
+        } else {
+            format!("reported by {}: {snippet}", to_hex(packed.pubkey()))
+        };
+        let mut targets = 0usize;
+        packed.foreach_tag(|name, value| {
+            if name == 'e' && value.len() == 32 && targets < MAX_REPORT_TARGETS {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(value);
+                match report_event(txn, &id, &reason) {
+                    Ok(()) => recorded += 1,
+                    Err(error) => {
+                        tracing::warn!(event_id = %to_hex(&id), %error, "moderation queue insert failed")
+                    }
+                }
+                targets += 1;
+            }
+            true
+        });
+    }
+    recorded
+}
+
+/// Apply a NIP-86 management mutation on the writer thread: commit to LMDB,
+/// then atomically refresh the in-memory snapshot used by ingest and
+/// connection admission.
+fn apply_management(
+    env: &Env,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
+    cmd: ManagementCmd,
+) -> Result<(), String> {
+    let mut txn = env.begin_rw().map_err(|e| e.to_string())?;
+    cmd.apply(&mut txn).map_err(|e| e.to_string())?;
+    txn.commit().map_err(|e| e.to_string())?;
+    let snap = env
+        .begin_ro()
+        .and_then(|txn| load_moderation_snapshot_ro(&txn))
+        .map_err(|e| e.to_string())?;
+    *moderation.write() = snap;
+    Ok(())
 }
 
 fn event_matches_vanish_markers(

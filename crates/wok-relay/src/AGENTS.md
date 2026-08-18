@@ -7,6 +7,7 @@
 | `protocol.rs` | `ClientCommand` / `RelayMessage` (EVENT/REQ/CLOSE/COUNT/AUTH/NEG-*) |
 | `config.rs` | Native TOML `Config` plus strfry HOCON translation for migrate |
 | `capabilities.rs` | NIP-11 capability catalog and `supported_nips` |
+| `moderation.rs` | NIP-86 commands, management levels, write-permission decisions |
 | `abuse.rs` | Per-IP / per-pubkey token buckets, query cost, PoW bits |
 | `restrict.rs` | Restricted-kind / involved-pubkey read policy |
 | `plugin.rs` | Write-policy child process (JSONL stdin/stdout, timeout) |

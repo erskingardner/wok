@@ -16,6 +16,7 @@ pub mod integrity;
 pub mod keys;
 pub mod lookup;
 pub mod migration;
+pub mod moderation;
 pub mod payload;
 pub mod reindex;
 pub mod schema;
@@ -39,6 +40,15 @@ pub use lookup::{
     most_recent_levid_ro,
 };
 pub use migration::{event_fingerprint, snapshot_lmdb_readonly, EventFingerprint};
+pub use moderation::{
+    allow_event, allow_pubkey, assign_role, ban_event, ban_pubkey, banned_event_reason_ro,
+    banned_pubkey_reason_ro, block_ip, blocked_ip_reason_ro, clear_reported_event, delete_role,
+    is_event_moderated_ro, list_allowed_pubkeys_ro, list_banned_events_ro, list_banned_pubkeys_ro,
+    list_blocked_ips_ro, list_reported_events_ro, list_roles_ro, load_moderation_snapshot_ro,
+    pubkey_roles_ro, put_role, report_event, unallow_pubkey, unassign_role, unban_pubkey,
+    unblock_ip, ModerationSnapshot, Role, BUILTIN_ROLES, BUILTIN_ROLE_ADMIN, BUILTIN_ROLE_MEMBER,
+    BUILTIN_ROLE_MODERATOR, MAX_REASON_BYTES,
+};
 pub use payload::{
     encode_raw_payload, encode_zstd_payload, event_json_owned, get_event_json, parse_payload,
     Decompressor, PayloadView, PAYLOAD_RAW, PAYLOAD_ZSTD,

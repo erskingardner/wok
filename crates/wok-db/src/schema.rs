@@ -23,6 +23,9 @@ pub const DBI_NEGENTROPY: &str = "negentropy";
 pub const DBI_EVENT_SEARCH: &str = "wok_Event__search";
 /// Persistent NIP-62 maximum vanish timestamp by 32-byte pubkey.
 pub const DBI_VANISH_PUBKEY: &str = "wok_VanishPubkey";
+/// Wok-owned NIP-86 moderation records, prefixed by record type. This DBI is
+/// optional when opening a read-only strfry v3 migration source.
+pub const DBI_MODERATION: &str = "wok_Moderation";
 
 pub const DBI_NAMES: &[&str] = &[
     DBI_META,
@@ -43,6 +46,7 @@ pub const DBI_NAMES: &[&str] = &[
     DBI_NEGENTROPY,
     DBI_EVENT_SEARCH,
     DBI_VANISH_PUBKEY,
+    DBI_MODERATION,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -153,6 +157,11 @@ pub fn dbi_specs() -> &'static [DbiSpec] {
         },
         DbiSpec {
             name: DBI_VANISH_PUBKEY,
+            flags: MDB_CREATE,
+            comparator: ComparatorKind::Default,
+        },
+        DbiSpec {
+            name: DBI_MODERATION,
             flags: MDB_CREATE,
             comparator: ComparatorKind::Default,
         },

@@ -6,6 +6,7 @@ pub mod abuse;
 pub mod capabilities;
 pub mod config;
 pub mod metrics;
+pub mod moderation;
 pub mod plugin;
 pub mod protocol;
 pub mod restrict;
@@ -17,6 +18,7 @@ pub use capabilities::{
     RELAY_CAPABILITY_CATALOG,
 };
 pub use config::{Config, EphemeralPersistence, StrfryConfigTranslation};
+pub use moderation::{management_level, write_permitted, ManagementCmd, ManagementLevel, Role};
 pub use protocol::{ClientCommand, RelayMessage};
 pub use rlimit::apply_nofiles_limit;
 pub use server::{start, Outbound, OutboundFrame, RelayHandle};

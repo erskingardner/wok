@@ -246,6 +246,9 @@ pub struct AuthConfig {
     pub service_url: String,
     pub restricted_read_kinds: Vec<u64>,
     pub restrict_read_to_involved_pubkey: bool,
+    /// When true, only NIP-86 allowlisted or role-holding pubkeys (and
+    /// operator admin pubkeys) may write events.
+    pub restrict_writes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +334,7 @@ impl Default for Config {
                     // operator configures the relay URL required by NIP-42.
                     restricted_read_kinds: vec![4, 1059],
                     restrict_read_to_involved_pubkey: true,
+                    restrict_writes: false,
                 },
                 info: InfoConfig {
                     name: "wok default".into(),

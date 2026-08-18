@@ -948,3 +948,392 @@ async fn raw_http(addr: std::net::SocketAddr, request: &str) -> String {
     stream.read_to_end(&mut response).await.unwrap();
     String::from_utf8(response).unwrap()
 }
+
+/// POST a NIP-86 management RPC signed with `key`. The `u` tag deliberately
+/// uses the ws:// form to exercise the relay's URL normalization.
+async fn nip86_rpc(
+    addr: std::net::SocketAddr,
+    key: &Keypair,
+    method: &str,
+    params: serde_json::Value,
+) -> (String, serde_json::Value) {
+    use sha2::Digest;
+    let body = json!({"method": method, "params": params}).to_string();
+    let payload = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+    let nonce = hex::encode(rand::random::<[u8; 16]>());
+    let event = sign_event_with_key(
+        json!({
+            "created_at": now_secs(),
+            "kind": 27235,
+            "tags": [
+                ["u", format!("ws://{addr}")],
+                ["method", "POST"],
+                ["payload", payload],
+                ["nonce", nonce],
+            ],
+            "content": "",
+        }),
+        key,
+    );
+    let authorization = base64::engine::general_purpose::STANDARD.encode(event.to_string());
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Nostr {authorization}\r\nContent-Type: application/nostr+json+rpc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let raw = raw_http(addr, &request).await;
+    let status = raw.lines().next().unwrap_or("").to_string();
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap_or("{}").trim())
+            .unwrap_or(json!({}));
+    (status, parsed)
+}
+
+async fn ws_publish<S>(ws: &mut S, event: serde_json::Value) -> Vec<String>
+where
+    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+{
+    ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+        .await
+        .unwrap();
+    recv_until(ws, |t| t.contains("\"OK\"")).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip86_management_api_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    // Small map: the suite default reserves 10TB of virtual space per relay
+    // and concurrent relays can exceed the host's VM budget.
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (admin_pubkey, _) = admin_key.x_only_public_key();
+    let alice_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (alice_pubkey, _) = alice_key.x_only_public_key();
+    let alice_hex = hex::encode(alice_pubkey.serialize());
+    let mod_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (mod_pubkey, _) = mod_key.x_only_public_key();
+    let mod_hex = hex::encode(mod_pubkey.serialize());
+
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // NIP-11 advertises the management API only when the admin surface is on.
+    let nip11 = reqwest_get_nip11(addr).await;
+    assert!(
+        nip11["supported_nips"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(86)),
+        "NIP-11 should advertise 86, got {nip11}"
+    );
+
+    // Unauthenticated and non-manager requests are rejected with 401.
+    let body = json!({"method": "supportedmethods", "params": []}).to_string();
+    let unauth = raw_http(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/nostr+json+rpc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    )
+    .await;
+    assert!(unauth.starts_with("HTTP/1.1 401"), "{unauth}");
+    let (status, _) = nip86_rpc(addr, &alice_key, "supportedmethods", json!([])).await;
+    assert!(status.starts_with("HTTP/1.1 401"), "{status}");
+
+    let (status, result) = nip86_rpc(addr, &admin_key, "supportedmethods", json!([])).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    assert!(
+        result["result"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("banpubkey")),
+        "{result}"
+    );
+
+    // Alice publishes; her event is served historically and counted.
+    let url = format!("ws://{addr}/");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let ev1 = sign_event_with_key(
+        json!({"created_at": now_secs(), "kind": 1, "tags": [], "content": "nip86-e2e-one"}),
+        &alice_key,
+    );
+    let ev1_id = ev1["id"].as_str().unwrap().to_string();
+    let msgs = ws_publish(&mut ws, ev1.clone()).await;
+    assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
+    ws.send(Message::Text(
+        json!(["REQ", "s1", {"authors": [alice_hex], "limit": 10}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(msgs.iter().any(|t| t.contains("nip86-e2e-one")), "{msgs:?}");
+
+    // Ban alice: writes rejected, stored events suppressed from REQ and COUNT.
+    let (_, result) = nip86_rpc(addr, &admin_key, "banpubkey", json!([alice_hex, "spam"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedpubkeys", json!([])).await;
+    assert!(
+        result["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["pubkey"] == json!(alice_hex) && entry["reason"] == json!("spam")),
+        "{result}"
+    );
+    let ev2 = sign_event_with_key(
+        json!({"created_at": now_secs(), "kind": 1, "tags": [], "content": "nip86-e2e-two"}),
+        &alice_key,
+    );
+    let msgs = ws_publish(&mut ws, ev2).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains("false") && t.contains("restricted")),
+        "{msgs:?}"
+    );
+    ws.send(Message::Text(
+        json!(["REQ", "s2", {"authors": [alice_hex], "limit": 10}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        !msgs.iter().any(|t| t.contains("nip86-e2e-one")),
+        "banned author's stored events must be suppressed, got {msgs:?}"
+    );
+    ws.send(Message::Text(
+        json!(["COUNT", "c1", {"kinds": [1]}]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("COUNT")).await;
+    assert!(
+        msgs.iter().any(|t| t.contains("\"count\":0")),
+        "banned author's events must not be counted, got {msgs:?}"
+    );
+
+    // Unban restores visibility: bans suppress, they do not delete.
+    let (_, result) = nip86_rpc(addr, &admin_key, "unbanpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    ws.send(Message::Text(
+        json!(["REQ", "s3", {"authors": [alice_hex], "limit": 10}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        msgs.iter().any(|t| t.contains("nip86-e2e-one")),
+        "unban must restore suppressed events, got {msgs:?}"
+    );
+
+    // Event-level ban and allowevent.
+    let (_, result) = nip86_rpc(addr, &admin_key, "banevent", json!([ev1_id, "illegal"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    ws.send(Message::Text(
+        json!(["REQ", "s4", {"ids": [ev1_id]}]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        !msgs.iter().any(|t| t.contains("nip86-e2e-one")),
+        "banned event must be suppressed, got {msgs:?}"
+    );
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowevent", json!([ev1_id])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+
+    // A NIP-56 report feeds the moderation queue; banevent dequeues it.
+    let report = sign_event_with_key(
+        json!({
+            "created_at": now_secs(),
+            "kind": 1984,
+            "tags": [["e", ev1_id]],
+            "content": "spam report",
+        }),
+        &alice_key,
+    );
+    let msgs = ws_publish(&mut ws, report).await;
+    assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listeventsneedingmoderation", json!([])).await;
+    assert!(
+        result["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == json!(ev1_id)
+                && entry["reason"].as_str().unwrap().contains("spam report")),
+        "{result}"
+    );
+    let (_, result) = nip86_rpc(addr, &admin_key, "banevent", json!([ev1_id])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listeventsneedingmoderation", json!([])).await;
+    assert!(
+        !result["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == json!(ev1_id)),
+        "banevent must clear the moderation queue entry, got {result}"
+    );
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowevent", json!([ev1_id])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+
+    // Roles: moderators ban but cannot change relay configuration.
+    let (_, result) = nip86_rpc(
+        addr,
+        &admin_key,
+        "createrole",
+        json!(["vip", "VIP", "valued posters", "#ffcc00", 10]),
+    )
+    .await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "assignrole", json!([alice_hex, "vip"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(
+        addr,
+        &admin_key,
+        "assignrole",
+        json!([mod_hex, "moderator"]),
+    )
+    .await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &mod_key, "banpubkey", json!([alice_hex])).await;
+    assert_eq!(
+        result["result"],
+        json!(true),
+        "moderator must ban: {result}"
+    );
+    let (_, result) = nip86_rpc(addr, &mod_key, "changerelayname", json!(["x"])).await;
+    assert!(
+        result["error"].as_str().unwrap_or("").contains("admin"),
+        "moderator must not change relay config: {result}"
+    );
+    let (_, result) = nip86_rpc(addr, &mod_key, "unbanpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "deleterole", json!(["vip"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+
+    // Config-backed methods fail cleanly without a writable config file.
+    let (_, result) = nip86_rpc(addr, &admin_key, "changerelayname", json!(["new name"])).await;
+    assert!(
+        result["error"].as_str().unwrap_or("").contains("config"),
+        "{result}"
+    );
+
+    // Blocked IPs are refused at connection admission, HTTP management
+    // included; the in-process handle is the operator's escape hatch.
+    let (_, result) = nip86_rpc(addr, &admin_key, "blockip", json!(["127.0.0.1", "abuse"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let blocked = tokio_tungstenite::connect_async(&url).await;
+    assert!(blocked.is_err(), "blocked IP must not upgrade to WebSocket");
+    handle
+        .manage(wok_relay::ManagementCmd::UnblockIp {
+            ip: "127.0.0.1".into(),
+        })
+        .await
+        .unwrap();
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let _ = recv_until(&mut ws2, |_| true).await;
+
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip86_restrict_writes_allowlist_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    // Small map: the suite default reserves 10TB of virtual space per relay
+    // and concurrent relays can exceed the host's VM budget.
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (admin_pubkey, _) = admin_key.x_only_public_key();
+    let alice_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (alice_pubkey, _) = alice_key.x_only_public_key();
+    let alice_hex = hex::encode(alice_pubkey.serialize());
+
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
+    cfg.relay.auth.restrict_writes = true;
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let url = format!("ws://{addr}/");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let publish = |content: &str| {
+        sign_event_with_key(
+            json!({"created_at": now_secs(), "kind": 1, "tags": [], "content": content}),
+            &alice_key,
+        )
+    };
+
+    let msgs = ws_publish(&mut ws, publish("denied-before-allow")).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains("false") && t.contains("restricted")),
+        "{msgs:?}"
+    );
+
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let msgs = ws_publish(&mut ws, publish("allowed-after-allow")).await;
+    assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
+
+    let (_, result) = nip86_rpc(addr, &admin_key, "unallowpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let msgs = ws_publish(&mut ws, publish("denied-after-unallow")).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains("false") && t.contains("restricted")),
+        "{msgs:?}"
+    );
+
+    // A member role also grants write access.
+    let (_, result) = nip86_rpc(addr, &admin_key, "assignrole", json!([alice_hex, "member"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let msgs = ws_publish(&mut ws, publish("allowed-via-member-role")).await;
+    assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
+
+    handle.request_shutdown();
+}

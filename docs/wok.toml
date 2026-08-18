@@ -86,6 +86,9 @@ enabled = true
 service_url = ""
 restricted_read_kinds = [4, 1059]
 restrict_read_to_involved_pubkey = true
+# When true, only NIP-86 allowlisted or role-holding pubkeys (and operator
+# admin pubkeys) may write events.
+restrict_writes = false
 
 [relay.info]
 name = "wok default"

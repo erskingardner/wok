@@ -23,6 +23,8 @@ pub enum ManagementCmd {
     DeleteRole { id: String },
     AssignRole { pubkey: [u8; 32], role: String },
     UnassignRole { pubkey: [u8; 32], role: String },
+    AllowKind { kind: u64 },
+    DisallowKind { kind: u64 },
 }
 
 impl ManagementCmd {
@@ -41,6 +43,8 @@ impl ManagementCmd {
             Self::DeleteRole { id } => wok_db::delete_role(txn, id),
             Self::AssignRole { pubkey, role } => wok_db::assign_role(txn, pubkey, role),
             Self::UnassignRole { pubkey, role } => wok_db::unassign_role(txn, pubkey, role),
+            Self::AllowKind { kind } => wok_db::allow_kind(txn, *kind),
+            Self::DisallowKind { kind } => wok_db::disallow_kind(txn, *kind),
         }
     }
 }
@@ -90,6 +94,30 @@ pub fn write_permitted(cfg: &Config, snap: &ModerationSnapshot, pubkey: &[u8; 32
     }
     let hex = to_hex(pubkey);
     cfg.admin.pubkeys.iter().any(|allowed| allowed == &hex)
+}
+
+/// Writer-side authoritative `write_permitted`, evaluated against committed
+/// LMDB moderation state instead of the in-memory snapshot. This closes the
+/// race where an allowlist/role revocation commits after an event passed the
+/// ingester's snapshot check but before the writer persists it.
+pub fn stored_write_permitted(
+    txn: &wok_db::RoTxn<'_>,
+    cfg: &Config,
+    pubkey: &[u8; 32],
+) -> Result<bool, wok_db::DbError> {
+    if wok_db::banned_pubkey_reason_ro(txn, pubkey)?.is_some() {
+        return Ok(false);
+    }
+    if !cfg.relay.auth.restrict_writes {
+        return Ok(true);
+    }
+    if wok_db::allowed_pubkey_reason_ro(txn, pubkey)?.is_some()
+        || !wok_db::pubkey_roles_ro(txn, pubkey)?.is_empty()
+    {
+        return Ok(true);
+    }
+    let hex = to_hex(pubkey);
+    Ok(cfg.admin.pubkeys.iter().any(|allowed| allowed == &hex))
 }
 
 #[cfg(test)]
@@ -154,5 +182,70 @@ mod tests {
         assert!(write_permitted(&cfg, &snap, &[3u8; 32])); // allowlisted
         assert!(write_permitted(&cfg, &snap, &admin_pk)); // operator admin
         assert!(!write_permitted(&cfg, &snap, &[4u8; 32])); // ban wins
+    }
+
+    /// The writer-side recheck must observe committed revocations, closing
+    /// the race where an event passed the ingester's snapshot check before
+    /// `unallowpubkey`/`unassignrole`/`deleterole` committed.
+    #[test]
+    fn stored_write_permitted_sees_committed_revocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::default()).unwrap();
+        let mut cfg = Config::default();
+        cfg.relay.auth.restrict_writes = true;
+        let admin_pk = [1u8; 32];
+        cfg.admin.pubkeys = vec![to_hex(&admin_pk)];
+        let alice = [7u8; 32];
+
+        let permitted = |env: &wok_db::Env, cfg: &Config, pk: &[u8; 32]| {
+            let txn = env.begin_ro().unwrap();
+            stored_write_permitted(&txn, cfg, pk).unwrap()
+        };
+
+        // Nobody is allowed initially; admins always are.
+        assert!(!permitted(&env, &cfg, &alice));
+        assert!(permitted(&env, &cfg, &admin_pk));
+
+        // Allow, then revoke: the committed state flips the decision.
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::allow_pubkey(&mut txn, &alice, "").unwrap();
+        txn.commit().unwrap();
+        assert!(permitted(&env, &cfg, &alice));
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::unallow_pubkey(&mut txn, &alice).unwrap();
+        txn.commit().unwrap();
+        assert!(!permitted(&env, &cfg, &alice));
+
+        // Role assignment grants, role deletion revokes.
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::put_role(
+            &mut txn,
+            &Role {
+                id: "vip".into(),
+                label: String::new(),
+                description: String::new(),
+                color: String::new(),
+                order: 0,
+            },
+        )
+        .unwrap();
+        wok_db::assign_role(&mut txn, &alice, "vip").unwrap();
+        txn.commit().unwrap();
+        assert!(permitted(&env, &cfg, &alice));
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::delete_role(&mut txn, "vip").unwrap();
+        txn.commit().unwrap();
+        assert!(!permitted(&env, &cfg, &alice));
+
+        // A ban dominates even an explicit allow.
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::allow_pubkey(&mut txn, &alice, "").unwrap();
+        wok_db::ban_pubkey(&mut txn, &alice, "").unwrap();
+        txn.commit().unwrap();
+        assert!(!permitted(&env, &cfg, &alice));
+
+        // Unrestricted mode ignores the allowlist entirely.
+        cfg.relay.auth.restrict_writes = false;
+        assert!(permitted(&env, &cfg, &[9u8; 32]));
     }
 }

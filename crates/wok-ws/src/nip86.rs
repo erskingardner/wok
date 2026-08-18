@@ -12,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use wok_relay::{management_level, Config, ManagementCmd, ManagementLevel, RelayHandle, Role};
+use wok_relay::{management_level, ManagementCmd, ManagementLevel, RelayHandle, Role};
 
 pub const RPC_CONTENT_TYPE: &str = "application/nostr+json+rpc";
 const MAX_RPC_BODY: usize = 64 * 1024;
@@ -125,7 +125,7 @@ pub async fn dispatch(
         "authorized NIP-86 management request"
     );
 
-    let outcome = execute(&handle, &cfg, level, &body).await;
+    let outcome = execute(&handle, level, &body).await;
     match outcome {
         Ok(result) => {
             admin::commit_replay_id(
@@ -142,7 +142,6 @@ pub async fn dispatch(
 
 async fn execute(
     handle: &Arc<RelayHandle>,
-    cfg: &Config,
     level: ManagementLevel,
     body: &[u8],
 ) -> Result<Value, String> {
@@ -261,38 +260,19 @@ async fn execute(
         }
         "allowkind" => {
             let kind = kind_param(params)?;
-            let mut kinds = configured_kinds(cfg)?;
-            if kinds.is_empty() {
-                return Ok(json!(true)); // unrestricted: every kind is allowed
-            }
-            if !kinds.contains(&kind) {
-                kinds.push(kind);
-                kinds.sort_unstable();
-                write_kinds(handle, &kinds)?;
-            }
-            Ok(json!(true))
+            manage(handle, ManagementCmd::AllowKind { kind }).await
         }
         "disallowkind" => {
             let kind = kind_param(params)?;
-            let mut kinds = configured_kinds(cfg)?;
-            if kinds.is_empty() {
-                kinds = (0..=u16::MAX as u64).filter(|k| *k != kind).collect();
-            } else {
-                kinds.retain(|k| *k != kind);
-            }
-            if kinds.is_empty() {
-                return Err("cannot disallow every kind".into());
-            }
-            write_kinds(handle, &kinds)?;
-            Ok(json!(true))
+            manage(handle, ManagementCmd::DisallowKind { kind }).await
         }
         "listallowedkinds" => {
-            let kinds = configured_kinds(cfg)?;
-            if kinds.is_empty() {
-                Ok(json!((0..=u16::MAX as u64).collect::<Vec<_>>()))
-            } else {
-                Ok(json!(kinds))
-            }
+            let snap = handle.moderation.read();
+            let kinds = match &snap.kind_policy {
+                Some(policy) => policy.allowed_kinds(),
+                None => (0..=u16::MAX as u64).collect(),
+            };
+            Ok(json!(kinds))
         }
         _ => unreachable!("method checked against SUPPORTED_METHODS"),
     }
@@ -305,34 +285,6 @@ async fn manage(handle: &Arc<RelayHandle>, cmd: ManagementCmd) -> Result<Value, 
 fn config_patch(handle: &Arc<RelayHandle>, patch: Value) -> Result<Value, String> {
     admin::apply_config_patch(handle, patch.to_string().as_bytes()).map_err(|(_, error)| error)?;
     Ok(json!(true))
-}
-
-/// Persist a kind allowlist and make sure filter validation enforces it.
-fn write_kinds(handle: &Arc<RelayHandle>, kinds: &[u64]) -> Result<(), String> {
-    let joined = kinds
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    config_patch(
-        handle,
-        json!({ "filters": { "allowed_kinds": joined, "enabled": true } }),
-    )?;
-    Ok(())
-}
-
-fn configured_kinds(cfg: &Config) -> Result<Vec<u64>, String> {
-    let raw = cfg.relay.filter_validation.allowed_kinds.trim();
-    if raw.is_empty() {
-        return Ok(Vec::new());
-    }
-    raw.split(',')
-        .map(|part| {
-            part.trim()
-                .parse::<u64>()
-                .map_err(|_| format!("configured allowed_kinds entry {part:?} is not a number"))
-        })
-        .collect()
 }
 
 fn parse_hex32(value: &str) -> Result<[u8; 32], String> {

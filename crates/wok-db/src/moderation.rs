@@ -21,6 +21,7 @@ const PREFIX_BLOCKED_IP: u8 = b'I';
 const PREFIX_REPORTED_EVENT: u8 = b'R';
 const PREFIX_ROLE: u8 = b'G';
 const PREFIX_PUBKEY_ROLES: u8 = b'P';
+const PREFIX_KIND_POLICY: u8 = b'K';
 
 /// Longest stored operator-supplied reason.
 pub const MAX_REASON_BYTES: usize = 512;
@@ -51,6 +52,45 @@ pub struct Role {
     pub order: u64,
 }
 
+const KIND_POLICY_BYTES: usize = (u16::MAX as usize + 1) / 8;
+
+/// NIP-86 allowed-kind set as a 65536-bit map (8 KiB), stored under a single
+/// `K` record. Absent record means every kind is allowed; a present map is
+/// authoritative, including the all-zero "nothing allowed" state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KindPolicy(pub Box<[u8; KIND_POLICY_BYTES]>);
+
+impl KindPolicy {
+    /// A policy allowing every kind.
+    pub fn allow_all() -> Self {
+        Self(Box::new([0xff; KIND_POLICY_BYTES]))
+    }
+
+    pub fn allows(&self, kind: u64) -> bool {
+        let kind = kind as usize;
+        self.0
+            .get(kind / 8)
+            .is_some_and(|byte| byte & (1 << (kind % 8)) != 0)
+    }
+
+    pub fn set_allowed(&mut self, kind: u64, allowed: bool) {
+        let kind = kind as usize;
+        debug_assert!(kind <= u16::MAX as usize);
+        if allowed {
+            self.0[kind / 8] |= 1 << (kind % 8);
+        } else {
+            self.0[kind / 8] &= !(1 << (kind % 8));
+        }
+    }
+
+    /// Enumerate the allowed kinds (used by `listallowedkinds`).
+    pub fn allowed_kinds(&self) -> Vec<u64> {
+        (0..=u16::MAX as u64)
+            .filter(|kind| self.allows(*kind))
+            .collect()
+    }
+}
+
 /// Full in-memory copy of the moderation tables for synchronous checks on
 /// hot paths (connection admission, ingest, live broadcast).
 #[derive(Debug, Clone, Default)]
@@ -62,6 +102,8 @@ pub struct ModerationSnapshot {
     pub reported_events: HashMap<[u8; 32], String>,
     pub roles: BTreeMap<String, Role>,
     pub pubkey_roles: HashMap<[u8; 32], Vec<String>>,
+    /// `None` means every kind is allowed (no policy record stored).
+    pub kind_policy: Option<KindPolicy>,
 }
 
 impl ModerationSnapshot {
@@ -76,6 +118,13 @@ impl ModerationSnapshot {
     /// and pubkeys holding any role (built-in or custom), may write.
     pub fn write_permitted(&self, pubkey: &[u8; 32]) -> bool {
         self.allowed_pubkeys.contains_key(pubkey) || self.pubkey_roles.contains_key(pubkey)
+    }
+
+    /// Kind admission under the NIP-86 kind policy. `None` allows everything.
+    pub fn kind_allowed(&self, kind: u64) -> bool {
+        self.kind_policy
+            .as_ref()
+            .is_none_or(|policy| policy.allows(kind))
     }
 }
 
@@ -155,14 +204,19 @@ fn validate_role_id(id: &str) -> Result<(), DbError> {
     Ok(())
 }
 
-fn validate_ip(ip: &str) -> Result<(), DbError> {
-    if ip.is_empty() || ip.len() > MAX_IP_BYTES {
-        return Err(DbError::msg(format!("ip must be 1..={MAX_IP_BYTES} bytes")));
+/// Parse and canonicalize an IP for use as a moderation key. Connection
+/// admission renders peers with `IpAddr::to_string()`, so storing anything
+/// but the canonical form (e.g. `2001:0db8::1`) would silently never match.
+fn canonicalize_ip(ip: &str) -> Result<String, DbError> {
+    let parsed: std::net::IpAddr = ip
+        .trim()
+        .parse()
+        .map_err(|_| DbError::msg(format!("{ip:?} is not a valid IP address")))?;
+    let canonical = parsed.to_string();
+    if canonical.len() > MAX_IP_BYTES {
+        return Err(DbError::msg(format!("ip must be <= {MAX_IP_BYTES} bytes")));
     }
-    if ip.chars().any(char::is_control) {
-        return Err(DbError::msg("ip must not contain control characters"));
-    }
-    Ok(())
+    Ok(canonical)
 }
 
 fn count_prefix<T: ReadOps>(txn: &T, dbi: MDB_dbi, prefix: u8) -> Result<usize, DbError> {
@@ -263,8 +317,23 @@ pub fn pubkey_roles_ro<T: ReadOps>(txn: &T, pubkey: &[u8; 32]) -> Result<Vec<Str
     Ok(serde_json::from_slice(&raw).unwrap_or_default())
 }
 
-/// True when the event id or its author is banned. Used by query scans so
-/// moderated events disappear from REQ/COUNT results without deletion.
+/// Load the stored kind policy, if any.
+pub fn kind_policy_ro<T: ReadOps>(txn: &T) -> Result<Option<KindPolicy>, DbError> {
+    let Some(dbi) = txn.moderation_dbi() else {
+        return Ok(None);
+    };
+    let Some(raw) = txn.get_record(dbi, &[PREFIX_KIND_POLICY])? else {
+        return Ok(None);
+    };
+    let bits: [u8; KIND_POLICY_BYTES] = raw
+        .try_into()
+        .map_err(|_| DbError::msg("corrupt kind policy record"))?;
+    Ok(Some(KindPolicy(Box::new(bits))))
+}
+
+/// True when the event id, its author, or its kind is moderated. Used by
+/// query scans so moderated events disappear from REQ/COUNT results without
+/// deletion.
 pub fn is_event_moderated_ro(
     txn: &RoTxn<'_>,
     packed: PackedEventView<'_>,
@@ -278,9 +347,16 @@ pub fn is_event_moderated_ro(
     {
         return Ok(true);
     }
-    Ok(txn
+    if txn
         .get(dbi, &prefixed(PREFIX_BANNED_PUBKEY, packed.pubkey()))?
-        .is_some())
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if let Some(policy) = kind_policy_ro(txn)? {
+        return Ok(!policy.allows(packed.kind()));
+    }
+    Ok(false)
 }
 
 pub fn load_moderation_snapshot_ro(txn: &RoTxn<'_>) -> Result<ModerationSnapshot, DbError> {
@@ -338,6 +414,16 @@ pub fn load_moderation_snapshot_ro(txn: &RoTxn<'_>) -> Result<ModerationSnapshot
                     return false;
                 }
             },
+            PREFIX_KIND_POLICY if payload.is_empty() => {
+                let bits: Result<[u8; KIND_POLICY_BYTES], _> = value.try_into();
+                match bits {
+                    Ok(bits) => snap.kind_policy = Some(KindPolicy(Box::new(bits))),
+                    Err(_) => {
+                        error = Some(DbError::msg("corrupt kind policy record"));
+                        return false;
+                    }
+                }
+            }
             _ => {}
         }
         true
@@ -399,20 +485,57 @@ pub fn allow_event(txn: &mut RwTxn<'_>, id: &[u8; 32]) -> Result<(), DbError> {
     clear_record(txn, PREFIX_REPORTED_EVENT, id)
 }
 
+fn store_kind_policy(txn: &mut RwTxn<'_>, policy: &KindPolicy) -> Result<(), DbError> {
+    let dbi = txn
+        .env()
+        .dbis()
+        .moderation
+        .ok_or_else(|| DbError::msg("NIP-86 moderation database is unavailable"))?;
+    txn.put(dbi, &[PREFIX_KIND_POLICY], policy.0.as_slice(), 0)?;
+    Ok(())
+}
+
+/// NIP-86 `allowkind`. A no-op when no policy exists (every kind is already
+/// allowed); otherwise sets the kind's bit in the stored map.
+pub fn allow_kind(txn: &mut RwTxn<'_>, kind: u64) -> Result<(), DbError> {
+    if kind > u16::MAX as u64 {
+        return Err(DbError::msg("kind must be between 0 and 65535"));
+    }
+    let Some(mut policy) = kind_policy_ro(txn)? else {
+        return Ok(());
+    };
+    policy.set_allowed(kind, true);
+    store_kind_policy(txn, &policy)
+}
+
+/// NIP-86 `disallowkind`. With no stored policy this materializes the
+/// allow-all map and clears the kind's bit, so one exclusion does not
+/// enumerate 65,535 config entries. The all-zero map (no kinds allowed) is
+/// representable and intentional.
+pub fn disallow_kind(txn: &mut RwTxn<'_>, kind: u64) -> Result<(), DbError> {
+    if kind > u16::MAX as u64 {
+        return Err(DbError::msg("kind must be between 0 and 65535"));
+    }
+    let mut policy = kind_policy_ro(txn)?.unwrap_or_else(KindPolicy::allow_all);
+    policy.set_allowed(kind, false);
+    store_kind_policy(txn, &policy)
+}
+
 pub fn block_ip(txn: &mut RwTxn<'_>, ip: &str, reason: &str) -> Result<(), DbError> {
-    validate_ip(ip)?;
+    let canonical = canonicalize_ip(ip)?;
     validate_reason(reason)?;
     put_record(
         txn,
         PREFIX_BLOCKED_IP,
-        ip.as_bytes(),
+        canonical.as_bytes(),
         reason.as_bytes(),
         MAX_MODERATION_RECORDS,
     )
 }
 
 pub fn unblock_ip(txn: &mut RwTxn<'_>, ip: &str) -> Result<(), DbError> {
-    clear_record(txn, PREFIX_BLOCKED_IP, ip.as_bytes())
+    let canonical = canonicalize_ip(ip)?;
+    clear_record(txn, PREFIX_BLOCKED_IP, canonical.as_bytes())
 }
 
 /// Record an event id as needing moderation (from a NIP-56 kind 1984 report).
@@ -701,5 +824,93 @@ mod tests {
         let long = "x".repeat(MAX_REASON_BYTES + 1);
         assert!(ban_pubkey(&mut txn, &[1u8; 32], &long).is_err());
         txn.abort();
+    }
+
+    #[test]
+    fn blocked_ips_are_canonicalized_at_storage() {
+        let (_dir, env) = test_env();
+        let mut txn = env.begin_rw().unwrap();
+        // Non-canonical input is stored in the canonical form admission uses.
+        block_ip(&mut txn, "2001:0db8:0000::0001", "botnet").unwrap();
+        assert!(block_ip(&mut txn, "not-an-ip", "").is_err());
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(
+            blocked_ip_reason_ro(&txn, "2001:db8::1")
+                .unwrap()
+                .as_deref(),
+            Some("botnet")
+        );
+        assert!(blocked_ip_reason_ro(&txn, "2001:0db8:0000::0001")
+            .unwrap()
+            .is_none());
+        drop(txn);
+
+        // Unblock also canonicalizes its input.
+        let mut txn = env.begin_rw().unwrap();
+        unblock_ip(&mut txn, "2001:0DB8::1").unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert!(blocked_ip_reason_ro(&txn, "2001:db8::1").unwrap().is_none());
+    }
+
+    #[test]
+    fn kind_policy_gates_visibility_and_roundtrips() {
+        let (_dir, env) = test_env();
+        let tags = wok_event::PackedEventTagBuilder::default();
+        let kind1 =
+            wok_event::PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 1, 1, 0, &tags).unwrap();
+        let kind2 =
+            wok_event::PackedEventBuilder::build(&[3u8; 32], &[2u8; 32], 1, 2, 0, &tags).unwrap();
+
+        // No policy: everything allowed.
+        let txn = env.begin_ro().unwrap();
+        assert!(kind_policy_ro(&txn).unwrap().is_none());
+        assert!(!is_event_moderated_ro(&txn, kind1.view()).unwrap());
+        drop(txn);
+
+        // disallowkind from the default materializes the map with one bit off.
+        let mut txn = env.begin_rw().unwrap();
+        disallow_kind(&mut txn, 1).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        let policy = kind_policy_ro(&txn).unwrap().unwrap();
+        assert!(!policy.allows(1));
+        assert!(policy.allows(2));
+        assert!(is_event_moderated_ro(&txn, kind1.view()).unwrap());
+        assert!(!is_event_moderated_ro(&txn, kind2.view()).unwrap());
+        drop(txn);
+
+        // allowkind restores the kind; the map itself persists.
+        let mut txn = env.begin_rw().unwrap();
+        allow_kind(&mut txn, 1).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert!(!is_event_moderated_ro(&txn, kind1.view()).unwrap());
+        drop(txn);
+
+        // The all-zero map (no kinds allowed) is representable.
+        let mut txn = env.begin_rw().unwrap();
+        for kind in 0..=u16::MAX as u64 {
+            disallow_kind(&mut txn, kind).unwrap();
+        }
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        let policy = kind_policy_ro(&txn).unwrap().unwrap();
+        assert!(policy.allowed_kinds().is_empty());
+        assert!(is_event_moderated_ro(&txn, kind2.view()).unwrap());
+    }
+
+    #[test]
+    fn snapshot_carries_kind_policy() {
+        let (_dir, env) = test_env();
+        let mut txn = env.begin_rw().unwrap();
+        disallow_kind(&mut txn, 7).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        let snap = load_moderation_snapshot_ro(&txn).unwrap();
+        assert!(!snap.kind_allowed(7));
+        assert!(snap.kind_allowed(8));
     }
 }

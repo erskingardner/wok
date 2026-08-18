@@ -59,10 +59,11 @@ relay or editing the config file.
 
 Bans are **suppressive, not destructive**. A banned pubkey or event id is
 rejected on future writes (`OK false "restricted: ..."`) and hidden from
-historical REQ results, live delivery, and COUNT, but the stored records
-remain in the database, so `unbanpubkey` / `allowevent` restore them
-exactly. Negentropy sync between relays is unaffected by bans, so operators
-can still mirror a banned corpus between their own relays.
+historical REQ results, live delivery (including monitor catch-up and
+queued DB changes), and COUNT, but the stored records remain in the
+database, so `unbanpubkey` / `allowevent` restore them exactly. Negentropy
+sync between relays is unaffected by bans, so operators can still mirror a
+banned corpus between their own relays.
 
 `allowpubkey` only has an effect when `relay.auth.restrict_writes = true`:
 then writes are accepted only from allowlisted pubkeys, pubkeys holding any
@@ -102,15 +103,28 @@ list (100,000 records per type, 512-byte reasons).
 
 ## Config-backed methods
 
-`changerelayname`, `changerelaydescription`, `changerelayicon`, and the
-kind-policy methods edit the live configuration through the same validated,
-atomic `wok.toml` rewrite as the admin dashboard, so they require
-`admin.allow_config_writes` and a relay started from a writable config file;
-otherwise they return the dashboard's error. `allowkind` / `disallowkind`
-maintain `relay.filter_validation.allowed_kinds` and enable filter
-validation so the list is enforced; `listallowedkinds` reports the full
-0–65535 range when no list is configured. `disallowkind` refuses to empty
-the list, since an empty list means "all kinds allowed".
+`changerelayname`, `changerelaydescription`, and `changerelayicon` edit the
+live configuration through the same validated, atomic `wok.toml` rewrite as
+the admin dashboard, so they require `admin.allow_config_writes` and a relay
+started from a writable config file; otherwise they return the dashboard's
+error.
+
+## Kind policy
+
+`allowkind` / `disallowkind` / `listallowedkinds` maintain a dedicated kind
+policy in the moderation table (a 65536-bit map), not the query-filter
+validation config. With no stored policy every kind is allowed and
+`listallowedkinds` reports the full 0–65535 range. A disallowed kind is:
+
+- rejected on write admission (`OK false "restricted: kind N is not allowed
+  by this relay"`), and
+- hidden from query results like a ban — including REQs without a `kinds`
+  field — until `allowkind` restores it.
+
+The all-zero map (no kinds allowed) is representable; `disallowkind` never
+refuses an exclusion. IPs given to `blockip` / `unblockip` are parsed and
+stored in canonical form, so any equivalent spelling (`2001:0db8::1` vs
+`2001:db8::1`) refers to the same record.
 
 ## Persistence
 

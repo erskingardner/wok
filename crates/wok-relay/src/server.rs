@@ -9,7 +9,7 @@
 use crate::abuse::{leading_zero_bits, AbuseController, BudgetKind};
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
-use crate::moderation::{write_permitted, ManagementCmd};
+use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{ClientCommand, RelayMessage};
 use crate::restrict::ReadRestrictor;
@@ -1075,20 +1075,28 @@ fn ingest_event(
         id.copy_from_slice(packed.id());
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(packed.pubkey());
-        let rejected = if snap.banned_events.contains_key(&id) {
+        let rejected = if !snap.kind_allowed(packed.kind()) {
+            Some((
+                &metrics.moderation_kind_rejections,
+                format!(
+                    "restricted: kind {} is not allowed by this relay",
+                    packed.kind()
+                ),
+            ))
+        } else if snap.banned_events.contains_key(&id) {
             Some((
                 &metrics.moderation_banned_event_rejections,
-                "restricted: event is banned by the relay operator",
+                "restricted: event is banned by the relay operator".to_string(),
             ))
         } else if snap.banned_pubkeys.contains_key(&pubkey) {
             Some((
                 &metrics.moderation_banned_author_rejections,
-                "restricted: author is banned by the relay operator",
+                "restricted: author is banned by the relay operator".to_string(),
             ))
         } else if !write_permitted(cfg, &snap, &pubkey) {
             Some((
                 &metrics.moderation_restricted_write_rejections,
-                "restricted: writes are restricted to allowlisted pubkeys",
+                "restricted: writes are restricted to allowlisted pubkeys".to_string(),
             ))
         } else {
             None
@@ -1100,7 +1108,7 @@ fn ingest_event(
                 RelayMessage::Ok {
                     event_id: id_hex,
                     accepted: false,
-                    message: message.into(),
+                    message,
                 },
                 metrics,
             );
@@ -1783,17 +1791,24 @@ fn run_writer(
                                 continue;
                             }
                         };
+                        let mut author = [0u8; 32];
+                        author.copy_from_slice(packed_view.pubkey());
                         let stored_checks = env.begin_ro().and_then(|txn| {
                             Ok::<_, wok_db::DbError>((
                                 is_event_vanished_ro(&txn, packed_view)?,
                                 is_event_moderated_ro(&txn, packed_view)?,
+                                // Recheck allowlist/role eligibility against
+                                // committed state: a revocation may have
+                                // landed after the ingester's snapshot check.
+                                stored_write_permitted(&txn, &cfg_snap, &author)?,
                             ))
                         });
-                        let (vanished, moderated) = match stored_checks {
-                            Ok((vanished, moderated)) => (
+                        let (vanished, moderated, write_allowed) = match stored_checks {
+                            Ok((vanished, moderated, write_allowed)) => (
                                 vanished
                                     || event_matches_vanish_markers(packed_view, &batch_vanish),
                                 moderated,
+                                write_allowed,
                             ),
                             Err(error) => {
                                 conns.send(
@@ -1836,6 +1851,26 @@ fn run_writer(
                                     event_id: id_hex,
                                     accepted: false,
                                     message: "restricted: event or author is banned by the relay operator".into(),
+                                },
+                                &metrics,
+                            );
+                            continue;
+                        }
+                        if !write_allowed {
+                            metrics
+                                .moderation_restricted_write_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            let id_hex = PackedEventView::new(&packed)
+                                .map(|event| to_hex(event.id()))
+                                .unwrap_or_else(|_| "?".into());
+                            conns.send(
+                                conn_id,
+                                RelayMessage::Ok {
+                                    event_id: id_hex,
+                                    accepted: false,
+                                    message:
+                                        "restricted: writes are restricted to allowlisted pubkeys"
+                                            .into(),
                                 },
                                 &metrics,
                             );
@@ -2520,6 +2555,7 @@ fn run_req_monitor(
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
                             if is_event_vanished_ro(&txn, packed).unwrap_or(true)
+                                || is_event_moderated_ro(&txn, packed).unwrap_or(true)
                                 || !r.should_send_to_subscriber(packed, pk)
                                 || (!requires_content && !sub.filter_group.does_match(packed))
                             {
@@ -2577,7 +2613,9 @@ fn run_req_monitor(
                     let requires_content = monitors.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if is_event_vanished_ro(&txn, packed).unwrap_or(true) {
+                            if is_event_vanished_ro(&txn, packed).unwrap_or(true)
+                                || is_event_moderated_ro(&txn, packed).unwrap_or(true)
+                            {
                                 return true;
                             }
                             let packed_recipients = if requires_content {
@@ -2626,6 +2664,11 @@ fn run_req_monitor(
                 }
                 MonitorMsg::Ephemeral { packed, json } => {
                     if let Ok(packed) = PackedEventView::new(&packed) {
+                        // Live-only events skip the database, but not the
+                        // moderation policy: id/author/kind checks all apply.
+                        if is_event_moderated_ro(&txn, packed).unwrap_or(true) {
+                            continue;
+                        }
                         let search_terms = if monitors.requires_content() {
                             Some(wok_db::event_search_terms(&json).unwrap_or_default())
                         } else {

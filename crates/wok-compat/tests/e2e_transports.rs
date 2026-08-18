@@ -1337,3 +1337,202 @@ async fn nip86_restrict_writes_allowlist_e2e() {
 
     handle.request_shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip86_kind_policy_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (admin_pubkey, _) = admin_key.x_only_public_key();
+    let alice_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let url = format!("ws://{addr}/");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let publish = |content: &str| {
+        sign_event_with_key(
+            json!({"created_at": now_secs(), "kind": 1, "tags": [], "content": content}),
+            &alice_key,
+        )
+    };
+    let msgs = ws_publish(&mut ws, publish("kind-policy-one")).await;
+    assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
+
+    // disallowkind rejects new writes and suppresses stored events, including
+    // from REQs without a kinds field.
+    let (_, result) = nip86_rpc(addr, &admin_key, "disallowkind", json!([1])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedkinds", json!([])).await;
+    let kinds = result["result"].as_array().unwrap();
+    assert_eq!(kinds.len(), 65535, "{result}");
+    assert!(!kinds.contains(&json!(1)), "{result}");
+    let msgs = ws_publish(&mut ws, publish("kind-policy-two")).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains("false") && t.contains("kind 1 is not allowed")),
+        "{msgs:?}"
+    );
+    ws.send(Message::Text(
+        json!(["REQ", "w1", {"limit": 10}]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        !msgs.iter().any(|t| t.contains("kind-policy-one")),
+        "wildcard REQ must not return a disallowed kind, got {msgs:?}"
+    );
+
+    // allowkind restores both admission and visibility.
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowkind", json!([1])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let msgs = ws_publish(&mut ws, publish("kind-policy-three")).await;
+    assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
+    ws.send(Message::Text(
+        json!(["REQ", "w2", {"limit": 10}]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        msgs.iter().any(|t| t.contains("kind-policy-one")),
+        "allowkind must restore visibility, got {msgs:?}"
+    );
+
+    handle.request_shutdown();
+}
+
+/// A DB change queued before a ban commits must not deliver the banned
+/// author's events afterwards: the live monitor rechecks moderation against
+/// committed state on every batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip86_ban_suppresses_queued_live_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (admin_pubkey, _) = admin_key.x_only_public_key();
+    let alice_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (alice_pubkey, _) = alice_key.x_only_public_key();
+    let alice_hex = hex::encode(alice_pubkey.serialize());
+
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let url = format!("ws://{addr}/");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws.send(Message::Text(
+        json!(["REQ", "live", {"kinds": [1]}]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let _ = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+
+    // Out-of-band writer, like a co-resident import: bypasses the relay's
+    // ingest enforcement entirely.
+    let env2 = Env::open(
+        dir.path(),
+        EnvOptions {
+            create_dir: false,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    let external_write = |content: &str| {
+        let ev = sign_event_with_key(
+            json!({"created_at": now_secs(), "kind": 1, "tags": [], "content": content}),
+            &alice_key,
+        );
+        let parsed = wok_event::parse_and_verify_event(
+            &ev,
+            &wok_event::EventLimits::default(),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let mut evs = vec![wok_db::EventToWrite::new(
+            parsed.packed.into_bytes(),
+            parsed.json,
+        )];
+        let mut txn = env2.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut evs, false).unwrap();
+        txn.commit().unwrap();
+    };
+
+    // Baseline: an external write is delivered live.
+    external_write("queued-live-before-ban");
+    let msgs = recv_until(&mut ws, |t| t.contains("queued-live-before-ban")).await;
+    assert!(
+        msgs.iter().any(|t| t.contains("queued-live-before-ban")),
+        "{msgs:?}"
+    );
+
+    // Ban, then an external write of the banned author: never delivered.
+    let (_, result) = nip86_rpc(addr, &admin_key, "banpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    external_write("queued-live-after-ban");
+    let mut delivered = false;
+    for _ in 0..6 {
+        if let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_millis(300), ws.next()).await
+        {
+            if msg
+                .to_text()
+                .unwrap_or("")
+                .contains("queued-live-after-ban")
+            {
+                delivered = true;
+            }
+        }
+    }
+    assert!(!delivered, "banned author's queued event must not go live");
+
+    // Unban: external writes flow again.
+    let (_, result) = nip86_rpc(addr, &admin_key, "unbanpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    external_write("queued-live-after-unban");
+    let msgs = recv_until(&mut ws, |t| t.contains("queued-live-after-unban")).await;
+    assert!(
+        msgs.iter().any(|t| t.contains("queued-live-after-unban")),
+        "{msgs:?}"
+    );
+
+    handle.request_shutdown();
+}

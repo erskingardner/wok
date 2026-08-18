@@ -27,7 +27,7 @@ use wok_db::{
     backfill_vanish_markers, is_event_moderated_ro, is_event_vanished_ro,
     load_moderation_snapshot_ro, lookup_event_by_id_ro, moderation_reason_ro, most_recent_levid_ro,
     report_event, sweep_vanished_events, write_events_with_policy, Decompressor, Env, EventToWrite,
-    EventWriteStatus, ModerationSnapshot, VANISH_KIND,
+    EventWriteStatus, ModerationSnapshot, MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
@@ -2087,6 +2087,8 @@ fn run_writer(
             meta.push(conn_id);
             evs.push(ev);
         }
+        let report_capacity =
+            MAX_MODERATION_RECORDS.saturating_sub(moderation.read().reported_events.len());
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
             if negentropy_max_tags != cfg_snap.relay.max_tags_per_filter {
@@ -2100,7 +2102,7 @@ fn run_writer(
                 false,
                 &vanish_policy,
             )?;
-            let reports = record_reports(&mut txn, &evs);
+            let report_updates = record_reports(&mut txn, &evs, report_capacity);
             if cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events != 0 {
                 let stored = txn.entries(txn.env().dbis().event)? as u64;
                 if stored > cfg_snap.relay.abuse.max_stored_events {
@@ -2114,42 +2116,38 @@ fn run_writer(
                 }
             }
             txn.commit()?;
-            Ok::<_, wok_db::DbError>(reports)
+            Ok::<_, wok_db::DbError>(report_updates)
         })();
-        let reports_recorded = match &write_res {
-            Ok(reports) => *reports,
-            Err(_) => 0,
+        let report_updates = match write_res {
+            Ok(report_updates) => report_updates,
+            Err(error) => {
+                // The transaction aborted; nothing was written this batch.
+                for memo in quota_counts.values_mut() {
+                    memo.pending = 0;
+                }
+                for (i, conn_id) in meta.iter().enumerate() {
+                    let id_hex = PackedEventView::new(&evs[i].packed)
+                        .map(|p| to_hex(p.id()))
+                        .unwrap_or_else(|_| "?".into());
+                    conns.send(
+                        *conn_id,
+                        RelayMessage::Ok {
+                            event_id: id_hex,
+                            accepted: false,
+                            message: format!("Write error: {error}"),
+                        },
+                        &metrics,
+                    );
+                }
+                continue;
+            }
         };
-        if let Err(error) = write_res {
-            // The transaction aborted; nothing was written this batch.
-            for memo in quota_counts.values_mut() {
-                memo.pending = 0;
-            }
-            for (i, conn_id) in meta.iter().enumerate() {
-                let id_hex = PackedEventView::new(&evs[i].packed)
-                    .map(|p| to_hex(p.id()))
-                    .unwrap_or_else(|_| "?".into());
-                conns.send(
-                    *conn_id,
-                    RelayMessage::Ok {
-                        event_id: id_hex,
-                        accepted: false,
-                        message: format!("Write error: {error}"),
-                    },
-                    &metrics,
-                );
-            }
-            continue;
-        }
-        if reports_recorded > 0 {
-            // New moderation-queue entries committed with this batch; refresh
-            // the snapshot the management API lists from.
-            match env
-                .begin_ro()
-                .and_then(|txn| load_moderation_snapshot_ro(&txn))
-            {
-                Ok(snap) => *moderation.write() = snap,
-                Err(error) => tracing::warn!(%error, "moderation snapshot refresh failed"),
+        if !report_updates.is_empty() {
+            // The writer serializes both management commands and report
+            // inserts, so committed deltas can update the snapshot directly.
+            let mut snapshot = moderation.write();
+            for (id, reason) in report_updates {
+                snapshot.reported_events.insert(id, reason);
             }
         }
         let quota_enabled =
@@ -2219,10 +2217,16 @@ const MAX_REPORT_TARGETS: usize = 64;
 
 /// Record NIP-86 moderation-queue entries for kind 1984 reports written in
 /// this batch. Runs inside the same transaction so a stored report and its
-/// queue entries commit atomically. Queue-cap exhaustion is logged, never
-/// fatal to the event write. Returns how many queue entries were recorded.
-fn record_reports(txn: &mut wok_db::RwTxn<'_>, evs: &[EventToWrite]) -> usize {
-    let mut recorded = 0usize;
+/// queue entries commit atomically. Queue-cap exhaustion is logged once per
+/// batch, never fatal to the event write. Returns the committed snapshot
+/// deltas without rescanning the moderation table.
+fn record_reports(
+    txn: &mut wok_db::RwTxn<'_>,
+    evs: &[EventToWrite],
+    mut new_records_remaining: usize,
+) -> HashMap<[u8; 32], String> {
+    let mut updates = HashMap::new();
+    let mut capacity_warned = false;
     for ev in evs {
         if ev.status != EventWriteStatus::Written {
             continue;
@@ -2242,19 +2246,24 @@ fn record_reports(txn: &mut wok_db::RwTxn<'_>, evs: &[EventToWrite]) -> usize {
                     .map(str::to_owned)
             })
             .unwrap_or_default();
-        let snippet: String = content.chars().take(200).collect();
-        let reason = if snippet.is_empty() {
-            format!("reported by {}", to_hex(packed.pubkey()))
-        } else {
-            format!("reported by {}: {snippet}", to_hex(packed.pubkey()))
-        };
+        let reason = report_reason(packed.pubkey(), &content);
         let mut targets = 0usize;
         packed.foreach_tag(|name, value| {
             if name == 'e' && value.len() == 32 && targets < MAX_REPORT_TARGETS {
                 let mut id = [0u8; 32];
                 id.copy_from_slice(value);
-                match report_event(txn, &id, &reason) {
-                    Ok(()) => recorded += 1,
+                match report_event(txn, &id, &reason, &mut new_records_remaining) {
+                    Ok(true) => {
+                        updates.insert(id, reason.clone());
+                    }
+                    Ok(false) if !capacity_warned => {
+                        capacity_warned = true;
+                        tracing::warn!(
+                            limit = MAX_MODERATION_RECORDS,
+                            "moderation queue capacity reached; dropping new targets"
+                        );
+                    }
+                    Ok(false) => {}
                     Err(error) => {
                         tracing::warn!(event_id = %to_hex(&id), %error, "moderation queue insert failed")
                     }
@@ -2264,7 +2273,22 @@ fn record_reports(txn: &mut wok_db::RwTxn<'_>, evs: &[EventToWrite]) -> usize {
             true
         });
     }
-    recorded
+    updates
+}
+
+fn report_reason(pubkey: &[u8], content: &str) -> String {
+    let mut reason = format!("reported by {}", to_hex(pubkey));
+    if content.is_empty() {
+        return reason;
+    }
+    reason.push_str(": ");
+    for ch in content.chars().take(200) {
+        if reason.len().saturating_add(ch.len_utf8()) > MAX_REASON_BYTES {
+            break;
+        }
+        reason.push(ch);
+    }
+    reason
 }
 
 /// Apply a NIP-86 management mutation on the writer thread: commit to LMDB,
@@ -3178,6 +3202,38 @@ mod tests {
         let gift =
             PackedEventBuilder::build(&[5; 32], &[6; 32], 999, 21059, 0, &gift_tags).unwrap();
         assert!(event_matches_vanish_markers(gift.view(), &markers));
+    }
+
+    #[test]
+    fn multibyte_report_reason_is_bounded_and_reaches_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let first_target = [9u8; 32];
+        let dropped_target = [10u8; 32];
+        let mut tags = PackedEventTagBuilder::default();
+        tags.add('e', &first_target).unwrap();
+        tags.add('e', &dropped_target).unwrap();
+        let packed =
+            PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 1, REPORT_KIND, 0, &tags).unwrap();
+        let mut report = EventToWrite::new(
+            packed.into_bytes(),
+            json!({"content": "💥".repeat(200)}).to_string(),
+        );
+        report.status = EventWriteStatus::Written;
+
+        let mut txn = env.begin_rw().unwrap();
+        let updates = record_reports(&mut txn, &[report], 1);
+        txn.commit().unwrap();
+        assert_eq!(updates.len(), 1);
+        let reason = updates.get(&first_target).unwrap();
+        assert!(reason.len() <= MAX_REASON_BYTES);
+        assert!(reason.contains('💥'));
+
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(
+            wok_db::list_reported_events_ro(&txn).unwrap(),
+            vec![(first_target, reason.clone())]
+        );
     }
 
     #[tokio::test]

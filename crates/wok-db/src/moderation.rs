@@ -565,15 +565,32 @@ pub fn unblock_ip(txn: &mut RwTxn<'_>, ip: &str) -> Result<(), DbError> {
 }
 
 /// Record an event id as needing moderation (from a NIP-56 kind 1984 report).
-pub fn report_event(txn: &mut RwTxn<'_>, id: &[u8; 32], reason: &str) -> Result<(), DbError> {
+///
+/// `new_records_remaining` is maintained by the single relay writer from its
+/// authoritative moderation snapshot. Existing records may still be updated
+/// at capacity. Returns `false` only when a new record would exceed the cap.
+pub fn report_event(
+    txn: &mut RwTxn<'_>,
+    id: &[u8; 32],
+    reason: &str,
+    new_records_remaining: &mut usize,
+) -> Result<bool, DbError> {
     validate_reason(reason)?;
-    put_record(
-        txn,
-        PREFIX_REPORTED_EVENT,
-        id,
-        reason.as_bytes(),
-        MAX_MODERATION_RECORDS,
-    )
+    let dbi = txn
+        .env()
+        .dbis()
+        .moderation
+        .ok_or_else(|| DbError::msg("NIP-86 moderation database is unavailable"))?;
+    let key = prefixed(PREFIX_REPORTED_EVENT, id);
+    let is_new = txn.get(dbi, &key)?.is_none();
+    if is_new && *new_records_remaining == 0 {
+        return Ok(false);
+    }
+    txn.put(dbi, &key, reason.as_bytes(), 0)?;
+    if is_new {
+        *new_records_remaining -= 1;
+    }
+    Ok(true)
 }
 
 pub fn clear_reported_event(txn: &mut RwTxn<'_>, id: &[u8; 32]) -> Result<(), DbError> {
@@ -759,7 +776,14 @@ mod tests {
         allow_pubkey(&mut txn, &[8u8; 32], "").unwrap();
         ban_event(&mut txn, &id, "illegal").unwrap();
         block_ip(&mut txn, "203.0.113.7", "botnet").unwrap();
-        report_event(&mut txn, &[4u8; 32], "reported by alice").unwrap();
+        let mut report_capacity = MAX_MODERATION_RECORDS;
+        assert!(report_event(
+            &mut txn,
+            &[4u8; 32],
+            "reported by alice",
+            &mut report_capacity,
+        )
+        .unwrap());
         put_role(
             &mut txn,
             &Role {
@@ -850,6 +874,24 @@ mod tests {
         let long = "x".repeat(MAX_REASON_BYTES + 1);
         assert!(ban_pubkey(&mut txn, &[1u8; 32], &long).is_err());
         txn.abort();
+    }
+
+    #[test]
+    fn reported_event_capacity_allows_updates_without_new_records() {
+        let (_dir, env) = test_env();
+        let existing = [1u8; 32];
+        let dropped = [2u8; 32];
+        let mut remaining = 1usize;
+        let mut txn = env.begin_rw().unwrap();
+        assert!(report_event(&mut txn, &existing, "first", &mut remaining).unwrap());
+        assert_eq!(remaining, 0);
+        assert!(!report_event(&mut txn, &dropped, "full", &mut remaining).unwrap());
+        assert!(report_event(&mut txn, &existing, "updated", &mut remaining).unwrap());
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro().unwrap();
+        let reported = list_reported_events_ro(&txn).unwrap();
+        assert_eq!(reported, vec![(existing, "updated".to_string())]);
     }
 
     #[test]

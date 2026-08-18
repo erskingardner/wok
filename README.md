@@ -65,7 +65,8 @@ cargo build --release -p wok-cli
 
 The binary is `target/release/wok`. Requires a recent stable Rust (2021
 edition); LMDB and zstd are built from vendored sources by the `lmdb-sys`/`zstd`
-crates, so no system libraries are needed beyond a C toolchain.
+crates, and outbound TLS uses Rustls with the operating system's native root
+certificate store, so no system libraries are needed beyond a C toolchain.
 
 Tagged releases publish checksummed native archives for Linux x86-64/ARM64 and
 macOS Intel/Apple Silicon. See [CHANGELOG.md](CHANGELOG.md) for notable changes

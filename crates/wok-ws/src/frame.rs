@@ -517,25 +517,24 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
                 let deadline =
                     frame_deadline.get_or_insert_with(|| tokio::time::Instant::now() + gap);
                 match tokio::time::timeout_at(*deadline, stream.read_buf(&mut parser.buf)).await {
-                    Ok(res) => {
-                        let n = res?;
-                        if n > 0 {
-                            *frame_deadline = Some(tokio::time::Instant::now() + gap);
-                        }
-                        n
-                    }
+                    Ok(res) => res?,
                     Err(_) => return Err(WsError::Protocol("frame read timeout")),
                 }
             }
-            None => {
-                *frame_deadline = None;
-                stream.read_buf(&mut parser.buf).await?
-            }
+            None => stream.read_buf(&mut parser.buf).await?,
         };
         if n == 0 {
             return Err(WsError::Protocol("eof"));
         }
         parser.drain_events_into(events)?;
+        // Arm or advance the deadline after every read that leaves assembly
+        // pending — including the empty-to-partial transition where this
+        // same read also produced events — so the guard is armed before the
+        // caller dispatches those events (dispatch can await backpressure).
+        if let Some(gap) = frame_idle_timeout {
+            *frame_deadline = (!parser.buf.is_empty() || parser.frag_opcode.is_some())
+                .then(|| tokio::time::Instant::now() + gap);
+        }
         if !events.is_empty() {
             return Ok(());
         }
@@ -584,6 +583,38 @@ mod tests {
             WsEvent::Message(MessageKind::Text, p) => assert_eq!(p, b"hello"),
             _ => panic!(),
         }
+    }
+
+    #[tokio::test]
+    async fn read_events_into_arms_deadline_when_read_leaves_partial_frame() {
+        // One TCP read carries a complete text frame followed by the first
+        // byte of the next frame's header. The parser starts empty, the
+        // complete event is returned, and the partial successor stays
+        // buffered: the idle deadline must be armed for it before the
+        // caller dispatches the event (dispatch can await backpressure).
+        let mut wire = masked_frame(true, false, OP_TEXT, b"hi");
+        wire.push(0x81); // lone FIN+text opcode byte: partial next frame
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire).await.unwrap();
+
+        let mut parser = WsParser::new(1 << 20, None);
+        let mut events = Vec::new();
+        let mut deadline = None;
+        read_events_into(
+            &mut rx,
+            &mut parser,
+            &mut events,
+            Some(std::time::Duration::from_secs(30)),
+            &mut deadline,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            deadline.is_some(),
+            "deadline must be armed for the retained partial frame"
+        );
     }
 
     #[test]

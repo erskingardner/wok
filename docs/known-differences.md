@@ -46,6 +46,12 @@ it is not a promise to reproduce upstream bugs.
   table. The pinned strfry request worker attempts to view EventPayload JSON as
   PackedEvent, unlike its live-monitor path.
 - JSON input nesting is capped at 128 levels as a denial-of-service bound.
+- WebSocket connections have lifecycle timeouts strfry lacks: a pre-upgrade
+  HTTP header read deadline (`relay.handshake_timeout_secs`), an idle-gap
+  deadline while a partial frame or unfinished fragmented message is
+  buffered (`relay.frame_read_timeout_secs`), and ping/pong liveness (a ping
+  unanswered for a full `relay.auto_ping_seconds` interval closes the
+  connection).
 - Mesh client connections do not currently offer permessage-deflate. Wok's
   WebSocket server does negotiate it.
 

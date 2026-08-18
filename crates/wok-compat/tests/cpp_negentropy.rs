@@ -120,7 +120,7 @@ fn strfry_refuses_wok_owned_tree_database() {
     let mut recs = Vec::new();
     {
         let txn = env.begin_ro().unwrap();
-        wok_query::foreach_by_filter(&txn, &json!({}), u64::MAX, 64, |lev| {
+        wok_query::foreach_by_filter(&txn, &json!({}), u64::MAX, 64, 16, |lev| {
             if let Ok(Some(buf)) = wok_db::get_packed_ro(&txn, lev) {
                 let p = PackedEventView::new(&buf).unwrap();
                 recs.push((p.created_at(), p.id().to_vec()));

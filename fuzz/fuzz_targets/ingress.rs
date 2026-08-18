@@ -60,7 +60,9 @@ impl BTreeBackend for FuzzBackend {
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
-        let _ = wok_event::json::parse_strict(text);
+        if let Ok(value) = wok_event::json::parse_strict(text) {
+            let _ = wok_query::NostrFilterGroup::from_value(&value, 500, 3, 16);
+        }
         let _ = ClientCommand::parse(text);
     }
     let _ = wok_event::PackedEventView::new(data);

@@ -69,7 +69,12 @@ impl ReadRestrictor {
                 .get(&'p')
                 .map(|t| t.size() > 0 && (0..t.size()).all(|i| t.at(i) == pk))
                 .unwrap_or(false);
-            if !author_scoped && !p_scoped {
+            let and_p_scoped = f
+                .and_tags
+                .get(&'p')
+                .map(|t| t.size() > 0 && (0..t.size()).all(|i| t.at(i) == pk))
+                .unwrap_or(false);
+            if !author_scoped && !p_scoped && !and_p_scoped {
                 return false;
             }
         }
@@ -111,9 +116,9 @@ mod tests {
     #[test]
     fn fully_restricted_kinds() {
         let r = ReadRestrictor::new(vec![4, 1059], true);
-        let fg = NostrFilterGroup::from_value(&json!({"kinds":[4]}), 500, 3).unwrap();
+        let fg = NostrFilterGroup::from_value(&json!({"kinds":[4]}), 500, 3, 16).unwrap();
         assert!(r.is_filter_group_fully_restricted(&fg));
-        let fg = NostrFilterGroup::from_value(&json!({"kinds":[1,4]}), 500, 3).unwrap();
+        let fg = NostrFilterGroup::from_value(&json!({"kinds":[1,4]}), 500, 3, 16).unwrap();
         assert!(!r.is_filter_group_fully_restricted(&fg));
     }
 
@@ -132,13 +137,55 @@ mod tests {
     #[test]
     fn count_without_kinds_cannot_leak_restricted_population() {
         let r = ReadRestrictor::new(vec![4, 1059], true);
-        let broad = NostrFilterGroup::from_value(&json!({}), 500, 3).unwrap();
+        let broad = NostrFilterGroup::from_value(&json!({}), 500, 3, 16).unwrap();
         assert!(!r.is_filter_allowed_to_count(&broad, None));
         assert!(!r.is_filter_allowed_to_count(&broad, Some(&[9u8; 32])));
 
         let scoped =
-            NostrFilterGroup::from_value(&json!({"authors":[hex::encode([9u8; 32])]}), 500, 3)
+            NostrFilterGroup::from_value(&json!({"authors":[hex::encode([9u8; 32])]}), 500, 3, 16)
                 .unwrap();
         assert!(r.is_filter_allowed_to_count(&scoped, Some(&[9u8; 32])));
+    }
+
+    #[test]
+    fn nip91_required_p_tag_safely_scopes_restricted_count() {
+        let r = ReadRestrictor::new(vec![4], true);
+        let authed = [9u8; 32];
+        let other = [8u8; 32];
+        let scoped = NostrFilterGroup::from_value(
+            &json!({
+                "kinds":[4],
+                "&p":[hex::encode(authed)],
+                "#p":[hex::encode(authed)]
+            }),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert!(r.is_filter_allowed_to_count(&scoped, Some(&authed)));
+        assert!(!r.is_filter_allowed_to_count(&scoped, Some(&[7u8; 32])));
+
+        let ambiguous_and = NostrFilterGroup::from_value(
+            &json!({
+                "kinds":[4],
+                "&p":[hex::encode(authed), hex::encode(other)],
+                "#p":[hex::encode(authed), hex::encode(other)]
+            }),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert!(!r.is_filter_allowed_to_count(&ambiguous_and, Some(&authed)));
+
+        let unsafe_or = NostrFilterGroup::from_value(
+            &json!({"kinds":[4], "#p":[hex::encode(authed), hex::encode(other)]}),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert!(!r.is_filter_allowed_to_count(&unsafe_or, Some(&authed)));
     }
 }

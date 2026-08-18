@@ -104,7 +104,8 @@ interface or protect the path at the reverse proxy.
 | `relay.frame_read_timeout_secs` | `30` | Live (new connections) | No | Maximum idle gap between socket reads while a partial WebSocket frame or unfinished fragmented message is buffered (slow-trickle guard); zero disables it. |
 | `relay.query_timeslice_budget_us` | `10000` | Live | Yes | Query CPU budget before cooperative yielding. |
 | `relay.max_filter_limit` | `500` | Live | Yes | Maximum normal REQ filter limit. |
-| `relay.max_tags_per_filter` | `3` | Live | Yes | Maximum tag query keys in one filter. |
+| `relay.max_tags_per_filter` | `3` | Live | Yes | Maximum distinct tag names across `#` and NIP-91 `&` query keys in one filter. |
+| `relay.max_and_entries` | `16` | Live | Yes | Maximum distinct values across all NIP-91 `&` query keys in one filter; zero disables NIP-91 and removes it from NIP-11. |
 | `relay.max_filter_limit_count` | `1000000` | Live | Yes | Maximum COUNT filter limit. |
 | `relay.max_total_events_per_req` | `2000` | Live | Yes | Deduplicated historical events across a REQ; zero is unlimited. |
 | `relay.max_subs_per_connection` | `200` | Live | Yes | Simultaneous subscriptions per connection. |

@@ -17,6 +17,7 @@ pub struct RelayCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityCondition {
     Always,
+    AdminEnabled,
     AuthConfigured,
     CountEnabled,
     NegentropyEnabled,
@@ -29,6 +30,7 @@ impl CapabilityCondition {
     fn is_enabled(self, cfg: &Config) -> bool {
         match self {
             Self::Always => true,
+            Self::AdminEnabled => cfg.admin.enabled && !cfg.admin.pubkeys.is_empty(),
             Self::AuthConfigured => {
                 cfg.relay.auth.enabled && !cfg.relay.auth.service_url.is_empty()
             }
@@ -109,6 +111,11 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
         name: "Negentropy syncing",
         enabled_when: CapabilityCondition::NegentropyEnabled,
     },
+    RelayCapability {
+        nip: 86,
+        name: "Relay management API",
+        enabled_when: CapabilityCondition::AdminEnabled,
+    },
 ];
 
 pub fn relay_capabilities(cfg: &Config) -> Vec<RelayCapability> {
@@ -150,6 +157,16 @@ mod tests {
 
         cfg.relay.abuse.min_pow_difficulty = 20;
         assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 13, 40, 42, 50, 62, 70]);
+    }
+
+    #[test]
+    fn nip86_requires_enabled_admin_with_pubkeys() {
+        let mut cfg = Config::default();
+        assert!(!supported_nips(&cfg).contains(&86));
+        cfg.admin.enabled = true;
+        assert!(!supported_nips(&cfg).contains(&86));
+        cfg.admin.pubkeys = vec!["ab".repeat(32)];
+        assert!(supported_nips(&cfg).contains(&86));
     }
 
     #[test]

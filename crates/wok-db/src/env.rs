@@ -17,7 +17,8 @@ use crate::comparators::{
 use crate::error::check;
 use crate::fbs::{decode_meta, encode_meta, encode_negentropy_filter, Meta};
 use crate::schema::{
-    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_META, DBI_VANISH_PUBKEY,
+    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_META, DBI_MODERATION,
+    DBI_VANISH_PUBKEY,
 };
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
@@ -75,6 +76,8 @@ pub struct Dbis {
     pub event_search: Option<MDB_dbi>,
     /// Absent only while inspecting an unmodified strfry v3 source.
     pub vanish_pubkey: Option<MDB_dbi>,
+    /// Absent only while inspecting an unmodified strfry v3 source.
+    pub moderation: Option<MDB_dbi>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -200,7 +203,10 @@ impl Env {
         for spec in dbi_specs() {
             let cname = CString::new(spec.name).unwrap();
             let mut dbi: MDB_dbi = 0;
-            let wok_only = matches!(spec.name, DBI_EVENT_SEARCH | DBI_VANISH_PUBKEY);
+            let wok_only = matches!(
+                spec.name,
+                DBI_EVENT_SEARCH | DBI_VANISH_PUBKEY | DBI_MODERATION
+            );
             let foreign_source = wok_only && !opened.is_empty() && {
                 let version = match meta_version_in_open_txn(txn, opened[0]) {
                     Ok(version) => version,
@@ -274,6 +280,7 @@ impl Env {
             negentropy: opened[15],
             event_search: (opened[16] != 0).then_some(opened[16]),
             vanish_pubkey: (opened[17] != 0).then_some(opened[17]),
+            moderation: (opened[18] != 0).then_some(opened[18]),
         };
 
         if let Err(e) = unsafe { check(mdb_txn_commit(txn)) } {

@@ -69,7 +69,9 @@ with `wok migrate strfry`: a read-only v3 snapshot is verified, assigned Wok's
 v4 ownership marker, and promoted atomically with translated config and a
 manifest. Protocol work now follows the NIPs-first policy in
 `docs/compatibility-policy.md`; inherited strfry bugs are candidates for fixes,
-not permanent compatibility requirements.
+not permanent compatibility requirements. Post-migration feature work beyond
+the strfry baseline includes NIP-50 search, NIP-45 HLL sketches, and the
+NIP-86 management API (`docs/nip86.md`).
 
 ## Non-goals
 

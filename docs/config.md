@@ -136,6 +136,7 @@ control boundary.
 | `relay.auth.service_url` | empty | Public relay URL placed in and checked against AUTH challenges. |
 | `relay.auth.restricted_read_kinds` | `[4, 1059]` | Kinds hidden from unauthenticated historical reads. |
 | `relay.auth.restrict_read_to_involved_pubkey` | `true` | Restrict authenticated reads to the author or first `p`-tag recipient. |
+| `relay.auth.restrict_writes` | `false` | Only NIP-86 allowlisted or role-holding pubkeys (and operator admins) may write. See [nip86.md](nip86.md). |
 
 Private reads fail closed until `service_url` is configured. Clearing
 `restricted_read_kinds` restores unrestricted history, but Wok stops

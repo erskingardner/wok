@@ -21,6 +21,7 @@ arbitrary list.
 | 62 | Request to Vanish | persistent maximum-timestamp markers, immediate query/rebroadcast suppression, gift-wrap recipient cleanup, and bounded physical deletion | `nip62_vanish.rs`, relay e2e | `relay.nip62.enabled` |
 | 70 | Protected events | `-` tag + AUTH | `nip_conformance.rs` | always |
 | 77 | Negentropy | `wok-negentropy` | protocol unit tests | `negentropy.enabled` |
+| 86 | Relay management API | `wok-ws` RPC + `wok-db` moderation tables + `wok-relay` enforcement | `e2e_transports.rs` | `admin.enabled` with operator pubkeys |
 
 NIP-02, NIP-04, and NIP-28 event kinds are accepted and stored, but those
 client/application semantics are deliberately not advertised as relay
@@ -46,3 +47,10 @@ relay immediately suppresses qualifying authored events and gift wraps for the
 requesting recipient, prevents rebroadcast, then physically deletes them in
 bounded background batches. The request itself remains stored and cannot be
 deleted with kind 5. See `relay.nip62` in the sample configuration.
+
+NIP-86 management calls are JSON-RPC-like POSTs to the relay URI authorized
+by NIP-98 events from operator admins or role-holding moderators. Bans
+suppress rather than delete; allowlists gate writes only when
+`relay.auth.restrict_writes` is set; kind-1984 reports feed the moderation
+queue. See [NIP-86 management](nip86.md) for levels, role semantics, and the
+method table.

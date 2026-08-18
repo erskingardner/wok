@@ -9,6 +9,7 @@
 use crate::abuse::{leading_zero_bits, AbuseController, BudgetKind};
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
+use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{ClientCommand, RelayMessage};
 use crate::restrict::ReadRestrictor;
@@ -23,9 +24,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use wok_db::{
-    backfill_vanish_markers, is_event_vanished_ro, lookup_event_by_id_ro, most_recent_levid_ro,
-    sweep_vanished_events, write_events_with_policy, Decompressor, Env, EventToWrite,
-    EventWriteStatus, VANISH_KIND,
+    backfill_vanish_markers, is_event_moderated_ro, is_event_vanished_ro,
+    load_moderation_snapshot_ro, lookup_event_by_id_ro, moderation_reason_ro, most_recent_levid_ro,
+    report_event, sweep_vanished_events, write_events_with_policy, Decompressor, Env, EventToWrite,
+    EventWriteStatus, ModerationSnapshot, MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
@@ -216,10 +218,14 @@ pub struct RelayHandle {
     next_id: Arc<AtomicU64>,
     pub metrics: Arc<Metrics>,
     pub config: Arc<parking_lot::RwLock<Config>>,
+    /// In-memory copy of the NIP-86 moderation tables, refreshed by the
+    /// writer thread after every management mutation.
+    pub moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     abuse: Arc<AbuseController>,
     config_path: Arc<parking_lot::RwLock<Option<std::path::PathBuf>>>,
+    writer_tx: Sender<WriterMsg>,
 }
 
 pub enum IngestMsg {
@@ -244,6 +250,15 @@ enum WriterMsg {
     Close {
         conn_id: u64,
     },
+    /// NIP-86 mutation plus the reply channel for the HTTP handler. Runs on
+    /// the single writer thread so the LMDB change and the snapshot refresh
+    /// are ordered against event writes.
+    Management(ManagementMsg),
+}
+
+pub struct ManagementMsg {
+    pub cmd: ManagementCmd,
+    pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 enum ReqMsg {
@@ -323,6 +338,15 @@ impl RelayHandle {
 
     /// Apply the connection-opening budget before a WebSocket upgrade.
     pub fn admit_connection(&self, ip: &[u8]) -> bool {
+        if !ip.is_empty() {
+            let rendered = render_ip(ip);
+            if self.moderation.read().blocked_ips.contains_key(&rendered) {
+                self.metrics
+                    .abuse_connection_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
         let cfg = self.config.read();
         let admitted = self
             .abuse
@@ -333,6 +357,17 @@ impl RelayHandle {
                 .fetch_add(1, Ordering::Relaxed);
         }
         admitted
+    }
+
+    /// Apply a NIP-86 management mutation on the writer thread and wait for
+    /// the LMDB commit plus in-memory snapshot refresh.
+    pub async fn manage(&self, cmd: ManagementCmd) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.writer_tx
+            .try_send(WriterMsg::Management(ManagementMsg { cmd, reply }))
+            .map_err(|_| "relay writer queue is full".to_string())?;
+        rx.await
+            .map_err(|_| "relay writer shut down before replying".to_string())?
     }
 
     pub async fn client_message(&self, conn_id: u64, ip: impl Into<Arc<[u8]>>, payload: String) {
@@ -423,16 +458,24 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let (neg_txs, neg_rxs): (Vec<_>, Vec<_>) =
         (0..n_negentropy).map(|_| bounded::<NegMsg>(4096)).unzip();
 
+    let moderation = Arc::new(parking_lot::RwLock::new(
+        env.begin_ro()
+            .and_then(|txn| load_moderation_snapshot_ro(&txn))
+            .map_err(|e| format!("NIP-86 moderation load failed: {e}"))?,
+    ));
+
     let handle = RelayHandle {
         ingest: ingest_txs,
         conns: conns.clone(),
         next_id: Arc::new(AtomicU64::new(1)),
         metrics: metrics.clone(),
         config: config.clone(),
+        moderation: moderation.clone(),
         shutdown: shutdown.clone(),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         abuse: abuse.clone(),
         config_path: Arc::new(parking_lot::RwLock::new(None)),
+        writer_tx: writer_tx.clone(),
     };
 
     for (i, ingest_rx) in ingest_rxs.into_iter().enumerate() {
@@ -444,11 +487,13 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let req_txs = req_txs.clone();
         let neg_txs = neg_txs.clone();
         let abuse = abuse.clone();
+        let moderation = moderation.clone();
         thread::Builder::new()
             .name(format!("ingester-{i}"))
             .spawn(move || {
                 run_ingester(
-                    env, cfg, conns, metrics, abuse, ingest_rx, writer_tx, req_txs, neg_txs,
+                    env, cfg, conns, metrics, abuse, moderation, ingest_rx, writer_tx, req_txs,
+                    neg_txs,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -470,7 +515,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let mon_txs = mon_txs.clone();
         thread::Builder::new()
             .name("writer".into())
-            .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_txs))
+            .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_txs, moderation))
             .map_err(|e| e.to_string())?;
     }
     for (i, req_rx) in req_rxs.into_iter().enumerate() {
@@ -657,6 +702,7 @@ fn run_ingester(
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     abuse: Arc<AbuseController>,
+    moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
     writer_tx: Sender<WriterMsg>,
     req_txs: Vec<Sender<ReqMsg>>,
@@ -687,8 +733,19 @@ fn run_ingester(
                 // the hottest ingress path even though reloads are rare.
                 let cfg_snap = cfg.read();
                 handle_client(
-                    &env, &cfg_snap, &conns, &metrics, &abuse, &mut auth, conn_id, ip, &payload,
-                    &writer_tx, &req_txs, &neg_txs,
+                    &env,
+                    &cfg_snap,
+                    &conns,
+                    &metrics,
+                    &abuse,
+                    &moderation,
+                    &mut auth,
+                    conn_id,
+                    ip,
+                    &payload,
+                    &writer_tx,
+                    &req_txs,
+                    &neg_txs,
                 );
             }
         }
@@ -702,6 +759,7 @@ fn handle_client(
     conns: &ConnTable,
     metrics: &Metrics,
     abuse: &AbuseController,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     ip: Arc<[u8]>,
@@ -738,7 +796,7 @@ fn handle_client(
                 return;
             }
             ingest_event(
-                env, cfg, conns, metrics, abuse, auth, conn_id, ip, v, writer_tx,
+                env, cfg, conns, metrics, abuse, moderation, auth, conn_id, ip, v, writer_tx,
             );
         }
         ClientCommand::Auth(v) => {
@@ -972,6 +1030,7 @@ fn ingest_event(
     conns: &ConnTable,
     metrics: &Metrics,
     abuse: &AbuseController,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     ip: Arc<[u8]>,
@@ -1010,6 +1069,52 @@ fn ingest_event(
         kind = packed.kind(),
         "validated inbound event"
     );
+    {
+        let snap = moderation.read();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(packed.id());
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(packed.pubkey());
+        let rejected = if !snap.kind_allowed(packed.kind()) {
+            Some((
+                &metrics.moderation_kind_rejections,
+                format!(
+                    "restricted: kind {} is not allowed by this relay",
+                    packed.kind()
+                ),
+            ))
+        } else if snap.banned_events.contains_key(&id) {
+            Some((
+                &metrics.moderation_banned_event_rejections,
+                "restricted: event is banned by the relay operator".to_string(),
+            ))
+        } else if snap.banned_pubkeys.contains_key(&pubkey) {
+            Some((
+                &metrics.moderation_banned_author_rejections,
+                "restricted: author is banned by the relay operator".to_string(),
+            ))
+        } else if !write_permitted(cfg, &snap, &pubkey) {
+            Some((
+                &metrics.moderation_restricted_write_rejections,
+                "restricted: writes are restricted to allowlisted pubkeys".to_string(),
+            ))
+        } else {
+            None
+        };
+        if let Some((counter, message)) = rejected {
+            counter.fetch_add(1, Ordering::Relaxed);
+            conns.send(
+                conn_id,
+                RelayMessage::Ok {
+                    event_id: id_hex,
+                    accepted: false,
+                    message,
+                },
+                metrics,
+            );
+            return;
+        }
+    }
     let is_vanish_request = packed.kind() == VANISH_KIND;
     if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
         conns.send(
@@ -1552,11 +1657,13 @@ fn run_writer(
     metrics: Arc<Metrics>,
     rx: Receiver<WriterMsg>,
     mon_txs: Vec<Sender<MonitorMsg>>,
+    moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
     let mut negentropy_max_tags = cfg.read().relay.max_tags_per_filter;
     let mut negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
     let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
+    let mut event_batch = Vec::with_capacity(WRITER_BATCH_MAX);
     let mut closed = std::collections::HashSet::new();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
     let mut events: Vec<(u64, EventToWrite)> = Vec::with_capacity(256);
@@ -1565,6 +1672,7 @@ fn run_writer(
     let mut meta: Vec<u64> = Vec::with_capacity(256);
     while let Ok(msg) = rx.recv() {
         batch.clear();
+        event_batch.clear();
         closed.clear();
         batch_vanish.clear();
         events.clear();
@@ -1588,13 +1696,25 @@ fn run_writer(
                 closed.insert(*conn_id);
             }
         }
+        // Management mutations take priority over every event in the drained
+        // batch. This closes the same-batch race where an event queued just
+        // before a ban/revocation could otherwise pass its stored-state
+        // recheck and be committed after the management command returned.
+        for m in batch.drain(..) {
+            if let WriterMsg::Management(msg) = m {
+                let result = apply_management(&env, &moderation, msg.cmd);
+                let _ = msg.reply.send(result);
+            } else {
+                event_batch.push(m);
+            }
+        }
         let cfg_snap = cfg.read().clone();
         let vanish_policy = cfg_snap.vanish_policy();
         // A valid vanish request and an ephemeral gift wrap can arrive in the
         // same drained writer batch. Compute the batch markers up front so a
         // live-only event cannot be broadcast immediately before its request
         // is persisted later in that batch.
-        for m in &batch {
+        for m in &event_batch {
             let WriterMsg::AddEvent {
                 conn_id,
                 packed,
@@ -1623,7 +1743,7 @@ fn run_writer(
                 .and_modify(|timestamp| *timestamp = (*timestamp).max(event.created_at()))
                 .or_insert(event.created_at());
         }
-        for m in batch.drain(..) {
+        for m in event_batch.drain(..) {
             if let WriterMsg::AddEvent {
                 conn_id,
                 ip,
@@ -1664,7 +1784,7 @@ fn run_writer(
                     )
                 };
                 if res == PluginResult::Accept {
-                    if !is_vanish_request {
+                    {
                         let packed_view = match PackedEventView::new(&packed) {
                             Ok(event) => event,
                             Err(error) => {
@@ -1680,13 +1800,31 @@ fn run_writer(
                                 continue;
                             }
                         };
-                        let stored_suppression = env
-                            .begin_ro()
-                            .and_then(|txn| is_event_vanished_ro(&txn, packed_view));
-                        let suppressed = match stored_suppression {
-                            Ok(value) => {
-                                value || event_matches_vanish_markers(packed_view, &batch_vanish)
-                            }
+                        let mut author = [0u8; 32];
+                        author.copy_from_slice(packed_view.pubkey());
+                        let stored_checks = env.begin_ro().and_then(|txn| {
+                            Ok::<_, wok_db::DbError>((
+                                if is_vanish_request {
+                                    false
+                                } else {
+                                    is_event_vanished_ro(&txn, packed_view)?
+                                },
+                                moderation_reason_ro(&txn, packed_view)?,
+                                // Recheck allowlist/role eligibility against
+                                // committed state: a ban/revocation may have
+                                // landed after the ingester's snapshot check.
+                                // Vanish requests bypass their own markers,
+                                // but not moderation or write restrictions.
+                                stored_write_permitted(&txn, &cfg_snap, &author)?,
+                            ))
+                        });
+                        let (vanished, moderated, write_allowed) = match stored_checks {
+                            Ok((vanished, moderated, write_allowed)) => (
+                                vanished
+                                    || event_matches_vanish_markers(packed_view, &batch_vanish),
+                                moderated,
+                                write_allowed,
+                            ),
                             Err(error) => {
                                 conns.send(
                                     conn_id,
@@ -1700,7 +1838,7 @@ fn run_writer(
                                 continue;
                             }
                         };
-                        if suppressed {
+                        if vanished {
                             let id_hex = PackedEventView::new(&packed)
                                 .map(|event| to_hex(event.id()))
                                 .unwrap_or_else(|_| "?".into());
@@ -1710,6 +1848,60 @@ fn run_writer(
                                     event_id: id_hex,
                                     accepted: false,
                                     message: "blocked: author or recipient requested vanish".into(),
+                                },
+                                &metrics,
+                            );
+                            continue;
+                        }
+                        if let Some(reason) = moderated {
+                            let (counter, message) = match reason {
+                                wok_db::ModerationReason::BannedEvent => (
+                                    &metrics.moderation_banned_event_rejections,
+                                    "restricted: event is banned by the relay operator".to_string(),
+                                ),
+                                wok_db::ModerationReason::BannedAuthor => (
+                                    &metrics.moderation_banned_author_rejections,
+                                    "restricted: author is banned by the relay operator"
+                                        .to_string(),
+                                ),
+                                wok_db::ModerationReason::KindNotAllowed => (
+                                    &metrics.moderation_kind_rejections,
+                                    format!(
+                                        "restricted: kind {} is not allowed by this relay",
+                                        packed_view.kind()
+                                    ),
+                                ),
+                            };
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            let id_hex = PackedEventView::new(&packed)
+                                .map(|event| to_hex(event.id()))
+                                .unwrap_or_else(|_| "?".into());
+                            conns.send(
+                                conn_id,
+                                RelayMessage::Ok {
+                                    event_id: id_hex,
+                                    accepted: false,
+                                    message,
+                                },
+                                &metrics,
+                            );
+                            continue;
+                        }
+                        if !write_allowed {
+                            metrics
+                                .moderation_restricted_write_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            let id_hex = PackedEventView::new(&packed)
+                                .map(|event| to_hex(event.id()))
+                                .unwrap_or_else(|_| "?".into());
+                            conns.send(
+                                conn_id,
+                                RelayMessage::Ok {
+                                    event_id: id_hex,
+                                    accepted: false,
+                                    message:
+                                        "restricted: writes are restricted to allowlisted pubkeys"
+                                            .into(),
                                 },
                                 &metrics,
                             );
@@ -1910,6 +2102,8 @@ fn run_writer(
             meta.push(conn_id);
             evs.push(ev);
         }
+        let report_capacity =
+            MAX_MODERATION_RECORDS.saturating_sub(moderation.read().reported_events.len());
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
             if negentropy_max_tags != cfg_snap.relay.max_tags_per_filter {
@@ -1923,6 +2117,7 @@ fn run_writer(
                 false,
                 &vanish_policy,
             )?;
+            let report_updates = record_reports(&mut txn, &evs, report_capacity);
             if cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events != 0 {
                 let stored = txn.entries(txn.env().dbis().event)? as u64;
                 if stored > cfg_snap.relay.abuse.max_stored_events {
@@ -1936,28 +2131,39 @@ fn run_writer(
                 }
             }
             txn.commit()?;
-            Ok::<_, wok_db::DbError>(())
+            Ok::<_, wok_db::DbError>(report_updates)
         })();
-        if let Err(error) = write_res {
-            // The transaction aborted; nothing was written this batch.
-            for memo in quota_counts.values_mut() {
-                memo.pending = 0;
+        let report_updates = match write_res {
+            Ok(report_updates) => report_updates,
+            Err(error) => {
+                // The transaction aborted; nothing was written this batch.
+                for memo in quota_counts.values_mut() {
+                    memo.pending = 0;
+                }
+                for (i, conn_id) in meta.iter().enumerate() {
+                    let id_hex = PackedEventView::new(&evs[i].packed)
+                        .map(|p| to_hex(p.id()))
+                        .unwrap_or_else(|_| "?".into());
+                    conns.send(
+                        *conn_id,
+                        RelayMessage::Ok {
+                            event_id: id_hex,
+                            accepted: false,
+                            message: format!("Write error: {error}"),
+                        },
+                        &metrics,
+                    );
+                }
+                continue;
             }
-            for (i, conn_id) in meta.iter().enumerate() {
-                let id_hex = PackedEventView::new(&evs[i].packed)
-                    .map(|p| to_hex(p.id()))
-                    .unwrap_or_else(|_| "?".into());
-                conns.send(
-                    *conn_id,
-                    RelayMessage::Ok {
-                        event_id: id_hex,
-                        accepted: false,
-                        message: format!("Write error: {error}"),
-                    },
-                    &metrics,
-                );
+        };
+        if !report_updates.is_empty() {
+            // The writer serializes both management commands and report
+            // inserts, so committed deltas can update the snapshot directly.
+            let mut snapshot = moderation.write();
+            for (id, reason) in report_updates {
+                snapshot.reported_events.insert(id, reason);
             }
-            continue;
         }
         let quota_enabled =
             cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0;
@@ -2017,6 +2223,106 @@ fn run_writer(
         }
         broadcast_db_change(&mon_txs);
     }
+}
+
+/// NIP-56 report kind; accepted reports feed the NIP-86 moderation queue.
+const REPORT_KIND: u64 = 1984;
+/// Most `e` tags harvested from one report event.
+const MAX_REPORT_TARGETS: usize = 64;
+
+/// Record NIP-86 moderation-queue entries for kind 1984 reports written in
+/// this batch. Runs inside the same transaction so a stored report and its
+/// queue entries commit atomically. Queue-cap exhaustion is logged once per
+/// batch, never fatal to the event write. Returns the committed snapshot
+/// deltas without rescanning the moderation table.
+fn record_reports(
+    txn: &mut wok_db::RwTxn<'_>,
+    evs: &[EventToWrite],
+    mut new_records_remaining: usize,
+) -> HashMap<[u8; 32], String> {
+    let mut updates = HashMap::new();
+    let mut capacity_warned = false;
+    for ev in evs {
+        if ev.status != EventWriteStatus::Written {
+            continue;
+        }
+        let Ok(packed) = PackedEventView::new(&ev.packed) else {
+            continue;
+        };
+        if packed.kind() != REPORT_KIND {
+            continue;
+        }
+        let content = serde_json::from_str::<Value>(&ev.json)
+            .ok()
+            .and_then(|event| {
+                event
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let reason = report_reason(packed.pubkey(), &content);
+        let mut targets = 0usize;
+        packed.foreach_tag(|name, value| {
+            if name == 'e' && value.len() == 32 && targets < MAX_REPORT_TARGETS {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(value);
+                match report_event(txn, &id, &reason, &mut new_records_remaining) {
+                    Ok(true) => {
+                        updates.insert(id, reason.clone());
+                    }
+                    Ok(false) if !capacity_warned => {
+                        capacity_warned = true;
+                        tracing::warn!(
+                            limit = MAX_MODERATION_RECORDS,
+                            "moderation queue capacity reached; dropping new targets"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(event_id = %to_hex(&id), %error, "moderation queue insert failed")
+                    }
+                }
+                targets += 1;
+            }
+            true
+        });
+    }
+    updates
+}
+
+fn report_reason(pubkey: &[u8], content: &str) -> String {
+    let mut reason = format!("reported by {}", to_hex(pubkey));
+    if content.is_empty() {
+        return reason;
+    }
+    reason.push_str(": ");
+    for ch in content.chars().take(200) {
+        if reason.len().saturating_add(ch.len_utf8()) > MAX_REASON_BYTES {
+            break;
+        }
+        reason.push(ch);
+    }
+    reason
+}
+
+/// Apply a NIP-86 management mutation on the writer thread: commit to LMDB,
+/// then atomically refresh the in-memory snapshot used by ingest and
+/// connection admission.
+fn apply_management(
+    env: &Env,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
+    cmd: ManagementCmd,
+) -> Result<(), String> {
+    let mut txn = env.begin_rw().map_err(|e| e.to_string())?;
+    cmd.apply(&mut txn).map_err(|e| e.to_string())?;
+    txn.commit().map_err(|e| e.to_string())?;
+    let snap = env
+        .begin_ro()
+        .and_then(|txn| load_moderation_snapshot_ro(&txn))
+        .map_err(|e| e.to_string())?;
+    *moderation.write() = snap;
+    Ok(())
 }
 
 fn event_matches_vanish_markers(
@@ -2098,7 +2404,9 @@ fn render_ip(ip: &[u8]) -> String {
         format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
     } else if ip.len() == 16 {
         let a: [u8; 16] = ip.try_into().unwrap_or([0; 16]);
-        std::net::Ipv6Addr::from(a).to_string()
+        let ipv6 = std::net::Ipv6Addr::from(a);
+        ipv6.to_ipv4_mapped()
+            .map_or_else(|| ipv6.to_string(), |ipv4| ipv4.to_string())
     } else {
         String::new()
     }
@@ -2304,6 +2612,7 @@ fn run_req_monitor(
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
                             if is_event_vanished_ro(&txn, packed).unwrap_or(true)
+                                || is_event_moderated_ro(&txn, packed).unwrap_or(true)
                                 || !r.should_send_to_subscriber(packed, pk)
                                 || (!requires_content && !sub.filter_group.does_match(packed))
                             {
@@ -2361,7 +2670,9 @@ fn run_req_monitor(
                     let requires_content = monitors.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if is_event_vanished_ro(&txn, packed).unwrap_or(true) {
+                            if is_event_vanished_ro(&txn, packed).unwrap_or(true)
+                                || is_event_moderated_ro(&txn, packed).unwrap_or(true)
+                            {
                                 return true;
                             }
                             let packed_recipients = if requires_content {
@@ -2410,6 +2721,11 @@ fn run_req_monitor(
                 }
                 MonitorMsg::Ephemeral { packed, json } => {
                     if let Ok(packed) = PackedEventView::new(&packed) {
+                        // Live-only events skip the database, but not the
+                        // moderation policy: id/author/kind checks all apply.
+                        if is_event_moderated_ro(&txn, packed).unwrap_or(true) {
+                            continue;
+                        }
                         let search_terms = if monitors.requires_content() {
                             Some(wok_db::event_search_terms(&json).unwrap_or_default())
                         } else {
@@ -2903,6 +3219,138 @@ mod tests {
         let gift =
             PackedEventBuilder::build(&[5; 32], &[6; 32], 999, 21059, 0, &gift_tags).unwrap();
         assert!(event_matches_vanish_markers(gift.view(), &markers));
+    }
+
+    #[test]
+    fn mapped_ipv6_peers_render_as_ipv4() {
+        assert_eq!(
+            render_ip(
+                &"::ffff:203.0.113.7"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            ),
+            "203.0.113.7"
+        );
+        assert_eq!(
+            render_ip(
+                &"2001:db8::1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            ),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn same_batch_ban_precedes_ordinary_and_vanish_writes() {
+        for kind in [1, VANISH_KIND] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+            env.ensure_initialized().unwrap();
+
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.nip62.enabled = true;
+            config.relay.nip62.service_url = "wss://relay.example.com".into();
+            let config = Arc::new(parking_lot::RwLock::new(config));
+            let conns = Arc::new(ConnTable::new());
+            let metrics = Arc::new(Metrics::default());
+            let moderation = Arc::new(parking_lot::RwLock::new(
+                env.begin_ro()
+                    .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                    .unwrap(),
+            ));
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+
+            let author = [kind as u8; 32];
+            let id = [(kind as u8).saturating_add(1); 32];
+            let tags = PackedEventTagBuilder::default();
+            let packed = PackedEventBuilder::build(&id, &author, 1, kind, 0, &tags).unwrap();
+            let json = json!({
+                "id": to_hex(&id),
+                "pubkey": to_hex(&author),
+                "created_at": 1,
+                "kind": kind,
+                "tags": [["relay", "ALL_RELAYS"]],
+                "content": "",
+                "sig": "00".repeat(64),
+            })
+            .to_string();
+
+            let (writer_tx, writer_rx) = bounded(4);
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    ip: Arc::from([127, 0, 0, 1]),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: None,
+                })
+                .unwrap();
+            let (reply, reply_rx) = tokio::sync::oneshot::channel();
+            writer_tx
+                .send(WriterMsg::Management(ManagementMsg {
+                    cmd: ManagementCmd::BanPubkey {
+                        pubkey: author,
+                        reason: "same batch".into(),
+                    },
+                    reply,
+                }))
+                .unwrap();
+            drop(writer_tx);
+
+            run_writer(
+                env.clone(),
+                config,
+                conns,
+                metrics,
+                writer_rx,
+                Vec::new(),
+                moderation,
+            );
+
+            assert!(reply_rx.blocking_recv().unwrap().is_ok());
+            let response = out_rx.try_recv().unwrap().into_text();
+            assert!(response.contains("false"), "{response}");
+            assert!(response.contains("author is banned"), "{response}");
+            let txn = env.begin_ro().unwrap();
+            assert_eq!(txn.entries(env.dbis().event).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn multibyte_report_reason_is_bounded_and_reaches_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let first_target = [9u8; 32];
+        let dropped_target = [10u8; 32];
+        let mut tags = PackedEventTagBuilder::default();
+        tags.add('e', &first_target).unwrap();
+        tags.add('e', &dropped_target).unwrap();
+        let packed =
+            PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 1, REPORT_KIND, 0, &tags).unwrap();
+        let mut report = EventToWrite::new(
+            packed.into_bytes(),
+            json!({"content": "💥".repeat(200)}).to_string(),
+        );
+        report.status = EventWriteStatus::Written;
+
+        let mut txn = env.begin_rw().unwrap();
+        let updates = record_reports(&mut txn, &[report], 1);
+        txn.commit().unwrap();
+        assert_eq!(updates.len(), 1);
+        let reason = updates.get(&first_target).unwrap();
+        assert!(reason.len() <= MAX_REASON_BYTES);
+        assert!(reason.contains('💥'));
+
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(
+            wok_db::list_reported_events_ro(&txn).unwrap(),
+            vec![(first_target, reason.clone())]
+        );
     }
 
     #[tokio::test]

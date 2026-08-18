@@ -27,6 +27,7 @@ Operator and design documentation. Code remains the authority for current behavi
 | `mesh-and-maintenance.md` | router/stream/sync, doctor, reindex |
 | `releases.md` | Tag and GitHub release process |
 | `nip50-search.md` | Search semantics and scoring |
+| `nip86.md` | Management API: methods, levels, ban/role semantics |
 
 ## Evidence / reports
 

@@ -8,6 +8,7 @@
 
 mod admin;
 pub mod frame;
+mod nip86;
 
 use bytes::Bytes;
 use frame::{
@@ -155,6 +156,18 @@ async fn dispatch(
     let path = req.uri().path().to_string();
     if matches!(path.as_str(), "/admin" | "/admin/") || path.starts_with("/admin/api/") {
         return admin::dispatch(req, handle, admin_state).await;
+    }
+    // NIP-86 management RPC arrives as an HTTP POST to the relay URI itself.
+    if path == "/"
+        && req.method() == hyper::Method::POST
+        && req
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with(nip86::RPC_CONTENT_TYPE))
+            .unwrap_or(false)
+    {
+        return nip86::dispatch(req, handle, admin_state).await;
     }
     let host = req
         .headers()

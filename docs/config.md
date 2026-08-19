@@ -242,3 +242,26 @@ All Unix-socket settings require restart and are file-only.
 | `relay.unix.max_pending_outbound_bytes` | `33554432` | Pending output budget before disconnect. |
 
 See [Unix socket protocol](unix-socket.md) for framing and peer authorization.
+
+## Native FIPS transport
+
+All native-FIPS settings require restart, are file-only, and are supported on
+Linux and FreeBSD. See [Native FIPS transport](fips-native.md) for daemon,
+permission, identity, lifecycle, and two-node test instructions.
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `relay.fips.enabled` | `false` | Bind the experimental native FIPS datagram listener. |
+| `relay.fips.socket_path` | `/run/fips/api.sock` | FIPS daemon native-API Unix socket. |
+| `relay.fips.port` | `7777` | Configurable FIPS application port; 0 through 1023 are rejected. |
+| `relay.fips.max_pending_outbound_bytes` | `33554432` | Pending Wok output budget before flow termination. |
+| `relay.fips.hello_retry_ms` | `250` | Initial bounded-backoff retry interval published for compatible connectors. |
+| `relay.fips.setup_timeout_secs` | `15` | Listener deadline for the opening `HELLO`. |
+| `relay.fips.incomplete_message_timeout_secs` | `30` | Monotonic expiry for incomplete messages and ordering gaps. |
+| `relay.fips.max_incomplete_messages` | `16` | Per-flow incomplete-message count bound. |
+| `relay.fips.max_reassembly_bytes` | `8388608` | Aggregate per-flow receive buffer bound; at least the logical-message limit. |
+| `relay.fips.max_chunks` | `4096` | Maximum chunks in one logical message. |
+| `relay.fips.max_completed_messages` | `16` | Completed later messages retained while waiting for ordering gaps. |
+
+FIPS V1 `DATA` delivery is not guaranteed. The FIPS node key identifies only
+the transport peer and never counts as NIP-42 authentication.

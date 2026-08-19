@@ -27,7 +27,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use wok_relay::{supported_nips, Config, Outbound, OutboundFrame, RelayHandle};
+use wok_relay::{supported_nips, Config, Outbound, OutboundFrame, RelayHandle, TransportSource};
 
 const SOFTWARE: &str = "git+https://github.com/erskingardner/wok.git";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -130,12 +130,9 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
-    let ip = match peer.ip() {
-        std::net::IpAddr::V4(value) => value.octets().to_vec(),
-        std::net::IpAddr::V6(value) => value.octets().to_vec(),
-    };
+    let source = TransportSource::ip_address(peer.ip());
     if is_ws_upgrade {
-        if !handle.admit_connection(&ip) {
+        if !handle.admit_connection(&source) {
             return text_status_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate-limited: connection budget exhausted",
@@ -147,7 +144,7 @@ async fn dispatch(
     // have no per-IP budget: every /admin/api attempt runs a Schnorr
     // verification before rejection, a straight unauthenticated CPU drain.
     // Gate them behind the connection budget.
-    if !handle.admit_connection(&ip) {
+    if !handle.admit_connection(&source) {
         return text_status_response(
             StatusCode::TOO_MANY_REQUESTS,
             "rate-limited: connection budget exhausted",
@@ -630,15 +627,7 @@ async fn handle_ws<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let conn_id = handle.next_conn_id();
-    handle
-        .metrics
-        .active_connections
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let ip: Arc<[u8]> = match peer.ip() {
-        std::net::IpAddr::V4(v) => Arc::from(v.octets()),
-        std::net::IpAddr::V6(v) => Arc::from(v.octets()),
-    };
+    let source = TransportSource::ip_address(peer.ip());
     let auto_ping = handle.config.read().relay.auto_ping_seconds;
     let frame_read_timeout = handle.config.read().relay.frame_read_timeout_secs;
     let frame_idle_timeout =
@@ -650,7 +639,8 @@ async fn handle_ws<S>(
     let max_pending = handle.config.read().relay.max_pending_outbound_bytes;
     let outbound = Outbound::new(tx, max_pending);
     let killed = outbound.killed();
-    handle.register(conn_id, outbound).await;
+    let connection = handle.register_connection(source, outbound).await;
+    let conn_id = connection.conn_id();
     tracing::info!(conn_id, peer = %peer, transport = "websocket", "client connected");
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut parser = WsParser::new(
@@ -710,14 +700,14 @@ async fn handle_ws<S>(
                             match ev {
                                 WsEvent::Message(MessageKind::Text, t) => {
                                     match String::from_utf8(t) {
-                                        Ok(text) => handle.client_message(conn_id, ip.clone(), text).await,
-                                        Err(_) => handle.client_message(conn_id, ip.clone(), "x".into()).await,
+                                        Ok(text) => connection.client_message(text).await,
+                                        Err(_) => connection.client_message("x".into()).await,
                                     }
                                 }
                                 WsEvent::Message(MessageKind::Binary, b) => {
                                     match String::from_utf8(b) {
-                                        Ok(text) => handle.client_message(conn_id, ip.clone(), text).await,
-                                        Err(_) => handle.client_message(conn_id, ip.clone(), "x".into()).await,
+                                        Ok(text) => connection.client_message(text).await,
+                                        Err(_) => connection.client_message("x".into()).await,
                                     }
                                 }
                                 WsEvent::Ping(p) => {
@@ -754,11 +744,7 @@ async fn handle_ws<S>(
             }
         }
     }
-    handle.close(conn_id).await;
-    handle
-        .metrics
-        .active_connections
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    connection.close().await;
     tracing::info!(conn_id, peer = %peer, transport = "websocket", "client disconnected");
 }
 

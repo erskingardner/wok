@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use wok_relay::{Config, Outbound, OutboundFrame, RelayHandle};
+use wok_relay::{Config, Outbound, OutboundFrame, RelayHandle, TransportSource};
 
 #[derive(Debug, thiserror::Error)]
 pub enum UnixError {
@@ -195,19 +195,16 @@ async fn handle_conn(
     if !peer_allowed(&stream, &cfg)? {
         return Err(UnixError::Message("peer credentials rejected".into()));
     }
-    let conn_id = handle.next_conn_id();
-    let source: Arc<[u8]> = Arc::from([]);
-    handle
-        .metrics
-        .active_connections
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let max_frame = cfg.relay.unix.max_frame_bytes;
     // Outbound's byte accounting is the single queue bound. Keeping a second
     // message-count ceiling makes small historical frames fail prematurely.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
     let outbound = Outbound::new(tx, cfg.relay.unix.max_pending_outbound_bytes);
     let killed = outbound.killed();
-    handle.register(conn_id, outbound).await;
+    let connection = handle
+        .register_connection(TransportSource::Unix, outbound)
+        .await;
+    let conn_id = connection.conn_id();
     tracing::info!(conn_id, transport = "unix", "client connected");
     let mut len_buf = [0u8; 4];
     let result = async {
@@ -227,7 +224,7 @@ async fn handle_conn(
                     stream.read_exact(&mut body).await?;
                     let text = String::from_utf8(body)
                         .map_err(|_| UnixError::Message("frame not utf-8".into()))?;
-                    handle.client_message(conn_id, source.clone(), text).await;
+                    connection.client_message(text).await;
                 }
                 out = rx.recv() => {
                     match out {
@@ -242,11 +239,7 @@ async fn handle_conn(
         Ok::<_, UnixError>(())
     }
     .await;
-    handle.close(conn_id).await;
-    handle
-        .metrics
-        .active_connections
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    connection.close().await;
     tracing::info!(conn_id, transport = "unix", "client disconnected");
     result
 }

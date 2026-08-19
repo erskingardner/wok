@@ -342,8 +342,6 @@ impl SearchScan {
         score
     }
 
-    // `is_multiple_of` is not available at Wok's Rust 1.85 MSRV.
-    #[allow(clippy::manual_is_multiple_of)]
     fn gather(
         &mut self,
         txn: &RoTxn<'_>,
@@ -438,7 +436,8 @@ impl SearchScan {
                 }
             }
 
-            self.approx_work % 128 != 0 || start.elapsed().as_micros() as u64 <= time_budget_us
+            !self.approx_work.is_multiple_of(128)
+                || start.elapsed().as_micros() as u64 <= time_budget_us
         })?;
         if let Some(error) = error {
             return Err(error);

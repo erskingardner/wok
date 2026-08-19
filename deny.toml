@@ -16,6 +16,15 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
+exceptions = [
+    # Transitive dependencies of the pinned native FIPS client. Keep these
+    # scoped to the exact crates instead of widening the workspace allowlist.
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["GPL-3.0-or-later"], crate = "rustables" },
+    { allow = ["GPL-3.0-or-later"], crate = "rustables-macros" },
+    { allow = ["WTFPL"], crate = "tun" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
 
 [bans]
 multiple-versions = "warn"
@@ -26,4 +35,4 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/jmcorgan/fips.git"]

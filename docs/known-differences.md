@@ -19,6 +19,9 @@ it is not a promise to reproduce upstream bugs.
 
 - Wok offers an optional Unix socket transport. Write-policy plugins see
   `sourceType: "unix"` for those connections.
+- Wok offers an optional native FIPS datagram transport on Linux and FreeBSD.
+  Write-policy plugins see `sourceType: "fips"` and a peer `npub` key encoded
+  as lowercase hex plus its FIPS port. That key is not NIP-42 identity.
 - `wok event <levId>` prints one event by local event ID.
 - NIP-11 reports Wok's repository as the software implementation.
 - Wok implements NIP-50 ranked content search using a Wok-owned derived LMDB

@@ -406,7 +406,9 @@ impl Env {
         if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
             return Err(DbError::msg(std::io::Error::last_os_error().to_string()));
         }
-        Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+        let available_blocks = statvfs_u64(stats.f_bavail, "f_bavail")?;
+        let fragment_size = statvfs_u64(stats.f_frsize, "f_frsize")?;
+        Ok(available_blocks.saturating_mul(fragment_size))
     }
 
     pub fn compact_to_fd(&self, fd: i32) -> Result<(), DbError> {
@@ -424,6 +426,16 @@ impl Env {
             .map_err(|_| DbError::msg("path NUL"))?;
         check(unsafe { mdb_env_copy2(self.inner.env, cpath.as_ptr(), MDB_CP_COMPACT) })
     }
+}
+
+fn statvfs_u64<T>(value: T, field: &str) -> Result<u64, DbError>
+where
+    T: TryInto<u64>,
+    T::Error: std::fmt::Display,
+{
+    value
+        .try_into()
+        .map_err(|error| DbError::msg(format!("invalid statvfs {field}: {error}")))
 }
 
 impl std::fmt::Debug for Env {

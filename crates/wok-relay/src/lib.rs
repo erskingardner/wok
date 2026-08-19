@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod restrict;
 pub mod rlimit;
 pub mod server;
+pub mod source;
 
 pub use capabilities::{
     relay_capabilities, supported_nips, CapabilityCondition, RelayCapability,
@@ -21,4 +22,5 @@ pub use config::{Config, EphemeralPersistence, StrfryConfigTranslation};
 pub use moderation::{management_level, write_permitted, ManagementCmd, ManagementLevel, Role};
 pub use protocol::{ClientCommand, RelayMessage};
 pub use rlimit::apply_nofiles_limit;
-pub use server::{start, Outbound, OutboundFrame, RelayHandle};
+pub use server::{start, ConnectionGuard, Outbound, OutboundFrame, RelayHandle};
+pub use source::TransportSource;

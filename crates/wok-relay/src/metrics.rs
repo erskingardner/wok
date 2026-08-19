@@ -160,7 +160,7 @@ impl Metrics {
         let g = |n: &AtomicU64| n.load(Ordering::Relaxed);
         format!(
             concat!(
-                "# HELP wok_active_connections Current WebSocket/Unix connections\n",
+                "# HELP wok_active_connections Current WebSocket/Unix/FIPS connections\n",
                 "# TYPE wok_active_connections gauge\n",
                 "wok_active_connections {}\n",
                 "# TYPE wok_authenticated_connections gauge\n",

@@ -6,6 +6,7 @@ use std::io::BufRead;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use wok_db::{
     check_integrity, delete_events, event_json_owned, write_events_with_policy, Decompressor, Env,
     EnvOptions, EventToWrite, NoopNegentropy,
@@ -488,6 +489,8 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     let env = open_env(&cfg)?;
     let bind: SocketAddr = format!("{}:{}", cfg.relay.bind, cfg.relay.port).parse()?;
     let unix_cfg = cfg.clone();
+    let fips_enabled = cfg.relay.fips.enabled;
+    let fips_cfg = Arc::new(cfg.clone());
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     if config_path.exists() {
         handle.set_config_path(config_path.clone());
@@ -495,6 +498,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     }
     let h2 = handle.clone();
     let h3 = handle.clone();
+    let h4 = handle.clone();
     let ws = tokio::spawn(async move {
         if let Err(e) = wok_ws::serve(h3, bind).await {
             tracing::error!("ws server: {e}");
@@ -505,18 +509,38 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
             tracing::error!("unix server: {e}");
         }
     });
+    let mut fips =
+        fips_enabled.then(|| tokio::spawn(async move { wok_fips::serve(h4, fips_cfg).await }));
     // C++ graceful shutdown is SIGUSR1; wok also treats SIGINT the same way.
     let mut sigusr1 =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT: initiating graceful shutdown"),
-        _ = sigusr1.recv() => tracing::info!("SIGUSR1: initiating graceful shutdown"),
-    }
+    let fips_failure = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT: initiating graceful shutdown");
+            None
+        },
+        _ = sigusr1.recv() => {
+            tracing::info!("SIGUSR1: initiating graceful shutdown");
+            None
+        },
+        result = async { fips.as_mut().expect("guarded FIPS task").await }, if fips.is_some() => {
+            Some(match result {
+                Ok(Ok(())) => "FIPS transport exited unexpectedly".to_string(),
+                Ok(Err(error)) => format!("FIPS transport failed: {error}"),
+                Err(error) => format!("FIPS transport task failed: {error}"),
+            })
+        },
+    };
     handle.request_shutdown();
     // Listeners stop accepting and return (the unix server unlinks its
     // socket); existing connections drain naturally like C++.
     let _ = ws.await;
     let _ = unix.await;
+    if fips_failure.is_none() {
+        if let Some(fips) = fips {
+            let _ = fips.await;
+        }
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let n = handle
@@ -534,7 +558,11 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         tracing::info!("Graceful shutdown in progress: {n} connections remaining");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    Ok(())
+    if let Some(error) = fips_failure {
+        Err(anyhow::anyhow!(error))
+    } else {
+        Ok(())
+    }
 }
 
 fn cmd_info(cfg: &Config) -> Result<()> {

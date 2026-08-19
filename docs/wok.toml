@@ -156,3 +156,20 @@ auth_uids = []
 auth_gids = []
 max_frame_bytes = 131072
 max_pending_outbound_bytes = 33554432
+
+[relay.fips]
+# Native datagram transport; Linux and FreeBSD only. All settings require a
+# listener restart. The FIPS daemon must enable node.native_api.enabled.
+enabled = false
+socket_path = "/run/fips/api.sock"
+# FIPS application port used by the Wok demo protocol.
+port = 7777
+max_pending_outbound_bytes = 33554432
+# Connector-side HELLO defaults published for compatible clients.
+hello_retry_ms = 250
+setup_timeout_secs = 15
+incomplete_message_timeout_secs = 30
+max_incomplete_messages = 16
+max_reassembly_bytes = 8388608
+max_chunks = 4096
+max_completed_messages = 16

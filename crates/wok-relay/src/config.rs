@@ -217,6 +217,7 @@ pub struct RelayConfig {
     pub filter_validation: FilterValidationConfig,
     pub abuse: AbuseConfig,
     pub unix: UnixConfig,
+    pub fips: FipsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +298,22 @@ pub struct UnixConfig {
     pub auth_gids: Vec<u32>,
     pub max_frame_bytes: usize,
     pub max_pending_outbound_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FipsConfig {
+    pub enabled: bool,
+    pub socket_path: PathBuf,
+    pub port: u16,
+    pub max_pending_outbound_bytes: usize,
+    pub hello_retry_ms: u64,
+    pub setup_timeout_secs: u64,
+    pub incomplete_message_timeout_secs: u64,
+    pub max_incomplete_messages: usize,
+    pub max_reassembly_bytes: usize,
+    pub max_chunks: u16,
+    pub max_completed_messages: usize,
 }
 
 impl Default for Config {
@@ -428,6 +445,19 @@ impl Default for Config {
                     max_frame_bytes: 131072,
                     max_pending_outbound_bytes: 33_554_432,
                 },
+                fips: FipsConfig {
+                    enabled: false,
+                    socket_path: PathBuf::from("/run/fips/api.sock"),
+                    port: 7777,
+                    max_pending_outbound_bytes: 33_554_432,
+                    hello_retry_ms: 250,
+                    setup_timeout_secs: 15,
+                    incomplete_message_timeout_secs: 30,
+                    max_incomplete_messages: 16,
+                    max_reassembly_bytes: 8_388_608,
+                    max_chunks: 4096,
+                    max_completed_messages: 16,
+                },
             },
         }
     }
@@ -551,6 +581,7 @@ impl Config {
         validate_admin_config(&mut parsed.admin)?;
         clamp_size_class(&mut parsed);
         parsed.relay.unix.mode = mask_socket_mode(parsed.relay.unix.mode);
+        validate_fips_config(&parsed.relay)?;
         if parsed.observability.history_interval_secs == 0 {
             return Err("observability.history_interval_secs must be at least 1".into());
         }
@@ -1034,6 +1065,12 @@ impl Config {
                     .to_string(),
             );
         }
+        if self.relay.fips.max_pending_outbound_bytes == 0 {
+            warnings.push(
+                "relay.fips.max_pending_outbound_bytes is zero — slow-client queue is unlimited"
+                    .to_string(),
+            );
+        }
         warnings
     }
 
@@ -1068,6 +1105,7 @@ impl Config {
         self.relay.req_monitor_threads = old.relay.req_monitor_threads;
         self.relay.negentropy_threads = old.relay.negentropy_threads;
         self.relay.unix = old.relay.unix;
+        self.relay.fips = old.relay.fips;
         // Subscriber construction is process-global. Log encoding/filter
         // changes take effect after restart, while history bounds reload live.
         self.observability.log_format = old.observability.log_format;
@@ -1083,7 +1121,7 @@ impl Config {
 pub const MAX_SIZE_CLASS_BYTES: usize = 16 * 1024 * 1024;
 
 fn clamp_size_class(parsed: &mut TomlConfig) {
-    let fields: [(&str, &mut usize); 3] = [
+    let fields: [(&str, &mut usize); 4] = [
         ("events.max_event_size", &mut parsed.events.max_event_size),
         (
             "relay.max_websocket_payload_size",
@@ -1093,6 +1131,10 @@ fn clamp_size_class(parsed: &mut TomlConfig) {
             "relay.unix.max_frame_bytes",
             &mut parsed.relay.unix.max_frame_bytes,
         ),
+        (
+            "relay.fips.max_reassembly_bytes",
+            &mut parsed.relay.fips.max_reassembly_bytes,
+        ),
     ];
     for (name, value) in fields {
         if *value > MAX_SIZE_CLASS_BYTES {
@@ -1100,6 +1142,44 @@ fn clamp_size_class(parsed: &mut TomlConfig) {
             *value = MAX_SIZE_CLASS_BYTES;
         }
     }
+}
+
+fn validate_fips_config(relay: &RelayConfig) -> Result<(), String> {
+    let fips = &relay.fips;
+    if fips.port <= 1023 {
+        return Err("relay.fips.port must be in the FIPS application range 1024-65535".into());
+    }
+    if fips.socket_path.as_os_str().is_empty() {
+        return Err("relay.fips.socket_path must not be empty".into());
+    }
+    for (name, value) in [
+        ("hello_retry_ms", fips.hello_retry_ms),
+        ("setup_timeout_secs", fips.setup_timeout_secs),
+        (
+            "incomplete_message_timeout_secs",
+            fips.incomplete_message_timeout_secs,
+        ),
+    ] {
+        if value == 0 {
+            return Err(format!("relay.fips.{name} must be at least 1"));
+        }
+    }
+    if fips.max_incomplete_messages == 0 {
+        return Err("relay.fips.max_incomplete_messages must be at least 1".into());
+    }
+    if fips.enabled && fips.max_reassembly_bytes < relay.max_websocket_payload_size {
+        return Err(
+            "relay.fips.max_reassembly_bytes must be at least relay.max_websocket_payload_size"
+                .into(),
+        );
+    }
+    if fips.max_chunks == 0 {
+        return Err("relay.fips.max_chunks must be at least 1".into());
+    }
+    if fips.max_completed_messages == 0 {
+        return Err("relay.fips.max_completed_messages must be at least 1".into());
+    }
+    Ok(())
 }
 
 fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {
@@ -1788,6 +1868,66 @@ mod tests {
         assert_eq!(cfg.relay.max_filter_limit, 123, "limits reload live");
         assert_eq!(cfg.observability.log_format, LogFormat::Pretty);
         assert_eq!(cfg.observability.history_max_points, 20);
+    }
+
+    #[test]
+    fn fips_config_parses_and_is_restart_required() {
+        let mut cfg = Config::parse_toml(
+            r#"
+            [relay.fips]
+            enabled = true
+            socket_path = "/run/fips/custom.sock"
+            port = 4242
+            max_pending_outbound_bytes = 1048576
+            hello_retry_ms = 100
+            setup_timeout_secs = 9
+            incomplete_message_timeout_secs = 11
+            max_incomplete_messages = 3
+            max_reassembly_bytes = 8388608
+            max_chunks = 128
+            max_completed_messages = 5
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.relay.fips.enabled);
+        assert_eq!(
+            cfg.relay.fips.socket_path,
+            PathBuf::from("/run/fips/custom.sock")
+        );
+        assert_eq!(cfg.relay.fips.port, 4242);
+
+        let replacement = Config::parse_toml(
+            r#"
+            [relay.fips]
+            enabled = false
+            socket_path = "/tmp/ignored.sock"
+            port = 5252
+            "#,
+        )
+        .unwrap();
+        cfg.apply_reload(replacement);
+        assert!(cfg.relay.fips.enabled);
+        assert_eq!(
+            cfg.relay.fips.socket_path,
+            PathBuf::from("/run/fips/custom.sock")
+        );
+        assert_eq!(cfg.relay.fips.port, 4242);
+    }
+
+    #[test]
+    fn enabled_fips_requires_room_for_a_relay_message() {
+        let error = Config::parse_toml(
+            r#"
+            [relay]
+            max_websocket_payload_size = 1048576
+
+            [relay.fips]
+            enabled = true
+            max_reassembly_bytes = 65536
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.contains("max_reassembly_bytes"), "{error}");
     }
 
     #[test]

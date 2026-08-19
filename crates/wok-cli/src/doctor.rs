@@ -416,6 +416,45 @@ fn check_external_paths(cfg: &Config, report: &mut DoctorReport) {
         }
     }
 
+    if !cfg.relay.fips.enabled {
+        report.add("fips-native-api", CheckStatus::Pass, "disabled");
+    } else if !cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        report.add(
+            "fips-native-api",
+            CheckStatus::Fail,
+            "native FIPS is supported only on Linux and FreeBSD",
+        );
+    } else {
+        let path = &cfg.relay.fips.socket_path;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            match path.metadata() {
+                Ok(metadata) if metadata.file_type().is_socket() => report.add(
+                    "fips-native-api",
+                    CheckStatus::Pass,
+                    format!("native API socket {}", path.display()),
+                ),
+                Ok(_) => report.add(
+                    "fips-native-api",
+                    CheckStatus::Fail,
+                    format!("{} exists and is not a socket", path.display()),
+                ),
+                Err(error) => report.add(
+                    "fips-native-api",
+                    CheckStatus::Fail,
+                    format!("cannot access {}: {error}", path.display()),
+                ),
+            }
+        }
+        #[cfg(not(unix))]
+        report.add(
+            "fips-native-api",
+            CheckStatus::Fail,
+            "native FIPS requires a Unix socket",
+        );
+    }
+
     if !cfg.relay.unix.enabled {
         report.add("unix-socket", CheckStatus::Pass, "disabled");
         return;

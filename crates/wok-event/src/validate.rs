@@ -120,16 +120,19 @@ pub fn parse_and_verify_event(
         return Err(EventError::msg("event is not an object"));
     }
     let packed = nostr_json_to_packed_event(orig, limits)?;
+    let json = normalize_event_json(orig)?;
+    if verify_msg {
+        // Reject oversized events before hashing their content or performing
+        // Schnorr verification. Transport limits bound the preceding JSON
+        // parse and structural conversion.
+        verify_event_json_size(&json, limits.max_event_size)?;
+    }
     if verify_time {
         let p = policy.ok_or_else(|| EventError::msg("timestamp policy required"))?;
         verify_event_timestamp(packed.view(), p)?;
     }
     if verify_msg {
         verify_nostr_event(packed.view(), orig)?;
-    }
-    let json = normalize_event_json(orig)?;
-    if verify_msg {
-        verify_event_json_size(&json, limits.max_event_size)?;
     }
     Ok(ParsedEvent { packed, json })
 }
@@ -178,6 +181,38 @@ mod tests {
         }));
         ev["id"] = json!("11".repeat(32));
         assert!(parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).is_err());
+    }
+
+    #[test]
+    fn accepts_extended_length_encrypted_carriers_with_default_limits() {
+        let content = "x".repeat(256 * 1024);
+        for kind in [445, 1059] {
+            let ev = sign_event(json!({
+                "created_at": 1_700_000_000u64,
+                "kind": kind,
+                "tags": [],
+                "content": content,
+            }));
+            let parsed =
+                parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).unwrap();
+            assert_eq!(parsed.packed.view().kind(), kind);
+            assert!(parsed.json.len() > 65_536);
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_event_before_bad_signature() {
+        let mut ev = sign_event(json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 445,
+            "tags": [],
+            "content": "x".repeat(crate::DEFAULT_MAX_EVENT_SIZE),
+        }));
+        ev["sig"] = json!("00".repeat(64));
+        let err = parse_and_verify_event(&ev, &EventLimits::default(), None, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("event too large"), "{err}");
     }
 
     #[test]

@@ -6,6 +6,11 @@ use crate::kinds::{
 use crate::packed::{PackedEvent, PackedEventBuilder, PackedEventTagBuilder};
 use crate::{EventError, MAX_INDEXED_TAG_VAL_SIZE};
 
+/// Default ceiling for normalized event JSON. This is intentionally far below
+/// NIP-44's protocol maximum while leaving room for extended-length encrypted
+/// gift wraps and MLS group events.
+pub const DEFAULT_MAX_EVENT_SIZE: usize = 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct EventLimits {
     pub max_event_size: usize,
@@ -16,7 +21,7 @@ pub struct EventLimits {
 impl Default for EventLimits {
     fn default() -> Self {
         Self {
-            max_event_size: 65536,
+            max_event_size: DEFAULT_MAX_EVENT_SIZE,
             max_num_tags: 2000,
             max_tag_val_size: 1024,
         }

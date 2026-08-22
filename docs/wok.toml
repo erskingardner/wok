@@ -21,7 +21,9 @@ no_read_ahead = false
 min_free_disk_bytes = 1073741824
 
 [events]
-max_event_size = 65536
+# Normalized event JSON. The 1 MiB default accommodates bounded extended
+# NIP-44 payloads such as gift wraps and MLS group events.
+max_event_size = 1048576
 reject_newer_than_secs = 900
 reject_older_than_secs = 94608000
 reject_ephemeral_older_than_secs = 60
@@ -47,7 +49,7 @@ port = 7777
 nofiles = 524288
 # Trusted reverse-proxy header containing the client IP; empty disables it.
 real_ip_header = ""
-max_websocket_payload_size = 131072
+max_websocket_payload_size = 2097152
 # Maximum combined compact-JSON bytes across all filters in one REQ/COUNT.
 max_req_filter_size = 65536
 # Unconditional maximum filter objects in one REQ/COUNT.
@@ -154,7 +156,7 @@ group = ""
 # Empty allowlists accept any local UID/GID.
 auth_uids = []
 auth_gids = []
-max_frame_bytes = 131072
+max_frame_bytes = 2097152
 max_pending_outbound_bytes = 33554432
 
 [relay.fips]

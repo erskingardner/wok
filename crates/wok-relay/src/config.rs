@@ -340,7 +340,7 @@ impl Default for Config {
             db_no_read_ahead: false,
             db_min_free_disk_bytes: 1_073_741_824,
             events: EventsConfig {
-                max_event_size: 65536,
+                max_event_size: wok_event::DEFAULT_MAX_EVENT_SIZE,
                 reject_newer_than_secs: 900,
                 reject_older_than_secs: 94_608_000,
                 reject_ephemeral_older_than_secs: 60,
@@ -381,7 +381,7 @@ impl Default for Config {
                     privacy: String::new(),
                     terms: String::new(),
                 },
-                max_websocket_payload_size: 131072,
+                max_websocket_payload_size: 2 * wok_event::DEFAULT_MAX_EVENT_SIZE,
                 max_req_filter_size: 65_536,
                 max_filters_per_req: 200,
                 auto_ping_seconds: 55,
@@ -450,7 +450,7 @@ impl Default for Config {
                     group: String::new(),
                     auth_uids: Vec::new(),
                     auth_gids: Vec::new(),
-                    max_frame_bytes: 131072,
+                    max_frame_bytes: 2 * wok_event::DEFAULT_MAX_EVENT_SIZE,
                     max_pending_outbound_bytes: 33_554_432,
                 },
                 fips: FipsConfig {

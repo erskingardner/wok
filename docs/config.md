@@ -60,7 +60,7 @@ All event settings reload live and are available in the dashboard.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `events.max_event_size` | `65536` | Maximum serialized event size in bytes. |
+| `events.max_event_size` | `1048576` | Maximum normalized serialized event size in bytes. |
 | `events.reject_newer_than_secs` | `900` | Maximum accepted future clock skew. |
 | `events.reject_older_than_secs` | `94608000` | Maximum age for non-ephemeral events. |
 | `events.reject_ephemeral_older_than_secs` | `60` | Maximum age for ephemeral events at publication. |
@@ -68,6 +68,13 @@ All event settings reload live and are available in the dashboard.
 | `events.ephemeral_persistence` | `live_only` | `live_only` broadcasts without storage; `ttl` persists then expires. |
 | `events.max_num_tags` | `2000` | Maximum tags on one event. |
 | `events.max_tag_val_size` | `1024` | Maximum bytes in one tag value. |
+
+The 1 MiB event ceiling accommodates bounded extended-length NIP-44 payloads,
+including kind 1059 gift wraps and kind 445 MLS group events. Wok does not
+decrypt or identify NIP-44 content, so this remains a global event limit and is
+measured after Base64 encoding, JSON escaping, and event metadata are present.
+The NIP-44 theoretical maximum is not a relay allocation target. Existing
+operator files that explicitly retain `65536` continue enforcing 64 KiB.
 
 ## Observability
 
@@ -95,7 +102,7 @@ interface or protect the path at the reverse proxy.
 | `relay.port` | `7777` | Restart | TCP listen port. |
 | `relay.nofiles` | `524288` | Restart | Requested process file-descriptor limit. |
 | `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-IP budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. |
-| `relay.max_websocket_payload_size` | `131072` | Restart | Maximum reassembled WebSocket payload bytes. |
+| `relay.max_websocket_payload_size` | `2097152` | Restart | Maximum reassembled WebSocket payload bytes. |
 | `relay.max_req_filter_size` | `65536` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. |
 | `relay.max_filters_per_req` | `200` | Live | Yes | Unconditional maximum filter objects in one REQ or COUNT. |
 | `relay.auto_ping_seconds` | `55` | Restart | WebSocket ping interval; zero disables automatic pings. A ping unanswered for a full interval closes the connection. |
@@ -238,7 +245,7 @@ All Unix-socket settings require restart and are file-only.
 | `relay.unix.group` | empty | Group applied with `chown` after bind. |
 | `relay.unix.auth_uids` | `[]` | Allowed peer UIDs; empty accepts any UID. |
 | `relay.unix.auth_gids` | `[]` | Allowed peer GIDs; empty accepts any GID. |
-| `relay.unix.max_frame_bytes` | `131072` | Maximum length-prefixed JSON frame. |
+| `relay.unix.max_frame_bytes` | `2097152` | Maximum length-prefixed JSON frame. |
 | `relay.unix.max_pending_outbound_bytes` | `33554432` | Pending output budget before disconnect. |
 
 See [Unix socket protocol](unix-socket.md) for framing and peer authorization.

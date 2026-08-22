@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The default normalized event ceiling is now 1 MiB, with 2 MiB WebSocket and
+  Unix message ceilings, so bounded extended-length NIP-44 payloads such as
+  kind 1059 gift wraps and kind 445 MLS group events can pass through the
+  relay. All three settings remain operator-configurable and retain the 16 MiB
+  hard ceiling; explicitly configured 64 KiB deployments are unchanged.
+- Oversized normalized events are rejected before event-id hashing and Schnorr
+  verification, limiting the extra admission cost made reachable by the larger
+  transport envelope.
+
 ## [0.4.0] - 2026-08-18
 
 ### Added

@@ -316,6 +316,14 @@ pub struct FipsConfig {
     pub max_completed_messages: usize,
 }
 
+fn default_fips_socket_path() -> PathBuf {
+    if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+        PathBuf::from("/var/run/fips/api.sock")
+    } else {
+        PathBuf::from("/run/fips/api.sock")
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -447,7 +455,7 @@ impl Default for Config {
                 },
                 fips: FipsConfig {
                     enabled: false,
-                    socket_path: PathBuf::from("/run/fips/api.sock"),
+                    socket_path: default_fips_socket_path(),
                     port: 7777,
                     max_pending_outbound_bytes: 33_554_432,
                     hello_retry_ms: 250,
@@ -1573,6 +1581,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fips_socket_default_matches_packaged_platform_path() {
+        let expected = if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+            PathBuf::from("/var/run/fips/api.sock")
+        } else {
+            PathBuf::from("/run/fips/api.sock")
+        };
+        assert_eq!(Config::default().relay.fips.socket_path, expected);
+    }
+
+    #[test]
     fn size_class_settings_are_clamped_to_ceiling() {
         let c = Config::parse_toml(
             r#"
@@ -2237,7 +2255,11 @@ mod tests {
         Config::parse_toml(documented).unwrap();
 
         let documented: toml::Value = toml::from_str(documented).unwrap();
-        let defaults: toml::Value = toml::from_str(&Config::default().to_toml().unwrap()).unwrap();
+        // The checked-in sample is the Linux deployment form. FIPS packages
+        // use /var/run on macOS and FreeBSD, which is tested separately.
+        let mut defaults = Config::default();
+        defaults.relay.fips.socket_path = PathBuf::from("/run/fips/api.sock");
+        let defaults: toml::Value = toml::from_str(&defaults.to_toml().unwrap()).unwrap();
         assert_eq!(
             documented, defaults,
             "docs/wok.toml must list every default"

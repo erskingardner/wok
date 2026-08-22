@@ -158,9 +158,10 @@ max_frame_bytes = 131072
 max_pending_outbound_bytes = 33554432
 
 [relay.fips]
-# Native datagram transport; Linux and FreeBSD only. All settings require a
+# Native datagram transport; Linux, FreeBSD, and macOS only. All settings require a
 # listener restart. The FIPS daemon must enable node.native_api.enabled.
 enabled = false
+# Use /var/run/fips/api.sock on packaged macOS and FreeBSD installations.
 socket_path = "/run/fips/api.sock"
 # FIPS application port used by the Wok demo protocol.
 port = 7777

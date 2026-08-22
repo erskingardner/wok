@@ -13,8 +13,8 @@ tokio.workspace = true
 tracing.workspace = true
 wok-relay = { path = "../wok-relay" }
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-fips = { git = "https://github.com/jmcorgan/fips.git", rev = "9a2b85cd4f511c978de1b028d6124115f64ad7a8" }
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))'.dependencies]
+fips = { git = "https://github.com/jmcorgan/fips.git", rev = "d69325a2a37d419328471883d3dbc21c6f2a5a3d" }
 libc.workspace = true
 
 [dev-dependencies]

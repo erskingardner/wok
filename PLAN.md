@@ -27,7 +27,7 @@ Cargo workspace crates:
 | `wok-relay` | Transport-neutral commands, write path, AUTH, plugins, cron |
 | `wok-ws` | HTTP + WebSocket transport |
 | `wok-unix` | Length-prefixed Unix `SOCK_STREAM` transport |
-| `wok-fips` | Native FIPS datagram transport on Linux/FreeBSD |
+| `wok-fips` | Native FIPS datagram transport on Linux/FreeBSD/macOS |
 | `wok-cli` | `relay`, dbutils, mesh commands |
 | `wok-bench` | Comparative load generation |
 | `wok-compat` | C++ differential harnesses and fixtures |

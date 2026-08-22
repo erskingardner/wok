@@ -2,12 +2,12 @@
 
 Wok can serve the Nostr relay protocol directly over the experimental FIPS
 native datagram API. It does not use the `fips0` IPv6/TUN interface. Native
-operation is supported on Linux and FreeBSD; other targets keep the transport
-disabled and return a platform error if it is configured on.
+operation is supported on Linux, FreeBSD, and macOS; other targets keep the
+transport disabled and return a platform error if it is configured on.
 
 This integration consumes the `fips` Rust package from commit
-`9a2b85cd4f511c978de1b028d6124115f64ad7a8` on the
-`native-api-berkeley` branch. The package's module is
+`d69325a2a37d419328471883d3dbc21c6f2a5a3d` on the `master` branch. The
+package's module is
 `fips::native::client`; there is no separately packaged `fips-api` crate at
 that revision.
 
@@ -21,7 +21,8 @@ node:
     enabled: true
 ```
 
-The default socket is `/run/fips/api.sock`. FIPS creates it as `root:fips`
+The packaged socket default is `/run/fips/api.sock` on Linux and
+`/var/run/fips/api.sock` on macOS and FreeBSD. FIPS creates it as `root:fips`
 with mode `0770`, under a `root:fips` directory with mode `0750`. Give the Wok
 service account supplementary membership in the `fips` group. For the sample
 systemd unit, use an override rather than editing the installed file:
@@ -39,6 +40,8 @@ enabled = true
 socket_path = "/run/fips/api.sock"
 port = 7777
 ```
+
+Use `/var/run/fips/api.sock` for packaged macOS and FreeBSD nodes.
 
 Port 7777 is the Wok demo convention and is configurable. All
 `relay.fips.*` settings require a Wok restart. FIPS application ports 0 through
@@ -131,7 +134,7 @@ disabled; the test needs no `/dev/net/tun`, host networking, or `NET_ADMIN`.
 
 ## External two-node smoke test
 
-To exercise existing Linux or FreeBSD nodes instead, run FIPS on two nodes
+To exercise existing Linux, FreeBSD, or macOS nodes instead, run FIPS on two nodes
 with the native API enabled. Start Wok with the listener above on node A. On
 node B, use node A's FIPS npub:
 

@@ -39,7 +39,7 @@ quirk. It also provides Unix-domain socket and native FIPS datagram transports.
   library offers it); mirrors uWS negotiation as strfry configures it.
 - **Unix `SOCK_STREAM` transport** (wok extension): 4-byte big-endian
   length-prefixed JSON, same dispatcher as WebSocket.
-- **Native FIPS datagram transport** (disabled by default, Linux/FreeBSD):
+- **Native FIPS datagram transport** (disabled by default, Linux/FreeBSD/macOS):
   direct `fips::native::client` flows with correlated setup, dynamic chunking,
   bounded reassembly, and no dependency on the IPv6/TUN shim. FIPS V1 DATA is
   not guaranteed delivery.
@@ -68,9 +68,9 @@ cargo build --release -p wok-cli
 ```
 
 The binary is `target/release/wok`. The declared MSRV is Rust 1.94.1. LMDB and
-zstd are built from vendored sources, and outbound TLS uses Rustls. Linux and
-FreeBSD builds also compile the native FIPS client dependency and require
-Clang/libclang, pkg-config, and D-Bus development headers.
+zstd are built from vendored sources, and outbound TLS uses Rustls. Linux,
+FreeBSD, and macOS builds also compile the native FIPS client dependency.
+Linux builds require Clang/libclang, pkg-config, and D-Bus development headers.
 
 Tagged releases publish checksummed native archives for Linux x86-64/ARM64 and
 macOS Intel/Apple Silicon. See [CHANGELOG.md](CHANGELOG.md) for notable changes
@@ -113,7 +113,7 @@ path = "./wok-db/wok.sock"
 mode = 0o600
 ```
 
-Native FIPS (disabled by default; Linux/FreeBSD):
+Native FIPS (disabled by default; Linux/FreeBSD/macOS):
 
 ```toml
 [relay.fips]
@@ -121,6 +121,8 @@ enabled = true
 socket_path = "/run/fips/api.sock"
 port = 7777
 ```
+
+The packaged socket default is `/var/run/fips/api.sock` on macOS and FreeBSD.
 
 See [Native FIPS transport](docs/fips-native.md) for daemon configuration,
 permissions, protocol limitations, the one-command Docker Compose Linux signed
@@ -175,7 +177,7 @@ crates/
   wok-relay       Transport-neutral dispatcher, writer, AUTH, plugins, cron
   wok-ws          HTTP + WebSocket transport (in-house codec, permessage-deflate)
   wok-unix        Length-prefixed Unix SOCK_STREAM transport
-  wok-fips        Native FIPS datagram transport (Linux/FreeBSD)
+  wok-fips        Native FIPS datagram transport (Linux/FreeBSD/macOS)
   wok-cli         relay, dbutils, mesh commands
   wok-bench       Comparative benchmark harness
   wok-compat      C++ differential harnesses and fixtures
@@ -239,7 +241,7 @@ Summary:
 
 **wok extensions**
 - Unix socket transport (disabled by default).
-- Native FIPS datagram transport (disabled by default; Linux/FreeBSD).
+- Native FIPS datagram transport (disabled by default; Linux/FreeBSD/macOS).
 - `wok event <levId>` prints one event by local event ID.
 
 **Intentional Wok behavior**

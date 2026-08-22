@@ -37,7 +37,7 @@ clients ─FIPS─► wok-fips─┤
 | `wok-ws` | HTTP + WebSocket (in-house RFC 6455/7692 codec) |
 | `wok-unix` | Length-prefixed Unix `SOCK_STREAM` transport |
 | `fips-message` | Wok-independent FIPS V1 framing and reassembly |
-| `wok-fips` | Native FIPS datagram transport (Linux/FreeBSD) |
+| `wok-fips` | Native FIPS datagram transport (Linux/FreeBSD/macOS) |
 | `wok-cli` | `wok` binary: relay, migrate, doctor, mesh, dbutils |
 | `wok-bench` | Comparative load harness (excluded from default CI tests) |
 | `wok-compat` | NIP conformance, e2e, optional C++ differentials |

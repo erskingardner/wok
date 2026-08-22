@@ -418,11 +418,15 @@ fn check_external_paths(cfg: &Config, report: &mut DoctorReport) {
 
     if !cfg.relay.fips.enabled {
         report.add("fips-native-api", CheckStatus::Pass, "disabled");
-    } else if !cfg!(any(target_os = "linux", target_os = "freebsd")) {
+    } else if !cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    )) {
         report.add(
             "fips-native-api",
             CheckStatus::Fail,
-            "native FIPS is supported only on Linux and FreeBSD",
+            "native FIPS is supported only on Linux, FreeBSD, and macOS",
         );
     } else {
         let path = &cfg.relay.fips.socket_path;

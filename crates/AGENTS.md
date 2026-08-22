@@ -29,7 +29,7 @@ on top.
 | `wok-relay/` | Dispatcher, config, AUTH, plugins | `src/server.rs` |
 | `wok-ws/` | HTTP, NIP-11, WebSocket, admin | `src/lib.rs` |
 | `wok-unix/` | Unix socket frames | `src/lib.rs` |
-| `wok-fips/` | Native FIPS datagram adapter (Linux/FreeBSD) | `src/lib.rs` |
+| `wok-fips/` | Native FIPS datagram adapter (Linux/FreeBSD/macOS) | `src/lib.rs` |
 | `wok-cli/` | `wok` binary | `src/main.rs` |
 | `wok-bench/` | Comparative harness | `src/main.rs` |
 | `wok-compat/` | Conformance / e2e / C++ diffs | `src/lib.rs`, `tests/` |

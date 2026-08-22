@@ -1,18 +1,18 @@
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     platform::run()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 fn main() {
-    eprintln!("the native FIPS event matrix is supported only on Linux and FreeBSD");
+    eprintln!("the native FIPS event matrix is supported only on Linux, FreeBSD, and macOS");
     std::process::exit(2);
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 mod support;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 mod platform {
     use super::support::client::exchange;
     use fips::native::client::FipsAddr;

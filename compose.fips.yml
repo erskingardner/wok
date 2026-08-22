@@ -5,7 +5,7 @@ x-runtime-image: &runtime-image
     context: .
     dockerfile: testing/fips-native/Dockerfile
     args:
-      FIPS_GIT_REV: 9a2b85cd4f511c978de1b028d6124115f64ad7a8
+      FIPS_GIT_REV: d69325a2a37d419328471883d3dbc21c6f2a5a3d
   image: wok-fips-e2e:local
 
 services:

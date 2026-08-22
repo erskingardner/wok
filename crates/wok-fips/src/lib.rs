@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
 //! Wok transport over the experimental FIPS native datagram API.
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", test))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos", test))]
 mod session;
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 use std::sync::Arc;
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 use wok_relay::{Config, RelayHandle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FipsError {
-    #[error("native FIPS transport is supported only on Linux and FreeBSD")]
+    #[error("native FIPS transport is supported only on Linux, FreeBSD, and macOS")]
     UnsupportedPlatform,
     #[error("FIPS native API: {0}")]
     Io(#[from] std::io::Error),
@@ -21,13 +21,13 @@ pub enum FipsError {
     Task(String),
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 mod native;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 pub use native::serve;
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 pub async fn serve(_handle: RelayHandle, cfg: Arc<Config>) -> Result<(), FipsError> {
     if cfg.relay.fips.enabled {
         Err(FipsError::UnsupportedPlatform)
@@ -36,7 +36,10 @@ pub async fn serve(_handle: RelayHandle, cfg: Arc<Config>) -> Result<(), FipsErr
     }
 }
 
-#[cfg(all(test, not(any(target_os = "linux", target_os = "freebsd"))))]
+#[cfg(all(
+    test,
+    not(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))
+))]
 mod unsupported_tests {
     use super::*;
     use wok_db::{Env, EnvOptions};

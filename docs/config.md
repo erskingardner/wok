@@ -246,13 +246,13 @@ See [Unix socket protocol](unix-socket.md) for framing and peer authorization.
 ## Native FIPS transport
 
 All native-FIPS settings require restart, are file-only, and are supported on
-Linux and FreeBSD. See [Native FIPS transport](fips-native.md) for daemon,
+Linux, FreeBSD, and macOS. See [Native FIPS transport](fips-native.md) for daemon,
 permission, identity, lifecycle, and two-node test instructions.
 
 | Key | Default | Meaning |
 |---|---:|---|
 | `relay.fips.enabled` | `false` | Bind the experimental native FIPS datagram listener. |
-| `relay.fips.socket_path` | `/run/fips/api.sock` | FIPS daemon native-API Unix socket. |
+| `relay.fips.socket_path` | platform-specific | FIPS daemon native-API Unix socket: `/run/fips/api.sock` on Linux, `/var/run/fips/api.sock` on macOS and FreeBSD. |
 | `relay.fips.port` | `7777` | Configurable FIPS application port; 0 through 1023 are rejected. |
 | `relay.fips.max_pending_outbound_bytes` | `33554432` | Pending Wok output budget before flow termination. |
 | `relay.fips.hello_retry_ms` | `250` | Initial bounded-backoff retry interval published for compatible connectors. |

@@ -30,7 +30,7 @@ or protect it at the reverse proxy. The endpoint is unauthenticated and sends
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `wok_active_connections` | gauge | none | Current WebSocket and Unix-socket connections. |
+| `wok_active_connections` | gauge | none | Current WebSocket, Unix-socket, and native FIPS connections. |
 | `wok_authenticated_connections` | gauge | none | Current connections that completed NIP-42 AUTH. |
 | `wok_written_events_total` | counter | none | Events committed to durable storage. |
 | `wok_ephemeral_events_total` | counter | none | Accepted ephemeral events handled by the live/TTL path. |

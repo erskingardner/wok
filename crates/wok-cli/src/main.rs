@@ -6,6 +6,7 @@ use std::io::BufRead;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use wok_db::{
     check_integrity, delete_events, event_json_owned, write_events_with_policy, Decompressor, Env,
     EnvOptions, EventToWrite, NoopNegentropy,
@@ -472,6 +473,7 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 }
 
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
+    ensure_compiled_transport_support(&cfg)?;
     if let Some(warning) = cfg.auth_configuration_warning() {
         tracing::warn!("{warning}; restricted reads fail closed");
     }
@@ -488,6 +490,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     let env = open_env(&cfg)?;
     let bind: SocketAddr = format!("{}:{}", cfg.relay.bind, cfg.relay.port).parse()?;
     let unix_cfg = cfg.clone();
+    let fips_cfg = Arc::new(cfg.clone());
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     if config_path.exists() {
         handle.set_config_path(config_path.clone());
@@ -505,18 +508,37 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
             tracing::error!("unix server: {e}");
         }
     });
+    let mut fips = spawn_fips_transport(handle.clone(), fips_cfg);
     // C++ graceful shutdown is SIGUSR1; wok also treats SIGINT the same way.
     let mut sigusr1 =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT: initiating graceful shutdown"),
-        _ = sigusr1.recv() => tracing::info!("SIGUSR1: initiating graceful shutdown"),
-    }
+    let fips_failure = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT: initiating graceful shutdown");
+            None
+        },
+        _ = sigusr1.recv() => {
+            tracing::info!("SIGUSR1: initiating graceful shutdown");
+            None
+        },
+        result = async { fips.as_mut().expect("guarded FIPS task").await }, if fips.is_some() => {
+            Some(match result {
+                Ok(Ok(())) => "FIPS transport exited unexpectedly".to_string(),
+                Ok(Err(error)) => format!("FIPS transport failed: {error}"),
+                Err(error) => format!("FIPS transport task failed: {error}"),
+            })
+        },
+    };
     handle.request_shutdown();
     // Listeners stop accepting and return (the unix server unlinks its
     // socket); existing connections drain naturally like C++.
     let _ = ws.await;
     let _ = unix.await;
+    if fips_failure.is_none() {
+        if let Some(fips) = fips {
+            let _ = fips.await;
+        }
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let n = handle
@@ -534,7 +556,43 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         tracing::info!("Graceful shutdown in progress: {n} connections remaining");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+    if let Some(error) = fips_failure {
+        Err(anyhow::anyhow!(error))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_compiled_transport_support(_cfg: &Config) -> Result<()> {
+    #[cfg(not(feature = "native-fips"))]
+    if _cfg.relay.fips.enabled {
+        bail!(
+            "relay.fips.enabled is true, but this Wok binary was built without the \
+             native-fips feature; rebuild with --features native-fips"
+        );
+    }
     Ok(())
+}
+
+fn spawn_fips_transport(
+    handle: wok_relay::RelayHandle,
+    cfg: Arc<Config>,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    #[cfg(feature = "native-fips")]
+    {
+        cfg.relay.fips.enabled.then(|| {
+            tokio::spawn(async move {
+                wok_fips::serve(handle, cfg)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+    }
+    #[cfg(not(feature = "native-fips"))]
+    {
+        let _ = (handle, cfg);
+        None
+    }
 }
 
 fn cmd_info(cfg: &Config) -> Result<()> {
@@ -2072,6 +2130,21 @@ mod main_tests {
     use wok_db::{write_events, EventToWrite, NoopNegentropy};
     use wok_event::{parse_and_verify_event, EventLimits};
     use wok_negentropy::Storage;
+
+    #[test]
+    fn compiled_transport_support_matches_native_fips_feature() {
+        let mut cfg = Config::default();
+        cfg.relay.fips.enabled = true;
+        let result = ensure_compiled_transport_support(&cfg);
+        if cfg!(feature = "native-fips") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("built without the native-fips feature"));
+        }
+    }
 
     #[test]
     fn parse_mesh_time_rejects_multibyte_units_without_panicking() {

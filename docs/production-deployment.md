@@ -7,6 +7,9 @@ state directory, runtime directory, and private temporary directory; removes
 Linux capabilities; blocks privilege gain; hides home and device access; and
 restricts address families to TCP/IP and Unix sockets.
 
+Native FIPS deployments also need access to the FIPS daemon's Unix socket;
+see [Native FIPS transport](fips-native.md).
+
 ## Install the service
 
 The following is a reference layout for a Linux host using systemd. Review the
@@ -57,6 +60,23 @@ changes as root. Wok's watcher applies supported live settings after the file
 is replaced. If dashboard writes are required, move the configuration to a
 separately scoped writable path and change `ExecStart`; doing so expands the
 impact of a compromised admin credential.
+
+When native FIPS is enabled, install a release archive whose name ends in
+`-native-fips` (or build with `--features native-fips`), then add the service
+account to the socket's group without changing the primary database group:
+
+```sh
+sudo systemctl edit wok
+```
+
+```ini
+[Service]
+SupplementaryGroups=fips
+```
+
+Restart Wok after any `relay.fips.*` change. A FIPS daemon restart invalidates
+all native flows; Wok discards them and rebinds instead of treating the event
+as a peer close.
 
 ## Filesystem and database policy
 

@@ -13,6 +13,7 @@ use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{ClientCommand, RelayMessage};
 use crate::restrict::ReadRestrictor;
+use crate::source::TransportSource;
 use crate::supported_nips;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
@@ -231,7 +232,7 @@ pub struct RelayHandle {
 pub enum IngestMsg {
     Client {
         conn_id: u64,
-        ip: Arc<[u8]>,
+        source: TransportSource,
         payload: String,
     },
     Close {
@@ -242,7 +243,7 @@ pub enum IngestMsg {
 enum WriterMsg {
     AddEvent {
         conn_id: u64,
-        ip: Arc<[u8]>,
+        source: TransportSource,
         packed: Vec<u8>,
         json: String,
         authed: Option<[u8; 32]>,
@@ -320,6 +321,61 @@ struct AuthSession {
     authed: Option<[u8; 32]>,
 }
 
+/// Owns one relay registration and guarantees transport cleanup on every exit
+/// path, including task cancellation.
+pub struct ConnectionGuard {
+    handle: RelayHandle,
+    conn_id: u64,
+    source: TransportSource,
+    closed: bool,
+}
+
+impl ConnectionGuard {
+    pub const fn conn_id(&self) -> u64 {
+        self.conn_id
+    }
+
+    pub fn source(&self) -> &TransportSource {
+        &self.source
+    }
+
+    pub async fn client_message(&self, payload: String) {
+        self.handle
+            .client_message(self.conn_id, self.source.clone(), payload)
+            .await;
+    }
+
+    pub async fn close(mut self) {
+        self.handle.finish_connection(self.conn_id).await;
+        self.closed = true;
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let handle = self.handle.clone();
+        let conn_id = self.conn_id;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                handle.finish_connection(conn_id).await;
+            });
+        } else {
+            handle.conns.remove(conn_id);
+            handle
+                .metrics
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
+            let _ = handle
+                .ingest_route(conn_id)
+                .try_send(IngestMsg::Close { conn_id });
+        }
+    }
+}
+
 impl RelayHandle {
     pub fn next_conn_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
@@ -336,10 +392,28 @@ impl RelayHandle {
         self.conns.insert(conn_id, out);
     }
 
-    /// Apply the connection-opening budget before a WebSocket upgrade.
-    pub fn admit_connection(&self, ip: &[u8]) -> bool {
-        if !ip.is_empty() {
-            let rendered = render_ip(ip);
+    pub async fn register_connection(
+        &self,
+        source: TransportSource,
+        out: Outbound,
+    ) -> ConnectionGuard {
+        let conn_id = self.next_conn_id();
+        self.conns.insert(conn_id, out);
+        self.metrics
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        ConnectionGuard {
+            handle: self.clone(),
+            conn_id,
+            source,
+            closed: false,
+        }
+    }
+
+    /// Apply the connection-opening budget before transport registration.
+    pub fn admit_connection(&self, source: &TransportSource) -> bool {
+        if let Some(ip) = source.ip() {
+            let rendered = ip.to_string();
             if self.moderation.read().blocked_ips.contains_key(&rendered) {
                 self.metrics
                     .abuse_connection_rejections
@@ -350,7 +424,7 @@ impl RelayHandle {
         let cfg = self.config.read();
         let admitted = self
             .abuse
-            .admit_ip(ip, BudgetKind::Connection, &cfg.relay.abuse);
+            .admit_source(source, BudgetKind::Connection, &cfg.relay.abuse);
         if !admitted {
             self.metrics
                 .abuse_connection_rejections
@@ -370,12 +444,12 @@ impl RelayHandle {
             .map_err(|_| "relay writer shut down before replying".to_string())?
     }
 
-    pub async fn client_message(&self, conn_id: u64, ip: impl Into<Arc<[u8]>>, payload: String) {
+    pub async fn client_message(&self, conn_id: u64, source: TransportSource, payload: String) {
         let _ = self
             .ingest_route(conn_id)
             .send(IngestMsg::Client {
                 conn_id,
-                ip: ip.into(),
+                source,
                 payload,
             })
             .await;
@@ -387,6 +461,13 @@ impl RelayHandle {
             .ingest_route(conn_id)
             .send(IngestMsg::Close { conn_id })
             .await;
+    }
+
+    async fn finish_connection(&self, conn_id: u64) {
+        self.close(conn_id).await;
+        self.metrics
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -725,7 +806,7 @@ fn run_ingester(
             }
             IngestMsg::Client {
                 conn_id,
-                ip,
+                source,
                 payload,
             } => {
                 // Keep the cheap read guard for the duration of one command.
@@ -741,7 +822,7 @@ fn run_ingester(
                     &moderation,
                     &mut auth,
                     conn_id,
-                    ip,
+                    source,
                     &payload,
                     &writer_tx,
                     &req_txs,
@@ -762,7 +843,7 @@ fn handle_client(
     moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
-    ip: Arc<[u8]>,
+    source: TransportSource,
     payload: &str,
     writer_tx: &Sender<WriterMsg>,
     req_txs: &[Sender<ReqMsg>],
@@ -779,7 +860,7 @@ fn handle_client(
         ClientCommand::Newline => {}
         ClientCommand::Event(v) => {
             metrics.client_event.fetch_add(1, Ordering::Relaxed);
-            if !abuse.admit_ip(&ip, BudgetKind::Event, &cfg.relay.abuse) {
+            if !abuse.admit_source(&source, BudgetKind::Event, &cfg.relay.abuse) {
                 metrics
                     .abuse_event_rate_rejections
                     .fetch_add(1, Ordering::Relaxed);
@@ -796,7 +877,7 @@ fn handle_client(
                 return;
             }
             ingest_event(
-                env, cfg, conns, metrics, abuse, moderation, auth, conn_id, ip, v, writer_tx,
+                env, cfg, conns, metrics, abuse, moderation, auth, conn_id, source, v, writer_tx,
             );
         }
         ClientCommand::Auth(v) => {
@@ -815,7 +896,7 @@ fn handle_client(
         ClientCommand::Req { sub_id, filters } => {
             metrics.client_req.fetch_add(1, Ordering::Relaxed);
             let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-            if !abuse.admit_ip(&ip, BudgetKind::Req, &cfg.relay.abuse)
+            if !abuse.admit_source(&source, BudgetKind::Req, &cfg.relay.abuse)
                 || pubkey
                     .as_ref()
                     .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
@@ -845,7 +926,7 @@ fn handle_client(
         ClientCommand::Count { sub_id, filters } => {
             metrics.client_count.fetch_add(1, Ordering::Relaxed);
             let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-            if !abuse.admit_ip(&ip, BudgetKind::Count, &cfg.relay.abuse)
+            if !abuse.admit_source(&source, BudgetKind::Count, &cfg.relay.abuse)
                 || pubkey
                     .as_ref()
                     .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Count, &cfg.relay.abuse))
@@ -896,7 +977,7 @@ fn handle_client(
             payload_hex,
         } => {
             let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-            if !abuse.admit_ip(&ip, BudgetKind::Req, &cfg.relay.abuse)
+            if !abuse.admit_source(&source, BudgetKind::Req, &cfg.relay.abuse)
                 || pubkey
                     .as_ref()
                     .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
@@ -950,7 +1031,7 @@ fn handle_client(
             // each cost a worker round with B-tree descents, and persistent
             // sessions could otherwise stream them back-to-back forever.
             let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-            if !abuse.admit_ip(&ip, BudgetKind::Req, &cfg.relay.abuse)
+            if !abuse.admit_source(&source, BudgetKind::Req, &cfg.relay.abuse)
                 || pubkey
                     .as_ref()
                     .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
@@ -1033,7 +1114,7 @@ fn ingest_event(
     moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
-    ip: Arc<[u8]>,
+    source: TransportSource,
     orig: Value,
     writer_tx: &Sender<WriterMsg>,
 ) {
@@ -1305,7 +1386,7 @@ fn ingest_event(
 
     let _ = writer_tx.send(WriterMsg::AddEvent {
         conn_id,
-        ip,
+        source,
         packed: parsed.packed.into_bytes(),
         json: parsed.json,
         authed,
@@ -1756,7 +1837,7 @@ fn run_writer(
         for m in event_batch.drain(..) {
             if let WriterMsg::AddEvent {
                 conn_id,
-                ip,
+                source,
                 packed,
                 json,
                 authed,
@@ -1771,18 +1852,11 @@ fn run_writer(
                 let res = if is_vanish_request || cfg_snap.relay.write_policy_plugin.is_empty() {
                     PluginResult::Accept
                 } else {
-                    // Unix-socket connections carry no IP; they are reported
-                    // to write-policy plugins as sourceType "unix" (wok
-                    // extension). Event JSON is parsed only when a plugin will
-                    // consume it; the normal empty-plugin path remains packed.
-                    let source_type = if ip.is_empty() {
-                        "unix"
-                    } else if ip.len() == 4 {
-                        "IP4"
-                    } else {
-                        "IP6"
-                    };
-                    let source_info = render_ip(&ip);
+                    // Transport metadata remains separate from NIP-42 auth.
+                    // Event JSON is parsed only when a plugin will consume it;
+                    // the normal empty-plugin path remains packed.
+                    let source_type = source.plugin_type();
+                    let source_info = source.plugin_info();
                     let ev_json: Value = serde_json::from_str(&json).unwrap_or(json!({}));
                     plugin.accept_event(
                         &cfg_snap.relay.write_policy_plugin,
@@ -2407,19 +2481,6 @@ fn stored_event_count(env: &Env, pubkey: &[u8; 32]) -> Result<u64, wok_db::DbErr
         },
     )?;
     Ok(count)
-}
-
-fn render_ip(ip: &[u8]) -> String {
-    if ip.len() == 4 {
-        format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
-    } else if ip.len() == 16 {
-        let a: [u8; 16] = ip.try_into().unwrap_or([0; 16]);
-        let ipv6 = std::net::Ipv6Addr::from(a);
-        ipv6.to_ipv4_mapped()
-            .map_or_else(|| ipv6.to_string(), |ipv4| ipv4.to_string())
-    } else {
-        String::new()
-    }
 }
 
 fn run_req_worker(
@@ -3233,28 +3294,6 @@ mod tests {
     }
 
     #[test]
-    fn mapped_ipv6_peers_render_as_ipv4() {
-        assert_eq!(
-            render_ip(
-                &"::ffff:203.0.113.7"
-                    .parse::<std::net::Ipv6Addr>()
-                    .unwrap()
-                    .octets(),
-            ),
-            "203.0.113.7"
-        );
-        assert_eq!(
-            render_ip(
-                &"2001:db8::1"
-                    .parse::<std::net::Ipv6Addr>()
-                    .unwrap()
-                    .octets(),
-            ),
-            "2001:db8::1"
-        );
-    }
-
-    #[test]
     fn same_batch_ban_precedes_ordinary_and_vanish_writes() {
         for kind in [1, VANISH_KIND] {
             let dir = tempfile::tempdir().unwrap();
@@ -3295,7 +3334,7 @@ mod tests {
             writer_tx
                 .send(WriterMsg::AddEvent {
                     conn_id: 1,
-                    ip: Arc::from([127, 0, 0, 1]),
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
                     packed: packed.into_bytes(),
                     json,
                     authed: None,
@@ -3427,7 +3466,11 @@ mod tests {
             "content": "core-ok",
         }));
         handle
-            .client_message(conn, vec![127, 0, 0, 1], json!(["EVENT", ev]).to_string())
+            .client_message(
+                conn,
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                json!(["EVENT", ev]).to_string(),
+            )
             .await;
         let mut got = None;
         for _ in 0..80 {
@@ -3467,7 +3510,7 @@ mod tests {
         handle
             .client_message(
                 conn,
-                vec![127, 0, 0, 1],
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
                 json!(["EVENT", event]).to_string(),
             )
             .await;
@@ -3497,7 +3540,7 @@ mod tests {
         handle
             .client_message(
                 conn,
-                vec![127, 0, 0, 1],
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
                 json!(["REQ", "broad", {}]).to_string(),
             )
             .await;
@@ -3527,7 +3570,7 @@ mod tests {
         handle
             .client_message(
                 conn,
-                vec![127, 0, 0, 1],
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
                 json!(["REQ", "private", {"kinds":[1059]}]).to_string(),
             )
             .await;
@@ -3539,6 +3582,64 @@ mod tests {
             closed.contains("\"CLOSED\"") && closed.contains("auth-required"),
             "{closed}"
         );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fips_node_identity_is_not_nip42_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        handle
+            .client_message(
+                conn,
+                TransportSource::Fips {
+                    public_key: [7; 32],
+                    port: 4242,
+                },
+                json!(["REQ", "private", {"kinds":[1059]}]).to_string(),
+            )
+            .await;
+
+        let challenge = recv_outbound(&mut rx).await;
+        let closed = recv_outbound(&mut rx).await;
+        assert!(challenge.contains("\"AUTH\""), "{challenge}");
+        assert!(
+            closed.contains("\"CLOSED\"") && closed.contains("auth-required"),
+            "{closed}"
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_connection_guard_cleans_up_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let connection = handle
+            .register_connection(TransportSource::Unix, Outbound::new(tx, 0))
+            .await;
+        assert_eq!(handle.metrics.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.metrics.active_connections.load(Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection guard cleanup");
+        assert!(rx.recv().await.is_none());
         handle.request_shutdown();
     }
 
@@ -3559,7 +3660,7 @@ mod tests {
         handle
             .client_message(
                 conn,
-                vec![127, 0, 0, 1],
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
                 json!(["REQ", "limited", {"kinds":[1]}]).to_string(),
             )
             .await;
@@ -3600,7 +3701,7 @@ mod tests {
             handle
                 .client_message(
                     conn,
-                    vec![127, 0, 0, 1],
+                    TransportSource::ip_address("127.0.0.1".parse().unwrap()),
                     json!(["EVENT", event]).to_string(),
                 )
                 .await;
@@ -3643,7 +3744,7 @@ mod tests {
             handle
                 .client_message(
                     conn,
-                    vec![127, 0, 0, 1],
+                    TransportSource::ip_address("127.0.0.1".parse().unwrap()),
                     json!(["EVENT", event]).to_string(),
                 )
                 .await;
@@ -3686,7 +3787,7 @@ mod tests {
         handle
             .client_message(
                 conn,
-                vec![127, 0, 0, 1],
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
                 json!(["EVENT", event]).to_string(),
             )
             .await;

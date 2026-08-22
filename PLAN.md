@@ -20,12 +20,14 @@ Cargo workspace crates:
 | Crate | Ownership |
 | --- | --- |
 | `wok-event` | Event JSON, NIP-01 hashing, Schnorr, PackedEvent, kind helpers |
+| `fips-message` | Wok-independent FIPS V1 framing, handshake, chunking, bounded reassembly |
 | `wok-db` | Wok-owned LMDB, read-only strfry v3 migration, transactions, integrity |
 | `wok-query` | Filters, DBScan, QueryScheduler, ActiveMonitors |
 | `wok-negentropy` | NIP-77 protocol, Vector storage, persistent BTreeLMDB |
 | `wok-relay` | Transport-neutral commands, write path, AUTH, plugins, cron |
 | `wok-ws` | HTTP + WebSocket transport |
 | `wok-unix` | Length-prefixed Unix `SOCK_STREAM` transport |
+| `wok-fips` | Native FIPS datagram transport on Linux/FreeBSD/macOS |
 | `wok-cli` | `relay`, dbutils, mesh commands |
 | `wok-bench` | Comparative load generation |
 | `wok-compat` | C++ differential harnesses and fixtures |
@@ -50,6 +52,11 @@ See `docs/known-differences.md` as it is filled in. Initial decisions:
 - **PackedEvent integers** use native endian (little-endian on supported hosts). Fried import/export is little-endian-only, matching C++.
 - **Historical restricted-kind REQ filtering** uses the Event table PackedEvent, not the JSON payload. C++ `RelayReqWorker` currently constructs `PackedEventView` from EventPayload bytes; that does not match the monitor path or AUTH intent. wok implements the intended PackedEvent check and records the C++ discrepancy.
 - **Unix socket** is a wok extension. It is disabled by default and is not advertised as a C++-compatible feature.
+- **Native FIPS is a Wok extension.** It consumes the native datagram API,
+  never the IPv6/TUN shim. FIPS node identity remains transport metadata and
+  does not satisfy NIP-42. V1 DATA delivery is explicitly unreliable. The
+  `wok-cli` dependency is compile-time opt-in through `native-fips`; an enabled
+  runtime configuration fails closed when that feature is absent.
 - **NIP advertisement** lists only capabilities covered by conformance tests.
 - **`foreach_full` must not use `MDB_GET_BOTH_RANGE` on non-`DUPSORT` DBIs.** Integer-key tables (Event, Meta, EventPayload, NegentropyFilter) return `MDB_INCOMPATIBLE` otherwise. This blocked the relay write path once the default `{}` negentropy filter caused `DeferredSink` to scan NegentropyFilter.
 - **Auth strictness follows intent, not the letter of C++ @9acdaeb.** Fully-restricted REQ/NEG-OPEN require a *completed* auth (C++: any session); `SetAuth` is dispatched to the negentropy worker (C++ defines but never dispatches); one challenge per session vacancy (C++ re-sends an unstored challenge per restricted REQ). See docs/known-differences.md.

@@ -8,7 +8,7 @@ A Rust Nostr relay that began as a reimplementation of
 [strfry](https://github.com/hoytech/strfry). Wok provides a verified, one-way
 migration from strfry v3 databases and configs, then owns its database and
 evolves against the Nostr specifications rather than preserving every strfry
-quirk. It also provides an additional Unix-domain socket transport.
+quirk. It also provides Unix-domain socket and native FIPS datagram transports.
 
 [![ci](https://github.com/erskingardner/wok/actions/workflows/ci.yml/badge.svg)](https://github.com/erskingardner/wok/actions/workflows/ci.yml)
 
@@ -39,6 +39,10 @@ quirk. It also provides an additional Unix-domain socket transport.
   library offers it); mirrors uWS negotiation as strfry configures it.
 - **Unix `SOCK_STREAM` transport** (wok extension): 4-byte big-endian
   length-prefixed JSON, same dispatcher as WebSocket.
+- **Native FIPS datagram transport** (disabled by default, Linux/FreeBSD/macOS):
+  direct `fips::native::client` flows with correlated setup, dynamic chunking,
+  bounded reassembly, and no dependency on the IPv6/TUN shim. FIPS V1 DATA is
+  not guaranteed delivery.
 - **Mesh tooling**: `router` (multi-connection replication with hot reconfig),
   `stream`, `sync` (NIP-77 two-phase transfer), `upload`, `download`.
 - **Operational continuity**: worker pools (`numThreads.*`), single LMDB writer,
@@ -60,17 +64,23 @@ quirk. It also provides an additional Unix-domain socket transport.
 ## Build
 
 ```bash
+# Lean binary: WebSocket and Unix transports, without the FIPS dependency.
 cargo build --release -p wok-cli
+
+# Native FIPS binary.
+cargo build --release -p wok-cli --features native-fips
 ```
 
-The binary is `target/release/wok`. Requires a recent stable Rust (2021
-edition); LMDB and zstd are built from vendored sources by the `lmdb-sys`/`zstd`
-crates, and outbound TLS uses Rustls with the operating system's native root
-certificate store, so no system libraries are needed beyond a C toolchain.
+The binary is `target/release/wok`. The declared MSRV is Rust 1.94.1. LMDB and
+zstd are built from vendored sources, and outbound TLS uses Rustls. The default
+build does not compile or link `wok-fips` or the upstream FIPS dependency.
+Feature-enabled Linux builds require Clang/libclang, pkg-config, and D-Bus
+development headers.
 
-Tagged releases publish checksummed native archives for Linux x86-64/ARM64 and
-macOS Intel/Apple Silicon. See [CHANGELOG.md](CHANGELOG.md) for notable changes
-and [docs/releases.md](docs/releases.md) for the tag and release process.
+Tagged releases publish checksummed lean and `-native-fips` archives for Linux
+x86-64/ARM64 and macOS Intel/Apple Silicon. See [CHANGELOG.md](CHANGELOG.md) for
+notable changes and [docs/releases.md](docs/releases.md) for the tag and release
+process.
 
 ## Migrate from strfry
 
@@ -109,6 +119,29 @@ path = "./wok-db/wok.sock"
 mode = 0o600
 ```
 
+Native FIPS (disabled by default; Linux/FreeBSD/macOS):
+
+Build or install the `native-fips` binary variant first. A lean binary rejects
+this configuration instead of silently omitting the listener.
+
+```toml
+[relay.fips]
+enabled = true
+socket_path = "/run/fips/api.sock"
+port = 7777
+```
+
+The packaged socket default is `/var/run/fips/api.sock` on macOS and FreeBSD.
+
+See [Native FIPS transport](docs/fips-native.md) for daemon configuration,
+permissions, protocol limitations, the one-command Docker Compose Linux signed
+event size matrix, and the external two-node smoke test. Run the contained
+Linux integration with:
+
+```sh
+scripts/test-fips-compose.sh
+```
+
 ## CLI
 
 All C++ subcommands exist:
@@ -116,7 +149,7 @@ All C++ subcommands exist:
 | Command | Notes |
 |---|---|
 | `migrate strfry --db <dir> --config <file> --output <dir> [--check]` | Read-only preflight or verified, one-way migration into a Wok-owned database (`--json` with `--check`) |
-| `relay` | WS (+ optional Unix) relay |
+| `relay` | WebSocket relay with optional Unix and native FIPS listeners |
 | `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse` |
 | `scan`, `event <levId>`, `info`, `delete`, `compact`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |
 | `doctor [--json]` | Config, storage, index, payload, negentropy, capacity, and runtime-path diagnostics |
@@ -130,7 +163,7 @@ Before cutover or after an unclean shutdown, run `wok --config wok.toml
 doctor`. It validates every event-derived index semantically, decompresses
 payloads and matches their IDs to packed records, opens every negentropy tree,
 checks the Wok database marker and host endianness, reports LMDB map/disk
-capacity, and verifies configured plugin and Unix-socket paths. `--json` emits
+capacity, and verifies configured plugin, Unix-socket, and native-FIPS paths. `--json` emits
 the complete machine-readable report; failures exit nonzero.
 
 If `doctor` finds damage confined to derived event indexes or negentropy,
@@ -145,6 +178,7 @@ backup directory and a `reindex-manifest.json` records the operation.
 
 ```
 crates/
+  fips-message    Wok-independent FIPS V1 envelope, chunking, reassembly
   wok-event       Event JSON, NIP-01 hashing (tao::json-exact), Schnorr, PackedEvent
   wok-db          Wok storage, strfry v3 snapshot/import, transactions, integrity
   wok-query       Filters, DBScan, QueryScheduler, ActiveMonitors
@@ -152,6 +186,7 @@ crates/
   wok-relay       Transport-neutral dispatcher, writer, AUTH, plugins, cron
   wok-ws          HTTP + WebSocket transport (in-house codec, permessage-deflate)
   wok-unix        Length-prefixed Unix SOCK_STREAM transport
+  wok-fips        Native FIPS datagram transport (Linux/FreeBSD/macOS)
   wok-cli         relay, dbutils, mesh commands
   wok-bench       Comparative benchmark harness
   wok-compat      C++ differential harnesses and fixtures
@@ -215,6 +250,7 @@ Summary:
 
 **wok extensions**
 - Unix socket transport (disabled by default).
+- Native FIPS datagram transport (disabled by default; Linux/FreeBSD/macOS).
 - `wok event <levId>` prints one event by local event ID.
 
 **Intentional Wok behavior**
@@ -271,8 +307,12 @@ Summary:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --exclude wok-bench --locked
+# Lean default graph.
+cargo clippy --workspace --exclude wok-fips --all-targets --locked -- -D warnings
+cargo test --workspace --exclude wok-bench --exclude wok-fips --locked
+# Feature-enabled graph.
+cargo clippy --workspace --all-targets --locked --features wok-cli/native-fips -- -D warnings
+cargo test --workspace --exclude wok-bench --locked --features wok-cli/native-fips
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
 # Optional C++ differential (requires a strfry binary):
 cargo test -p wok-db --test cpp_roundtrip

@@ -416,6 +416,55 @@ fn check_external_paths(cfg: &Config, report: &mut DoctorReport) {
         }
     }
 
+    if !cfg.relay.fips.enabled {
+        report.add("fips-native-api", CheckStatus::Pass, "disabled");
+    } else if !cfg!(feature = "native-fips") {
+        report.add(
+            "fips-native-api",
+            CheckStatus::Fail,
+            "binary was built without the native-fips feature",
+        );
+    } else if !cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    )) {
+        report.add(
+            "fips-native-api",
+            CheckStatus::Fail,
+            "native FIPS is supported only on Linux, FreeBSD, and macOS",
+        );
+    } else {
+        let path = &cfg.relay.fips.socket_path;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            match path.metadata() {
+                Ok(metadata) if metadata.file_type().is_socket() => report.add(
+                    "fips-native-api",
+                    CheckStatus::Pass,
+                    format!("native API socket {}", path.display()),
+                ),
+                Ok(_) => report.add(
+                    "fips-native-api",
+                    CheckStatus::Fail,
+                    format!("{} exists and is not a socket", path.display()),
+                ),
+                Err(error) => report.add(
+                    "fips-native-api",
+                    CheckStatus::Fail,
+                    format!("cannot access {}: {error}", path.display()),
+                ),
+            }
+        }
+        #[cfg(not(unix))]
+        report.add(
+            "fips-native-api",
+            CheckStatus::Fail,
+            "native FIPS requires a Unix socket",
+        );
+    }
+
     if !cfg.relay.unix.enabled {
         report.add("unix-socket", CheckStatus::Pass, "disabled");
         return;
@@ -535,5 +584,26 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "write-policy" && check.status == CheckStatus::Fail));
+    }
+
+    #[cfg(not(feature = "native-fips"))]
+    #[test]
+    fn enabled_fips_reports_a_missing_build_feature() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        drop(env);
+        let mut cfg = Config {
+            db: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        cfg.relay.fips.enabled = true;
+        let report = run(&cfg, Path::new("missing-test-config.toml"));
+        assert!(!report.ok);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "fips-native-api"
+                && check.status == CheckStatus::Fail
+                && check.detail.contains("without the native-fips feature")
+        }));
     }
 }

@@ -2,7 +2,7 @@
 
 Rust Nostr relay that began as a reimplementation of [strfry](https://github.com/hoytech/strfry). strfry v3 is a verified, one-way import format. Runtime databases are Wok-owned (v4 marker) and protocol behavior follows pinned NIPs, not every strfry quirk.
 
-License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MSRV is 1.85 (`rust-toolchain.toml` pins a newer stable for local builds).
+License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MSRV is 1.94.1 (`rust-toolchain.toml` pins a newer stable for local builds).
 
 ## Layout
 
@@ -22,6 +22,7 @@ Generated or local-only: `target/`, `bench-results/`, `strfry-db/`, `fuzz/artifa
 ```
 clients ──WS──► wok-ws ──┐
 clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicated OS threads
+clients ─FIPS─► wok-fips─┤
                          │     writer / req / monitor / negentropy / cron
                          └ outbound mpsc back to the connection task
 ```
@@ -35,6 +36,8 @@ clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicate
 | `wok-relay` | Transport-neutral dispatcher, AUTH, plugins, config |
 | `wok-ws` | HTTP + WebSocket (in-house RFC 6455/7692 codec) |
 | `wok-unix` | Length-prefixed Unix `SOCK_STREAM` transport |
+| `fips-message` | Wok-independent FIPS V1 framing and reassembly |
+| `wok-fips` | Native FIPS datagram transport (Linux/FreeBSD/macOS) |
 | `wok-cli` | `wok` binary: relay, migrate, doctor, mesh, dbutils |
 | `wok-bench` | Comparative load harness (excluded from default CI tests) |
 | `wok-compat` | NIP conformance, e2e, optional C++ differentials |
@@ -54,10 +57,13 @@ Source-of-truth order: pinned NIPs → explicit Wok decisions in `docs/` and `PL
 ## Commands
 
 ```bash
-cargo build --release -p wok-cli          # binary: target/release/wok
+cargo build --release -p wok-cli          # lean binary: target/release/wok
+cargo build --release -p wok-cli --features native-fips
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --exclude wok-bench --locked
+cargo clippy --workspace --exclude wok-fips --all-targets --locked -- -D warnings
+cargo test --workspace --exclude wok-bench --exclude wok-fips --locked
+cargo clippy --workspace --all-targets --locked --features wok-cli/native-fips -- -D warnings
+cargo test --workspace --exclude wok-bench --locked --features wok-cli/native-fips
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
 ```
 

@@ -1,0 +1,10 @@
+[package]
+name = "fips-message"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"

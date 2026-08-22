@@ -21,16 +21,18 @@ in `CHANGELOG.md` must agree.
    ```
 
 The tag push starts `.github/workflows/release.yml`. It independently validates
-the tag/version/changelog contract, runs the release gate, builds native Wok
-binaries for Linux x86-64 and ARM64 plus macOS Intel and Apple Silicon, creates
-checksums, and publishes a GitHub Release for that tag. It never moves or
-creates a tag itself.
+the tag/version/changelog contract, runs the release gate, builds both lean and
+`native-fips` Wok binaries for Linux x86-64 and ARM64 plus macOS Intel and Apple
+Silicon, creates checksums, and publishes a GitHub Release for that tag. It
+never moves or creates a tag itself.
 
 ## Release assets
 
 Each archive contains `wok`, `README.md`, `CHANGELOG.md`, `LICENSE`, the
 example `wok.toml`, and the complete `docs/` tree so README links and the Wok
-logo remain available offline. `SHA256SUMS` covers all published archives. Wok
+logo remain available offline. Standard `wok-VERSION-TARGET` archives exclude
+the native FIPS dependency. Archives ending in `-native-fips` contain the
+feature-enabled binary. `SHA256SUMS` covers all published archives. Wok
 currently uses Unix-specific process, signal, and socket APIs, so Windows
 artifacts are not published.
 

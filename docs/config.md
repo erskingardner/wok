@@ -255,6 +255,8 @@ See [Unix socket protocol](unix-socket.md) for framing and peer authorization.
 All native-FIPS settings require restart, are file-only, and are supported on
 Linux, FreeBSD, and macOS. See [Native FIPS transport](fips-native.md) for daemon,
 permission, identity, lifecycle, and two-node test instructions.
+They take effect only in a binary built with the `native-fips` Cargo feature;
+an enabled configuration is rejected by a lean binary.
 
 | Key | Default | Meaning |
 |---|---:|---|

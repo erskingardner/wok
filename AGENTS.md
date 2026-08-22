@@ -57,10 +57,13 @@ Source-of-truth order: pinned NIPs → explicit Wok decisions in `docs/` and `PL
 ## Commands
 
 ```bash
-cargo build --release -p wok-cli          # binary: target/release/wok
+cargo build --release -p wok-cli          # lean binary: target/release/wok
+cargo build --release -p wok-cli --features native-fips
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --exclude wok-bench --locked
+cargo clippy --workspace --exclude wok-fips --all-targets --locked -- -D warnings
+cargo test --workspace --exclude wok-bench --exclude wok-fips --locked
+cargo clippy --workspace --all-targets --locked --features wok-cli/native-fips -- -D warnings
+cargo test --workspace --exclude wok-bench --locked --features wok-cli/native-fips
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
 ```
 

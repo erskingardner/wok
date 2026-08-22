@@ -54,7 +54,9 @@ See `docs/known-differences.md` as it is filled in. Initial decisions:
 - **Unix socket** is a wok extension. It is disabled by default and is not advertised as a C++-compatible feature.
 - **Native FIPS is a Wok extension.** It consumes the native datagram API,
   never the IPv6/TUN shim. FIPS node identity remains transport metadata and
-  does not satisfy NIP-42. V1 DATA delivery is explicitly unreliable.
+  does not satisfy NIP-42. V1 DATA delivery is explicitly unreliable. The
+  `wok-cli` dependency is compile-time opt-in through `native-fips`; an enabled
+  runtime configuration fails closed when that feature is absent.
 - **NIP advertisement** lists only capabilities covered by conformance tests.
 - **`foreach_full` must not use `MDB_GET_BOTH_RANGE` on non-`DUPSORT` DBIs.** Integer-key tables (Event, Meta, EventPayload, NegentropyFilter) return `MDB_INCOMPATIBLE` otherwise. This blocked the relay write path once the default `{}` negentropy filter caused `DeferredSink` to scan NegentropyFilter.
 - **Auth strictness follows intent, not the letter of C++ @9acdaeb.** Fully-restricted REQ/NEG-OPEN require a *completed* auth (C++: any session); `SetAuth` is dispatched to the negentropy worker (C++ defines but never dispatches); one challenge per session vacancy (C++ re-sends an unstored challenge per restricted REQ). See docs/known-differences.md.

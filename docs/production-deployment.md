@@ -61,8 +61,9 @@ is replaced. If dashboard writes are required, move the configuration to a
 separately scoped writable path and change `ExecStart`; doing so expands the
 impact of a compromised admin credential.
 
-When native FIPS is enabled, add the service account to the socket's group
-without changing the primary database group:
+When native FIPS is enabled, install a release archive whose name ends in
+`-native-fips` (or build with `--features native-fips`), then add the service
+account to the socket's group without changing the primary database group:
 
 ```sh
 sudo systemctl edit wok

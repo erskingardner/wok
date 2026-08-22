@@ -10,6 +10,10 @@ default-run = "wok"
 name = "wok"
 path = "src/main.rs"
 
+[features]
+default = []
+native-fips = ["dep:wok-fips"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -32,7 +36,7 @@ url.workspace = true
 zstd = { workspace = true, features = ["zdict_builder"] }
 wok-db = { path = "../wok-db" }
 wok-event = { path = "../wok-event" }
-wok-fips = { path = "../wok-fips" }
+wok-fips = { path = "../wok-fips", optional = true }
 wok-negentropy = { path = "../wok-negentropy" }
 wok-query = { path = "../wok-query" }
 wok-relay = { path = "../wok-relay" }

@@ -17,7 +17,7 @@ RUN apt-get update && \
 WORKDIR /src/wok
 COPY . .
 RUN grep -Fq "${FIPS_GIT_REV}" Cargo.lock && \
-    cargo build --release --locked -p wok-cli --bin wok && \
+    cargo build --release --locked -p wok-cli --bin wok --features native-fips && \
     cargo build --release --locked -p wok-fips \
         --example native-client \
         --example native-event-matrix

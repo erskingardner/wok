@@ -64,17 +64,23 @@ quirk. It also provides Unix-domain socket and native FIPS datagram transports.
 ## Build
 
 ```bash
+# Lean binary: WebSocket and Unix transports, without the FIPS dependency.
 cargo build --release -p wok-cli
+
+# Native FIPS binary.
+cargo build --release -p wok-cli --features native-fips
 ```
 
 The binary is `target/release/wok`. The declared MSRV is Rust 1.94.1. LMDB and
-zstd are built from vendored sources, and outbound TLS uses Rustls. Linux,
-FreeBSD, and macOS builds also compile the native FIPS client dependency.
-Linux builds require Clang/libclang, pkg-config, and D-Bus development headers.
+zstd are built from vendored sources, and outbound TLS uses Rustls. The default
+build does not compile or link `wok-fips` or the upstream FIPS dependency.
+Feature-enabled Linux builds require Clang/libclang, pkg-config, and D-Bus
+development headers.
 
-Tagged releases publish checksummed native archives for Linux x86-64/ARM64 and
-macOS Intel/Apple Silicon. See [CHANGELOG.md](CHANGELOG.md) for notable changes
-and [docs/releases.md](docs/releases.md) for the tag and release process.
+Tagged releases publish checksummed lean and `-native-fips` archives for Linux
+x86-64/ARM64 and macOS Intel/Apple Silicon. See [CHANGELOG.md](CHANGELOG.md) for
+notable changes and [docs/releases.md](docs/releases.md) for the tag and release
+process.
 
 ## Migrate from strfry
 
@@ -114,6 +120,9 @@ mode = 0o600
 ```
 
 Native FIPS (disabled by default; Linux/FreeBSD/macOS):
+
+Build or install the `native-fips` binary variant first. A lean binary rejects
+this configuration instead of silently omitting the listener.
 
 ```toml
 [relay.fips]
@@ -298,8 +307,12 @@ Summary:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --exclude wok-bench --locked
+# Lean default graph.
+cargo clippy --workspace --exclude wok-fips --all-targets --locked -- -D warnings
+cargo test --workspace --exclude wok-bench --exclude wok-fips --locked
+# Feature-enabled graph.
+cargo clippy --workspace --all-targets --locked --features wok-cli/native-fips -- -D warnings
+cargo test --workspace --exclude wok-bench --locked --features wok-cli/native-fips
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
 # Optional C++ differential (requires a strfry binary):
 cargo test -p wok-db --test cpp_roundtrip

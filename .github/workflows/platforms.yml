@@ -15,19 +15,35 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.target }} (${{ matrix.variant }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            variant: default
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            variant: native-fips
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            variant: default
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            variant: native-fips
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+            variant: default
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            variant: native-fips
           - runner: macos-15
             target: aarch64-apple-darwin
+            variant: default
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            variant: native-fips
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -35,10 +51,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Install native FIPS build dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.variant == 'native-fips'
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libdbus-1-dev pkg-config
       - name: Build release binary
-        run: cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          if [[ "$VARIANT" == native-fips ]]; then
+            cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli --features native-fips
+          else
+            cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli
+          fi
       - name: Smoke-test version metadata
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')

@@ -19,16 +19,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install native FIPS build dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libdbus-1-dev pkg-config
       - name: fmt
         run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: test
-        run: cargo test --workspace --exclude wok-bench --locked
+      - name: Verify the default binary excludes native FIPS
+        run: |
+          tree=$(cargo tree -p wok-cli --edges normal --prefix none)
+          if grep -E '^(fips|fips-message|wok-fips) v' <<<"$tree"; then
+            echo "default wok-cli unexpectedly includes native FIPS dependencies" >&2
+            exit 1
+          fi
+      - name: clippy (default features)
+        run: cargo clippy --workspace --exclude wok-fips --all-targets --locked -- -D warnings
+      - name: test (default features)
+        run: cargo test --workspace --exclude wok-bench --exclude wok-fips --locked
       - name: conformance smoke
         run: cargo test -p wok-compat --test nip_conformance --test e2e_transports --locked
+
+  native-fips:
+    name: native FIPS feature
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install native FIPS build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libdbus-1-dev pkg-config
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked --features wok-cli/native-fips -- -D warnings
+      - name: test
+        run: cargo test --workspace --exclude wok-bench --locked --features wok-cli/native-fips
 
   msrv:
     name: rust 1.94.1 minimum version
@@ -36,7 +56,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Check default workspace at declared MSRV
+        run: cargo check --workspace --exclude wok-fips --all-targets --locked
+
+  native-fips-msrv:
+    name: native FIPS at rust 1.94.1
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
       - name: Install native FIPS build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libdbus-1-dev pkg-config
-      - name: Check workspace at declared MSRV
-        run: cargo check --workspace --all-targets --locked
+      - name: Check feature-enabled workspace at declared MSRV
+        run: cargo check --workspace --all-targets --locked --features wok-cli/native-fips

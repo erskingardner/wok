@@ -473,6 +473,7 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 }
 
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
+    ensure_compiled_transport_support(&cfg)?;
     if let Some(warning) = cfg.auth_configuration_warning() {
         tracing::warn!("{warning}; restricted reads fail closed");
     }
@@ -489,7 +490,6 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     let env = open_env(&cfg)?;
     let bind: SocketAddr = format!("{}:{}", cfg.relay.bind, cfg.relay.port).parse()?;
     let unix_cfg = cfg.clone();
-    let fips_enabled = cfg.relay.fips.enabled;
     let fips_cfg = Arc::new(cfg.clone());
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     if config_path.exists() {
@@ -498,7 +498,6 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     }
     let h2 = handle.clone();
     let h3 = handle.clone();
-    let h4 = handle.clone();
     let ws = tokio::spawn(async move {
         if let Err(e) = wok_ws::serve(h3, bind).await {
             tracing::error!("ws server: {e}");
@@ -509,8 +508,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
             tracing::error!("unix server: {e}");
         }
     });
-    let mut fips =
-        fips_enabled.then(|| tokio::spawn(async move { wok_fips::serve(h4, fips_cfg).await }));
+    let mut fips = spawn_fips_transport(handle.clone(), fips_cfg);
     // C++ graceful shutdown is SIGUSR1; wok also treats SIGINT the same way.
     let mut sigusr1 =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
@@ -562,6 +560,38 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         Err(anyhow::anyhow!(error))
     } else {
         Ok(())
+    }
+}
+
+fn ensure_compiled_transport_support(_cfg: &Config) -> Result<()> {
+    #[cfg(not(feature = "native-fips"))]
+    if _cfg.relay.fips.enabled {
+        bail!(
+            "relay.fips.enabled is true, but this Wok binary was built without the \
+             native-fips feature; rebuild with --features native-fips"
+        );
+    }
+    Ok(())
+}
+
+fn spawn_fips_transport(
+    handle: wok_relay::RelayHandle,
+    cfg: Arc<Config>,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    #[cfg(feature = "native-fips")]
+    {
+        cfg.relay.fips.enabled.then(|| {
+            tokio::spawn(async move {
+                wok_fips::serve(handle, cfg)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+    }
+    #[cfg(not(feature = "native-fips"))]
+    {
+        let _ = (handle, cfg);
+        None
     }
 }
 
@@ -2100,6 +2130,21 @@ mod main_tests {
     use wok_db::{write_events, EventToWrite, NoopNegentropy};
     use wok_event::{parse_and_verify_event, EventLimits};
     use wok_negentropy::Storage;
+
+    #[test]
+    fn compiled_transport_support_matches_native_fips_feature() {
+        let mut cfg = Config::default();
+        cfg.relay.fips.enabled = true;
+        let result = ensure_compiled_transport_support(&cfg);
+        if cfg!(feature = "native-fips") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("built without the native-fips feature"));
+        }
+    }
 
     #[test]
     fn parse_mesh_time_rejects_multibyte_units_without_panicking() {

@@ -5,6 +5,17 @@ native datagram API. It does not use the `fips0` IPv6/TUN interface. Native
 operation is supported on Linux, FreeBSD, and macOS; other targets keep the
 transport disabled and return a platform error if it is configured on.
 
+Native FIPS is also a compile-time opt-in. Build Wok with:
+
+```sh
+cargo build --release -p wok-cli --features native-fips
+```
+
+The default `wok-cli` build does not compile or link `wok-fips` or the upstream
+FIPS dependency. If a lean binary reads `relay.fips.enabled = true`, it exits
+before opening the database or starting any listener and explains which feature
+is required. Tagged releases provide separately named `-native-fips` archives.
+
 This integration consumes the `fips` Rust package from commit
 `d69325a2a37d419328471883d3dbc21c6f2a5a3d` on the `master` branch. The
 package's module is

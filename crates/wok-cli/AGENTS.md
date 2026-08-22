@@ -2,7 +2,9 @@
 
 The `wok` binary. Subcommands cover relay, verified strfry migration, DB utilities, diagnostics, and mesh tooling.
 
-Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default config path: `wok.toml`.
+Build: `cargo build --release -p wok-cli` produces the lean
+`target/release/wok`; add `--features native-fips` for the native FIPS adapter.
+Default config path: `wok.toml`.
 
 ## Layout
 

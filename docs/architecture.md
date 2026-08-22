@@ -26,3 +26,5 @@ Crate boundaries: `fips-message`, `wok-event`, `wok-db`, `wok-query`,
 `wok-negentropy`, `wok-relay`, `wok-ws`, `wok-unix`, `wok-fips`, `wok-cli`,
 `wok-bench`, `wok-compat`. `fips-message` is payload-agnostic and has no Wok
 dependencies; `wok-fips` is the Linux/FreeBSD/macOS adapter into `wok-relay`.
+`wok-cli` selects that adapter only through its opt-in `native-fips` feature;
+the default binary has no compiled dependency on either `wok-fips` or `fips`.

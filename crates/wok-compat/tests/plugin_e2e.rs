@@ -12,6 +12,9 @@ use wok_compat::{sign_event, sign_event_with_key};
 use wok_db::{Env, EnvOptions};
 use wok_relay::Config;
 
+const WRITE_POLICY_TIMEOUT_SECS: u64 = 5;
+const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -68,7 +71,7 @@ fn test_cfg(dir: &std::path::Path, plugin_cmd: String) -> Config {
     cfg.relay.unix.enabled = false;
     cfg.relay.auth.enabled = false;
     cfg.relay.write_policy_plugin = plugin_cmd;
-    cfg.relay.write_policy_timeout_secs = 5;
+    cfg.relay.write_policy_timeout_secs = WRITE_POLICY_TIMEOUT_SECS;
     cfg
 }
 
@@ -97,7 +100,10 @@ async fn publish(addr: std::net::SocketAddr, ev: serde_json::Value) -> String {
         .await
         .unwrap();
     for _ in 0..20 {
-        match tokio::time::timeout(Duration::from_secs(3), ws.next()).await {
+        // The client must outlive the relay's plugin deadline. On a loaded CI
+        // runner, starting the external Node process can consume most of that
+        // window before the relay sends its OK response.
+        match tokio::time::timeout(CLIENT_RESPONSE_TIMEOUT, ws.next()).await {
             Ok(Some(Ok(m))) => {
                 let t = m.to_text().unwrap_or("").to_string();
                 if t.contains("\"OK\"") {

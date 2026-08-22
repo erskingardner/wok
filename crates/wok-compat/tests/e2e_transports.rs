@@ -31,6 +31,17 @@ fn test_cfg(dir: &std::path::Path) -> Config {
     cfg
 }
 
+fn test_env(dir: &std::path::Path) -> Env {
+    Env::open(
+        dir,
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap()
+}
+
 async fn recv_until<S>(ws: &mut S, pred: impl Fn(&str) -> bool) -> Vec<String>
 where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -55,7 +66,7 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_publish_and_subscribe() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir.path());
     let handle = wok_relay::start(env, cfg).unwrap();
@@ -121,7 +132,7 @@ async fn ws_publish_and_subscribe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_accepts_events_beyond_the_legacy_nip44_ceiling() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir.path());
     let handle = wok_relay::start(env, cfg).unwrap();
@@ -165,7 +176,7 @@ async fn ws_accepts_events_beyond_the_legacy_nip44_ceiling() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip91_historical_live_and_count_share_and_semantics() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir.path());
     let handle = wok_relay::start(env, cfg).unwrap();
@@ -251,7 +262,7 @@ async fn nip91_historical_live_and_count_share_and_semantics() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip62_vanish_is_immediate_and_blocks_rebroadcast() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir.path());
     let handle = wok_relay::start(env, cfg).unwrap();
@@ -373,7 +384,7 @@ async fn nip62_vanish_is_immediate_and_blocks_rebroadcast() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip45_count_returns_mergeable_hll_for_canonical_tag_query() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir.path());
     let handle = wok_relay::start(env, cfg).unwrap();
@@ -499,7 +510,7 @@ async fn nip45_count_returns_mergeable_hll_for_canonical_tag_query() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip50_ranked_historical_and_live_search() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir.path());
     let handle = wok_relay::start(env, cfg).unwrap();
@@ -608,7 +619,7 @@ async fn nip50_ranked_historical_and_live_search() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ephemeral_events_are_live_only_by_default() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let probe = env.clone();
     let cfg = test_cfg(dir.path());
@@ -694,7 +705,7 @@ async fn ephemeral_events_are_live_only_by_default() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ttl_compatibility_mode_persists_ephemeral_events() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let probe = env.clone();
     let mut cfg = test_cfg(dir.path());
@@ -755,7 +766,7 @@ async fn ttl_compatibility_mode_persists_ephemeral_events() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unix_publish_and_subscribe() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let sock = dir.path().join("wok.sock");
     let mut cfg = test_cfg(dir.path());
@@ -833,7 +844,7 @@ async fn unix_publish_and_subscribe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_publish_unix_subscribe() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let sock = dir.path().join("wok.sock");
     let mut cfg = test_cfg(dir.path());
@@ -901,7 +912,7 @@ async fn ws_publish_unix_subscribe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unix_publish_ws_subscribe() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let sock = dir.path().join("wok.sock");
     let mut cfg = test_cfg(dir.path());
@@ -952,7 +963,7 @@ async fn unix_publish_ws_subscribe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip11_http_document() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let mut cfg = test_cfg(dir.path());
     cfg.relay.info.pubkey =
@@ -1003,7 +1014,7 @@ async fn nip11_http_document() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip98_admin_http_route_authenticates_and_rejects_replay() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

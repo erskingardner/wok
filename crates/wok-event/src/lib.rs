@@ -24,7 +24,7 @@ pub use packed::{
 };
 pub use parse::{
     from_hex, from_hex_exact, from_hex_strict, from_lower_hex_exact, normalize_event_json,
-    nostr_json_to_packed_event, to_hex, EventLimits, ParsedEvent,
+    nostr_json_to_packed_event, to_hex, EventLimits, ParsedEvent, DEFAULT_MAX_EVENT_SIZE,
 };
 pub use validate::{
     parse_and_verify_event, verify_event_json_size, verify_event_timestamp, verify_nostr_event,

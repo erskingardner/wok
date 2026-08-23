@@ -5,7 +5,8 @@ plugin isolation guidance, and logging policy, see
 [Production deployment security](production-deployment.md).
 
 - Treat every EVENT as untrusted. IDs and Schnorr signatures are verified unless `--no-verify` import is explicitly used.
-- Input limits: `max_event_size`, tag counts, WebSocket/Unix frame sizes, and
+- Input limits: `max_event_size`, tag counts, WebSocket/Unix frame sizes, FIPS
+  logical-message/chunk/reassembly bounds, and
   `max_pending_outbound_bytes`.
 - Unix sockets: bound at a sibling temp path, chmod/chowned there, and
   atomically renamed into place (no bind→chmod window); stale-path replacement
@@ -19,6 +20,10 @@ plugin isolation guidance, and logging policy, see
   Stop the relay and all DB utilities first; promotion retains the original
   database as a sibling backup rather than modifying it in place.
 - Do not expose the Unix socket on a shared host without UID/GID policy and `0600` mode.
+- Native FIPS access requires membership in the daemon's `fips` group. That
+  grants access to an experimental node-local datagram API; keep group
+  membership narrow. A FIPS node key is transport metadata only and cannot
+  authenticate a Nostr/Marmot user or bypass NIP-42.
 
 ## Memory-safety boundary
 

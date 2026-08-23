@@ -1,6 +1,7 @@
 //! Relay-native token buckets and inexpensive admission checks.
 
 use crate::config::AbuseConfig;
+use crate::source::TransportSource;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ pub enum BudgetKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Principal {
     Ip(Vec<u8>),
+    FipsNode([u8; 32]),
     Pubkey([u8; 32]),
 }
 
@@ -37,6 +39,27 @@ pub struct AbuseController {
 }
 
 impl AbuseController {
+    pub fn admit_source(
+        &self,
+        source: &TransportSource,
+        kind: BudgetKind,
+        cfg: &AbuseConfig,
+    ) -> bool {
+        if !cfg.enabled {
+            return true;
+        }
+        let principal = match source {
+            TransportSource::Ip(ip) => Principal::Ip(match ip {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            }),
+            TransportSource::Fips { public_key, .. } => Principal::FipsNode(*public_key),
+            TransportSource::Unix => return true,
+        };
+        let (rate, burst) = spec(kind, cfg);
+        self.admit(principal, kind, rate, burst)
+    }
+
     pub fn admit_ip(&self, ip: &[u8], kind: BudgetKind, cfg: &AbuseConfig) -> bool {
         if !cfg.enabled || ip.is_empty() {
             return true;

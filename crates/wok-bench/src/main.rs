@@ -1208,7 +1208,11 @@ impl ClientConnection {
 
     async fn close(&mut self, _frame: Option<()>) -> Result<()> {
         match self {
-            Self::WebSocket(stream) => stream.close(None).await.context("WebSocket close"),
+            Self::WebSocket(stream) => {
+                tokio_tungstenite::WebSocketStream::close(stream.as_mut(), None)
+                    .await
+                    .context("WebSocket close")
+            }
             Self::Unix(stream) => {
                 use tokio::io::AsyncWriteExt;
                 stream.shutdown().await.context("Unix socket close")

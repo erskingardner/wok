@@ -1,6 +1,13 @@
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+    # Inherited through the pinned experimental FIPS client. None currently
+    # has a compatible upstream upgrade; keep the exceptions exact and remove
+    # them when FIPS advances its nostr/rtnetlink dependency graph.
+    "RUSTSEC-2024-0384", # instant, unmaintained
+    "RUSTSEC-2024-0436", # paste, unmaintained
+    "RUSTSEC-2026-0243", # nostr-relay-pool, resource exhaustion
+]
 
 [licenses]
 confidence-threshold = 0.8
@@ -16,6 +23,15 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
+exceptions = [
+    # Transitive dependencies of the pinned native FIPS client. Keep these
+    # scoped to the exact crates instead of widening the workspace allowlist.
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["GPL-3.0-or-later"], crate = "rustables" },
+    { allow = ["GPL-3.0-or-later"], crate = "rustables-macros" },
+    { allow = ["WTFPL"], crate = "tun" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
 
 [bans]
 multiple-versions = "warn"
@@ -26,4 +42,4 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/jmcorgan/fips.git"]

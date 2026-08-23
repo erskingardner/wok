@@ -1,0 +1,39 @@
+name: native FIPS end to end
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - compose.fips.yml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - scripts/test-fips-compose.sh
+      - testing/fips-native/**
+      - .github/workflows/fips-e2e.yml
+  pull_request:
+    paths:
+      - compose.fips.yml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - scripts/test-fips-compose.sh
+      - testing/fips-native/**
+      - .github/workflows/fips-e2e.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-fips-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose-event-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build two FIPS nodes and verify signed event size matrix
+        run: scripts/test-fips-compose.sh

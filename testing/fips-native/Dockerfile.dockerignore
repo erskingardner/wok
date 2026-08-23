@@ -1,0 +1,10 @@
+.git
+target
+bench-results
+strfry-db
+fuzz/artifacts
+fuzz/corpus
+*.mdb
+*.mdb-lock
+.env
+.env.*

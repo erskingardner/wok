@@ -3,7 +3,7 @@
 | File | When | What |
 | --- | --- | --- |
 | `ci.yml` | every push/PR | lean dependency boundary, fmt, clippy/tests with and without `native-fips`, conformance smoke, MSRV 1.94.1 checks |
-| `fips-e2e.yml` | FIPS-relevant master/PR changes; manual | Two native Linux FIPS nodes plus Wok, asserting signed event size boundaries and query-back over Compose |
+| `fips-e2e.yml` | FIPS-relevant master/PR changes; manual | Evidence for the very experimental adapter: two native Linux FIPS nodes plus Wok; passing is not a stability claim |
 | `platforms.yml` | master, PR | Lean and `native-fips` builds: Linux x86_64/ARM64, macOS Intel/Apple Silicon |
 | `security.yml` | Cargo.toml/lock/deny.toml; weekly | `cargo-deny` via `deny.toml` |
 | `fuzz.yml` | fuzz/protocol paths; weekly Wednesday | AddressSanitizer ingress fuzz |

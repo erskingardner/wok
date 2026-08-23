@@ -4,6 +4,16 @@ Rust Nostr relay that began as a reimplementation of [strfry](https://github.com
 
 License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MSRV is 1.94.1 (`rust-toolchain.toml` pins a newer stable for local builds).
 
+## Native FIPS status
+
+Native FIPS support is **very experimental and not production-ready**. Its
+upstream API, Wok framing, configuration, and interoperability contract may
+change incompatibly, and datagrams or relay responses may be lost. Agents must
+not describe it as stable, reliable, production-ready, or generally available.
+Keep it compile-time and runtime opt-in, preserve explicit warnings in user and
+operator documentation, and require real FIPS interoperability evidence for
+behavior claims.
+
 ## Layout
 
 | Path | What it is |
@@ -36,8 +46,8 @@ clients ─FIPS─► wok-fips─┤
 | `wok-relay` | Transport-neutral dispatcher, AUTH, plugins, config |
 | `wok-ws` | HTTP + WebSocket (in-house RFC 6455/7692 codec) |
 | `wok-unix` | Length-prefixed Unix `SOCK_STREAM` transport |
-| `fips-message` | Wok-independent FIPS V1 framing and reassembly |
-| `wok-fips` | Native FIPS datagram transport (Linux/FreeBSD/macOS) |
+| `fips-message` | Very experimental Wok-independent FIPS V1 framing and reassembly |
+| `wok-fips` | Very experimental native FIPS datagram transport (Linux/FreeBSD/macOS) |
 | `wok-cli` | `wok` binary: relay, migrate, doctor, mesh, dbutils |
 | `wok-bench` | Comparative load harness (excluded from default CI tests) |
 | `wok-compat` | NIP conformance, e2e, optional C++ differentials |

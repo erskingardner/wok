@@ -9,6 +9,6 @@ Operator/CI helper scripts. Not on the relay runtime path.
 | `benchmark-campaign.sh` | Two-host / full `wok-bench` campaign wrapper |
 | `benchmark-transports.sh` | Same-host Unix vs WebSocket comparison |
 | `benchmark-relay-control.sh` | Relay control / orchestration for campaigns |
-| `test-fips-compose.sh` | Disposable two-node Linux FIPS/Wok signed-event size matrix |
+| `test-fips-compose.sh` | Disposable evidence for the very experimental two-node Linux FIPS/Wok adapter; passing is not a stability claim |
 
 Release process is documented in `docs/releases.md`. Benchmark methodology is `docs/benchmarks.md`. GitHub release workflow calls the release scripts from `.github/workflows/release.yml`.

@@ -1,5 +1,11 @@
 # FIPS logical-message protocol V1
 
+> [!CAUTION]
+> **This protocol is very experimental.** V1 identifies the current wire
+> format; it is not a stability promise. The format, limits, lifecycle, and
+> interoperability contract may change incompatibly before the native FIPS
+> transport is declared stable.
+
 This protocol carries opaque logical messages over FIPS native datagrams. It
 does not add reliability to FIPS V1: complete messages can be lost whenever a
 datagram is lost. Its responsibilities are only session establishment,

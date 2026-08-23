@@ -32,7 +32,9 @@ Each archive contains `wok`, `README.md`, `CHANGELOG.md`, `LICENSE`, the
 example `wok.toml`, and the complete `docs/` tree so README links and the Wok
 logo remain available offline. Standard `wok-VERSION-TARGET` archives exclude
 the native FIPS dependency. Archives ending in `-native-fips` contain the
-feature-enabled binary. `SHA256SUMS` covers all published archives. Wok
+feature-enabled, very experimental binary; their publication is not a
+production-readiness or compatibility guarantee. `SHA256SUMS` covers all
+published archives. Wok
 currently uses Unix-specific process, signal, and socket APIs, so Windows
 artifacts are not published.
 

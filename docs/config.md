@@ -252,6 +252,10 @@ See [Unix socket protocol](unix-socket.md) for framing and peer authorization.
 
 ## Native FIPS transport
 
+> [!WARNING]
+> Native FIPS is very experimental and not production-ready. Its configuration
+> and wire behavior may change incompatibly.
+
 All native-FIPS settings require restart, are file-only, and are supported on
 Linux, FreeBSD, and macOS. See [Native FIPS transport](fips-native.md) for daemon,
 permission, identity, lifecycle, and two-node test instructions.

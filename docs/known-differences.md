@@ -19,8 +19,9 @@ it is not a promise to reproduce upstream bugs.
 
 - Wok offers an optional Unix socket transport. Write-policy plugins see
   `sourceType: "unix"` for those connections.
-- Wok offers an optional native FIPS datagram transport on Linux, FreeBSD, and
-  macOS.
+- Wok offers a very experimental native FIPS datagram transport on Linux,
+  FreeBSD, and macOS. It is not production-ready; its API, wire format,
+  configuration, and interoperability contract may change incompatibly.
   Write-policy plugins see `sourceType: "fips"` and a peer `npub` key encoded
   as lowercase hex plus its FIPS port. That key is not NIP-42 identity.
 - `wok event <levId>` prints one event by local event ID.

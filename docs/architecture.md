@@ -1,6 +1,8 @@
 # Architecture
 
-Tokio owns WebSocket, Unix, and native FIPS I/O. Dedicated OS threads own LMDB.
+Tokio owns WebSocket, Unix, and native FIPS I/O. The native FIPS adapter and
+its wire protocol are very experimental and not production-ready. Dedicated OS
+threads own LMDB.
 
 ```
 clients ──WS──► wok-ws ──┐
@@ -25,6 +27,7 @@ Invariants:
 Crate boundaries: `fips-message`, `wok-event`, `wok-db`, `wok-query`,
 `wok-negentropy`, `wok-relay`, `wok-ws`, `wok-unix`, `wok-fips`, `wok-cli`,
 `wok-bench`, `wok-compat`. `fips-message` is payload-agnostic and has no Wok
-dependencies; `wok-fips` is the Linux/FreeBSD/macOS adapter into `wok-relay`.
+dependencies; `wok-fips` is the very experimental Linux/FreeBSD/macOS adapter
+into `wok-relay`.
 `wok-cli` selects that adapter only through its opt-in `native-fips` feature;
 the default binary has no compiled dependency on either `wok-fips` or `fips`.

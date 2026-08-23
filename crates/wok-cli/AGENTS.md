@@ -6,6 +6,10 @@ Build: `cargo build --release -p wok-cli` produces the lean
 `target/release/wok`; add `--features native-fips` for the native FIPS adapter.
 Default config path: `wok.toml`.
 
+The native FIPS feature is **very experimental and not production-ready**. It
+must remain compile-time and runtime opt-in. A lean binary must fail explicitly
+when configuration enables FIPS; it must never silently ignore the request.
+
 ## Layout
 
 - `Cargo.toml`

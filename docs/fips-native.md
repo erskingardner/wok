@@ -1,5 +1,13 @@
 # Native FIPS transport
 
+> [!CAUTION]
+> **This entire integration is very experimental and is not production-ready.**
+> The upstream native API, Wok's FIPS V1 framing, configuration keys, and
+> interoperability behavior may change without backward compatibility. FIPS
+> datagrams and Nostr responses can be lost. Operators must expect breakage and
+> coordinated manual upgrades; ordinary production relays should leave the
+> compile-time feature and runtime listener disabled.
+
 Wok can serve the Nostr relay protocol directly over the experimental FIPS
 native datagram API. It does not use the `fips0` IPv6/TUN interface. Native
 operation is supported on Linux, FreeBSD, and macOS; other targets keep the

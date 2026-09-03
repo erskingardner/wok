@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-03
+
 ### Changed
 
 - The default normalized event ceiling is now 1 MiB, with 2 MiB WebSocket and
@@ -17,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Oversized normalized events are rejected before event-id hashing and Schnorr
   verification, limiting the extra admission cost made reachable by the larger
   transport envelope.
+
+### Fixed
+
+- WebSocket and Unix connections now share explicit transport metadata and a
+  cancellation-safe lifecycle guard, so an abandoned connection task cannot
+  leave behind a stale relay registration or inflated active-connection gauge.
+- Filesystem capacity checks now convert `statvfs` fields without assuming
+  platform-specific integer types.
 
 ## [0.4.0] - 2026-08-18
 

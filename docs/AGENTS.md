@@ -24,7 +24,6 @@ Operator and design documentation. Code remains the authority for current behavi
 | `observability.md` | Metrics / tracing |
 | `admin-dashboard.md` | `/admin` |
 | `unix-socket.md` | Length-prefixed Unix protocol |
-| `fips-native.md` + `fips-message-v1.md` | Very experimental native FIPS adapter and unstable wire format |
 | `mesh-and-maintenance.md` | router/stream/sync, doctor, reindex |
 | `releases.md` | Tag and GitHub release process |
 | `nip50-search.md` | Search semantics and scoring |
@@ -35,6 +34,3 @@ Operator and design documentation. Code remains the authority for current behavi
 Dated benchmark writeups (`benchmark-*.md`, `websocket-performance-*.md`, `transport-benchmark-*.md`), `sample-bench-*.md` / `.jsonl`, and `FINAL.md` (definition-of-done). `wok.svg` is the logo.
 
 When behavior changes, update the relevant doc in the same change: NIPs → `nips.md` + capabilities; strfry diffs → `known-differences.md`; config keys → `config.md` + `wok.toml`.
-Native FIPS documentation must keep a prominent warning that the adapter is
-very experimental, unreliable, subject to incompatible change, and not
-production-ready.

@@ -17,7 +17,6 @@ pub enum BudgetKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Principal {
     Ip(Vec<u8>),
-    FipsNode([u8; 32]),
     Pubkey([u8; 32]),
 }
 
@@ -53,7 +52,6 @@ impl AbuseController {
                 std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
                 std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
             }),
-            TransportSource::Fips { public_key, .. } => Principal::FipsNode(*public_key),
             TransportSource::Unix => return true,
         };
         let (rate, burst) = spec(kind, cfg);

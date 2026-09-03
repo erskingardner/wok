@@ -1,15 +1,11 @@
 use std::net::IpAddr;
 
-/// Transport metadata for one relay connection.
-///
-/// A FIPS node key is an abuse/logging principal only. It is deliberately a
-/// separate variant from authenticated Nostr identity, which is established
-/// exclusively by NIP-42 inside the relay protocol.
+/// Transport metadata for one relay connection, kept separate from the
+/// authenticated Nostr identity established by NIP-42.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TransportSource {
     Ip(IpAddr),
     Unix,
-    Fips { public_key: [u8; 32], port: u16 },
 }
 
 impl TransportSource {
@@ -26,7 +22,6 @@ impl TransportSource {
         match self {
             Self::Ip(_) => "websocket",
             Self::Unix => "unix",
-            Self::Fips { .. } => "fips",
         }
     }
 
@@ -35,7 +30,6 @@ impl TransportSource {
             Self::Ip(IpAddr::V4(_)) => "IP4",
             Self::Ip(IpAddr::V6(_)) => "IP6",
             Self::Unix => "unix",
-            Self::Fips { .. } => "fips",
         }
     }
 
@@ -43,16 +37,13 @@ impl TransportSource {
         match self {
             Self::Ip(ip) => ip.to_string(),
             Self::Unix => String::new(),
-            Self::Fips { public_key, port } => {
-                format!("{}:{port}", hex::encode(public_key))
-            }
         }
     }
 
     pub const fn ip(&self) -> Option<IpAddr> {
         match self {
             Self::Ip(ip) => Some(*ip),
-            Self::Unix | Self::Fips { .. } => None,
+            Self::Unix => None,
         }
     }
 }

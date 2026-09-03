@@ -3586,38 +3586,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fips_node_identity_is_not_nip42_authentication() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
-        env.ensure_initialized().unwrap();
-        let mut cfg = Config::default();
-        cfg.db = dir.path().to_path_buf();
-        let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
-        let conn = handle.next_conn_id();
-        handle.register(conn, Outbound::new(tx, 0)).await;
-        handle
-            .client_message(
-                conn,
-                TransportSource::Fips {
-                    public_key: [7; 32],
-                    port: 4242,
-                },
-                json!(["REQ", "private", {"kinds":[1059]}]).to_string(),
-            )
-            .await;
-
-        let challenge = recv_outbound(&mut rx).await;
-        let closed = recv_outbound(&mut rx).await;
-        assert!(challenge.contains("\"AUTH\""), "{challenge}");
-        assert!(
-            closed.contains("\"CLOSED\"") && closed.contains("auth-required"),
-            "{closed}"
-        );
-        handle.request_shutdown();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_connection_guard_cleans_up_registration() {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), EnvOptions::default()).unwrap();

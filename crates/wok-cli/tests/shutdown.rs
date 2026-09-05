@@ -17,12 +17,13 @@ async fn sigterm_closes_cleanly_and_preserves_acknowledged_event() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("s.sock");
     let cfg = dir.path().join("wok.toml");
-    std::fs::write(&cfg,format!("[database]\npath={:?}\nmap_size=67108864\nmin_free_disk_bytes=0\n[relay]\nbind=\"127.0.0.1\"\nport=0\n[relay.unix]\nenabled=true\npath={:?}\n",dir.path().join("db"),socket)).unwrap();
+    std::fs::write(&cfg,format!("[database]\npath={:?}\nmap_size=67108864\nmin_free_disk_bytes=0\n[relay]\nbind=\"127.0.0.1\"\nport=0\nnofiles=0\n[relay.unix]\nenabled=true\npath={:?}\n",dir.path().join("db"),socket)).unwrap();
+    let stderr_path = dir.path().join("relay.stderr");
     let mut child = Guard(
         Command::new(env!("CARGO_BIN_EXE_wok"))
             .args(["--config", cfg.to_str().unwrap(), "relay"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
             .spawn()
             .unwrap(),
     );
@@ -33,7 +34,8 @@ async fn sigterm_closes_cleanly_and_preserves_acknowledged_event() {
         }
         assert!(
             child.0.try_wait().unwrap().is_none(),
-            "relay exited during startup"
+            "relay exited during startup: {}",
+            std::fs::read_to_string(&stderr_path).unwrap()
         );
         assert!(Instant::now() < deadline, "startup deadline");
         tokio::time::sleep(Duration::from_millis(10)).await;

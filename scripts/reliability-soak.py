@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import resource
 import signal
 import subprocess
 import sys
@@ -80,6 +81,8 @@ min_free_disk_bytes = 0
 [relay]
 bind = "127.0.0.1"
 port = {args.port}
+# Retain the runner's inherited limit; this bounded workload uses few sockets.
+nofiles = 0
 max_filter_limit = 30000
 max_total_events_per_req = 30000
 max_pending_outbound_bytes = 16777216
@@ -91,6 +94,7 @@ path = {json.dumps(str(unix))}
 max_pending_outbound_bytes = 16777216
 ''')
     metadata = {"platform": platform.platform(), "machine": platform.machine(), "cpu_count": os.cpu_count(),
+                "nofile_limits": resource.getrlimit(resource.RLIMIT_NOFILE),
                 "seconds_requested": args.seconds, "seed": args.seed, "wok_sha256": digest(args.wok),
                 "driver_sha256": digest(args.driver), "config_sha256": digest(cfg),
                 "durability": "normal LMDB synchronous commits", "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

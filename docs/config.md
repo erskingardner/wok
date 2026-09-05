@@ -131,7 +131,10 @@ interface or protect the path at the reverse proxy.
 | `relay.req_monitor_threads` | `3` | Restart | Query monitor worker count. |
 | `relay.negentropy_threads` | `2` | Restart | Negentropy worker count. |
 | `relay.negentropy_enabled` | `true` | Live | Yes | Enable and advertise NIP-77 synchronization. |
-| `relay.max_sync_events` | `1000000` | Live | Yes | Event ceiling for one Negentropy synchronization. |
+| `relay.max_sync_events` | `1000000` | Live | Yes | Event ceiling for one temporary Negentropy view; direct trees do not materialize the set. |
+| `relay.sync_memory_per_connection` | `268435456` | Live | Yes | Bytes reserved for sync sessions on one connection (256 MiB); zero rejects new sessions. |
+| `relay.sync_memory_total` | `1073741824` | Live | Yes | Shared sync reservation ceiling across workers (1 GiB); zero rejects new sessions. |
+| `relay.sync_idle_timeout_secs` | `60` | Live | Yes | Maximum idle wait for the next sync message; active construction has no fixed lifetime. Zero expires sessions immediately. |
 
 ## Authentication and private reads
 

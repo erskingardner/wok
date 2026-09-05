@@ -3,7 +3,9 @@
 | File | Role |
 | --- | --- |
 | `lib.rs` | Crate root and re-exports |
-| `server.rs` | Process: ingest, writer, req, monitor, negentropy, cron; `RelayHandle` |
+| `server.rs` | Process wiring, transport lifecycle, ingest, req, monitor; `RelayHandle` |
+| `server/writer.rs` | Publication batches, management and maintenance on the single writer |
+| `server/negentropy.rs` | Visibility-safe sync sessions and shared memory reservations |
 | `protocol.rs` | `ClientCommand` / `RelayMessage` (EVENT/REQ/CLOSE/COUNT/AUTH/NEG-*) |
 | `config.rs` | Native TOML `Config` plus strfry HOCON translation for migrate |
 | `capabilities.rs` | NIP-11 capability catalog and `supported_nips` |

@@ -22,6 +22,9 @@ impl Vector {
         if id.len() != ID_SIZE {
             return Err(NegError::msg("bad id size for added item"));
         }
+        self.items
+            .try_reserve(1)
+            .map_err(|_| NegError::msg("sync allocation failed"))?;
         self.items.push(Item::new(created_at, id)?);
         Ok(())
     }
@@ -31,13 +34,19 @@ impl Vector {
             return Err(NegError::msg("already sealed"));
         }
         self.sealed = true;
-        self.items.sort();
+        self.items.sort_unstable();
         for i in 1..self.items.len() {
             if self.items[i - 1] == self.items[i] {
                 return Err(NegError::msg("duplicate item inserted"));
             }
         }
         Ok(())
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Item>())
     }
 
     pub fn unseal(&mut self) {

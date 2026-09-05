@@ -159,6 +159,64 @@ impl NegentropyFilterCache {
     }
 }
 
+/// One publication transaction's tree deltas. Only timestamp/id pairs are
+/// retained; large event payloads and tag arrays are never copied.
+pub struct BatchSink<'a> {
+    cache: &'a mut NegentropyFilterCache,
+    prepared: bool,
+    ops: std::collections::BTreeMap<u64, Vec<(u64, [u8; 32], bool)>>,
+}
+impl NegentropyFilterCache {
+    pub fn batch(&mut self) -> BatchSink<'_> {
+        BatchSink {
+            cache: self,
+            prepared: false,
+            ops: Default::default(),
+        }
+    }
+}
+impl wok_db::NegentropySink for BatchSink<'_> {
+    fn update(
+        &mut self,
+        txn: &mut RwTxn<'_>,
+        packed: PackedEventView<'_>,
+        insert: bool,
+    ) -> Result<(), wok_db::DbError> {
+        if !self.prepared {
+            self.cache
+                .freshen_rw(txn)
+                .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
+            self.prepared = true;
+        }
+        for f in &self.cache.filters {
+            if f.filter.does_match(packed) {
+                self.ops.entry(f.tree_id).or_default().push((
+                    packed.created_at(),
+                    packed.id().try_into().unwrap(),
+                    insert,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+impl BatchSink<'_> {
+    pub fn flush(self, txn: &mut RwTxn<'_>) -> Result<(), NegError> {
+        for (tree_id, ops) in self.ops {
+            let mut tree = lmdb_store::open_rw(txn, tree_id)?;
+            for (timestamp, id, insert) in ops {
+                if insert {
+                    tree.insert(timestamp, &id)?;
+                } else {
+                    tree.erase(timestamp, &id)?;
+                }
+            }
+            tree.backend.flush()?;
+        }
+        Ok(())
+    }
+}
+
 /// Optional compatibility sink for callers that need to defer tree updates
 /// until after their event-write loop.
 #[derive(Default)]
@@ -184,12 +242,12 @@ impl DeferredSink {
         cache: &mut NegentropyFilterCache,
         txn: &mut RwTxn<'_>,
     ) -> Result<(), NegError> {
-        cache.freshen_rw(txn)?;
+        let mut batch = cache.batch();
         for (buf, insert) in self.ops {
             let packed = PackedEventView::new(&buf).map_err(|e| NegError::msg(e.to_string()))?;
-            cache.apply(txn, packed, insert)?;
+            wok_db::NegentropySink::update(&mut batch, txn, packed, insert)?;
         }
-        Ok(())
+        batch.flush(txn)
     }
 }
 

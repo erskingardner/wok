@@ -90,6 +90,9 @@ req_monitor_threads = 3
 negentropy_threads = 2
 negentropy_enabled = true
 max_sync_events = 1000000
+sync_memory_per_connection = 268435456
+sync_memory_total = 1073741824
+sync_idle_timeout_secs = 60
 
 [relay.auth]
 enabled = true

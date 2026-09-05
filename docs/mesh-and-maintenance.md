@@ -58,11 +58,28 @@ write latency for throughput. A batch size of zero is rejected.
 ## Precomputed-tree filters and restricted kinds
 
 `wok negentropy add <filter>` registers a persistent tree for a filter.
-Reconciliation against a precomputed (stateless) tree does **not** apply the
-per-item read restrictor: any client that opens a sync matching the tree's
-filter learns the matching event IDs and timestamps, including those of
-`relay.auth.restricted_read_kinds` kinds (event content itself stays gated
-downstream; the in-memory sync path does filter per item). This matches C++
-strfry. If you keep restricted kinds on the relay, build trees only with
-filters narrow enough not to cover them — a broad `wok negentropy add '{}'`
-exposes the existence and timing of every restricted event.
+The relay uses that tree directly only when it can prove its records are
+publicly visible. The current conservative proof checks restricted-kind
+presence and requires empty expiration, moderation and vanish tables. A filter
+that explicitly excludes restricted kinds can still use the direct path.
+
+Otherwise, synchronization builds a temporary view using the same per-event
+visibility predicate as REQ and COUNT. AUTH adds readable identities; it does
+not grant permission to enumerate other users' restricted IDs. No permanent
+per-user trees or privileged replication credentials are introduced.
+
+Sync sessions reserve memory before construction, with defaults of 256 MiB
+per connection and 1 GiB across all workers. Construction reserves conservative
+space for query/ranking/deduplication state; after sealing, unused space is
+released. A sealed vector uses about 40 bytes per item before allocator slack,
+plus a 4 MiB protocol/filter allowance. Budgets cover session allocations, not
+the process's total RSS, LMDB mappings, or separately bounded transport queues.
+A budget rejection returns NEG-ERR; it never silently reconciles a truncated set.
+
+Sessions expire after 60 seconds waiting for the next client reconciliation
+message. Active sessions have no fixed maximum lifetime. AUTH changes, read
+policy changes, visibility revocation/deletion or the earliest included expiry
+close affected sessions; clients reopen them. Current storage revocations
+conservatively invalidate all sessions. Large syncs can use narrower time ranges
+or larger configured budgets when a temporary view cannot fit. Lowering a live
+budget constrains new reservations; existing ones drain or expire normally.

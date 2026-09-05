@@ -89,3 +89,7 @@ regression test. Differential parity alone is not a reason to retain it.
   sequence in `wok_State`. Opening a v4 database for normal Wok writes upgrades
   its marker atomically; signed records and payloads are not rewritten. Counters
   initialize per author on first mutation. Older Wok writers refuse v5.
+- All read paths, including COUNT/HLL and NIP-77 ID reconciliation, enforce
+  the same first-recipient/author policy, moderation, vanish and expiry checks.
+  Multiple successfully authenticated identities remain valid on one connection
+  (up to 64); the first identity remains the connection's rate-limit identity.

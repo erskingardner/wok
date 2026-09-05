@@ -6,6 +6,9 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::field_reassign_with_default)]
 
+mod writer;
+use writer::*;
+
 use crate::abuse::{leading_zero_bits, AbuseController, BudgetKind};
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
@@ -25,16 +28,18 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use wok_db::{
-    backfill_vanish_markers, is_event_moderated_ro, is_event_vanished_ro,
-    load_moderation_snapshot_ro, lookup_event_by_id_ro, moderation_reason_ro, most_recent_levid_ro,
-    report_event, sweep_vanished_events, write_events_with_policy, Decompressor, Env, EventToWrite,
-    EventWriteStatus, ModerationSnapshot, MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
+    backfill_vanish_markers, is_event_vanished_ro, load_moderation_snapshot_ro,
+    lookup_event_by_id_ro, moderation_reason_ro, most_recent_levid_ro, report_event,
+    sweep_vanished_events, Decompressor, Env, EventToWrite, EventWriteStatus, ModerationSnapshot,
+    MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
     AUTH_KIND, GIFT_WRAP_KINDS, PROTECTED_TAG, REPOST_KINDS,
 };
-use wok_negentropy::{DeferredSink, Negentropy, NegentropyFilterCache, Vector};
+use wok_negentropy::{DeferredSink, NegentropyFilterCache};
+mod negentropy;
+use negentropy::run_negentropy;
 use wok_query::{
     ActiveMonitors, FilterValidator, NostrFilterGroup, QueryScheduler, SubId, Subscription,
 };
@@ -241,6 +246,7 @@ pub enum IngestMsg {
 }
 
 enum WriterMsg {
+    Maintenance,
     AddEvent {
         conn_id: u64,
         source: TransportSource,
@@ -319,6 +325,7 @@ enum NegMsg {
 struct AuthSession {
     challenge: String,
     authed: Option<[u8; 32]>,
+    identities: Vec<[u8; 32]>,
 }
 
 /// Owns one relay registration and guarantees transport cleanup on every exit
@@ -343,6 +350,28 @@ impl ConnectionGuard {
         self.handle
             .client_message(self.conn_id, self.source.clone(), payload)
             .await;
+    }
+
+    /// Cancellation covers the entire transport future, including writes and
+    /// ingress backpressure. The caller then closes this guard exactly once.
+    pub async fn run_until_cancelled<F: std::future::Future>(
+        &self,
+        killed: &tokio::sync::Notify,
+        io: F,
+    ) -> Option<F::Output> {
+        let shutdown = self.handle.shutdown_handle();
+        let shutdown_wait = shutdown.notified();
+        tokio::pin!(shutdown_wait);
+        shutdown_wait.as_mut().enable();
+        if self.handle.is_shutdown() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = killed.notified() => None,
+            _ = shutdown_wait => None,
+            result = io => Some(result),
+        }
     }
 
     pub async fn close(mut self) {
@@ -620,23 +649,23 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
             .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx))
             .map_err(|e| e.to_string())?;
     }
+    let sync_memory = Arc::new(negentropy::MemoryPool::default());
     for (i, neg_rx) in neg_rxs.into_iter().enumerate() {
+        let sync_memory = sync_memory.clone();
         let env = env.clone();
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
         thread::Builder::new()
             .name(format!("negentropy-{i}"))
-            .spawn(move || run_negentropy(env, cfg, conns, metrics, neg_rx))
+            .spawn(move || run_negentropy(env, cfg, conns, metrics, neg_rx, sync_memory))
             .map_err(|e| e.to_string())?;
     }
     {
-        let env = env.clone();
-        let cfg = config.clone();
         let shutdown = shutdown.clone();
         thread::Builder::new()
             .name("cron".into())
-            .spawn(move || run_cron(env, cfg, shutdown))
+            .spawn(move || run_cron(writer_tx, shutdown))
             .map_err(|e| e.to_string())?;
     }
 
@@ -693,8 +722,8 @@ fn broadcast_ephemeral(mon_txs: &[Sender<MonitorMsg>], packed: &[u8], json: &str
     }
 }
 
-/// Watch data.mdb for changes made by *other* processes (a co-resident C++
-/// strfry, `wok import`, ...) and poke the req-monitor, mirroring C++
+/// Watch data.mdb for changes made by compatible Wok maintenance commands
+/// and poke the req-monitor. strfry must never write a Wok database. Like
 /// RelayReqMonitor's hoytech::file_change_monitor (100ms debounce). Polling
 /// is used for portability; semantics match.
 fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorMsg>>, shutdown: Arc<AtomicBool>) {
@@ -1300,6 +1329,7 @@ fn ingest_event(
                     AuthSession {
                         challenge: challenge.clone(),
                         authed: None,
+                        identities: Vec::new(),
                     },
                 );
                 conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
@@ -1327,8 +1357,8 @@ fn ingest_event(
                 return;
             }
             Some(asess) => {
-                let pk = asess.authed.unwrap();
-                if pk.as_slice() != packed.pubkey() {
+                let pk: [u8; 32] = packed.pubkey().try_into().unwrap();
+                if !asess.identities.contains(&pk) {
                     conns.send(
                         conn_id,
                         RelayMessage::Ok {
@@ -1466,9 +1496,6 @@ fn ingest_auth_inner(
     let asess = auth
         .get_mut(&conn_id)
         .ok_or("no auth status available for connection")?;
-    if asess.authed.is_some() {
-        return Err("already authenticated".into());
-    }
     let mut found_challenge = false;
     let mut found_relay = false;
     let expected = normalize_relay_url(&cfg.relay.auth.service_url);
@@ -1498,7 +1525,15 @@ fn ingest_auth_inner(
     }
     let mut pk = [0u8; 32];
     pk.copy_from_slice(packed.pubkey());
-    asess.authed = Some(pk);
+    if !asess.identities.contains(&pk) {
+        if asess.identities.len() >= 64 {
+            return Err("restricted: too many authenticated identities".into());
+        }
+        asess.identities.push(pk);
+    }
+    // Keep admission accounting pinned to the first identity; authenticating
+    // another key must not reset the connection's abuse budget.
+    asess.authed.get_or_insert(pk);
     let _ = req_tx.send(ReqMsg::SetAuth {
         conn_id,
         authed: pk,
@@ -1611,7 +1646,12 @@ fn ingest_req(
     let authed = auth.get(&conn_id).and_then(|a| a.authed);
     let r = restrictor(cfg);
     let requires_auth = if count_only {
-        !r.is_filter_allowed_to_count(&fg, authed.as_ref().map(|a| a.as_slice()))
+        !auth.get(&conn_id).is_some_and(|session| {
+            session
+                .identities
+                .iter()
+                .any(|pk| r.is_filter_allowed_to_count(&fg, Some(pk)))
+        }) && !r.is_filter_allowed_to_count(&fg, None)
     } else {
         r.is_filter_group_fully_restricted(&fg) && authed.is_none()
     };
@@ -1621,6 +1661,7 @@ fn ingest_req(
             e.insert(AuthSession {
                 challenge: challenge.clone(),
                 authed: None,
+                identities: Vec::new(),
             });
             conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
         }
@@ -1657,6 +1698,9 @@ fn ingest_neg(
     is_open: bool,
     neg_tx: &Sender<NegMsg>,
 ) -> Result<(), String> {
+    if payload_hex.len() > 2 * 1024 * 1024 {
+        return Err("negentropy payload exceeds 1 MiB".into());
+    }
     let payload = wok_event::from_hex_strict(payload_hex).map_err(|e| e.to_string())?;
     if is_open {
         let Some(mut filter) = filter else {
@@ -1665,7 +1709,7 @@ fn ingest_neg(
         if !filter.is_object() {
             return Err("negentropy filter must be an object".into());
         }
-        let max_limit = cfg.relay.max_sync_events + 1;
+        let max_limit = cfg.relay.max_sync_events.saturating_add(1);
         let fg = NostrFilterGroup::from_value(
             &filter,
             max_limit,
@@ -1704,6 +1748,7 @@ fn ingest_neg(
                 e.insert(AuthSession {
                     challenge: challenge.clone(),
                     authed: None,
+                    identities: Vec::new(),
                 });
                 conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
             }
@@ -1741,749 +1786,12 @@ fn ingest_neg(
     Ok(())
 }
 
-fn run_writer(
-    env: Env,
-    cfg: Arc<parking_lot::RwLock<Config>>,
-    conns: Arc<ConnTable>,
-    metrics: Arc<Metrics>,
-    rx: Receiver<WriterMsg>,
-    mon_txs: Vec<Sender<MonitorMsg>>,
-    moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
-) {
-    let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
-    let mut negentropy_max_tags = cfg.read().relay.max_tags_per_filter;
-    let mut negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
-    let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
-    let mut event_batch = Vec::with_capacity(WRITER_BATCH_MAX);
-    let mut closed = std::collections::HashSet::new();
-    let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
-    let mut events: Vec<(u64, EventToWrite)> = Vec::with_capacity(256);
-    let mut quota_counts: HashMap<[u8; 32], PubkeyQuotaMemo> = HashMap::new();
-    let mut evs: Vec<EventToWrite> = Vec::with_capacity(256);
-    let mut meta: Vec<u64> = Vec::with_capacity(256);
-    while let Ok(msg) = rx.recv() {
-        batch.clear();
-        event_batch.clear();
-        closed.clear();
-        batch_vanish.clear();
-        events.clear();
-        if quota_counts.len() > QUOTA_MEMO_MAX_AUTHORS {
-            quota_counts.clear();
-        }
-        evs.clear();
-        meta.clear();
-        batch.push(msg);
-        while batch.len() < WRITER_BATCH_MAX {
-            match rx.try_recv() {
-                Ok(more) => batch.push(more),
-                Err(_) => break,
-            }
-        }
-        // Filter out events from connections closed within this batch, like
-        // C++ RelayWriter (a per-batch set; a persistent set would leak one
-        // entry per closed connection for the life of the process).
-        for m in &batch {
-            if let WriterMsg::Close { conn_id } = m {
-                closed.insert(*conn_id);
-            }
-        }
-        // Management mutations take priority over every event in the drained
-        // batch. This closes the same-batch race where an event queued just
-        // before a ban/revocation could otherwise pass its stored-state
-        // recheck and be committed after the management command returned.
-        for m in batch.drain(..) {
-            if let WriterMsg::Management(msg) = m {
-                let result = apply_management(&env, &moderation, msg.cmd);
-                let _ = msg.reply.send(result);
-            } else {
-                event_batch.push(m);
-            }
-        }
-        let cfg_snap = cfg.read().clone();
-        let vanish_policy = cfg_snap.vanish_policy();
-        // A valid vanish request and an ephemeral gift wrap can arrive in the
-        // same drained writer batch. Compute the batch markers up front so a
-        // live-only event cannot be broadcast immediately before its request
-        // is persisted later in that batch.
-        for m in &event_batch {
-            let WriterMsg::AddEvent {
-                conn_id,
-                packed,
-                json,
-                ..
-            } = m
-            else {
-                continue;
-            };
-            if closed.contains(conn_id) {
-                continue;
-            }
-            let Ok(event) = PackedEventView::new(packed) else {
-                continue;
-            };
-            // Exact JSON tag-name inspection is only needed for kind 62.
-            // Parsing every ordinary event again made publication pay for a
-            // feature-specific slow path before the kind was even checked.
-            if event.kind() != VANISH_KIND || !vanish_policy.targets_this_relay_json(json) {
-                continue;
-            }
-            let mut pubkey = [0u8; 32];
-            pubkey.copy_from_slice(event.pubkey());
-            batch_vanish
-                .entry(pubkey)
-                .and_modify(|timestamp| *timestamp = (*timestamp).max(event.created_at()))
-                .or_insert(event.created_at());
-        }
-        for m in event_batch.drain(..) {
-            if let WriterMsg::AddEvent {
-                conn_id,
-                source,
-                packed,
-                json,
-                authed,
-            } = m
-            {
-                if closed.contains(&conn_id) {
-                    continue;
-                }
-                let mut ok_msg = String::new();
-                let is_vanish_request =
-                    PackedEventView::new(&packed).is_ok_and(|event| event.kind() == VANISH_KIND);
-                let res = if is_vanish_request || cfg_snap.relay.write_policy_plugin.is_empty() {
-                    PluginResult::Accept
-                } else {
-                    // Transport metadata remains separate from NIP-42 auth.
-                    // Event JSON is parsed only when a plugin will consume it;
-                    // the normal empty-plugin path remains packed.
-                    let source_type = source.plugin_type();
-                    let source_info = source.plugin_info();
-                    let ev_json: Value = serde_json::from_str(&json).unwrap_or(json!({}));
-                    plugin.accept_event(
-                        &cfg_snap.relay.write_policy_plugin,
-                        &ev_json,
-                        source_type,
-                        &source_info,
-                        authed.as_ref().map(|a| a.as_slice()),
-                        &mut ok_msg,
-                    )
-                };
-                if res == PluginResult::Accept {
-                    {
-                        let packed_view = match PackedEventView::new(&packed) {
-                            Ok(event) => event,
-                            Err(error) => {
-                                conns.send(
-                                    conn_id,
-                                    RelayMessage::Ok {
-                                        event_id: "?".into(),
-                                        accepted: false,
-                                        message: format!("invalid: {error}"),
-                                    },
-                                    &metrics,
-                                );
-                                continue;
-                            }
-                        };
-                        let mut author = [0u8; 32];
-                        author.copy_from_slice(packed_view.pubkey());
-                        let stored_checks = env.begin_ro().and_then(|txn| {
-                            Ok::<_, wok_db::DbError>((
-                                if is_vanish_request {
-                                    false
-                                } else {
-                                    is_event_vanished_ro(&txn, packed_view)?
-                                },
-                                moderation_reason_ro(&txn, packed_view)?,
-                                // Recheck allowlist/role eligibility against
-                                // committed state: a ban/revocation may have
-                                // landed after the ingester's snapshot check.
-                                // Vanish requests bypass their own markers,
-                                // but not moderation or write restrictions.
-                                stored_write_permitted(&txn, &cfg_snap, &author)?,
-                            ))
-                        });
-                        let (vanished, moderated, write_allowed) = match stored_checks {
-                            Ok((vanished, moderated, write_allowed)) => (
-                                vanished
-                                    || event_matches_vanish_markers(packed_view, &batch_vanish),
-                                moderated,
-                                write_allowed,
-                            ),
-                            Err(error) => {
-                                conns.send(
-                                    conn_id,
-                                    RelayMessage::Ok {
-                                        event_id: to_hex(packed_view.id()),
-                                        accepted: false,
-                                        message: format!("Write error: {error}"),
-                                    },
-                                    &metrics,
-                                );
-                                continue;
-                            }
-                        };
-                        if vanished {
-                            let id_hex = PackedEventView::new(&packed)
-                                .map(|event| to_hex(event.id()))
-                                .unwrap_or_else(|_| "?".into());
-                            conns.send(
-                                conn_id,
-                                RelayMessage::Ok {
-                                    event_id: id_hex,
-                                    accepted: false,
-                                    message: "blocked: author or recipient requested vanish".into(),
-                                },
-                                &metrics,
-                            );
-                            continue;
-                        }
-                        if let Some(reason) = moderated {
-                            let (counter, message) = match reason {
-                                wok_db::ModerationReason::BannedEvent => (
-                                    &metrics.moderation_banned_event_rejections,
-                                    "restricted: event is banned by the relay operator".to_string(),
-                                ),
-                                wok_db::ModerationReason::BannedAuthor => (
-                                    &metrics.moderation_banned_author_rejections,
-                                    "restricted: author is banned by the relay operator"
-                                        .to_string(),
-                                ),
-                                wok_db::ModerationReason::KindNotAllowed => (
-                                    &metrics.moderation_kind_rejections,
-                                    format!(
-                                        "restricted: kind {} is not allowed by this relay",
-                                        packed_view.kind()
-                                    ),
-                                ),
-                            };
-                            counter.fetch_add(1, Ordering::Relaxed);
-                            let id_hex = PackedEventView::new(&packed)
-                                .map(|event| to_hex(event.id()))
-                                .unwrap_or_else(|_| "?".into());
-                            conns.send(
-                                conn_id,
-                                RelayMessage::Ok {
-                                    event_id: id_hex,
-                                    accepted: false,
-                                    message,
-                                },
-                                &metrics,
-                            );
-                            continue;
-                        }
-                        if !write_allowed {
-                            metrics
-                                .moderation_restricted_write_rejections
-                                .fetch_add(1, Ordering::Relaxed);
-                            let id_hex = PackedEventView::new(&packed)
-                                .map(|event| to_hex(event.id()))
-                                .unwrap_or_else(|_| "?".into());
-                            conns.send(
-                                conn_id,
-                                RelayMessage::Ok {
-                                    event_id: id_hex,
-                                    accepted: false,
-                                    message:
-                                        "restricted: writes are restricted to allowlisted pubkeys"
-                                            .into(),
-                                },
-                                &metrics,
-                            );
-                            continue;
-                        }
-                    }
-                    let is_live_only = cfg_snap.events.ephemeral_persistence
-                        == EphemeralPersistence::LiveOnly
-                        && PackedEventView::new(&packed)
-                            .map(|event| event.expiration() == 1)
-                            .unwrap_or(false);
-                    if is_live_only {
-                        let id_hex = PackedEventView::new(&packed)
-                            .map(|event| to_hex(event.id()))
-                            .unwrap_or_else(|_| "?".into());
-                        broadcast_ephemeral(&mon_txs, &packed, &json);
-                        metrics
-                            .ephemeral_events_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        conns.send(
-                            conn_id,
-                            RelayMessage::Ok {
-                                event_id: id_hex,
-                                accepted: true,
-                                message: String::new(),
-                            },
-                            &metrics,
-                        );
-                    } else {
-                        if !is_vanish_request
-                            && cfg_snap.relay.abuse.enabled
-                            && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0
-                        {
-                            let packed_view = match PackedEventView::new(&packed) {
-                                Ok(packed) => packed,
-                                Err(error) => {
-                                    conns.send(
-                                        conn_id,
-                                        RelayMessage::Ok {
-                                            event_id: "?".into(),
-                                            accepted: false,
-                                            message: format!("invalid: {error}"),
-                                        },
-                                        &metrics,
-                                    );
-                                    continue;
-                                }
-                            };
-                            let mut pubkey = [0u8; 32];
-                            pubkey.copy_from_slice(packed_view.pubkey());
-                            let memo = match quota_counts.entry(pubkey) {
-                                std::collections::hash_map::Entry::Occupied(entry) => {
-                                    entry.into_mut()
-                                }
-                                std::collections::hash_map::Entry::Vacant(entry) => {
-                                    match stored_event_count(&env, &pubkey) {
-                                        Ok(count) => entry.insert(PubkeyQuotaMemo {
-                                            baseline: count,
-                                            pending: 0,
-                                            since_recheck: 0,
-                                        }),
-                                        Err(error) => {
-                                            conns.send(
-                                                conn_id,
-                                                RelayMessage::Ok {
-                                                    event_id: to_hex(packed_view.id()),
-                                                    accepted: false,
-                                                    message: format!("Write error: {error}"),
-                                                },
-                                                &metrics,
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                }
-                            };
-                            // Periodic bounds-check: re-verify the baseline so
-                            // deletions, replacements, and out-of-band writes
-                            // can't drift the memo without bound.
-                            if memo.since_recheck >= QUOTA_MEMO_RECHECK_EVENTS {
-                                match stored_event_count(&env, &pubkey) {
-                                    Ok(count) => {
-                                        memo.baseline = count;
-                                        memo.since_recheck = 0;
-                                    }
-                                    Err(error) => {
-                                        conns.send(
-                                            conn_id,
-                                            RelayMessage::Ok {
-                                                event_id: to_hex(packed_view.id()),
-                                                accepted: false,
-                                                message: format!("Write error: {error}"),
-                                            },
-                                            &metrics,
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            if memo.baseline.saturating_add(memo.pending)
-                                >= cfg_snap.relay.abuse.max_stored_events_per_pubkey
-                            {
-                                metrics
-                                    .abuse_pubkey_quota_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
-                                conns.send(
-                                    conn_id,
-                                    RelayMessage::Ok {
-                                        event_id: to_hex(packed_view.id()),
-                                        accepted: false,
-                                        message: "blocked: author storage quota exceeded".into(),
-                                    },
-                                    &metrics,
-                                );
-                                continue;
-                            }
-                            memo.pending = memo.pending.saturating_add(1);
-                            memo.since_recheck = memo.since_recheck.saturating_add(1);
-                        }
-                        events.push((conn_id, EventToWrite::new(packed, json)));
-                    }
-                } else {
-                    let id_hex = PackedEventView::new(&packed)
-                        .map(|p| to_hex(p.id()))
-                        .unwrap_or_else(|_| "?".into());
-                    conns.send(
-                        conn_id,
-                        RelayMessage::Ok {
-                            event_id: id_hex,
-                            accepted: res == PluginResult::ShadowReject,
-                            message: ok_msg,
-                        },
-                        &metrics,
-                    );
-                }
-            }
-        }
-        if events.is_empty() {
-            continue;
-        }
-        if cfg_snap.db_min_free_disk_bytes != 0 {
-            match env.available_disk_bytes() {
-                Ok(available) if available < cfg_snap.db_min_free_disk_bytes => {
-                    metrics
-                        .abuse_disk_reserve_rejections
-                        .fetch_add(events.len() as u64, Ordering::Relaxed);
-                    // Nothing will be written this batch: roll quota pendings back.
-                    for memo in quota_counts.values_mut() {
-                        memo.pending = 0;
-                    }
-                    for (conn_id, event) in &events {
-                        let id_hex = PackedEventView::new(&event.packed)
-                            .map(|event| to_hex(event.id()))
-                            .unwrap_or_else(|_| "?".into());
-                        conns.send(
-                            *conn_id,
-                            RelayMessage::Ok {
-                                event_id: id_hex,
-                                accepted: false,
-                                message: format!(
-                                    "blocked: disk reserve requires {} free bytes",
-                                    cfg_snap.db_min_free_disk_bytes
-                                ),
-                            },
-                            &metrics,
-                        );
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    // Nothing will be written this batch: roll quota pendings back.
-                    for memo in quota_counts.values_mut() {
-                        memo.pending = 0;
-                    }
-                    for (conn_id, event) in &events {
-                        let id_hex = PackedEventView::new(&event.packed)
-                            .map(|event| to_hex(event.id()))
-                            .unwrap_or_else(|_| "?".into());
-                        conns.send(
-                            *conn_id,
-                            RelayMessage::Ok {
-                                event_id: id_hex,
-                                accepted: false,
-                                message: format!("Write error: disk space check failed: {error}"),
-                            },
-                            &metrics,
-                        );
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        // Move the events out instead of cloning each packed/json pair.
-        evs.reserve(events.len());
-        meta.reserve(events.len());
-        for (conn_id, ev) in events.drain(..) {
-            meta.push(conn_id);
-            evs.push(ev);
-        }
-        let report_capacity =
-            MAX_MODERATION_RECORDS.saturating_sub(moderation.read().reported_events.len());
-        let write_res = (|| {
-            let mut txn = env.begin_rw()?;
-            if negentropy_max_tags != cfg_snap.relay.max_tags_per_filter {
-                negentropy_max_tags = cfg_snap.relay.max_tags_per_filter;
-                negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
-            }
-            write_events_with_policy(
-                &mut txn,
-                &mut negentropy_cache,
-                &mut evs,
-                false,
-                &vanish_policy,
-            )?;
-            let report_updates = record_reports(&mut txn, &evs, report_capacity);
-            if cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events != 0 {
-                let stored = txn.entries(txn.env().dbis().event)? as u64;
-                if stored > cfg_snap.relay.abuse.max_stored_events {
-                    metrics
-                        .abuse_global_quota_rejections
-                        .fetch_add(evs.len() as u64, Ordering::Relaxed);
-                    return Err(wok_db::DbError::msg(format!(
-                        "global storage quota of {} events exceeded",
-                        cfg_snap.relay.abuse.max_stored_events
-                    )));
-                }
-            }
-            txn.commit()?;
-            Ok::<_, wok_db::DbError>(report_updates)
-        })();
-        let report_updates = match write_res {
-            Ok(report_updates) => report_updates,
-            Err(error) => {
-                // The transaction aborted; nothing was written this batch.
-                for memo in quota_counts.values_mut() {
-                    memo.pending = 0;
-                }
-                for (i, conn_id) in meta.iter().enumerate() {
-                    let id_hex = PackedEventView::new(&evs[i].packed)
-                        .map(|p| to_hex(p.id()))
-                        .unwrap_or_else(|_| "?".into());
-                    conns.send(
-                        *conn_id,
-                        RelayMessage::Ok {
-                            event_id: id_hex,
-                            accepted: false,
-                            message: format!("Write error: {error}"),
-                        },
-                        &metrics,
-                    );
-                }
-                continue;
-            }
-        };
-        if !report_updates.is_empty() {
-            // The writer serializes both management commands and report
-            // inserts, so committed deltas can update the snapshot directly.
-            let mut snapshot = moderation.write();
-            for (id, reason) in report_updates {
-                snapshot.reported_events.insert(id, reason);
-            }
-        }
-        let quota_enabled =
-            cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events_per_pubkey != 0;
-        for (i, conn_id) in meta.iter().enumerate() {
-            let packed = PackedEventView::new(&evs[i].packed).ok();
-            // Reconcile quota memos with actual write outcomes: confirmed
-            // writes move from pending into the baseline; anything else
-            // (duplicate/replaced/deleted/failed) just releases the pending.
-            if quota_enabled {
-                if let Some(p) = &packed {
-                    let mut author = [0u8; 32];
-                    author.copy_from_slice(p.pubkey());
-                    if let Some(memo) = quota_counts.get_mut(&author) {
-                        memo.pending = memo.pending.saturating_sub(1);
-                        if evs[i].status == EventWriteStatus::Written {
-                            memo.baseline = memo.baseline.saturating_add(1);
-                        }
-                    }
-                }
-            }
-            let id_hex = packed
-                .as_ref()
-                .map(|p| to_hex(p.id()))
-                .unwrap_or_else(|| "?".into());
-            let (written, message) = match evs[i].status {
-                EventWriteStatus::Written => {
-                    metrics.written_events_total.fetch_add(1, Ordering::Relaxed);
-                    (true, String::new())
-                }
-                EventWriteStatus::Duplicate => {
-                    metrics.dup_events_total.fetch_add(1, Ordering::Relaxed);
-                    (true, "duplicate: have this event".into())
-                }
-                EventWriteStatus::Replaced => {
-                    metrics
-                        .rejected_events_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    (false, "replaced: have newer event".into())
-                }
-                EventWriteStatus::Deleted => {
-                    metrics
-                        .rejected_events_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    (false, "deleted: user requested deletion".into())
-                }
-                EventWriteStatus::QuotaExceeded => {
-                    (false, "blocked: author storage quota exceeded".into())
-                }
-                EventWriteStatus::Pending => (false, "Write error: pending".into()),
-            };
-            conns.send(
-                *conn_id,
-                RelayMessage::Ok {
-                    event_id: id_hex,
-                    accepted: written,
-                    message,
-                },
-                &metrics,
-            );
-        }
-        broadcast_db_change(&mon_txs);
+fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::ReadVisibility {
+    crate::restrict::ReadVisibility {
+        restrictor: restrictor(cfg),
+        identities,
+        ephemeral_lifetime_secs: Some(cfg.events.ephemeral_lifetime_secs),
     }
-}
-
-/// NIP-56 report kind; accepted reports feed the NIP-86 moderation queue.
-const REPORT_KIND: u64 = 1984;
-/// Most `e` tags harvested from one report event.
-const MAX_REPORT_TARGETS: usize = 64;
-
-/// Record NIP-86 moderation-queue entries for kind 1984 reports written in
-/// this batch. Runs inside the same transaction so a stored report and its
-/// queue entries commit atomically. Queue-cap exhaustion is logged once per
-/// batch, never fatal to the event write. Returns the committed snapshot
-/// deltas without rescanning the moderation table.
-fn record_reports(
-    txn: &mut wok_db::RwTxn<'_>,
-    evs: &[EventToWrite],
-    mut new_records_remaining: usize,
-) -> HashMap<[u8; 32], String> {
-    let mut updates = HashMap::new();
-    let mut capacity_warned = false;
-    for ev in evs {
-        if ev.status != EventWriteStatus::Written {
-            continue;
-        }
-        let Ok(packed) = PackedEventView::new(&ev.packed) else {
-            continue;
-        };
-        if packed.kind() != REPORT_KIND {
-            continue;
-        }
-        let content = serde_json::from_str::<Value>(&ev.json)
-            .ok()
-            .and_then(|event| {
-                event
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_default();
-        let reason = report_reason(packed.pubkey(), &content);
-        let mut targets = 0usize;
-        packed.foreach_tag(|name, value| {
-            if name == 'e' && value.len() == 32 && targets < MAX_REPORT_TARGETS {
-                let mut id = [0u8; 32];
-                id.copy_from_slice(value);
-                match report_event(txn, &id, &reason, &mut new_records_remaining) {
-                    Ok(true) => {
-                        updates.insert(id, reason.clone());
-                    }
-                    Ok(false) if !capacity_warned => {
-                        capacity_warned = true;
-                        tracing::warn!(
-                            limit = MAX_MODERATION_RECORDS,
-                            "moderation queue capacity reached; dropping new targets"
-                        );
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::warn!(event_id = %to_hex(&id), %error, "moderation queue insert failed")
-                    }
-                }
-                targets += 1;
-            }
-            true
-        });
-    }
-    updates
-}
-
-fn report_reason(pubkey: &[u8], content: &str) -> String {
-    let mut reason = format!("reported by {}", to_hex(pubkey));
-    if content.is_empty() {
-        return reason;
-    }
-    reason.push_str(": ");
-    for ch in content.chars().take(200) {
-        if reason.len().saturating_add(ch.len_utf8()) > MAX_REASON_BYTES {
-            break;
-        }
-        reason.push(ch);
-    }
-    reason
-}
-
-/// Apply a NIP-86 management mutation on the writer thread: commit to LMDB,
-/// then atomically refresh the in-memory snapshot used by ingest and
-/// connection admission.
-fn apply_management(
-    env: &Env,
-    moderation: &parking_lot::RwLock<ModerationSnapshot>,
-    cmd: ManagementCmd,
-) -> Result<(), String> {
-    let mut txn = env.begin_rw().map_err(|e| e.to_string())?;
-    cmd.apply(&mut txn).map_err(|e| e.to_string())?;
-    txn.commit().map_err(|e| e.to_string())?;
-    let snap = env
-        .begin_ro()
-        .and_then(|txn| load_moderation_snapshot_ro(&txn))
-        .map_err(|e| e.to_string())?;
-    *moderation.write() = snap;
-    Ok(())
-}
-
-fn event_matches_vanish_markers(
-    packed: PackedEventView<'_>,
-    markers: &HashMap<[u8; 32], u64>,
-) -> bool {
-    if packed.kind() != VANISH_KIND {
-        let mut author = [0u8; 32];
-        author.copy_from_slice(packed.pubkey());
-        if markers
-            .get(&author)
-            .is_some_and(|timestamp| packed.created_at() <= *timestamp)
-        {
-            return true;
-        }
-    }
-    if GIFT_WRAP_KINDS.contains(&packed.kind()) {
-        let mut matched = false;
-        packed.foreach_tag(|name, value| {
-            if name == 'p' && value.len() == 32 {
-                let mut recipient = [0u8; 32];
-                recipient.copy_from_slice(value);
-                if markers.contains_key(&recipient) {
-                    matched = true;
-                    return false;
-                }
-            }
-            true
-        });
-        if matched {
-            return true;
-        }
-    }
-    false
-}
-
-/// Accepted events per author between full stored-count re-verifications.
-/// Bounds quota-memo drift from deletions/replacements and out-of-band
-/// writers while keeping the full prefix rescan off the hot write path.
-const QUOTA_MEMO_RECHECK_EVENTS: u64 = 4096;
-/// Cap on memoized authors; clears (and re-baselines on demand) beyond it.
-const QUOTA_MEMO_MAX_AUTHORS: usize = 100_000;
-
-/// Per-pubkey storage-quota memo, kept across writer batches so a
-/// high-volume author doesn't trigger a full prefix rescan every batch.
-#[derive(Default, Clone, Copy)]
-struct PubkeyQuotaMemo {
-    /// Last verified stored-event count for the author.
-    baseline: u64,
-    /// Events accepted but not yet confirmed written; returns to zero by
-    /// the end of each batch.
-    pending: u64,
-    /// Accepted events since the baseline was verified.
-    since_recheck: u64,
-}
-
-fn stored_event_count(env: &Env, pubkey: &[u8; 32]) -> Result<u64, wok_db::DbError> {
-    let txn = env.begin_ro()?;
-    let start = wok_db::keys::make_key_string_u64(pubkey, 0);
-    let end = wok_db::keys::make_key_string_u64(pubkey, u64::MAX);
-    let mut count = 0u64;
-    txn.foreach_full(
-        txn.env().dbis().event_pubkey,
-        &start,
-        &end,
-        false,
-        |key, _| {
-            if key.starts_with(pubkey) {
-                count = count.saturating_add(1);
-            }
-            true
-        },
-    )?;
-    Ok(count)
 }
 
 fn run_req_worker(
@@ -2501,7 +1809,7 @@ fn run_req_worker(
         initial_cfg.relay.max_filter_limit_count.saturating_add(1),
     );
     drop(initial_cfg);
-    let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut decomp = Decompressor::new();
     loop {
         let msg = if queries.has_running() {
@@ -2519,7 +1827,6 @@ fn run_req_worker(
         let cfg_snap = cfg.read();
         queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
         queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
-        let r = restrictor(&cfg_snap);
         let txn = match env.begin_ro() {
             Ok(t) => t,
             Err(_) => continue,
@@ -2547,7 +1854,10 @@ fn run_req_worker(
                     conn_id,
                     authed: pk,
                 } => {
-                    authed.insert(conn_id, pk);
+                    let identities = authed.entry(conn_id).or_default();
+                    if !identities.contains(&pk) {
+                        identities.push(pk);
+                    }
                     let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::SetAuth {
                         conn_id,
                         authed: pk,
@@ -2569,21 +1879,18 @@ fn run_req_worker(
         // Events are framed and delivered inside the scan callback: no
         // per-event Subscription clone, no intermediate collection, and the
         // payload JSON is copied exactly once (into the frame).
-        let _ = queries.process(
+        let _ = queries.process_visible(
             &txn,
             cfg_snap.relay.query_timeslice_budget_us,
-            |sub, lev, payload| {
+            |sub| {
+                read_visibility(
+                    &cfg_snap,
+                    authed.get(&sub.conn_id).cloned().unwrap_or_default(),
+                )
+            },
+            |sub, _lev, payload| {
                 if sub.count_only {
                     return;
-                }
-                let pk = authed.get(&sub.conn_id).map(|a| a.as_slice());
-                // Zero-copy packed lookup for the restriction check.
-                if let Ok(Some(buf)) = txn.get_u64(txn.env().dbis().event, lev) {
-                    if let Ok(packed) = PackedEventView::new(buf) {
-                        if !r.should_send_to_subscriber(packed, pk) {
-                            return;
-                        }
-                    }
                 }
                 if let Some(raw) = payload {
                     if let Ok(json) = decomp.decode(&txn, raw, cfg_snap.events.max_event_size) {
@@ -2658,7 +1965,7 @@ fn run_req_monitor(
     rx: Receiver<MonitorMsg>,
 ) {
     let mut monitors = ActiveMonitors::new(cfg.read().relay.max_subs_per_connection);
-    let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut curr_event_id = u64::MAX;
     let mut decomp = Decompressor::new();
     while let Ok(msg) = rx.recv() {
@@ -2668,6 +1975,7 @@ fn run_req_monitor(
         }
         let cfg_snap = cfg.read();
         let r = restrictor(&cfg_snap);
+        let global_visibility = read_visibility(&cfg_snap, vec![]);
         let txn = match env.begin_ro() {
             Ok(t) => t,
             Err(_) => continue,
@@ -2680,14 +1988,13 @@ fn run_req_monitor(
             match msg {
                 MonitorMsg::NewSub { mut sub, ready } => {
                     let conn = sub.conn_id;
-                    let pk = authed.get(&conn).map(|a| a.as_slice());
+                    let pk = authed.get(&conn).map(|a| a.as_slice()).unwrap_or(&[]);
                     let start = sub.latest_event_id.saturating_add(1);
                     let requires_content = sub.filter_group.requires_content();
+                    let visibility = read_visibility(&cfg_snap, pk.to_vec());
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if is_event_vanished_ro(&txn, packed).unwrap_or(true)
-                                || is_event_moderated_ro(&txn, packed).unwrap_or(true)
-                                || !r.should_send_to_subscriber(packed, pk)
+                            if !visibility.allows(&txn, packed).unwrap_or(false)
                                 || (!requires_content && !sub.filter_group.does_match(packed))
                             {
                                 return true;
@@ -2730,7 +2037,10 @@ fn run_req_monitor(
                     conn_id,
                     authed: pk,
                 } => {
-                    authed.insert(conn_id, pk);
+                    let identities = authed.entry(conn_id).or_default();
+                    if !identities.contains(&pk) {
+                        identities.push(pk);
+                    }
                 }
                 MonitorMsg::RemoveSub { conn_id, sub_id } => {
                     monitors.remove_sub(conn_id, &sub_id);
@@ -2741,15 +2051,15 @@ fn run_req_monitor(
                 }
                 MonitorMsg::DbChange => {
                     let start = curr_event_id.saturating_add(1);
-                    let requires_content = monitors.requires_content();
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if is_event_vanished_ro(&txn, packed).unwrap_or(true)
-                                || is_event_moderated_ro(&txn, packed).unwrap_or(true)
+                            if !global_visibility
+                                .globally_visible(&txn, packed)
+                                .unwrap_or(false)
                             {
                                 return true;
                             }
-                            let packed_recipients = if requires_content {
+                            let packed_recipients = if monitors.event_requires_content(packed) {
                                 None
                             } else {
                                 let recipients = monitors.process(lev, packed, None);
@@ -2779,9 +2089,11 @@ fn run_req_monitor(
                                     let filtered: Vec<(u64, SubId)> = recips
                                         .into_iter()
                                         .filter(|recip| {
-                                            let pk =
-                                                authed.get(&recip.conn_id).map(|a| a.as_slice());
-                                            r.should_send_to_subscriber(packed, pk)
+                                            let pk = authed
+                                                .get(&recip.conn_id)
+                                                .map(|a| a.as_slice())
+                                                .unwrap_or(&[]);
+                                            r.should_send_to_identities(packed, pk)
                                         })
                                         .map(|recip| (recip.conn_id, recip.sub_id))
                                         .collect();
@@ -2797,10 +2109,13 @@ fn run_req_monitor(
                     if let Ok(packed) = PackedEventView::new(&packed) {
                         // Live-only events skip the database, but not the
                         // moderation policy: id/author/kind checks all apply.
-                        if is_event_moderated_ro(&txn, packed).unwrap_or(true) {
+                        if !global_visibility
+                            .globally_visible(&txn, packed)
+                            .unwrap_or(false)
+                        {
                             continue;
                         }
-                        let search_terms = if monitors.requires_content() {
+                        let search_terms = if monitors.event_requires_content(packed) {
                             Some(wok_db::event_search_terms(&json).unwrap_or_default())
                         } else {
                             None
@@ -2811,8 +2126,9 @@ fn run_req_monitor(
                             .filter(|recipient| {
                                 let pk = authed
                                     .get(&recipient.conn_id)
-                                    .map(|authed| authed.as_slice());
-                                r.should_send_to_subscriber(packed, pk)
+                                    .map(|authed| authed.as_slice())
+                                    .unwrap_or(&[]);
+                                r.should_send_to_identities(packed, pk)
                             })
                             .map(|recipient| (recipient.conn_id, recipient.sub_id))
                             .collect();
@@ -2824,418 +2140,9 @@ fn run_req_monitor(
     }
 }
 
-fn run_negentropy(
-    env: Env,
-    cfg: Arc<parking_lot::RwLock<Config>>,
-    conns: Arc<ConnTable>,
-    metrics: Arc<Metrics>,
-    rx: Receiver<NegMsg>,
-) {
-    let mut views: HashMap<(u64, String), NegView> = HashMap::new();
-    let initial_cfg = cfg.read();
-    let mut queries = QueryScheduler::new(
-        initial_cfg.relay.abuse.max_concurrent_historical_queries,
-        initial_cfg.relay.max_sync_events,
-        initial_cfg.relay.max_filter_limit_count.saturating_add(1),
-    );
-    drop(initial_cfg);
-    queries.ensure_exists = false;
-    let mut authed: HashMap<u64, [u8; 32]> = HashMap::new();
-    let max_subs = cfg.read().relay.max_subs_per_connection;
-    loop {
-        let msg = if queries.has_running() {
-            match rx.try_recv() {
-                Ok(m) => Some(m),
-                Err(crossbeam_channel::TryRecvError::Empty) => None,
-                Err(_) => break,
-            }
-        } else {
-            match rx.recv() {
-                Ok(m) => Some(m),
-                Err(_) => break,
-            }
-        };
-        let cfg_snap = cfg.read().clone();
-        queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
-        queries.set_max_total_events_per_req(cfg_snap.relay.max_sync_events);
-        let txn = match env.begin_ro() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if let Some(msg) = msg {
-            match msg {
-                NegMsg::Open {
-                    sub,
-                    filter_str,
-                    payload,
-                } => {
-                    let conn = sub.conn_id;
-                    let sid = sub.sub_id.to_string();
-                    let key = (conn, sid.clone());
-                    // C++ replaces any existing view with the same handle.
-                    views.remove(&key);
-                    let mut tree_id = None;
-                    let _ = wok_db::foreach_negentropy_filter(&txn, |id, f| {
-                        if f == filter_str {
-                            tree_id = Some(id);
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    if let Some(tid) = tree_id {
-                        reconcile_stateless(
-                            &txn, &conns, &metrics, conn, &sid, tid, &sub, &payload,
-                        );
-                        // C++ keeps the stateless view even if the first
-                        // reconcile failed (handleReconcile runs before
-                        // addStatelessView), so insert unconditionally.
-                        if count_conn_views(&views, conn) >= max_subs {
-                            views.remove(&key);
-                            conns.send(
-                                conn,
-                                RelayMessage::notice_error("too many concurrent NEG requests"),
-                                &metrics,
-                            );
-                        } else {
-                            views.insert(key, NegView::Stateless { sub, tree_id: tid });
-                        }
-                    } else if count_conn_views(&views, conn) >= max_subs {
-                        conns.send(
-                            conn,
-                            RelayMessage::notice_error("too many concurrent NEG requests"),
-                            &metrics,
-                        );
-                    } else {
-                        match queries.add_sub(&txn, sub) {
-                            Ok(true) => {
-                                views.insert(
-                                    key,
-                                    NegView::Memory {
-                                        initial: payload,
-                                        vec: Vector::new(),
-                                    },
-                                );
-                            }
-                            _ => {
-                                metrics
-                                    .abuse_query_concurrency_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
-                                conns.send(
-                                    conn,
-                                    RelayMessage::NegErr {
-                                        sub_id: sid,
-                                        message:
-                                            "rate-limited: too many concurrent historical queries"
-                                                .into(),
-                                        extra: None,
-                                    },
-                                    &metrics,
-                                );
-                            }
-                        }
-                    }
-                }
-                NegMsg::Msg {
-                    conn_id,
-                    sub_id,
-                    payload,
-                } => {
-                    let key = (conn_id, sub_id.to_string());
-                    match views.get_mut(&key) {
-                        Some(NegView::Memory { vec, .. }) => {
-                            if !vec.is_sealed() {
-                                conns.send(
-                                    conn_id,
-                                    RelayMessage::notice_error(
-                                        "negentropy error: got NEG-MSG before NEG-OPEN complete",
-                                    ),
-                                    &metrics,
-                                );
-                            } else {
-                                match reconcile_vector(vec, &payload) {
-                                    Ok(resp) => {
-                                        conns.send(
-                                            conn_id,
-                                            RelayMessage::NegMsg {
-                                                sub_id: sub_id.to_string(),
-                                                payload_hex: hex::encode(resp),
-                                            },
-                                            &metrics,
-                                        );
-                                    }
-                                    Err(_) => {
-                                        send_neg_protocol_error(
-                                            &conns,
-                                            &metrics,
-                                            conn_id,
-                                            &sub_id.to_string(),
-                                        );
-                                        views.remove(&key);
-                                    }
-                                }
-                            }
-                        }
-                        Some(NegView::Stateless { sub, tree_id }) => {
-                            let tid = *tree_id;
-                            let ok = reconcile_stateless(
-                                &txn,
-                                &conns,
-                                &metrics,
-                                conn_id,
-                                &sub_id.to_string(),
-                                tid,
-                                sub,
-                                &payload,
-                            );
-                            if !ok {
-                                views.remove(&key);
-                            }
-                        }
-                        None => {
-                            conns.send(
-                                conn_id,
-                                RelayMessage::NegErr {
-                                    sub_id: sub_id.to_string(),
-                                    message: "closed: unknown subscription handle".into(),
-                                    extra: None,
-                                },
-                                &metrics,
-                            );
-                        }
-                    }
-                }
-                NegMsg::SetAuth {
-                    conn_id,
-                    authed: pk,
-                } => {
-                    authed.insert(conn_id, pk);
-                }
-                NegMsg::CloseSub { conn_id, sub_id } => {
-                    queries.remove_sub(conn_id, &sub_id);
-                    views.remove(&(conn_id, sub_id.to_string()));
-                }
-                NegMsg::Close { conn_id } => {
-                    queries.close_conn(conn_id);
-                    views.retain(|k, _| k.0 != conn_id);
-                    authed.remove(&conn_id);
-                }
-            }
-        }
-        let r = restrictor(&cfg_snap);
-        let mut lev_hits: Vec<(Subscription, u64)> = Vec::new();
-        let mut done: Vec<(Subscription, u64)> = Vec::new();
-        let _ = queries.process(
-            &txn,
-            cfg_snap.relay.query_timeslice_budget_us,
-            |sub, lev, _| {
-                lev_hits.push((sub.clone(), lev));
-            },
-            |sub, total, _hll, _dedup_limited| {
-                done.push((sub.clone(), total));
-            },
-        );
-        for (sub, lev) in lev_hits {
-            if let Ok(Some(buf)) = wok_db::get_packed_ro(&txn, lev) {
-                if let Ok(packed) = PackedEventView::new(&buf) {
-                    let pk = authed.get(&sub.conn_id).map(|a| a.as_slice());
-                    if r.should_send_to_subscriber(packed, pk) {
-                        if let Some(NegView::Memory { vec, .. }) =
-                            views.get_mut(&(sub.conn_id, sub.sub_id.to_string()))
-                        {
-                            let _ = vec.insert(packed.created_at(), packed.id());
-                        }
-                    }
-                }
-            }
-        }
-        for (sub, total) in done {
-            let key = (sub.conn_id, sub.sub_id.to_string());
-            let Some(NegView::Memory { initial, vec }) = views.get_mut(&key) else {
-                continue;
-            };
-            // C++ counts matched levIds before the ReadRestrictor filter.
-            if total > cfg_snap.relay.max_sync_events {
-                conns.send(
-                    sub.conn_id,
-                    RelayMessage::NegErr {
-                        sub_id: sub.sub_id.to_string(),
-                        message: "blocked: too many query results".into(),
-                        extra: Some(json!(cfg_snap.relay.max_sync_events)),
-                    },
-                    &metrics,
-                );
-                views.remove(&key);
-                continue;
-            }
-            let _ = vec.seal();
-            let initial = std::mem::take(initial);
-            match reconcile_vector(vec, &initial) {
-                Ok(resp) => {
-                    conns.send(
-                        sub.conn_id,
-                        RelayMessage::NegMsg {
-                            sub_id: sub.sub_id.to_string(),
-                            payload_hex: hex::encode(resp),
-                        },
-                        &metrics,
-                    );
-                }
-                Err(_) => {
-                    send_neg_protocol_error(&conns, &metrics, sub.conn_id, &sub.sub_id.to_string());
-                    views.remove(&key);
-                }
-            }
-        }
-    }
-}
-
-enum NegView {
-    Memory { initial: Vec<u8>, vec: Vector },
-    Stateless { sub: Subscription, tree_id: u64 },
-}
-
-fn count_conn_views(views: &HashMap<(u64, String), NegView>, conn: u64) -> usize {
-    views.keys().filter(|k| k.0 == conn).count()
-}
-
-fn reconcile_vector(store: &mut Vector, payload: &[u8]) -> Result<Vec<u8>, String> {
-    // Borrow the view instead of cloning it into each reconcile round: a
-    // Memory view can hold up to max_sync_events items (~40 MB), and every
-    // NEG-MSG used to memcpy the whole thing.
-    let mut ne = Negentropy::new(store, 500_000).map_err(|e| e.to_string())?;
-    ne.reconcile(payload).map_err(|e| e.to_string())
-}
-
-fn send_neg_protocol_error(conns: &ConnTable, metrics: &Metrics, conn: u64, sid: &str) {
-    conns.send(
-        conn,
-        RelayMessage::NegErr {
-            sub_id: sid.to_string(),
-            message: "PROTOCOL-ERROR".into(),
-            extra: None,
-        },
-        metrics,
-    );
-}
-
-/// Reconcile one message against a precomputed tree ("stateless" view in
-/// C++). Returns false on protocol error (caller removes the view).
-#[allow(clippy::too_many_arguments)]
-fn reconcile_stateless(
-    txn: &wok_db::RoTxn<'_>,
-    conns: &ConnTable,
-    metrics: &Metrics,
-    conn: u64,
-    sid: &str,
-    tree_id: u64,
-    sub: &Subscription,
-    payload: &[u8],
-) -> bool {
-    let resp = (|| -> Result<Vec<u8>, String> {
-        let mut tree = wok_negentropy::open_ro(txn, tree_id).map_err(|e| e.to_string())?;
-        let f = sub.filter_group.filters.first();
-        let since = f.map(|f| f.since).unwrap_or(0);
-        let until = f.map(|f| f.until).unwrap_or(u64::MAX);
-        let lower = wok_negentropy::Bound::timestamp(since);
-        let upper = wok_negentropy::Bound::timestamp(if until == u64::MAX {
-            u64::MAX
-        } else {
-            until.saturating_add(1)
-        });
-        let sub_store =
-            wok_negentropy::SubRange::new(&mut tree, &lower, &upper).map_err(|e| e.to_string())?;
-        let mut ne = Negentropy::new(sub_store, 500_000).map_err(|e| e.to_string())?;
-        ne.reconcile(payload).map_err(|e| e.to_string())
-    })();
-    match resp {
-        Ok(r) => {
-            conns.send(
-                conn,
-                RelayMessage::NegMsg {
-                    sub_id: sid.to_string(),
-                    payload_hex: hex::encode(r),
-                },
-                metrics,
-            );
-            true
-        }
-        Err(_) => {
-            send_neg_protocol_error(conns, metrics, conn, sid);
-            false
-        }
-    }
-}
-
-fn run_cron(env: Env, cfg: Arc<parking_lot::RwLock<Config>>, shutdown: Arc<AtomicBool>) {
-    let mut vanish_cursor = Vec::new();
-    while !shutdown.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(2));
-        let cfg_snap = cfg.read().clone();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let ephemeral_cutoff = now.saturating_sub(cfg_snap.events.ephemeral_lifetime_secs);
-        let mut expired = Vec::new();
-        if let Ok(txn) = env.begin_ro() {
-            let most_recent = most_recent_levid_ro(&txn).unwrap_or(0);
-            let _ = txn.foreach_full(
-                txn.env().dbis().event_expiration,
-                &0u64.to_ne_bytes(),
-                &0u64.to_ne_bytes(),
-                false,
-                |k, v| {
-                    if k.len() != 8 || v.len() != 8 {
-                        return true;
-                    }
-                    let expiration = u64::from_ne_bytes(k.try_into().unwrap());
-                    let lev = u64::from_ne_bytes(v.try_into().unwrap());
-                    if expiration > now {
-                        return false;
-                    }
-                    if lev == most_recent {
-                        return true;
-                    }
-                    if expiration == 1 {
-                        if let Ok(Some(buf)) = wok_db::get_packed_ro(&txn, lev) {
-                            if let Ok(p) = PackedEventView::new(&buf) {
-                                if p.created_at() <= ephemeral_cutoff {
-                                    expired.push(lev);
-                                }
-                            }
-                        }
-                    } else {
-                        expired.push(lev);
-                    }
-                    true
-                },
-            );
-        }
-        if let Ok(mut txn) = env.begin_rw() {
-            let mut sink = DeferredSink::default();
-            let expired_deleted = wok_db::delete_events(&mut txn, &mut sink, expired).unwrap_or(0);
-            let vanished_deleted = sweep_vanished_events(
-                &mut txn,
-                &mut sink,
-                cfg_snap.relay.nip62.deletion_batch_size,
-                &mut vanish_cursor,
-            )
-            .unwrap_or(0);
-            let cfg = cfg.read();
-            let mut cache = NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
-            let _ = sink.apply(&mut cache, &mut txn);
-            let _ = txn.commit();
-            if expired_deleted > 0 || vanished_deleted > 0 {
-                tracing::info!(
-                    expired_deleted,
-                    vanished_deleted,
-                    "relay maintenance deleted events"
-                );
-            }
-        }
-    }
-}
+#[cfg(test)]
+#[path = "review_regressions.rs"]
+mod review_regressions;
 
 #[cfg(test)]
 mod tests {

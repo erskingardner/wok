@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Lifecycle conformance tests wait for negentropy close processing before
+  asserting unrelated replies, avoiding a race with in-flight revocations.
 - Benchmark commands return a failing exit status when any trial fails, after
   preserving JSONL results, the summary, and corpus metadata for diagnosis.
 - Benchmark fanout subscribers read concurrently with publication, verify payloads

@@ -258,7 +258,7 @@ impl Reader {
         let mut peer = wok_negentropy::Negentropy::new(vector, 4096).unwrap();
         let init = peer.initiate().unwrap();
         self.wire
-            .send(json!(["NEG-OPEN", "sync", {}, hex::encode(init)]))
+            .send(json!(["NEG-OPEN", "sync", {}, hex::encode(&init)]))
             .await
             .unwrap();
         let mut ids = BTreeSet::new();
@@ -289,11 +289,36 @@ impl Reader {
                     expected.keys().cloned().collect(),
                     "sync differs from independent visibility model"
                 );
-                self.wire.send(json!(["NEG-CLOSE", "sync"])).await.unwrap();
+                self.close_sync(&init).await;
                 return;
             }
         }
         panic!("sync exceeded round budget");
+    }
+    async fn close_sync(&mut self, probe: &[u8]) {
+        self.wire.send(json!(["NEG-CLOSE", "sync"])).await.unwrap();
+        // NEG-CLOSE has no acknowledgement and REQ runs on another worker.
+        // Probe the closed handle on the same negentropy worker before the
+        // model changes visibility or reuses the handle. A revocation already
+        // in flight can precede the required unknown-handle response.
+        self.wire
+            .send(json!(["NEG-MSG", "sync", hex::encode(probe)]))
+            .await
+            .unwrap();
+        for response in 0..2 {
+            let reply = self.response().await;
+            assert_eq!(reply[0], "NEG-ERR", "{reply}");
+            assert_eq!(reply[1], "sync", "{reply}");
+            if reply[2] == "closed: unknown subscription handle" {
+                return;
+            }
+            assert_eq!(response, 0, "duplicate revocation: {reply}");
+            assert_eq!(
+                reply[2], "closed: visibility changed; reopen synchronization",
+                "unexpected synchronization failure: {reply}"
+            );
+        }
+        panic!("closed synchronization handle was not released");
     }
     async fn observe(&mut self, model: &Model) {
         let all = model.expected(&self.identities, None, false);
@@ -333,6 +358,65 @@ impl Reader {
         }
         assert!(self.pending.is_empty(), "missing expected live deliveries");
     }
+}
+
+#[tokio::test]
+async fn closed_sync_drains_revocation_before_history() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let close = ws.next().await.unwrap().unwrap();
+        let close: Value = serde_json::from_str(close.to_text().unwrap()).unwrap();
+        assert_eq!(close, json!(["NEG-CLOSE", "sync"]));
+        // The worker may revoke the session just before processing its close.
+        ws.send(Message::Text(
+            json!([
+                "NEG-ERR",
+                "sync",
+                "closed: visibility changed; reopen synchronization"
+            ])
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let request = ws.next().await.unwrap().unwrap();
+        let mut request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+        if request[0] == "NEG-MSG" {
+            assert_eq!(request[1], "sync");
+            ws.send(Message::Text(
+                json!(["NEG-ERR", "sync", "closed: unknown subscription handle"])
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let next = ws.next().await.unwrap().unwrap();
+            request = serde_json::from_str(next.to_text().unwrap()).unwrap();
+        }
+        assert_eq!(request, json!(["REQ", "history", {}]));
+        ws.send(Message::Text(json!(["EOSE", "history"]).to_string().into()))
+            .await
+            .unwrap();
+        // Keep the connection open until the history subscription is closed.
+        let close = ws.next().await.unwrap().unwrap();
+        let close: Value = serde_json::from_str(close.to_text().unwrap()).unwrap();
+        assert_eq!(close, json!(["CLOSE", "history"]));
+    });
+    let mut reader = Reader {
+        wire: Wire::connect(&endpoint).await.unwrap(),
+        identities: BTreeSet::new(),
+        challenge: String::new(),
+        pending: BTreeMap::new(),
+    };
+    reader.close_sync(&[]).await;
+    reader.history(json!({}), &BTreeMap::new()).await;
+    server.await.unwrap();
 }
 
 async fn publish(publisher: &mut Wire, readers: &mut [Reader], model: &mut Model, event: Value) {

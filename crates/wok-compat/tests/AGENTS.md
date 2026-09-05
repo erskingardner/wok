@@ -3,6 +3,8 @@
 | File | Role |
 | --- | --- |
 | `nip_conformance.rs` | Advertised NIP relay behavior vs pinned specs |
+| `lifecycle_model.rs` | Generated real-transport privacy/lifecycle model and in-flight revocation |
+| `support/wire.rs` | Shared framed Unix / WebSocket test and soak client |
 | `e2e_transports.rs` | WebSocket + Unix end-to-end |
 | `ws_deflate.rs` | permessage-deflate negotiation/frames |
 | `ws_timeouts.rs` | Handshake/frame-read/pong liveness timeouts |

@@ -19,6 +19,8 @@ wok-query = { path = "../wok-query" }
 wok-relay = { path = "../wok-relay" }
 
 [dev-dependencies]
+anyhow.workspace = true
+hdrhistogram.workspace = true
 base64.workspace = true
 rustls.workspace = true
 sha2.workspace = true

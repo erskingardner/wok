@@ -2841,8 +2841,10 @@ dependencies = [
 name = "wok-compat"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "futures-util",
+ "hdrhistogram",
  "hex",
  "rand 0.8.7",
  "rustls",

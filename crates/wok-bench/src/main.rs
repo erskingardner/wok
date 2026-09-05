@@ -2065,6 +2065,26 @@ fn ws_search_trial(
     Ok((qps, notes, mismatches == 0, mismatches))
 }
 
+fn check_fanout_event(
+    frame: &Value,
+    sid: &str,
+    expected: &std::collections::BTreeMap<&str, (usize, &Value)>,
+    seen: &mut [bool],
+) -> Result<()> {
+    anyhow::ensure!(
+        frame.as_array().is_some_and(|a| a.len() == 3) && frame[0] == "EVENT" && frame[1] == sid,
+        "invalid fanout envelope"
+    );
+    let id = frame[2]["id"].as_str().context("missing fanout event ID")?;
+    let &(index, event) = expected.get(id).context("unexpected fanout ID")?;
+    anyhow::ensure!(
+        !seen[index] && &frame[2] == event,
+        "duplicate or altered fanout event {id}"
+    );
+    seen[index] = true;
+    Ok(())
+}
+
 /// 1 publisher, `subs` subscribers; measures aggregate delivery/drain time and
 /// verifies every subscriber receives every event.
 fn live_fanout_trial(
@@ -2083,8 +2103,8 @@ fn live_fanout_trial(
         for i in 0..subs {
             let mut ws = connect_retry(&url).await?;
             let filter = match workload.mix {
-                EventMix::Kind1 => json!({"kinds":[1]}),
-                EventMix::Realistic | EventMix::Lifecycle => json!({}),
+                EventMix::Kind1 => json!({"kinds":[1], "limit":0}),
+                EventMix::Realistic | EventMix::Lifecycle => json!({"limit":0}),
             };
             ws.send(Message::Text(
                 json!(["REQ", format!("s{i}"), filter]).to_string().into(),
@@ -2096,62 +2116,71 @@ fn live_fanout_trial(
             read_history(ws, &format!("s{i}")).await?;
         }
         let mut publisher = connect_retry(&url).await?;
+        // Share the expected payloads; each subscriber retains only a seen bitmap.
+        let expected: std::collections::BTreeMap<_, _> = events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e["id"].as_str().unwrap(), (i, e)))
+            .collect();
+        anyhow::ensure!(
+            expected.len() == events.len(),
+            "duplicate generated fanout IDs"
+        );
         let start = Instant::now();
-        for ev in &events {
-            publisher
-                .send(Message::Text(json!(["EVENT", ev]).to_string().into()))
-                .await?;
-            anyhow::ensure!(
-                read_ack(&mut publisher, ev).await?,
-                "fanout publication rejected"
-            );
-        }
-        // Collect deliveries.
-        let mut delivered = 0u64;
-        let t_collect = Instant::now();
-        for (i, ws) in subscribers.iter_mut().enumerate() {
-            let actual = tokio::time::timeout(Duration::from_secs(30), async {
-                let mut actual = Vec::new();
-                while actual.len() < events.len() {
-                    let message = ws.next().await.context("closed during fanout")??;
-                    if !message.is_text() {
-                        continue;
-                    }
-                    let frame: Value = serde_json::from_str(message.to_text()?)?;
-                    anyhow::ensure!(
-                        frame.as_array().is_some_and(|a| a.len() == 3)
-                            && frame[0] == "EVENT"
-                            && frame[1] == format!("s{i}"),
-                        "invalid fanout frame: {frame}"
-                    );
-                    actual.push(frame[2].clone());
+        let publish = async {
+            for ev in &events {
+                publisher
+                    .send(Message::Text(json!(["EVENT", ev]).to_string().into()))
+                    .await?;
+                anyhow::ensure!(
+                    read_ack(&mut publisher, ev).await?,
+                    "fanout publication rejected"
+                );
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let readers = subscribers.iter_mut().enumerate().map(|(i, ws)| {
+            let expected = &expected;
+            async move {
+                let sid = format!("s{i}");
+                let mut seen = vec![false; expected.len()];
+                for _ in 0..expected.len() {
+                    // An inactivity deadline, not a fixed lifetime: large active
+                    // fanout workloads can legitimately take more than 30s.
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        loop {
+                            let message = ws.next().await.context("closed during fanout")??;
+                            if !message.is_text() {
+                                continue;
+                            }
+                            let frame: Value = serde_json::from_str(message.to_text()?)?;
+                            check_fanout_event(&frame, &sid, expected, &mut seen)?;
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                    })
+                    .await
+                    .context("fanout inactivity deadline")??;
                 }
-                Ok::<_, anyhow::Error>(actual)
-            })
-            .await
-            .context("fanout deadline")??;
-            anyhow::ensure!(
-                same_event_set(&actual, &events),
-                "fanout set mismatch for subscriber {i}"
-            );
-            delivered += actual.len() as u64;
-        }
-        let collect_elapsed = t_collect.elapsed();
-        hist.record(collect_elapsed.as_micros().max(1) as u64)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok::<_, anyhow::Error>(expected.len() as u64)
+            }
+        });
+        let (_, deliveries) =
+            tokio::try_join!(publish, futures_util::future::try_join_all(readers))?;
+        let delivered: u64 = deliveries.into_iter().sum();
         let elapsed = start.elapsed();
+        hist.record(elapsed.as_micros().max(1) as u64)?;
         let _ = publisher.close(None).await;
         for subscriber in &mut subscribers {
             let _ = subscriber.close(None).await;
         }
-        Ok::<_, anyhow::Error>((delivered, elapsed, collect_elapsed))
+        Ok::<_, anyhow::Error>((delivered, elapsed))
     });
     stop_target(&mut child);
-    let (delivered, elapsed, _collect) = out?;
+    let (delivered, elapsed) = out?;
     let expected = n * subs as u64;
     let eps = delivered as f64 / elapsed.as_secs_f64();
     let miss = if delivered != expected { 1 } else { 0 };
-    let notes = format!("{subs} subscribers x {n} events: delivered {delivered}/{expected}");
+    let notes = format!("{subs} subscribers x {n} events: delivered {delivered}/{expected}; concurrent readers; latency is aggregate trial duration");
     Ok((eps, notes, miss == 0, miss))
 }
 
@@ -2368,6 +2397,88 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fanout_bitmap_rejects_duplicate_altered_and_unexpected_events() {
+        let event = json!({"id":"expected", "content":"original"});
+        let expected = std::collections::BTreeMap::from([("expected", (0, &event))]);
+        let good = json!(["EVENT", "s", event]);
+        let mut seen = [false];
+        check_fanout_event(&good, "s", &expected, &mut seen).unwrap();
+        assert!(check_fanout_event(&good, "s", &expected, &mut seen).is_err());
+        for bad in [
+            json!(["EVENT", "other", event]),
+            json!(["EVENT", "s", {"id":"expected", "content":"altered"}]),
+            json!(["EVENT", "s", {"id":"unknown", "content":"original"}]),
+        ] {
+            assert!(check_fanout_event(&bad, "s", &expected, &mut [false]).is_err());
+        }
+    }
+
+    #[test]
+    fn fanout_reads_subscribers_while_publishing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    use tokio_tungstenite::tungstenite::Message;
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let (stream, _) = listener.accept().await?;
+                    let mut subscriber = tokio_tungstenite::accept_async(stream).await?;
+                    let _req = subscriber.next().await.context("subscription closed")??;
+                    subscriber
+                        .send(Message::Text(json!(["EOSE", "s0"]).to_string().into()))
+                        .await?;
+                    let (stream, _) = listener.accept().await?;
+                    let mut publisher = tokio_tungstenite::accept_async(stream).await?;
+                    let message = publisher.next().await.context("publisher closed")??;
+                    let event: Value = serde_json::from_str(message.to_text()?)?;
+                    subscriber.send(Message::Ping(vec![1].into())).await?;
+                    let pong =
+                        tokio::time::timeout(Duration::from_millis(300), subscriber.next()).await;
+                    anyhow::ensure!(
+                        matches!(pong, Ok(Some(Ok(Message::Pong(_))))),
+                        "subscriber was not being polled: {pong:?}"
+                    );
+                    subscriber
+                        .send(Message::Text(
+                            json!(["EVENT", "s0", event[1]]).to_string().into(),
+                        ))
+                        .await?;
+                    publisher
+                        .send(Message::Text(
+                            json!(["OK", event[1]["id"], true, ""]).to_string().into(),
+                        ))
+                        .await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp = TempDir::new().unwrap();
+        let url = format!("ws://{addr}");
+        let result = live_fanout_trial(
+            &rt,
+            RelayTarget {
+                bin: None,
+                url: Some(&url),
+                dbdir: temp.path(),
+            },
+            EventWorkload {
+                count: 1,
+                seed: 1,
+                base_timestamp: 1_800_000_000,
+                mix: EventMix::Kind1,
+            },
+            1,
+            &mut Histogram::new(3).unwrap(),
+        );
+        let peer_result = server.join().unwrap();
+        assert!(peer_result.is_ok(), "{peer_result:?}");
+        assert!(result.is_ok(), "{result:?}");
+    }
 
     #[test]
     fn idle_clients_answer_relay_pings_during_hold() {

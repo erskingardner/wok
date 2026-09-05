@@ -245,8 +245,13 @@ query sets. Preserve them as historical measurements; do not compare their rates
 directly with new runs. The mixed read/write scenario now queries a fixed corpus
 author while distinct authors publish, allowing an exact historical oracle despite
 concurrent commits. The search oracle uses the generated equal-score vocabulary.
-Fanout timing measures aggregate publication/delivery/drain time, not individual
-subscriber delivery latency. Warm-up is excluded from measured search time.
+Fanout subscribers read concurrently with publication and request no historical
+events (`limit: 0`). Both throughput and the latency fields use aggregate
+publication/delivery duration; the latter contain one sample per trial, not
+individual subscriber delivery percentiles. Older harness versions recorded only
+post-publication drain time in those latency fields. Each subscriber verifies
+unique IDs and exact payloads against shared expectations without retaining a
+second copy of all received events. Warm-up is excluded from measured search time.
 
 Storage verification accounts for the documented ephemeral difference: Wok's
 live-only default must export no ephemeral records. strfry's temporary storage

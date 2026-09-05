@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Integrity checks now validate v5 state encodings, stored author counts against
+  primary events, and sequence high-water marks. Reindex accepts rebuildable
+  author-count corruption while refusing detected sequence corruption.
+
+### Added
+
+- Process-kill regression coverage for atomic v4-to-v5 upgrades and event,
+  counter, and sequence commits, including lazy state initialization.
+- MAP_FULL rollback coverage for staged event and counter changes.
+
 ## [0.5.0] - 2026-09-03
 
 ### Changed

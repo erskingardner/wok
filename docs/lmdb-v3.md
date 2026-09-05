@@ -51,16 +51,24 @@ creation flags on the private snapshot.
 
 `wok integrity` verifies metadata and payload envelopes and compares every
 expected event-derived secondary-index entry with the actual indexes in both
-directions. `wok doctor` additionally decompresses payloads, checks payload ID
+directions. It also validates `wok_State` encodings, compares each stored author
+count against primary events (not the derived author index), and checks that a
+stored sequence is at least the greatest surviving local ID. Author-count
+verification uses temporary memory proportional to the number of distinct
+authors during this offline scan; it adds no work to normal event admission.
+`wok doctor` additionally decompresses payloads, checks payload ID
 identity, opens negentropy trees, and diagnoses version, endianness, capacity,
 config, plugin, and socket-path problems.
 
 `wok reindex --confirm-relay-stopped` repairs damage confined to derived
-event/negentropy indexes. It copies authoritative Meta, filter, dictionary,
+event/negentropy indexes or author counters. It copies authoritative Meta, filter, dictionary,
 PackedEvent, and EventPayload records into a sibling staging database, derives
 all indexes again, verifies the event fingerprint and integrity report, then
 renames the original to a retained backup and atomically promotes the staged
-directory. It refuses primary, payload, or metadata corruption.
+directory. It preserves a valid sequence and discards author counters for lazy
+reconstruction from the rebuilt indexes. It refuses primary, payload, or
+metadata corruption, including a malformed or regressed sequence; the highest
+surviving event cannot establish the sequence of a previously deleted tail.
 
 ## Wok v4 to v5
 
@@ -77,3 +85,19 @@ that high-water mark while rebuilding author counts lazily from authoritative
 indexes. An aborted transaction changes neither sequence nor counts. Older Wok
 versions refuse v5; rollback requires restoring the backup, not lowering the
 version marker or mixing writers.
+
+Missing author keys and a missing sequence are valid before lazy initialization;
+a v5 marker with no `wok_State` table is not. A stored zero count is valid for
+an author with no surviving events. A sequence above the surviving tail is
+expected after deletion. Integrity checks cannot distinguish a legitimately
+absent lazy key from an erased key, or prove the historical value of a lost
+sequence from a single snapshot. Preserve backups for that recovery case.
+
+`cargo test -p wok-db --lib crash_tests` exercises 43 forced process kills:
+three v4 upgrade boundaries, and five write boundaries for insertion,
+replacement, deletion, and mixed batches with both initialized and lazy state.
+The upgrade fixtures remove the state DBI entirely. Reopening read-only must
+show either the previous committed snapshot or the complete new snapshot;
+subsequent writes must allocate the expected next ID. Test-only checkpoints
+are absent from production builds. These are process-death tests before and
+after LMDB commit, not power-loss or torn-write simulations.

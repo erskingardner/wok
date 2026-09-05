@@ -1,79 +1,94 @@
-# wok implementation plan
+# Wok plan
 
-Rust reimplementation of the C++ [strfry](https://github.com/hoytech/strfry) Nostr relay.
-Reference checkout: `/Users/jeff/code/strfry` at `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`.
+Wok is a Rust Nostr relay with WebSocket and Unix socket transports and a
+Wok-owned LMDB database. strfry v3 is a verified, one-way import format.
+This file tracks current priorities; historical implementation and benchmark
+evidence lives in [docs/FINAL.md](docs/FINAL.md) and the dated reports in `docs/`.
 
-This file is the living plan. Update it when discoveries change the work.
+## Source of truth
 
-## Source-of-truth order
+1. NIPs at the revision pinned in [docs/nips.md](docs/nips.md).
+2. Explicit Wok decisions in this file and `docs/`.
+3. Lossless migration and event identity.
+4. Pinned strfry behavior as historical/differential evidence.
 
-1. Canonical NIPs at the revision pinned by the conformance suite.
-2. Explicit Wok safety, storage, and product decisions in this file and `docs/`.
-3. Lossless migration and event-identity requirements.
-4. Actual C++ behavior at the pinned commit, plus its tests and fixtures, as a
-   historical and differential reference.
+See [compatibility policy](docs/compatibility-policy.md) and
+[known differences](docs/known-differences.md). Inherited strfry bugs are not
+compatibility requirements.
 
-## Architecture
+## Architecture and constraints
 
-Cargo workspace crates:
+- Tokio owns network I/O. Dedicated OS threads own LMDB work. Transactions,
+  cursors, and mmap borrows never cross `.await`.
+- One application-level writer commits event records, indexes, author-count
+  changes, and the local event sequence together.
+- New databases use Wok v5. Writable open upgrades Wok v4 atomically; read-only
+  inspection does not upgrade. strfry import always requires `wok migrate strfry`.
+- Event IDs, signatures, tags, content, and stored payloads survive migration
+  unchanged. Strict parsing and tao-compatible JSON encoding belong to
+  `wok_event::json`.
+- ID and author filters require exact 32-byte values. Advertised NIPs need
+  observable behavior and conformance coverage.
+- REQ, COUNT, live delivery, and negentropy share visibility rules. AUTH can add
+  multiple identities; it does not grant unrestricted replication access.
+- Sync memory is bounded per connection and globally. Active sessions have no
+  fixed lifetime; idle timeout, policy changes, and visibility revocations can
+  close them. Oversized views fail explicitly instead of returning partial sets.
 
-| Crate | Ownership |
-| --- | --- |
-| `wok-event` | Event JSON, NIP-01 hashing, Schnorr, PackedEvent, kind helpers |
-| `wok-db` | Wok-owned LMDB, read-only strfry v3 migration, transactions, integrity |
-| `wok-query` | Filters, DBScan, QueryScheduler, ActiveMonitors |
-| `wok-negentropy` | NIP-77 protocol, Vector storage, persistent BTreeLMDB |
-| `wok-relay` | Transport-neutral commands, write path, AUTH, plugins, cron |
-| `wok-ws` | HTTP + WebSocket transport |
-| `wok-unix` | Length-prefixed Unix `SOCK_STREAM` transport |
-| `wok-cli` | `relay`, dbutils, mesh commands |
-| `wok-bench` | Comparative load generation |
-| `wok-compat` | C++ differential harnesses and fixtures |
+The crate map is in [AGENTS.md](AGENTS.md); threading and worker ownership are
+in [docs/architecture.md](docs/architecture.md).
 
-Tokio owns network I/O. Dedicated OS threads own LMDB. Transactions, cursors, and mmap borrows never cross `.await`.
+## Completed baseline
 
-## Phases
+The relay, query engine, negentropy, CLI, worker pools, graceful shutdown,
+configuration reload, compression, mesh tooling, search, HLL sketches, management
+API, and transport/conformance suites are implemented. Production readiness
+still needs the operational validation below.
 
-1. Workspace + event/packed/filter unit tests.
-2. LMDB v3 differential implementation and fixtures (historical parity phase).
-3. Query engine + write semantics (replace/delete/expire).
-4. Relay core + WebSocket + Unix.
-5. Negentropy + CLI parity.
-6. Compatibility, conformance, e2e, benches, docs, CI.
+The [September 5 audit](docs/code-review-2026-09-05.md) records the correctness,
+privacy, resource-budget, performance, and simplification fixes. These include
+publisher receipt ownership, authorized bounded sync, persistent sequence and
+author counters, shared visibility checks, cancellation-safe transport I/O, and
+benchmark outcome validation. Benchmark results remain scoped to their recorded
+hardware and workload; short local runs are not production soak evidence.
 
-## Documented C++ / NIP decisions
+### Storage integrity and recovery follow-up
 
-See `docs/known-differences.md` as it is filled in. Initial decisions:
+- [x] Check stored author counters against primary events, independently of the
+  author index, while accepting legitimate lazy initialization.
+- [x] Validate state encodings and require any stored sequence to cover all
+  surviving local IDs. Detect a v5 marker without its state table.
+- [x] Allow reindex to rebuild author counts, preserve a valid historical
+  sequence, and refuse detected sequence corruption without modifying the source.
+- [x] Kill subprocesses around upgrade and write commit boundaries, including
+  insertion, replacement, deletion, mixed batches, and lazy state initialization.
+  Verify exact primary/payload bytes, integrity, counters, and subsequent IDs.
+- [x] Exercise MAP_FULL rollback after staging event and counter changes.
 
-- **ID/author filters are exact 32-byte values**, matching C++ `FilterSetBytes(..., 32, 32)`. Historical NIP-01 prefixes are not implemented.
-- **Stored event JSON** is compact with alphabetically ordered top-level keys (`content`, `created_at`, `id`, `kind`, `pubkey`, `sig`, `tags`), matching `tao::json` object encoding.
-- **PackedEvent integers** use native endian (little-endian on supported hosts). Fried import/export is little-endian-only, matching C++.
-- **Historical restricted-kind REQ filtering** uses the Event table PackedEvent, not the JSON payload. C++ `RelayReqWorker` currently constructs `PackedEventView` from EventPayload bytes; that does not match the monitor path or AUTH intent. wok implements the intended PackedEvent check and records the C++ discrepancy.
-- **Unix socket** is a wok extension. It is disabled by default and is not advertised as a C++-compatible feature.
-- **NIP advertisement** lists only capabilities covered by conformance tests.
-- **`foreach_full` must not use `MDB_GET_BOTH_RANGE` on non-`DUPSORT` DBIs.** Integer-key tables (Event, Meta, EventPayload, NegentropyFilter) return `MDB_INCOMPATIBLE` otherwise. This blocked the relay write path once the default `{}` negentropy filter caused `DeferredSink` to scan NegentropyFilter.
-- **Auth strictness follows intent, not the letter of C++ @9acdaeb.** Fully-restricted REQ/NEG-OPEN require a *completed* auth (C++: any session); `SetAuth` is dispatched to the negentropy worker (C++ defines but never dispatches); one challenge per session vacancy (C++ re-sends an unstored challenge per restricted REQ). See docs/known-differences.md.
-- **JSON byte parity is with tao::json, not serde_json.** Duplicate keys rejected, U+007F escaped, ryu d2s f64 formatting. All ingress parsing goes through `wok_event::json::parse_strict`; hashing and stored JSON go through `to_tao_string`.
+These tests cover abrupt process death with normal LMDB durability settings.
+They do not simulate power loss, torn storage writes, or a failed filesystem.
+A missing lazy sequence cannot be distinguished from erased historical state
+using a single snapshot; deleted-tail history requires a trusted backup.
 
-## Status
+## Next priorities
 
-Phases 1–6 are implemented, plus all originally-deferred roadmap items:
-worker pools, graceful shutdown, config hot-reload, dict training,
-stream/sync transfers, router, and permessage-deflate. See `docs/FINAL.md`
-for gates, evidence, and remaining production soak work. Two review passes
-against the C++ source landed additional correctness fixes; see the
-"Post-review hardening" and "Third pass" sections of `docs/FINAL.md`.
+1. **Controlled Linux soak and benchmarks.** Use a fixed dataset and declared
+   hardware, warmup, durability, and transport settings. Mix publishing,
+   subscriptions, deletion/replacement, and long syncs; include slow consumers
+   and reconnects. Record latency distributions, RSS, CPU, writer stalls,
+   database growth, and correctness outcomes. Keep throughput claims tied to
+   reproducible evidence.
+2. **Large-sync efficiency.** Measure the cost of temporary authorized views
+   and conservative session invalidation. Explore narrower invalidation and
+   cheaper public-tree eligibility only with privacy regressions and measured
+   benefit. Preserve bounded memory, explicit failure, and support for long
+   active syncs; permanent per-user trees are not the default design.
 
-The current evolution phase replaces shared writable database compatibility
-with `wok migrate strfry`: a read-only v3 snapshot is verified, assigned Wok's
-v4 ownership marker, and promoted atomically with translated config and a
-manifest. Protocol work now follows the NIPs-first policy in
-`docs/compatibility-policy.md`; inherited strfry bugs are candidates for fixes,
-not permanent compatibility requirements. Post-migration feature work beyond
-the strfry baseline includes NIP-50 search, NIP-45 HLL sketches, and the
-NIP-86 management API (`docs/nip86.md`).
+## Deferred and non-goals
 
-## Non-goals
-
-No CBOR. No implicit migration during normal commands. No mutation of
-user/production strfry databases. No mixed strfry/Wok writers.
+- Storage-backend independence is deferred. Keep LMDB until a concrete backend
+  or operational requirement justifies an abstraction and comparative benchmark.
+- No implicit strfry migration, production strfry mutation, or mixed writers.
+  Older Wok writers must be stopped before the v5 upgrade; rollback restores a
+  backup rather than lowering the marker. See [storage format](docs/lmdb-v3.md).
+- No CBOR transport.

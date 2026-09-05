@@ -1,5 +1,20 @@
 # Mesh and maintenance
 
+## Storage checks and repair
+
+`wok integrity` checks primary/index consistency and v5 state encodings, stored
+author counts, and the local sequence high-water mark. Counts are verified
+against primary events; missing lazy counters are allowed. `wok doctor --json`
+includes these checks during read-only inspection.
+
+With the relay stopped, `wok reindex --confirm-relay-stopped` can repair derived
+indexes and author counts while retaining the original database as a backup.
+It preserves the stored sequence even when the newest events have been deleted.
+A malformed or regressed sequence is metadata corruption and blocks reindex:
+surviving records cannot establish the lost deletion history. Use a trusted
+backup for recovery. See [storage integrity and upgrade](lmdb-v3.md#integrity)
+for lazy-initialization limits and process-kill test coverage.
+
 ## Outbound connections
 
 `wok sync`, `wok stream`, `wok router`, `wok upload`, and `wok download`

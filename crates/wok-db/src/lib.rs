@@ -73,3 +73,5 @@ pub use write::{
     delete_event_basic, delete_events, lookup_event_by_id, most_recent_levid, write_events,
     write_events_with_policy, EventToWrite, EventWriteStatus, NegentropySink, NoopNegentropy,
 };
+
+pub mod state;

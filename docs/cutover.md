@@ -22,5 +22,5 @@
    before an operational cutover.
 4. Unix socket clients must be disabled or moved; strfry has no Unix Nostr listener.
 
-Do not point strfry at Wok's v4 database and never mix writers on one LMDB
+Do not point strfry at Wok's v5 database and never mix writers on one LMDB
 environment. See [migration-from-strfry.md](migration-from-strfry.md).

@@ -7,7 +7,7 @@ have `Meta.endianness = 1` and `Meta.dbVersion = 3`.
 
 Wok never runs directly on that source. `wok migrate strfry` takes a read-only,
 transactionally consistent copy, verifies the copied records, and changes the
-copy's `Meta.dbVersion` to Wok version 4. Version 4 is an ownership boundary;
+copy's `Meta.dbVersion` to Wok version 5. Version 4 introduced the ownership boundary;
 the first Wok format retains the v3 record layout to make migration lossless,
 but future Wok versions may evolve it. There is no implicit migration during
 normal `relay`, `info`, or database utility commands.
@@ -61,3 +61,19 @@ PackedEvent, and EventPayload records into a sibling staging database, derives
 all indexes again, verifies the event fingerprint and integrity report, then
 renames the original to a retained backup and atomically promotes the staged
 directory. It refuses primary, payload, or metadata corruption.
+
+## Wok v4 to v5
+
+Stop all older Wok writers before opening the database with this release and
+keep a backup for rollback. A normal writable open creates `wok_State` and
+upgrades the marker in one transaction. Read-only inspection does not upgrade
+it. Primary PackedEvent and payload bytes remain unchanged. The sequence
+initializes from the highest existing local ID; author counters initialize
+lazily under the writer transaction, before the first insert or deletion for
+that author. Subsequent changes coalesce and commit with the event batch.
+
+The sequence never decreases after deleting the newest record. Reindex retains
+that high-water mark while rebuilding author counts lazily from authoritative
+indexes. An aborted transaction changes neither sequence nor counts. Older Wok
+versions refuse v5; rollback requires restoring the backup, not lowering the
+version marker or mixing writers.

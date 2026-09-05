@@ -1,5 +1,8 @@
 # Historical parity report and current migration boundary
 
+Historical milestone report. Current runtime databases use Wok v5; see
+[lmdb-v3.md](lmdb-v3.md#wok-v4-to-v5) for the subsequent bookkeeping upgrade.
+
 This records the original Rust reimplementation parity work. That milestone is
 historical evidence, not the current compatibility promise. Wok now supports a
 verified one-way migration from strfry v3 into a Wok-owned v4 database and

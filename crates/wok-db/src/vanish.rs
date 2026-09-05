@@ -118,6 +118,7 @@ pub fn mark_vanished(txn: &mut RwTxn<'_>, pubkey: &[u8], timestamp: u64) -> Resu
     let existing = txn.get(dbi, pubkey)?.and_then(read_timestamp).unwrap_or(0);
     if timestamp > existing {
         txn.put(dbi, pubkey, &timestamp.to_ne_bytes(), 0)?;
+        crate::state::invalidate_visibility(txn)?;
     }
     Ok(())
 }

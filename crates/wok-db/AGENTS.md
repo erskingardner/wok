@@ -2,7 +2,7 @@
 
 Wok LMDB storage and the read-only strfry v3 migration boundary.
 
-Runtime databases are Wok-owned (v4 marker). strfry v3 is opened only as a migration source. This crate also owns NIP-50 search postings, NIP-62 vanish markers, NIP-86 moderation records, payload compression, integrity, and index rebuild.
+Runtime databases are Wok-owned (v5 marker). strfry v3 is opened only as a migration source. This crate also owns NIP-50 search postings, NIP-62 vanish markers, NIP-86 moderation records, payload compression, integrity, and index rebuild.
 
 ## Layout
 

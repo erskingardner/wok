@@ -51,7 +51,7 @@ passes.
 3. Every Event and EventPayload record is fingerprinted using its local event
    ID, exact packed bytes, and exact stored payload bytes.
 4. Only the copied Meta database ownership marker is changed, from strfry v3
-   to Wok v4.
+   to Wok v5.
 5. The event fingerprint and count must remain identical after that change, and
    the result must reopen as a Wok database.
 6. Supported source settings are translated into native Wok TOML, with the
@@ -106,7 +106,7 @@ identical semantics. Before starting Wok, review at least:
 Start Wok with the generated config and perform REQ, publish, AUTH, COUNT, and
 negentropy smoke tests appropriate to the deployment before moving traffic.
 
-The original strfry database is the rollback point. Wok's v4 database must not
+The original strfry database is the rollback point. Wok's v5 database must not
 be opened by strfry. If post-cutover events need to move back, stop Wok, export
 the required JSONL, and import it into a separate strfry v3 database. Test that
 recovery workflow before production cutover if zero event loss is required.

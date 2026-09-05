@@ -2,6 +2,8 @@
 
 use lmdb_sys::*;
 
+pub const DBI_STATE: &str = "wok_State";
+
 pub const DBI_META: &str = "rasgueadb_defaultDb__Meta";
 pub const DBI_NEGENTROPY_FILTER: &str = "rasgueadb_defaultDb__NegentropyFilter";
 pub const DBI_EVENT: &str = "rasgueadb_defaultDb__Event";
@@ -47,6 +49,7 @@ pub const DBI_NAMES: &[&str] = &[
     DBI_EVENT_SEARCH,
     DBI_VANISH_PUBKEY,
     DBI_MODERATION,
+    DBI_STATE,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -162,6 +165,11 @@ pub fn dbi_specs() -> &'static [DbiSpec] {
         },
         DbiSpec {
             name: DBI_MODERATION,
+            flags: MDB_CREATE,
+            comparator: ComparatorKind::Default,
+        },
+        DbiSpec {
+            name: DBI_STATE,
             flags: MDB_CREATE,
             comparator: ComparatorKind::Default,
         },

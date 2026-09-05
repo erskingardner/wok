@@ -153,7 +153,10 @@ fn strfry_refuses_wok_owned_tree_database() {
         .unwrap();
     assert!(
         !out.status.success()
-            && String::from_utf8_lossy(&out.stderr).contains("Database version too new: 4"),
+            && String::from_utf8_lossy(&out.stderr).contains(&format!(
+                "Database version too new: {}",
+                wok_event::WOK_DB_VERSION
+            )),
         "stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)

@@ -23,7 +23,7 @@ quirk. It also provides an additional Unix-domain socket transport.
   translates supported settings into native TOML, and emits a checksummed
   manifest.
 - **Independent storage ownership.** strfry v3 is an import format. Wok uses a
-  v4 marker so strfry and Wok cannot accidentally become mixed writers, even
+  v5 marker so strfry and Wok cannot accidentally become mixed writers, even
   while the initial Wok layout remains structurally close to v3.
 - **Nostr-first protocol behavior.** EVENT/REQ/CLOSE/COUNT/EOSE/OK/NOTICE/
   CLOSED/AUTH and NEG-* are tested against pinned NIPs. Differential tests are
@@ -225,7 +225,7 @@ Summary:
 - Historical restricted-kind REQ filtering uses the PackedEvent from the Event
   table (C++ `RelayReqWorker` currently views EventPayload bytes).
 - JSON nesting capped at 128 levels (DoS hardening; tao has no limit).
-- New Wok databases use a Wok-owned v4 marker. strfry v3 is accepted only by
+- New Wok databases use a Wok-owned v5 marker. strfry v3 is accepted only by
   `wok migrate strfry`.
 - `wok` creates a missing database directory for new Wok databases.
 - NIP-11 `software` string is wok's repo URL.

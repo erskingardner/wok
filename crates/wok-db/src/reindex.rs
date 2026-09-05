@@ -71,6 +71,11 @@ pub fn rebuild_primary_and_event_indices(
     }
 
     copy_table(source, target, source_dbis.meta, target_dbis.meta)?;
+    if let Some(state) = target_dbis.state {
+        target.clear(state)?;
+        crate::state::reset_for_reindex(source, target)?;
+    }
+
     copy_table(
         source,
         target,
@@ -153,6 +158,12 @@ pub fn rebuild_primary_and_event_indices(
     })?;
     if let Some(error) = error {
         return Err(error);
+    }
+    target.event_sequence = Some(target.event_sequence.unwrap_or(0).max(last_lev_id));
+    if let Some(raw) = target.get_u64(target_dbis.meta, 1)? {
+        let mut meta = crate::decode_meta(raw)?;
+        meta.db_version = wok_event::WOK_DB_VERSION;
+        target.put_u64(target_dbis.meta, 1, &crate::encode_meta(&meta), 0)?;
     }
     initialize_search_index_state(target, last_lev_id)?;
     Ok(ReindexStats {

@@ -71,7 +71,10 @@ fn cpp_refuses_wok_owned_database() {
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Database version too new: 4"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!(
+        "Database version too new: {}",
+        wok_event::WOK_DB_VERSION
+    )));
 }
 
 #[test]

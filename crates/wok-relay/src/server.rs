@@ -2293,6 +2293,9 @@ fn run_writer(
                         .fetch_add(1, Ordering::Relaxed);
                     (false, "deleted: user requested deletion".into())
                 }
+                EventWriteStatus::QuotaExceeded => {
+                    (false, "blocked: author storage quota exceeded".into())
+                }
                 EventWriteStatus::Pending => (false, "Write error: pending".into()),
             };
             conns.send(

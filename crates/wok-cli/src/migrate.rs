@@ -714,7 +714,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(output.join(MANIFEST_NAME)).unwrap()).unwrap();
         assert_eq!(manifest["event_count"], 1);
         assert_eq!(manifest["source_db_version"], 3);
-        assert_eq!(manifest["target_db_version"], 4);
+        assert_eq!(manifest["target_db_version"], wok_event::WOK_DB_VERSION);
         assert_eq!(manifest["verification"]["event_records_unchanged"], true);
         assert_eq!(manifest["ignored_config_keys"], json!(["relay.info.nips"]));
         assert!(manifest["translated_config_keys"]

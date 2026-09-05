@@ -1,6 +1,6 @@
 # Wok
 
-Rust Nostr relay that began as a reimplementation of [strfry](https://github.com/hoytech/strfry). strfry v3 is a verified, one-way import format. Runtime databases are Wok-owned (v4 marker) and protocol behavior follows pinned NIPs, not every strfry quirk.
+Rust Nostr relay that began as a reimplementation of [strfry](https://github.com/hoytech/strfry). strfry v3 is a verified, one-way import format. Runtime databases are Wok-owned (v5 marker) and protocol behavior follows pinned NIPs, not every strfry quirk.
 
 License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MSRV is 1.85 (`rust-toolchain.toml` pins a newer stable for local builds).
 
@@ -43,7 +43,7 @@ clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicate
 
 - Tokio owns network I/O only. LMDB transactions, cursors, and mmap slices must never cross `.await`.
 - One application-level LMDB writer; worker pools per stage (`numThreads.*`).
-- New databases use Wok v4. strfry v3 is accepted only by `wok migrate strfry`. Never mix writers.
+- New databases use Wok v5. strfry v3 is accepted only by `wok migrate strfry`. Never mix writers.
 - Event identity (id, sig, tags, content, stored payload) is preserved across migration. Hashing and stored JSON go through `wok_event::json` (`parse_strict` / `to_tao_string`), not stock `serde_json`.
 - ID and author filters are exact 32-byte values. Prefix filters are rejected.
 - Advertise only NIPs with observable relay behavior and conformance coverage (`wok-relay` capabilities catalog).

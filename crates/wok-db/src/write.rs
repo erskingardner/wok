@@ -23,10 +23,13 @@ pub enum EventWriteStatus {
     Duplicate,
     Replaced,
     Deleted,
+    QuotaExceeded,
 }
 
 #[derive(Debug, Clone)]
-pub struct EventToWrite {
+pub struct EventToWrite<C = ()> {
+    /// Caller-owned context travels with the event through sorting and outcomes.
+    pub context: C,
     pub packed: Vec<u8>,
     pub json: String,
     pub status: EventWriteStatus,
@@ -36,10 +39,23 @@ pub struct EventToWrite {
 impl EventToWrite {
     pub fn new(packed: Vec<u8>, json: String) -> Self {
         Self {
+            context: (),
             packed,
             json,
             status: EventWriteStatus::Pending,
             lev_id: 0,
+        }
+    }
+}
+
+impl<C> EventToWrite<C> {
+    pub fn with_context<D>(self, context: D) -> EventToWrite<D> {
+        EventToWrite {
+            context,
+            packed: self.packed,
+            json: self.json,
+            status: self.status,
+            lev_id: self.lev_id,
         }
     }
 }
@@ -348,6 +364,11 @@ fn del_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
 
 pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbError> {
     let dbis = txn.env().dbis();
+    crate::state::preserve_high_water(txn)?;
+    if let Some(raw) = txn.get_u64(dbis.event, lev_id)?.map(<[u8]>::to_vec) {
+        crate::state::change_author_count(txn, PackedEventView::new(&raw)?.pubkey(), false)?;
+        crate::state::invalidate_visibility(txn)?;
+    }
     let json = if let Some(raw) = txn.get_u64(dbis.event_payload, lev_id)?.map(<[u8]>::to_vec) {
         let mut decompressor = Decompressor::new();
         Some(
@@ -375,7 +396,8 @@ pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbEr
 
 fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, DbError> {
     let dbis = txn.env().dbis();
-    let lev_id = txn.next_integer_key(dbis.event)?;
+    crate::state::change_author_count(txn, PackedEventView::new(packed)?.pubkey(), true)?;
+    let lev_id = crate::state::allocate_event_id(txn)?;
     let inserted = txn.put_u64(dbis.event, lev_id, packed, MDB_NOOVERWRITE | MDB_APPEND)?;
     if !inserted {
         return Err(DbError::msg("duplicate insert into Event"));
@@ -389,21 +411,31 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
     Ok(lev_id)
 }
 
-pub fn write_events<N: NegentropySink>(
+pub fn write_events<N: NegentropySink, C>(
     txn: &mut RwTxn<'_>,
     ne: &mut N,
-    evs: &mut [EventToWrite],
+    evs: &mut [EventToWrite<C>],
     _log_deletions: bool,
 ) -> Result<(), DbError> {
     write_events_with_policy(txn, ne, evs, _log_deletions, &VanishPolicy::disabled())
 }
 
-pub fn write_events_with_policy<N: NegentropySink>(
+pub fn write_events_with_policy<N: NegentropySink, C>(
     txn: &mut RwTxn<'_>,
     ne: &mut N,
-    evs: &mut [EventToWrite],
+    evs: &mut [EventToWrite<C>],
     _log_deletions: bool,
     vanish_policy: &VanishPolicy,
+) -> Result<(), DbError> {
+    write_events_with_quota(txn, ne, evs, vanish_policy, 0)
+}
+
+pub fn write_events_with_quota<N: NegentropySink, C>(
+    txn: &mut RwTxn<'_>,
+    ne: &mut N,
+    evs: &mut [EventToWrite<C>],
+    vanish_policy: &VanishPolicy,
+    author_quota: u64,
 ) -> Result<(), DbError> {
     evs.sort_by(|a, b| {
         let pa = PackedEventView::new(&a.packed).ok();
@@ -428,6 +460,7 @@ pub fn write_events_with_policy<N: NegentropySink>(
             json,
             status,
             lev_id,
+            ..
         } = &mut current_and_after[0];
         let packed = PackedEventView::new(packed_bytes)?;
 
@@ -664,6 +697,22 @@ pub fn write_events_with_policy<N: NegentropySink>(
         }
 
         if *status == EventWriteStatus::Pending {
+            if author_quota != 0 && !is_vanish_request {
+                let count = crate::state::author_count(txn, packed.pubkey())?;
+                let mut removed = std::collections::HashSet::new();
+                for &lev in &lev_ids_to_delete {
+                    if let Some(raw) = txn.get_u64(txn.env().dbis().event, lev)? {
+                        if PackedEventView::new(raw)?.pubkey() == packed.pubkey() {
+                            removed.insert(lev);
+                        }
+                    }
+                }
+                if count.saturating_sub(removed.len() as u64).saturating_add(1) > author_quota {
+                    *status = EventWriteStatus::QuotaExceeded;
+                    lev_ids_to_delete.clear();
+                    continue;
+                }
+            }
             if is_vanish_request && vanish_policy.enabled {
                 mark_vanished(txn, packed.pubkey(), packed.created_at())?;
             }

@@ -7,7 +7,7 @@ it is not a promise to reproduce upstream bugs.
 ## Storage and migration
 
 - strfry LMDB v3 is read only through `wok migrate strfry`. Normal Wok
-  commands require a Wok-owned database marker (currently v4).
+  commands require a Wok-owned database marker (currently v5).
 - Migration preserves exact Event and EventPayload records and checks their
   fingerprint. Wok does not promise that strfry can reopen the result.
 - Supported source settings are translated from strfry HOCON into strict Wok
@@ -83,4 +83,9 @@ regression test. Differential parity alone is not a reason to retain it.
 - LMDB no longer accidentally enables `MDB_NOMETASYNC` by passing the
   same-valued DBI-only `MDB_CREATE` flag when opening the environment.
 - Custom LMDB comparators are total for malformed keys and never panic across
-  their C ABI boundary; valid v3/v4 key ordering remains unchanged.
+  their C ABI boundary; valid v3/v4/v5 key ordering remains unchanged.
+
+- Wok v5 adds transactional author counters and a monotonic local event
+  sequence in `wok_State`. Opening a v4 database for normal Wok writes upgrades
+  its marker atomically; signed records and payloads are not rewritten. Counters
+  initialize per author on first mutation. Older Wok writers refuse v5.

@@ -26,6 +26,8 @@ pub struct RwTxn<'env> {
     pub(crate) env: &'env Env,
     committed: bool,
     lifetime: (),
+    pub(crate) event_sequence: Option<u64>,
+    pub(crate) author_counts: std::collections::HashMap<Vec<u8>, u64>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -108,6 +110,8 @@ impl<'env> RwTxn<'env> {
             env,
             committed: false,
             lifetime: (),
+            event_sequence: None,
+            author_counts: Default::default(),
             _not_send_or_sync: PhantomData,
         })
     }
@@ -179,11 +183,18 @@ impl<'env> RwTxn<'env> {
         foreach_full(self.txn, dbi, start_key, start_dup, reverse, cb)
     }
 
+    pub(crate) fn largest_integer_key(&self, dbi: MDB_dbi) -> Result<u64, DbError> {
+        largest_integer_key(self.txn, dbi)
+    }
+
     pub fn next_integer_key(&self, dbi: MDB_dbi) -> Result<u64, DbError> {
-        Ok(largest_integer_key(self.txn, dbi)? + 1)
+        self.largest_integer_key(dbi)?
+            .checked_add(1)
+            .ok_or_else(|| DbError::msg("integer key space exhausted"))
     }
 
     pub fn commit(mut self) -> Result<(), DbError> {
+        crate::state::flush(&mut self)?;
         self.committed = true;
         check(unsafe { mdb_txn_commit(self.txn) })
     }

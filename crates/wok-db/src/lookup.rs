@@ -38,6 +38,9 @@ pub fn lookup_event_by_id_ro(
 }
 
 pub fn most_recent_levid_ro(txn: &RoTxn<'_>) -> Result<u64, DbError> {
+    if let Some(high_water) = crate::state::high_water_ro(txn)? {
+        return Ok(high_water);
+    }
     let mut lev = 0u64;
     txn.foreach_full(
         txn.env().dbis().event,

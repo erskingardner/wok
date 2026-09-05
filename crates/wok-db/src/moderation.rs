@@ -272,6 +272,7 @@ fn put_record(
         return Err(DbError::msg("moderation record limit reached"));
     }
     txn.put(dbi, &key, value, 0)?;
+    crate::state::invalidate_visibility(txn)?;
     Ok(())
 }
 
@@ -282,6 +283,7 @@ fn clear_record(txn: &mut RwTxn<'_>, prefix: u8, payload: &[u8]) -> Result<(), D
         .moderation
         .ok_or_else(|| DbError::msg("NIP-86 moderation database is unavailable"))?;
     txn.del(dbi, &prefixed(prefix, payload), None)?;
+    crate::state::invalidate_visibility(txn)?;
     Ok(())
 }
 
@@ -523,6 +525,7 @@ fn store_kind_policy(txn: &mut RwTxn<'_>, policy: &KindPolicy) -> Result<(), DbE
         .moderation
         .ok_or_else(|| DbError::msg("NIP-86 moderation database is unavailable"))?;
     txn.put(dbi, &[PREFIX_KIND_POLICY], policy.0.as_slice(), 0)?;
+    crate::state::invalidate_visibility(txn)?;
     Ok(())
 }
 

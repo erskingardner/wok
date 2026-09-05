@@ -35,9 +35,9 @@ pub const MAX_SUBID_SIZE: usize = 64;
 pub const MAX_INDEXED_TAG_VAL_SIZE: usize = 255;
 /// Database format accepted as an import source from strfry.
 pub const STRFRY_DB_VERSION: u64 = 3;
-/// Wok-owned database format. Version 4 currently changes only the ownership
-/// marker; it deliberately prevents either relay from writing the other's DB.
-pub const WOK_DB_VERSION: u64 = 4;
+/// Wok-owned database format. Version 5 adds transactional sequence/counters.
+/// The marker prevents older writers from silently violating these invariants.
+pub const WOK_DB_VERSION: u64 = 5;
 pub const CURR_DB_VERSION: u64 = WOK_DB_VERSION;
 pub const AUTH_KIND: u64 = 22242;
 pub const DELETION_KIND: u64 = 5;

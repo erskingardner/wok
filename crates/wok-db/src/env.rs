@@ -17,7 +17,7 @@ use crate::comparators::{
 use crate::error::check;
 use crate::fbs::{decode_meta, encode_meta, encode_negentropy_filter, Meta};
 use crate::schema::{
-    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_META, DBI_MODERATION,
+    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_META, DBI_MODERATION, DBI_STATE,
     DBI_VANISH_PUBKEY,
 };
 use crate::txn::{RoTxn, RwTxn};
@@ -78,6 +78,7 @@ pub struct Dbis {
     pub vanish_pubkey: Option<MDB_dbi>,
     /// Absent only while inspecting an unmodified strfry v3 source.
     pub moderation: Option<MDB_dbi>,
+    pub state: Option<MDB_dbi>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -136,6 +137,33 @@ fn meta_version_in_open_txn(txn: *mut MDB_txn, meta_dbi: MDB_dbi) -> Result<u64,
     check(rc)?;
     let raw = unsafe { std::slice::from_raw_parts(value.mv_data.cast::<u8>(), value.mv_size) };
     Ok(decode_meta(raw)?.db_version)
+}
+
+// v4 -> v5 adds only lazily initialized bookkeeping. The marker and creation
+// of new DBIs commit atomically; primary event bytes are untouched.
+fn upgrade_v4_marker(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<(), DbError> {
+    if meta_version_in_open_txn(txn, dbi)? != 4 {
+        return Ok(());
+    }
+    let mut key_bytes = 1u64.to_ne_bytes();
+    let mut key = MDB_val {
+        mv_size: 8,
+        mv_data: key_bytes.as_mut_ptr().cast(),
+    };
+    let mut value = MDB_val {
+        mv_size: 0,
+        mv_data: ptr::null_mut(),
+    };
+    check(unsafe { mdb_get(txn, dbi, &mut key, &mut value) })?;
+    let raw = unsafe { std::slice::from_raw_parts(value.mv_data.cast::<u8>(), value.mv_size) };
+    let mut meta = decode_meta(raw)?;
+    meta.db_version = wok_event::WOK_DB_VERSION;
+    let mut encoded = encode_meta(&meta);
+    let mut value = MDB_val {
+        mv_size: encoded.len(),
+        mv_data: encoded.as_mut_ptr().cast(),
+    };
+    check(unsafe { mdb_put(txn, dbi, &mut key, &mut value, 0) })
 }
 
 impl Env {
@@ -205,7 +233,7 @@ impl Env {
             let mut dbi: MDB_dbi = 0;
             let wok_only = matches!(
                 spec.name,
-                DBI_EVENT_SEARCH | DBI_VANISH_PUBKEY | DBI_MODERATION
+                DBI_EVENT_SEARCH | DBI_VANISH_PUBKEY | DBI_MODERATION | DBI_STATE
             );
             let foreign_source = wok_only && !opened.is_empty() && {
                 let version = match meta_version_in_open_txn(txn, opened[0]) {
@@ -216,7 +244,7 @@ impl Env {
                         return Err(error);
                     }
                 };
-                version != 0 && version != wok_event::WOK_DB_VERSION
+                version != 0 && version != 4 && version != wok_event::WOK_DB_VERSION
             };
             let dbi_flags = if opts.create_dbis && !foreign_source {
                 spec.flags
@@ -259,6 +287,15 @@ impl Env {
                 return Err(DbError::from_rc(cmp_rc));
             }
             opened.push(dbi);
+            if spec.name == DBI_META && !opts.read_only && opts.create_dbis {
+                if let Err(error) = upgrade_v4_marker(txn, dbi) {
+                    unsafe {
+                        mdb_txn_abort(txn);
+                        mdb_env_close(env);
+                    }
+                    return Err(error);
+                }
+            }
         }
 
         let dbis = Dbis {
@@ -281,6 +318,7 @@ impl Env {
             event_search: (opened[16] != 0).then_some(opened[16]),
             vanish_pubkey: (opened[17] != 0).then_some(opened[17]),
             moderation: (opened[18] != 0).then_some(opened[18]),
+            state: (opened[19] != 0).then_some(opened[19]),
         };
 
         if let Err(e) = unsafe { check(mdb_txn_commit(txn)) } {

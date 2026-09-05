@@ -1,0 +1,14 @@
+# Isolated benchmark fixture. Admission limiting is deliberately disabled.
+# Bind the published host port to loopback or an isolated private interface.
+[database]
+path = "/data/db"
+map_size = 8589934592
+min_free_disk_bytes = 268435456
+[relay]
+bind = "0.0.0.0"
+port = 7777
+nofiles = 0
+[relay.abuse]
+enabled = false
+[observability]
+log_format = "json"

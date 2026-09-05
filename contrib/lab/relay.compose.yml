@@ -1,0 +1,33 @@
+services:
+  relay:
+    image: wok-lab:${LAB_IMAGE_TAG:-local}
+    build:
+      context: ../..
+      dockerfile: contrib/lab/Dockerfile
+      args:
+        SOURCE_REVISION: ${LAB_SOURCE_REVISION:-unknown}
+    ports:
+      - "${LAB_RELAY_BIND:-127.0.0.1}:${LAB_RELAY_PORT:-7777}:7777"
+    volumes:
+      - relay-data:/data
+    cpus: ${LAB_RELAY_CPUS:-2}
+    mem_limit: ${LAB_RELAY_MEMORY:-2g}
+    memswap_limit: ${LAB_RELAY_MEMORY:-2g}
+    pids_limit: 256
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, '2', 'http://127.0.0.1:7777/metrics']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: json-file
+      options: {max-size: 20m, max-file: '3'}
+volumes:
+  relay-data:

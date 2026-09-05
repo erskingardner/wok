@@ -1,0 +1,15 @@
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/**
+!contrib/
+!contrib/lab/
+!contrib/lab/**
+**/target
+**/__pycache__
+**/.env
+**/.env.*
+**/*.mdb
+**/*.sock

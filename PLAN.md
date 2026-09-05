@@ -70,9 +70,26 @@ They do not simulate power loss, torn storage writes, or a failed filesystem.
 A missing lazy sequence cannot be distinguished from erased historical state
 using a single snapshot; deleted-tail history requires a trusted backup.
 
+## Reliability validation follow-up
+
+- [x] Run benchmark correctness tests in CI and native behavioral tests on every
+  distribution platform; require the pinned C++ reference in a migration job.
+- [x] Expand fuzz triggers to master pushes and all exercised crates; seed size
+  and protocol boundaries and reuse the corpus.
+- [x] Add generated WebSocket/Unix privacy lifecycle tests and in-flight sync
+  revocation checks against an independent expected-set model.
+- [x] Add a repeatable Linux soak runner and short CI / longer scheduled jobs.
+- [x] Complete and record the initial one-hour Linux container soak; see the
+  [dated evidence report](docs/reliability-2026-09-05.md).
+
+See [reliability validation](docs/reliability.md) for the gates, workload,
+commands, and evidence limits. New process and real-C++ tests exposed missing
+SIGTERM handling and incomplete migration extension-table initialization; both
+are now covered by regressions.
+
 ## Next priorities
 
-1. **Controlled Linux soak and benchmarks.** Use a fixed dataset and declared
+1. **Broader Linux soak and benchmarks.** Use a fixed dataset and declared
    hardware, warmup, durability, and transport settings. Mix publishing,
    subscriptions, deletion/replacement, and long syncs; include slow consumers
    and reconnects. Record latency distributions, RSS, CPU, writer stalls,

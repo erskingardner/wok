@@ -1,6 +1,6 @@
 # wok-bench
 
-Comparative load harness: Wok vs strfry, correctness before speed. Excluded from default CI (`cargo test --workspace --exclude wok-bench`). `#![forbid(unsafe_code)]`.
+Comparative load harness: Wok vs strfry, correctness before speed. Correctness tests run in normal CI (`cargo test --workspace`); comparative load campaigns run separately. `#![forbid(unsafe_code)]`.
 
 Never opens a user database. Each trial uses a disposable temp dir, a deterministic signed corpus, warm-up, and latency histograms. A trial that drops events or deliveries is `ok=false`.
 

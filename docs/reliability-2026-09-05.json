@@ -1,0 +1,91 @@
+{
+  "code_commit": "d10321861ac43ec27206ee96661f6b17ee88bc61",
+  "soak_runtime_source": "c89d0820c67237e6b18598c20182fa85b0273e73",
+  "container_image": "rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663",
+  "manifest": {
+    "platform": "Linux-7.0.12-linuxkit-aarch64-with-glibc2.36",
+    "machine": "aarch64",
+    "cpu_count": 14,
+    "seconds_requested": 3600,
+    "seed": 4242,
+    "wok_sha256": "3c78e70887e894192d85a933afe5e150bdc34c1a789a562e7f093e21c34e658e",
+    "driver_sha256": "194826a95ffa2465398edbc53fa18cc7e2e0611d58b4cec99cf8360529569a13",
+    "config_sha256": "5fcb72a0cc787eac61994a947a3d24570c2fa2a3d732683ab9abc18450440cf7",
+    "durability": "normal LMDB synchronous commits",
+    "started_utc": "2026-09-05T14:38:04Z",
+    "memory_policy": {
+      "rss_max_mib": 768,
+      "anonymous_growth_max_mib_after_120s_warmup": 64
+    },
+    "cpu.max": "400000 100000",
+    "memory.max": "4294967296",
+    "memory.swap.max": "0"
+  },
+  "result": {
+    "ok": true,
+    "driver": {
+      "ack_max_ms": 112.511,
+      "ack_p50_ms": 5.791,
+      "ack_p99_ms": 16.127,
+      "live_deliveries": 572672,
+      "ok": true,
+      "pressure_receipts": 3840,
+      "query_max_ms": 375.551,
+      "query_p99_ms": 323.327,
+      "receipts": 143168,
+      "restart_verified": true,
+      "rounds": 3580,
+      "seconds": 3600.892322054,
+      "seed": 4242,
+      "slow_closes": 118,
+      "stored": 20324,
+      "sync_rounds": 480
+    },
+    "peak_rss_kib": 168924,
+    "peak_anonymous_kib": 133020,
+    "memory_segments": [
+      {
+        "pid": 4889,
+        "anonymous_growth_kib": 16044
+      },
+      {
+        "pid": 4960,
+        "anonymous_growth_kib": 14720
+      }
+    ],
+    "final_db_bytes": 30371840,
+    "samples": 715,
+    "corpus_sha256": "1851f369cd2b9d4cef57afa56ef006f133f39c950c57fa8f5eca3f01a6daba57"
+  },
+  "sampled_active_connections_max": 15,
+  "sampled_relay_cpu_seconds": 147.16,
+  "sampled_threads_max": 20,
+  "raw_archive_sha256": "cf357b1fa858049a12e1a11627fa31e13cdd702cc367de31c21afe5c47597ae3",
+  "github_canary": {
+    "ok": true,
+    "driver": {
+      "ack_max_ms": 29.951,
+      "ack_p50_ms": 2.269,
+      "ack_p99_ms": 17.759,
+      "live_deliveries": 28512,
+      "ok": true,
+      "pressure_receipts": 192,
+      "query_max_ms": 354.815,
+      "query_p99_ms": 354.815,
+      "receipts": 7128,
+      "restart_verified": true,
+      "rounds": 179,
+      "seconds": 181.074050476,
+      "seed": 4242,
+      "slow_closes": 4,
+      "stored": 20324,
+      "sync_rounds": 26
+    },
+    "peak_rss_kib": 107640,
+    "peak_anonymous_kib": 67200,
+    "memory_segments": [],
+    "final_db_bytes": 29503488,
+    "samples": 39,
+    "corpus_sha256": "5432af4b809c4abf93529788c9023050178c583cc947a1e6883d1178b8fe9c1d"
+  }
+}

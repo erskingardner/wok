@@ -268,6 +268,7 @@ Summary:
 - [Mesh and maintenance](docs/mesh-and-maintenance.md)
 - [Cutover / rollback](docs/cutover.md)
 - [Security](docs/security.md)
+- [Reliability validation and CI gates](docs/reliability.md)
 - [Known differences](docs/known-differences.md)
 - [Definition-of-done report](docs/FINAL.md)
 
@@ -276,7 +277,7 @@ Summary:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --exclude wok-bench --locked
+cargo test --workspace --locked
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
 # Optional C++ differential (requires a strfry binary):
 cargo test -p wok-db --test cpp_roundtrip

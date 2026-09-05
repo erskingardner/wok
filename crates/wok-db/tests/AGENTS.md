@@ -14,4 +14,4 @@ Storage integration tests. They open disposable LMDB environments.
 | `nip62_vanish.rs` | Request to Vanish markers and sweep |
 | `cpp_roundtrip.rs` | Optional differential vs strfry (needs `STRFRY_BIN`) |
 
-`cpp_roundtrip` is skipped when strfry is absent. Query/search behavior is also covered in `crates/wok-query/tests/` and `crates/wok-compat/tests/`.
+`cpp_roundtrip` may skip locally when strfry is absent. `WOK_REQUIRE_STRFRY=1` turns a missing reference into a failure; the dedicated CI migration job sets it. Query/search behavior is also covered in `crates/wok-query/tests/` and `crates/wok-compat/tests/`.

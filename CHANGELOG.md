@@ -9,12 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SIGTERM now follows the graceful relay shutdown path, including Unix socket
+  cleanup. A CLI process test verifies acknowledged data survives shutdown.
+- strfry migration creates Wok extension tables in the private staging copy and
+  verifies target integrity before promotion; a real C++ import regression checks
+  source preservation and exact event identity.
 - Integrity checks now validate v5 state encodings, stored author counts against
   primary events, and sequence high-water marks. Reindex accepts rebuildable
   author-count corruption while refusing detected sequence corruption.
 
 ### Added
 
+- Generated WebSocket/Unix lifecycle tests compare history, live events, COUNT,
+  and sync with an independent privacy model, including AUTH and revocation.
+- CI runs benchmark correctness tests, native behavioral suites on all four
+  distribution platforms, mandatory pinned C++ migration tests, broader seeded
+  fuzzing, and a repeatable Linux soak with resource and restart checks.
 - Process-kill regression coverage for atomic v4-to-v5 upgrades and event,
   counter, and sequence commits, including lazy state initialization.
 - MAP_FULL rollback coverage for staged event and counter changes.

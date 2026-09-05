@@ -36,7 +36,7 @@ clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicate
 | `wok-ws` | HTTP + WebSocket (in-house RFC 6455/7692 codec) |
 | `wok-unix` | Length-prefixed Unix `SOCK_STREAM` transport |
 | `wok-cli` | `wok` binary: relay, migrate, doctor, mesh, dbutils |
-| `wok-bench` | Comparative load harness (excluded from default CI tests) |
+| `wok-bench` | Comparative load harness (correctness tests included in CI) |
 | `wok-compat` | NIP conformance, e2e, optional C++ differentials |
 
 ## Invariants
@@ -57,7 +57,7 @@ Source-of-truth order: pinned NIPs → explicit Wok decisions in `docs/` and `PL
 cargo build --release -p wok-cli          # binary: target/release/wok
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --exclude wok-bench --locked
+cargo test --workspace --locked
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
 ```
 

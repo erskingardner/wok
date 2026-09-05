@@ -5,6 +5,7 @@ Operator/CI helper scripts. Not on the relay runtime path.
 | File | Role |
 | --- | --- |
 | `check-release.sh` | Release contract: version, changelog, lockfile, tests |
+| `reliability-soak.py` | Disposable Linux relay/load processes, resource samples, restart and integrity gates |
 | `release-notes.sh` | Extract changelog notes for a tag |
 | `benchmark-campaign.sh` | Two-host / full `wok-bench` campaign wrapper |
 | `benchmark-transports.sh` | Same-host Unix vs WebSocket comparison |

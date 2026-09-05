@@ -10,4 +10,4 @@ NIPs pin used by the conformance suite: `656cecc7c0a815b6a2b218d3b5d6f078b3f4dba
 - `src/lib.rs` — shared helpers (sign events, temp DB, strfry spawn)
 - `tests/` — the actual suites
 
-CI always runs `nip_conformance` and `e2e_transports`. C++ tests are optional locally.
+CI runs every workspace test, including `nip_conformance` and `e2e_transports`. A separate pinned-reference job requires C++ tests with `WOK_REQUIRE_STRFRY=1`; they remain optional locally. `examples/reliability_soak.rs` is the load driver for the Linux soak.

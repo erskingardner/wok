@@ -19,6 +19,8 @@ LMDB environment and table access. Start at `lib.rs` for the public API.
 | `vanish.rs` | NIP-62 markers, query suppression, bounded sweep |
 | `moderation.rs` | NIP-86 records (prefix-keyed), snapshot, query suppression |
 | `integrity.rs` | Primary + every event-derived index check |
+| `state.rs` | Transactional sequence, lazy author counters, visibility generation |
+| `crash_tests.rs` | Test-only checkpoints and subprocess kill/restart coverage |
 | `reindex.rs` | Rebuild indexes from PackedEvent + payload primaries |
 | `migration.rs` | Read-only LMDB snapshot + event fingerprint for `wok migrate` |
 

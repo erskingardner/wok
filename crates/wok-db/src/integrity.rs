@@ -9,6 +9,7 @@ use crate::write::{event_index_entries, EventIndexEntry};
 use crate::DbError;
 use lmdb_sys::MDB_dbi;
 use serde::Serialize;
+use std::collections::HashMap;
 use wok_event::PackedEventView;
 
 const MAX_REPORTED_ISSUES: usize = 100;
@@ -34,6 +35,8 @@ pub struct IntegrityReport {
     pub packed_parse_errors: u64,
     pub payload_parse_errors: u64,
     pub metadata_errors: u64,
+    pub author_counts_checked: u64,
+    pub author_count_errors: u64,
     pub lookup_errors: u64,
     pub issues: Vec<IntegrityIssue>,
 }
@@ -48,6 +51,7 @@ impl IntegrityReport {
             && self.packed_parse_errors == 0
             && self.payload_parse_errors == 0
             && self.metadata_errors == 0
+            && self.author_count_errors == 0
             && self.lookup_errors == 0
     }
 
@@ -206,6 +210,96 @@ fn check_metadata_tables(txn: &RoTxn<'_>, report: &mut IntegrityReport) -> Resul
     Ok(())
 }
 
+/// Author counts are rebuildable; the historical sequence is not. Missing
+/// keys are legitimate lazy initialization, but an existing sequence must
+/// cover every surviving local ID. Deleted-tail history cannot be reconstructed
+/// from the current snapshot and must never be inferred to be zero.
+fn check_state(
+    txn: &RoTxn<'_>,
+    report: &mut IntegrityReport,
+    authors: &HashMap<[u8; 32], u64>,
+    largest_id: u64,
+) -> Result<(), DbError> {
+    let Some(dbi) = txn.env().dbis().state else {
+        let version = txn
+            .get_u64(txn.env().dbis().meta, 1)?
+            .and_then(|raw| decode_meta(raw).ok())
+            .map(|meta| meta.db_version);
+        if version.is_some_and(|version| version >= 5) {
+            report.metadata_errors += 1;
+            report.issue(
+                "missing-table",
+                "state",
+                "v5 database has no wok_State table".into(),
+            );
+        }
+        return Ok(());
+    };
+    txn.foreach_full(dbi, &[], &[], false, |key, raw| {
+        if key.first() == Some(&b'a') {
+            let Ok(author): Result<&[u8; 32], _> = key[1..].try_into() else {
+                report.author_count_errors += 1;
+                report.issue(
+                    "malformed-key",
+                    "author_counts",
+                    format!("key has {} bytes, expected 33", key.len()),
+                );
+                return true;
+            };
+            report.author_counts_checked += 1;
+            match crate::state::decode(raw) {
+                Ok(count) => {
+                    let expected = authors.get(author).copied().unwrap_or(0);
+                    if count != expected {
+                        report.author_count_errors += 1;
+                        report.issue(
+                            "counter-mismatch",
+                            "author_counts",
+                            format!(
+                                "author {}: stored {count}, primary records {expected}",
+                                wok_event::to_hex(author)
+                            ),
+                        );
+                    }
+                }
+                Err(error) => {
+                    report.author_count_errors += 1;
+                    report.issue("malformed-value", "author_counts", error.to_string());
+                }
+            }
+        } else if key == crate::state::HIGH_WATER || key == crate::state::POLICY_GENERATION {
+            match crate::state::decode(raw) {
+                Ok(sequence) if key == crate::state::HIGH_WATER && sequence < largest_id => {
+                    report.metadata_errors += 1;
+                    report.issue(
+                        "sequence-regression",
+                        "state",
+                        format!("stored sequence {sequence} is below greatest surviving local ID {largest_id}"),
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    report.metadata_errors += 1;
+                    report.issue(
+                        "malformed-value",
+                        "state",
+                        format!("{}: {error}", String::from_utf8_lossy(key)),
+                    );
+                }
+            }
+        } else {
+            report.metadata_errors += 1;
+            report.issue(
+                "malformed-key",
+                "state",
+                format!("unknown key {}", wok_event::to_hex(key)),
+            );
+        }
+        true
+    })?;
+    Ok(())
+}
+
 fn check_payload(txn: &RoTxn<'_>, lev_id: u64, raw: &[u8], report: &mut IntegrityReport) {
     match parse_payload(raw) {
         Ok(PayloadView::Raw(json)) => {
@@ -267,6 +361,8 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
     let dbis = txn.env().dbis();
     let mut report = IntegrityReport::default();
     let mut search_decompressor = Decompressor::new();
+    let mut authors = HashMap::<[u8; 32], u64>::new();
+    let mut largest_id = 0;
 
     check_metadata_tables(txn, &mut report)?;
 
@@ -282,6 +378,7 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
             return true;
         };
 
+        largest_id = largest_id.max(lev_id);
         match txn.get_u64(dbis.event_payload, lev_id) {
             Ok(Some(payload)) => check_payload(txn, lev_id, payload, &mut report),
             Ok(None) => {
@@ -302,6 +399,9 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
                 return true;
             }
         };
+        *authors
+            .entry(packed.pubkey().try_into().expect("validated packed pubkey"))
+            .or_default() += 1;
         for entry in event_index_entries(dbis, lev_id, packed) {
             report.expected_index_entries += 1;
             match entry_exists(txn, &entry) {
@@ -364,6 +464,9 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
         }
         true
     })?;
+
+    check_state(txn, &mut report, &authors, largest_id)?;
+    drop(authors);
 
     txn.foreach_full(dbis.event_payload, &[], &[], false, |key, value| {
         report.payloads += 1;

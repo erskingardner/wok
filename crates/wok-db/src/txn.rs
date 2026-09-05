@@ -194,9 +194,18 @@ impl<'env> RwTxn<'env> {
     }
 
     pub fn commit(mut self) -> Result<(), DbError> {
+        #[cfg(test)]
+        crate::crash_tests::checkpoint("write-before-flush");
         crate::state::flush(&mut self)?;
+        #[cfg(test)]
+        crate::crash_tests::checkpoint("write-before-commit");
         self.committed = true;
-        check(unsafe { mdb_txn_commit(self.txn) })
+        let result = check(unsafe { mdb_txn_commit(self.txn) });
+        #[cfg(test)]
+        if result.is_ok() {
+            crate::crash_tests::checkpoint("write-after-commit");
+        }
+        result
     }
 
     pub fn abort(mut self) {

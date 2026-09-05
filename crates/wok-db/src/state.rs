@@ -2,10 +2,10 @@
 use crate::keys::make_key_string_u64;
 use crate::{DbError, RoTxn, RwTxn};
 
-const HIGH_WATER: &[u8] = b"sequence";
+pub(crate) const HIGH_WATER: &[u8] = b"sequence";
 pub const POLICY_GENERATION: &[u8] = b"visibility";
 
-fn decode(raw: &[u8]) -> Result<u64, DbError> {
+pub(crate) fn decode(raw: &[u8]) -> Result<u64, DbError> {
     Ok(u64::from_le_bytes(
         raw.try_into()
             .map_err(|_| DbError::msg("invalid state counter"))?,
@@ -134,9 +134,13 @@ pub(crate) fn flush(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
     };
     if let Some(sequence) = txn.event_sequence.take() {
         txn.put(dbi, HIGH_WATER, &sequence.to_le_bytes(), 0)?;
+        #[cfg(test)]
+        crate::crash_tests::checkpoint("sequence-staged");
     }
     for (key, count) in std::mem::take(&mut txn.author_counts) {
         txn.put(dbi, &key, &count.to_le_bytes(), 0)?;
+        #[cfg(test)]
+        crate::crash_tests::checkpoint("author-count-staged");
     }
     Ok(())
 }

@@ -75,3 +75,6 @@ pub use write::{
 };
 
 pub mod state;
+
+#[cfg(test)]
+mod crash_tests;

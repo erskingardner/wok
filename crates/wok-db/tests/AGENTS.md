@@ -9,6 +9,7 @@ Storage integration tests. They open disposable LMDB environments.
 | `foreach_full.rs` | Full-table scans; `MDB_GET_BOTH_RANGE` must not be used on non-DUPSORT DBIs |
 | `index_drift.rs` | Derived indexes stay consistent with primaries |
 | `failure_recovery.rs` | Unclean shutdown / recovery |
+| `state_integrity.rs` | Corrupt state detection and valid lazy/deleted-tail state |
 | `nip59_gift_wrap.rs` | Gift-wrap deletion / recipient semantics |
 | `nip62_vanish.rs` | Request to Vanish markers and sweep |
 | `cpp_roundtrip.rs` | Optional differential vs strfry (needs `STRFRY_BIN`) |

@@ -113,12 +113,19 @@ fn map_full_aborts_the_entire_transaction() {
     let directory = TempDir::new().unwrap();
     let env = Env::open(directory.path(), constrained_options()).unwrap();
     env.ensure_initialized().unwrap();
+    let mut baseline = signed_event("committed before map exhaustion", 1_800_000_000);
+    write_and_commit(&env, &mut baseline);
+    let before = wok_db::event_fingerprint(&env).unwrap();
     let dbi = env.dbis().event_payload;
     let value = vec![0x5a; 128 * 1024];
     let mut txn = env.begin_rw().unwrap();
+    wok_db::delete_event_basic(&mut txn, baseline.lev_id).unwrap();
+    let mut uncommitted = [signed_event("uncommitted replacement", 1_800_000_001)];
+    write_events(&mut txn, &mut NoopNegentropy, &mut uncommitted, false).unwrap();
+    assert_eq!(uncommitted[0].lev_id, 2);
     let mut map_full = false;
 
-    for key in 1..=1_024 {
+    for key in 100..=1_124 {
         match txn.put_u64(dbi, key, &value, 0) {
             Ok(_) => {}
             Err(DbError::Lmdb(code, _)) if code == lmdb_sys::MDB_MAP_FULL => {
@@ -133,6 +140,15 @@ fn map_full_aborts_the_entire_transaction() {
     drop(env);
 
     let reopened = Env::open(directory.path(), constrained_options()).unwrap();
+    assert_eq!(wok_db::event_fingerprint(&reopened).unwrap(), before);
     let txn = reopened.begin_ro().unwrap();
-    assert_eq!(txn.entries(reopened.dbis().event_payload).unwrap(), 0);
+    assert_eq!(txn.entries(reopened.dbis().event_payload).unwrap(), 1);
+    assert_eq!(wok_db::state::high_water_ro(&txn).unwrap(), Some(1));
+    let report = check_integrity(&txn).unwrap();
+    assert!(report.ok(), "{report:#?}");
+    drop(txn);
+    let mut probe = signed_event("retry after map exhaustion", 1_800_000_002);
+    write_and_commit(&reopened, &mut probe);
+    assert_eq!(probe.lev_id, 2);
+    assert!(check_integrity(&reopened.begin_ro().unwrap()).unwrap().ok());
 }

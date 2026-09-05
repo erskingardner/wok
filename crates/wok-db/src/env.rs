@@ -163,7 +163,10 @@ fn upgrade_v4_marker(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<(), DbError> {
         mv_size: encoded.len(),
         mv_data: encoded.as_mut_ptr().cast(),
     };
-    check(unsafe { mdb_put(txn, dbi, &mut key, &mut value, 0) })
+    check(unsafe { mdb_put(txn, dbi, &mut key, &mut value, 0) })?;
+    #[cfg(test)]
+    crate::crash_tests::checkpoint("upgrade-marker-staged");
+    Ok(())
 }
 
 impl Env {
@@ -321,11 +324,15 @@ impl Env {
             state: (opened[19] != 0).then_some(opened[19]),
         };
 
+        #[cfg(test)]
+        crate::crash_tests::checkpoint("open-before-commit");
         if let Err(e) = unsafe { check(mdb_txn_commit(txn)) } {
             unsafe { mdb_env_close(env) };
             return Err(e);
         }
 
+        #[cfg(test)]
+        crate::crash_tests::checkpoint("open-after-commit");
         let inner = Arc::new(EnvInner {
             env,
             dbis,
@@ -333,6 +340,22 @@ impl Env {
             read_only: opts.read_only,
         });
         Ok(Self { inner })
+    }
+
+    /// Build a genuine pre-state-table fixture. Test callers consume the only
+    /// environment handle, with no live cursors or transactions.
+    #[cfg(test)]
+    pub(crate) fn into_test_fixture_without_state(self, version: u64) {
+        let mut txn = self.begin_rw().unwrap();
+        let mut meta = decode_meta(txn.get_u64(self.dbis().meta, 1).unwrap().unwrap()).unwrap();
+        meta.db_version = version;
+        txn.put_u64(self.dbis().meta, 1, &encode_meta(&meta), 0)
+            .unwrap();
+        // SAFETY: the fixture owns this environment exclusively, the DBI is
+        // valid, and no other transaction/cursor can retain its handle. Drop
+        // the Env immediately after committing; never use its stale Dbis.
+        check(unsafe { mdb_drop(txn.txn, self.dbis().state.unwrap(), 1) }).unwrap();
+        txn.commit().unwrap();
     }
 
     pub fn path(&self) -> &Path {

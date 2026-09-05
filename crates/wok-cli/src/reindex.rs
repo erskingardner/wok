@@ -64,7 +64,10 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
     };
     let source = Env::open(&database, options.clone()).context("open source database")?;
     if source.db_version()? != wok_event::WOK_DB_VERSION {
-        bail!("reindex requires a Wok-owned version 4 database");
+        bail!(
+            "reindex requires a Wok-owned version {} database",
+            wok_event::WOK_DB_VERSION
+        );
     }
     let source_integrity = check_integrity(&source.begin_ro()?)?;
     ensure_reindexable(&source_integrity)?;
@@ -182,6 +185,7 @@ fn ensure_reindexable(report: &wok_db::IntegrityReport) -> Result<()> {
         );
     }
     let rebuildable_tables = [
+        "author_counts",
         "event_id",
         "event_pubkey_kind",
         "event_tag",
@@ -373,6 +377,23 @@ mod tests {
                 Some(&events[0].lev_id.to_ne_bytes()),
             )
             .unwrap();
+            let mut author_key = vec![b'a'];
+            author_key.extend_from_slice(view.pubkey());
+            txn.put(
+                env.dbis().state.unwrap(),
+                &author_key,
+                &999u64.to_le_bytes(),
+                0,
+            )
+            .unwrap();
+            // Retain a historical high-water mark above the surviving tail.
+            txn.put(
+                env.dbis().state.unwrap(),
+                b"sequence",
+                &41u64.to_le_bytes(),
+                0,
+            )
+            .unwrap();
             txn.commit().unwrap();
         }
         drop(env);
@@ -396,6 +417,13 @@ mod tests {
         .unwrap();
         assert!(check_integrity(&repaired.begin_ro().unwrap()).unwrap().ok());
         let txn = repaired.begin_ro().unwrap();
+        assert_eq!(wok_db::state::high_water_ro(&txn).unwrap(), Some(41));
+        let mut author_key = vec![b'a'];
+        author_key.extend_from_slice(view.pubkey());
+        assert!(txn
+            .get(repaired.dbis().state.unwrap(), &author_key)
+            .unwrap()
+            .is_none());
         let mut search_hits = Vec::new();
         wok_query::foreach_by_filter(&txn, &json!({"search":"repair me"}), 100, 3, 16, |lev_id| {
             search_hits.push(lev_id)
@@ -403,6 +431,13 @@ mod tests {
         .unwrap();
         assert_eq!(search_hits.len(), 1, "reindexed event was not searchable");
         drop(txn);
+        let mut txn = repaired.begin_rw().unwrap();
+        assert_eq!(
+            wok_db::state::author_count(&mut txn, view.pubkey()).unwrap(),
+            1
+        );
+        txn.commit().unwrap();
+        assert!(check_integrity(&repaired.begin_ro().unwrap()).unwrap().ok());
         let original = Env::open(
             &backup,
             EnvOptions {
@@ -413,5 +448,68 @@ mod tests {
         )
         .unwrap();
         assert!(!check_integrity(&original.begin_ro().unwrap()).unwrap().ok());
+    }
+
+    #[test]
+    fn refuses_sequence_corruption_even_when_issue_details_are_truncated() {
+        for sequence in [0u64.to_le_bytes().to_vec(), vec![1]] {
+            let root = tempfile::tempdir().unwrap();
+            let database = root.path().join("db");
+            let backup = root.path().join("backup");
+            let env = Env::open(&database, EnvOptions::default()).unwrap();
+            env.ensure_initialized().unwrap();
+            let (packed, json) = signed_event();
+            let mut events = [EventToWrite::new(packed, json)];
+            let mut txn = env.begin_rw().unwrap();
+            write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+            txn.commit().unwrap();
+            let mut txn = env.begin_rw().unwrap();
+            let state = env.dbis().state.unwrap();
+            for i in 0u16..101 {
+                let mut key = vec![b'a'];
+                key.extend_from_slice(&i.to_be_bytes());
+                txn.put(state, &key, &0u64.to_le_bytes(), 0).unwrap();
+            }
+            txn.put(state, b"sequence", &sequence, 0).unwrap();
+            txn.commit().unwrap();
+            let report = check_integrity(&env.begin_ro().unwrap()).unwrap();
+            assert_eq!(report.issues.len(), 100);
+            assert!(report
+                .issues
+                .iter()
+                .all(|issue| issue.table == "author_counts"));
+            assert_eq!(report.metadata_errors, 1);
+            let fingerprint = event_fingerprint(&env).unwrap();
+            drop(env);
+            let cfg = Config {
+                db: database.clone(),
+                ..Config::default()
+            };
+            let error = run(&cfg, Some(&backup), true).unwrap_err();
+            assert!(
+                error.to_string().contains("metadata corruption"),
+                "{error:#}"
+            );
+            assert!(!backup.exists());
+            let env = Env::open(
+                &database,
+                EnvOptions {
+                    read_only: true,
+                    create_dbis: false,
+                    create_dir: false,
+                    ..EnvOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(event_fingerprint(&env).unwrap(), fingerprint);
+            assert_eq!(
+                env.begin_ro()
+                    .unwrap()
+                    .get(env.dbis().state.unwrap(), b"sequence")
+                    .unwrap()
+                    .unwrap(),
+                sequence
+            );
+        }
     }
 }

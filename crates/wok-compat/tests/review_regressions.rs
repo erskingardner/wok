@@ -4,6 +4,7 @@
 
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use wok_relay::{Config, ConnectionGuard, Outbound, OutboundFrame, RelayHandle, TransportSource};
 
 fn now() -> u64 {
@@ -167,6 +168,63 @@ async fn review_latest_event_is_not_served_after_expiration() {
     assert_eq!(
         reply[0], "EOSE",
         "expired event was still delivered: {reply}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_unix_partial_header_survives_outbound_delivery() {
+    let relay = Relay::new(|cfg| {
+        cfg.relay.unix.enabled = true;
+        cfg.relay.unix.path = cfg.db.join("review.sock");
+    });
+    let cfg = relay.handle.config.read().clone();
+    let path = cfg.relay.unix.path.clone();
+    let handle = relay.handle.clone();
+    let listener = tokio::spawn(async move { wok_unix::serve(handle, cfg).await });
+    let mut socket = loop {
+        match wok_unix::connect(&path).await {
+            Ok(socket) => break socket,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    wok_unix::write_frame(&mut socket, br#"["REQ","live",{"kinds":[1],"limit":0}]"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        wok_unix::read_frame(&mut socket, 1_000_000).await.unwrap(),
+        br#"["EOSE","live"]"#
+    );
+    let body = br#"["REQ","after",{"kinds":[2],"limit":0}]"#;
+    let header = (body.len() as u32).to_be_bytes();
+    socket.write_all(&header[..2]).await.unwrap();
+    // Allow the actual connection task to consume the two available bytes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (publisher, mut rx) = relay.connection().await;
+    let event = wok_compat::sign_event(
+        json!({"created_at":now(), "kind":1, "tags":[], "content":"interleave"}),
+    );
+    publish(&publisher, &mut rx, &event).await;
+    let live = tokio::time::timeout(
+        Duration::from_secs(3),
+        wok_unix::read_frame(&mut socket, 1_000_000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&live).unwrap()[0], "EVENT");
+    socket.write_all(&header[2..]).await.unwrap();
+    socket.write_all(body).await.unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        wok_unix::read_frame(&mut socket, 1_000_000),
+    )
+    .await;
+    publisher.close().await;
+    relay.handle.request_shutdown();
+    listener.await.unwrap().unwrap();
+    assert!(
+        matches!(&reply, Ok(Ok(bytes)) if bytes == br#"["EOSE","after"]"#),
+        "valid fragmented request failed after outbound EVENT: {reply:?}"
     );
 }
 

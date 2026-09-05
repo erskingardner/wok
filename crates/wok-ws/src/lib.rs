@@ -673,80 +673,83 @@ async fn handle_ws<S>(
     // future) so select! cancellation by outbound traffic or pings cannot
     // restart it.
     let mut frame_deadline = None;
-    'outer: loop {
-        tokio::select! {
-            _ = killed.notified() => {
-                tracing::info!(conn_id, peer = %peer, reason = "slow_client", "client terminated");
-                break;
-            }
-            _ = ping.tick(), if auto_ping > 0 => {
-                if awaiting_pong {
-                    tracing::info!(conn_id, peer = %peer, reason = "pong_timeout", "client terminated");
-                    break;
+    let io = async {
+        'outer: loop {
+            tokio::select! {
+                _ = ping.tick(), if auto_ping > 0 => {
+                    if awaiting_pong {
+                        tracing::info!(conn_id, peer = %peer, reason = "pong_timeout", "client terminated");
+                        break;
+                    }
+                    if write_bytes(&mut wr, &encoder.encode_control(OP_PING, &[])).await.is_err() {
+                        break;
+                    }
+                    // The next tick was scheduled when this one was consumed,
+                    // before the write above. Restart the interval so a stalled
+                    // write can't eat the peer's pong window.
+                    ping.reset();
+                    awaiting_pong = true;
                 }
-                if write_bytes(&mut wr, &encoder.encode_control(OP_PING, &[])).await.is_err() {
-                    break;
-                }
-                // The next tick was scheduled when this one was consumed,
-                // before the write above. Restart the interval so a stalled
-                // write can't eat the peer's pong window.
-                ping.reset();
-                awaiting_pong = true;
-            }
-            incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline) => {
-                match incoming {
-                    Ok(()) => {
-                        for ev in incoming_events.drain(..) {
-                            match ev {
-                                WsEvent::Message(MessageKind::Text, t) => {
-                                    match String::from_utf8(t) {
-                                        Ok(text) => connection.client_message(text).await,
-                                        Err(_) => connection.client_message("x".into()).await,
+                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline) => {
+                    match incoming {
+                        Ok(()) => {
+                            for ev in incoming_events.drain(..) {
+                                match ev {
+                                    WsEvent::Message(MessageKind::Text, t) => {
+                                        match String::from_utf8(t) {
+                                            Ok(text) => connection.client_message(text).await,
+                                            Err(_) => connection.client_message("x".into()).await,
+                                        }
                                     }
-                                }
-                                WsEvent::Message(MessageKind::Binary, b) => {
-                                    match String::from_utf8(b) {
-                                        Ok(text) => connection.client_message(text).await,
-                                        Err(_) => connection.client_message("x".into()).await,
+                                    WsEvent::Message(MessageKind::Binary, b) => {
+                                        match String::from_utf8(b) {
+                                            Ok(text) => connection.client_message(text).await,
+                                            Err(_) => connection.client_message("x".into()).await,
+                                        }
                                     }
-                                }
-                                WsEvent::Ping(p) => {
-                                    if write_bytes(&mut wr, &encoder.encode_control(OP_PONG, &p)).await.is_err() {
+                                    WsEvent::Ping(p) => {
+                                        if write_bytes(&mut wr, &encoder.encode_control(OP_PONG, &p)).await.is_err() {
+                                            break 'outer;
+                                        }
+                                    }
+                                    WsEvent::Pong(_) => {
+                                        awaiting_pong = false;
+                                    }
+                                    WsEvent::Close(c) => {
+                                        let _ = write_bytes(&mut wr, &encoder.encode_control(frame::OP_CLOSE, &c)).await;
                                         break 'outer;
                                     }
                                 }
-                                WsEvent::Pong(_) => {
-                                    awaiting_pong = false;
-                                }
-                                WsEvent::Close(c) => {
-                                    let _ = write_bytes(&mut wr, &encoder.encode_control(frame::OP_CLOSE, &c)).await;
-                                    break 'outer;
-                                }
                             }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-            out = rx.recv() => {
-                match out {
-                    Some(frame) => {
-                        let bytes = match encoder.encode_message(MessageKind::Text, frame.into_text().as_bytes()) {
-                            Ok(b) => b,
-                            Err(_) => break,
-                        };
-                        if write_bytes(&mut wr, &bytes).await.is_err() {
-                            break;
+                out = rx.recv() => {
+                    match out {
+                        Some(frame) => {
+                            let bytes = match encoder.encode_message(MessageKind::Text, frame.text.as_bytes()) {
+                                Ok(b) => b,
+                                Err(_) => break,
+                            };
+                            if write_bytes(&mut wr, &bytes).await.is_err() {
+                                break;
+                            }
                         }
+                        None => break,
                     }
-                    None => break,
                 }
             }
         }
-    }
+    };
+    connection.run_until_cancelled(&killed, io).await;
     connection.close().await;
     tracing::info!(conn_id, peer = %peer, transport = "websocket", "client disconnected");
 }
+
+#[cfg(test)]
+#[path = "review_regressions.rs"]
+mod review_regressions;
 
 #[cfg(test)]
 mod landing_tests {

@@ -9,8 +9,8 @@ clients ─Unix─► wok-unix─┼─► RelayHandle (crossbeam) ─► ingest
                          │                              ├ req-worker
                          │                              ├ req-monitor
                          │                              ├ negentropy
-                         │                              └ cron (expiration)
-                         └ outbound mpsc<String> back to the connection task
+                         │                              └ cron (queues maintenance to writer)
+                         └ outbound mpsc<OutboundFrame> back to the connection task
 ```
 
 Invariants:
@@ -18,8 +18,17 @@ Invariants:
 - strfry v3 is a read-only migration source; Wok runtime databases carry a
   Wok-owned version marker and are never shared with a strfry writer.
 - LMDB transactions, cursors, and mmap slices never cross `.await`.
-- A single application-level writer thread commits events.
-- Connection-affine ingest uses one ingester in this build (can be sharded later by `conn_id`).
-- Outbound channels are bounded; slow clients fail `try_send` and are dropped by the transport when the buffer fills.
+- A single application-level writer thread commits events, management changes and
+  maintenance deletions together with counters and derived tree/index updates.
+- Connection-affine ingest, query, monitor and sync worker pools route by connection ID.
+- Outbound queue memory is bounded by byte reservations, retained through in-flight
+  writes. The shared connection guard cancels transport I/O on termination or shutdown.
 
 Crate boundaries: `wok-event`, `wok-db`, `wok-query`, `wok-negentropy`, `wok-relay`, `wok-ws`, `wok-unix`, `wok-cli`, `wok-bench`, `wok-compat`.
+
+Read visibility lives in `wok-query::ReadVisibility` and applies before history,
+COUNT/HLL and search limits. Live delivery and temporary sync use the same policy.
+Direct persistent-tree sync requires an explicit public-visibility proof.
+`server/writer.rs` owns mutation and receipts; `server/negentropy.rs` owns sync
+sessions and a reservation pool shared across all workers. Unix reader and writer
+futures progress independently so outbound traffic cannot cancel partial headers.

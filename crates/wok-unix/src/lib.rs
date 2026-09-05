@@ -206,39 +206,43 @@ async fn handle_conn(
         .await;
     let conn_id = connection.conn_id();
     tracing::info!(conn_id, transport = "unix", "client connected");
-    let mut len_buf = [0u8; 4];
-    let result = async {
+    let (mut rd, mut wr) = stream.split();
+    let reader = async {
         loop {
-            tokio::select! {
-                _ = killed.notified() => {
-                    tracing::debug!("[{conn_id}] unix: terminated slow client");
-                    break;
-                }
-                read = stream.read_exact(&mut len_buf) => {
-                    read?;
-                    let n = u32::from_be_bytes(len_buf) as usize;
-                    if n > max_frame {
-                        return Err(UnixError::Message(format!("frame too large: {n}")));
-                    }
-                    let mut body = vec![0u8; n];
-                    stream.read_exact(&mut body).await?;
-                    let text = String::from_utf8(body)
-                        .map_err(|_| UnixError::Message("frame not utf-8".into()))?;
-                    connection.client_message(text).await;
-                }
-                out = rx.recv() => {
-                    match out {
-                        Some(frame) => {
-                            write_frame(&mut stream, frame.into_text().as_bytes()).await?;
-                        }
-                        None => break,
-                    }
-                }
+            let mut header = [0u8; 4];
+            rd.read_exact(&mut header).await?;
+            let n = u32::from_be_bytes(header) as usize;
+            if n > max_frame {
+                return Err(UnixError::Message(format!("frame too large: {n}")));
             }
+            let mut body = vec![0u8; n];
+            rd.read_exact(&mut body).await?;
+            let text = String::from_utf8(body)
+                .map_err(|_| UnixError::Message("frame not utf-8".into()))?;
+            connection.client_message(text).await;
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, UnixError>(())
+    };
+    let writer = async {
+        while let Some(frame) = rx.recv().await {
+            // Keep the frame alive until the complete write releases its bytes.
+            wr.write_all(&(frame.text.len() as u32).to_be_bytes())
+                .await?;
+            wr.write_all(frame.text.as_bytes()).await?;
+            wr.flush().await?;
         }
         Ok::<_, UnixError>(())
-    }
-    .await;
+    };
+    let result = connection
+        .run_until_cancelled(&killed, async {
+            tokio::select! {
+                result = reader => result,
+                result = writer => result,
+            }
+        })
+        .await
+        .unwrap_or(Ok(()));
     connection.close().await;
     tracing::info!(conn_id, transport = "unix", "client disconnected");
     result

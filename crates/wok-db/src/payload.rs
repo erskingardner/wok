@@ -76,14 +76,12 @@ impl Decompressor {
     pub fn decode<'a>(
         &'a mut self,
         txn: &RoTxn<'_>,
-        raw: &[u8],
+        raw: &'a [u8],
         max_event_size: usize,
     ) -> Result<&'a str, DbError> {
         match parse_payload(raw)? {
             PayloadView::Raw(json) => {
-                self.buffer.clear();
-                self.buffer.extend_from_slice(json);
-                std::str::from_utf8(&self.buffer).map_err(|_| DbError::msg("payload not utf-8"))
+                std::str::from_utf8(json).map_err(|_| DbError::msg("payload not utf-8"))
             }
             PayloadView::Zstd {
                 dict_id,
@@ -95,14 +93,12 @@ impl Decompressor {
     pub fn decode_rw<'a>(
         &'a mut self,
         txn: &RwTxn<'_>,
-        raw: &[u8],
+        raw: &'a [u8],
         max_event_size: usize,
     ) -> Result<&'a str, DbError> {
         match parse_payload(raw)? {
             PayloadView::Raw(json) => {
-                self.buffer.clear();
-                self.buffer.extend_from_slice(json);
-                std::str::from_utf8(&self.buffer).map_err(|_| DbError::msg("payload not utf-8"))
+                std::str::from_utf8(json).map_err(|_| DbError::msg("payload not utf-8"))
             }
             PayloadView::Zstd {
                 dict_id,
@@ -185,9 +181,7 @@ pub fn get_event_json<'a>(
     let raw = txn
         .get_u64(txn.env().dbis().event_payload, lev_id)?
         .ok_or_else(|| DbError::msg("couldn't find event in EventPayload"))?;
-    // Copy raw to owned because decomp.decode borrows txn and decomp.
-    let owned = raw.to_vec();
-    decomp.decode(txn, &owned, max_event_size)
+    decomp.decode(txn, raw, max_event_size)
 }
 
 pub fn event_json_owned(

@@ -324,6 +324,20 @@ impl<'txn> Cursor<'txn> {
         val: Option<&[u8]>,
         op: u32,
     ) -> Result<Option<Kv<'txn>>, DbError> {
+        // Only single-record operations are supported. In particular MULTIPLE
+        // operations have different output semantics and must not enter this API.
+        match op {
+            MDB_SET | MDB_SET_KEY | MDB_SET_RANGE if key.is_some() => {}
+            MDB_GET_BOTH | MDB_GET_BOTH_RANGE if key.is_some() && val.is_some() => {}
+            MDB_FIRST | MDB_LAST | MDB_NEXT | MDB_PREV | MDB_NEXT_DUP | MDB_PREV_DUP
+            | MDB_NEXT_NODUP | MDB_PREV_NODUP | MDB_FIRST_DUP | MDB_LAST_DUP | MDB_GET_CURRENT => {}
+            _ => {
+                return Err(DbError::msg(
+                    "unsupported cursor operation or missing seek input",
+                ))
+            }
+        }
+        let op = if op == MDB_SET { MDB_SET_KEY } else { op };
         let mut k = match key {
             Some(b) => mdb_val(b),
             None => MDB_val {
@@ -343,6 +357,15 @@ impl<'txn> Cursor<'txn> {
             return Ok(None);
         }
         check(rc)?;
+        // These operations can leave one or both MDB_vals pointing at caller
+        // input (or untouched). Re-read the positioned record from LMDB before
+        // assigning the transaction lifetime to the returned slices.
+        if matches!(
+            op,
+            MDB_GET_BOTH | MDB_GET_BOTH_RANGE | MDB_FIRST_DUP | MDB_LAST_DUP
+        ) {
+            check(unsafe { mdb_cursor_get(self.cursor, &mut k, &mut v, MDB_GET_CURRENT) })?;
+        }
         Ok(Some((
             slice_from_val(&k, self.transaction_lifetime),
             slice_from_val(&v, self.transaction_lifetime),

@@ -1,0 +1,476 @@
+{
+  "context": "Local Docker Desktop Linux arm64; 2 CPU and 2 GiB per container; shared host with overlapping builds/tests/campaigns. No capacity or speedup inference. Fanout latency definition changed between controls.",
+  "runs": [
+    {
+      "run_id": "audit-medium",
+      "result": {
+        "ok": true,
+        "error": null,
+        "cleanup_errors": [],
+        "volumes_preserved": true
+      },
+      "source_revision": "96b9c284698de97a9afa171556a1e613b6eed6dc",
+      "dirty": false,
+      "benchmark_source_sha256": "a49c171b1d31462fb7f2ed731b72b8ffb4e334dc543e7a7741b36d8f0c8d3252",
+      "environment": {
+        "LAB_EVENTS": "20000",
+        "LAB_PUBLISHERS": "64",
+        "LAB_SUBSCRIBERS": "64",
+        "LAB_FANOUT_EVENTS": "500",
+        "LAB_CONNECTIONS": "2000",
+        "LAB_HOLD_SECONDS": "5",
+        "LAB_ROUNDS": "3",
+        "LAB_DEADLINE_SECONDS": "300",
+        "LAB_IMAGE_TAG": "audit-medium",
+        "LAB_SOURCE_REVISION": "96b9c284698de97a9afa171556a1e613b6eed6dc",
+        "LAB_RELAY_BIND": "127.0.0.1",
+        "LAB_TARGET": "ws://relay:7777",
+        "LAB_BASE_TIMESTAMP": "1788640933"
+      },
+      "peak_sampled_container_mib": {
+        "relay": 117.8,
+        "load": 104.7
+      },
+      "trials": [
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 4203.160938132634,
+          "latency_p99_ms": 40.127,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "64 concurrent connection(s): accepted 20000/20000, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 19355.437698037276,
+          "latency_p99_ms": 54.207,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "64 subscribers x 500 events: delivered 32000/32000"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": true,
+          "throughput_per_s": 3512.870278482791,
+          "latency_p99_ms": 0.485,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "opened 2000/2000 connections and held them for 5s"
+        },
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 3183.515605930555,
+          "latency_p99_ms": 36.575,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "64 concurrent connection(s): accepted 20000/20000, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 24207.21067325451,
+          "latency_p99_ms": 54.239,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "64 subscribers x 500 events: delivered 32000/32000"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": true,
+          "throughput_per_s": 3728.933849671843,
+          "latency_p99_ms": 0.47,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "opened 2000/2000 connections and held them for 5s"
+        },
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 2554.053916312891,
+          "latency_p99_ms": 42.207,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "64 concurrent connection(s): accepted 20000/20000, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 17089.734381019643,
+          "latency_p99_ms": 53.791,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "64 subscribers x 500 events: delivered 32000/32000"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": true,
+          "throughput_per_s": 3482.073485689288,
+          "latency_p99_ms": 0.779,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "opened 2000/2000 connections and held them for 5s"
+        }
+      ]
+    },
+    {
+      "run_id": "audit-large",
+      "result": {
+        "ok": true,
+        "error": null,
+        "cleanup_errors": [],
+        "volumes_preserved": true
+      },
+      "source_revision": "96b9c284698de97a9afa171556a1e613b6eed6dc",
+      "dirty": true,
+      "benchmark_source_sha256": "173ce10f8ad4099c725ae10f9082d173b9f15a8d458ff61a1d895241fb2453bf",
+      "environment": {
+        "LAB_EVENTS": "100000",
+        "LAB_PUBLISHERS": "128",
+        "LAB_SUBSCRIBERS": "128",
+        "LAB_FANOUT_EVENTS": "1000",
+        "LAB_CONNECTIONS": "10000",
+        "LAB_HOLD_SECONDS": "15",
+        "LAB_DEADLINE_SECONDS": "600",
+        "LAB_IMAGE_TAG": "audit-large",
+        "LAB_SOURCE_REVISION": "96b9c284698de97a9afa171556a1e613b6eed6dc-dirty",
+        "LAB_RELAY_BIND": "127.0.0.1",
+        "LAB_TARGET": "ws://relay:7777",
+        "LAB_BASE_TIMESTAMP": "1788641169"
+      },
+      "peak_sampled_container_mib": {
+        "relay": 222.0,
+        "load": 1330.176
+      },
+      "trials": [
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 4592.248599951789,
+          "latency_p99_ms": 51.519,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "128 concurrent connection(s): accepted 100000/100000, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 35186.456933289184,
+          "latency_p99_ms": 246.527,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "128 subscribers x 1000 events: delivered 128000/128000"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": true,
+          "throughput_per_s": 3327.9731688473103,
+          "latency_p99_ms": 1.114,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "opened 10000/10000 connections and held them for 15s"
+        }
+      ]
+    },
+    {
+      "run_id": "audit-idle-before",
+      "result": {
+        "ok": false,
+        "error": "load failed (1); see load artifacts",
+        "cleanup_errors": [],
+        "volumes_preserved": true
+      },
+      "source_revision": "96b9c284698de97a9afa171556a1e613b6eed6dc",
+      "dirty": false,
+      "benchmark_source_sha256": "a49c171b1d31462fb7f2ed731b72b8ffb4e334dc543e7a7741b36d8f0c8d3252",
+      "environment": {
+        "LAB_EVENTS": "10",
+        "LAB_PUBLISHERS": "2",
+        "LAB_SUBSCRIBERS": "2",
+        "LAB_FANOUT_EVENTS": "10",
+        "LAB_CONNECTIONS": "8",
+        "LAB_HOLD_SECONDS": "120",
+        "LAB_DEADLINE_SECONDS": "180",
+        "LAB_RELAY_PORT": "7778",
+        "LAB_IMAGE_TAG": "audit-idle-before",
+        "LAB_SOURCE_REVISION": "96b9c284698de97a9afa171556a1e613b6eed6dc",
+        "LAB_RELAY_BIND": "127.0.0.1",
+        "LAB_TARGET": "ws://relay:7777",
+        "LAB_BASE_TIMESTAMP": "1788640979"
+      },
+      "peak_sampled_container_mib": {
+        "relay": 8.469,
+        "load": 8.965
+      },
+      "trials": [
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 1275.1374215599214,
+          "latency_p99_ms": 2.189,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "2 concurrent connection(s): accepted 10/10, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 1427.904291287906,
+          "latency_p99_ms": 0.059,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "2 subscribers x 10 events: delivered 20/20"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": false,
+          "throughput_per_s": 0.0,
+          "latency_p99_ms": 0.438,
+          "errors": 1,
+          "mismatches": 0,
+          "notes": "IO error: Broken pipe (os error 32)"
+        }
+      ]
+    },
+    {
+      "run_id": "audit-idle-after",
+      "result": {
+        "ok": true,
+        "error": null,
+        "cleanup_errors": [],
+        "volumes_preserved": true
+      },
+      "source_revision": "96b9c284698de97a9afa171556a1e613b6eed6dc",
+      "dirty": true,
+      "benchmark_source_sha256": "173ce10f8ad4099c725ae10f9082d173b9f15a8d458ff61a1d895241fb2453bf",
+      "environment": {
+        "LAB_EVENTS": "10",
+        "LAB_PUBLISHERS": "2",
+        "LAB_SUBSCRIBERS": "2",
+        "LAB_FANOUT_EVENTS": "10",
+        "LAB_CONNECTIONS": "8",
+        "LAB_HOLD_SECONDS": "120",
+        "LAB_DEADLINE_SECONDS": "180",
+        "LAB_RELAY_PORT": "7778",
+        "LAB_IMAGE_TAG": "audit-idle-after",
+        "LAB_SOURCE_REVISION": "96b9c284698de97a9afa171556a1e613b6eed6dc-dirty",
+        "LAB_RELAY_BIND": "127.0.0.1",
+        "LAB_TARGET": "ws://relay:7777",
+        "LAB_BASE_TIMESTAMP": "1788641167"
+      },
+      "peak_sampled_container_mib": {
+        "relay": 8.531,
+        "load": 10.77
+      },
+      "trials": [
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 1583.5939665069875,
+          "latency_p99_ms": 2.307,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "2 concurrent connection(s): accepted 10/10, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 2115.7304559399136,
+          "latency_p99_ms": 0.07,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "2 subscribers x 10 events: delivered 20/20"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": true,
+          "throughput_per_s": 3013.0884797198432,
+          "latency_p99_ms": 0.444,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "opened 8/8 connections and held them for 120s"
+        }
+      ]
+    },
+    {
+      "run_id": "audit-fanout-before",
+      "result": {
+        "ok": true,
+        "error": null,
+        "cleanup_errors": [],
+        "volumes_preserved": true
+      },
+      "source_revision": "96b9c284698de97a9afa171556a1e613b6eed6dc",
+      "dirty": true,
+      "benchmark_source_sha256": "173ce10f8ad4099c725ae10f9082d173b9f15a8d458ff61a1d895241fb2453bf",
+      "environment": {
+        "LAB_EVENTS": "1000",
+        "LAB_PUBLISHERS": "8",
+        "LAB_SUBSCRIBERS": "8",
+        "LAB_FANOUT_EVENTS": "50000",
+        "LAB_CONNECTIONS": "8",
+        "LAB_HOLD_SECONDS": "1",
+        "LAB_DEADLINE_SECONDS": "300",
+        "LAB_IMAGE_TAG": "audit-fanout-before",
+        "LAB_SOURCE_REVISION": "96b9c284698de97a9afa171556a1e613b6eed6dc-dirty",
+        "LAB_RELAY_BIND": "127.0.0.1",
+        "LAB_TARGET": "ws://relay:7777",
+        "LAB_BASE_TIMESTAMP": "1788641335"
+      },
+      "peak_sampled_container_mib": {
+        "relay": 374.1,
+        "load": 94.94
+      },
+      "trials": [
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 937.9189487567317,
+          "latency_p99_ms": 119.807,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "8 concurrent connection(s): accepted 1000/1000, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 2803.1899702904307,
+          "latency_p99_ms": 2414.591,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "8 subscribers x 50000 events: delivered 400000/400000"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": true,
+          "throughput_per_s": 955.2048335274986,
+          "latency_p99_ms": 3.687,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "opened 8/8 connections and held them for 1s"
+        }
+      ]
+    },
+    {
+      "run_id": "audit-fanout-after",
+      "result": {
+        "ok": true,
+        "error": null,
+        "cleanup_errors": [],
+        "volumes_preserved": true
+      },
+      "source_revision": "4afcc518e48f45493a2059a83df28bced1afa0ec",
+      "dirty": true,
+      "benchmark_source_sha256": "61d7c737dc86ce68bfffd173813fafabcc3e99350e045d814b95eaffa185a4e3",
+      "environment": {
+        "LAB_EVENTS": "1000",
+        "LAB_PUBLISHERS": "8",
+        "LAB_SUBSCRIBERS": "8",
+        "LAB_FANOUT_EVENTS": "50000",
+        "LAB_CONNECTIONS": "8",
+        "LAB_HOLD_SECONDS": "1",
+        "LAB_DEADLINE_SECONDS": "300",
+        "LAB_IMAGE_TAG": "audit-fanout-after",
+        "LAB_SOURCE_REVISION": "4afcc518e48f45493a2059a83df28bced1afa0ec-dirty",
+        "LAB_RELAY_BIND": "127.0.0.1",
+        "LAB_TARGET": "ws://relay:7777",
+        "LAB_BASE_TIMESTAMP": "1788641658"
+      },
+      "peak_sampled_container_mib": {
+        "relay": 13.97,
+        "load": 91.14
+      },
+      "trials": [
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 2321.5198585640956,
+          "latency_p99_ms": 7.987,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "8 concurrent connection(s): accepted 1000/1000, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 1726.4499018514082,
+          "latency_p99_ms": 231735.295,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "8 subscribers x 50000 events: delivered 400000/400000; concurrent readers; latency is aggregate trial duration"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": true,
+          "throughput_per_s": 1792.6335310309346,
+          "latency_p99_ms": 1.573,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "opened 8/8 connections and held them for 1s"
+        }
+      ]
+    },
+    {
+      "run_id": "audit-final",
+      "result": {
+        "ok": true,
+        "error": null,
+        "cleanup_errors": [],
+        "volumes_preserved": true
+      },
+      "source_revision": "be2337d1ea54ddd99fe34cbcea91cd2c4c5826f6",
+      "dirty": false,
+      "benchmark_source_sha256": "388c2fc534578dd99575042d1331e454beeee33728b6011155bed601641bb7f4",
+      "environment": {
+        "LAB_EVENTS": "20000",
+        "LAB_PUBLISHERS": "64",
+        "LAB_SUBSCRIBERS": "64",
+        "LAB_FANOUT_EVENTS": "5000",
+        "LAB_CONNECTIONS": "2000",
+        "LAB_HOLD_SECONDS": "120",
+        "LAB_DEADLINE_SECONDS": "600",
+        "LAB_RELAY_PORT": "7778",
+        "LAB_IMAGE_TAG": "audit-final",
+        "LAB_SOURCE_REVISION": "be2337d1ea54ddd99fe34cbcea91cd2c4c5826f6",
+        "LAB_RELAY_BIND": "127.0.0.1",
+        "LAB_TARGET": "ws://relay:7777",
+        "LAB_BASE_TIMESTAMP": "1788641821"
+      },
+      "peak_sampled_container_mib": {
+        "relay": 55.13,
+        "load": 276.9
+      },
+      "trials": [
+        {
+          "scenario": "ws_publish_scaled",
+          "ok": true,
+          "throughput_per_s": 1426.8884851514579,
+          "latency_p99_ms": 536.063,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "64 concurrent connection(s): accepted 20000/20000, rejected 0; storage not inspected (remote target)"
+        },
+        {
+          "scenario": "live_fanout",
+          "ok": true,
+          "throughput_per_s": 7908.992586216182,
+          "latency_p99_ms": 40468.479,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "64 subscribers x 5000 events: delivered 320000/320000; concurrent readers; latency is aggregate trial duration"
+        },
+        {
+          "scenario": "idle_connections",
+          "ok": true,
+          "throughput_per_s": 2574.1085828835826,
+          "latency_p99_ms": 1.495,
+          "errors": 0,
+          "mismatches": 0,
+          "notes": "opened 2000/2000 connections and held them for 120s"
+        }
+      ]
+    }
+  ]
+}

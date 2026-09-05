@@ -79,6 +79,8 @@ result/limit verification). Use `--scenario <name>` to isolate one scenario.
 For a repeatable local setup or fresh two-VM deployment, start with the
 [Docker load lab](load-lab.md). It packages `wok-bench` with the relay, preserves
 results, and checks shutdown/integrity without fixed host addresses.
+The [September 5 local lab audit](load-lab-audit-2026-09-05.md) records larger
+campaigns, long-idle validation, generator corrections, and measurement limits.
 
 ## Two-host load generation
 

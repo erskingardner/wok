@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Portable Docker relay/load lab with local and two-VM SSH campaigns, bounded
+  workloads, preserved artifacts, and shutdown/integrity correctness gates.
+
 - Generated WebSocket/Unix lifecycle tests compare history, live events, COUNT,
   and sync with an independent privacy model, including AUTH and revocation.
 - CI runs benchmark correctness tests, native behavioral suites on all four

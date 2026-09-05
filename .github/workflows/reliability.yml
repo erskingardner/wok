@@ -3,9 +3,9 @@ name: reliability soak
 on:
   push:
     branches: [master]
-    paths: ['crates/**', 'scripts/reliability-soak.py', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
+    paths: ['crates/**', 'scripts/reliability-soak.py', 'scripts/lab.py', 'scripts/lab-bootstrap-debian.sh', 'scripts/tests/**', 'contrib/lab/**', '.dockerignore', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
   pull_request:
-    paths: ['crates/**', 'scripts/reliability-soak.py', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
+    paths: ['crates/**', 'scripts/reliability-soak.py', 'scripts/lab.py', 'scripts/lab-bootstrap-debian.sh', 'scripts/tests/**', 'contrib/lab/**', '.dockerignore', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
   schedule:
     - cron: '23 2 * * 0'
   workflow_dispatch:
@@ -46,5 +46,28 @@ jobs:
         with:
           name: reliability-soak-${{ github.sha }}
           path: ${{ runner.temp }}/wok-soak
+          if-no-files-found: error
+          retention-days: 30
+
+  compose:
+    name: portable Docker lab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check result gates and artifact extraction
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          shellcheck scripts/lab-bootstrap-debian.sh
+      - name: Build and exercise both Compose services
+        run: python3 scripts/lab.py local --run-id ci-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Preserve lab evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-lab-${{ github.sha }}
+          path: bench-results/lab/
           if-no-files-found: error
           retention-days: 30

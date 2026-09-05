@@ -79,6 +79,9 @@ using a single snapshot; deleted-tail history requires a trusted backup.
 - [x] Add generated WebSocket/Unix privacy lifecycle tests and in-flight sync
   revocation checks against an independent expected-set model.
 - [x] Add a repeatable Linux soak runner and short CI / longer scheduled jobs.
+- [x] Package a portable [Docker load lab](docs/load-lab.md) with local campaigns,
+  two-host SSH orchestration, isolated volumes, and benchmark correctness gates.
+  Actual remote/bootstrap validation remains pending disposable VM access.
 - [x] Complete and record the initial one-hour Linux container soak; see the
   [dated evidence report](docs/reliability-2026-09-05.md).
 

@@ -269,6 +269,7 @@ Summary:
 - [Cutover / rollback](docs/cutover.md)
 - [Security](docs/security.md)
 - [Reliability validation and CI gates](docs/reliability.md)
+- [Local and two-VM load lab](docs/load-lab.md)
 - [Known differences](docs/known-differences.md)
 - [Definition-of-done report](docs/FINAL.md)
 

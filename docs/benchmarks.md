@@ -72,6 +72,12 @@ connection count), `idle_connections` (open-and-hold connection capacity),
 `nip50_search` (rare, intersected, and full-corpus ranked searches with
 result/limit verification). Use `--scenario <name>` to isolate one scenario.
 
+## Portable Docker lab
+
+For a repeatable local setup or fresh two-VM deployment, start with the
+[Docker load lab](load-lab.md). It packages `wok-bench` with the relay, preserves
+results, and checks shutdown/integrity without fixed host addresses.
+
 ## Two-host load generation
 
 The `load` profile can run from a separate load-generator VM against an

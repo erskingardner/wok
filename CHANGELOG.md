@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Benchmark commands return a failing exit status when any trial fails, after
+  preserving JSONL results, the summary, and corpus metadata for diagnosis.
 - Benchmark fanout subscribers read concurrently with publication, verify payloads
   using shared expectations, and report aggregate trial time consistently.
 - Benchmark idle clients answer WebSocket pings throughout connection setup and

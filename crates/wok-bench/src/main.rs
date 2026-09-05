@@ -426,6 +426,13 @@ fn main() -> Result<()> {
     std::fs::write(args.out.join("summary.md"), &md)?;
     println!("wrote {} and summary.md", jsonl.display());
     print!("\n{md}");
+    anyhow::ensure!(
+        trials
+            .iter()
+            .all(|t| t.ok && t.errors == 0 && t.mismatches == 0),
+        "benchmark trials failed; see {}",
+        jsonl.display()
+    );
     Ok(())
 }
 

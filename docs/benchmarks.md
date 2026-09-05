@@ -30,6 +30,8 @@ and `summary.md`. The timestamp is selected once per campaign rather than once
 per generator. Pass `--base-timestamp` when two machines must create
 byte-identical corpora. Remote repetitions use stable, distinct per-scenario
 workload seeds so a persistent relay does not receive duplicate event IDs.
+The command exits unsuccessfully if any trial fails or records errors/mismatches,
+after writing the reports; a failed campaign still retains diagnostic artifacts.
 The default `--event-mix kind1` preserves the focused historical workload.
 `--event-mix realistic` uses 32 stable actors and adds a weighted mix of kind 0
 metadata, kind 1 notes and replies, kind 3 contacts, kind 7 reactions, kind

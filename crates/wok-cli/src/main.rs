@@ -505,11 +505,14 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
             tracing::error!("unix server: {e}");
         }
     });
-    // C++ graceful shutdown is SIGUSR1; wok also treats SIGINT the same way.
+    // Service managers use SIGTERM; preserve the interactive SIGINT and
+    // historical strfry SIGUSR1 paths as equivalent graceful shutdowns.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigusr1 =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT: initiating graceful shutdown"),
+        _ = sigterm.recv() => tracing::info!("SIGTERM: initiating graceful shutdown"),
         _ = sigusr1.recv() => tracing::info!("SIGUSR1: initiating graceful shutdown"),
     }
     handle.request_shutdown();

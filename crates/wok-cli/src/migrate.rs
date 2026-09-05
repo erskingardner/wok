@@ -229,8 +229,21 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
     snapshot.upgrade_strfry_v3_to_wok()?;
     drop(snapshot);
 
-    let target = Env::open(&staging_db, options).context("reopen migrated Wok database")?;
+    // A real strfry snapshot has none of Wok's extension tables. Create them
+    // only in the private, now Wok-owned staging copy, before promotion.
+    let target = Env::open(
+        &staging_db,
+        EnvOptions {
+            create_dbis: true,
+            ..options
+        },
+    )
+    .context("reopen migrated Wok database")?;
     target.ensure_initialized()?;
+    let target_integrity = check_integrity(&target.begin_ro()?)?;
+    if !target_integrity.ok() {
+        bail!("migrated database failed integrity checks: {target_integrity:?}");
+    }
     let after = event_fingerprint(&target)?;
     if before != after {
         bail!("event verification failed after assigning Wok database ownership");

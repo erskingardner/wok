@@ -306,6 +306,61 @@ async fn review_count_and_req_use_the_same_recipient_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual local timing diagnostic, not a capacity benchmark"]
+async fn review_benchmark_client_nagle_diagnostic() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let relay = Relay::new(|cfg| cfg.relay.abuse.enabled = false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", listener.local_addr().unwrap());
+    let handle = relay.handle.clone();
+    let server = tokio::spawn(async move { wok_ws::serve_listener(handle, listener).await });
+    for disable_nagle in [false, true, true, false] {
+        let mut sockets = Vec::new();
+        for _ in 0..4 {
+            sockets.push(
+                tokio_tungstenite::connect_async_with_config(&url, None, disable_nagle)
+                    .await
+                    .unwrap()
+                    .0,
+            );
+        }
+        let started = std::time::Instant::now();
+        for i in 0..80 {
+            let ws = &mut sockets[i % 4];
+            ws.send(Message::Text(
+                json!(["REQ","timing",{"kinds":[1],"limit":0}])
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(reply.to_text().unwrap()).unwrap(),
+                json!(["EOSE", "timing"])
+            );
+            ws.send(Message::Text(json!(["CLOSE", "timing"]).to_string().into()))
+                .await
+                .unwrap();
+        }
+        println!(
+            "NODELAY={disable_nagle}: 80 REQ/EOSE/CLOSE on 4 rotated sockets in {:?}",
+            started.elapsed()
+        );
+        for mut socket in sockets {
+            let _ = socket.close(None).await;
+        }
+    }
+    relay.handle.request_shutdown();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiple_auth_keys_remain_authorized_for_reads_and_protected_writes() {
     let relay = Relay::new(|cfg| cfg.relay.auth.service_url = "wss://review.example".into());
     let (conn, mut rx) = relay.connection().await;

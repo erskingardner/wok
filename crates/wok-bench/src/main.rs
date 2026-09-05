@@ -25,8 +25,13 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+static CLIENT_NODELAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 #[derive(Parser, Debug)]
 struct Args {
+    /// Disable client Nagle; explicit false permits controlled transport comparisons.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    tcp_nodelay: bool,
     /// C++ strfry binary
     #[arg(long, default_value = "/Users/jeff/code/strfry/strfry")]
     strfry: PathBuf,
@@ -130,6 +135,7 @@ struct Trial {
     corpus_sha256: String,
     binary_sha256: String,
     profile: String,
+    client_tcp_nodelay: bool,
 }
 
 #[derive(Serialize)]
@@ -202,6 +208,7 @@ fn main() -> Result<()> {
         )
         .init();
     let mut args = Args::parse();
+    CLIENT_NODELAY.store(args.tcp_nodelay, std::sync::atomic::Ordering::Relaxed);
     if args.repetitions == 0 {
         anyhow::bail!("--repetitions must be at least 1");
     }
@@ -729,6 +736,7 @@ fn run_trial(
     }
 
     Ok(Trial {
+        client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
         repetition,
@@ -765,6 +773,7 @@ fn failed_trial(
     notes: String,
 ) -> Trial {
     Trial {
+        client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
         repetition,
@@ -1086,6 +1095,70 @@ fn import_with(bin: &Path, dbdir: &Path, jsonl: &Path, verify: bool) -> bool {
         .unwrap_or(false)
 }
 
+fn export_values(bin: &Path, dbdir: &Path) -> Result<Vec<Value>> {
+    let conf = write_conf(bin, dbdir, 0);
+    let output = Command::new(bin)
+        .arg("--config")
+        .arg(conf)
+        .arg("export")
+        .current_dir(dbdir)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "storage verification export failed"
+    );
+    String::from_utf8(output.stdout)?
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).map_err(anyhow::Error::from))
+        .collect()
+}
+
+/// Independent final-state oracle for generated publication mixes. Ephemerals
+/// are live-only; replacements retain the latest address; kind-5 e tags delete
+/// only the same author's target. The generator uses only these lifecycle forms.
+fn retained_events(events: &[Value]) -> Vec<Value> {
+    let mut retained: Vec<Value> = Vec::new();
+    let mut ordered = events.to_vec();
+    ordered.sort_by_key(|e| e["created_at"].as_u64().unwrap());
+    for event in ordered {
+        let kind = event["kind"].as_u64().unwrap();
+        if (20_000..30_000).contains(&kind) {
+            continue;
+        }
+        if kind == 5 {
+            for tag in event["tags"].as_array().unwrap() {
+                if tag[0] == "e" {
+                    retained.retain(|old| old["id"] != tag[1] || old["pubkey"] != event["pubkey"]);
+                }
+            }
+        }
+        if kind == 0
+            || kind == 3
+            || (10_000..20_000).contains(&kind)
+            || (30_000..40_000).contains(&kind)
+        {
+            let address = |e: &Value| {
+                e["tags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t[0] == "d")
+                    .and_then(|t| t[1].as_str())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            retained.retain(|old| {
+                old["pubkey"] != event["pubkey"]
+                    || old["kind"] != event["kind"]
+                    || (kind >= 30_000 && address(old) != address(&event))
+            });
+        }
+        retained.push(event);
+    }
+    retained
+}
+
 fn export_count(bin: &Path, dbdir: &Path) -> u64 {
     let conf = write_conf(bin, dbdir, 0);
     let out = Command::new(bin)
@@ -1230,10 +1303,14 @@ async fn connect_retry(endpoint: &str) -> Result<ClientConnection> {
                 .map(ClientConnection::Unix)
                 .map_err(anyhow::Error::from)
         } else {
-            tokio_tungstenite::connect_async(endpoint)
-                .await
-                .map(|(stream, _)| ClientConnection::WebSocket(Box::new(stream)))
-                .map_err(anyhow::Error::from)
+            tokio_tungstenite::connect_async_with_config(
+                endpoint,
+                None,
+                CLIENT_NODELAY.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await
+            .map(|(stream, _)| ClientConnection::WebSocket(Box::new(stream)))
+            .map_err(anyhow::Error::from)
         };
         match connected {
             Ok(stream) => return Ok(stream),
@@ -1244,6 +1321,171 @@ async fn connect_retry(endpoint: &str) -> Result<ClientConnection> {
         }
     }
     anyhow::bail!("connect failed: {last_err:?}")
+}
+
+fn parse_receipt(reply: &Value, event: &Value) -> Result<bool> {
+    anyhow::ensure!(
+        reply.as_array().is_some_and(|a| a.len() == 4)
+            && reply[0] == "OK"
+            && reply[1] == event["id"]
+            && reply[3].is_string(),
+        "invalid or misrouted publication receipt: {reply}"
+    );
+    reply[2].as_bool().context("OK acceptance is not boolean")
+}
+
+async fn read_ack(socket: &mut ClientConnection, event: &Value) -> Result<bool> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let message = socket.next().await.context("closed before OK")??;
+            if !message.is_text() {
+                continue;
+            }
+            let reply: Value = serde_json::from_str(message.to_text()?)?;
+            if reply[0] == "AUTH" {
+                continue;
+            }
+            return parse_receipt(&reply, event);
+        }
+    })
+    .await
+    .context("publication acknowledgement deadline")?
+}
+
+/// Independent NIP-01 oracle for this harness's historical filter workloads.
+fn expected_history(events: &[Value], filter: &Value) -> Vec<Value> {
+    let mut matches: Vec<Value> = events
+        .iter()
+        .filter(|event| {
+            for (key, condition) in filter.as_object().unwrap() {
+                match key.as_str() {
+                    "limit" => {}
+                    "since" => {
+                        if event["created_at"].as_u64().unwrap() < condition.as_u64().unwrap() {
+                            return false;
+                        }
+                    }
+                    "until" => {
+                        if event["created_at"].as_u64().unwrap() > condition.as_u64().unwrap() {
+                            return false;
+                        }
+                    }
+                    "ids" | "authors" | "kinds" => {
+                        let field = match key.as_str() {
+                            "ids" => "id",
+                            "authors" => "pubkey",
+                            _ => "kind",
+                        };
+                        if !condition.as_array().unwrap().contains(&event[field]) {
+                            return false;
+                        }
+                    }
+                    tag if tag.starts_with('#') => {
+                        if !event["tags"].as_array().unwrap().iter().any(|t| {
+                            t[0].as_str() == Some(&tag[1..])
+                                && condition.as_array().unwrap().contains(&t[1])
+                        }) {
+                            return false;
+                        }
+                    }
+                    _ => panic!("unsupported benchmark oracle filter: {key}"),
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    matches.sort_by(|a, b| {
+        b["created_at"]
+            .as_u64()
+            .cmp(&a["created_at"].as_u64())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    matches.truncate(
+        filter["limit"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            .min(usize::MAX as u64) as usize,
+    );
+    matches
+}
+
+async fn read_history(socket: &mut ClientConnection, sid: &str) -> Result<Vec<Value>> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        loop {
+            let message = socket.next().await.context("closed before EOSE")??;
+            if !message.is_text() {
+                continue;
+            }
+            let reply: Value = serde_json::from_str(message.to_text()?)?;
+            if reply[0] == "AUTH" {
+                continue;
+            }
+            anyhow::ensure!(reply[1] == sid, "wrong subscription in reply: {reply}");
+            match reply[0].as_str() {
+                Some("EVENT") => {
+                    anyhow::ensure!(
+                        reply.as_array().is_some_and(|a| a.len() == 3),
+                        "invalid EVENT"
+                    );
+                    events.push(reply[2].clone());
+                }
+                Some("EOSE") => {
+                    anyhow::ensure!(
+                        reply.as_array().is_some_and(|a| a.len() == 2),
+                        "invalid EOSE"
+                    );
+                    return Ok(events);
+                }
+                _ => anyhow::bail!("unexpected query reply: {reply}"),
+            }
+        }
+    })
+    .await
+    .context("historical query deadline")?
+}
+
+fn same_event_set(actual: &[Value], expected: &[Value]) -> bool {
+    if actual.len() != expected.len() {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let expected: std::collections::HashMap<_, _> = expected
+        .iter()
+        .map(|e| (e["id"].as_str().unwrap(), e))
+        .collect();
+    actual.iter().all(|e| {
+        e["id"]
+            .as_str()
+            .is_some_and(|id| seen.insert(id) && expected.get(id).is_some_and(|want| *want == e))
+    })
+}
+
+// strfry retains ephemeral events temporarily; Wok defaults to live-only.
+// Verify the exact durable set for both and, for strfry, permit only an
+// unmodified, duplicate-free subset of the submitted ephemeral events.
+fn verify_stored_events(actual: &[Value], submitted: &[Value], live_only: bool) -> bool {
+    let ephemeral = |e: &Value| {
+        e["kind"]
+            .as_u64()
+            .is_some_and(|k| (20_000..30_000).contains(&k))
+    };
+    let (transient, durable): (Vec<_>, Vec<_>) = actual.iter().cloned().partition(ephemeral);
+    if live_only && !transient.is_empty() {
+        return false;
+    }
+    let allowed: std::collections::HashMap<_, _> = submitted
+        .iter()
+        .filter(|e| ephemeral(e))
+        .map(|e| (e["id"].as_str().unwrap(), e))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    transient.iter().all(|e| {
+        e["id"]
+            .as_str()
+            .is_some_and(|id| seen.insert(id) && allowed.get(id).is_some_and(|want| *want == e))
+    }) && same_event_set(&durable, &retained_events(submitted))
 }
 
 /// Publish `n` events concurrently over `conns` connections, with one event
@@ -1298,10 +1540,10 @@ fn ws_publish_target_trial(
             let ws = &mut sockets[i % conns];
             ws.send(Message::Text(json!(["EVENT", ev]).to_string().into()))
                 .await?;
-            let _ = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+            anyhow::ensure!(read_ack(ws, ev).await?, "warmup publication rejected");
         }
         let mut batches = vec![Vec::new(); conns];
-        for (i, event) in events.into_iter().skip(warmup_events).enumerate() {
+        for (i, event) in events.iter().skip(warmup_events).cloned().enumerate() {
             let connection = if workload.mix == EventMix::Lifecycle {
                 // Deletions must follow the referenced event from the same
                 // author. Actor-sticky batches retain that ordering while
@@ -1336,19 +1578,9 @@ fn ws_publish_target_trial(
                     socket
                         .send(Message::Text(json!(["EVENT", event]).to_string().into()))
                         .await?;
-                    let ok_reply = loop {
-                        match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
-                            Ok(Some(Ok(message))) => {
-                                let text = message.to_text().unwrap_or("").to_string();
-                                if text.contains("\"OK\"") {
-                                    break text;
-                                }
-                            }
-                            _ => break String::new(),
-                        }
-                    };
+                    let accepted_reply = read_ack(&mut socket, &event).await?;
                     latencies.push(event_started.elapsed().as_micros().max(1) as u64);
-                    if ok_reply.contains("true") {
+                    if accepted_reply {
                         accepted += 1;
                     } else {
                         rejected += 1;
@@ -1373,17 +1605,29 @@ fn ws_publish_target_trial(
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     let eps = accepted as f64 / elapsed.as_secs_f64();
-    let miss = u64::from(rejected > 0 || accepted != workload.count);
+    let stored_ok = if let Some(bin) = target.bin {
+        let actual = export_values(bin, target.dbdir)?;
+        verify_stored_events(
+            &actual,
+            &events,
+            bin.file_name().and_then(|n| n.to_str()) == Some("wok"),
+        )
+    } else {
+        true
+    };
+    let miss = u64::from(rejected > 0 || accepted != workload.count || !stored_ok);
     let notes = format!(
-        "{conns} concurrent connection(s): accepted {accepted}/{}, rejected {rejected}",
-        workload.count
+        "{conns} concurrent connection(s): accepted {accepted}/{}, rejected {rejected}; storage {}",
+        workload.count,
+        if target.bin.is_none() {
+            "not inspected (remote target)"
+        } else if stored_ok {
+            "verified"
+        } else {
+            "MISMATCH"
+        }
     );
-    Ok((
-        eps,
-        notes,
-        rejected == 0 && accepted == workload.count,
-        miss,
-    ))
+    Ok((eps, notes, miss == 0, miss))
 }
 
 /// Run `queries` REQs of mixed shapes against an exact corpus. Local targets
@@ -1450,12 +1694,8 @@ fn ws_query_trial(
                 json!(["REQ", subscription, f]).to_string().into(),
             ))
             .await?;
-            while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await
-            {
-                if m.to_text().unwrap_or("").contains("EOSE") {
-                    break;
-                }
-            }
+            let actual = read_history(ws, &subscription).await?;
+            anyhow::ensure!(same_event_set(&actual, &expected_history(&events,f)), "warmup returned wrong events");
             ws.send(Message::Text(
                 json!(["CLOSE", subscription]).to_string().into(),
             ))
@@ -1473,28 +1713,16 @@ fn ws_query_trial(
                 json!(["REQ", subscription, f]).to_string().into(),
             ))
             .await?;
-            let mut query_results = 0u64;
-            let mut saw_eose = false;
-            while let Ok(Some(Ok(m))) =
-                tokio::time::timeout(Duration::from_secs(10), ws.next()).await
-            {
-                let t = m.to_text().unwrap_or("");
-                if t.contains("\"EVENT\"") {
-                    results += 1;
-                    query_results += 1;
-                }
-                if t.contains("EOSE") {
-                    saw_eose = true;
-                    break;
-                }
-            }
+            let actual = read_history(ws,&subscription).await?;
+            results += actual.len() as u64;
+            let correct = same_event_set(&actual,&expected_history(&events,f));
             ws.send(Message::Text(
                 json!(["CLOSE", subscription]).to_string().into(),
             ))
             .await?;
             hist.record(t0.elapsed().as_micros().max(1) as u64)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if !saw_eose || query_results == 0 {
+            if !correct {
                 mismatches += 1;
             }
             done += 1;
@@ -1563,7 +1791,7 @@ fn deep_history_trial(
         let mut mismatches = 0u64;
         let mut latencies = Vec::new();
         let started_all = Instant::now();
-        for page in 0..pages {
+        for _page in 0..pages {
             let started = Instant::now();
             socket
                 .send(Message::Text(
@@ -1577,55 +1805,26 @@ fn deep_history_trial(
                     .into(),
                 ))
                 .await?;
-            let mut page_events = 0u64;
-            let mut oldest = until;
-            let mut saw_eose = false;
-            while let Ok(Some(Ok(message))) =
-                tokio::time::timeout(Duration::from_secs(60), socket.next()).await
-            {
-                let text = message.to_text().unwrap_or("");
-                let parsed: Value = match serde_json::from_str(text) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        mismatches += 1;
-                        continue;
-                    }
-                };
-                match parsed.get(0).and_then(Value::as_str) {
-                    Some("EVENT") => {
-                        page_events += 1;
-                        if let Some(event) = parsed.get(2) {
-                            let created = event
-                                .get("created_at")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(u64::MAX);
-                            oldest = oldest.min(created);
-                            if let Some(id) = event.get("id").and_then(Value::as_str) {
-                                if !seen.insert(id.to_string()) {
-                                    mismatches += 1;
-                                }
-                            } else {
-                                mismatches += 1;
-                            }
-                        }
-                    }
-                    Some("EOSE") => {
-                        saw_eose = true;
-                        break;
-                    }
-                    Some("CLOSED") => {
-                        mismatches += 1;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            latencies.push(started.elapsed().as_micros().max(1) as u64);
-            let expected_page = page_size.min(n.saturating_sub(page * page_size));
-            if !saw_eose || page_events != expected_page || oldest == u64::MAX {
+            let actual = read_history(&mut socket, "deep").await?;
+            let expected = expected_history(
+                &events,
+                &json!({"authors":[author],"kinds":[1],"until":until,"limit":page_size}),
+            );
+            let oldest = actual
+                .iter()
+                .filter_map(|e| e["created_at"].as_u64())
+                .min()
+                .unwrap_or(u64::MAX);
+            if !same_event_set(&actual, &expected) || oldest == u64::MAX {
                 mismatches += 1;
                 break;
             }
+            for event in &actual {
+                if !seen.insert(event["id"].as_str().unwrap().to_owned()) {
+                    mismatches += 1;
+                }
+            }
+            latencies.push(started.elapsed().as_micros().max(1) as u64);
             until = oldest.saturating_sub(1);
         }
         let elapsed = started_all.elapsed();
@@ -1674,6 +1873,11 @@ fn mixed_read_write_trial(
             anyhow::bail!("mixed-load import retained {imported}/{n} events");
         }
     }
+    let query_author = base_events
+        .iter()
+        .find(|e| e["kind"] == 1)
+        .context("mixed corpus has no kind 1")?["pubkey"]
+        .clone();
     let query_count = queries.max(1);
     let write_count = query_count.max(50).min(n);
     let new_events = generate_values(EventWorkload {
@@ -1702,7 +1906,7 @@ fn mixed_read_write_trial(
                 query_socket
                     .send(Message::Text(
                         json!(["REQ", subscription_id, {
-                            "kinds":[1],
+                            "kinds":[1], "authors":[query_author],
                             "limit":100,
                             "until":u64::MAX.saturating_sub(query_number)
                         }])
@@ -1710,44 +1914,16 @@ fn mixed_read_write_trial(
                         .into(),
                     ))
                     .await?;
-                let mut query_results = 0u64;
-                let mut saw_eose = false;
-                while let Ok(Some(Ok(message))) =
-                    tokio::time::timeout(Duration::from_secs(30), query_socket.next()).await
-                {
-                    let text = message.to_text().unwrap_or("");
-                    if let Ok(frame) = serde_json::from_str::<Value>(text) {
-                        let command = frame.get(0).and_then(Value::as_str);
-                        let frame_sub = frame.get(1).and_then(Value::as_str);
-                        if frame_sub != Some(subscription_id.as_str()) {
-                            continue;
-                        }
-                        match command {
-                            Some("EVENT") => query_results += 1,
-                            Some("CLOSED") => {
-                                mismatches += 1;
-                                break;
-                            }
-                            Some("EOSE") => {
-                                saw_eose = true;
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                let actual = read_history(&mut query_socket, &subscription_id).await?;
+                let expected = expected_history(&base_events, &json!({"kinds":[1], "authors":[query_author], "limit":100, "until":u64::MAX.saturating_sub(query_number)}));
+                let query_results = actual.len() as u64;
+                if !same_event_set(&actual, &expected) { mismatches += 1; }
                 query_socket
                     .send(Message::Text(
                         json!(["CLOSE", subscription_id]).to_string().into(),
                     ))
                     .await?;
                 latencies.push(started.elapsed().as_micros().max(1) as u64);
-                // Up to `limit` records come from the historical snapshot.
-                // Events committed after that snapshot are deliberately
-                // caught up before EOSE, so concurrent writes may add to it.
-                if !saw_eose || query_results == 0 || query_results > 100 + write_count {
-                    mismatches += 1;
-                }
                 results += query_results;
                 completed += 1;
             }
@@ -1761,16 +1937,8 @@ fn mixed_read_write_trial(
                 write_socket
                     .send(Message::Text(json!(["EVENT", event]).to_string().into()))
                     .await?;
-                while let Ok(Some(Ok(message))) =
-                    tokio::time::timeout(Duration::from_secs(30), write_socket.next()).await
-                {
-                    let text = message.to_text().unwrap_or("");
-                    if text.contains("\"OK\"") {
-                        if text.contains("true") {
-                            accepted += 1;
-                        }
-                        break;
-                    }
+                if read_ack(&mut write_socket, event).await? {
+                    accepted += 1;
                 }
             }
             let _ = write_socket.close(None).await;
@@ -1838,14 +2006,17 @@ fn ws_search_trial(
         let mut done = 0u64;
         let mut returned = 0u64;
         let mut mismatches = 0u64;
-        let measured_start = Instant::now();
+        let mut measured_start = Instant::now();
 
         for query_number in 0..total {
+            if query_number == warmup {
+                measured_start = Instant::now();
+            }
             let needle = format!("needle{}", (query_number * 17) % 1024);
-            let (search, required_term) = match query_number % 3 {
-                0 => (needle.clone(), needle.as_str()),
-                1 => (format!("common {needle}"), needle.as_str()),
-                _ => ("common".to_string(), "common"),
+            let search = match query_number % 3 {
+                0 => needle.clone(),
+                1 => format!("common {needle}"),
+                _ => "common".to_string(),
             };
             let socket_index = query_number as usize % sockets.len();
             let socket = &mut sockets[socket_index];
@@ -1857,28 +2028,20 @@ fn ws_search_trial(
                         .into(),
                 ))
                 .await?;
-            let mut query_results = 0u64;
-            let mut saw_eose = false;
-            while let Ok(Some(Ok(message))) =
-                tokio::time::timeout(Duration::from_secs(10), socket.next()).await
-            {
-                let text = message.to_text().unwrap_or("");
-                if text.contains("\"EVENT\"") {
-                    query_results += 1;
-                    if !text.contains(required_term) {
-                        mismatches += 1;
-                    }
-                }
-                if text.contains("\"CLOSED\"") {
-                    mismatches += 1;
-                    break;
-                }
-                if text.contains("EOSE") {
-                    saw_eose = true;
-                    break;
-                }
-            }
-            if !saw_eose || query_results > 20 {
+            let actual = read_history(socket, "nip50-bench").await?;
+            let candidates: Vec<Value> = events
+                .iter()
+                .filter(|event| {
+                    let content = event["content"].as_str().unwrap();
+                    search
+                        .split_whitespace()
+                        .all(|term| content.split_whitespace().any(|word| word == term))
+                })
+                .cloned()
+                .collect();
+            let expected = expected_history(&candidates, &json!({"kinds":[1], "limit":20}));
+            let query_results = actual.len() as u64;
+            if !same_event_set(&actual, &expected) {
                 mismatches += 1;
             }
             if query_number >= warmup {
@@ -1902,7 +2065,7 @@ fn ws_search_trial(
     Ok((qps, notes, mismatches == 0, mismatches))
 }
 
-/// 1 publisher, `subs` subscribers; measures per-event delivery latency and
+/// 1 publisher, `subs` subscribers; measures aggregate delivery/drain time and
 /// verifies every subscriber receives every event.
 fn live_fanout_trial(
     rt: &tokio::runtime::Runtime,
@@ -1929,15 +2092,8 @@ fn live_fanout_trial(
             .await?;
             subscribers.push(ws);
         }
-        // Wait for all EOSEs.
-        for ws in &mut subscribers {
-            while let Ok(Some(Ok(m))) =
-                tokio::time::timeout(Duration::from_secs(5), ws.next()).await
-            {
-                if m.to_text().unwrap_or("").contains("EOSE") {
-                    break;
-                }
-            }
+        for (i, ws) in subscribers.iter_mut().enumerate() {
+            read_history(ws, &format!("s{i}")).await?;
         }
         let mut publisher = connect_retry(&url).await?;
         let start = Instant::now();
@@ -1945,25 +2101,40 @@ fn live_fanout_trial(
             publisher
                 .send(Message::Text(json!(["EVENT", ev]).to_string().into()))
                 .await?;
-            // Read our own OK to serialize the flow.
-            let _ = tokio::time::timeout(Duration::from_secs(5), publisher.next()).await;
+            anyhow::ensure!(
+                read_ack(&mut publisher, ev).await?,
+                "fanout publication rejected"
+            );
         }
         // Collect deliveries.
         let mut delivered = 0u64;
         let t_collect = Instant::now();
-        'collect: for ws in &mut subscribers {
-            let mut got = 0u64;
-            while got < n {
-                match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
-                    Ok(Some(Ok(m))) => {
-                        if m.to_text().unwrap_or("").contains("\"EVENT\"") {
-                            got += 1;
-                            delivered += 1;
-                        }
+        for (i, ws) in subscribers.iter_mut().enumerate() {
+            let actual = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut actual = Vec::new();
+                while actual.len() < events.len() {
+                    let message = ws.next().await.context("closed during fanout")??;
+                    if !message.is_text() {
+                        continue;
                     }
-                    _ => break 'collect,
+                    let frame: Value = serde_json::from_str(message.to_text()?)?;
+                    anyhow::ensure!(
+                        frame.as_array().is_some_and(|a| a.len() == 3)
+                            && frame[0] == "EVENT"
+                            && frame[1] == format!("s{i}"),
+                        "invalid fanout frame: {frame}"
+                    );
+                    actual.push(frame[2].clone());
                 }
-            }
+                Ok::<_, anyhow::Error>(actual)
+            })
+            .await
+            .context("fanout deadline")??;
+            anyhow::ensure!(
+                same_event_set(&actual, &events),
+                "fanout set mismatch for subscriber {i}"
+            );
+            delivered += actual.len() as u64;
         }
         let collect_elapsed = t_collect.elapsed();
         hist.record(collect_elapsed.as_micros().max(1) as u64)
@@ -2014,6 +2185,15 @@ fn idle_connections_trial(
         let open_elapsed = started.elapsed();
         tokio::time::sleep(Duration::from_secs(hold_seconds)).await;
         for socket in &mut sockets {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!(["REQ","idle-check",{"limit":0}]).to_string().into(),
+                ))
+                .await?;
+            anyhow::ensure!(
+                read_history(socket, "idle-check").await?.is_empty(),
+                "unexpected idle history"
+            );
             let _ = socket.close(None).await;
         }
         Ok::<_, anyhow::Error>((sockets.len(), open_elapsed))
@@ -2045,18 +2225,14 @@ fn cold_start_trial(
             r#"["REQ","s",{"kinds":[1],"limit":1}]"#.into(),
         ))
         .await?;
-        while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
-            if m.to_text().unwrap_or("").contains("EOSE") {
-                break;
-            }
-        }
+        read_history(&mut ws, "s").await?;
         Ok::<_, anyhow::Error>(())
     });
     let ms = start.elapsed().as_micros().max(1) as u64 / 1000;
     let _ = child.kill();
     let _ = child.wait();
     out?;
-    hist.record(ms)?;
+    hist.record(ms.saturating_mul(1000))?;
     Ok(ms)
 }
 
@@ -2295,5 +2471,61 @@ mod tests {
         assert_eq!(response.to_text().unwrap(), r#"["EOSE","test"]"#);
         let _ = client.close(None).await;
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod correctness_tests {
+    use super::*;
+    #[test]
+    fn receipts_require_exact_id_and_boolean() {
+        let event = json!({"id":"alice"});
+        assert!(parse_receipt(&json!(["OK", "bob", true, ""]), &event).is_err());
+        assert!(parse_receipt(&json!(["OK", "alice", "true", ""]), &event).is_err());
+        assert!(!parse_receipt(
+            &json!(["OK", "alice", false, "true appears in reason"]),
+            &event
+        )
+        .unwrap());
+        assert!(parse_receipt(&json!(["OK", "alice", true, ""]), &event).unwrap());
+    }
+    #[test]
+    fn storage_oracle_respects_live_only_and_ttl_transport_policies() {
+        let event =
+            json!({"id":"e","kind":20001,"created_at":1,"pubkey":"p","tags":[],"content":"body"});
+        let events = vec![event.clone()];
+        assert!(verify_stored_events(&[], &events, true));
+        assert!(!verify_stored_events(&events, &events, true));
+        assert!(verify_stored_events(&events, &events, false));
+        assert!(!verify_stored_events(
+            &[event.clone(), event.clone()],
+            &events,
+            false
+        ));
+        let mut bad = event;
+        bad["content"] = json!("corrupt");
+        assert!(!verify_stored_events(&[bad], &events, false));
+    }
+    #[test]
+    fn oracle_rejects_duplicates_wrong_payload_and_wrong_set() {
+        let a = json!({"id":"a","pubkey":"p","kind":1,"created_at":1,"tags":[["t","rust"]],"content":"EOSE"});
+        let b = json!({"id":"b","pubkey":"p","kind":1,"created_at":2,"tags":[],"content":"EVENT"});
+        let corpus = vec![a.clone(), b.clone()];
+        assert_eq!(
+            expected_history(&corpus, &json!({"#t":["rust"],"limit":1})),
+            vec![a.clone()]
+        );
+        assert_eq!(
+            expected_history(&corpus, &json!({"limit":1})),
+            vec![b.clone()]
+        );
+        assert!(!same_event_set(&[a.clone(), a.clone()], &corpus));
+        let mut changed = a.clone();
+        changed["content"] = json!("altered");
+        assert!(!same_event_set(&[changed], &[a]));
+        assert!(same_event_set(
+            std::slice::from_ref(&b),
+            std::slice::from_ref(&b)
+        ));
     }
 }

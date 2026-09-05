@@ -55,9 +55,10 @@ Generate a signed corpus without running a relay, or reuse one verbatim:
 
 When `--corpus` and `--events` are both supplied, the harness rejects a count
 mismatch. Remote historical query scenarios assume the identical corpus has
-already been imported into the target relay; they still verify EOSE,
-non-empty expected results, publication acknowledgements, and delivery
-completeness.
+already been imported into the target relay; they verify parsed EOSE/subscription envelopes, exact expected historical
+sets, publication IDs/boolean acceptance, and complete per-subscriber deliveries.
+Local publication trials also export and compare the final stored state, including
+replacement, deletion and ephemeral semantics; remote storage is explicitly not inspected.
 
 Scenarios: `import` (signature-verifying bulk import), `export`,
 `negentropy_build`, `ws_publish_1conn`/`ws_publish_8conn` (per-publish OK
@@ -224,3 +225,26 @@ same-host transport and two-host network measurements.
 
 See [NIP-50 search](nip50-search.md) for the search workload, exact semantics,
 and 100k/1m-event scale results.
+
+## September 5 audit corrections
+
+The harness defaults to `--tcp-nodelay true` and records this setting in every
+result row. Use explicit true/false runs on the same Linux host before attributing
+older WebSocket request plateaus to the codec, LMDB, or Nagle. A Mac loopback
+A/B/B/A diagnostic did not demonstrate a consistent Nagle penalty.
+
+Historical reports used weaker correctness checks and a different client TCP
+setting. Their zero-mismatch counts do not validate receipt routing or exact
+query sets. Preserve them as historical measurements; do not compare their rates
+directly with new runs. The mixed read/write scenario now queries a fixed corpus
+author while distinct authors publish, allowing an exact historical oracle despite
+concurrent commits. The search oracle uses the generated equal-score vocabulary.
+Fanout timing measures aggregate publication/delivery/drain time, not individual
+subscriber delivery latency. Warm-up is excluded from measured search time.
+
+Storage verification accounts for the documented ephemeral difference: Wok's
+live-only default must export no ephemeral records. strfry's temporary storage
+may export a duplicate-free subset of submitted ephemeral events, each with its
+exact original payload. Both must export the exact expected persistent set.
+The first lifecycle audit control flagged this intentional difference; the oracle
+was then corrected and tested, rather than treating it as a strfry defect.

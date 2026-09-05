@@ -170,9 +170,13 @@ rotated relay order, and correctness gates before speed. Local process
 comparisons, two-host load campaigns, and same-host Unix/WebSocket comparisons
 are separate experiments so network RTT is not confused with transport cost.
 
-Latest controlled post-hardening campaign — Wok `fa9b061`, Linux x86-64,
+Historical controlled post-hardening campaign — Wok `fa9b061`, Linux x86-64,
 100,000 realistic events, and three order-rotated repetitions. All 96 two-host
-and same-host result rows passed their correctness gates:
+and same-host result rows passed that harness's correctness gates. The September 5
+audit found that those gates did not verify receipt ownership or exact query sets;
+the corrected harness now does. Client TCP_NODELAY is now explicit and enabled
+by default. These older figures are not measurements of the current fixes:
+
 
 | Median scenario | Wok WebSocket | Wok Unix | strfry WebSocket |
 |---|---:|---:|---:|

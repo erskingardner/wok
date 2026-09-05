@@ -11,7 +11,7 @@ fn strfry_bin() -> PathBuf {
     )
 }
 
-/// Differential tests are skipped when no C++ binary is available (e.g. CI).
+/// Local differential tests may skip without C++; the dedicated CI job requires it.
 fn strfry_available() -> bool {
     let available = strfry_bin().is_file();
     assert!(
@@ -36,7 +36,11 @@ fn make_cpp_db() -> (TempDir, PathBuf) {
     let db = tmp.path().join("db");
     std::fs::create_dir_all(&db).unwrap();
     let conf = tmp.path().join("strfry.conf");
-    std::fs::write(&conf, format!("db = \"{}\"\n", db.display())).unwrap();
+    std::fs::write(
+        &conf,
+        format!("db = \"{}\"\nrelay {{ nofiles = 0 }}\n", db.display()),
+    )
+    .unwrap();
     let out = Command::new(strfry_bin())
         .args(["--config", conf.to_str().unwrap(), "info"])
         .output()
@@ -72,7 +76,11 @@ fn cpp_refuses_wok_owned_database() {
     drop(env);
 
     let conf = tmp.path().join("strfry.conf");
-    std::fs::write(&conf, format!("db = \"{}\"\n", db.display())).unwrap();
+    std::fs::write(
+        &conf,
+        format!("db = \"{}\"\nrelay {{ nofiles = 0 }}\n", db.display()),
+    )
+    .unwrap();
     let out = Command::new(strfry_bin())
         .args(["--config", conf.to_str().unwrap(), "info"])
         .output()

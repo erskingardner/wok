@@ -10,7 +10,11 @@ use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 
 fn write_conf(dir: &Path) -> std::path::PathBuf {
     let conf = dir.join("strfry.conf");
-    std::fs::write(&conf, format!("db = \"{}\"\n", dir.display())).unwrap();
+    std::fs::write(
+        &conf,
+        format!("db = \"{}\"\nrelay {{ nofiles = 0 }}\n", dir.display()),
+    )
+    .unwrap();
     conf
 }
 

@@ -22,7 +22,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
     let db = dir.path().join("source");
     std::fs::create_dir(&db).unwrap();
     let config = dir.path().join("strfry.conf");
-    std::fs::write(&config, format!("db = {:?}\n", db)).unwrap();
+    std::fs::write(&config, format!("db = {:?}\nrelay {{ nofiles = 0 }}\n", db)).unwrap();
     let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
     let mut events = Vec::new();
     for i in 0..12 {

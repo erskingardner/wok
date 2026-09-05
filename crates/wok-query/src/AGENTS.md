@@ -8,6 +8,7 @@
 | `scheduler.rs` | Per-connection query scheduling |
 | `monitor.rs` | Live inverted index (`ActiveMonitors`) |
 | `subid.rs` | `SubId`, `Subscription`, `QueryError` |
+| `visibility.rs` | Shared recipient, moderation, vanish and expiration policy |
 | `hll.rs` | NIP-45 HyperLogLog registers and filter offset |
 
 Historical restricted-kind filtering uses PackedEvent from the Event table, not EventPayload bytes. That is intentional and documented in `docs/known-differences.md`.

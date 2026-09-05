@@ -63,8 +63,9 @@ impl QueryScheduler {
     pub fn remove_sub(&mut self, conn_id: u64, sub_id: &SubId) {
         if let Some(map) = self.conns.get_mut(&conn_id) {
             if let Some(idx) = map.remove(sub_id) {
-                if let Some(q) = self.queries.get_mut(idx).and_then(|s| s.as_mut()) {
-                    q.dead = true;
+                if self.queries[idx].take().is_some() {
+                    self.running.retain(|queued| *queued != idx);
+                    self.free.push(idx);
                 }
             }
             if map.is_empty() {
@@ -76,8 +77,9 @@ impl QueryScheduler {
     pub fn close_conn(&mut self, conn_id: u64) {
         if let Some(map) = self.conns.remove(&conn_id) {
             for idx in map.values() {
-                if let Some(q) = self.queries.get_mut(*idx).and_then(|s| s.as_mut()) {
-                    q.dead = true;
+                if self.queries[*idx].take().is_some() {
+                    self.running.retain(|queued| queued != idx);
+                    self.free.push(*idx);
                 }
             }
         }
@@ -87,10 +89,32 @@ impl QueryScheduler {
         &mut self,
         txn: &RoTxn<'_>,
         time_budget_us: u64,
+        on_event: F,
+        on_complete: C,
+    ) -> Result<(), wok_db::DbError>
+    where
+        F: FnMut(&Subscription, u64, Option<&[u8]>),
+        C: FnMut(&Subscription, u64, Option<String>, bool),
+    {
+        self.process_visible(
+            txn,
+            time_budget_us,
+            |_| Default::default(),
+            on_event,
+            on_complete,
+        )
+    }
+
+    pub fn process_visible<F, C, V>(
+        &mut self,
+        txn: &RoTxn<'_>,
+        time_budget_us: u64,
+        visibility: V,
         mut on_event: F,
         mut on_complete: C,
     ) -> Result<(), wok_db::DbError>
     where
+        V: Fn(&Subscription) -> crate::visibility::ReadVisibility,
         F: FnMut(&Subscription, u64, Option<&[u8]>),
         C: FnMut(&Subscription, u64, Option<String>, bool),
     {
@@ -111,6 +135,7 @@ impl QueryScheduler {
         let ensure_exists = self.ensure_exists;
         let result = {
             let q = self.queries[idx].as_mut().unwrap();
+            q.visibility = visibility(&q.sub);
             q.process(
                 txn,
                 |sub, lev| {

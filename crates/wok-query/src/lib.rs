@@ -15,3 +15,5 @@ pub use monitor::{ActiveMonitors, Recipient};
 pub use scan::{foreach_by_filter, DbQuery, DbScan};
 pub use scheduler::QueryScheduler;
 pub use subid::{QueryError, SubId, Subscription};
+
+pub mod visibility;

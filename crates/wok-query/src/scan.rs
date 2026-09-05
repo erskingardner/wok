@@ -1,13 +1,15 @@
 //! Resumable DBScan matching `src/DBQuery.h`.
 
+use crate::visibility::ReadVisibility;
+
 use crate::filter::NostrFilter;
 use crate::subid::Subscription;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
 use wok_db::{
-    is_event_moderated_ro, is_event_vanished_ro, search_bigram_posting_exists,
-    search_posting_count, search_posting_exists, search_postings, RoTxn, SearchQuery,
+    search_bigram_posting_exists, search_posting_count, search_posting_exists, search_postings,
+    RoTxn, SearchQuery,
 };
 use wok_event::PackedEventView;
 
@@ -247,6 +249,7 @@ impl SearchGroupScan {
         filters: &[NostrFilter],
         latest_event_id: u64,
         time_budget_us: u64,
+        visibility: &ReadVisibility,
         mut handle_event: H,
     ) -> Result<bool, wok_db::DbError>
     where
@@ -262,6 +265,7 @@ impl SearchGroupScan {
                     &filters[self.gather_index],
                     latest_event_id,
                     remaining_us,
+                    visibility,
                 )?;
                 if !complete {
                     return Ok(false);
@@ -350,6 +354,7 @@ impl SearchScan {
         filter: &NostrFilter,
         latest_event_id: u64,
         time_budget_us: u64,
+        visibility: &ReadVisibility,
     ) -> Result<bool, wok_db::DbError> {
         if self.gathering_complete {
             return Ok(true);
@@ -381,8 +386,18 @@ impl SearchScan {
             .map(|pair| (pair[0].clone(), pair[1].clone()))
             .collect();
         let base_score = self.base_score();
+        let starting_work = self.approx_work;
         let mut error = None;
         let completed = search_postings(txn, &primary, self.resume_lev_id, |lev_id| {
+            // Check before consuming this candidate so every miss path yields,
+            // and resume still points at the first unprocessed posting.
+            if self.approx_work > starting_work
+                && self.approx_work % 128 == 0
+                && (self.approx_work - starting_work >= 4096
+                    || start.elapsed().as_micros() as u64 > time_budget_us)
+            {
+                return false;
+            }
             self.resume_lev_id = lev_id.saturating_add(1);
             self.approx_work = self.approx_work.saturating_add(1);
             if lev_id > latest_event_id {
@@ -413,6 +428,14 @@ impl SearchScan {
             if !filter.does_match_without_search(packed) {
                 return true;
             }
+            match visibility.allows(txn, packed) {
+                Ok(true) => {}
+                Ok(false) => return true,
+                Err(err) => {
+                    error = Some(err);
+                    return false;
+                }
+            }
             let mut score = base_score;
             for (first, second) in &phrase_pairs {
                 match search_bigram_posting_exists(txn, first, second, lev_id) {
@@ -438,7 +461,7 @@ impl SearchScan {
                 }
             }
 
-            self.approx_work % 128 != 0 || start.elapsed().as_micros() as u64 <= time_budget_us
+            true
         })?;
         if let Some(error) = error {
             return Err(error);
@@ -457,12 +480,13 @@ impl SearchScan {
         filter: &NostrFilter,
         latest_event_id: u64,
         time_budget_us: u64,
+        visibility: &ReadVisibility,
         mut handle_event: H,
     ) -> Result<bool, wok_db::DbError>
     where
         H: FnMut(u64) -> bool,
     {
-        if !self.gather(txn, filter, latest_event_id, time_budget_us)? {
+        if !self.gather(txn, filter, latest_event_id, time_budget_us, visibility)? {
             return Ok(false);
         }
         while self.emit_index < self.ranked_hits.len() {
@@ -489,6 +513,54 @@ impl DbScan {
     }
 
     pub fn new(f: &NostrFilter, txn: &RoTxn<'_>) -> Self {
+        let default = Self::new_unplanned(f, txn);
+        // A tiny author history can otherwise lose to a ubiquitous tag. Bound
+        // this probe to 64 postings and eight seeks per alternative; avoid a
+        // statistics table or a database-sized planning pass. Uncertain/error
+        // cases retain the established plan.
+        if f.ids.is_none() && f.authors.is_some() && (!f.tags.is_empty() || !f.and_tags.is_empty())
+        {
+            let mut author_filter = f.clone();
+            author_filter.tags.clear();
+            author_filter.and_tags.clear();
+            author_filter.index_only_scans = false;
+            let author = Self::new_unplanned(&author_filter, txn);
+            if author.cursors.len() <= 8
+                && default.cursors.len() <= 8
+                && author.probe_size(txn).is_ok_and(|n| n < 16)
+                && default.probe_size(txn).is_ok_and(|n| n == 64)
+            {
+                // Retain full original-filter checks when scanning this seed.
+                return author;
+            }
+        }
+        default
+    }
+
+    fn probe_size(&self, txn: &RoTxn<'_>) -> Result<usize, wok_db::DbError> {
+        let mut count = 0;
+        for cursor in &self.cursors {
+            txn.foreach_full(
+                self.index_dbi,
+                &cursor.resume_key,
+                &cursor.resume_val.to_ne_bytes(),
+                true,
+                |key, _| {
+                    if !cursor.key_match(key) {
+                        return false;
+                    }
+                    count += 1;
+                    count < 64
+                },
+            )?;
+            if count >= 64 {
+                return Ok(64);
+            }
+        }
+        Ok(count)
+    }
+
+    fn new_unplanned(f: &NostrFilter, txn: &RoTxn<'_>) -> Self {
         let dbis = txn.env().dbis();
         let mut index_only = f.index_only_scans;
         let mut cursors = Vec::new();
@@ -709,6 +781,7 @@ impl DbScan {
 }
 
 pub struct DbQuery {
+    pub visibility: ReadVisibility,
     pub sub: Subscription,
     scanner: Option<QueryScanner>,
     search_group: Option<SearchGroupScan>,
@@ -752,6 +825,7 @@ impl DbQuery {
                 .all(|filter| filter.search.is_some());
         Self {
             sub,
+            visibility: ReadVisibility::default(),
             scanner: None,
             search_group: None,
             all_filters_search,
@@ -787,15 +861,13 @@ impl DbQuery {
     fn visible_event_pubkey(
         txn: &RoTxn<'_>,
         lev_id: u64,
+        visibility: &ReadVisibility,
     ) -> Result<Option<[u8; 32]>, wok_db::DbError> {
         let Some(raw) = txn.get_u64(txn.env().dbis().event, lev_id)? else {
             return Ok(None);
         };
         let packed = PackedEventView::new(raw)?;
-        if is_event_vanished_ro(txn, packed)? {
-            return Ok(None);
-        }
-        if is_event_moderated_ro(txn, packed)? {
+        if !visibility.allows(txn, packed)? {
             return Ok(None);
         }
         let mut pubkey = [0u8; 32];
@@ -828,8 +900,9 @@ impl DbQuery {
                 &self.sub.filter_group.filters,
                 self.sub.latest_event_id,
                 time_budget_us,
+                &self.visibility,
                 |lev_id| {
-                    let pubkey = match Self::visible_event_pubkey(txn, lev_id) {
+                    let pubkey = match Self::visible_event_pubkey(txn, lev_id, &self.visibility) {
                         Ok(Some(pubkey)) => pubkey,
                         Ok(None) => return,
                         Err(error) => {
@@ -898,7 +971,7 @@ impl DbQuery {
                 if lev_id > latest {
                     return false;
                 }
-                let pubkey = match Self::visible_event_pubkey(txn, lev_id) {
+                let pubkey = match Self::visible_event_pubkey(txn, lev_id, &self.visibility) {
                     Ok(Some(pubkey)) => pubkey,
                     Ok(None) => return false,
                     Err(error) => {
@@ -931,9 +1004,14 @@ impl DbQuery {
                         }
                     })?
                 }
-                QueryScanner::Search(scanner) => {
-                    scanner.scan(txn, &f, latest, time_budget_us, &mut handle)?
-                }
+                QueryScanner::Search(scanner) => scanner.scan(
+                    txn,
+                    &f,
+                    latest,
+                    time_budget_us,
+                    &self.visibility,
+                    &mut handle,
+                )?,
             };
             if let Some(error) = visibility_error {
                 return Err(error);

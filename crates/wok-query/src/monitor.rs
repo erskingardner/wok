@@ -27,6 +27,7 @@ pub struct ActiveMonitors {
     all_kinds: HashMap<u64, Vec<MonitorItem>>,
     all_others: Vec<MonitorItem>,
     max_subs: usize,
+    content_subscriptions: usize,
 }
 
 impl ActiveMonitors {
@@ -39,6 +40,7 @@ impl ActiveMonitors {
             all_kinds: HashMap::new(),
             all_others: Vec::new(),
             max_subs,
+            content_subscriptions: 0,
         }
     }
 
@@ -82,10 +84,7 @@ impl ActiveMonitors {
     }
 
     pub fn requires_content(&self) -> bool {
-        self.conns
-            .values()
-            .flat_map(HashMap::values)
-            .any(|subscription| subscription.filter_group.requires_content())
+        self.content_subscriptions != 0
     }
 
     pub fn process(
@@ -114,6 +113,34 @@ impl ActiveMonitors {
         search_terms: Option<&SearchTermSet>,
     ) -> Vec<Recipient> {
         let mut recipients = Vec::new();
+        let candidates = self.candidates(packed);
+
+        for (conn_id, sub_id) in candidates {
+            if let Some(sub) = self
+                .conns
+                .get_mut(&conn_id)
+                .and_then(|m| m.get_mut(&sub_id))
+            {
+                if let Some(lev_id) = lev_id {
+                    if sub.latest_event_id >= lev_id {
+                        continue;
+                    }
+                }
+                if sub
+                    .filter_group
+                    .does_match_with_search_terms(packed, search_terms)
+                {
+                    if let Some(lev_id) = lev_id {
+                        sub.latest_event_id = lev_id;
+                    }
+                    recipients.push(Recipient { conn_id, sub_id });
+                }
+            }
+        }
+        recipients
+    }
+
+    fn candidates(&self, packed: PackedEventView<'_>) -> Vec<(u64, SubId)> {
         let mut candidates: Vec<(u64, SubId)> = Vec::new();
         let mut id = [0u8; 32];
         id.copy_from_slice(packed.id());
@@ -152,32 +179,28 @@ impl ActiveMonitors {
         candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_str().cmp(b.1.as_str())));
         candidates.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
-        for (conn_id, sub_id) in candidates {
-            if let Some(sub) = self
-                .conns
-                .get_mut(&conn_id)
-                .and_then(|m| m.get_mut(&sub_id))
-            {
-                if let Some(lev_id) = lev_id {
-                    if sub.latest_event_id >= lev_id {
-                        continue;
-                    }
-                }
-                if sub
-                    .filter_group
-                    .does_match_with_search_terms(packed, search_terms)
-                {
-                    if let Some(lev_id) = lev_id {
-                        sub.latest_event_id = lev_id;
-                    }
-                    recipients.push(Recipient { conn_id, sub_id });
-                }
-            }
-        }
-        recipients
+        candidates
+    }
+
+    /// Content is needed only if an indexed candidate has a search filter
+    /// whose other predicates match this event.
+    pub fn event_requires_content(&self, packed: PackedEventView<'_>) -> bool {
+        self.requires_content()
+            && self.candidates(packed).iter().any(|(conn, sid)| {
+                self.conns
+                    .get(conn)
+                    .and_then(|subs| subs.get(sid))
+                    .is_some_and(|sub| {
+                        sub.filter_group
+                            .filters
+                            .iter()
+                            .any(|f| f.search.is_some() && f.does_match_without_search(packed))
+                    })
+            })
     }
 
     fn install(&mut self, sub: &Subscription) {
+        self.content_subscriptions += usize::from(sub.filter_group.requires_content());
         for f in &sub.filter_group.filters {
             let item = || MonitorItem {
                 conn_id: sub.conn_id,
@@ -212,6 +235,7 @@ impl ActiveMonitors {
     /// Remove exactly the lookup keys `install` added for this subscription,
     /// like C++ `uninstallLookups`: O(filter size), not O(index size).
     fn uninstall(&mut self, sub: &Subscription) {
+        self.content_subscriptions -= usize::from(sub.filter_group.requires_content());
         let pred = |it: &MonitorItem| it.conn_id == sub.conn_id && it.sub_id == sub.sub_id;
         for f in &sub.filter_group.filters {
             if let Some(ids) = &f.ids {

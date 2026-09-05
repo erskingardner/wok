@@ -1,0 +1,50 @@
+name: reliability soak
+
+on:
+  push:
+    branches: [master]
+    paths: ['crates/**', 'scripts/reliability-soak.py', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
+  pull_request:
+    paths: ['crates/**', 'scripts/reliability-soak.py', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
+  schedule:
+    - cron: '23 2 * * 0'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Mixed workload duration (10-3600 seconds); weekly runs use 3600'
+        default: '3600'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reliability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOAK_DURATION: ${{ github.event_name == 'schedule' && '3600' || inputs.seconds || '180' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build production relay and load driver
+        run: |
+          cargo build --release --locked -p wok-cli --bin wok
+          cargo build --release --locked -p wok-compat --example reliability_soak
+      - name: Verify mixed workload, bounded memory and restart
+        run: |
+          python3 scripts/reliability-soak.py --wok target/release/wok \
+            --driver target/release/examples/reliability_soak \
+            --seconds "$SOAK_DURATION" --seed 4242 --out "$RUNNER_TEMP/wok-soak"
+      - name: Preserve workload, results and failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-soak-${{ github.sha }}
+          path: ${{ runner.temp }}/wok-soak
+          if-no-files-found: error
+          retention-days: 30

@@ -68,14 +68,14 @@ fuzz_target!(|data: &[u8]| {
     let _ = wok_event::PackedEventView::new(data);
 
     for role in [Role::Server, Role::Client] {
-        let mut parser = WsParser::with_role(131_072, Some(InflateCtx::new(false)), role);
+        let mut parser = WsParser::with_role(2_097_152, Some(InflateCtx::new(false)), role);
         for chunk in data.chunks(257) {
             if parser.feed(chunk).is_err() {
                 break;
             }
         }
     }
-    let _ = InflateCtx::new(false).decompress(data, 131_072);
+    let _ = InflateCtx::new(false).decompress(data, 2_097_152);
 
     // fbs metadata decoders: Meta, CompressionDictionary, NegentropyFilter.
     let _ = wok_db::fbs::decode_meta(data);

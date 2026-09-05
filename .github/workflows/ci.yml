@@ -24,9 +24,37 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --workspace --exclude wok-bench --locked
-      - name: conformance smoke
-        run: cargo test -p wok-compat --test nip_conformance --test e2e_transports --locked
+        run: cargo test --workspace --locked
+
+  migration:
+    name: pinned strfry migration compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      WOK_REQUIRE_STRFRY: '1'
+      STRFRY_BIN: ${{ github.workspace }}/.reference/strfry/strfry
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: hoytech/strfry
+          ref: 9acdaeb1f63919184ece5f2dd67af21f1ed62f1b
+          path: .reference/strfry
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build pinned import reference
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libssl-dev zlib1g-dev liblmdb-dev libflatbuffers-dev libsecp256k1-dev libzstd-dev
+          make -C .reference/strfry setup-golpe
+          make -C .reference/strfry -j2
+          test -x "$STRFRY_BIN"
+      - name: Verify migration and event identity against C++
+        run: |
+          cargo test -p wok-db --test cpp_roundtrip --locked -- --nocapture
+          cargo test -p wok-compat --test cpp_export --test cpp_negentropy --locked -- --nocapture
+          cargo test -p wok-cli migrate::tests --locked
+          cargo test -p wok-cli --test migration_cpp --locked
 
   msrv:
     name: rust 1.85 minimum version

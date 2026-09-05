@@ -1,13 +1,20 @@
 name: fuzz
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/**'
+      - 'fuzz/**'
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/fuzz.yml
   pull_request:
     paths:
+      - 'crates/**'
       - 'fuzz/**'
-      - 'crates/wok-event/**'
-      - 'crates/wok-negentropy/**'
-      - 'crates/wok-relay/src/protocol.rs'
-      - 'crates/wok-ws/src/frame.rs'
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/fuzz.yml
   schedule:
     - cron: '43 3 * * 3'
@@ -24,6 +31,7 @@ jobs:
   ingress:
     name: ingress (address)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -32,13 +40,21 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      - name: Restore accumulated corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/ingress
+          key: ingress-corpus-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: ingress-corpus-${{ runner.os }}-
+      - name: Seed protocol and size boundaries
+        run: python3 fuzz/seed-corpus.py
       - name: Run bounded ingress campaign
         run: |
           nightly_cargo="$(rustup which --toolchain nightly cargo)"
           nightly_rustc="$(rustup which --toolchain nightly rustc)"
           CARGO="$nightly_cargo" RUSTC="$nightly_rustc" \
             cargo fuzz run ingress --target x86_64-unknown-linux-gnu \
-              --sanitizer address -- -runs=10000 -max_len=131072
+              --sanitizer address -- -runs=10000 -max_len=2097152 -timeout=10 -rss_limit_mb=2048
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@v4

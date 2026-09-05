@@ -33,9 +33,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace --exclude wok-bench --locked
-      - name: Conformance smoke
-        run: cargo test -p wok-compat --test nip_conformance --test e2e_transports --locked
+        run: cargo test --workspace --locked
 
   build:
     name: Build ${{ matrix.target }}

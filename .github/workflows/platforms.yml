@@ -36,6 +36,8 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli
+      - name: Native storage and transport behavior
+        run: cargo test --locked --target '${{ matrix.target }}' -p wok-db -p wok-unix -p wok-ws -p wok-compat -p wok-cli
       - name: Smoke-test version metadata
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')

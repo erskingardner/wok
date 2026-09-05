@@ -17,7 +17,13 @@ pub fn strfry_bin() -> PathBuf {
 }
 
 pub fn strfry_available() -> bool {
-    strfry_bin().is_file()
+    let available = strfry_bin().is_file();
+    assert!(
+        available || std::env::var_os("WOK_REQUIRE_STRFRY").is_none(),
+        "required strfry reference is missing at {}",
+        strfry_bin().display()
+    );
+    available
 }
 
 pub fn sign_event(ev: Value) -> Value {

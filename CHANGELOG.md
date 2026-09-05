@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Benchmark idle clients answer WebSocket pings throughout connection setup and
+  hold periods, avoiding false disconnect failures in long capacity tests.
+
 - SIGTERM now follows the graceful relay shutdown path, including Unix socket
   cleanup. A CLI process test verifies acknowledged data survives shutdown.
 - strfry migration creates Wok extension tables in the private staging copy and

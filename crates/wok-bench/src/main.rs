@@ -2155,6 +2155,49 @@ fn live_fanout_trial(
     Ok((eps, notes, miss == 0, miss))
 }
 
+// Every WebSocket is polled from the moment it opens, including while other
+// clients connect. Application-idle clients still owe transport-level pongs.
+async fn idle_client(
+    mut socket: ClientConnection,
+    mut finish: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    use tokio_tungstenite::tungstenite::Message;
+    if matches!(&socket, ClientConnection::WebSocket(_)) {
+        loop {
+            tokio::select! {
+                _ = &mut finish => break,
+                message = socket.next() => {
+                    match message.context("idle connection closed")?? {
+                        Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+                        Message::Pong(_) => {},
+                        Message::Text(text) => {
+                            let message: Value = serde_json::from_str(&text)?;
+                            anyhow::ensure!(message[0] == "AUTH" || message[0] == "NOTICE",
+                                "unexpected application message on idle connection: {message}");
+                        }
+                        other => anyhow::bail!("unexpected idle frame: {other:?}"),
+                    }
+                }
+            }
+        }
+    } else {
+        // Unix has no transport heartbeat. Avoid cancelling a partial framed
+        // read just to begin the final usability probe.
+        let _ = finish.await;
+    }
+    socket
+        .send(Message::Text(
+            json!(["REQ", "idle-check", {"limit":0}]).to_string().into(),
+        ))
+        .await?;
+    anyhow::ensure!(
+        read_history(&mut socket, "idle-check").await?.is_empty(),
+        "unexpected idle history"
+    );
+    let _ = socket.close(None).await;
+    Ok(())
+}
+
 /// Open and hold a large number of quiet WebSocket connections. Connection
 /// setup latency is recorded individually and all sockets must remain usable
 /// until the hold period finishes.
@@ -2170,33 +2213,34 @@ fn idle_connections_trial(
     let (url, mut child) = start_target(bin, target_url, dbdir)?;
     let out = rt.block_on(async {
         let started = Instant::now();
-        let mut sockets = Vec::with_capacity(connections);
+        let mut clients = tokio::task::JoinSet::new();
+        let mut finish = Vec::with_capacity(connections);
         for _ in 0..connections {
             let connection_started = Instant::now();
             match connect_retry(&url).await {
                 Ok(socket) => {
                     hist.record(connection_started.elapsed().as_micros().max(1) as u64)
                         .map_err(|error| anyhow::anyhow!("{error}"))?;
-                    sockets.push(socket);
+                    let (done, receiver) = tokio::sync::oneshot::channel();
+                    finish.push(done);
+                    clients.spawn(idle_client(socket, receiver));
                 }
                 Err(_) => break,
             }
         }
         let open_elapsed = started.elapsed();
         tokio::time::sleep(Duration::from_secs(hold_seconds)).await;
-        for socket in &mut sockets {
-            socket
-                .send(tokio_tungstenite::tungstenite::Message::Text(
-                    json!(["REQ","idle-check",{"limit":0}]).to_string().into(),
-                ))
-                .await?;
-            anyhow::ensure!(
-                read_history(socket, "idle-check").await?.is_empty(),
-                "unexpected idle history"
-            );
-            let _ = socket.close(None).await;
+        let opened = finish.len();
+        // Probe one client at a time, preserving the workload instead of
+        // turning the end of the hold into a synchronized REQ burst.
+        for done in finish {
+            let _ = done.send(());
+            clients
+                .join_next()
+                .await
+                .context("missing idle client")???;
         }
-        Ok::<_, anyhow::Error>((sockets.len(), open_elapsed))
+        Ok::<_, anyhow::Error>((opened, open_elapsed))
     });
     stop_target(&mut child);
     let (opened, elapsed) = out?;
@@ -2324,6 +2368,47 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_clients_answer_relay_pings_during_hold() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                use tokio_tungstenite::tungstenite::Message;
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut peer = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for _ in 0..3 {
+                    peer.send(Message::Ping(vec![4, 2].into())).await.unwrap();
+                    let reply = tokio::time::timeout(Duration::from_millis(300), peer.next()).await;
+                    anyhow::ensure!(matches!(reply, Ok(Some(Ok(Message::Pong(ref p)))) if p.as_ref() == [4, 2]),
+                        "idle client failed to answer relay ping: {reply:?}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let req = tokio::time::timeout(Duration::from_secs(3), peer.next()).await?.context("client closed before final probe")??;
+                anyhow::ensure!(req.is_text(), "expected final usability probe");
+                peer.send(Message::Text(json!(["EOSE", "idle-check"]).to_string().into())).await?;
+                Ok::<_, anyhow::Error>(())
+            })
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut hist = Histogram::new(3).unwrap();
+        let temp = TempDir::new().unwrap();
+        let result = idle_connections_trial(
+            &rt,
+            None,
+            Some(&format!("ws://{addr}")),
+            temp.path(),
+            1,
+            1,
+            &mut hist,
+        );
+        let peer_result = server.join().unwrap();
+        assert!(peer_result.is_ok(), "{peer_result:?}");
+        assert!(result.is_ok(), "{result:?}");
+    }
 
     #[test]
     fn corpus_is_byte_reproducible() {

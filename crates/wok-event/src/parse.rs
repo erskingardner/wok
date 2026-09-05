@@ -48,7 +48,7 @@ pub fn from_hex_exact(s: &str) -> Result<Vec<u8>, EventError> {
 
 /// Decode an even-length hex string without accepting a `0x` prefix.
 pub fn from_hex_strict(s: &str) -> Result<Vec<u8>, EventError> {
-    if s.starts_with("0x") || !s.len().is_multiple_of(2) {
+    if s.starts_with("0x") || s.len() % 2 != 0 {
         return Err(EventError::msg(
             "hex must have an even length and no prefix",
         ));
@@ -82,7 +82,7 @@ pub(crate) fn from_lower_hex_array<const N: usize>(s: &str) -> Result<[u8; N], E
 
 fn from_hex_impl(s: &str, allow_uneven: bool) -> Result<Vec<u8>, EventError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if !s.len().is_multiple_of(2) {
+    if s.len() % 2 != 0 {
         if !allow_uneven {
             return Err(EventError::msg("uneven size input to from_hex"));
         }

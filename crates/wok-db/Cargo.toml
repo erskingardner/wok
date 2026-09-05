@@ -2,6 +2,7 @@
 name = "wok-db"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Wok LMDB storage and verified strfry v3 migration"
 

@@ -875,7 +875,7 @@ impl EventFactory {
         let pubkey = hex::encode(key.x_only_public_key().0.serialize());
         let mut tags = vec![json!(["t", format!("tag-{}", i % 64)])];
         match kind {
-            1 if i.is_multiple_of(5) => {
+            1 if i % 5 == 0 => {
                 if let Some((event_id, parent_pubkey, _)) = &self.last_note {
                     tags.push(json!(["e", event_id, "", "reply"]));
                     tags.push(json!(["p", parent_pubkey]));

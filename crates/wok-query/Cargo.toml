@@ -2,6 +2,7 @@
 name = "wok-query"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Nostr filters, index selection, and resumable scans"
 

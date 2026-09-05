@@ -35,4 +35,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.85.0
       - name: Check workspace at declared MSRV
-        run: cargo check --workspace --all-targets --locked
+        run: |
+          rustup run 1.85.0 rustc --version
+          rustup run 1.85.0 cargo --version
+          rustup run 1.85.0 cargo check --workspace --all-targets --locked

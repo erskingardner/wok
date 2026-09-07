@@ -1,5 +1,10 @@
 # Publication slowdown investigation — September 7, 2026
 
+Follow-up: the [strfry comparison](benchmark-strfry-soak-comparison-2026-09-07.md)
+reproduced database-growth slowdown in the latest release and development branch,
+including controls that align metadata durability with Wok. It also found an
+upstream environment-flag collision that matters for interpreting raw throughput.
+
 The 24-hour soak's publication slowdown reproduces with a newly started relay
 and a copy of its completed database. The dominant measured cost is committing
 the larger database's writes, with approximately 16 events per transaction in

@@ -12,7 +12,8 @@ Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default conf
 - `src/doctor.rs` — `wok doctor`
 - `src/reindex.rs` — `wok reindex`
 - `src/router.rs` — `wok router`
-- `src/mesh.rs` — shared outbound WebSocket client helpers for stream/sync/upload/download
+- `src/sync.rs` — NIP-77 transfer and comparison outcomes
+- `src/mesh.rs` — shared outbound WebSocket client helpers for router/sync/upload/download
 
 ## Command groups
 
@@ -23,6 +24,6 @@ Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default conf
 | Diagnostics | `doctor`, `integrity`, `info` |
 | Maintenance | `reindex`, `compact`, `dict`, `negentropy` |
 | Data | `import`, `export`, `scan`, `event`, `delete`, `monitor` |
-| Mesh | `router`, `stream`, `sync`, `upload`, `download` |
+| Mesh | `router`, `sync`, `upload`, `download` |
 
 `migrate` never mutates the source strfry DB/config. `reindex` requires `--confirm-relay-stopped`. Broken-pipe on stdout is a clean exit (not abort under `panic = "abort"`).

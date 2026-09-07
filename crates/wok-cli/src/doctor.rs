@@ -363,16 +363,16 @@ fn check_payload_identity(txn: &wok_db::RoTxn<'_>, max_size: usize, report: &mut
 
 fn check_negentropy(txn: &wok_db::RoTxn<'_>, report: &mut DoctorReport) {
     let mut tree_ids = Vec::new();
-    if let Err(error) = foreach_negentropy_filter(txn, |id, _| {
-        tree_ids.push(id);
+    if let Err(error) = foreach_negentropy_filter(txn, |id, filter| {
+        tree_ids.push((id, filter.to_string()));
         true
     }) {
         report.add("negentropy", CheckStatus::Fail, error.to_string());
         return;
     }
     let mut total = 0u64;
-    for id in &tree_ids {
-        let result = wok_negentropy::open_ro(txn, *id).and_then(|mut tree| tree.size_mut());
+    for (id, filter) in &tree_ids {
+        let result = wok_negentropy::verify_tree(txn, *id, filter);
         match result {
             Ok(size) => total = total.saturating_add(size),
             Err(error) => {
@@ -388,7 +388,10 @@ fn check_negentropy(txn: &wok_db::RoTxn<'_>, report: &mut DoctorReport) {
     report.add(
         "negentropy",
         CheckStatus::Pass,
-        format!("{} trees, {total} items", tree_ids.len()),
+        format!(
+            "{} trees, {total} items verified against primary events",
+            tree_ids.len()
+        ),
     );
 }
 

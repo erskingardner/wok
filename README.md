@@ -40,7 +40,7 @@ quirk. It also provides an additional Unix-domain socket transport.
 - **Unix `SOCK_STREAM` transport** (wok extension): 4-byte big-endian
   length-prefixed JSON, same dispatcher as WebSocket.
 - **Mesh tooling**: `router` (multi-connection replication with hot reconfig),
-  `stream`, `sync` (NIP-77 two-phase transfer), `upload`, `download`.
+  `sync` (NIP-77 two-phase transfer), `upload`, `download`.
 - **Operational continuity**: worker pools (`numThreads.*`), single LMDB writer,
   bounded queues with backpressure, slow-client termination
   (`max_pending_outbound_bytes`), config hot-reload, graceful shutdown
@@ -111,7 +111,7 @@ mode = 0o600
 
 ## CLI
 
-All C++ subcommands exist:
+Available operator commands:
 
 | Command | Notes |
 |---|---|
@@ -124,7 +124,7 @@ All C++ subcommands exist:
 | `dict stats/train/compress/decompress` | zstd dictionary management (ZDICT training included) |
 | `negentropy list/add/build` | persistent trees; build uses bounded, restart-safe batches |
 | `router <file>` | mesh replication with hot reconfig |
-| `stream`, `sync`, `upload`, `download` | mesh transfers; stream reconnects with bounded backoff |
+| `sync`, `upload`, `download` | mesh transfers; sync reports transfer outcomes and set differences |
 
 Before cutover or after an unclean shutdown, run `wok --config wok.toml
 doctor`. It validates every event-derived index semantically, decompresses
@@ -244,7 +244,7 @@ Summary:
   carried forward.
 
 **Remaining gaps**
-- Mesh *client* links (router/stream/sync) don't offer permessage-deflate
+- Mesh *client* links (router/sync) don't offer permessage-deflate
   (tungstenite client limitation; bandwidth only). The wok *server* speaks
   deflate like C++.
 

@@ -915,12 +915,15 @@ async fn handle_conn_text(
                 }
             }
         }
-        "NOTICE" => {
+        "NOTICE" | "CLOSED" => {
             let _ = tx
                 .send(ManagerMsg::Log {
                     group: group.to_string(),
                     url: url.to_string(),
-                    text: truncate_chars(&format!("NOTICE: {v}"), MAX_LOG_CHARS),
+                    text: truncate_chars(
+                        &format!("{}: {v}", v[0].as_str().unwrap_or("peer")),
+                        MAX_LOG_CHARS,
+                    ),
                 })
                 .await;
         }
@@ -1010,6 +1013,25 @@ async fn router_db_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_subscription_is_reported_to_the_operator() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_EVENT_BYTES));
+        handle_conn_text(
+            &tx,
+            "peer",
+            "wss://peer.example",
+            r#"["CLOSED","X","auth-required: authenticate"]"#,
+            65536,
+            &budget,
+        )
+        .await;
+        let Some(ManagerMsg::Log { text, .. }) = rx.try_recv().ok() else {
+            panic!("CLOSED was silently ignored")
+        };
+        assert!(text.contains("CLOSED") && text.contains("auth-required"));
+    }
 
     #[test]
     fn connection_timeout_above_ceiling_is_rejected() {

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- CLI import and delete update negentropy trees atomically with primary records.
+  Doctor verifies exact tree membership against primary events and reports existing
+  drift; sync verifies matching local trees before using them. Import exits nonzero
+  when any records are rejected. Router reports CLOSED subscription messages.
+- Missing-ID comparison terminates when sets differ. Sync now exposes JSON outcomes
+  and a comparison-only `--check`, accounts for event rejections and missing downloads,
+  matches upload ACKs by ID, and exits nonzero on incomplete transfers. The default
+  protocol-progress timeout is 60 seconds. CLI tracing goes to stderr so it cannot
+  corrupt JSON summaries or exported event streams.
+
+### Removed
+
+- Removed the deprecated `wok stream` command. Use `wok router` for persistent
+  streaming and periodic `wok sync` for reconciliation.
+
 ## [0.6.0] - 2026-09-07
 
 ### Changed

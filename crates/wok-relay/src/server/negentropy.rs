@@ -238,6 +238,21 @@ pub(super) fn run_negentropy(
                             }
                         });
                     }
+                    // The match-all tree must contain exactly one item per primary
+                    // event. Detect old CLI import/delete drift without scanning the
+                    // database on the network worker. Filtered trees get an exact
+                    // membership check through the operator's `wok doctor`.
+                    if let Some(id) = tree_id.filter(|_| filter_str == "{}") {
+                        let complete = (|| -> Result<bool, wok_negentropy::NegError> {
+                            let mut tree = wok_negentropy::open_ro(&txn, id)?;
+                            Ok(tree.size_mut()? == txn.entries(txn.env().dbis().event)? as u64)
+                        })();
+                        if !matches!(complete, Ok(true)) {
+                            fail(&conns, &metrics, conn, &sid,
+                                "error: inconsistent negentropy tree; operator must run wok doctor and reindex");
+                            continue;
+                        }
+                    }
                     // Reserve the construction peak before scheduling the query.
                     // Dedup tables, ranking heaps, vector growth and temporary hits
                     // are covered, then release excess after the immutable set seals.

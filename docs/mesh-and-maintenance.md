@@ -17,7 +17,7 @@ for lazy-initialization limits and process-kill test coverage.
 
 ## Outbound connections
 
-`wok sync`, `wok stream`, `wok router`, `wok upload`, and `wok download`
+`wok sync`, `wok router`, `wok upload`, and `wok download`
 dial whatever `ws(s)://` URL the operator (or a router config file) supplies.
 There is no filtering against loopback, link-local (e.g. `169.254.169.254`),
 or private ranges — these commands will happily dial internal addresses, and
@@ -31,26 +31,83 @@ Use `wok router` for new long-running replication setups. It supports multiple
 named streams, filters, directions, URLs, hot configuration reload, and
 per-connection reconnects.
 
-The compatibility-oriented `wok stream` command is deprecated but remains
-safe to supervise. After a failed connection or remote close it schedules a
-Tokio timer instead of blocking the runtime, reconnects after one second by
-default, and doubles failures up to a 30-second ceiling. Both values are
-configurable:
+The legacy `wok stream` command has been removed. Use a router config instead:
 
-```console
-wok stream wss://relay.example --dir both \
-  --reconnect-delay 1 --max-reconnect-delay 30
+```text
+connectionTimeout = 20
+streams {
+    peer {
+        dir = "down"
+        filter = { "kinds": [0, 3, 5, 445, 1059, 10000, 10002, 10050, 10051, 30443] }
+        urls = ["wss://relay.example"]
+    }
+}
 ```
 
-Upload scans are capped at 1,000 primary rows per runtime tick. The local
-cursor advances only after each WebSocket send completes, so the first unsent
-event is retried after reconnect. Download batches are verified and committed
-before retrying.
+```console
+wok --config /etc/wok.toml router /etc/wok-router.conf
+```
 
-Streaming subscriptions cover live traffic; WebSocket delivery is not a
-durable acknowledgment protocol. Run `wok sync` periodically (or after a known
-outage) for exact NIP-77 reconciliation rather than assuming a reconnect alone
-fills a remote-side gap.
+Streaming subscriptions cover live traffic (`limit: 0`); reconnects do not repair
+historical gaps. Supervise router and run non-overlapping `wok sync` jobs
+periodically and after outages. Start router before the first catch-up.
+
+## Reconciliation results
+
+```console
+wok --config /etc/wok.toml sync wss://relay.example --dir down --timeout 60 --json
+wok --config /etc/wok.toml sync wss://relay.example --check --json
+wok --config /etc/wok.toml sync wss://relay.example --print-missing
+```
+
+`--print-missing` implies comparison only and prints `have,<id>` / `need,<id>`
+without transferring records. `--check` also compares only, exiting nonzero when
+either set has differences. `--dir none --json` reports differences with a zero
+exit status when the comparison itself succeeds. All comparisons use the supplied
+filter and the remote connection's readable view, not the remote operator's full DB.
+
+`--json` emits one summary on stdout, including transfer/protocol failures; tracing
+logs go to stderr. Fields are `ok`, `reconciled`, `have`, `need`, `downloaded`,
+`written`, `duplicates`, `rejected`, `unavailable`, `uploaded`, `upload_rejected`,
+and `error`. `have` and `need` count unique differences discovered during the run,
+not the remaining differences after transfer. `uploaded` counts positive relay
+ACKs, not recipient delivery. CLI parsing/config-loading errors may occur before a
+summary can be produced. JSON and missing-ID output are mutually exclusive.
+
+A transfer exits nonzero on rejected downloads, rejected uploads, requested IDs
+missing at EOSE, closed subscriptions, protocol errors, disconnects or timeout.
+Only ACKs matching outstanding upload IDs count. Unsolicited events/EOSE/ACKs
+cannot complete a batch. Duplicate records already stored are successful outcomes.
+The client caps combined unique differences at five million; partition larger
+comparisons with explicit filters or time windows. The default timeout is 60
+seconds without protocol progress; ping traffic does not
+extend it. Use an outer service timeout to bound connection setup and total run time.
+
+A successful transfer does not establish a lasting equality of two live databases:
+replacement, expiration, deletion and concurrent arrivals may change either set.
+Run a subsequent comparison with an explicit observation window, and investigate
+residual differences. Timestamp admission limits apply to sync downloads; use the
+verified database migration for an exact historical copy. Router's `pluginDown`
+is separate from public write policy; sync is an operator DB import and does not
+execute that plugin.
+
+## Checking existing tree drift
+
+CLI import and delete now maintain negentropy trees in the same transaction as
+primary events. Older versions could leave trees missing imported IDs or retaining
+deleted IDs. `wok doctor --json` now compares every registered tree's count and exact
+membership/timestamps with primary events, including filtered trees. This uses one
+read snapshot and bounded auxiliary memory, with work proportional to the database
+and tree sizes. It can be I/O intensive on large databases.
+
+Sync verifies a matching local tree before using it. The remote relay's trees must
+also pass operator-side `doctor`. The Wok relay rejects a match-all tree whose count
+differs from primary storage; filtered trees require the full operator check.
+An empty or partial remote tree is not evidence
+of an empty remote database. After a failed check, stop the relay and other writers,
+run `wok reindex --confirm-relay-stopped`, then rerun doctor. Reindex retains a backup
+and verifies primary event fingerprints. A tree added with `negentropy add` must be
+built and verified before relying on it for reconciliation.
 
 ## Negentropy tree builds
 

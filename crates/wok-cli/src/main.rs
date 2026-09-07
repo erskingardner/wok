@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use wok_db::{
     check_integrity, delete_events, event_json_owned, write_events_with_policy, Decompressor, Env,
-    EnvOptions, EventToWrite, NoopNegentropy,
+    EnvOptions, EventToWrite,
 };
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_negentropy::Storage;
@@ -17,6 +17,7 @@ mod mesh;
 mod migrate;
 mod reindex;
 mod router;
+mod sync;
 
 use wok_relay::Config;
 
@@ -180,35 +181,7 @@ enum Command {
         cmd: NegCmd,
     },
     Integrity,
-    Sync {
-        url: String,
-        #[arg(long, default_value = "both")]
-        dir: String,
-        #[arg(long)]
-        filter: Option<String>,
-        /// Add since/until to the filter. Format: START-END, e.g. 2M- or 1Y-3w
-        #[arg(long)]
-        range: Option<String>,
-        /// Only print missing record IDs (implies --dir=none)
-        #[arg(long)]
-        print_missing: bool,
-        #[arg(long, default_value_t = 60_000)]
-        frame_size_limit: u64,
-        /// Abort if no activity for this many seconds (0 = no timeout)
-        #[arg(long, default_value_t = 0)]
-        timeout: u64,
-    },
-    Stream {
-        url: String,
-        #[arg(long, default_value = "down")]
-        dir: String,
-        /// Initial non-blocking reconnect delay in seconds
-        #[arg(long, default_value_t = 1)]
-        reconnect_delay: u64,
-        /// Maximum exponential reconnect delay in seconds
-        #[arg(long, default_value_t = 30)]
-        max_reconnect_delay: u64,
-    },
+    Sync(sync::Options),
     Upload {
         url: String,
         #[arg(long, default_value_t = 50)]
@@ -373,33 +346,7 @@ async fn main() -> Result<()> {
         Command::Dict { cmd } => cmd_dict(&cfg, cmd),
         Command::Negentropy { cmd } => cmd_neg(&cfg, cmd),
         Command::Integrity => cmd_integrity(&cfg),
-        Command::Sync {
-            url,
-            dir,
-            filter,
-            range,
-            print_missing,
-            frame_size_limit,
-            timeout,
-        } => {
-            cmd_sync(
-                &cfg,
-                url,
-                dir,
-                filter,
-                range,
-                print_missing,
-                frame_size_limit,
-                timeout,
-            )
-            .await
-        }
-        Command::Stream {
-            url,
-            dir,
-            reconnect_delay,
-            max_reconnect_delay,
-        } => cmd_stream(&cfg, url, dir, reconnect_delay, max_reconnect_delay).await,
+        Command::Sync(options) => sync::run(&cfg, options).await,
         Command::Upload { url, pipeline } => cmd_upload(url, pipeline).await,
         Command::Download { url, filter } => cmd_download(url, filter).await,
         Command::Router { router_config_file } => router::run_router(cfg, router_config_file).await,
@@ -423,7 +370,10 @@ fn init_tracing(config: Option<&Config>) -> Result<()> {
         .unwrap_or(wok_relay::config::LogFormat::Pretty);
     match format {
         wok_relay::config::LogFormat::Pretty => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(filter)
+                .init();
         }
         wok_relay::config::LogFormat::Json => {
             tracing_subscriber::fmt()
@@ -431,6 +381,7 @@ fn init_tracing(config: Option<&Config>) -> Result<()> {
                 .flatten_event(true)
                 .with_current_span(true)
                 .with_span_list(true)
+                .with_writer(std::io::stderr)
                 .with_env_filter(filter)
                 .init();
         }
@@ -614,6 +565,7 @@ fn cmd_import(
         match parse_import_line(&line, fried, no_verify, &limits) {
             Ok(ev) => batch.push(ev),
             Err(e) => {
+                total_rejected += 1;
                 tracing::warn!("Unable to parse JSON on line {i}: {e}");
                 continue;
             }
@@ -644,6 +596,9 @@ fn cmd_import(
     tracing::info!(
         "Done. Processed {total_processed} lines. {total_written} added, {total_rejected} rejected, {total_dups} dups"
     );
+    if total_rejected > 0 {
+        bail!("import incomplete: {total_rejected} records rejected; {total_written} written, {total_dups} duplicates");
+    }
     Ok(())
 }
 
@@ -690,7 +645,7 @@ fn commit_import(
     show_rejected: bool,
 ) -> Result<()> {
     let mut txn = env.begin_rw()?;
-    let mut sink = NoopNegentropy;
+    let mut sink = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
     write_events_with_policy(&mut txn, &mut sink, batch, false, &cfg.vanish_policy())?;
     txn.commit()?;
     for ev in batch.drain(..) {
@@ -852,7 +807,7 @@ fn cmd_delete(cfg: &Config, age: Option<u64>, filter: Option<String>, dry_run: b
     }
     tracing::info!("Deleting {} events", levs.len());
     let mut txn = env.begin_rw()?;
-    let mut sink = NoopNegentropy;
+    let mut sink = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
     delete_events(&mut txn, &mut sink, levs)?;
     txn.commit()?;
     Ok(())
@@ -1377,636 +1332,6 @@ fn downloaded_event_matches(
         .unwrap_or(false)
 }
 
-/// Verify and write a batch of downloaded events, updating negentropy trees
-/// like C++ WriterPipeline (verifyMsg + verifyTime).
-fn write_downloaded(
-    env: &Env,
-    cfg: &Config,
-    batch: &mut Vec<serde_json::Value>,
-    written: &mut u64,
-) -> Result<()> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-    let limits = cfg.event_limits();
-    let mut evs = Vec::with_capacity(batch.len());
-    for v in batch.drain(..) {
-        let policy = cfg.timestamp_policy_for_kind(
-            v.get("kind")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(u64::MAX),
-        );
-        match parse_and_verify_event(&v, &limits, Some(&policy), true, true) {
-            Ok(p) => evs.push(EventToWrite::new(p.packed.into_bytes(), p.json)),
-            Err(e) => tracing::warn!("downloaded event rejected: {e}"),
-        }
-    }
-    if evs.is_empty() {
-        return Ok(());
-    }
-    let mut txn = env.begin_rw()?;
-    let mut sink = wok_negentropy::DeferredSink::default();
-    write_events_with_policy(&mut txn, &mut sink, &mut evs, false, &cfg.vanish_policy())?;
-    let mut cache = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
-    sink.apply(&mut cache, &mut txn)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    txn.commit()?;
-    *written += evs
-        .iter()
-        .filter(|e| e.status == wok_db::EventWriteStatus::Written)
-        .count() as u64;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn cmd_sync(
-    cfg: &Config,
-    url: String,
-    dir: String,
-    filter: Option<String>,
-    range: Option<String>,
-    print_missing: bool,
-    frame_size_limit: u64,
-    timeout: u64,
-) -> Result<()> {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-
-    if !["both", "up", "down", "none"].contains(&dir.as_str()) {
-        bail!("invalid direction: {dir}. Should be one of both/up/down/none");
-    }
-    if print_missing && dir != "none" {
-        bail!("--print-missing requires --dir=none");
-    }
-    let dir = if print_missing {
-        "none".to_string()
-    } else {
-        dir
-    };
-    let do_up = dir == "both" || dir == "up";
-    let do_down = dir == "both" || dir == "down";
-
-    let mut filter_json: serde_json::Value =
-        wok_event::json::parse_strict(filter.as_deref().unwrap_or("{}"))?;
-    if let Some(range) = &range {
-        process_range_option(range, &mut filter_json)?;
-    }
-    let filter_group = wok_query::NostrFilterGroup::from_value(
-        &filter_json,
-        u64::MAX,
-        cfg.relay.max_tags_per_filter,
-        cfg.relay.max_and_entries,
-    )?;
-
-    let env = open_env(cfg)?;
-
-    // Prefer a precomputed tree whose canonical (time-stripped) filter
-    // matches, like C++.
-    enum SyncStorage {
-        Tree(u64),
-        Vector(wok_negentropy::Vector),
-    }
-    let storage = {
-        let mut canonical = filter_json.clone();
-        if let Some(obj) = canonical.as_object_mut() {
-            obj.remove("since");
-            obj.remove("until");
-        }
-        let canonical = wok_event::json::to_tao_string(&canonical);
-        let txn = env.begin_ro()?;
-        let mut tree_id = None;
-        wok_db::foreach_negentropy_filter(&txn, |id, f| {
-            if f == canonical {
-                tree_id = Some(id);
-                false
-            } else {
-                true
-            }
-        })?;
-        match tree_id {
-            Some(id) => SyncStorage::Tree(id),
-            None => {
-                let mut levs = Vec::new();
-                foreach_by_filter_scan(
-                    &txn,
-                    &filter_json,
-                    u64::MAX,
-                    cfg.relay.max_tags_per_filter,
-                    cfg.relay.max_and_entries,
-                    |lev| levs.push(lev),
-                )?;
-                levs.sort_unstable();
-                let mut v = wok_negentropy::Vector::new();
-                for lev in levs {
-                    if let Some(buf) = wok_db::get_packed_ro(&txn, lev)? {
-                        let p = PackedEventView::new(&buf)
-                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                        v.insert(p.created_at(), p.id())
-                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                    }
-                }
-                v.seal().map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                tracing::info!("Filter matches {} events", v.size_checked().unwrap_or(0));
-                SyncStorage::Vector(v)
-            }
-        }
-    };
-
-    let initiate = |env: &Env| -> Result<Vec<u8>> {
-        let txn = env.begin_ro()?;
-        match &storage {
-            SyncStorage::Tree(tid) => {
-                let mut tree = wok_negentropy::open_ro(&txn, *tid)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let f = filter_group.filters.first();
-                let since = f.map(|f| f.since).unwrap_or(0);
-                let until = f.map(|f| f.until).unwrap_or(u64::MAX);
-                let lower = wok_negentropy::Bound::timestamp(since);
-                let upper = wok_negentropy::Bound::timestamp(if until == u64::MAX {
-                    u64::MAX
-                } else {
-                    until.saturating_add(1)
-                });
-                let sub = wok_negentropy::SubRange::new(&mut tree, &lower, &upper)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let mut ne = wok_negentropy::Negentropy::new(sub, frame_size_limit)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                ne.initiate().map_err(|e| anyhow::anyhow!(e.to_string()))
-            }
-            SyncStorage::Vector(v) => {
-                let mut ne = wok_negentropy::Negentropy::new(v.clone(), frame_size_limit)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                ne.initiate().map_err(|e| anyhow::anyhow!(e.to_string()))
-            }
-        }
-    };
-    let reconcile = |env: &Env,
-                     payload: &[u8],
-                     have: &mut Vec<Vec<u8>>,
-                     need: &mut Vec<Vec<u8>>|
-     -> Result<Option<Vec<u8>>> {
-        let txn = env.begin_ro()?;
-        match &storage {
-            SyncStorage::Tree(tid) => {
-                let mut tree = wok_negentropy::open_ro(&txn, *tid)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let f = filter_group.filters.first();
-                let since = f.map(|f| f.since).unwrap_or(0);
-                let until = f.map(|f| f.until).unwrap_or(u64::MAX);
-                let lower = wok_negentropy::Bound::timestamp(since);
-                let upper = wok_negentropy::Bound::timestamp(if until == u64::MAX {
-                    u64::MAX
-                } else {
-                    until.saturating_add(1)
-                });
-                let sub = wok_negentropy::SubRange::new(&mut tree, &lower, &upper)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let mut ne = wok_negentropy::Negentropy::new(sub, frame_size_limit)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                ne.set_initiator();
-                ne.reconcile_with_ids(payload, have, need)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))
-            }
-            SyncStorage::Vector(v) => {
-                let mut ne = wok_negentropy::Negentropy::new(v.clone(), frame_size_limit)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                ne.set_initiator();
-                ne.reconcile_with_ids(payload, have, need)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))
-            }
-        }
-    };
-
-    let connect = mesh::connect_mesh(&url, cfg.events.max_event_size);
-    let capability_filter = mesh::outbound_filter_for_relay(&url, &filter_json);
-    let (ws, remote_filter) = tokio::join!(connect, capability_filter);
-    let mut ws = ws?;
-    let remote_filter = remote_filter?;
-    let init = initiate(&env)?;
-    let open = serde_json::json!(["NEG-OPEN", "N", remote_filter, hex::encode(init)]);
-    ws.send(Message::Text(open.to_string().into())).await?;
-
-    const HIGH_WATER_UP: usize = 100;
-    const LOW_WATER_UP: usize = 50;
-    const BATCH_DOWN: usize = 50;
-    /// A malicious or buggy peer can keep supplying fresh 32-byte IDs forever,
-    /// growing RAM ~3x network speed; cap the tracked have/need ID sets.
-    const MAX_SYNC_IDS: usize = 5_000_000;
-
-    let mut have: std::collections::VecDeque<Vec<u8>> = Default::default();
-    let mut need: std::collections::VecDeque<Vec<u8>> = Default::default();
-    let mut seen_have: std::collections::HashSet<Vec<u8>> = Default::default();
-    let mut seen_need: std::collections::HashSet<Vec<u8>> = Default::default();
-    // Only track IDs for directions we actually act on (print-missing needs both).
-    let track_have = do_up || print_missing;
-    let track_need = do_down || print_missing;
-    let mut sync_done = false;
-    let mut received_neg_msg = false;
-    let mut in_flight_up = 0usize;
-    let mut in_flight_down = false;
-    // Assigned on every NEG-MSG before any read.
-    let mut total_haves: usize;
-    let mut total_needs: usize;
-    let mut batch: Vec<serde_json::Value> = Vec::new();
-    let mut written = 0u64;
-    let mut last_activity = std::time::Instant::now();
-
-    loop {
-        if timeout > 0 && last_activity.elapsed().as_secs() >= timeout {
-            write_downloaded(&env, cfg, &mut batch, &mut written)?;
-            bail!("Sync timed out: no activity for {timeout} seconds");
-        }
-        let msg = match tokio::time::timeout(std::time::Duration::from_secs(1), ws.next()).await {
-            Ok(Some(m)) => m?,
-            Ok(None) => bail!("connection closed"),
-            Err(_) => {
-                // 1s idle tick: flush pending writes / pump queues.
-                write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                if sync_done
-                    && have.is_empty()
-                    && need.is_empty()
-                    && in_flight_up == 0
-                    && !in_flight_down
-                {
-                    break;
-                }
-                continue;
-            }
-        };
-        last_activity = std::time::Instant::now();
-        let txt = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-            Message::Close(_) => bail!("connection closed"),
-            _ => continue,
-        };
-        let v: serde_json::Value = match serde_json::from_str(&txt) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let cmd = v[0].as_str().unwrap_or("");
-        match cmd {
-            "NEG-MSG" => {
-                received_neg_msg = true;
-                let payload = wok_event::from_hex_strict(v[2].as_str().unwrap_or(""))?;
-                let mut curr_have = Vec::new();
-                let mut curr_need = Vec::new();
-                let next = match reconcile(&env, &payload, &mut curr_have, &mut curr_need) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                        return Err(e.context("Unable to parse negentropy message from relay"));
-                    }
-                };
-                for id in curr_have {
-                    if track_have && seen_have.insert(id.clone()) {
-                        have.push_back(id);
-                    }
-                }
-                for id in curr_need {
-                    if track_need && seen_need.insert(id.clone()) {
-                        need.push_back(id);
-                    }
-                }
-                if seen_have.len() + seen_need.len() > MAX_SYNC_IDS {
-                    write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                    bail!("Sync aborted: peer supplied more than {MAX_SYNC_IDS} unique ids");
-                }
-                total_haves = seen_have.len();
-                total_needs = seen_need.len();
-                match next {
-                    Some(next) => {
-                        let m = serde_json::json!(["NEG-MSG", "N", hex::encode(next)]);
-                        ws.send(Message::Text(m.to_string().into())).await?;
-                    }
-                    None => {
-                        sync_done = true;
-                        tracing::info!(
-                            "Set reconcile complete. Have {total_haves} need {total_needs}"
-                        );
-                        ws.send(Message::Text(r#"["NEG-CLOSE","N"]"#.into()))
-                            .await?;
-                    }
-                }
-            }
-            "OK" => {
-                in_flight_up = in_flight_up.saturating_sub(1);
-                if v[2].as_bool() == Some(false) {
-                    tracing::warn!("Unable to upload event {}: {}", v[1], v[3]);
-                }
-            }
-            "EVENT" => {
-                if let Some(ev) = v.get(2) {
-                    let matches_filter =
-                        downloaded_event_matches(&filter_group, ev, &cfg.event_limits());
-                    if !matches_filter {
-                        continue;
-                    }
-                    batch.push(ev.clone());
-                    if batch.len() >= 1000 {
-                        write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                    }
-                }
-            }
-            "EOSE" => {
-                in_flight_down = false;
-                write_downloaded(&env, cfg, &mut batch, &mut written)?;
-            }
-            "NEG-ERR" => {
-                write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                bail!("Got NEG-ERR response from relay: {v}");
-            }
-            "NOTICE" => {
-                let notice = v[1].as_str().unwrap_or("");
-                tracing::warn!(message = ?notice, "NOTICE from relay");
-                if !received_neg_msg {
-                    let lower = notice.to_ascii_lowercase();
-                    for kw in [
-                        "error",
-                        "invalid",
-                        "unrecognized",
-                        "bad msg",
-                        "bad message",
-                        "could not parse",
-                        "disabled",
-                        "unsupported",
-                        "unknown",
-                    ] {
-                        if lower.contains(kw) {
-                            write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                            bail!("Received error NOTICE before any negentropy response, relay likely does not support negentropy syncing");
-                        }
-                    }
-                }
-            }
-            _ => {
-                let preview: String = txt.chars().take(512).collect();
-                tracing::warn!(message = ?preview, "unexpected message from relay");
-            }
-        }
-
-        // Pump uploads (haves) with the C++ water marks.
-        if do_up && !have.is_empty() && in_flight_up <= LOW_WATER_UP {
-            let mut num_sent = 0usize;
-            let txn = env.begin_ro()?;
-            let mut decomp = Decompressor::new();
-            let mut to_send = Vec::new();
-            while let Some(id) = have.back().cloned() {
-                if in_flight_up + to_send.len() >= HIGH_WATER_UP {
-                    break;
-                }
-                have.pop_back();
-                match wok_db::lookup_event_by_id_ro(&txn, &id)? {
-                    Some((lev, _)) => {
-                        let json =
-                            event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size)?;
-                        to_send.push(format!("[\"EVENT\",{json}]"));
-                    }
-                    None => {
-                        tracing::warn!("Couldn't upload event because not found (deleted?)");
-                    }
-                }
-                num_sent += 1;
-            }
-            drop(txn);
-            for m in to_send {
-                ws.send(Message::Text(m.into())).await?;
-                in_flight_up += 1;
-            }
-            if num_sent > 0 {
-                tracing::info!("UP: {num_sent} events ({} remaining)", have.len());
-            }
-        }
-
-        // Pump downloads (needs) one REQ batch at a time.
-        if do_down && !need.is_empty() && !in_flight_down {
-            let mut ids = Vec::new();
-            while let Some(id) = need.back().cloned() {
-                if ids.len() >= BATCH_DOWN {
-                    break;
-                }
-                need.pop_back();
-                ids.push(hex::encode(id));
-            }
-            tracing::info!("DOWN: {} events ({} remaining)", ids.len(), need.len());
-            let req = serde_json::json!(["REQ", "R", { "ids": ids }]);
-            ws.send(Message::Text(req.to_string().into())).await?;
-            in_flight_down = true;
-        }
-
-        // Once a direction is fully done, drop its dedup state so a long
-        // remaining transfer in the other direction doesn't keep it resident.
-        if !print_missing && sync_done && have.is_empty() && in_flight_up == 0 {
-            seen_have = Default::default();
-        }
-        if !print_missing && sync_done && need.is_empty() && !in_flight_down {
-            seen_need = Default::default();
-        }
-
-        if sync_done && have.is_empty() && need.is_empty() && in_flight_up == 0 && !in_flight_down {
-            write_downloaded(&env, cfg, &mut batch, &mut written)?;
-            if print_missing {
-                for id in &seen_have {
-                    cli_println!("have,{}", hex::encode(id));
-                }
-                for id in &seen_need {
-                    cli_println!("need,{}", hex::encode(id));
-                }
-            }
-            break;
-        }
-    }
-    tracing::info!("Sync done; {written} events written");
-    Ok(())
-}
-
-async fn cmd_stream(
-    cfg: &Config,
-    url: String,
-    dir: String,
-    reconnect_delay: u64,
-    max_reconnect_delay: u64,
-) -> Result<()> {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-
-    if !["up", "down", "both"].contains(&dir.as_str()) {
-        bail!("invalid direction: {dir}. Should be one of up/down/both");
-    }
-    if reconnect_delay == 0 || max_reconnect_delay < reconnect_delay {
-        bail!("reconnect delays require 1 <= reconnect-delay <= max-reconnect-delay");
-    }
-    tracing::warn!("'wok stream' is deprecated. Please use 'wok router' instead.");
-
-    let env = open_env(cfg)?;
-    // Dedup set of remote event IDs we've already downloaded; capped so a
-    // peer feeding invented IDs can't grow RAM without bound. At the cap the
-    // dedup degrades to possible duplicate uploads (harmless).
-    const MAX_DOWNLOADED_IDS: usize = 1_000_000;
-    /// Flush the write batch at this many queued bytes even below the
-    /// per-flush event count.
-    const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
-    let mut downloaded: std::collections::HashSet<Vec<u8>> = Default::default();
-    let mut curr_event_id = {
-        let txn = env.begin_ro()?;
-        most_recent_levid_ro_quiet(&txn)
-    };
-    let mut batch: Vec<serde_json::Value> = Vec::new();
-    let mut batch_bytes = 0usize;
-    let mut written = 0u64;
-    let initial_delay = std::time::Duration::from_secs(reconnect_delay);
-    let maximum_delay = std::time::Duration::from_secs(max_reconnect_delay);
-    let mut delay = initial_delay;
-
-    loop {
-        tracing::info!(url = %url, "stream connecting");
-        match mesh::connect_mesh(&url, cfg.events.max_event_size).await {
-            Ok(mut ws) => {
-                tracing::info!(url = %url, "stream connected");
-                delay = initial_delay;
-                let subscription = if dir == "down" || dir == "both" {
-                    Some(
-                        ws.send(Message::Text(r#"["REQ","sub",{"limit":0}]"#.into()))
-                            .await,
-                    )
-                } else {
-                    None
-                };
-                let disconnect = if let Some(Err(error)) = subscription {
-                    error.to_string()
-                } else {
-                    let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(1));
-                    let mut upload_tick =
-                        tokio::time::interval(std::time::Duration::from_millis(100));
-                    'connected: loop {
-                        tokio::select! {
-                            msg = ws.next() => {
-                                let Some(msg) = msg else {
-                                    break "remote closed the websocket".to_string();
-                                };
-                                let msg = match msg {
-                                    Ok(message) => message,
-                                    Err(error) => break error.to_string(),
-                                };
-                                let txt = match msg {
-                                    Message::Text(t) => t.to_string(),
-                                    Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-                                    Message::Ping(payload) => {
-                                        if let Err(error) = ws.send(Message::Pong(payload)).await {
-                                            break error.to_string();
-                                        }
-                                        continue;
-                                    }
-                                    Message::Close(frame) => break format!("remote close: {frame:?}"),
-                                    _ => continue,
-                                };
-                                let v: serde_json::Value = match serde_json::from_str(&txt) {
-                                    Ok(v) => v,
-                                    Err(error) => {
-                                        tracing::warn!(url = %url, %error, "stream ignored invalid JSON");
-                                        continue;
-                                    }
-                                };
-                                match v[0].as_str().unwrap_or("") {
-                                    "EOSE" => write_downloaded(&env, cfg, &mut batch, &mut written)?,
-                                    "NOTICE" => tracing::warn!(url = %url, "NOTICE message: {v}"),
-                                    "OK" if v[2].as_bool() == Some(false) => {
-                                        tracing::warn!(url = %url, "event not written: {v}");
-                                    }
-                                    "EVENT" if dir == "down" || dir == "both" => {
-                                        // Drop frames that could never hold a valid
-                                        // event before queueing them unverified.
-                                        if txt.len() > cfg.events.max_event_size + 64 {
-                                            tracing::warn!(url = %url, "stream dropped oversize frame");
-                                            continue;
-                                        }
-                                        if let Some(ev) = v.get(2) {
-                                            if dir == "both" {
-                                                if let Some(id) = ev.get("id").and_then(|id| id.as_str()) {
-                                                    // Event IDs are 32 bytes hex; longer
-                                                    // "ids" are attacker-controlled padding.
-                                                    if id.len() == 64 && downloaded.len() < MAX_DOWNLOADED_IDS {
-                                                        if let Ok(raw) = wok_event::from_lower_hex_exact(id) {
-                                                            downloaded.insert(raw);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            batch_bytes += txt.len();
-                                            batch.push(ev.clone());
-                                            if batch.len() >= 1000 || batch_bytes >= MAX_BATCH_BYTES {
-                                                write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                                                batch_bytes = 0;
-                                            }
-                                        }
-                                    }
-                                    other => tracing::warn!(url = %url, command = other, "stream ignored unexpected relay message"),
-                                }
-                            }
-                            _ = flush_tick.tick() => {
-                                write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                                batch_bytes = 0;
-                            }
-                            _ = upload_tick.tick(), if dir != "down" => {
-                                let mut outbound = Vec::new();
-                                {
-                                    let txn = env.begin_ro()?;
-                                    let mut decomp = Decompressor::new();
-                                    let mut rows = 0usize;
-                                    wok_db::foreach_event_from(&txn, curr_event_id.saturating_add(1), |lev, packed_bytes| {
-                                        if rows >= 1_000 {
-                                            return false;
-                                        }
-                                        rows += 1;
-                                        let message = if let Ok(p) = PackedEventView::new(packed_bytes) {
-                                            if downloaded.remove(p.id()) {
-                                                None
-                                            } else {
-                                                event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size)
-                                                    .ok()
-                                                    .map(|json| format!("[\"EVENT\",{json}]"))
-                                            }
-                                        } else {
-                                            None
-                                        };
-                                        outbound.push((lev, message));
-                                        true
-                                    })?;
-                                }
-                                for (lev, message) in outbound {
-                                    if let Some(message) = message {
-                                        if let Err(error) = ws.send(Message::Text(message.into())).await {
-                                            break 'connected error.to_string();
-                                        }
-                                    }
-                                    // Advance only after the corresponding send succeeds,
-                                    // so a reconnect retries the first unsent local event.
-                                    curr_event_id = lev;
-                                }
-                            }
-                        }
-                    }
-                };
-                write_downloaded(&env, cfg, &mut batch, &mut written)?;
-                tracing::warn!(url = %url, reason = %disconnect, written, "stream disconnected");
-            }
-            Err(error) => {
-                tracing::warn!(url = %url, %error, "stream connection failed");
-            }
-        }
-        tracing::info!(url = %url, delay_secs = delay.as_secs(), "stream reconnect scheduled");
-        tokio::time::sleep(delay).await;
-        delay = next_reconnect_delay(delay, maximum_delay);
-    }
-}
-
-fn next_reconnect_delay(
-    current: std::time::Duration,
-    maximum: std::time::Duration,
-) -> std::time::Duration {
-    current.saturating_mul(2).min(maximum)
-}
-
 fn most_recent_levid_ro_quiet(txn: &wok_db::RoTxn<'_>) -> u64 {
     wok_db::most_recent_levid_ro(txn).unwrap_or(0)
 }
@@ -2077,6 +1402,42 @@ mod main_tests {
     use wok_negentropy::Storage;
 
     #[test]
+    fn imported_events_update_legacy_zero_counter_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            db: dir.path().join("db"),
+            ..Config::default()
+        };
+        let env = open_env(&cfg).unwrap();
+        {
+            let mut txn = env.begin_rw().unwrap();
+            let mut meta =
+                wok_db::decode_meta(txn.get_u64(env.dbis().meta, 1).unwrap().unwrap()).unwrap();
+            meta.negentropy_modification_counter = 0;
+            txn.put_u64(env.dbis().meta, 1, &wok_db::encode_meta(&meta), 0)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let mut events = vec![signed_event(1)];
+        let (mut written, mut rejected, mut duplicates) = (0, 0, 0);
+        commit_import(
+            &cfg,
+            &env,
+            &mut events,
+            &mut written,
+            &mut rejected,
+            &mut duplicates,
+            false,
+        )
+        .unwrap();
+        assert_eq!((written, rejected, duplicates), (1, 0, 0));
+        assert_eq!(
+            wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn parse_mesh_time_rejects_multibyte_units_without_panicking() {
         assert_eq!(parse_mesh_time("1h").unwrap(), 3600);
         assert_eq!(parse_mesh_time("2d").unwrap(), 2 * 86400);
@@ -2139,20 +1500,6 @@ mod main_tests {
     }
 
     #[test]
-    fn reconnect_backoff_is_exponential_and_capped() {
-        let maximum = std::time::Duration::from_secs(5);
-        assert_eq!(
-            next_reconnect_delay(std::time::Duration::from_secs(1), maximum),
-            std::time::Duration::from_secs(2)
-        );
-        assert_eq!(
-            next_reconnect_delay(std::time::Duration::from_secs(4), maximum),
-            maximum
-        );
-        assert_eq!(next_reconnect_delay(maximum, maximum), maximum);
-    }
-
-    #[test]
     fn nip91_sync_post_filters_legacy_relay_results() {
         let filter = wok_query::NostrFilterGroup::from_value(
             &json!({"&t":["meme", "cat"], "#t":["meme", "cat", "black"]}),
@@ -2201,34 +1548,5 @@ mod main_tests {
             &searchable,
             &EventLimits::default(),
         ));
-    }
-
-    #[tokio::test]
-    async fn stream_reconnects_after_remote_close_without_blocking_runtime() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
-                websocket.close(None).await.unwrap();
-            }
-        });
-
-        let directory = tempfile::tempdir().unwrap();
-        let cfg = Config {
-            db: directory.path().join("db"),
-            ..Config::default()
-        };
-        let client = tokio::spawn(async move {
-            cmd_stream(&cfg, format!("ws://{address}"), "down".into(), 1, 1).await
-        });
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .expect("stream did not reconnect")
-            .unwrap();
-        client.abort();
-        assert!(client.await.unwrap_err().is_cancelled());
     }
 }

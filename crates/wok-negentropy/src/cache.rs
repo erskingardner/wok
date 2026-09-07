@@ -6,7 +6,7 @@ use wok_db::{lookup, RoTxn, RwTxn};
 use wok_event::PackedEventView;
 use wok_query::NostrFilter;
 
-fn parse_negentropy_filter(
+pub(crate) fn parse_negentropy_filter(
     filter_str: &str,
     max_tags_per_filter: usize,
     max_and_entries: usize,
@@ -30,7 +30,7 @@ struct FilterInfo {
 
 pub struct NegentropyFilterCache {
     filters: Vec<FilterInfo>,
-    modification_counter: u64,
+    modification_counter: Option<u64>,
     max_tags_per_filter: usize,
 }
 
@@ -45,7 +45,7 @@ impl NegentropyFilterCache {
     pub fn new(max_tags_per_filter: usize) -> Self {
         Self {
             filters: Vec::new(),
-            modification_counter: 0,
+            modification_counter: None,
             max_tags_per_filter,
         }
     }
@@ -55,7 +55,7 @@ impl NegentropyFilterCache {
             .get_u64(txn.env().dbis().meta, 1)?
             .ok_or_else(|| NegError::msg("no Meta entry"))?;
         let meta = wok_db::decode_meta(raw)?;
-        if meta.negentropy_modification_counter == self.modification_counter {
+        if Some(meta.negentropy_modification_counter) == self.modification_counter {
             return Ok(());
         }
         self.filters.clear();
@@ -79,7 +79,7 @@ impl NegentropyFilterCache {
         if let Some(e) = parse_err {
             return Err(e);
         }
-        self.modification_counter = meta.negentropy_modification_counter;
+        self.modification_counter = Some(meta.negentropy_modification_counter);
         Ok(())
     }
 
@@ -88,7 +88,7 @@ impl NegentropyFilterCache {
             .get_u64(txn.env().dbis().meta, 1)?
             .ok_or_else(|| NegError::msg("no Meta entry"))?;
         let meta = wok_db::decode_meta(raw)?;
-        if meta.negentropy_modification_counter == self.modification_counter {
+        if Some(meta.negentropy_modification_counter) == self.modification_counter {
             return Ok(());
         }
         self.filters.clear();
@@ -110,7 +110,7 @@ impl NegentropyFilterCache {
         if let Some(e) = parse_err {
             return Err(e);
         }
-        self.modification_counter = meta.negentropy_modification_counter;
+        self.modification_counter = Some(meta.negentropy_modification_counter);
         Ok(())
     }
 }

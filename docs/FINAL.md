@@ -117,7 +117,7 @@ Approximate unit/integration count from the last workspace run: 86 non-empty tes
 
 See `docs/known-differences.md` for the full, current list. Highlights:
 
-- Mesh client connections (router/stream/sync) don't offer permessage-deflate (server side supports it).
+- Mesh client connections (router/sync) don't offer permessage-deflate (server side supports it).
 - NIP-11 software string is wok's URL.
 - ID/author filters are exact 32 bytes (C++), not NIP-01 prefixes.
 - Historical restricted-kind REQ filtering uses PackedEvent from the Event table (intentional; C++ ReqWorker currently views payload bytes).
@@ -163,10 +163,8 @@ A full second review against the C++ source produced these fix commits:
   frozen.
 - `dict train/compress/decompress` (ZDICT training; verified
   cross-implementation with the C++ binary).
-- `stream` persists downloads (verified like WriterPipeline), streams uploads,
-  and reconnects with non-blocking capped backoff; `sync` does the full C++
-  two-phase negentropy transfer (verified 150/150 events both directions
-  against the C++ relay).
+- `sync` performs two-phase negentropy transfer; `router` handles persistent
+  streaming. The legacy `stream` command has been removed.
 - `router` with tao-config parsing, per-URL reconnecting clients, hot
   reconfig, and plugin gating (validated live against the C++ relay).
 - permessage-deflate via an in-house RFC 6455/7692 codec (the Rust WS

@@ -26,7 +26,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
     let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
     let mut events = Vec::new();
     for i in 0..12 {
-        let mut e = json!({"pubkey":hex::encode(key.x_only_public_key().0.serialize()),"kind":1,"created_at":1_800_000_000+i,"tags":[["t","migration"],["p","01".repeat(32)]],"content":format!("migration {i}: café 🦀 \\ \" \u{7f}")});
+        let mut e = json!({"pubkey":hex::encode(key.x_only_public_key().0.serialize()),"kind":if i % 3 == 0 { 1 } else { 1059 },"created_at":1_800_000_000+i,"tags":[["t","migration"],["p", if i % 2 == 0 { "01".repeat(32) } else { "02".repeat(32) }]],"content":format!("migration {i}: café 🦀 \\ \" \u{7f}")});
         let id = wok_event::event_id_hash(&e).unwrap();
         e["id"] = json!(hex::encode(id));
         e["sig"] = json!(hex::encode(

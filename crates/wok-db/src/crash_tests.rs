@@ -60,12 +60,27 @@ fn seed(path: &Path) -> Env {
         events.iter().map(|e| e.lev_id).collect::<Vec<_>>(),
         [1, 2, 3]
     );
+    // Seed tracked counters explicitly; ordinary quota-free writes are lazy.
+    initialize_counts(&mut txn);
     txn.commit().unwrap();
     env
 }
 
+fn initialize_counts(txn: &mut crate::RwTxn<'_>) {
+    for author in [7, 8] {
+        let packed = event(author, 1, 100).packed;
+        crate::state::author_count(
+            txn,
+            wok_event::PackedEventView::new(&packed).unwrap().pubkey(),
+        )
+        .unwrap();
+    }
+}
+
 fn mutate(env: &Env, action: &str) {
     let mut txn = env.begin_rw().unwrap();
+    // Exercise atomic initialization as well as updates after a lazy upgrade.
+    initialize_counts(&mut txn);
     let mut events = match action {
         "insert" => vec![event(7, 1, 103)],
         "replace" => vec![event(7, 0, 103)],

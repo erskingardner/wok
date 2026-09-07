@@ -51,8 +51,9 @@ fn author_key(pubkey: &[u8]) -> Vec<u8> {
     key
 }
 
-/// Lazily initialize each author under the writer transaction. No startup
-/// scan of the entire relay is required, and deletions initialize BEFORE removal.
+/// Lazily initialize a requested count under the writer transaction. Quota
+/// checks use this before mutation; authors whose count is never requested
+/// need no stored counter. Existing counters are maintained even without quotas.
 pub fn author_count(txn: &mut RwTxn<'_>, pubkey: &[u8]) -> Result<u64, DbError> {
     let dbi = txn
         .env()
@@ -89,14 +90,29 @@ pub fn change_author_count(
     pubkey: &[u8],
     insert: bool,
 ) -> Result<(), DbError> {
-    let old = author_count(txn, pubkey)?;
+    let dbi = txn
+        .env()
+        .dbis()
+        .state
+        .ok_or_else(|| DbError::msg("missing Wok state table"))?;
+    let key = author_key(pubkey);
+    let old = if let Some(count) = txn.author_counts.get(&key) {
+        *count
+    } else if let Some(raw) = txn.get(dbi, &key)? {
+        decode(raw)?
+    } else {
+        // No cached count can become stale. A later quota check derives the
+        // current count from the author index, including earlier mutations
+        // in the same transaction, then keeps it current from that point on.
+        return Ok(());
+    };
     let count = if insert {
         old.checked_add(1)
     } else {
         old.checked_sub(1)
     }
     .ok_or_else(|| DbError::msg("author count overflow or drift"))?;
-    txn.author_counts.insert(author_key(pubkey), count);
+    txn.author_counts.insert(key, count);
     Ok(())
 }
 

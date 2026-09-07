@@ -32,3 +32,10 @@ Direct persistent-tree sync requires an explicit public-visibility proof.
 `server/writer.rs` owns mutation and receipts; `server/negentropy.rs` owns sync
 sessions and a reservation pool shared across all workers. Unix reader and writer
 futures progress independently so outbound traffic cannot cancel partial headers.
+
+Author counts are derived lazily when first requested, normally for quota
+enforcement (enabled by default). Publications without quotas do not create unused counters. Once
+initialized, a counter stays transactionally current through inserts, replacements
+and deletions, including while quotas are disabled. Enabling a quota may therefore
+require a one-time author-index scan for an author without a cached count; no
+database upgrade or startup-wide scan is required.

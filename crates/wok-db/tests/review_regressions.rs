@@ -173,3 +173,88 @@ fn duplicate_cursor_seek_returns_database_owned_key_and_value() {
     assert!(cursor.get(None, None, lmdb_sys::MDB_SET).is_err());
     assert!(cursor.get(None, None, lmdb_sys::MDB_GET_MULTIPLE).is_err());
 }
+
+#[test]
+fn unused_author_counts_stay_absent_until_requested_after_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut key = vec![b'a'];
+    key.extend_from_slice(&[9; 32]);
+    let dbi = env.dbis().state.unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    let mut events = [stored_event(1, 1, 1), stored_event(2, 2, 1)];
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+    txn.commit().unwrap();
+    assert!(env.begin_ro().unwrap().get(dbi, &key).unwrap().is_none());
+
+    let mut txn = env.begin_rw().unwrap();
+    wok_db::delete_event_basic(&mut txn, events[0].lev_id).unwrap();
+    let mut next = [stored_event(3, 3, 1)];
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut next, false).unwrap();
+    assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 2);
+    // Once requested, further mutations must update the in-transaction cache.
+    wok_db::delete_event_basic(&mut txn, events[1].lev_id).unwrap();
+    assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 1);
+    txn.abort();
+    assert!(env.begin_ro().unwrap().get(dbi, &key).unwrap().is_none());
+
+    let mut txn = env.begin_rw().unwrap();
+    assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 2);
+    txn.commit().unwrap();
+    drop(env);
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    wok_db::delete_event_basic(&mut txn, events[0].lev_id).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(
+        env.begin_ro()
+            .unwrap()
+            .get(env.dbis().state.unwrap(), &key)
+            .unwrap(),
+        Some(1u64.to_le_bytes().as_slice())
+    );
+}
+
+#[test]
+fn enabling_quota_counts_preexisting_events_and_disabling_keeps_cache_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    let mut events = [stored_event(1, 1, 1), stored_event(2, 2, 1)];
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+    txn.commit().unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    let mut attempted = [stored_event(3, 3, 1)];
+    wok_db::write::write_events_with_quota(
+        &mut txn,
+        &mut wok_db::NoopNegentropy,
+        &mut attempted,
+        &wok_db::VanishPolicy::disabled(),
+        2,
+    )
+    .unwrap();
+    assert_eq!(attempted[0].status, wok_db::EventWriteStatus::QuotaExceeded);
+    assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 2);
+    txn.commit().unwrap();
+
+    // Quotas disabled: an already persisted counter must still track writes.
+    let mut txn = env.begin_rw().unwrap();
+    let mut next = [stored_event(4, 4, 1)];
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut next, false).unwrap();
+    txn.commit().unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    let mut attempted = [stored_event(5, 5, 1)];
+    wok_db::write::write_events_with_quota(
+        &mut txn,
+        &mut wok_db::NoopNegentropy,
+        &mut attempted,
+        &wok_db::VanishPolicy::disabled(),
+        3,
+    )
+    .unwrap();
+    assert_eq!(attempted[0].status, wok_db::EventWriteStatus::QuotaExceeded);
+    assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 3);
+    txn.commit().unwrap();
+}

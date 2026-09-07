@@ -77,8 +77,9 @@ keep a backup for rollback. A normal writable open creates `wok_State` and
 upgrades the marker in one transaction. Read-only inspection does not upgrade
 it. Primary PackedEvent and payload bytes remain unchanged. The sequence
 initializes from the highest existing local ID; author counters initialize
-lazily under the writer transaction, before the first insert or deletion for
-that author. Subsequent changes coalesce and commit with the event batch.
+lazily when requested under the writer transaction, normally before a quota
+check. Once initialized, subsequent changes coalesce and commit with the event
+batch, including while quotas are disabled.
 
 The sequence never decreases after deleting the newest record. Reindex retains
 that high-water mark while rebuilding author counts lazily from authoritative

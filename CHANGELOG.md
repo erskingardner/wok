@@ -7,8 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-07
+
+### Changed
+
+- Wok runtime databases advance from v4 to v5 with a durable local event
+  sequence and transactional author counters. Stop older writers and keep a
+  backup before the first writable open; older releases cannot reopen the
+  upgraded database. Primary events and payloads are preserved. See
+  [upgrade and rollback guidance](https://github.com/erskingardner/wok/blob/v0.6.0/docs/lmdb-v3.md#wok-v4-to-v5).
+- Author counters initialize only when requested, normally for quota checks,
+  and remain current after initialization. Deployments without author quotas
+  avoid creating unused counters; existing quota and durability defaults remain
+  unchanged.
+- Historical queries share visibility checks and bound candidate scanning;
+  selective-author planning avoids unnecessary broad-tag scans. Raw payload
+  decoding avoids a copy, live monitors limit content parsing to relevant
+  subscriptions, and persistent negentropy tree updates batch within the
+  writer transaction.
+- Maintenance mutations run through the single writer, with publication and
+  synchronization responsibilities split into dedicated modules.
+
+### Security
+
+- Negentropy uses direct persistent trees only when the view is provably public;
+  temporary views apply the same authorization, moderation, expiration and
+  recipient visibility as other reads. Authorization changes invalidate affected
+  sessions.
+- Sync sessions share configurable memory reservations, defaulting to 256 MiB
+  per connection and 1 GiB across workers, with a 60-second idle timeout and no
+  fixed lifetime for active synchronization.
+- COUNT/HLL and search apply per-event visibility before counting or ranking.
+  LMDB cursor and raw-payload borrows remain tied to their owning transaction.
+
 ### Fixed
 
+- Batch sorting preserves each publication's receipt and publisher ownership.
+- Unix frame decoding survives concurrent outbound traffic, and both transports
+  cancel blocked connection I/O while retaining in-flight byte reservations.
+- Replacement and deletion quota checks use net storage effects. Event sequence
+  values are not reused after deleting the newest record, and expired events
+  are excluded from reads before maintenance removes them.
+- The locked dependency graph and workspace APIs support the declared Rust 1.85
+  minimum version, with CI explicitly selecting that toolchain.
 - Lifecycle conformance tests wait for negentropy close processing before
   asserting unrelated replies, avoiding a race with in-flight revocations.
 - Benchmark commands return a failing exit status when any trial fails, after
@@ -17,7 +58,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   using shared expectations, and report aggregate trial time consistently.
 - Benchmark idle clients answer WebSocket pings throughout connection setup and
   hold periods, avoiding false disconnect failures in long capacity tests.
-
 - SIGTERM now follows the graceful relay shutdown path, including Unix socket
   cleanup. A CLI process test verifies acknowledged data survives shutdown.
 - strfry migration creates Wok extension tables in the private staging copy and
@@ -29,9 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- NIP-42 supports multiple authenticated public keys on one connection, with
+  transport-level conformance coverage.
 - Portable Docker relay/load lab with local and two-VM SSH campaigns, bounded
   workloads, preserved artifacts, and shutdown/integrity correctness gates.
-
 - Generated WebSocket/Unix lifecycle tests compare history, live events, COUNT,
   and sync with an independent privacy model, including AUTH and revocation.
 - CI runs benchmark correctness tests, native behavioral suites on all four
@@ -40,6 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Process-kill regression coverage for atomic v4-to-v5 upgrades and event,
   counter, and sequence commits, including lazy state initialization.
 - MAP_FULL rollback coverage for staged event and counter changes.
+- Controlled soak, storage-write and search-layout experiment reports. The
+  event-local phrase index prototype remains unmerged and is not in this release.
 
 ## [0.5.0] - 2026-09-03
 
@@ -326,7 +369,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protected-event publishing and restricted reads require the appropriate
   authenticated author or recipient relationship.
 
-[Unreleased]: https://github.com/erskingardner/wok/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/erskingardner/wok/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/erskingardner/wok/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/erskingardner/wok/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/erskingardner/wok/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/erskingardner/wok/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/erskingardner/wok/compare/v0.2.0...v0.3.0

@@ -89,6 +89,8 @@ negentropy preparation time does not exclude its pages from commit cost.
 
 ## Additional controls and optimization evidence
 
+Follow-up: [Wok write attribution and optimization tests](benchmark-wok-write-amplification-2026-09-07.md) measured search as the largest contributor. Fixed 1–3 ms collection delays reduced writes but lowered throughput, so that prototype was not adopted.
+
 - A disposable full-database copy on tmpfs reached 10,332 events/s; an empty
   tmpfs case reached 20,663 events/s. This supports storage cost as the dominant
   wall-time constraint, while showing that database-size costs remain in RAM.

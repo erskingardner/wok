@@ -1,0 +1,2002 @@
+{
+  "date": "2026-09-07",
+  "baseline_runtime_revision": "76f9a6ac2f872848f32cf14d5b5d7fbd15051975",
+  "fix_revision": "eab76a1208b6c7a8685aa3aa110dcf9ad1f9406a",
+  "source_archive_base": "74c7e9e",
+  "source_archive_sha256": "d17dabbfb352404bbb5dbc75596f6dea32dc83fab92f529aeff4b68cff4a80b1",
+  "baseline_binary_sha256": "2d2c4a1bb7ec2b7d5cbe5e6844e5177963196618448da7c543f7992404fc38d6",
+  "harness_binary_sha256": "d3a129a131162a5f113a23594830593e054493e9d628b7d188b342c38ae03145",
+  "builds": {
+    "profile": {
+      "image_id": "sha256:8350d79439cde340f62dd079dac75069702146c5bb5eca03f0350c18298d863b",
+      "binary_sha256": "1d2e550339d5e46db0cc99ac95d59c24921f5a3db5b7f296f4d77f41f8ce15ed"
+    },
+    "profile2": {
+      "image_id": "sha256:06a09ff23f97254cf8ed12e0265a1eb798a3c1cc7697dca877d844e8b243d3e4",
+      "binary_sha256": "0bdd390411ec405ee47ef812a34dfd0a081bfd28e38b3cb7e2774d6ecaf1f9f4"
+    },
+    "coalesce": {
+      "image_id": "sha256:0e292687fde973c29dae0adfd7ab6ff81ffa137edfff01fa04a5e1cf6af46fda",
+      "binary_sha256": "f4c865955490a7d250e05a3845e763cef64ffed08ff136f1928d522518e363b4"
+    },
+    "lazy": {
+      "image_id": "sha256:b74d7cb71d286bc6842f535721e70e6574ede109596962a9697ccec9c47ef6cf",
+      "binary_sha256": "6cbbdc145ed08cee6275ec28222acbef5f1ef2e82afb3f8dd14204e0d436c8cf"
+    }
+  },
+  "source_database_sha256_before_and_after": "0132ac251b9034bfa2f52e26a19ea5b06136f651f31d81c26152d475d36a2f27",
+  "scope": {
+    "relay_cpus": 3,
+    "relay_memory_gib": 6,
+    "generator_cpus": 6,
+    "generator_memory_gib": 12,
+    "base_timestamp": 1788764100,
+    "seed": 920260907,
+    "map_size_bytes": 8589934592,
+    "baseline_events": 648000,
+    "measured_publications": 233000,
+    "warmup_events_per_trial": 50,
+    "trials": 26,
+    "baseline_config": "contrib/lab/wok.toml",
+    "quota_control_config": "# Isolated benchmark fixture. Admission limiting is deliberately disabled.\n# Bind the published host port to loopback or an isolated private interface.\n[database]\npath = \"/data/db\"\nmap_size = 8589934592\nmin_free_disk_bytes = 268435456\n[relay]\nbind = \"0.0.0.0\"\nport = 7777\nnofiles = 0\n[relay.abuse]\nenabled = true\nconnection_rate_per_second = 0\nevent_rate_per_second = 0\npubkey_event_rate_per_second = 0\nmax_stored_events_per_pubkey = 100000\n[observability]\nlog_format = \"json\"\n"
+  },
+  "attribution_method": "Net change in dirty bytes around each synchronous Wok put/del. Includes overflow runs, excludes loose/kept pages. Shared/internal first-touch cost may be charged to the triggering operation; not physical page ownership or flash writes. Final flush adds internal commit work. Instrumented throughput excluded.",
+  "profiles": {
+    "profile-coalesce-full": {
+      "transactions": 531,
+      "events": 10050,
+      "tables": {
+        "event": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 10100736
+        },
+        "event_id": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 91635712
+        },
+        "event_pubkey_kind": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 97931264
+        },
+        "event_tag": {
+          "puts": 19096,
+          "dels": 0,
+          "dirty_bytes": 115736576
+        },
+        "event_replace": {
+          "puts": 2012,
+          "dels": 0,
+          "dirty_bytes": 18296832
+        },
+        "event_created_at": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 7356416
+        },
+        "event_pubkey": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 91086848
+        },
+        "event_kind": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 21987328
+        },
+        "event_payload": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 14516224
+        },
+        "negentropy": {
+          "puts": 2693,
+          "dels": 0,
+          "dirty_bytes": 18604032
+        },
+        "event_search_marker": {
+          "puts": 531,
+          "dels": 531,
+          "dirty_bytes": 4239360
+        },
+        "event_search_term": {
+          "puts": 56015,
+          "dels": 0,
+          "dirty_bytes": 297988096
+        },
+        "event_search_bigram": {
+          "puts": 48983,
+          "dels": 0,
+          "dirty_bytes": 258019328
+        },
+        "state": {
+          "puts": 10581,
+          "dels": 0,
+          "dirty_bytes": 77205504
+        }
+      },
+      "precommit_dirty_bytes": 1124704256,
+      "flush_summary": {
+        "calls": 533,
+        "dirty_bytes": 1131720704,
+        "nonzero_keep_calls": 0
+      }
+    },
+    "profile-detail-full": {
+      "transactions": 676,
+      "events": 10050,
+      "tables": {
+        "event": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 12476416
+        },
+        "event_id": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 94146560
+        },
+        "event_pubkey_kind": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 100716544
+        },
+        "event_tag": {
+          "puts": 19096,
+          "dels": 0,
+          "dirty_bytes": 113377280
+        },
+        "event_replace": {
+          "puts": 2012,
+          "dels": 0,
+          "dirty_bytes": 18735104
+        },
+        "event_created_at": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 8589312
+        },
+        "event_pubkey": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 93945856
+        },
+        "event_kind": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 27348992
+        },
+        "event_payload": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 16932864
+        },
+        "negentropy": {
+          "puts": 2964,
+          "dels": 0,
+          "dirty_bytes": 22228992
+        },
+        "event_search_marker": {
+          "puts": 676,
+          "dels": 676,
+          "dirty_bytes": 5423104
+        },
+        "event_search_term": {
+          "puts": 56015,
+          "dels": 0,
+          "dirty_bytes": 313163776
+        },
+        "event_search_bigram": {
+          "puts": 48983,
+          "dels": 0,
+          "dirty_bytes": 259207168
+        },
+        "state": {
+          "puts": 10726,
+          "dels": 0,
+          "dirty_bytes": 80515072
+        }
+      },
+      "precommit_dirty_bytes": 1166807040,
+      "flush_summary": {
+        "calls": 678,
+        "dirty_bytes": 1172881408,
+        "nonzero_keep_calls": 0
+      }
+    },
+    "profile-empty": {
+      "transactions": 676,
+      "events": 10050,
+      "tables": {
+        "event": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 10452992
+        },
+        "event_id": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 42684416
+        },
+        "event_pubkey_kind": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 47865856
+        },
+        "event_tag": {
+          "puts": 19096,
+          "dels": 0,
+          "dirty_bytes": 65093632
+        },
+        "event_replace": {
+          "puts": 2012,
+          "dels": 0,
+          "dirty_bytes": 9846784
+        },
+        "event_created_at": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 6053888
+        },
+        "event_pubkey": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 46047232
+        },
+        "event_kind": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 15581184
+        },
+        "event_payload": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 13520896
+        },
+        "negentropy": {
+          "puts": 2301,
+          "dels": 0,
+          "dirty_bytes": 13897728
+        },
+        "event_search": {
+          "puts": 105674,
+          "dels": 676,
+          "dirty_bytes": 138862592
+        },
+        "state": {
+          "puts": 10726,
+          "dels": 0,
+          "dirty_bytes": 27447296
+        }
+      },
+      "precommit_dirty_bytes": 437354496,
+      "flush_summary": {
+        "calls": 681,
+        "dirty_bytes": 440487936,
+        "nonzero_keep_calls": 0
+      }
+    },
+    "profile-full": {
+      "transactions": 676,
+      "events": 10050,
+      "tables": {
+        "event": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 12476416
+        },
+        "event_id": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 93990912
+        },
+        "event_pubkey_kind": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 99389440
+        },
+        "event_tag": {
+          "puts": 19096,
+          "dels": 0,
+          "dirty_bytes": 116219904
+        },
+        "event_replace": {
+          "puts": 2012,
+          "dels": 0,
+          "dirty_bytes": 18366464
+        },
+        "event_created_at": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 8716288
+        },
+        "event_pubkey": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 91996160
+        },
+        "event_kind": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 25161728
+        },
+        "event_payload": {
+          "puts": 10050,
+          "dels": 0,
+          "dirty_bytes": 16912384
+        },
+        "negentropy": {
+          "puts": 2958,
+          "dels": 0,
+          "dirty_bytes": 22245376
+        },
+        "event_search": {
+          "puts": 105674,
+          "dels": 676,
+          "dirty_bytes": 577966080
+        },
+        "state": {
+          "puts": 10726,
+          "dels": 0,
+          "dirty_bytes": 78417920
+        }
+      },
+      "precommit_dirty_bytes": 1161859072,
+      "flush_summary": {
+        "calls": 678,
+        "dirty_bytes": 1167937536,
+        "nonzero_keep_calls": 0
+      }
+    }
+  },
+  "comparison": {
+    "trials": [
+      {
+        "relay": "baseline-full1",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1429.0749721206123,
+        "latency_p50_ms": 21.487,
+        "latency_p90_ms": 26.991,
+        "latency_p99_ms": 45.471,
+        "latency_max_ms": 61.471,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1181634982,
+          "syscr": 0,
+          "syscw": 280062,
+          "read_bytes": 8232960,
+          "write_bytes": 1184305152,
+          "cancelled_write_bytes": 0
+        },
+        "case": "baseline-full1",
+        "parameters": {
+          "label": "baseline-full1",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-lab:vm-canary-20260906",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": null,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "baseline-full2",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1406.3574635533757,
+        "latency_p50_ms": 22.303,
+        "latency_p90_ms": 25.935,
+        "latency_p99_ms": 45.311,
+        "latency_max_ms": 65.663,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1172713798,
+          "syscr": 0,
+          "syscw": 277302,
+          "read_bytes": 524288,
+          "write_bytes": 1175379968,
+          "cancelled_write_bytes": 0
+        },
+        "case": "baseline-full2",
+        "parameters": {
+          "label": "baseline-full2",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-lab:vm-canary-20260906",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": null,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "baseline-full3",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1392.8179678272372,
+        "latency_p50_ms": 22.719,
+        "latency_p90_ms": 26.703,
+        "latency_p99_ms": 32.863,
+        "latency_max_ms": 54.463,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1181200870,
+          "syscr": 0,
+          "syscw": 279227,
+          "read_bytes": 0,
+          "write_bytes": 1183875072,
+          "cancelled_write_bytes": 0
+        },
+        "case": "baseline-full3",
+        "parameters": {
+          "label": "baseline-full3",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-lab:vm-canary-20260906",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": null,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "baseline-quota-full",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1377.411760164831,
+        "latency_p50_ms": 22.335,
+        "latency_p90_ms": 27.647,
+        "latency_p99_ms": 41.375,
+        "latency_max_ms": 76.799,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1203758038,
+          "syscr": 0,
+          "syscw": 286049,
+          "read_bytes": 17096704,
+          "write_bytes": 1206431744,
+          "cancelled_write_bytes": 0
+        },
+        "case": "baseline-quota-full",
+        "parameters": {
+          "label": "baseline-quota-full",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-lab:vm-canary-20260906",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": "quota.toml",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-0-full1",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1356.6676517281253,
+        "latency_p50_ms": 23.311,
+        "latency_p90_ms": 26.943,
+        "latency_p99_ms": 48.127,
+        "latency_max_ms": 68.479,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1166406006,
+          "syscr": 0,
+          "syscw": 275469,
+          "read_bytes": 0,
+          "write_bytes": 1169080320,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-0-full1",
+        "parameters": {
+          "label": "coalesce-0-full1",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 0,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-0-full2",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1426.3996206295078,
+        "latency_p50_ms": 21.679,
+        "latency_p90_ms": 25.023,
+        "latency_p99_ms": 44.735,
+        "latency_max_ms": 66.943,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1197921022,
+          "syscr": 0,
+          "syscw": 283527,
+          "read_bytes": 0,
+          "write_bytes": 1200594944,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-0-full2",
+        "parameters": {
+          "label": "coalesce-0-full2",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 0,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-0-full3",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1369.1706494214968,
+        "latency_p50_ms": 22.847,
+        "latency_p90_ms": 26.687,
+        "latency_p99_ms": 32.335,
+        "latency_max_ms": 69.055,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1185071558,
+          "syscr": 0,
+          "syscw": 279620,
+          "read_bytes": 14807040,
+          "write_bytes": 1187745792,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-0-full3",
+        "parameters": {
+          "label": "coalesce-0-full3",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 0,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-1000-full1",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1273.2180787816824,
+        "latency_p50_ms": 25.391,
+        "latency_p90_ms": 33.407,
+        "latency_p99_ms": 53.119,
+        "latency_max_ms": 71.231,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1132702398,
+          "syscr": 0,
+          "syscw": 267701,
+          "read_bytes": 2863104,
+          "write_bytes": 1134800896,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-1000-full1",
+        "parameters": {
+          "label": "coalesce-1000-full1",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 1000,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-1000-full2",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1229.4259320028416,
+        "latency_p50_ms": 26.719,
+        "latency_p90_ms": 33.535,
+        "latency_p99_ms": 50.943,
+        "latency_max_ms": 84.927,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1134652022,
+          "syscr": 0,
+          "syscw": 268296,
+          "read_bytes": 2740224,
+          "write_bytes": 1136746496,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-1000-full2",
+        "parameters": {
+          "label": "coalesce-1000-full2",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 1000,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-1000-full3",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1329.8774651674923,
+        "latency_p50_ms": 23.871,
+        "latency_p90_ms": 32.831,
+        "latency_p99_ms": 45.023,
+        "latency_max_ms": 60.543,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1125754566,
+          "syscr": 0,
+          "syscw": 266008,
+          "read_bytes": 0,
+          "write_bytes": 1127817216,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-1000-full3",
+        "parameters": {
+          "label": "coalesce-1000-full3",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 1000,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-3000-full1",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1101.2410917285094,
+        "latency_p50_ms": 28.191,
+        "latency_p90_ms": 35.359,
+        "latency_p99_ms": 48.575,
+        "latency_max_ms": 64.159,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1022301982,
+          "syscr": 0,
+          "syscw": 238822,
+          "read_bytes": 0,
+          "write_bytes": 1023729664,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-3000-full1",
+        "parameters": {
+          "label": "coalesce-3000-full1",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 3000,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-3000-full2",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1134.628277597245,
+        "latency_p50_ms": 27.231,
+        "latency_p90_ms": 34.527,
+        "latency_p99_ms": 38.175,
+        "latency_max_ms": 63.327,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1037248398,
+          "syscr": 0,
+          "syscw": 242756,
+          "read_bytes": 0,
+          "write_bytes": 1038680064,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-3000-full2",
+        "parameters": {
+          "label": "coalesce-3000-full2",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 3000,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "coalesce-3000-full3",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1065.9755354303813,
+        "latency_p50_ms": 30.399,
+        "latency_p90_ms": 36.159,
+        "latency_p99_ms": 49.247,
+        "latency_max_ms": 74.559,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1032587310,
+          "syscr": 0,
+          "syscw": 241146,
+          "read_bytes": 4358144,
+          "write_bytes": 1034022912,
+          "cancelled_write_bytes": 0
+        },
+        "case": "coalesce-3000-full3",
+        "parameters": {
+          "label": "coalesce-3000-full3",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 3000,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "control-full1",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1312.8215227909413,
+        "latency_p50_ms": 24.015,
+        "latency_p90_ms": 27.519,
+        "latency_p99_ms": 32.159,
+        "latency_max_ms": 69.247,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1171251742,
+          "syscr": 0,
+          "syscw": 276896,
+          "read_bytes": 5885952,
+          "write_bytes": 1173925888,
+          "cancelled_write_bytes": 0
+        },
+        "case": "control-full1",
+        "parameters": {
+          "label": "control-full1",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-lab:vm-canary-20260906",
+          "coalesce_us": 0,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "control-full2",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1415.7648745832298,
+        "latency_p50_ms": 22.543,
+        "latency_p90_ms": 26.175,
+        "latency_p99_ms": 46.559,
+        "latency_max_ms": 70.143,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1159851966,
+          "syscr": 0,
+          "syscw": 273761,
+          "read_bytes": 11857920,
+          "write_bytes": 1162518528,
+          "cancelled_write_bytes": 0
+        },
+        "case": "control-full2",
+        "parameters": {
+          "label": "control-full2",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-lab:vm-canary-20260906",
+          "coalesce_us": 0,
+          "events": 10000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "lazy-full1",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1370.497424278164,
+        "latency_p50_ms": 22.127,
+        "latency_p90_ms": 26.175,
+        "latency_p99_ms": 49.311,
+        "latency_max_ms": 83.007,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1135031078,
+          "syscr": 0,
+          "syscw": 267803,
+          "read_bytes": 18853888,
+          "write_bytes": 1137700864,
+          "cancelled_write_bytes": 0
+        },
+        "case": "lazy-full1",
+        "parameters": {
+          "label": "lazy-full1",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:lazy",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": null,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "lazy-full2",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1439.1103531701922,
+        "latency_p50_ms": 21.775,
+        "latency_p90_ms": 25.439,
+        "latency_p99_ms": 38.303,
+        "latency_max_ms": 75.903,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1118593566,
+          "syscr": 0,
+          "syscw": 263814,
+          "read_bytes": 11812864,
+          "write_bytes": 1121263616,
+          "cancelled_write_bytes": 0
+        },
+        "case": "lazy-full2",
+        "parameters": {
+          "label": "lazy-full2",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:lazy",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": null,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "lazy-full3",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1547.0908049195468,
+        "latency_p50_ms": 20.159,
+        "latency_p90_ms": 25.215,
+        "latency_p99_ms": 43.167,
+        "latency_max_ms": 62.207,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1074373230,
+          "syscr": 0,
+          "syscw": 253956,
+          "read_bytes": 651264,
+          "write_bytes": 1077043200,
+          "cancelled_write_bytes": 0
+        },
+        "case": "lazy-full3",
+        "parameters": {
+          "label": "lazy-full3",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:lazy",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": null,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "lazy-quota-full",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1333.646675042191,
+        "latency_p50_ms": 23.551,
+        "latency_p90_ms": 27.855,
+        "latency_p99_ms": 40.671,
+        "latency_max_ms": 65.855,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1215194038,
+          "syscr": 0,
+          "syscw": 289042,
+          "read_bytes": 507904,
+          "write_bytes": 1217867776,
+          "cancelled_write_bytes": 0
+        },
+        "case": "lazy-quota-full",
+        "parameters": {
+          "label": "lazy-quota-full",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:lazy",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": "quota.toml",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "profile-coalesce-full",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1225.9154170098345,
+        "latency_p50_ms": 26.367,
+        "latency_p90_ms": 36.063,
+        "latency_p99_ms": 51.711,
+        "latency_max_ms": 83.135,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1132235343,
+          "syscr": 0,
+          "syscw": 335653,
+          "read_bytes": 6520832,
+          "write_bytes": 1133842432,
+          "cancelled_write_bytes": 0
+        },
+        "case": "profile-coalesce-full",
+        "parameters": {
+          "label": "profile-coalesce-full",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:profile2",
+          "coalesce_us": 1000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "profile-detail-full",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1365.8626140913184,
+        "latency_p50_ms": 22.799,
+        "latency_p90_ms": 27.535,
+        "latency_p99_ms": 50.239,
+        "latency_max_ms": 70.463,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1173542362,
+          "syscr": 0,
+          "syscw": 364469,
+          "read_bytes": 524288,
+          "write_bytes": 1175597056,
+          "cancelled_write_bytes": 0
+        },
+        "case": "profile-detail-full",
+        "parameters": {
+          "label": "profile-detail-full",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:profile2",
+          "coalesce_us": 0,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "profile-empty",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 2206.486378749601,
+        "latency_p50_ms": 14.519,
+        "latency_p90_ms": 17.455,
+        "latency_p99_ms": 19.663,
+        "latency_max_ms": 24.031,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 441057064,
+          "syscr": 0,
+          "syscw": 158739,
+          "read_bytes": 0,
+          "write_bytes": 443199488,
+          "cancelled_write_bytes": 0
+        },
+        "case": "profile-empty",
+        "parameters": {
+          "label": "profile-empty",
+          "full": false,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:profile",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "profile-full",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1369.7394791466324,
+        "latency_p50_ms": 23.039,
+        "latency_p90_ms": 28.111,
+        "latency_p99_ms": 47.551,
+        "latency_max_ms": 69.823,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1168503208,
+          "syscr": 0,
+          "syscw": 350168,
+          "read_bytes": 1654784,
+          "write_bytes": 1170653184,
+          "cancelled_write_bytes": 0
+        },
+        "case": "profile-full",
+        "parameters": {
+          "label": "profile-full",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:profile",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "single-0-full",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 290.8241071556825,
+        "latency_p50_ms": 3.461,
+        "latency_p90_ms": 4.207,
+        "latency_p99_ms": 5.587,
+        "latency_max_ms": 6.023,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "1 concurrent connection(s): accepted 1000/1000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83aebd22f9cc346c845b7516777382b46e8451bfec840b9f326949371821da41",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 397180717,
+          "syscr": 0,
+          "syscw": 98838,
+          "read_bytes": 0,
+          "write_bytes": 401350656,
+          "cancelled_write_bytes": 0
+        },
+        "case": "single-0-full",
+        "parameters": {
+          "label": "single-0-full",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 1,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 0,
+          "events": 1000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "single-1000-full",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 158.50869581494993,
+        "latency_p50_ms": 6.819,
+        "latency_p90_ms": 7.463,
+        "latency_p99_ms": 8.415,
+        "latency_max_ms": 13.743,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "1 concurrent connection(s): accepted 1000/1000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83aebd22f9cc346c845b7516777382b46e8451bfec840b9f326949371821da41",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 397180741,
+          "syscr": 0,
+          "syscw": 98841,
+          "read_bytes": 17674240,
+          "write_bytes": 401350656,
+          "cancelled_write_bytes": 0
+        },
+        "case": "single-1000-full",
+        "parameters": {
+          "label": "single-1000-full",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 1,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 1000,
+          "events": 1000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "single-3000-full",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 117.4272326678007,
+        "latency_p50_ms": 8.775,
+        "latency_p90_ms": 9.655,
+        "latency_p99_ms": 10.679,
+        "latency_max_ms": 14.831,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "1 concurrent connection(s): accepted 1000/1000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83aebd22f9cc346c845b7516777382b46e8451bfec840b9f326949371821da41",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 397180765,
+          "syscr": 0,
+          "syscw": 98844,
+          "read_bytes": 0,
+          "write_bytes": 401354752,
+          "cancelled_write_bytes": 0
+        },
+        "case": "single-3000-full",
+        "parameters": {
+          "label": "single-3000-full",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 1,
+          "image": "wok-write-lab:coalesce",
+          "coalesce_us": 3000,
+          "events": 1000,
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      }
+    ],
+    "medians": {
+      "coalesce-0": {
+        "trials": 3,
+        "throughput_per_s": 1369.1706494214968,
+        "latency_p50_ms": 22.847,
+        "latency_p99_ms": 44.735,
+        "write_bytes": 1187745792
+      },
+      "coalesce-1000": {
+        "trials": 3,
+        "throughput_per_s": 1273.2180787816824,
+        "latency_p50_ms": 25.391,
+        "latency_p99_ms": 50.943,
+        "write_bytes": 1134800896
+      },
+      "coalesce-3000": {
+        "trials": 3,
+        "throughput_per_s": 1101.2410917285094,
+        "latency_p50_ms": 28.191,
+        "latency_p99_ms": 48.575,
+        "write_bytes": 1034022912
+      },
+      "baseline": {
+        "trials": 3,
+        "throughput_per_s": 1406.3574635533757,
+        "latency_p50_ms": 22.303,
+        "latency_p99_ms": 45.311,
+        "write_bytes": 1183875072
+      },
+      "lazy": {
+        "trials": 3,
+        "throughput_per_s": 1439.1103531701922,
+        "latency_p50_ms": 21.775,
+        "latency_p99_ms": 43.167,
+        "write_bytes": 1121263616
+      }
+    }
+  },
+  "offline_verification": {
+    "profile-full": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }"
+    },
+    "profile-detail-full": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }"
+    },
+    "profile-coalesce-full": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }"
+    },
+    "coalesce-3000-full3": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }"
+    },
+    "baseline-full3": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }"
+    },
+    "lazy-full3": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 148608, author_count_errors: 0, lookup_errors: 0, issues: [] }"
+    },
+    "baseline-quota-full": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }"
+    },
+    "lazy-quota-full": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }"
+    }
+  },
+  "local_checks": {
+    "workspace_passed": 367,
+    "workspace_failed": 0,
+    "workspace_ignored": 1,
+    "clippy": "passed with -D warnings",
+    "format": "passed",
+    "diff_check": "passed"
+  },
+  "patches": {
+    "profile": "--- a/crates/wok-db/src/txn.rs\n+++ b/crates/wok-db/src/txn.rs\n@@ -21,11 +21,16 @@\n     _not_send_or_sync: PhantomData<Rc<()>>,\n }\n \n+unsafe extern \"C\" {\n+    fn wok_lab_dirty_bytes(txn: *mut MDB_txn) -> usize;\n+}\n+\n pub struct RwTxn<'env> {\n     pub(crate) txn: *mut MDB_txn,\n     pub(crate) env: &'env Env,\n     committed: bool,\n     lifetime: (),\n+    lab: std::collections::BTreeMap<MDB_dbi, (u64, u64, i64)>,\n     pub(crate) event_sequence: Option<u64>,\n     pub(crate) author_counts: std::collections::HashMap<Vec<u8>, u64>,\n     _not_send_or_sync: PhantomData<Rc<()>>,\n@@ -110,6 +115,7 @@\n             env,\n             committed: false,\n             lifetime: (),\n+            lab: Default::default(),\n             event_sequence: None,\n             author_counts: Default::default(),\n             _not_send_or_sync: PhantomData,\n@@ -131,7 +137,13 @@\n         val: &[u8],\n         flags: u32,\n     ) -> Result<bool, DbError> {\n-        put_raw(self.txn, dbi, key, val, flags)\n+        let before = unsafe { wok_lab_dirty_bytes(self.txn) } as i64;\n+        let result = put_raw(self.txn, dbi, key, val, flags);\n+        let after = unsafe { wok_lab_dirty_bytes(self.txn) } as i64;\n+        let entry = self.lab.entry(dbi).or_default();\n+        entry.0 += 1;\n+        entry.2 += after - before;\n+        result\n     }\n \n     pub fn put_u64(\n@@ -145,7 +157,13 @@\n     }\n \n     pub fn del(&mut self, dbi: MDB_dbi, key: &[u8], val: Option<&[u8]>) -> Result<bool, DbError> {\n-        del_raw(self.txn, dbi, key, val)\n+        let before = unsafe { wok_lab_dirty_bytes(self.txn) } as i64;\n+        let result = del_raw(self.txn, dbi, key, val);\n+        let after = unsafe { wok_lab_dirty_bytes(self.txn) } as i64;\n+        let entry = self.lab.entry(dbi).or_default();\n+        entry.1 += 1;\n+        entry.2 += after - before;\n+        result\n     }\n \n     pub fn del_u64(&mut self, dbi: MDB_dbi, key: u64, val: Option<&[u8]>) -> Result<bool, DbError> {\n@@ -197,6 +215,34 @@\n         #[cfg(test)]\n         crate::crash_tests::checkpoint(\"write-before-flush\");\n         crate::state::flush(&mut self)?;\n+        let d = self.env.dbis();\n+        let names = [\n+            (d.meta, \"meta\"),\n+            (d.negentropy_filter, \"negentropy_filter\"),\n+            (d.event, \"event\"),\n+            (d.event_id, \"event_id\"),\n+            (d.event_pubkey_kind, \"event_pubkey_kind\"),\n+            (d.event_tag, \"event_tag\"),\n+            (d.event_deletion, \"event_deletion\"),\n+            (d.event_replace, \"event_replace\"),\n+            (d.event_created_at, \"event_created_at\"),\n+            (d.event_pubkey, \"event_pubkey\"),\n+            (d.event_replace_deletion, \"event_replace_deletion\"),\n+            (d.event_kind, \"event_kind\"),\n+            (d.event_expiration, \"event_expiration\"),\n+            (d.compression_dictionary, \"compression_dictionary\"),\n+            (d.event_payload, \"event_payload\"),\n+            (d.negentropy, \"negentropy\"),\n+            (d.event_search.unwrap_or(u32::MAX), \"event_search\"),\n+            (d.vanish_pubkey.unwrap_or(u32::MAX), \"vanish_pubkey\"),\n+            (d.moderation.unwrap_or(u32::MAX), \"moderation\"),\n+            (d.state.unwrap_or(u32::MAX), \"state\"),\n+        ];\n+        for (dbi, (puts, dels, bytes)) in &self.lab {\n+            let name = names.iter().find(|(id, _)| id == dbi).map(|(_, name)| *name).unwrap_or(\"unknown\");\n+            eprintln!(\"LAB_DBI table={name} puts={puts} dels={dels} dirty_bytes={bytes}\");\n+        }\n+        eprintln!(\"LAB_PRECOMMIT dirty_bytes={}\", unsafe { wok_lab_dirty_bytes(self.txn) });\n         #[cfg(test)]\n         crate::crash_tests::checkpoint(\"write-before-commit\");\n         self.committed = true;\n--- a/lmdb-sys-0.8.0/lmdb/libraries/liblmdb/mdb.c\n+++ b/lmdb-sys-0.8.0/lmdb/libraries/liblmdb/mdb.c\n@@ -1952,6 +1952,22 @@\n \treturn rc;\n }\n \n+/* Diagnostic only: bytes currently eligible for a non-spill flush.\n+ * Includes overflow runs; excludes loose/kept pages just as page_flush does.\n+ * Only observed between synchronous calls in this workload's small RW txns.\n+ */\n+size_t wok_lab_dirty_bytes(MDB_txn *txn) {\n+    MDB_ID2L dl = txn->mt_u.dirty_list;\n+    size_t pages = 0;\n+    unsigned i;\n+    for (i = 1; i <= dl[0].mid; ++i) {\n+        MDB_page *p = dl[i].mptr;\n+        if (!(p->mp_flags & (P_LOOSE|P_KEEP)))\n+            pages += IS_OVERFLOW(p) ? p->mp_pages : 1;\n+    }\n+    return pages * txn->mt_env->me_psize;\n+}\n+\n static int mdb_page_flush(MDB_txn *txn, int keep);\n \n /**\tSpill pages from the dirty list back to disk.\n@@ -3273,6 +3289,7 @@\n \tint\t\t\tn = 0;\n #endif\n \n+\tfprintf(stderr, \"LAB_FLUSH txn=%lu keep=%d dirty_bytes=%lu\\n\", (unsigned long)txn->mt_txnid, keep, (unsigned long)wok_lab_dirty_bytes(txn));\n \tj = i = keep;\n \n \tif (env->me_flags & MDB_WRITEMAP) {\n",
+    "profile_detail_delta": "--- txn.profile.rs\n+++ txn.profile2.rs\n@@ -30,7 +30,7 @@\n     pub(crate) env: &'env Env,\n     committed: bool,\n     lifetime: (),\n-    lab: std::collections::BTreeMap<MDB_dbi, (u64, u64, i64)>,\n+    lab: std::collections::BTreeMap<(MDB_dbi, u8), (u64, u64, i64)>,\n     pub(crate) event_sequence: Option<u64>,\n     pub(crate) author_counts: std::collections::HashMap<Vec<u8>, u64>,\n     _not_send_or_sync: PhantomData<Rc<()>>,\n@@ -140,7 +140,7 @@\n         let before = unsafe { wok_lab_dirty_bytes(self.txn) } as i64;\n         let result = put_raw(self.txn, dbi, key, val, flags);\n         let after = unsafe { wok_lab_dirty_bytes(self.txn) } as i64;\n-        let entry = self.lab.entry(dbi).or_default();\n+        let entry = self.lab.entry((dbi, if Some(dbi) == self.env.dbis().event_search { key.first().copied().unwrap_or(0) } else { 0 })).or_default();\n         entry.0 += 1;\n         entry.2 += after - before;\n         result\n@@ -160,7 +160,7 @@\n         let before = unsafe { wok_lab_dirty_bytes(self.txn) } as i64;\n         let result = del_raw(self.txn, dbi, key, val);\n         let after = unsafe { wok_lab_dirty_bytes(self.txn) } as i64;\n-        let entry = self.lab.entry(dbi).or_default();\n+        let entry = self.lab.entry((dbi, if Some(dbi) == self.env.dbis().event_search { key.first().copied().unwrap_or(0) } else { 0 })).or_default();\n         entry.1 += 1;\n         entry.2 += after - before;\n         result\n@@ -238,8 +238,9 @@\n             (d.moderation.unwrap_or(u32::MAX), \"moderation\"),\n             (d.state.unwrap_or(u32::MAX), \"state\"),\n         ];\n-        for (dbi, (puts, dels, bytes)) in &self.lab {\n+        for ((dbi, prefix), (puts, dels, bytes)) in &self.lab {\n             let name = names.iter().find(|(id, _)| id == dbi).map(|(_, name)| *name).unwrap_or(\"unknown\");\n+            let name = if name == \"event_search\" { match prefix { 1 => \"event_search_term\", 2 => \"event_search_bigram\", _ => \"event_search_marker\" } } else { name };\n             eprintln!(\"LAB_DBI table={name} puts={puts} dels={dels} dirty_bytes={bytes}\");\n         }\n         eprintln!(\"LAB_PRECOMMIT dirty_bytes={}\", unsafe { wok_lab_dirty_bytes(self.txn) });\n",
+    "coalesce_not_adopted": "--- a/crates/wok-relay/src/server/writer.rs\n+++ b/crates/wok-relay/src/server/writer.rs\n@@ -26,10 +26,19 @@\n         batch_vanish.clear();\n         events.clear();\n         batch.push(msg);\n+        // Diagnostic prototype only: fixed upper bound, never extended by arrivals.\n+        let coalesce = std::env::var(\"LAB_COALESCE_US\").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);\n+        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(coalesce);\n         while batch.len() < WRITER_BATCH_MAX {\n             match rx.try_recv() {\n                 Ok(more) => batch.push(more),\n-                Err(_) => break,\n+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,\n+                Err(crossbeam_channel::TryRecvError::Empty) => {\n+                    match rx.recv_deadline(deadline) {\n+                        Ok(more) => batch.push(more),\n+                        Err(_) => break,\n+                    }\n+                }\n             }\n         }\n         // Filter out events from connections closed within this batch, like\n",
+    "lazy_counters": "diff --git a/crates/wok-db/src/state.rs b/crates/wok-db/src/state.rs\nindex 7d50695..e7fb2e7 100644\n--- a/crates/wok-db/src/state.rs\n+++ b/crates/wok-db/src/state.rs\n@@ -51,8 +51,9 @@ fn author_key(pubkey: &[u8]) -> Vec<u8> {\n     key\n }\n \n-/// Lazily initialize each author under the writer transaction. No startup\n-/// scan of the entire relay is required, and deletions initialize BEFORE removal.\n+/// Lazily initialize a requested count under the writer transaction. Quota\n+/// checks use this before mutation; authors whose count is never requested\n+/// need no stored counter. Existing counters are maintained even without quotas.\n pub fn author_count(txn: &mut RwTxn<'_>, pubkey: &[u8]) -> Result<u64, DbError> {\n     let dbi = txn\n         .env()\n@@ -89,14 +90,29 @@ pub fn change_author_count(\n     pubkey: &[u8],\n     insert: bool,\n ) -> Result<(), DbError> {\n-    let old = author_count(txn, pubkey)?;\n+    let dbi = txn\n+        .env()\n+        .dbis()\n+        .state\n+        .ok_or_else(|| DbError::msg(\"missing Wok state table\"))?;\n+    let key = author_key(pubkey);\n+    let old = if let Some(count) = txn.author_counts.get(&key) {\n+        *count\n+    } else if let Some(raw) = txn.get(dbi, &key)? {\n+        decode(raw)?\n+    } else {\n+        // No cached count can become stale. A later quota check derives the\n+        // current count from the author index, including earlier mutations\n+        // in the same transaction, then keeps it current from that point on.\n+        return Ok(());\n+    };\n     let count = if insert {\n         old.checked_add(1)\n     } else {\n         old.checked_sub(1)\n     }\n     .ok_or_else(|| DbError::msg(\"author count overflow or drift\"))?;\n-    txn.author_counts.insert(author_key(pubkey), count);\n+    txn.author_counts.insert(key, count);\n     Ok(())\n }\n \n"
+  },
+  "validation": "VERIFIED 26 trials; eight matching full event exports and clean integrity checks; original fixture unchanged; all containers stopped",
+  "artifact_sha256": {
+    "prepare-profile.py": "ca2a518660608b5abd2e6f3feb165e978f86c5c00942d84a569a2a86d6128c87",
+    "prepare-variants.py": "80b7eb1292ca7fa7e41d6437640a6a5ecc1488103700a2f9d999152027c4ab79",
+    "compare.py": "59054f47537402f9ee1ca8230d8166411fc9e8e99dae8d0a994c38697afe3f34",
+    "run-profile.py": "605df6b5950094ea3e6dbb5fd0dbcac346c5427f0712d0f230701f2151b73321",
+    "run-profile2.py": "056f62908288c35011cd065cf82ae3329a335a4da6424d5f540705a55cba418d",
+    "run-coalesce.py": "a5837dcb98677b50cb4380249c3c258252e639ab4e7835221b2c5e2792a3bb28",
+    "run-lazy.py": "605bcffb0a8c92c2615208dcaaa1cbfc8295cec9c0c74b8991dad136c5ec5d94",
+    "build-lazy.sh": "c425d82f0af5963dc5bbf49aac2a67ba3a43b945d68c8b43303a9b674cf6eca3",
+    "fingerprint.py": "5bff16239e1270b588a8b93364357c623318bd8ccdd4429b30371bbb947c4f59",
+    "summarize-profile.py": "7ec5d2e446e59847e362a4b28d092e8a89794400852ff63dc6576a05738f75f6",
+    "summarize.py": "b77b36eb1197da5bcc2797d6d278b8b5df52fad73ab20dc44d0dab2d7d1d4497",
+    "verify.py": "03b61ef37bd4abcf5f78eed4b9c760f3482cff8234a97043e34961b9a186db38",
+    "Dockerfile.profile": "05f51bd9ae801e9d58c949eae95583ee7e32258bc4e01492b758fd89923e7d27",
+    "Dockerfile.profile2": "beee88844ef08824b97c8e198dc2328db38bd33102ebf820cd3a499d53f9c778",
+    "Dockerfile.coalesce": "a18b75d7eef2a6d7f6fa9ca85a21f926a1c3e06e3e75b763e0e2fd7ef8f05ea0",
+    "Dockerfile.lazy": "fcae617b9064a3cd210c571a7c6c596f22e870053a55037caeca3a564e8bd1db",
+    "state.lazy.rs": "0d5a54a2a98a8780220ca6bd8babae88771c16df2d048ebe66f740d3a1809a88",
+    "workspace-tests.log": "751d6a78013db0b29aa211c984fcabe89be53a8d64bfd0cb7a1e762a4422ff80",
+    "db-tests.log": "04a61d627ac08c030fb0cec4330ffef94007d5bf3232df8052ed9dbeab44a752",
+    "clippy.log": "255ff54c181ee4b1844cd6e129eb5afb269e812ddd09ecc58c90c70cacbb3b3f"
+  }
+}

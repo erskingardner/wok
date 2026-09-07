@@ -1,0 +1,940 @@
+{
+  "date": "2026-09-07",
+  "decision": "park prototype; keep current master runtime and search layout",
+  "adoption_bar": "At least 20% sustained publication gain without material result, ranking, query latency, memory, security or durability regressions",
+  "scope": "Initial gate: three paired short publication bursts followed by sequential search; no concurrent mixed workload or new long soak",
+  "provenance": {
+    "baseline_source": "001a05705b84d90dc551c1a7c2a60788f5b3269f",
+    "baseline_runtime_commit": "eab76a1208b6c7a8685aa3aa110dcf9ad1f9406a",
+    "prototype_commit": "384bad8e95dbdc5a4f74f61288d6272da84459d9",
+    "fixture_helper_commit": "78e3486742e0de9fdf652d82d3c9c8c951df898c",
+    "prototype_branch": "codex/search-posting-prototype",
+    "baseline_binary_sha256": "6cbbdc145ed08cee6275ec28222acbef5f1ef2e82afb3f8dd14204e0d436c8cf",
+    "prototype_binary_sha256": "ef55b8b943fd0d6149f01d24cf331df69236df07c0ebba878a644acd4b8566d0",
+    "generator_binary_sha256": "d3a129a131162a5f113a23594830593e054493e9d628b7d188b342c38ae03145",
+    "source_archive_verification": {
+      "commit": "384bad8e95dbdc5a4f74f61288d6272da84459d9",
+      "matched_files": 127,
+      "ignored": "macOS AppleDouble metadata and AGENTS.md"
+    },
+    "image_ids": {
+      "baseline": "sha256:b74d7cb71d286bc6842f535721e70e6574ede109596962a9697ccec9c47ef6cf",
+      "phrases": "sha256:eee0de1a764ba1568673326b43e51f2172e65ae8c29670dee79348bf923271af"
+    }
+  },
+  "configuration": {
+    "relay_cpu_limit": 3,
+    "relay_memory_gib": 6,
+    "load_cpu_limit": 6,
+    "load_memory_gib": 12,
+    "swap": false,
+    "lmdb_map_bytes": 8589934592,
+    "durability": "synchronous LMDB unchanged",
+    "quota_per_author": 100000,
+    "global_quota": "unchanged default",
+    "rate_buckets": "disabled in isolated lab",
+    "toml": "# Isolated benchmark fixture. Admission limiting is deliberately disabled.\n# Bind the published host port to loopback or an isolated private interface.\n[database]\npath = \"/data/db\"\nmap_size = 8589934592\nmin_free_disk_bytes = 268435456\n[relay]\nbind = \"0.0.0.0\"\nport = 7777\nnofiles = 0\n[relay.abuse]\nenabled = true\nconnection_rate_per_second = 0\nevent_rate_per_second = 0\npubkey_event_rate_per_second = 0\nmax_stored_events_per_pubkey = 100000\nreq_rate_per_second = 0\n[observability]\nlog_format = \"json\"\n"
+  },
+  "method": {
+    "initial_events": 648000,
+    "fresh_copy_per_trial": true,
+    "both_search_layouts_rebuilt_before_trials": true,
+    "pair_order": [
+      "baseline, phrases",
+      "phrases, baseline",
+      "baseline, phrases"
+    ],
+    "events_per_trial": 10000,
+    "warmup_events_per_trial": 50,
+    "publish_connections": 32,
+    "search_queries_per_trial": 96,
+    "search_warmup_per_trial": 8,
+    "queries_per_group": 12,
+    "os_page_cache_explicitly_flushed": false,
+    "search_after_publication": true,
+    "search_max_ms_definition": "within-group maximum of 12 requests; aggregate is median across three trial maxima"
+  },
+  "differences_percent": {
+    "ratio_of_median_publication_throughputs": 10.902079713012647,
+    "paired_publication_gains": [
+      8.224789084112327,
+      15.873773412967363,
+      3.51532508939274
+    ],
+    "median_paired_publication_gain": 8.224789084112327,
+    "process_write_bytes": -21.296134041463343,
+    "reversed_phrase_median_latency": 17.732773792411717
+  },
+  "results": {
+    "trials": [
+      {
+        "relay": "baseline-full1",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1648.9527728165533,
+        "latency_p50_ms": 19.311,
+        "latency_p90_ms": 22.223,
+        "latency_p99_ms": 44.447,
+        "latency_max_ms": 223.231,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "case": "baseline-full1",
+        "parameters": {
+          "label": "baseline-full1",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:lazy",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": "quota.toml",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1212745694,
+          "syscr": 0,
+          "syscw": 256873,
+          "read_bytes": 1179648,
+          "write_bytes": 1215463424,
+          "cancelled_write_bytes": 0
+        },
+        "search": {
+          "rare": {
+            "queries": 12,
+            "p50_ms": 1.8924705000245012,
+            "max_ms": 2.3118289973353967
+          },
+          "reverse_phrase": {
+            "queries": 12,
+            "p50_ms": 364.28082400379935,
+            "max_ms": 372.6817000133451
+          },
+          "filtered_phrase": {
+            "queries": 12,
+            "p50_ms": 240.5700710005476,
+            "max_ms": 249.33300199336372
+          },
+          "intersection": {
+            "queries": 12,
+            "p50_ms": 2.5608180003473535,
+            "max_ms": 3.392269994947128
+          },
+          "multi_pair": {
+            "queries": 12,
+            "p50_ms": 656.2071244989056,
+            "max_ms": 730.5607490125112
+          },
+          "broad_term": {
+            "queries": 12,
+            "p50_ms": 172.65130700252485,
+            "max_ms": 182.6401060097851
+          },
+          "broad_phrase": {
+            "queries": 12,
+            "p50_ms": 415.4814530047588,
+            "max_ms": 445.05274599941913
+          },
+          "numeric_phrase": {
+            "queries": 12,
+            "p50_ms": 1.7162829972221516,
+            "max_ms": 2.530380996176973
+          }
+        },
+        "memory": {
+          "status-before-search.txt": {
+            "VmHWM": 889372672,
+            "VmRSS": 889372672
+          },
+          "status-after-search.txt": {
+            "VmHWM": 1065279488,
+            "VmRSS": 1065279488
+          }
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "baseline-full2",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1587.4837009119406,
+        "latency_p50_ms": 20.351,
+        "latency_p90_ms": 23.423,
+        "latency_p99_ms": 48.191,
+        "latency_max_ms": 59.775,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "case": "baseline-full2",
+        "parameters": {
+          "label": "baseline-full2",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:lazy",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": "quota.toml",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1201791798,
+          "syscr": 0,
+          "syscw": 254429,
+          "read_bytes": 0,
+          "write_bytes": 1204469760,
+          "cancelled_write_bytes": 0
+        },
+        "search": {
+          "rare": {
+            "queries": 12,
+            "p50_ms": 1.9606350033427589,
+            "max_ms": 2.3096460063243285
+          },
+          "reverse_phrase": {
+            "queries": 12,
+            "p50_ms": 368.8107444977504,
+            "max_ms": 390.96356100344565
+          },
+          "filtered_phrase": {
+            "queries": 12,
+            "p50_ms": 241.35853000188945,
+            "max_ms": 248.7471140048001
+          },
+          "intersection": {
+            "queries": 12,
+            "p50_ms": 2.7315230036037974,
+            "max_ms": 3.400261004571803
+          },
+          "multi_pair": {
+            "queries": 12,
+            "p50_ms": 660.5531780078309,
+            "max_ms": 682.6899269944988
+          },
+          "broad_term": {
+            "queries": 12,
+            "p50_ms": 175.60121249698568,
+            "max_ms": 183.70835301175248
+          },
+          "broad_phrase": {
+            "queries": 12,
+            "p50_ms": 421.82937899633544,
+            "max_ms": 464.09168899117503
+          },
+          "numeric_phrase": {
+            "queries": 12,
+            "p50_ms": 1.953760496689938,
+            "max_ms": 2.549066994106397
+          }
+        },
+        "memory": {
+          "status-before-search.txt": {
+            "VmHWM": 888651776,
+            "VmRSS": 888651776
+          },
+          "status-after-search.txt": {
+            "VmHWM": 1065713664,
+            "VmRSS": 1065713664
+          }
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "baseline-full3",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1609.1453515528115,
+        "latency_p50_ms": 19.631,
+        "latency_p90_ms": 22.911,
+        "latency_p99_ms": 45.055,
+        "latency_max_ms": 58.687,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "case": "baseline-full3",
+        "parameters": {
+          "label": "baseline-full3",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-write-lab:lazy",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": "quota.toml",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 1217745862,
+          "syscr": 0,
+          "syscw": 259127,
+          "read_bytes": 0,
+          "write_bytes": 1220423680,
+          "cancelled_write_bytes": 0
+        },
+        "search": {
+          "rare": {
+            "queries": 12,
+            "p50_ms": 1.8517005009925924,
+            "max_ms": 2.293894998729229
+          },
+          "reverse_phrase": {
+            "queries": 12,
+            "p50_ms": 361.4178095012903,
+            "max_ms": 381.11190299969167
+          },
+          "filtered_phrase": {
+            "queries": 12,
+            "p50_ms": 240.98843899264466,
+            "max_ms": 252.0936119981343
+          },
+          "intersection": {
+            "queries": 12,
+            "p50_ms": 2.79280349786859,
+            "max_ms": 3.3316349872620776
+          },
+          "multi_pair": {
+            "queries": 12,
+            "p50_ms": 654.2280335052055,
+            "max_ms": 685.0974929984659
+          },
+          "broad_term": {
+            "queries": 12,
+            "p50_ms": 171.3132385048084,
+            "max_ms": 174.92912900343072
+          },
+          "broad_phrase": {
+            "queries": 12,
+            "p50_ms": 413.6716709981556,
+            "max_ms": 445.6546629953664
+          },
+          "numeric_phrase": {
+            "queries": 12,
+            "p50_ms": 2.108904503984377,
+            "max_ms": 2.58948199916631
+          }
+        },
+        "memory": {
+          "status-before-search.txt": {
+            "VmHWM": 888307712,
+            "VmRSS": 888307712
+          },
+          "status-after-search.txt": {
+            "VmHWM": 1065394176,
+            "VmRSS": 1065394176
+          }
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "phrases-full1",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1784.5756604773367,
+        "latency_p50_ms": 17.775,
+        "latency_p90_ms": 21.135,
+        "latency_p99_ms": 29.903,
+        "latency_max_ms": 36.735,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "case": "phrases-full1",
+        "parameters": {
+          "label": "phrases-full1",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-search-lab:phrases",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": "quota.toml",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 953942686,
+          "syscr": 0,
+          "syscw": 218926,
+          "read_bytes": 0,
+          "write_bytes": 956616704,
+          "cancelled_write_bytes": 0
+        },
+        "search": {
+          "rare": {
+            "queries": 12,
+            "p50_ms": 1.948628996615298,
+            "max_ms": 2.4959339934866875
+          },
+          "reverse_phrase": {
+            "queries": 12,
+            "p50_ms": 431.9781345111551,
+            "max_ms": 460.21046899841167
+          },
+          "filtered_phrase": {
+            "queries": 12,
+            "p50_ms": 239.28483750205487,
+            "max_ms": 255.09022900951095
+          },
+          "intersection": {
+            "queries": 12,
+            "p50_ms": 3.368937505001668,
+            "max_ms": 3.692233993206173
+          },
+          "multi_pair": {
+            "queries": 12,
+            "p50_ms": 615.8933679907932,
+            "max_ms": 642.1187600062694
+          },
+          "broad_term": {
+            "queries": 12,
+            "p50_ms": 173.7882535016979,
+            "max_ms": 183.15604800591245
+          },
+          "broad_phrase": {
+            "queries": 12,
+            "p50_ms": 423.6398075008765,
+            "max_ms": 441.8350920022931
+          },
+          "numeric_phrase": {
+            "queries": 12,
+            "p50_ms": 2.101979000144638,
+            "max_ms": 3.241811995394528
+          }
+        },
+        "memory": {
+          "status-before-search.txt": {
+            "VmHWM": 657346560,
+            "VmRSS": 657346560
+          },
+          "status-after-search.txt": {
+            "VmHWM": 1007370240,
+            "VmRSS": 1007370240
+          }
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "phrases-full2",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1839.4772665624905,
+        "latency_p50_ms": 17.551,
+        "latency_p90_ms": 19.951,
+        "latency_p99_ms": 26.671,
+        "latency_max_ms": 37.055,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "case": "phrases-full2",
+        "parameters": {
+          "label": "phrases-full2",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-search-lab:phrases",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": "quota.toml",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 954647358,
+          "syscr": 0,
+          "syscw": 219261,
+          "read_bytes": 0,
+          "write_bytes": 957321216,
+          "cancelled_write_bytes": 0
+        },
+        "search": {
+          "rare": {
+            "queries": 12,
+            "p50_ms": 2.194558001065161,
+            "max_ms": 2.665296007762663
+          },
+          "reverse_phrase": {
+            "queries": 12,
+            "p50_ms": 418.06016649934463,
+            "max_ms": 471.5234640025301
+          },
+          "filtered_phrase": {
+            "queries": 12,
+            "p50_ms": 237.3602999941795,
+            "max_ms": 244.6151030017063
+          },
+          "intersection": {
+            "queries": 12,
+            "p50_ms": 3.074231499340385,
+            "max_ms": 4.0380419959547
+          },
+          "multi_pair": {
+            "queries": 12,
+            "p50_ms": 608.6711419993662,
+            "max_ms": 641.5698070049984
+          },
+          "broad_term": {
+            "queries": 12,
+            "p50_ms": 171.5853284986224,
+            "max_ms": 183.3249729970703
+          },
+          "broad_phrase": {
+            "queries": 12,
+            "p50_ms": 415.41316350048874,
+            "max_ms": 427.2104230039986
+          },
+          "numeric_phrase": {
+            "queries": 12,
+            "p50_ms": 2.253700004075654,
+            "max_ms": 3.1690220057498664
+          }
+        },
+        "memory": {
+          "status-before-search.txt": {
+            "VmHWM": 657731584,
+            "VmRSS": 657731584
+          },
+          "status-after-search.txt": {
+            "VmHWM": 1009786880,
+            "VmRSS": 1009786880
+          }
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      },
+      {
+        "relay": "phrases-full3",
+        "scenario": "ws_publish_scaled",
+        "repetition": 1,
+        "ok": true,
+        "throughput_per_s": 1665.7120418207444,
+        "latency_p50_ms": 18.847,
+        "latency_p90_ms": 21.295,
+        "latency_p99_ms": 33.599,
+        "latency_max_ms": 37.055,
+        "errors": 0,
+        "mismatches": 0,
+        "notes": "32 concurrent connection(s): accepted 10000/10000, rejected 0; storage not inspected (remote target)",
+        "os": "linux",
+        "arch": "x86_64",
+        "seed": 920260907,
+        "workload_seed": 9534272439762973896,
+        "event_mix": "realistic",
+        "base_timestamp": 1788764100,
+        "corpus_sha256": "83fa1bcbe0ae81a2c3c3b375ac3a6f6d532f3ac220f0e1fadbefc8c705d97640",
+        "profile": "smoke",
+        "client_tcp_nodelay": true,
+        "case": "phrases-full3",
+        "parameters": {
+          "label": "phrases-full3",
+          "full": true,
+          "trace": false,
+          "tmpfs": false,
+          "connections": 32,
+          "image": "wok-search-lab:phrases",
+          "coalesce_us": 0,
+          "events": 10000,
+          "config": "quota.toml",
+          "seed": 920260907,
+          "base_timestamp": 1788764100
+        },
+        "resource_delta": {
+          "rchar": 0,
+          "wchar": 931975902,
+          "syscr": 0,
+          "syscw": 213742,
+          "read_bytes": 1781760,
+          "write_bytes": 934653952,
+          "cancelled_write_bytes": 0
+        },
+        "search": {
+          "rare": {
+            "queries": 12,
+            "p50_ms": 1.955387502675876,
+            "max_ms": 2.5801599986152723
+          },
+          "reverse_phrase": {
+            "queries": 12,
+            "p50_ms": 428.8779184935265,
+            "max_ms": 455.4531840112759
+          },
+          "filtered_phrase": {
+            "queries": 12,
+            "p50_ms": 238.0969170044409,
+            "max_ms": 265.9197850007331
+          },
+          "intersection": {
+            "queries": 12,
+            "p50_ms": 3.1723264983156696,
+            "max_ms": 3.8472980086226016
+          },
+          "multi_pair": {
+            "queries": 12,
+            "p50_ms": 613.032913999632,
+            "max_ms": 637.8949039935833
+          },
+          "broad_term": {
+            "queries": 12,
+            "p50_ms": 170.83990150422323,
+            "max_ms": 176.10296999919228
+          },
+          "broad_phrase": {
+            "queries": 12,
+            "p50_ms": 427.66471200593514,
+            "max_ms": 459.8653870052658
+          },
+          "numeric_phrase": {
+            "queries": 12,
+            "p50_ms": 2.142441000614781,
+            "max_ms": 3.319399998872541
+          }
+        },
+        "memory": {
+          "status-before-search.txt": {
+            "VmHWM": 656994304,
+            "VmRSS": 656994304
+          },
+          "status-after-search.txt": {
+            "VmHWM": 1008410624,
+            "VmRSS": 1008410624
+          }
+        },
+        "relay_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        },
+        "load_state": {
+          "Running": false,
+          "OOMKilled": false,
+          "ExitCode": 0
+        }
+      }
+    ],
+    "medians": {
+      "baseline": {
+        "trials": 3,
+        "throughput_per_s": 1609.1453515528115,
+        "ack_p99_ms": 45.055,
+        "write_bytes": 1215463424,
+        "search": {
+          "rare": {
+            "p50_ms": 1.8924705000245012,
+            "max_ms": 2.3096460063243285
+          },
+          "reverse_phrase": {
+            "p50_ms": 364.28082400379935,
+            "max_ms": 381.11190299969167
+          },
+          "filtered_phrase": {
+            "p50_ms": 240.98843899264466,
+            "max_ms": 249.33300199336372
+          },
+          "intersection": {
+            "p50_ms": 2.7315230036037974,
+            "max_ms": 3.392269994947128
+          },
+          "multi_pair": {
+            "p50_ms": 656.2071244989056,
+            "max_ms": 685.0974929984659
+          },
+          "broad_term": {
+            "p50_ms": 172.65130700252485,
+            "max_ms": 182.6401060097851
+          },
+          "broad_phrase": {
+            "p50_ms": 415.4814530047588,
+            "max_ms": 445.6546629953664
+          },
+          "numeric_phrase": {
+            "p50_ms": 1.953760496689938,
+            "max_ms": 2.549066994106397
+          }
+        }
+      },
+      "phrases": {
+        "trials": 3,
+        "throughput_per_s": 1784.5756604773367,
+        "ack_p99_ms": 29.903,
+        "write_bytes": 956616704,
+        "search": {
+          "rare": {
+            "p50_ms": 1.955387502675876,
+            "max_ms": 2.5801599986152723
+          },
+          "reverse_phrase": {
+            "p50_ms": 428.8779184935265,
+            "max_ms": 460.21046899841167
+          },
+          "filtered_phrase": {
+            "p50_ms": 238.0969170044409,
+            "max_ms": 255.09022900951095
+          },
+          "intersection": {
+            "p50_ms": 3.1723264983156696,
+            "max_ms": 3.8472980086226016
+          },
+          "multi_pair": {
+            "p50_ms": 613.032913999632,
+            "max_ms": 641.5698070049984
+          },
+          "broad_term": {
+            "p50_ms": 171.5853284986224,
+            "max_ms": 183.15604800591245
+          },
+          "broad_phrase": {
+            "p50_ms": 423.6398075008765,
+            "max_ms": 441.8350920022931
+          },
+          "numeric_phrase": {
+            "p50_ms": 2.142441000614781,
+            "max_ms": 3.241811995394528
+          }
+        }
+      }
+    }
+  },
+  "query_equivalence": {
+    "baseline-full1": {
+      "queries": 96,
+      "ordered_filter_results_sha256": "d35f995711de4a19adc998f4c8217f4f90151788e97ad2f7dd029542614f7266"
+    },
+    "baseline-full2": {
+      "queries": 96,
+      "ordered_filter_results_sha256": "d35f995711de4a19adc998f4c8217f4f90151788e97ad2f7dd029542614f7266"
+    },
+    "baseline-full3": {
+      "queries": 96,
+      "ordered_filter_results_sha256": "d35f995711de4a19adc998f4c8217f4f90151788e97ad2f7dd029542614f7266"
+    },
+    "phrases-full1": {
+      "queries": 96,
+      "ordered_filter_results_sha256": "d35f995711de4a19adc998f4c8217f4f90151788e97ad2f7dd029542614f7266"
+    },
+    "phrases-full2": {
+      "queries": 96,
+      "ordered_filter_results_sha256": "d35f995711de4a19adc998f4c8217f4f90151788e97ad2f7dd029542614f7266"
+    },
+    "phrases-full3": {
+      "queries": 96,
+      "ordered_filter_results_sha256": "d35f995711de4a19adc998f4c8217f4f90151788e97ad2f7dd029542614f7266"
+    }
+  },
+  "offline_verification": {
+    "fixture-baseline": {
+      "fingerprint": {
+        "events": 648000,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "2c8bca542a5bc3f27096661d3457c50fffd7cbd90a7081ad578d840bb065ff9a",
+        "kinds": {
+          "0": 32544,
+          "1": 452736,
+          "3": 32544,
+          "7": 32544,
+          "9735": 32544,
+          "10002": 32544,
+          "30023": 32544
+        }
+      },
+      "integrity": "IntegrityReport { events: 648000, payloads: 648000, expected_index_entries: 11365056, actual_index_entries: 11365056, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 148608, author_count_errors: 0, lookup_errors: 0, issues: [] }",
+      "image": "wok-write-lab:lazy"
+    },
+    "fixture-phrases": {
+      "fingerprint": {
+        "events": 648000,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "2c8bca542a5bc3f27096661d3457c50fffd7cbd90a7081ad578d840bb065ff9a",
+        "kinds": {
+          "0": 32544,
+          "1": 452736,
+          "3": 32544,
+          "7": 32544,
+          "9735": 32544,
+          "10002": 32544,
+          "30023": 32544
+        }
+      },
+      "integrity": "IntegrityReport { events: 648000, payloads: 648000, expected_index_entries: 8726976, actual_index_entries: 8726976, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 148608, author_count_errors: 0, lookup_errors: 0, issues: [] }",
+      "image": "wok-search-lab:phrases"
+    },
+    "baseline-full3": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 11541412, actual_index_entries: 11541412, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }",
+      "image": "wok-write-lab:lazy"
+    },
+    "phrases-full3": {
+      "fingerprint": {
+        "events": 658050,
+        "duplicate_ids": 0,
+        "canonical_event_fingerprint": "4c1781057d966dc2eb540d13069994bbdbf3e84e9b4f7fbd3a8cb2fb4b8da10b",
+        "kinds": {
+          "0": 33047,
+          "1": 459768,
+          "3": 33047,
+          "7": 33047,
+          "9735": 33047,
+          "10002": 33047,
+          "30023": 33047
+        }
+      },
+      "integrity": "IntegrityReport { events: 658050, payloads: 658050, expected_index_entries: 8862387, actual_index_entries: 8862387, missing_payloads: [], orphan_payloads: [], missing_index_entries: 0, extra_index_entries: 0, malformed_records: 0, packed_parse_errors: 0, payload_parse_errors: 0, metadata_errors: 0, author_counts_checked: 150652, author_count_errors: 0, lookup_errors: 0, issues: [] }",
+      "image": "wok-search-lab:phrases"
+    }
+  },
+  "original_source_sha256_before_and_after": "0132ac251b9034bfa2f52e26a19ea5b06136f651f31d81c26152d475d36a2f27",
+  "containers_left_running": {
+    "relay": false,
+    "load": false
+  },
+  "local_validation": {
+    "workspace_tests_passed": 371,
+    "failed": 0,
+    "ignored": 1,
+    "clippy_warnings_denied": "passed",
+    "format": "passed",
+    "diff_check": "passed"
+  },
+  "not_tested": [
+    "long sustained capacity",
+    "mixed concurrent publication and search",
+    "broader content distributions",
+    "new Linux power-failure campaign",
+    "production upgrade and rollback policy"
+  ],
+  "artifacts_sha256": {
+    "source.tar.gz": "280d57487205d822bd67c7971e990f6a7495e783954fba9bb6aa4060bc47fdf9",
+    "build.sh": "6c4a1853888763dcac6bcf06dd317a085d6b7a870404b19890391385865e280e",
+    "build.log": "3daa7b921f15a44d492a99601e734130901ce68c4881cff29948e2f457230350",
+    "helper-build.log": "42a2faec3d30d46bb375f883306072259d20ff4873856b9e1896e148402857d8",
+    "Dockerfile": "fb9595d2c58d7fce70c7ff37dedd3456a4dde585db1b25aa6d697c2863ec7bc5",
+    "quota.toml": "464a22d77807cbaa7858647a3ae33d17bcbbe5541bd0b4683d87e0d91da93082",
+    "prepare-fixtures.py": "578adb158f83068e64cf004790d018c2ddb828cd8f3397b98e7d3e1b9cc3eb77",
+    "compare.py": "76fddcb861e1650ac2e6a925f1e48253fd893b27f102ae386428989b115523c1",
+    "run-gate.py": "b65d1401cdeb31f9ca58e34f4df8c20099a5531555453a97a7066323155b0ac6",
+    "search_client.py": "1d64ba4bfd28b373f59156b096ea2ca7444400b3e0a4bae04d07936ff3e28517",
+    "summarize.py": "c8eb138d0102baeea210741bb9933fc5ea1387b46a98ce4673fa5fbc79b52044",
+    "verify.py": "0241fd315180cfcdfd2bf100bcbb8a893f217b6c8c18fc0e0e0a855015c913c7",
+    "export-report.py": "f0f6c32f416248665b9d03a03d9b29cb6a6cb863aa50f58a525ebf9ba4bbca4d",
+    "workspace-tests.log": "023322dca575cb90b424522eb1920f380a2c719d31b8171020f6ba76314132a3",
+    "clippy.log": "c648ee82007ea45ac670113d388d2e8e50a8f284b108842a3a95f959dbb43842",
+    "archive-source-verification.json": "d791e4ff5a6a51bd2684d65bef7327465ef283783654d3c1c1e8f6e7d081f32f"
+  }
+}

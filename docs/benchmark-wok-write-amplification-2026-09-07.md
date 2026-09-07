@@ -180,7 +180,12 @@ Raw scripts, profiling binaries and logs remain in
 `bench-results/lab/wok-write-amplification-20260907/`; database copies and full
 exports remain on the VMs.
 
-The next substantial target is search posting representation and locality,
+Follow-up: an [event-local phrase index experiment](benchmark-search-layout-2026-09-07.md)
+reduced publication writes but produced modest throughput gains and a phrase
+query regression. That prototype was parked; the current layout is retained.
+
+The next substantial target identified by this investigation was search posting
+representation and locality,
 measured against unchanged search results and ranking. A useful experiment must
 include rare/common terms, phrase ranking, broad scans, mixed publication/search,
 replacement/deletion, rebuild, crash recovery and memory bounds. Changing the

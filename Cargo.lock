@@ -2776,7 +2776,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wok-bench"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "wok-cli"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2839,7 +2839,7 @@ dependencies = [
 
 [[package]]
 name = "wok-compat"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2865,7 +2865,7 @@ dependencies = [
 
 [[package]]
 name = "wok-db"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "flatbuffers",
  "hex",
@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "wok-event"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "hex",
  "proptest",
@@ -2901,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "wok-negentropy"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "hex",
  "lmdb-sys",
@@ -2918,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "wok-query"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "hex",
  "lmdb-sys",
@@ -2934,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "wok-relay"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -2961,7 +2961,7 @@ dependencies = [
 
 [[package]]
 name = "wok-unix"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "libc",
  "nix 0.29.0",
@@ -2976,7 +2976,7 @@ dependencies = [
 
 [[package]]
 name = "wok-ws"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",

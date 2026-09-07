@@ -24,7 +24,7 @@ Operator and design documentation. Code remains the authority for current behavi
 | `observability.md` | Metrics / tracing |
 | `admin-dashboard.md` | `/admin` |
 | `unix-socket.md` | Length-prefixed Unix protocol |
-| `mesh-and-maintenance.md` | router/stream/sync, doctor, reindex |
+| `mesh-and-maintenance.md` | router/sync, doctor, reindex |
 | `releases.md` | Tag and GitHub release process |
 | `reliability.md` | CI gates, generated integration tests, Linux soak and evidence limits |
 | `load-lab.md` | Local / two-VM Docker benchmark lab and SSH setup |

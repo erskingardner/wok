@@ -319,7 +319,10 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
 
     println!("Migrated {} events from strfry.", before.count);
     if source_integrity.superseded_events != 0 {
-        println!("Retained {} superseded events in {} replacement groups; relay reads serve only the winners.", source_integrity.superseded_events, source_integrity.superseded_groups);
+        println!(
+            "Retained {} superseded events in {} replacement groups; relay reads serve only the winners.",
+            source_integrity.superseded_events, source_integrity.superseded_groups,
+        );
     }
     println!("Wok config: {}", final_config.display());
     println!("Manifest: {}", output.join(MANIFEST_NAME).display());

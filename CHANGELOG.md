@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaceable events even when a lossless import retained multiple versions.
   Contact lists (kind 3), other replaceable kinds, and addressable events share
   timestamp/ID winner selection independent of query filters. Physical records
-  remain intact; sync filters that may include replaceable events use the
-  bounded filtered view instead of an unfiltered persistent tree.
+  remain intact. A transactional retained-history count preserves persistent
+  negentropy trees for clean databases; filters that may include superseded
+  records use the bounded filtered view.
 
 ## [0.6.1] - 2026-09-07
 

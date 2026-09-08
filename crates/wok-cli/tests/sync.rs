@@ -741,3 +741,42 @@ fn filtered_sync_view_respects_the_configured_event_budget() {
         .unwrap()
         .contains("filtered sync view exceeds"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_replacement_databases_sync_above_the_memory_view_event_limit() {
+    let local = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let options =
+        "[relay]\nmax_sync_events=1\n[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n";
+    let lc = config(local.path(), options);
+    let rc = config(remote.path(), options);
+    let events: Vec<_> = [0, 3, 41, 10002, 30443].into_iter().map(event).collect();
+    import(&lc, &events);
+    import(&rc, &events);
+    let server = serve(&rc).await;
+    let output = sync(&lc, &server.url, &["--check", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(summary(&output)["have"], 0);
+    assert_eq!(summary(&output)["need"], 0);
+}
+
+#[test]
+fn filtered_sync_reports_insufficient_round_memory_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "[relay]\nsync_memory_per_connection=1048576\n");
+    drop(replacement::seed(
+        &dir.path().join("db"),
+        &replacement::events(3),
+        5,
+    ));
+    let output = sync(&cfg, "ws://127.0.0.1:1", &["--check", "--json"]);
+    assert!(!output.status.success());
+    assert!(summary(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("sync_memory_per_connection and sync_memory_total for protocol rounds"));
+}

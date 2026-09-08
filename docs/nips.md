@@ -48,9 +48,11 @@ local insertion order. For addressable events, NIP-09 `a`-tag deletions remove
 every matching version at or before the deletion timestamp, preserving newer
 versions.
 
-Persistent negentropy trees represent physical storage. Filters that can
-include stored replaceable events use the bounded, visibility-filtered memory
-view instead, subject to the existing sync event and memory limits. Physical
+Persistent negentropy trees represent physical storage. A transactional count
+of retained superseded versions keeps clean databases on the persistent-tree
+fast path, including databases containing profiles and contact lists. When
+retained history exists, filters that can include replaceable events use the
+bounded, visibility-filtered memory view, subject to sync event and memory limits. Physical
 history remains intact; migration, reindex, and operator export retain their
 storage-preservation semantics.
 

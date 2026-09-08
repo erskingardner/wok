@@ -643,3 +643,91 @@ fn integrity_reports_retained_versions_without_treating_them_as_corruption() {
     assert_eq!(json["superseded_groups"], 3);
     assert_eq!(json["superseded_events"], 6);
 }
+
+#[test]
+fn physical_tree_fast_path_tracks_retained_history_transactionally() {
+    let key = key();
+    for kind in [0, 3, 41, 10002, 30443] {
+        let old = event(&key, kind, 100, json!([]), "old");
+        let newest = event(&key, kind, 200, json!([]), "newest");
+        let (_dir, env) = snapshot(std::slice::from_ref(&old));
+        let filter = NostrFilterGroup::from_value(&json!({}), 500, 3, 16).unwrap();
+        let visible = |env: &Env| {
+            wok_query::visibility::physical_tree_is_globally_visible(
+                &env.begin_ro().unwrap(),
+                &filter.filters[0],
+            )
+            .unwrap()
+        };
+        assert!(visible(&env), "clean kind {kind}");
+        wok_compat::write_event_to_env(&env, &newest);
+        assert!(visible(&env), "normal replacement kind {kind}");
+
+        let (_dir, dirty) = snapshot(&[old, newest]);
+        assert!(!visible(&dirty));
+        {
+            let mut txn = dirty.begin_rw().unwrap();
+            wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [1]).unwrap();
+            // Abort must not turn the committed history into a clean proof.
+        }
+        assert!(!visible(&dirty));
+        let before = dirty.begin_ro().unwrap();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut txn = dirty.begin_rw().unwrap();
+                    wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [1]).unwrap();
+                    txn.commit().unwrap();
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(!wok_query::visibility::physical_tree_is_globally_visible(
+            &before,
+            &filter.filters[0]
+        )
+        .unwrap());
+        drop(before);
+        assert!(visible(&dirty), "history cleared kind {kind}");
+    }
+}
+
+#[test]
+fn older_databases_initialize_history_counts_without_changing_events() {
+    let key = key();
+    let events = [
+        event(&key, 3, 100, json!([]), "old"),
+        event(&key, 3, 200, json!([]), "new"),
+    ];
+    for records in [&events[..1], &events[..]] {
+        let (_dir, env) = snapshot(records);
+        let before = stored_ids(&env);
+        let filter = NostrFilterGroup::from_value(&json!({}), 500, 3, 16).unwrap();
+        {
+            let mut txn = env.begin_rw().unwrap();
+            // Model a database written before replacement bookkeeping existed.
+            txn.clear(env.dbis().state.unwrap()).unwrap();
+            txn.commit().unwrap();
+        }
+        assert!(!wok_query::visibility::physical_tree_is_globally_visible(
+            &env.begin_ro().unwrap(),
+            &filter.filters[0]
+        )
+        .unwrap());
+        env.ensure_initialized().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(
+            wok_db::state::superseded_events_ro(&txn).unwrap(),
+            Some(records.len() as u64 - 1)
+        );
+        assert_eq!(
+            wok_query::visibility::physical_tree_is_globally_visible(&txn, &filter.filters[0])
+                .unwrap(),
+            records.len() == 1
+        );
+        assert!(wok_db::check_integrity(&txn).unwrap().ok());
+        wok_negentropy::verify_tree(&txn, 1, "{}").unwrap();
+        drop(txn);
+        assert_eq!(stored_ids(&env), before);
+    }
+}

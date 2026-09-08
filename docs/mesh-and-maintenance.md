@@ -109,7 +109,12 @@ execute that plugin.
 
 Local sync views use the same global visibility rules whether a matching
 persistent tree exists or not. A physical tree is used only when it can bypass
-those checks safely; otherwise sync builds a filtered view. Construction is
+those checks safely; otherwise sync builds a filtered view. Replacement kinds
+alone do not disable the tree: Wok tracks the number of retained superseded
+versions transactionally. First writable initialization of an older database
+counts its replacement index once; reindex rebuilds the count. Neither operation
+purges signed events. Clearing the last stale version restores the fast path.
+Construction is
 bounded by `relay.max_sync_events`, `relay.sync_memory_per_connection`, and
 `relay.sync_memory_total`, using conservative per-event estimates. Exceeding the
 budget fails explicitly before connecting; narrow the filter or review the

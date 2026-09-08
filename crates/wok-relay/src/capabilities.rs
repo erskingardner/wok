@@ -55,8 +55,6 @@ impl CapabilityCondition {
 
 /// The authoritative capability catalog for NIP-11, documentation, and tests.
 pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
-    // Includes latest-only replaceable reads even with retained source history;
-    // wire, COUNT, search, and NIP-77 coverage lives in replaceable_events.rs.
     RelayCapability {
         nip: 1,
         name: "Basic protocol",

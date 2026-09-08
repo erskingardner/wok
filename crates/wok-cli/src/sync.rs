@@ -171,17 +171,16 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
             None => {
                 // Match the relay's conservative construction budget. Falling
                 // back from a physical tree must not allocate an unbounded view.
-                let per_item = if filter_group.requires_content() {
-                    1024
-                } else {
-                    192
-                };
-                let memory_cap = cfg
+                let per_item =
+                    wok_negentropy::memory_view_item_bytes(filter_group.requires_content());
+                let memory_budget = cfg
                     .relay
                     .sync_memory_per_connection
-                    .min(cfg.relay.sync_memory_total)
-                    .saturating_sub(4 * 1024 * 1024)
-                    / per_item;
+                    .min(cfg.relay.sync_memory_total);
+                let view_budget = memory_budget.checked_sub(wok_negentropy::ROUND_MEMORY_BYTES)
+                    .ok_or_else(|| anyhow::anyhow!("filtered sync requires at least {} bytes of sync_memory_per_connection and sync_memory_total for protocol rounds", wok_negentropy::ROUND_MEMORY_BYTES))?;
+                // The overflow sentinel is also stored during construction.
+                let memory_cap = (view_budget / per_item).saturating_sub(1);
                 let cap = cfg.relay.max_sync_events.min(memory_cap);
                 let mut levs = Vec::new();
                 foreach_by_filter_scan(
@@ -427,15 +426,18 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                     let Some(id) = have.pop_front() else { break };
                     if let Some((lev, raw)) = wok_db::lookup_event_by_id_ro(&txn, &id)? {
                         let packed = PackedEventView::new(&raw)?;
-                        // A newer version may arrive after the reconciliation snapshot.
-                        if wok_db::is_event_superseded_ro(&txn, packed)? {
-                            report.upload_superseded += 1;
-                            continue;
-                        }
                         if !wok_query::visibility::ReadVisibility::default()
                             .globally_visible(&txn, packed)?
                         {
-                            report.unavailable += 1;
+                            // Classify only a hidden event: visible uploads need
+                            // one replacement lookup. Other visibility changes
+                            // mean the negotiated transfer is incomplete, and
+                            // retain the existing non-success outcome.
+                            if wok_db::is_event_superseded_ro(&txn, packed)? {
+                                report.upload_superseded += 1;
+                            } else {
+                                report.unavailable += 1;
+                            }
                             continue;
                         }
                         let event = event_json_owned(

@@ -26,3 +26,15 @@ pub use types::{Bound, Item, MAX_U64, PROTOCOL_VERSION};
 pub use vector::{SubRange, Vector};
 
 pub use btree::{BTreeBackend, BTreeCore, Key, Node, NodePtr, MAX_ITEMS, NODE_SIZE};
+
+/// Conservative reservation for protocol rounds, shared by relay and CLI sync.
+pub const ROUND_MEMORY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Construction peak per filtered event, including query dedup and vector growth.
+pub fn memory_view_item_bytes(has_search: bool) -> u64 {
+    if has_search {
+        1024
+    } else {
+        256
+    }
+}

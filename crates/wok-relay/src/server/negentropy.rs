@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wok_negentropy::{Negentropy, Vector};
 
 // Covers protocol input/output buffers, query/filter state and traversal stacks.
-const ROUND_BYTES: u64 = 4 * 1024 * 1024;
+use wok_negentropy::ROUND_MEMORY_BYTES as ROUND_BYTES;
 
 #[derive(Default)]
 pub(super) struct MemoryPool(Mutex<MemoryUsage>);
@@ -261,11 +261,9 @@ pub(super) fn run_negentropy(
                         f.limit = f.limit.min(cap);
                     }
                     let limit = sub.filter_group.filters[0].limit;
-                    let per_item = if sub.filter_group.filters[0].search.is_some() {
-                        1024
-                    } else {
-                        256
-                    };
+                    let per_item = wok_negentropy::memory_view_item_bytes(
+                        sub.filter_group.filters[0].search.is_some(),
+                    );
                     let bytes = if tree_id.is_some() {
                         ROUND_BYTES
                     } else {

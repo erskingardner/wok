@@ -81,6 +81,15 @@ lazily when requested under the writer transaction, normally before a quota
 check. Once initialized, subsequent changes coalesce and commit with the event
 batch, including while quotas are disabled.
 
+The `superseded-events` state counter records the number of physical replacement
+versions beyond one per address. Writable initialization derives a missing
+counter with one ordered replacement-index scan; event inserts and deletes
+maintain it in their transaction, and reindex rebuilds it. Read-only snapshots
+without this counter conservatively filter replacement history. A zero count
+allows persistent negentropy trees even when profiles or contact lists exist.
+Integrity compares the stored counter with the index-derived count. This derived
+state does not change signed primary records or the lossless migration contract.
+
 The sequence never decreases after deleting the newest record. Reindex retains
 that high-water mark while rebuilding author counts lazily from authoritative
 indexes. An aborted transaction changes neither sequence nor counts. Older Wok

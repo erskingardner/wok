@@ -271,7 +271,7 @@ fn check_state(
                     report.issue("malformed-value", "author_counts", error.to_string());
                 }
             }
-        } else if key == crate::state::HIGH_WATER || key == crate::state::POLICY_GENERATION {
+        } else if key == crate::state::HIGH_WATER || key == crate::state::POLICY_GENERATION || key == crate::state::SUPERSEDED_EVENTS {
             match crate::state::decode(raw) {
                 Ok(sequence) if key == crate::state::HIGH_WATER && sequence < largest_id => {
                     report.metadata_errors += 1;
@@ -626,5 +626,18 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
         })?;
     }
 
+    if let Some(count) = crate::state::superseded_events_ro(txn)? {
+        if count != report.superseded_events {
+            report.metadata_errors += 1;
+            report.issue(
+                "counter-drift",
+                "state",
+                format!(
+                    "superseded event count is {count}, expected {}",
+                    report.superseded_events
+                ),
+            );
+        }
+    }
     Ok(report)
 }

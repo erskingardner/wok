@@ -388,7 +388,17 @@ pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbEr
     if let Some(buf) = txn.get_u64(dbis.event, lev_id)?.map(|b| b.to_vec()) {
         let packed = PackedEventView::new(&buf)?;
         let idx = index_event(packed);
+        let replaceable =
+            is_replaceable_kind(packed.kind()) || is_param_replaceable_kind(packed.kind());
+        if replaceable {
+            crate::state::superseded_events(txn)?;
+        }
         del_indices(txn, lev_id, &idx)?;
+        if replaceable {
+            for key in &idx.replace {
+                crate::state::change_replacement_count(txn, key, false)?;
+            }
+        }
         txn.del_u64(dbis.event, lev_id, None)?;
     }
     Ok(deleted)
@@ -406,6 +416,12 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
     txn.put_u64(dbis.event_payload, lev_id, &payload, 0)?;
     let view = PackedEventView::new(packed)?;
     let idx = index_event(view);
+    if is_replaceable_kind(view.kind()) || is_param_replaceable_kind(view.kind()) {
+        crate::state::superseded_events(txn)?;
+        for key in &idx.replace {
+            crate::state::change_replacement_count(txn, key, true)?;
+        }
+    }
     put_indices(txn, lev_id, &idx)?;
     index_event_search(txn, lev_id, json)?;
     Ok(lev_id)
@@ -486,10 +502,10 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
     });
 
-    let mut lev_ids_to_delete: Vec<u64> = Vec::new();
     let mut indexed_through = None;
 
     for i in 0..evs.len() {
+        let mut lev_ids_to_delete: Vec<u64> = Vec::new();
         let (previous, current_and_after) = evs.split_at_mut(i);
         let previous_packed = previous.last().map(|event| event.packed.as_slice());
         let EventToWrite {
@@ -693,45 +709,37 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
 
         // A later tombstone/policy rejection must not apply proposed cleanup.
         if *status != EventWriteStatus::Pending {
-            lev_ids_to_delete.clear();
             continue;
         }
-        if *status == EventWriteStatus::Pending {
-            if author_quota != 0 && !is_vanish_request {
-                let count = crate::state::author_count(txn, packed.pubkey())?;
-                let mut removed = std::collections::HashSet::new();
-                for &lev in &lev_ids_to_delete {
-                    if let Some(raw) = txn.get_u64(txn.env().dbis().event, lev)? {
-                        if PackedEventView::new(raw)?.pubkey() == packed.pubkey() {
-                            removed.insert(lev);
-                        }
+        if author_quota != 0 && !is_vanish_request {
+            let count = crate::state::author_count(txn, packed.pubkey())?;
+            let mut removed = std::collections::HashSet::new();
+            for &lev in &lev_ids_to_delete {
+                if let Some(raw) = txn.get_u64(txn.env().dbis().event, lev)? {
+                    if PackedEventView::new(raw)?.pubkey() == packed.pubkey() {
+                        removed.insert(lev);
                     }
                 }
-                if count.saturating_sub(removed.len() as u64).saturating_add(1) > author_quota {
-                    *status = EventWriteStatus::QuotaExceeded;
-                    lev_ids_to_delete.clear();
-                    continue;
-                }
             }
-            if is_vanish_request && vanish_policy.enabled {
-                mark_vanished(txn, packed.pubkey(), packed.created_at())?;
-            }
-            let inserted_lev_id = insert_event(txn, packed_bytes, json)?;
-            indexed_through = Some(inserted_lev_id);
-            *lev_id = inserted_lev_id;
-            ne.update(txn, packed, true)?;
-            *status = EventWriteStatus::Written;
-
-            for lev in lev_ids_to_delete.drain(..) {
-                if let Some(buf) = lookup_event_by_levid(txn, lev)? {
-                    ne.update(txn, PackedEventView::new(&buf)?, false)?;
-                    delete_event_basic(txn, lev)?;
-                }
+            if count.saturating_sub(removed.len() as u64).saturating_add(1) > author_quota {
+                *status = EventWriteStatus::QuotaExceeded;
+                continue;
             }
         }
+        if is_vanish_request && vanish_policy.enabled {
+            mark_vanished(txn, packed.pubkey(), packed.created_at())?;
+        }
+        let inserted_lev_id = insert_event(txn, packed_bytes, json)?;
+        indexed_through = Some(inserted_lev_id);
+        *lev_id = inserted_lev_id;
+        ne.update(txn, packed, true)?;
+        *status = EventWriteStatus::Written;
 
-        if !lev_ids_to_delete.is_empty() {
-            return Err(DbError::msg("unprocessed deletion"));
+        for lev in lev_ids_to_delete {
+            if let Some(buf) = lookup_event_by_levid(txn, lev)? {
+                ne.update(txn, PackedEventView::new(&buf)?, false)?;
+                delete_event_basic(txn, lev)?;
+            }
         }
     }
 

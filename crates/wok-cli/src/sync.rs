@@ -42,10 +42,12 @@ struct Report {
     downloaded: u64,
     written: u64,
     duplicates: u64,
+    superseded: u64,
     rejected: u64,
     unavailable: u64,
     uploaded: u64,
     upload_rejected: u64,
+    upload_superseded: u64,
     error: Option<String>,
 }
 
@@ -63,10 +65,10 @@ pub async fn run(cfg: &Config, options: Options) -> Result<()> {
             serde_json::to_string(&report)?
         )?;
     } else {
-        eprintln!("Sync {}: reconciled={} have={} need={} downloaded={} written={} duplicates={} rejected={} unavailable={} uploaded={} upload_rejected={}",
+        eprintln!("Sync {}: reconciled={} have={} need={} downloaded={} written={} duplicates={} superseded={} rejected={} unavailable={} uploaded={} upload_rejected={} upload_superseded={}",
             if report.ok { "complete" } else { "failed" }, report.reconciled,
-            report.have, report.need, report.downloaded, report.written, report.duplicates,
-            report.rejected, report.unavailable, report.uploaded, report.upload_rejected);
+            report.have, report.need, report.downloaded, report.written, report.duplicates, report.superseded,
+            report.rejected, report.unavailable, report.uploaded, report.upload_rejected, report.upload_superseded);
     }
     result
 }
@@ -107,6 +109,7 @@ fn store_downloads(
         match event.status {
             wok_db::EventWriteStatus::Written => report.written += 1,
             wok_db::EventWriteStatus::Duplicate => report.duplicates += 1,
+            wok_db::EventWriteStatus::Replaced => report.superseded += 1,
             status => {
                 report.rejected += 1;
                 tracing::warn!(?status, "sync download not stored");
@@ -156,21 +159,42 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 true
             }
         })?;
-        match tree_id {
+        let tree_visible = wok_query::visibility::physical_tree_is_globally_visible(
+            &txn,
+            &filter_group.filters[0],
+        )?;
+        match tree_id.filter(|_| tree_visible) {
             Some(id) => {
                 wok_negentropy::verify_tree(&txn, id, &canonical)?;
                 SyncStorage::Tree(id)
             }
             None => {
+                // Match the relay's conservative construction budget. Falling
+                // back from a physical tree must not allocate an unbounded view.
+                let per_item = if filter_group.requires_content() {
+                    1024
+                } else {
+                    192
+                };
+                let memory_cap = cfg
+                    .relay
+                    .sync_memory_per_connection
+                    .min(cfg.relay.sync_memory_total)
+                    .saturating_sub(4 * 1024 * 1024)
+                    / per_item;
+                let cap = cfg.relay.max_sync_events.min(memory_cap);
                 let mut levs = Vec::new();
                 foreach_by_filter_scan(
                     &txn,
                     &filter_json,
-                    u64::MAX,
+                    cap.saturating_add(1),
                     cfg.relay.max_tags_per_filter,
                     cfg.relay.max_and_entries,
                     |lev| levs.push(lev),
                 )?;
+                if levs.len() as u64 > cap {
+                    bail!("filtered sync view exceeds event/memory budget ({cap} events); narrow the filter or review relay.max_sync_events and sync_memory settings");
+                }
                 levs.sort_unstable();
                 let mut v = wok_negentropy::Vector::new();
                 for lev in levs {
@@ -350,6 +374,11 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 if pending_up.remove(id) {
                     if accepted {
                         report.uploaded += 1;
+                    } else if reply[3]
+                        .as_str()
+                        .is_some_and(|message| message.starts_with("replaced:"))
+                    {
+                        report.upload_superseded += 1;
                     } else {
                         report.upload_rejected += 1;
                     }
@@ -396,7 +425,19 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 let mut decompressor = Decompressor::new();
                 while pending_up.len() + outgoing.len() < 100 {
                     let Some(id) = have.pop_front() else { break };
-                    if let Some((lev, _)) = wok_db::lookup_event_by_id_ro(&txn, &id)? {
+                    if let Some((lev, raw)) = wok_db::lookup_event_by_id_ro(&txn, &id)? {
+                        let packed = PackedEventView::new(&raw)?;
+                        // A newer version may arrive after the reconciliation snapshot.
+                        if wok_db::is_event_superseded_ro(&txn, packed)? {
+                            report.upload_superseded += 1;
+                            continue;
+                        }
+                        if !wok_query::visibility::ReadVisibility::default()
+                            .globally_visible(&txn, packed)?
+                        {
+                            report.unavailable += 1;
+                            continue;
+                        }
                         let event = event_json_owned(
                             &txn,
                             &mut decompressor,

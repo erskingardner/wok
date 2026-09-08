@@ -29,6 +29,8 @@ struct MigrationManifest {
     wok_version: &'static str,
     migrated_at_unix_seconds: u64,
     event_count: u64,
+    superseded_groups: u64,
+    superseded_events: u64,
     event_fingerprint_sha256: String,
     target_data_sha256: String,
     source_config_sha256: String,
@@ -278,6 +280,8 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
             .context("system clock is before Unix epoch")?
             .as_secs(),
         event_count: before.count,
+        superseded_groups: source_integrity.superseded_groups,
+        superseded_events: source_integrity.superseded_events,
         event_fingerprint_sha256: hex::encode(before.sha256),
         target_data_sha256: sha256_file(&staging_db.join("data.mdb"))?,
         source_config_sha256: sha256_bytes(&source_config_bytes),
@@ -314,6 +318,9 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
     }
 
     println!("Migrated {} events from strfry.", before.count);
+    if source_integrity.superseded_events != 0 {
+        println!("Retained {} superseded events in {} replacement groups; relay reads serve only the winners.", source_integrity.superseded_events, source_integrity.superseded_groups);
+    }
     println!("Wok config: {}", final_config.display());
     println!("Manifest: {}", output.join(MANIFEST_NAME).display());
     println!("Source files were not modified.");
@@ -379,6 +386,12 @@ fn prepare_strfry(
     let external_paths = external_path_checks(&source_cfg);
     let output_available = !output.exists();
     let mut warnings = Vec::new();
+    if source_integrity.superseded_events != 0 {
+        warnings.push(format!(
+            "{} superseded events in {} replacement groups will be preserved by this lossless migration; relay reads serve only the winners",
+            source_integrity.superseded_events, source_integrity.superseded_groups,
+        ));
+    }
     if let Some(warning) = source_cfg.auth_configuration_warning() {
         warnings.push(format!("{warning}; review AUTH before cutover"));
     }

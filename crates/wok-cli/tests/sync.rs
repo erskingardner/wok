@@ -645,3 +645,99 @@ async fn cpp_peer_syncs_both_directions_including_all_users_gift_wraps() {
         assert!(actual.contains(event));
     }
 }
+
+#[path = "support/replacement.rs"]
+mod replacement;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_tree_and_vector_views_offer_only_current_replaceable_versions() {
+    for kind in [3, 30443] {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let src = config(
+            source.path(),
+            "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+        );
+        let dst = config(
+            target.path(),
+            "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+        );
+        let events = replacement::events(kind);
+        drop(replacement::seed(&source.path().join("db"), &events, 5));
+        import(&dst, &[events[2].clone()]);
+        let server = serve(&dst).await;
+        for filter in ["{}".to_string(), format!("{{\"kinds\":[{kind}]}}")] {
+            let output = sync(
+                &src,
+                &server.url,
+                &["--check", "--filter", &filter, "--json"],
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(summary(&output)["have"], 0);
+            assert_eq!(summary(&output)["need"], 0);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superseded_transfers_are_reported_without_failing_sync() {
+    for kind in [3, 30443] {
+        for direction in ["up", "down"] {
+            let local = tempfile::tempdir().unwrap();
+            let remote = tempfile::tempdir().unwrap();
+            let lc = config(
+                local.path(),
+                "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+            );
+            let rc = config(
+                remote.path(),
+                "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+            );
+            let events = replacement::events(kind);
+            let (le, re) = if direction == "up" {
+                (&events[0], &events[2])
+            } else {
+                (&events[2], &events[0])
+            };
+            import(&lc, std::slice::from_ref(le));
+            import(&rc, std::slice::from_ref(re));
+            let server = serve(&rc).await;
+            let output = sync(&lc, &server.url, &["--dir", direction, "--json"]);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let report = summary(&output);
+            assert_eq!(report["rejected"], 0);
+            assert_eq!(report["upload_rejected"], 0);
+            assert_eq!(
+                report[if direction == "up" {
+                    "upload_superseded"
+                } else {
+                    "superseded"
+                }],
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn filtered_sync_view_respects_the_configured_event_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "[relay]\nmax_sync_events=1\n");
+    let mut events = replacement::events(3);
+    events.extend(replacement::events(1));
+    drop(replacement::seed(&dir.path().join("db"), &events, 5));
+    let output = sync(&cfg, "ws://127.0.0.1:1", &["--check", "--json"]);
+    assert!(!output.status.success());
+    assert!(summary(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("filtered sync view exceeds"));
+}

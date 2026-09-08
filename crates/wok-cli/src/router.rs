@@ -953,12 +953,22 @@ async fn router_db_change(
         let mut decomp = Decompressor::new();
         let start = curr_event_id.saturating_add(1);
         let mut latest = *curr_event_id;
+        let mut visibility_error = None;
+        let visibility = wok_query::visibility::ReadVisibility::default();
         wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
             latest = lev;
             let packed = match PackedEventView::new(packed_bytes) {
                 Ok(p) => p,
                 Err(_) => return true,
             };
+            match visibility.globally_visible(&txn, packed) {
+                Ok(true) => {}
+                Ok(false) => return true,
+                Err(error) => {
+                    visibility_error = Some(error);
+                    return false;
+                }
+            }
             let mut response: Option<String> = None;
             let mut ev_json: Option<Value> = None;
             for (gname, g) in groups.iter_mut() {
@@ -1000,6 +1010,9 @@ async fn router_db_change(
             }
             true
         })?;
+        if let Some(error) = visibility_error {
+            return Err(error.into());
+        }
         *curr_event_id = latest;
     }
     for (key, payload) in sends {
@@ -1013,6 +1026,54 @@ async fn router_db_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn router_outbound_skips_superseded_records_and_advances_the_cursor() {
+        for kind in [3, 30443] {
+            let dir = tempfile::tempdir().unwrap();
+            let events = replacement_fixture::events(kind);
+            let env = replacement_fixture::seed(dir.path(), &events, 5);
+            let cfg = Config::default();
+            let name = format!("replacement-test-{kind}");
+            let url = "ws://replacement-test.invalid".to_string();
+            let spec = StreamSpec {
+                dir: "up".into(),
+                filter: json!({}),
+                filter_str: "{}".into(),
+                plugin_down: String::new(),
+                plugin_up: String::new(),
+                urls: vec![url.clone()],
+            };
+            let mut groups = HashMap::from([(
+                name.clone(),
+                Group {
+                    spec,
+                    filter_group: NostrFilterGroup::from_value(&json!({}), u64::MAX, 3, 16)
+                        .unwrap(),
+                    plugin_down: PluginEventSifter::new(5),
+                    plugin_up: PluginEventSifter::new(5),
+                    conns: HashMap::new(),
+                },
+            )]);
+            let (tx, mut rx) = mpsc::channel(8);
+            let registry_key = (name, url);
+            CONN_REGISTRY.lock().insert(registry_key.clone(), tx);
+            let mut cursor = 0;
+            router_db_change(&env, &cfg, &mut groups, &mut cursor)
+                .await
+                .unwrap();
+            router_db_change(&env, &cfg, &mut groups, &mut cursor)
+                .await
+                .unwrap();
+            CONN_REGISTRY.lock().remove(&registry_key);
+            let mut sent = Vec::new();
+            while let Ok(ConnMsg::Send(payload)) = rx.try_recv() {
+                sent.push(serde_json::from_str::<Value>(&payload).unwrap()[1].clone());
+            }
+            assert_eq!(cursor, 3);
+            assert_eq!(sent, vec![events[2].clone()]);
+        }
+    }
 
     #[tokio::test]
     async fn closed_subscription_is_reported_to_the_operator() {
@@ -1164,3 +1225,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/replacement.rs"]
+mod replacement_fixture;

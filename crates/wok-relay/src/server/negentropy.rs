@@ -89,48 +89,9 @@ fn public_tree_allowed(
     cfg: &Config,
 ) -> Result<bool, wok_db::DbError> {
     let db = txn.env().dbis();
-    for dbi in [db.moderation, db.vanish_pubkey].into_iter().flatten() {
-        if txn.entries(dbi)? != 0 {
-            return Ok(false);
-        }
-    }
-    // Expiring/TTL records need per-event checks even between cleanup ticks.
-    if txn.entries(db.event_expiration)? != 0 {
+    if !wok_query::visibility::physical_tree_is_globally_visible(txn, &sub.filter_group.filters[0])?
+    {
         return Ok(false);
-    }
-    // Persistent trees describe physical records, including old versions in
-    // lossless snapshots. Unless the filter excludes replacement entirely,
-    // use the shared visibility scan whenever replaceable kinds are present.
-    let filter = &sub.filter_group.filters[0];
-    let excludes_replaceable = filter.kinds.as_ref().is_some_and(|kinds| {
-        kinds.iter().all(|kind| {
-            !wok_event::is_replaceable_kind(kind) && !wok_event::is_param_replaceable_kind(kind)
-        })
-    });
-    if !excludes_replaceable {
-        for (start, end) in [(0, 0), (3, 3), (41, 41), (10_000, 19_999), (30_000, 39_999)] {
-            let mut present = false;
-            let mut error = None;
-            txn.foreach_full(
-                db.event_kind,
-                &wok_db::keys::make_key_u64_u64(start, 0),
-                &0u64.to_ne_bytes(),
-                false,
-                |key, _| {
-                    match wok_db::keys::parse_key_u64_u64(key) {
-                        Ok((kind, _)) => present = kind <= end,
-                        Err(err) => error = Some(err),
-                    }
-                    false
-                },
-            )?;
-            if let Some(error) = error {
-                return Err(error);
-            }
-            if present {
-                return Ok(false);
-            }
-        }
     }
     let policy = restrictor(cfg);
     if !policy.restrict_to_involved {

@@ -7,6 +7,16 @@ author counts, and the local sequence high-water mark. Counts are verified
 against primary events; missing lazy counters are allowed. `wok doctor --json`
 includes these checks during read-only inspection.
 
+Integrity JSON also reports `superseded_groups` (replacement addresses with more
+than one stored version) and `superseded_events` (versions beyond one per address).
+These are advisory counts over structurally valid replacement-index entries,
+not corruption. Doctor emits a `replacement-history` warning when nonzero.
+The count scan uses constant additional memory. New winning writes remove every
+older record at their address transactionally; stale, duplicate, tombstoned, or
+quota-rejected writes leave existing records intact. Address-based deletions
+remove all matching versions at or before the deletion timestamp. Reindex and
+migration continue to preserve physical history.
+
 With the relay stopped, `wok reindex --confirm-relay-stopped` can repair derived
 indexes and author counts while retaining the original database as a backup.
 It preserves the stored sequence even when the newest events have been deleted.
@@ -51,6 +61,8 @@ wok --config /etc/wok.toml router /etc/wok-router.conf
 Streaming subscriptions cover live traffic (`limit: 0`); reconnects do not repair
 historical gaps. Supervise router and run non-overlapping `wok sync` jobs
 periodically and after outages. Start router before the first catch-up.
+Outbound router delivery applies global read visibility, including replacement,
+moderation, vanish, and expiration, before sending newly stored records.
 
 ## Reconciliation results
 
@@ -68,8 +80,8 @@ filter and the remote connection's readable view, not the remote operator's full
 
 `--json` emits one summary on stdout, including transfer/protocol failures; tracing
 logs go to stderr. Fields are `ok`, `reconciled`, `have`, `need`, `downloaded`,
-`written`, `duplicates`, `rejected`, `unavailable`, `uploaded`, `upload_rejected`,
-and `error`. `have` and `need` count unique differences discovered during the run,
+`written`, `duplicates`, `superseded`, `rejected`, `unavailable`, `uploaded`,
+`upload_rejected`, `upload_superseded`, and `error`. `have` and `need` count unique differences discovered during the run,
 not the remaining differences after transfer. `uploaded` counts positive relay
 ACKs, not recipient delivery. CLI parsing/config-loading errors may occur before a
 summary can be produced. JSON and missing-ID output are mutually exclusive.
@@ -78,6 +90,10 @@ A transfer exits nonzero on rejected downloads, rejected uploads, requested IDs
 missing at EOSE, closed subscriptions, protocol errors, disconnects or timeout.
 Only ACKs matching outstanding upload IDs count. Unsolicited events/EOSE/ACKs
 cannot complete a batch. Duplicate records already stored are successful outcomes.
+`superseded` counts downloads discarded because a newer local version exists.
+`upload_superseded` counts local records superseded before sending and negative
+peer ACKs explicitly prefixed `replaced:`. These are terminal successful outcomes;
+other policy rejections still fail the transfer.
 The client caps combined unique differences at five million; partition larger
 comparisons with explicit filters or time windows. The default timeout is 60
 seconds without protocol progress; ping traffic does not
@@ -90,6 +106,15 @@ residual differences. Timestamp admission limits apply to sync downloads; use th
 verified database migration for an exact historical copy. Router's `pluginDown`
 is separate from public write policy; sync is an operator DB import and does not
 execute that plugin.
+
+Local sync views use the same global visibility rules whether a matching
+persistent tree exists or not. A physical tree is used only when it can bypass
+those checks safely; otherwise sync builds a filtered view. Construction is
+bounded by `relay.max_sync_events`, `relay.sync_memory_per_connection`, and
+`relay.sync_memory_total`, using conservative per-event estimates. Exceeding the
+budget fails explicitly before connecting; narrow the filter or review the
+budgets. Uploads recheck visibility in case a record changed after reconciliation.
+Operator `export` remains a physical archive operation.
 
 ## Checking existing tree drift
 

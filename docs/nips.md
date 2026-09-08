@@ -41,6 +41,12 @@ superseded event. An expired or moderated winner does not expose older stored
 versions. REQ, COUNT, search, live delivery, and NIP-77 share this visibility
 rule; live subscriptions can still receive later updates as they arrive.
 Coverage is in `wok-compat/tests/replaceable_events.rs`.
+New winning publications remove all older stored versions at that address in
+the same transaction, including negentropy and author-quota accounting. An
+incoming stale event is rejected against the global winner, independent of
+local insertion order. For addressable events, NIP-09 `a`-tag deletions remove
+every matching version at or before the deletion timestamp, preserving newer
+versions.
 
 Persistent negentropy trees represent physical storage. Filters that can
 include stored replaceable events use the bounded, visibility-filtered memory

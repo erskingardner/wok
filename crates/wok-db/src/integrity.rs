@@ -25,6 +25,10 @@ pub struct IntegrityIssue {
 pub struct IntegrityReport {
     pub events: u64,
     pub payloads: u64,
+    /// Structurally valid replacement groups retaining more than one version.
+    /// Advisory only: lossless migration is allowed to preserve this history.
+    pub superseded_groups: u64,
+    pub superseded_events: u64,
     pub expected_index_entries: u64,
     pub actual_index_entries: u64,
     pub missing_payloads: Vec<u64>,
@@ -495,6 +499,8 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
     })?;
 
     for (name, dbi) in index_specs(txn) {
+        let mut replacement_key = Vec::new();
+        let mut replacement_count = 0u64;
         txn.foreach_full(dbi, &[], &[], false, |key, value| {
             report.actual_index_entries += 1;
             let Some(lev_id) = read_u64(value) else {
@@ -534,6 +540,22 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
             {
                 report.extra_index_entries += 1;
                 report.issue("unexpected-index", name, format!("levId {lev_id}"));
+            } else if name == "event_replace"
+                && (wok_event::is_replaceable_kind(packed.kind())
+                    || wok_event::is_param_replaceable_kind(packed.kind()))
+            {
+                // DUPSORT groups each address contiguously; constant extra memory.
+                if replacement_key != key {
+                    replacement_key = key.to_vec();
+                    replacement_count = 0;
+                }
+                replacement_count += 1;
+                if replacement_count == 2 {
+                    report.superseded_groups += 1;
+                }
+                if replacement_count > 1 {
+                    report.superseded_events += 1;
+                }
             }
             true
         })?;

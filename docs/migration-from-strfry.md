@@ -74,6 +74,10 @@ migration does not promote a partial output.
 The manifest records source and target paths and versions, Wok's version,
 migration time, event count and fingerprint, config hashes, the final Wok
 `data.mdb` hash, verification results, and review warnings.
+It also records `superseded_groups` and `superseded_events` for retained
+replaceable history. Preflight warns about these versions and migration reports
+the retained counts. This is advisory: all source records are preserved exactly,
+while relay queries expose only the newest version per replacement address.
 
 ## Config review
 

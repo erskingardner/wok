@@ -37,6 +37,9 @@ it is not a promise to reproduce upstream bugs.
   cleanup. Retained source versions cannot reappear through historical REQ,
   COUNT, search, live catch-up, or NIP-77. This follows pinned NIP-01 and is
   covered by `wok-compat/tests/replaceable_events.rs`.
+- Replacement writes and address deletions handle every retained version at an
+  address; the pinned strfry writer inspects only one replacement-index entry.
+  Rejected writes do not apply proposed physical cleanup.
 - Ephemeral kinds are live-only by default: after validation, AUTH, and policy
   checks they reach matching active subscriptions without being written to
   LMDB or negentropy. Operators can explicitly select `ttl` compatibility mode,

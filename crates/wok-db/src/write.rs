@@ -411,6 +411,43 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
     Ok(lev_id)
 }
 
+fn foreach_replacement(
+    txn: &RwTxn<'_>,
+    key: &[u8],
+    mut callback: impl FnMut(u64, PackedEventView<'_>) -> bool,
+) -> Result<(), DbError> {
+    let mut error = None;
+    txn.foreach_full(
+        txn.env().dbis().event_replace,
+        key,
+        &u64::MAX.to_ne_bytes(),
+        true,
+        |k, v| {
+            if k != key {
+                return false;
+            }
+            let result = (|| {
+                let lev = u64_from_ne_checked(v)?;
+                let raw = txn
+                    .get_u64(txn.env().dbis().event, lev)?
+                    .ok_or_else(|| DbError::msg("dangling replacement index entry"))?;
+                Ok::<_, DbError>(callback(lev, PackedEventView::new(raw)?))
+            })();
+            match result {
+                Ok(keep_going) => keep_going,
+                Err(err) => {
+                    error = Some(err);
+                    false
+                }
+            }
+        },
+    )?;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn write_events<N: NegentropySink, C>(
     txn: &mut RwTxn<'_>,
     ne: &mut N,
@@ -531,37 +568,22 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                 search_str.extend_from_slice(&replace);
                 let search_key = make_key_string_u64(&search_str, packed.kind());
 
-                let mut other: Option<u64> = None;
-                let mut scan_err: Option<DbError> = None;
-                txn.foreach_full(
-                    txn.env().dbis().event_replace,
-                    &search_key,
-                    &u64::MAX.to_ne_bytes(),
-                    true,
-                    |k, v| {
-                        if k != search_key.as_slice() {
-                            return false;
-                        }
-                        match u64_from_ne_checked(v) {
-                            Ok(lev) => other = Some(lev),
-                            Err(e) => scan_err = Some(e),
-                        }
-                        false
-                    },
-                )?;
-                if let Some(e) = scan_err {
-                    return Err(e);
-                }
-                if let Some(lev) = other {
-                    // C++ lookupEventByLevId throws on a dangling index entry.
-                    let buf = lookup_event_by_levid(txn, lev)?
-                        .ok_or_else(|| DbError::msg("unable to lookup event by levId"))?;
-                    let other_packed = PackedEventView::new(&buf)?;
-                    if is_event_a_before_event_b(packed, other_packed) {
-                        *status = EventWriteStatus::Replaced;
-                    } else {
-                        lev_ids_to_delete.push(lev);
+                // Imported history can contain several records, in any local-ID
+                // order. Reject against every candidate before scheduling cleanup.
+                let mut candidates = Vec::new();
+                let mut superseded = false;
+                foreach_replacement(txn, &search_key, |lev, other| {
+                    if is_event_a_before_event_b(packed, other) {
+                        superseded = true;
+                        return false;
                     }
+                    candidates.push(lev);
+                    true
+                })?;
+                if superseded {
+                    *status = EventWriteStatus::Replaced;
+                } else {
+                    lev_ids_to_delete.extend(candidates);
                 }
 
                 if is_param_replaceable_kind(packed.kind()) && *status == EventWriteStatus::Pending
@@ -648,43 +670,16 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                             search.extend_from_slice(&pubkey);
                             search.extend_from_slice(d_tag.as_bytes());
                             let search_key = make_key_string_u64(&search, kind);
-                            let mut hit: Option<u64> = None;
-                            let scan_res = txn.foreach_full(
-                                txn.env().dbis().event_replace,
-                                &search_key,
-                                &u64::MAX.to_ne_bytes(),
-                                true,
-                                |k, v| {
-                                    if k != search_key.as_slice() {
-                                        return false;
+                            if let Err(error) =
+                                foreach_replacement(txn, &search_key, |lev, other| {
+                                    if other.created_at() <= packed.created_at() {
+                                        lev_ids_to_delete.push(lev);
                                     }
-                                    match u64_from_ne_checked(v) {
-                                        Ok(lev) => hit = Some(lev),
-                                        Err(e) => scan_err = Some(e),
-                                    }
-                                    false
-                                },
-                            );
-                            if let Err(e) = scan_res {
-                                scan_err = Some(e);
+                                    true
+                                })
+                            {
+                                scan_err = Some(error);
                                 return false;
-                            }
-                            if let Some(lev) = hit {
-                                match lookup_event_by_levid(txn, lev) {
-                                    Ok(Some(buf)) => match PackedEventView::new(&buf) {
-                                        Ok(other) => {
-                                            if other.created_at() <= packed.created_at() {
-                                                lev_ids_to_delete.push(lev);
-                                            }
-                                        }
-                                        Err(e) => scan_err = Some(DbError::msg(e.to_string())),
-                                    },
-                                    Ok(None) => {
-                                        scan_err =
-                                            Some(DbError::msg("unable to lookup event by levId"));
-                                    }
-                                    Err(e) => scan_err = Some(e),
-                                }
                             }
                         }
                     }
@@ -696,6 +691,11 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
             }
         }
 
+        // A later tombstone/policy rejection must not apply proposed cleanup.
+        if *status != EventWriteStatus::Pending {
+            lev_ids_to_delete.clear();
+            continue;
+        }
         if *status == EventWriteStatus::Pending {
             if author_quota != 0 && !is_vanish_request {
                 let count = crate::state::author_count(txn, packed.pubkey())?;

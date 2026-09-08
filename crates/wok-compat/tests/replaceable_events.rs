@@ -463,3 +463,183 @@ async fn negentropy_hides_stale_ids_with_and_without_a_matching_persistent_tree(
         handle.request_shutdown();
     }
 }
+
+fn stored_ids(env: &Env) -> Vec<String> {
+    let txn = env.begin_ro().unwrap();
+    let mut result = Vec::new();
+    wok_db::foreach_event_from(&txn, 0, |_, raw| {
+        result.push(hex::encode(PackedEventView::new(raw).unwrap().id()));
+        true
+    })
+    .unwrap();
+    result.sort();
+    result
+}
+
+fn write_with_quota(
+    env: &Env,
+    event: &Value,
+    quota: u64,
+    commit: bool,
+) -> wok_db::EventWriteStatus {
+    let parsed = parse_and_verify_event(event, &EventLimits::default(), None, true, false).unwrap();
+    let mut events = [wok_db::EventToWrite::new(
+        parsed.packed.into_bytes(),
+        parsed.json,
+    )];
+    let mut txn = env.begin_rw().unwrap();
+    let mut sink = wok_negentropy::NegentropyFilterCache::new(3);
+    wok_db::write::write_events_with_quota(
+        &mut txn,
+        &mut sink,
+        &mut events,
+        &wok_db::VanishPolicy::disabled(),
+        quota,
+    )
+    .unwrap();
+    if commit {
+        txn.commit().unwrap();
+    } else {
+        txn.abort();
+    }
+    events[0].status
+}
+
+#[test]
+fn replacement_writer_removes_all_versions_atomically_and_uses_net_quota() {
+    for kind in [0, 3, 41, 10000, 19999, 30000, 30443, 39999] {
+        let key = key();
+        let events: Vec<_> = [300, 100, 200]
+            .iter()
+            .map(|t| event(&key, kind, *t, json!([["d", "a"]]), "old"))
+            .collect();
+        let (_dir, env) = snapshot(&events);
+        let newest = event(&key, kind, 400, json!([["d", "a"]]), "newest");
+        assert_eq!(
+            write_with_quota(&env, &newest, 1, false),
+            wok_db::EventWriteStatus::Written
+        );
+        assert_eq!(
+            stored_ids(&env),
+            ids(&events),
+            "abort must retain every record"
+        );
+        wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap();
+        assert_eq!(
+            write_with_quota(&env, &newest, 1, true),
+            wok_db::EventWriteStatus::Written,
+            "kind {kind}"
+        );
+        assert_eq!(stored_ids(&env), ids(std::slice::from_ref(&newest)));
+        assert!(wok_db::check_integrity(&env.begin_ro().unwrap())
+            .unwrap()
+            .ok());
+        wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        assert_eq!(
+            wok_db::state::author_count(
+                &mut txn,
+                &hex::decode(newest["pubkey"].as_str().unwrap()).unwrap()
+            )
+            .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn stale_arrivals_compare_every_version_and_do_not_mutate_storage() {
+    for kind in [3, 10002, 30443] {
+        let key = key();
+        let mut ties: Vec<_> = (0..3)
+            .map(|i| event(&key, kind, 300, json!([["d", "a"]]), &format!("tie{i}")))
+            .collect();
+        ties.sort_by_key(|v| v["id"].as_str().unwrap().to_owned());
+        let oldest = event(&key, kind, 100, json!([["d", "a"]]), "oldest");
+        let stored = [ties[0].clone(), oldest];
+        let (_dir, env) = snapshot(&stored);
+        for incoming in [
+            event(&key, kind, 200, json!([["d", "a"]]), "middle"),
+            ties[1].clone(),
+        ] {
+            assert_eq!(
+                write_with_quota(&env, &incoming, 0, true),
+                wok_db::EventWriteStatus::Replaced
+            );
+            assert_eq!(stored_ids(&env), ids(&stored));
+        }
+        assert_eq!(
+            write_with_quota(&env, &ties[0], 0, true),
+            wok_db::EventWriteStatus::Duplicate
+        );
+        assert_eq!(stored_ids(&env), ids(&stored));
+        wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap();
+    }
+}
+
+#[test]
+fn rejected_replacements_leave_candidates_intact() {
+    let key = key();
+    let old = event(&key, 30443, 100, json!([["d", "a"]]), "old");
+    let other = event(&key, 1, 100, json!([]), "other");
+    let newer = event(&key, 30443, 150, json!([["d", "a"]]), "new");
+    let (_dir, env) = snapshot(&[old.clone(), other.clone()]);
+    assert_eq!(
+        write_with_quota(&env, &newer, 1, true),
+        wok_db::EventWriteStatus::QuotaExceeded
+    );
+    assert_eq!(stored_ids(&env), ids(&[old.clone(), other]));
+    let address = format!("30443:{}:a", old["pubkey"].as_str().unwrap());
+    let deletion = event(&key, 5, 200, json!([["a", address]]), "delete");
+    // Imported deletion history can coexist with a record it tombstones.
+    let (_dir, env) = snapshot(&[old.clone(), deletion.clone()]);
+    assert_eq!(
+        write_with_quota(&env, &newer, 0, true),
+        wok_db::EventWriteStatus::Deleted
+    );
+    assert_eq!(stored_ids(&env), ids(&[old, deletion]));
+}
+
+#[test]
+fn address_deletion_removes_all_eligible_versions_and_keeps_newer_versions() {
+    let key = key();
+    let events: Vec<_> = [300, 100, 200]
+        .iter()
+        .map(|t| event(&key, 30443, *t, json!([["d", "a"]]), "version"))
+        .collect();
+    let other = event(&key, 30443, 100, json!([["d", "b"]]), "other address");
+    let mut input = events.clone();
+    input.push(other.clone());
+    let (_dir, env) = snapshot(&input);
+    let address = format!("30443:{}:a", events[0]["pubkey"].as_str().unwrap());
+    let deletion = event(
+        &key,
+        5,
+        250,
+        json!([["a", address], ["a", address]]),
+        "delete",
+    );
+    assert_eq!(
+        write_with_quota(&env, &deletion, 0, true),
+        wok_db::EventWriteStatus::Written
+    );
+    assert_eq!(stored_ids(&env), ids(&[events[0].clone(), other, deletion]));
+    wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap();
+}
+
+#[test]
+fn integrity_reports_retained_versions_without_treating_them_as_corruption() {
+    let key = key();
+    let mut events = Vec::new();
+    for kind in [0, 3, 30443, 1] {
+        for time in [100, 200, 300] {
+            events.push(event(&key, kind, time, json!([["d", "a"]]), "version"));
+        }
+    }
+    let (_dir, env) = snapshot(&events);
+    let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+    assert!(report.ok());
+    let json = serde_json::to_value(report).unwrap();
+    assert_eq!(json["superseded_groups"], 3);
+    assert_eq!(json["superseded_events"], 6);
+}

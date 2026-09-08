@@ -31,6 +31,31 @@ capabilities.
 ID and author filter values must be exactly 64 lowercase hexadecimal
 characters, as required by current NIP-01. Prefix filters are rejected.
 
+NIP-01 replacement is enforced when reading, even if a lossless migration
+retained multiple versions. Kinds 0, 3 (contact lists), and 10000–19999 select
+the newest event per author and kind; kinds 30000–39999 additionally use the
+first `d` tag (missing means empty). Equal timestamps select the lowest
+lexical event ID. The winner is determined across stored versions before
+request filters: an old ID, `until`, tag, or search filter cannot resurrect a
+superseded event. An expired or moderated winner does not expose older stored
+versions. REQ, COUNT, search, live delivery, and NIP-77 share this visibility
+rule; live subscriptions can still receive later updates as they arrive.
+Coverage is in `wok-compat/tests/replaceable_events.rs`.
+New winning publications remove all older stored versions at that address in
+the same transaction, including negentropy and author-quota accounting. An
+incoming stale event is rejected against the global winner, independent of
+local insertion order. For addressable events, NIP-09 `a`-tag deletions remove
+every matching version at or before the deletion timestamp, preserving newer
+versions.
+
+Persistent negentropy trees represent physical storage. A transactional count
+of retained superseded versions keeps clean databases on the persistent-tree
+fast path, including databases containing profiles and contact lists. When
+retained history exists, filters that can include replaceable events use the
+bounded, visibility-filtered memory view, subject to sync event and memory limits. Physical
+history remains intact; migration, reindex, and operator export retain their
+storage-preservation semantics.
+
 NIP-50 matches normalized search terms against event `content`, intersects
 them with every other supplied filter field, ranks before applying `limit`,
 and supports matching live events after EOSE. See

@@ -3,6 +3,57 @@
 use crate::keys::{make_key_string_u64, u64_from_ne, u64_from_ne_checked};
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
+use wok_event::{
+    is_event_a_before_event_b, is_param_replaceable_kind, is_replaceable_kind, PackedEventView,
+};
+
+/// Whether another stored event wins NIP-01 replacement in this read snapshot.
+/// Lossless imports can contain multiple versions. Do not rely on insertion
+/// order, query filters, or the writer having physically removed old records.
+pub fn is_event_superseded_ro(
+    txn: &RoTxn<'_>,
+    event: PackedEventView<'_>,
+) -> Result<bool, DbError> {
+    let addressable = is_param_replaceable_kind(event.kind());
+    if !addressable && !is_replaceable_kind(event.kind()) {
+        return Ok(false);
+    }
+    let mut address = event.pubkey().to_vec();
+    if addressable {
+        address.extend_from_slice(&event.first_d_tag().unwrap_or_default());
+    }
+    let key = make_key_string_u64(&address, event.kind());
+    let mut superseded = false;
+    let mut error = None;
+    txn.foreach_full(
+        txn.env().dbis().event_replace,
+        &key,
+        &u64::MAX.to_ne_bytes(),
+        true,
+        |candidate_key, value| {
+            if candidate_key != key {
+                return false;
+            }
+            let check = (|| {
+                let lev = u64_from_ne_checked(value)?;
+                let raw = txn
+                    .get_u64(txn.env().dbis().event, lev)?
+                    .ok_or_else(|| DbError::msg("dangling replacement index entry"))?;
+                Ok::<_, DbError>(is_event_a_before_event_b(event, PackedEventView::new(raw)?))
+            })();
+            match check {
+                Ok(true) => superseded = true,
+                Ok(false) => return true,
+                Err(err) => error = Some(err),
+            }
+            false
+        },
+    )?;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(superseded)
+}
 
 pub fn lookup_event_by_id_ro(
     txn: &RoTxn<'_>,

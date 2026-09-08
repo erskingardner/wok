@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wok_negentropy::{Negentropy, Vector};
 
 // Covers protocol input/output buffers, query/filter state and traversal stacks.
-const ROUND_BYTES: u64 = 4 * 1024 * 1024;
+use wok_negentropy::ROUND_MEMORY_BYTES as ROUND_BYTES;
 
 #[derive(Default)]
 pub(super) struct MemoryPool(Mutex<MemoryUsage>);
@@ -89,13 +89,8 @@ fn public_tree_allowed(
     cfg: &Config,
 ) -> Result<bool, wok_db::DbError> {
     let db = txn.env().dbis();
-    for dbi in [db.moderation, db.vanish_pubkey].into_iter().flatten() {
-        if txn.entries(dbi)? != 0 {
-            return Ok(false);
-        }
-    }
-    // Expiring/TTL records need per-event checks even between cleanup ticks.
-    if txn.entries(db.event_expiration)? != 0 {
+    if !wok_query::visibility::physical_tree_is_globally_visible(txn, &sub.filter_group.filters[0])?
+    {
         return Ok(false);
     }
     let policy = restrictor(cfg);
@@ -266,11 +261,9 @@ pub(super) fn run_negentropy(
                         f.limit = f.limit.min(cap);
                     }
                     let limit = sub.filter_group.filters[0].limit;
-                    let per_item = if sub.filter_group.filters[0].search.is_some() {
-                        1024
-                    } else {
-                        256
-                    };
+                    let per_item = wok_negentropy::memory_view_item_bytes(
+                        sub.filter_group.filters[0].search.is_some(),
+                    );
                     let bytes = if tree_id.is_some() {
                         ROUND_BYTES
                     } else {

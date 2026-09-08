@@ -27,6 +27,7 @@ pub struct RwTxn<'env> {
     committed: bool,
     lifetime: (),
     pub(crate) event_sequence: Option<u64>,
+    pub(crate) superseded_events: Option<u64>,
     pub(crate) author_counts: std::collections::HashMap<Vec<u8>, u64>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
@@ -111,6 +112,7 @@ impl<'env> RwTxn<'env> {
             committed: false,
             lifetime: (),
             event_sequence: None,
+            superseded_events: None,
             author_counts: Default::default(),
             _not_send_or_sync: PhantomData,
         })

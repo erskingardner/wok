@@ -165,6 +165,7 @@ pub fn rebuild_primary_and_event_indices(
         meta.db_version = wok_event::WOK_DB_VERSION;
         target.put_u64(target_dbis.meta, 1, &crate::encode_meta(&meta), 0)?;
     }
+    crate::state::superseded_events(target)?;
     initialize_search_index_state(target, last_lev_id)?;
     Ok(ReindexStats {
         events,

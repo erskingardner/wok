@@ -301,6 +301,19 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
                             integrity.actual_index_entries
                         ),
                     );
+                    let history_status = if integrity.superseded_events == 0 {
+                        CheckStatus::Pass
+                    } else {
+                        CheckStatus::Warn
+                    };
+                    report.add(
+                        "replacement-history",
+                        history_status,
+                        format!(
+                            "{} superseded events in {} replacement groups; retained history is hidden from relay reads",
+                            integrity.superseded_events, integrity.superseded_groups,
+                        ),
+                    );
                     report.integrity = Some(integrity);
                 }
                 Err(error) => report.add("integrity", CheckStatus::Fail, error.to_string()),

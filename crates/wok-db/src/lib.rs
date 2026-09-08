@@ -36,8 +36,8 @@ pub use integrity::{check_integrity, IntegrityIssue, IntegrityReport};
 pub use lookup::{
     bump_negentropy_mod_counter, foreach_created_at, foreach_event_from, foreach_negentropy_filter,
     foreach_negentropy_filter_rw, get_compression_dictionary_ro, get_packed_ro, get_payload_ro,
-    insert_compression_dictionary, insert_negentropy_filter, lookup_event_by_id_ro,
-    most_recent_levid_ro,
+    insert_compression_dictionary, insert_negentropy_filter, is_event_superseded_ro,
+    lookup_event_by_id_ro, most_recent_levid_ro,
 };
 pub use migration::{event_fingerprint, snapshot_lmdb_readonly, EventFingerprint};
 pub use moderation::{

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- New winning replacements remove every older version at their address in one
+  transaction, including quota and negentropy updates. Stale writes compare
+  against all stored versions, and address deletions remove all eligible history.
+- Doctor and migration report retained superseded groups/events without changing
+  lossless migration records. Sync and router uploads suppress stale versions;
+  sync reports superseded transfers separately from failures and bounds filtered
+  view construction using the configured sync event/memory budgets.
+- Historical queries, COUNT, search, live delivery, and NIP-77 suppress older
+  replaceable events even when a lossless import retained multiple versions.
+  Contact lists (kind 3), other replaceable kinds, and addressable events share
+  timestamp/ID winner selection independent of query filters. Physical records
+  remain intact. A transactional retained-history count preserves persistent
+  negentropy trees for clean databases; filters that may include superseded
+  records use the bounded filtered view.
+  Databases retaining history therefore cannot perform replaceable-inclusive
+  reconciliation above `relay.max_sync_events` (default 1,000,000) or the memory
+  budget until history is removed or the filter is narrowed. A dedicated purge
+  command remains follow-up work.
+
 ## [0.6.1] - 2026-09-07
 
 ### Fixed

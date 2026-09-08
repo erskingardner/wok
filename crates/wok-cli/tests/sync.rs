@@ -645,3 +645,155 @@ async fn cpp_peer_syncs_both_directions_including_all_users_gift_wraps() {
         assert!(actual.contains(event));
     }
 }
+
+#[path = "support/replacement.rs"]
+mod replacement;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_tree_and_vector_views_offer_only_current_replaceable_versions() {
+    for kind in [3, 30443] {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let src = config(
+            source.path(),
+            "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+        );
+        let dst = config(
+            target.path(),
+            "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+        );
+        let events = replacement::events(kind);
+        drop(replacement::seed(&source.path().join("db"), &events, 5));
+        import(&dst, &[events[2].clone()]);
+        let server = serve(&dst).await;
+        for filter in ["{}".to_string(), format!("{{\"kinds\":[{kind}]}}")] {
+            let output = sync(
+                &src,
+                &server.url,
+                &["--check", "--filter", &filter, "--json"],
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(summary(&output)["have"], 0);
+            assert_eq!(summary(&output)["need"], 0);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superseded_transfers_are_reported_without_failing_sync() {
+    for kind in [3, 30443] {
+        for direction in ["up", "down"] {
+            let local = tempfile::tempdir().unwrap();
+            let remote = tempfile::tempdir().unwrap();
+            let lc = config(
+                local.path(),
+                "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+            );
+            let rc = config(
+                remote.path(),
+                "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+            );
+            let events = replacement::events(kind);
+            let (le, re) = if direction == "up" {
+                (&events[0], &events[2])
+            } else {
+                (&events[2], &events[0])
+            };
+            import(&lc, std::slice::from_ref(le));
+            import(&rc, std::slice::from_ref(re));
+            let server = serve(&rc).await;
+            let output = sync(&lc, &server.url, &["--dir", direction, "--json"]);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let report = summary(&output);
+            assert_eq!(report["rejected"], 0);
+            assert_eq!(report["upload_rejected"], 0);
+            assert_eq!(
+                report[if direction == "up" {
+                    "upload_superseded"
+                } else {
+                    "superseded"
+                }],
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn filtered_sync_view_respects_the_configured_event_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "[relay]\nmax_sync_events=1\n");
+    let mut events = replacement::events(3);
+    events.extend(replacement::events(1));
+    drop(replacement::seed(&dir.path().join("db"), &events, 5));
+    let output = sync(&cfg, "ws://127.0.0.1:1", &["--check", "--json"]);
+    assert!(!output.status.success());
+    assert!(summary(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("filtered sync view exceeds"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_replacement_databases_sync_above_the_memory_view_event_limit() {
+    let local = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let options =
+        "[relay]\nmax_sync_events=1\n[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n";
+    let lc = config(local.path(), options);
+    let rc = config(remote.path(), options);
+    let events: Vec<_> = [0, 3, 41, 10002, 30443].into_iter().map(event).collect();
+    import(&lc, &events);
+    import(&rc, &events);
+    let server = serve(&rc).await;
+    let output = sync(&lc, &server.url, &["--check", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(summary(&output)["have"], 0);
+    assert_eq!(summary(&output)["need"], 0);
+}
+
+#[test]
+fn filtered_sync_reports_insufficient_round_memory_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "[relay]\nsync_memory_per_connection=1048576\n");
+    drop(replacement::seed(
+        &dir.path().join("db"),
+        &replacement::events(3),
+        5,
+    ));
+    let output = sync(&cfg, "ws://127.0.0.1:1", &["--check", "--json"]);
+    assert!(!output.status.success());
+    assert!(summary(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("sync_memory_per_connection and sync_memory_total for protocol rounds"));
+}
+
+#[test]
+fn empty_sync_filter_returns_a_structured_error_without_opening_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "");
+    let output = sync(
+        &cfg,
+        "ws://127.0.0.1:1",
+        &["--filter", "[]", "--check", "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(summary(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("at least one filter"));
+    assert!(!dir.path().join("db").exists());
+}

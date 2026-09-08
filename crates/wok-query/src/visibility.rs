@@ -3,6 +3,36 @@
 use crate::{NostrFilter, NostrFilterGroup};
 use wok_event::PackedEventView;
 
+/// Conservative, constant-seek proof that a physical tree needs no global
+/// visibility filtering. Callers separately enforce identity-scoped access.
+pub fn physical_tree_is_globally_visible(
+    txn: &wok_db::RoTxn<'_>,
+    filter: &NostrFilter,
+) -> Result<bool, wok_db::DbError> {
+    let db = txn.env().dbis();
+    for dbi in [db.moderation, db.vanish_pubkey].into_iter().flatten() {
+        if txn.entries(dbi)? != 0 {
+            return Ok(false);
+        }
+    }
+    // Expiring/TTL records need per-event checks even between cleanup ticks.
+    if txn.entries(db.event_expiration)? != 0 {
+        return Ok(false);
+    }
+    // Physical trees are safe for clean replacement groups, including profiles
+    // and contacts. Retained history (or older, uninitialized bookkeeping)
+    // requires per-event filtering unless the filter excludes replacement.
+    let excludes_replaceable = filter.kinds.as_ref().is_some_and(|kinds| {
+        kinds.iter().all(|kind| {
+            !wok_event::is_replaceable_kind(kind) && !wok_event::is_param_replaceable_kind(kind)
+        })
+    });
+    if !excludes_replaceable && wok_db::state::superseded_events_ro(txn)? != Some(0) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadRestrictor {
     pub restricted_kinds: Vec<u64>,
@@ -146,7 +176,8 @@ impl ReadVisibility {
             return Ok(false);
         }
         Ok(!wok_db::is_event_vanished_ro(txn, event)?
-            && !wok_db::is_event_moderated_ro(txn, event)?)
+            && !wok_db::is_event_moderated_ro(txn, event)?
+            && !wok_db::is_event_superseded_ro(txn, event)?)
     }
 }
 

@@ -3,6 +3,7 @@ use crate::keys::make_key_string_u64;
 use crate::{DbError, RoTxn, RwTxn};
 
 pub(crate) const HIGH_WATER: &[u8] = b"sequence";
+pub(crate) const SUPERSEDED_EVENTS: &[u8] = b"superseded-events";
 pub const POLICY_GENERATION: &[u8] = b"visibility";
 
 pub(crate) fn decode(raw: &[u8]) -> Result<u64, DbError> {
@@ -153,6 +154,9 @@ pub(crate) fn flush(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
         #[cfg(test)]
         crate::crash_tests::checkpoint("sequence-staged");
     }
+    if let Some(count) = txn.superseded_events.take() {
+        txn.put(dbi, SUPERSEDED_EVENTS, &count.to_le_bytes(), 0)?;
+    }
     for (key, count) in std::mem::take(&mut txn.author_counts) {
         txn.put(dbi, &key, &count.to_le_bytes(), 0)?;
         #[cfg(test)]
@@ -165,6 +169,84 @@ pub(crate) fn flush(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
 /// deleted tails. Caller has already cleared the target state table.
 pub(crate) fn reset_for_reindex(source: &RoTxn<'_>, target: &mut RwTxn<'_>) -> Result<(), DbError> {
     target.author_counts.clear();
+    target.superseded_events = None;
     target.event_sequence = high_water_ro(source)?;
+    Ok(())
+}
+
+/// None means this snapshot predates replacement bookkeeping; readers must
+/// conservatively filter it until a writable initialization/reindex counts it.
+pub fn superseded_events_ro(txn: &RoTxn<'_>) -> Result<Option<u64>, DbError> {
+    let Some(dbi) = txn.env().dbis().state else {
+        return Ok(None);
+    };
+    txn.get(dbi, SUPERSEDED_EVENTS)?.map(decode).transpose()
+}
+
+/// One ordered index scan on first initialization of an older database.
+/// Signed primary records and the physical negentropy tree remain untouched.
+pub(crate) fn superseded_events(txn: &mut RwTxn<'_>) -> Result<u64, DbError> {
+    if let Some(count) = txn.superseded_events {
+        return Ok(count);
+    }
+    let dbi = txn
+        .env()
+        .dbis()
+        .state
+        .ok_or_else(|| DbError::msg("missing Wok state table"))?;
+    let count = if let Some(raw) = txn.get(dbi, SUPERSEDED_EVENTS)? {
+        decode(raw)?
+    } else {
+        let mut previous = Vec::new();
+        let mut count = 0u64;
+        let mut error = None;
+        txn.foreach_full(txn.env().dbis().event_replace, &[], &[], false, |key, _| {
+            let kind = match crate::keys::parse_key_string_u64(key) {
+                Ok((_, kind)) => kind,
+                Err(err) => {
+                    error = Some(err);
+                    return false;
+                }
+            };
+            if wok_event::is_replaceable_kind(kind) || wok_event::is_param_replaceable_kind(kind) {
+                if previous == key {
+                    count += 1;
+                } else {
+                    previous = key.to_vec();
+                }
+            }
+            true
+        })?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        count
+    };
+    txn.superseded_events = Some(count);
+    Ok(count)
+}
+
+/// Call before inserting into, or after deleting from, the replacement index.
+/// Each member beyond the first contributes exactly one superseded record,
+/// irrespective of which event wins the timestamp/ID comparison.
+pub(crate) fn change_replacement_count(
+    txn: &mut RwTxn<'_>,
+    key: &[u8],
+    insert: bool,
+) -> Result<(), DbError> {
+    if txn.get(txn.env().dbis().event_replace, key)?.is_some() {
+        // The caller initialized the count before any index mutation.
+        let old = txn
+            .superseded_events
+            .ok_or_else(|| DbError::msg("replacement count not initialized"))?;
+        txn.superseded_events = Some(
+            if insert {
+                old.checked_add(1)
+            } else {
+                old.checked_sub(1)
+            }
+            .ok_or_else(|| DbError::msg("replacement count overflow or drift"))?,
+        );
+    }
     Ok(())
 }

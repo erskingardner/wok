@@ -33,6 +33,13 @@ it is not a promise to reproduce upstream bugs.
 
 ## Intentional protocol and operational differences
 
+- Latest-only replaceable reads are enforced independently of physical
+  cleanup. Retained source versions cannot reappear through historical REQ,
+  COUNT, search, live catch-up, or NIP-77. This follows pinned NIP-01 and is
+  covered by `wok-compat/tests/replaceable_events.rs`.
+- Replacement writes and address deletions handle every retained version at an
+  address; the pinned strfry writer inspects only one replacement-index entry.
+  Rejected writes do not apply proposed physical cleanup.
 - Ephemeral kinds are live-only by default: after validation, AUTH, and policy
   checks they reach matching active subscriptions without being written to
   LMDB or negentropy. Operators can explicitly select `ttl` compatibility mode,
@@ -58,6 +65,11 @@ it is not a promise to reproduce upstream bugs.
   connection).
 - Mesh client connections do not currently offer permessage-deflate. Wok's
   WebSocket server does negotiate it.
+- `wok sync` classifies a peer's negative upload ACK as superseded only when
+  its reason starts with `replaced:` (the prefix used by Wok). A foreign peer
+  using different wording is counted as `upload_rejected`, and the run exits
+  nonzero even if replacement semantics explain the difference. Arbitrary
+  human-readable rejection text is not treated as evidence of supersession.
 
 ## Compatibility-sensitive behavior retained
 

@@ -422,6 +422,7 @@ impl Env {
                 )));
             }
         }
+        crate::state::superseded_events(&mut txn)?;
         txn.commit()?;
         crate::search::ensure_search_index(self)?;
         Ok(())

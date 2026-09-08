@@ -780,3 +780,20 @@ fn filtered_sync_reports_insufficient_round_memory_explicitly() {
         .unwrap()
         .contains("sync_memory_per_connection and sync_memory_total for protocol rounds"));
 }
+
+#[test]
+fn empty_sync_filter_returns_a_structured_error_without_opening_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "");
+    let output = sync(
+        &cfg,
+        "ws://127.0.0.1:1",
+        &["--filter", "[]", "--check", "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(summary(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("at least one filter"));
+    assert!(!dir.path().join("db").exists());
+}

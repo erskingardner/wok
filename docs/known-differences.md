@@ -65,6 +65,11 @@ it is not a promise to reproduce upstream bugs.
   connection).
 - Mesh client connections do not currently offer permessage-deflate. Wok's
   WebSocket server does negotiate it.
+- `wok sync` classifies a peer's negative upload ACK as superseded only when
+  its reason starts with `replaced:` (the prefix used by Wok). A foreign peer
+  using different wording is counted as `upload_rejected`, and the run exits
+  nonzero even if replacement semantics explain the difference. Arbitrary
+  human-readable rejection text is not treated as evidence of supersession.
 
 ## Compatibility-sensitive behavior retained
 

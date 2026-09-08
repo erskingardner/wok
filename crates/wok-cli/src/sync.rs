@@ -135,6 +135,9 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
     )?;
+    if filter_group.filters.is_empty() {
+        bail!("sync requires at least one filter");
+    }
     let env = open_env(cfg)?;
     // Prefer a precomputed tree whose canonical (time-stripped) filter
     // matches, like C++.

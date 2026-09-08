@@ -626,17 +626,24 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
         })?;
     }
 
-    if let Some(count) = crate::state::superseded_events_ro(txn)? {
-        if count != report.superseded_events {
-            report.metadata_errors += 1;
-            report.issue(
-                "counter-drift",
-                "state",
-                format!(
-                    "superseded event count is {count}, expected {}",
-                    report.superseded_events
-                ),
-            );
+    // The advisory count includes only validated replacement entries. A broken
+    // index cannot establish drift in the separately maintained physical count.
+    if report.missing_index_entries == 0
+        && report.extra_index_entries == 0
+        && report.lookup_errors == 0
+    {
+        if let Some(count) = crate::state::superseded_events_ro(txn)? {
+            if count != report.superseded_events {
+                report.metadata_errors += 1;
+                report.issue(
+                    "counter-drift",
+                    "state",
+                    format!(
+                        "superseded event count is {count}, expected {}",
+                        report.superseded_events
+                    ),
+                );
+            }
         }
     }
     Ok(report)

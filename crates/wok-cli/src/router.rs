@@ -954,7 +954,10 @@ async fn router_db_change(
         let start = curr_event_id.saturating_add(1);
         let mut latest = *curr_event_id;
         let mut visibility_error = None;
-        let visibility = wok_query::visibility::ReadVisibility::default();
+        let visibility = wok_query::visibility::ReadVisibility {
+            ephemeral_lifetime_secs: Some(cfg.events.ephemeral_lifetime_secs),
+            ..Default::default()
+        };
         wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
             latest = lev;
             let packed = match PackedEventView::new(packed_bytes) {
@@ -1028,13 +1031,14 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn router_outbound_skips_superseded_records_and_advances_the_cursor() {
-        for kind in [3, 30443] {
+    async fn router_outbound_skips_hidden_records_and_advances_the_cursor() {
+        for (kind, ttl) in [(3, 1), (30443, 1), (20001, 1), (20001, 3600)] {
             let dir = tempfile::tempdir().unwrap();
             let events = replacement_fixture::events(kind);
             let env = replacement_fixture::seed(dir.path(), &events, 5);
-            let cfg = Config::default();
-            let name = format!("replacement-test-{kind}");
+            let mut cfg = Config::default();
+            cfg.events.ephemeral_lifetime_secs = ttl;
+            let name = format!("replacement-test-{kind}-{ttl}");
             let url = "ws://replacement-test.invalid".to_string();
             let spec = StreamSpec {
                 dir: "up".into(),
@@ -1071,7 +1075,14 @@ mod tests {
                 sent.push(serde_json::from_str::<Value>(&payload).unwrap()[1].clone());
             }
             assert_eq!(cursor, 3);
-            assert_eq!(sent, vec![events[2].clone()]);
+            let expected = if kind != 20001 {
+                vec![events[2].clone()]
+            } else if ttl == 1 {
+                Vec::new()
+            } else {
+                events
+            };
+            assert_eq!(sent, expected, "kind {kind}, ttl {ttl}");
         }
     }
 

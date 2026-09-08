@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain intact. A transactional retained-history count preserves persistent
   negentropy trees for clean databases; filters that may include superseded
   records use the bounded filtered view.
+  Databases retaining history therefore cannot perform replaceable-inclusive
+  reconciliation above `relay.max_sync_events` (default 1,000,000) or the memory
+  budget until history is removed or the filter is narrowed. A dedicated purge
+  command remains follow-up work.
 
 ## [0.6.1] - 2026-09-07
 

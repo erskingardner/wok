@@ -731,3 +731,26 @@ fn older_databases_initialize_history_counts_without_changing_events() {
         assert_eq!(stored_ids(&env), before);
     }
 }
+
+#[test]
+fn corrupt_replacement_indices_do_not_report_spurious_counter_drift() {
+    let key = key();
+    let events: Vec<_> = (1..=3)
+        .map(|time| event(&key, 3, time, json!([]), "history"))
+        .collect();
+    let (_dir, env) = snapshot(&events);
+    {
+        let mut txn = env.begin_rw().unwrap();
+        // Leave dangling secondary entries, including the middle replacement.
+        txn.del_u64(env.dbis().event, 2, None).unwrap();
+        txn.commit().unwrap();
+    }
+    let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+    assert!(!report.ok());
+    assert!(report.extra_index_entries > 0);
+    assert_eq!(report.metadata_errors, 0);
+    assert!(!report
+        .issues
+        .iter()
+        .any(|issue| issue.category == "counter-drift"));
+}

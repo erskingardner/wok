@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-08
+
 ### Fixed
 
+- Empty CLI sync filters return a structured error instead of panicking. Router
+  forwarding honors the configured ephemeral-event lifetime. Integrity avoids
+  misleading replacement-counter drift reports when indexes are already corrupt.
 - New winning replacements remove every older version at their address in one
   transaction, including quota and negentropy updates. Stale writes compare
   against all stored versions, and address deletions remove all eligible history.
@@ -409,7 +414,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protected-event publishing and restricted reads require the appropriate
   authenticated author or recipient relationship.
 
-[Unreleased]: https://github.com/erskingardner/wok/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/erskingardner/wok/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/erskingardner/wok/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/erskingardner/wok/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/erskingardner/wok/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/erskingardner/wok/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/erskingardner/wok/compare/v0.3.1...v0.4.0

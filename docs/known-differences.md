@@ -33,6 +33,10 @@ it is not a promise to reproduce upstream bugs.
 
 ## Intentional protocol and operational differences
 
+- Latest-only replaceable reads are enforced independently of physical
+  cleanup. Retained source versions cannot reappear through historical REQ,
+  COUNT, search, live catch-up, or NIP-77. This follows pinned NIP-01 and is
+  covered by `wok-compat/tests/replaceable_events.rs`.
 - Ephemeral kinds are live-only by default: after validation, AUTH, and policy
   checks they reach matching active subscriptions without being written to
   LMDB or negentropy. Operators can explicitly select `ttl` compatibility mode,

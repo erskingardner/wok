@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Historical queries, COUNT, search, live delivery, and NIP-77 suppress older
+  replaceable events even when a lossless import retained multiple versions.
+  Contact lists (kind 3), other replaceable kinds, and addressable events share
+  timestamp/ID winner selection independent of query filters. Physical records
+  remain intact; sync filters that may include replaceable events use the
+  bounded filtered view instead of an unfiltered persistent tree.
+
 ## [0.6.1] - 2026-09-07
 
 ### Fixed

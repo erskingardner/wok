@@ -146,7 +146,8 @@ impl ReadVisibility {
             return Ok(false);
         }
         Ok(!wok_db::is_event_vanished_ro(txn, event)?
-            && !wok_db::is_event_moderated_ro(txn, event)?)
+            && !wok_db::is_event_moderated_ro(txn, event)?
+            && !wok_db::is_event_superseded_ro(txn, event)?)
     }
 }
 

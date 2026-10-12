@@ -44,6 +44,7 @@ history_interval_secs = 15
 history_max_points = 5760
 
 [relay]
+# IPv4/IPv6 literal or hostname; a hostname binds every address it resolves to.
 bind = "127.0.0.1"
 port = 7777
 nofiles = 524288

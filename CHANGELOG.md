@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session on the relay as NIP-77 specifies.
 - OK reasons for storage failures start with `error:` instead of
   `Write error:`, and prefixed AUTH failures are no longer double-prefixed.
+- `relay.bind` accepts bare IPv6 literals (`::1`) and hostnames. A hostname
+  binds every address it resolves to, so `localhost` listens on both
+  `127.0.0.1` and `::1`. Bind failures now stop startup instead of leaving the
+  relay running without a WebSocket listener.
 
 ## [0.7.0] - 2026-09-08
 

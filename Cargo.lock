@@ -2986,6 +2986,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "parking_lot",
  "proptest",
  "rand 0.8.7",

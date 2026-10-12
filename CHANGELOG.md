@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AUTH replies `blocked:`. `relay.auth.enabled = false` now actually refuses
   AUTH. An authenticated COUNT that is not scoped to the authenticated key gets
   `restricted:` instead of a repeated `auth-required:`.
-- NIP-77 refusals that name a subscription (malformed hex or filter, negentropy
-  disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, so sync
+- NIP-77 refusals that name a subscription (malformed envelope, hex, or filter;
+  negentropy disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, so sync
   clients stop waiting. Every NEG-ERR, including rate limits, now closes the
   session on the relay as NIP-77 specifies.
 - OK reasons for storage failures start with `error:` instead of

@@ -86,6 +86,21 @@ pub enum ParseFailure {
     BadClose(String),
     /// `negentropy error: ...` -> NOTICE
     Neg(String),
+    /// Malformed NEG-OPEN / NEG-MSG that still names its subscription. The
+    /// relay answers NIP-77 NEG-ERR `invalid:`; NOTICE is only the fallback.
+    NegRequest { sub_id: String, reason: String },
+}
+
+/// A NEG-OPEN / NEG-MSG failure, addressed to its subscription when the id is
+/// a string so the relay can reply with NEG-ERR instead of NOTICE.
+fn neg_failure(sub_id: &Value, reason: &str) -> ParseFailure {
+    match sub_id.as_str() {
+        Some(sub_id) => ParseFailure::NegRequest {
+            sub_id: sub_id.to_string(),
+            reason: reason.to_string(),
+        },
+        None => ParseFailure::Neg(reason.to_string()),
+    }
 }
 
 impl ParseFailure {
@@ -94,7 +109,9 @@ impl ParseFailure {
             Self::BadMsg(e) => RelayMessage::notice_error(format!("bad msg: {e}")),
             Self::BadReq(e) => RelayMessage::notice_error(format!("bad req: {e}")),
             Self::BadClose(e) => RelayMessage::notice_error(format!("bad close: {e}")),
-            Self::Neg(e) => RelayMessage::notice_error(format!("negentropy error: {e}")),
+            Self::Neg(e) | Self::NegRequest { reason: e, .. } => {
+                RelayMessage::notice_error(format!("negentropy error: {e}"))
+            }
         }
     }
 }
@@ -159,29 +176,24 @@ impl ClientCommand {
             }
             "NEG-OPEN" => {
                 if arr.len() < 4 {
-                    return Err(ParseFailure::Neg(
-                        "negentropy query missing elements".into(),
-                    ));
+                    return Err(neg_failure(&arr[1], "negentropy query missing elements"));
                 }
+                let sub_id = arr[1].as_str().ok_or_else(|| {
+                    ParseFailure::Neg("NEG subscription id was not a string".into())
+                })?;
+                let payload_hex = arr[3]
+                    .as_str()
+                    .ok_or_else(|| neg_failure(&arr[1], "negentropy payload not a string"))?;
+                let (sub_id, payload_hex) = (sub_id.to_string(), payload_hex.to_string());
                 Ok(Self::NegOpen {
-                    sub_id: arr[1]
-                        .as_str()
-                        .ok_or_else(|| {
-                            ParseFailure::Neg("NEG subscription id was not a string".into())
-                        })?
-                        .to_string(),
+                    sub_id,
                     filter: std::mem::take(&mut arr[2]),
-                    payload_hex: arr[3]
-                        .as_str()
-                        .ok_or_else(|| ParseFailure::Neg("negentropy payload not a string".into()))?
-                        .to_string(),
+                    payload_hex,
                 })
             }
             "NEG-MSG" => {
                 if arr.len() < 3 {
-                    return Err(ParseFailure::Neg(
-                        "negentropy message missing elements".into(),
-                    ));
+                    return Err(neg_failure(&arr[1], "negentropy message missing elements"));
                 }
                 Ok(Self::NegMsg {
                     sub_id: arr[1]
@@ -192,7 +204,7 @@ impl ClientCommand {
                         .to_string(),
                     payload_hex: arr[2]
                         .as_str()
-                        .ok_or_else(|| ParseFailure::Neg("negentropy payload not a string".into()))?
+                        .ok_or_else(|| neg_failure(&arr[1], "negentropy payload not a string"))?
                         .to_string(),
                 })
             }

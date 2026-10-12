@@ -14,7 +14,7 @@ use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
 use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
 use crate::plugin::{PluginEventSifter, PluginResult};
-use crate::protocol::{has_reason_prefix, ClientCommand, RelayMessage};
+use crate::protocol::{has_reason_prefix, ClientCommand, ParseFailure, RelayMessage};
 use crate::restrict::ReadRestrictor;
 use crate::source::TransportSource;
 use crate::supported_nips;
@@ -887,6 +887,12 @@ fn handle_client(
 ) {
     let cmd = match ClientCommand::parse(payload) {
         Ok(c) => c,
+        Err(ParseFailure::NegRequest { sub_id, reason }) => {
+            let reason = format!("invalid: {reason}");
+            let neg_tx = route_tx(neg_txs, conn_id);
+            neg_err(conns, metrics, neg_tx, conn_id, &sub_id, reason);
+            return;
+        }
         Err(e) => {
             conns.send(conn_id, e.into_message(), metrics);
             return;

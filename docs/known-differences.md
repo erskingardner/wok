@@ -94,8 +94,8 @@ regression test. Differential parity alone is not a reason to retain it.
   pinned strfry still challenges and then rejects every AUTH. An authenticated
   COUNT that is not scoped to an authenticated key is `restricted:`, not
   another `auth-required:`. `relay.auth.enabled = false` now also refuses AUTH.
-- NIP-77: NEG-OPEN and NEG-MSG refusals (malformed hex or filter, negentropy
-  disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, and
+- NIP-77: NEG-OPEN and NEG-MSG refusals (malformed envelope, hex, or filter;
+  negentropy disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, and
   every NEG-ERR closes the session. Only an unusable subscription id still
   produces a NOTICE.
 - OK reasons for storage failures use `error:` instead of `Write error:`, and

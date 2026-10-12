@@ -174,6 +174,17 @@ async fn negentropy_refusals_are_neg_err() {
     send(&conn, json!(["NEG-MSG", "msg", "zz"])).await;
     assert_reply(&recv(&mut rx).await, "NEG-ERR", "msg", "invalid: ");
 
+    // Malformed envelopes that still name their subscription.
+    for (sid, msg) in [
+        ("null-open", json!(["NEG-OPEN", "null-open", {}, null])),
+        ("short-open", json!(["NEG-OPEN", "short-open", {}])),
+        ("null-msg", json!(["NEG-MSG", "null-msg", null])),
+        ("short-msg", json!(["NEG-MSG", "short-msg"])),
+    ] {
+        send(&conn, msg).await;
+        assert_reply(&recv(&mut rx).await, "NEG-ERR", sid, "invalid: ");
+    }
+
     send(
         &conn,
         json!(["NEG-OPEN", "x".repeat(65), {}, neg_initial()]),

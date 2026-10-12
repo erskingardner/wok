@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `127.0.0.1` and `::1`; resolved addresses this host cannot use are skipped
   with a warning. Bind failures now stop startup instead of leaving the
   relay running without a WebSocket listener.
+- Authors can read their own restricted-kind events that have no `p` tag
+  (for example NIP-78 kind 30078 app data). Before, REQ, COUNT, live
+  delivery, and sync hid them from everyone, including the author.
 
 ## [0.7.0] - 2026-09-08
 

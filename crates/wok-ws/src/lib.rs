@@ -39,8 +39,8 @@ pub(crate) const WOK_MARK_SVG: &str = r##"<svg viewBox="0 0 1028 1028" aria-hidd
 /// `host` is an IPv4 literal, an IPv6 literal (bare or bracketed), or a
 /// hostname. A literal binds exactly that address. A hostname binds every
 /// address it resolves to (`localhost` → `127.0.0.1` and `::1`); resolved
-/// addresses in a family this host cannot use are skipped with a warning,
-/// but at least one must bind. With port 0 every listener shares the port
+/// addresses that are not assigned on this host, or whose family it lacks,
+/// are skipped with a warning, but at least one must bind. With port 0 every listener shares the port
 /// assigned to the first.
 pub async fn bind_listeners(host: &str, port: u16) -> std::io::Result<Vec<TcpListener>> {
     let unbracketed = host
@@ -95,8 +95,10 @@ fn bind_error(addr: SocketAddr, e: std::io::Error) -> std::io::Error {
     std::io::Error::new(e.kind(), format!("bind {addr}: {e}"))
 }
 
-/// The address or its whole family is absent on this host, e.g. `::1` from
-/// `/etc/hosts` on a machine with IPv6 disabled.
+/// The address is not assigned on this host, or its whole family is absent,
+/// e.g. `::1` from `/etc/hosts` on a machine with IPv6 disabled. Linux
+/// reports an unassigned address and `disable_ipv6=1` with the same errno,
+/// so the two cannot be told apart.
 fn is_unusable_address(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(libc::EAFNOSUPPORT)
 }

@@ -98,7 +98,7 @@ interface or protect the path at the reverse proxy.
 
 | Key | Default | Reload | Dashboard | Meaning |
 |---|---:|---|---|---|
-| `relay.bind` | `127.0.0.1` | Restart | TCP listen address: an IPv4 or IPv6 literal (`::1` or `[::1]`), or a hostname. A hostname listens on every address it resolves to (`localhost` → `127.0.0.1` and `::1`), skipping address families the host lacks. |
+| `relay.bind` | `127.0.0.1` | Restart | TCP listen address: an IPv4 or IPv6 literal (`::1` or `[::1]`), or a hostname. A hostname listens on every address it resolves to (`localhost` → `127.0.0.1` and `::1`), skipping resolved addresses that are not assigned on this host or whose family it lacks, as long as one binds. |
 | `relay.port` | `7777` | Restart | TCP listen port. |
 | `relay.nofiles` | `524288` | Restart | Requested process file-descriptor limit. |
 | `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-IP budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. |

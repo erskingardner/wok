@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Write error:`, and prefixed AUTH failures are no longer double-prefixed.
 - `relay.bind` accepts bare IPv6 literals (`::1`) and hostnames. A hostname
   binds every address it resolves to, so `localhost` listens on both
-  `127.0.0.1` and `::1`. Bind failures now stop startup instead of leaving the
+  `127.0.0.1` and `::1`; resolved addresses this host cannot use are skipped
+  with a warning. Bind failures now stop startup instead of leaving the
   relay running without a WebSocket listener.
 
 ## [0.7.0] - 2026-09-08

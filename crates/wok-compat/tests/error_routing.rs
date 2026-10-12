@@ -152,16 +152,25 @@ async fn cpp_error_routing() {
     )
     .await;
 
-    // AUTH without serviceUrl -> OK false "error: ...".
+    // AUTH that cannot succeed -> OK false "blocked: ...".
+    send_and_expect(
+        &rig,
+        r#"["AUTH",{"id":"ab"}]"#.into(),
+        |t| t == r#"["OK","ab",false,"blocked: AUTH is disabled on this relay"]"#,
+        "auth disabled",
+    )
+    .await;
+    rig.handle.config.write().relay.auth.enabled = true;
     send_and_expect(
         &rig,
         r#"["AUTH",{"id":"ab"}]"#.into(),
         |t| {
-            t == r#"["OK","ab",false,"error: relay needs serviceUrl to be configured before AUTH can work"]"#
+            t == r#"["OK","ab",false,"blocked: relay needs service_url to be configured before AUTH can work"]"#
         },
-        "auth error",
+        "auth without service_url",
     )
     .await;
+    rig.handle.config.write().relay.auth.enabled = false;
 
     // EVENT with an invalid event -> OK false "invalid: ...".
     send_and_expect(

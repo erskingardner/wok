@@ -86,6 +86,21 @@ pub enum ParseFailure {
     BadClose(String),
     /// `negentropy error: ...` -> NOTICE
     Neg(String),
+    /// Malformed NEG-OPEN / NEG-MSG that still names its subscription. The
+    /// relay answers NIP-77 NEG-ERR `invalid:`; NOTICE is only the fallback.
+    NegRequest { sub_id: String, reason: String },
+}
+
+/// A NEG-OPEN / NEG-MSG failure, addressed to its subscription when the id is
+/// a string so the relay can reply with NEG-ERR instead of NOTICE.
+fn neg_failure(sub_id: &Value, reason: &str) -> ParseFailure {
+    match sub_id.as_str() {
+        Some(sub_id) => ParseFailure::NegRequest {
+            sub_id: sub_id.to_string(),
+            reason: reason.to_string(),
+        },
+        None => ParseFailure::Neg(reason.to_string()),
+    }
 }
 
 impl ParseFailure {
@@ -94,7 +109,9 @@ impl ParseFailure {
             Self::BadMsg(e) => RelayMessage::notice_error(format!("bad msg: {e}")),
             Self::BadReq(e) => RelayMessage::notice_error(format!("bad req: {e}")),
             Self::BadClose(e) => RelayMessage::notice_error(format!("bad close: {e}")),
-            Self::Neg(e) => RelayMessage::notice_error(format!("negentropy error: {e}")),
+            Self::Neg(e) | Self::NegRequest { reason: e, .. } => {
+                RelayMessage::notice_error(format!("negentropy error: {e}"))
+            }
         }
     }
 }
@@ -159,29 +176,24 @@ impl ClientCommand {
             }
             "NEG-OPEN" => {
                 if arr.len() < 4 {
-                    return Err(ParseFailure::Neg(
-                        "negentropy query missing elements".into(),
-                    ));
+                    return Err(neg_failure(&arr[1], "negentropy query missing elements"));
                 }
+                let sub_id = arr[1].as_str().ok_or_else(|| {
+                    ParseFailure::Neg("NEG subscription id was not a string".into())
+                })?;
+                let payload_hex = arr[3]
+                    .as_str()
+                    .ok_or_else(|| neg_failure(&arr[1], "negentropy payload not a string"))?;
+                let (sub_id, payload_hex) = (sub_id.to_string(), payload_hex.to_string());
                 Ok(Self::NegOpen {
-                    sub_id: arr[1]
-                        .as_str()
-                        .ok_or_else(|| {
-                            ParseFailure::Neg("NEG subscription id was not a string".into())
-                        })?
-                        .to_string(),
+                    sub_id,
                     filter: std::mem::take(&mut arr[2]),
-                    payload_hex: arr[3]
-                        .as_str()
-                        .ok_or_else(|| ParseFailure::Neg("negentropy payload not a string".into()))?
-                        .to_string(),
+                    payload_hex,
                 })
             }
             "NEG-MSG" => {
                 if arr.len() < 3 {
-                    return Err(ParseFailure::Neg(
-                        "negentropy message missing elements".into(),
-                    ));
+                    return Err(neg_failure(&arr[1], "negentropy message missing elements"));
                 }
                 Ok(Self::NegMsg {
                     sub_id: arr[1]
@@ -192,7 +204,7 @@ impl ClientCommand {
                         .to_string(),
                     payload_hex: arr[2]
                         .as_str()
-                        .ok_or_else(|| ParseFailure::Neg("negentropy payload not a string".into()))?
+                        .ok_or_else(|| neg_failure(&arr[1], "negentropy payload not a string"))?
                         .to_string(),
                 })
             }
@@ -275,6 +287,28 @@ impl RelayMessage {
     }
 }
 
+/// Machine-readable prefixes defined by NIP-01 (plus NIP-42's `auth-required`)
+/// for OK, CLOSED and NEG-ERR reasons.
+const REASON_PREFIXES: &[&str] = &[
+    "auth-required",
+    "blocked",
+    "duplicate",
+    "error",
+    "invalid",
+    "mute",
+    "pow",
+    "rate-limited",
+    "restricted",
+];
+
+/// True when `reason` already starts with a standard `prefix: ` so it can be
+/// sent as is.
+pub fn has_reason_prefix(reason: &str) -> bool {
+    reason
+        .split_once(": ")
+        .is_some_and(|(prefix, _)| REASON_PREFIXES.contains(&prefix))
+}
+
 pub fn parse_sub_id(s: &str) -> Result<SubId, String> {
     SubId::new(s).map_err(|e| e.to_string())
 }
@@ -312,5 +346,16 @@ mod tests {
             message.to_json(),
             r#"["CLOSED","sub","auth-required: authenticate first"]"#
         );
+    }
+
+    #[test]
+    fn reason_prefix_detection_only_accepts_standard_words() {
+        assert!(has_reason_prefix(
+            "restricted: too many authenticated identities"
+        ));
+        assert!(has_reason_prefix("auth-required: authenticate first"));
+        assert!(!has_reason_prefix("challenge string mismatch"));
+        assert!(!has_reason_prefix("Write error: disk full"));
+        assert!(!has_reason_prefix("restricted:no space"));
     }
 }

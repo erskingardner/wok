@@ -1,0 +1,281 @@
+//! Pins the machine-readable prefixes on refusals that clients act on:
+//! `auth-required:` only while AUTH can still help, a final `restricted:` or
+//! `blocked:` otherwise, and NIP-77 refusals as NEG-ERR (which closes the
+//! session) rather than NOTICE.
+#![allow(clippy::field_reassign_with_default)]
+
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use wok_relay::{Config, ConnectionGuard, Outbound, OutboundFrame, RelayHandle, TransportSource};
+
+const SERVICE_URL: &str = "wss://prefixes.example";
+
+type Rx = tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>;
+type Configure = fn(&mut Config);
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+struct Relay {
+    handle: RelayHandle,
+    _dir: tempfile::TempDir,
+}
+
+impl Relay {
+    fn new(configure: impl FnOnce(&mut Config)) -> Self {
+        let (dir, env) = wok_compat::temp_db();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        configure(&mut cfg);
+        Self {
+            handle: wok_relay::start(env, cfg).unwrap(),
+            _dir: dir,
+        }
+    }
+
+    async fn connection(&self) -> (ConnectionGuard, Rx) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = self
+            .handle
+            .register_connection(TransportSource::Unix, Outbound::new(tx, 0))
+            .await;
+        (conn, rx)
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.handle.request_shutdown();
+    }
+}
+
+async fn recv(rx: &mut Rx) -> Value {
+    let frame = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(&frame.into_text()).unwrap()
+}
+
+async fn send(conn: &ConnectionGuard, msg: Value) {
+    conn.client_message(msg.to_string()).await;
+}
+
+fn assert_reply(reply: &Value, kind: &str, sub_id: &str, prefix: &str) {
+    assert_eq!(reply[0], kind, "{reply}");
+    assert_eq!(reply[1], sub_id, "{reply}");
+    let reason = reply[2].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with(prefix),
+        "expected a {prefix:?} reason, got {reply}"
+    );
+}
+
+fn neg_initial() -> String {
+    let mut store = wok_negentropy::Vector::new();
+    store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+    hex::encode(client.initiate().unwrap())
+}
+
+/// With AUTH unusable, a restricted read is refused for good: no challenge
+/// (the first reply is the refusal itself) and no `auth-required:` that would
+/// send a NIP-42 client into an AUTH that cannot succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restricted_reads_are_final_when_auth_is_unusable() {
+    let cases: [(&str, Configure); 2] = [
+        ("no service_url", |_| {}),
+        ("auth disabled", |cfg| {
+            cfg.relay.auth.enabled = false;
+            cfg.relay.auth.service_url = SERVICE_URL.into();
+        }),
+    ];
+    for (label, configure) in cases {
+        let relay = Relay::new(configure);
+        let (conn, mut rx) = relay.connection().await;
+
+        send(&conn, json!(["REQ", "dm", {"kinds":[4]}])).await;
+        assert_reply(&recv(&mut rx).await, "CLOSED", "dm", "restricted:");
+
+        send(&conn, json!(["COUNT", "count", {"kinds":[1059]}])).await;
+        assert_reply(&recv(&mut rx).await, "CLOSED", "count", "restricted:");
+
+        send(
+            &conn,
+            json!(["NEG-OPEN", "sync", {"kinds":[1059]}, neg_initial()]),
+        )
+        .await;
+        assert_reply(&recv(&mut rx).await, "NEG-ERR", "sync", "restricted:");
+
+        send(&conn, json!(["AUTH", {"id":"ab"}])).await;
+        let reply = recv(&mut rx).await;
+        assert_eq!(reply[0], "OK", "{label}: {reply}");
+        assert_eq!(reply[2], false, "{label}: {reply}");
+        assert!(
+            reply[3].as_str().unwrap().starts_with("blocked: "),
+            "{label}: {reply}"
+        );
+        conn.close().await;
+    }
+}
+
+/// NIP-42 flow: `auth-required:` and a challenge, AUTH, then the same REQ id
+/// is re-sent and served. Once authenticated, a COUNT not scoped to an
+/// authenticated key is `restricted:` rather than another `auth-required:`, so
+/// a client does not loop re-authenticating with the same key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_required_only_while_authenticating_can_help() {
+    let relay = Relay::new(|cfg| cfg.relay.auth.service_url = SERVICE_URL.into());
+    let (conn, mut rx) = relay.connection().await;
+
+    send(&conn, json!(["REQ", "dm", {"kinds":[4]}])).await;
+    let challenge = recv(&mut rx).await;
+    assert_eq!(challenge[0], "AUTH", "{challenge}");
+    assert_reply(&recv(&mut rx).await, "CLOSED", "dm", "auth-required: ");
+
+    let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+    let auth = wok_compat::sign_event_with_key(
+        json!({"created_at":now(),"kind":22242,
+            "tags":[["relay",SERVICE_URL],["challenge",challenge[1]]],"content":""}),
+        &key,
+    );
+    send(&conn, json!(["AUTH", auth])).await;
+    assert_eq!(recv(&mut rx).await[2], true);
+
+    send(&conn, json!(["REQ", "dm", {"kinds":[4]}])).await;
+    assert_eq!(recv(&mut rx).await, json!(["EOSE", "dm"]));
+
+    send(&conn, json!(["COUNT", "count", {"kinds":[4]}])).await;
+    assert_reply(&recv(&mut rx).await, "CLOSED", "count", "restricted: ");
+    conn.close().await;
+}
+
+/// Every NEG-OPEN / NEG-MSG refusal that can name its subscription is a
+/// NEG-ERR, so sync clients stop waiting; only an unusable sub id is a NOTICE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negentropy_refusals_are_neg_err() {
+    let relay = Relay::new(|_| {});
+    let (conn, mut rx) = relay.connection().await;
+
+    send(&conn, json!(["NEG-OPEN", "hex", {}, "zz"])).await;
+    assert_reply(&recv(&mut rx).await, "NEG-ERR", "hex", "invalid: ");
+
+    send(
+        &conn,
+        json!(["NEG-OPEN", "filter", {"kinds":"nope"}, neg_initial()]),
+    )
+    .await;
+    assert_reply(&recv(&mut rx).await, "NEG-ERR", "filter", "invalid: ");
+
+    send(&conn, json!(["NEG-MSG", "msg", "zz"])).await;
+    assert_reply(&recv(&mut rx).await, "NEG-ERR", "msg", "invalid: ");
+
+    // Malformed envelopes that still name their subscription.
+    for (sid, msg) in [
+        ("null-open", json!(["NEG-OPEN", "null-open", {}, null])),
+        ("short-open", json!(["NEG-OPEN", "short-open", {}])),
+        ("null-msg", json!(["NEG-MSG", "null-msg", null])),
+        ("short-msg", json!(["NEG-MSG", "short-msg"])),
+    ] {
+        send(&conn, msg).await;
+        assert_reply(&recv(&mut rx).await, "NEG-ERR", sid, "invalid: ");
+    }
+
+    send(
+        &conn,
+        json!(["NEG-OPEN", "x".repeat(65), {}, neg_initial()]),
+    )
+    .await;
+    let reply = recv(&mut rx).await;
+    assert_eq!(reply[0], "NOTICE", "{reply}");
+    assert!(
+        reply[1].as_str().unwrap().contains("negentropy error"),
+        "{reply}"
+    );
+    conn.close().await;
+
+    let disabled = Relay::new(|cfg| cfg.relay.negentropy_enabled = false);
+    let (conn, mut rx) = disabled.connection().await;
+    send(&conn, json!(["NEG-OPEN", "off", {}, neg_initial()])).await;
+    assert_reply(&recv(&mut rx).await, "NEG-ERR", "off", "blocked: ");
+    conn.close().await;
+}
+
+/// NIP-77: after NEG-ERR the subscription is closed, so the relay must not
+/// keep reconciling a session it has already reported as failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn neg_err_closes_the_session() {
+    let relay = Relay::new(|_| {});
+    let (conn, mut rx) = relay.connection().await;
+
+    send(
+        &conn,
+        json!(["NEG-OPEN", "sync", {"kinds":[1]}, neg_initial()]),
+    )
+    .await;
+    assert_eq!(recv(&mut rx).await[0], "NEG-MSG");
+
+    send(&conn, json!(["NEG-MSG", "sync", "zz"])).await;
+    assert_reply(&recv(&mut rx).await, "NEG-ERR", "sync", "invalid: ");
+
+    send(&conn, json!(["NEG-MSG", "sync", neg_initial()])).await;
+    assert_eq!(
+        recv(&mut rx).await,
+        json!(["NEG-ERR", "sync", "closed: unknown subscription handle"])
+    );
+    conn.close().await;
+}
+
+/// The NEG-ERR is ordered after any reply the worker already owes for the
+/// session: a NEG-OPEN immediately followed by a failing NEG-MSG never yields
+/// a NEG-MSG for that id after its NEG-ERR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn neg_err_follows_in_flight_replies() {
+    let relay = Relay::new(|_| {});
+    let (conn, mut rx) = relay.connection().await;
+    for i in 0..50 {
+        let event = wok_compat::sign_event(
+            json!({"created_at":now(),"kind":1,"tags":[],"content":format!("event {i}")}),
+        );
+        send(&conn, json!(["EVENT", event])).await;
+        assert_eq!(recv(&mut rx).await[2], true);
+    }
+
+    for round in 0..20 {
+        let sid = format!("sync-{round}");
+        send(
+            &conn,
+            json!(["NEG-OPEN", sid, {"kinds":[1]}, neg_initial()]),
+        )
+        .await;
+        send(&conn, json!(["NEG-MSG", sid, "zz"])).await;
+        // Same connection, same worker: once this reply arrives, everything
+        // the worker produced for `sid` has already been sent.
+        send(
+            &conn,
+            json!(["NEG-OPEN", "barrier", {"kinds":[2]}, neg_initial()]),
+        )
+        .await;
+
+        let mut errored = false;
+        loop {
+            let reply = recv(&mut rx).await;
+            if reply[1] == "barrier" {
+                assert_eq!(reply[0], "NEG-MSG", "{reply}");
+                break;
+            }
+            assert_eq!(reply[1], sid.as_str(), "{reply}");
+            assert!(!errored, "reply after NEG-ERR: {reply}");
+            if reply[0] == "NEG-ERR" {
+                assert_reply(&reply, "NEG-ERR", &sid, "invalid: ");
+                errored = true;
+            }
+        }
+        assert!(errored, "{sid} was never refused");
+    }
+    conn.close().await;
+}

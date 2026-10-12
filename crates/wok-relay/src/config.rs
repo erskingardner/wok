@@ -518,6 +518,13 @@ impl Config {
         }
     }
 
+    /// True when a NIP-42 AUTH can succeed: auth is enabled and the relay URL
+    /// that AUTH events must name is configured. NIP-11 advertises NIP-42 under
+    /// the same condition, and every AUTH challenge is gated on it.
+    pub fn auth_usable(&self) -> bool {
+        self.relay.auth.enabled && !self.relay.auth.service_url.is_empty()
+    }
+
     /// Explain when restricted reads are deliberately failing closed because
     /// the relay cannot complete NIP-42 authentication.
     pub fn auth_configuration_warning(&self) -> Option<String> {

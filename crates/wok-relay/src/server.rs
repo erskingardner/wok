@@ -240,6 +240,133 @@ pub struct RelayHandle {
     abuse: Arc<AbuseController>,
     config_path: Arc<parking_lot::RwLock<Option<std::path::PathBuf>>>,
     writer_tx: Sender<WriterMsg>,
+    threads: Arc<RelayThreads>,
+}
+
+/// How long dropping the last `RelayHandle` waits for the relay threads.
+const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The relay's OS threads, shared by every `RelayHandle` clone.
+///
+/// The threads own the only `Env` clones `start` makes. LMDB closes the
+/// environment (and, on macOS, unlinks its two named POSIX semaphores) only
+/// when the last clone drops, so a process that exits with these threads
+/// still running leaks those semaphores until reboot. Explicit
+/// `RelayHandle::shutdown_and_join`, or dropping the last handle, stops and
+/// joins them first.
+struct RelayThreads {
+    shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    ingest: Vec<tokio::sync::mpsc::Sender<IngestMsg>>,
+    writer_tx: Sender<WriterMsg>,
+    running: Mutex<RunningThreads>,
+}
+
+#[derive(Default)]
+struct RunningThreads {
+    ingesters: Vec<thread::JoinHandle<()>>,
+    /// Every other stage; each exits on the shutdown flag, a `Stop`
+    /// message, or once the ingesters and writer drop their senders.
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl RelayThreads {
+    fn stop_and_join(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        // Held throughout so a concurrent caller returns only once the
+        // threads are gone, not as soon as the first caller took them.
+        let mut running = self.running.lock();
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown_notify.notify_waiters();
+        for h in &running.workers {
+            h.thread().unpark();
+        }
+        for tx in &self.ingest {
+            send_ingest_stop(tx, deadline);
+        }
+        let ingesters = join_until(std::mem::take(&mut running.ingesters), deadline);
+        if ingesters.is_empty() {
+            let _ = self.writer_tx.send_deadline(WriterMsg::Stop, deadline);
+        }
+        let workers = join_until(std::mem::take(&mut running.workers), deadline);
+        running.ingesters = ingesters;
+        running.workers = workers;
+        if running.ingesters.is_empty() && running.workers.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<_> = running
+            .ingesters
+            .iter()
+            .chain(&running.workers)
+            .map(|h| h.thread().name().unwrap_or("?").to_string())
+            .collect();
+        Err(format!(
+            "relay threads still running after {timeout:?}: {}",
+            names.join(", ")
+        ))
+    }
+}
+
+impl Drop for RelayThreads {
+    fn drop(&mut self) {
+        if let Err(e) = self.stop_and_join(DROP_JOIN_TIMEOUT) {
+            tracing::warn!("{e}; their LMDB environment stays open");
+        }
+    }
+}
+
+/// Queue `Stop` without `blocking_send`, which panics inside a runtime.
+fn send_ingest_stop(tx: &tokio::sync::mpsc::Sender<IngestMsg>, deadline: std::time::Instant) {
+    let mut msg = IngestMsg::Stop;
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(back)) => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                msg = back;
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+/// Join every finished thread, polling until `deadline`; returns the rest.
+fn join_until(
+    mut pending: Vec<thread::JoinHandle<()>>,
+    deadline: std::time::Instant,
+) -> Vec<thread::JoinHandle<()>> {
+    loop {
+        let (done, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|h| h.is_finished());
+        for h in done {
+            let name = h.thread().name().unwrap_or("?").to_string();
+            if h.join().is_err() {
+                tracing::error!(thread = %name, "relay thread panicked");
+            }
+        }
+        pending = rest;
+        if pending.is_empty() || std::time::Instant::now() >= deadline {
+            return pending;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Sleep up to `total`, waking early once `shutdown` is set (the joiner
+/// unparks waiting threads). Returns false on shutdown.
+fn sleep_unless_shutdown(shutdown: &AtomicBool, total: Duration) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::park_timeout(deadline - now);
+    }
 }
 
 pub enum IngestMsg {
@@ -256,6 +383,9 @@ pub enum IngestMsg {
     Close {
         conn_id: u64,
     },
+    /// Sent only by `RelayThreads::stop_and_join`: the ingester exits even
+    /// though transports still hold `RelayHandle` clones (and so senders).
+    Stop,
 }
 
 enum WriterMsg {
@@ -274,6 +404,10 @@ enum WriterMsg {
     /// the single writer thread so the LMDB change and the snapshot refresh
     /// are ordered against event writes.
     Management(ManagementMsg),
+    /// Sent only by `RelayThreads::stop_and_join`, after every ingester has
+    /// exited, so all events they forwarded are already queued ahead of it.
+    /// The cron thread and `RelayHandle` clones keep the channel open.
+    Stop,
 }
 
 pub struct ManagementMsg {
@@ -541,9 +675,24 @@ impl RelayHandle {
         self.shutdown.load(Ordering::Relaxed)
     }
 
+    /// Stop accepting new connections. Relay threads keep serving existing
+    /// connections until `shutdown_and_join` or the last handle drops.
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.shutdown_notify.notify_waiters();
+    }
+
+    /// Request shutdown, stop every relay thread (even while other handle
+    /// clones and connections remain), and wait up to `timeout` for them to
+    /// exit. On `Ok`, the relay holds no `Env` clone, so the environment
+    /// closes once the caller drops its own. Blocks the calling thread (from
+    /// async code, prefer `spawn_blocking`). Idempotent.
+    ///
+    /// Without this, a process can exit while the threads still hold the
+    /// `Env`; on macOS that leaks LMDB's POSIX semaphores until reboot (see
+    /// docs/production-deployment.md).
+    pub fn shutdown_and_join(&self, timeout: Duration) -> Result<(), String> {
+        self.threads.stop_and_join(timeout)
     }
 
     /// Transports select on this to break out of a blocking accept.
@@ -588,6 +737,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         );
     }
     let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let abuse = Arc::new(AbuseController::default());
 
     // One channel per worker thread. Connections are pinned to a worker by
@@ -613,18 +763,28 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     ));
 
     let handle = RelayHandle {
-        ingest: ingest_txs,
+        ingest: ingest_txs.clone(),
         conns: conns.clone(),
         next_id: Arc::new(AtomicU64::new(1)),
         metrics: metrics.clone(),
         config: config.clone(),
         moderation: moderation.clone(),
         shutdown: shutdown.clone(),
-        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        shutdown_notify: shutdown_notify.clone(),
         abuse: abuse.clone(),
         config_path: Arc::new(parking_lot::RwLock::new(None)),
         writer_tx: writer_tx.clone(),
+        threads: Arc::new(RelayThreads {
+            shutdown: shutdown.clone(),
+            shutdown_notify: shutdown_notify.clone(),
+            ingest: ingest_txs.clone(),
+            writer_tx: writer_tx.clone(),
+            running: Mutex::new(RunningThreads::default()),
+        }),
     };
+    // Registered as each thread spawns, for `RelayThreads::stop_and_join`.
+    let ingester = |h| handle.threads.running.lock().ingesters.push(h);
+    let worker = |h| handle.threads.running.lock().workers.push(h);
 
     for (i, ingest_rx) in ingest_rxs.into_iter().enumerate() {
         let env = env.clone();
@@ -644,6 +804,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
                     neg_txs,
                 )
             })
+            .map(ingester)
             .map_err(|e| e.to_string())?;
     }
     {
@@ -653,6 +814,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         thread::Builder::new()
             .name("metrics-history".into())
             .spawn(move || run_metrics_history(cfg, metrics, shutdown))
+            .map(worker)
             .map_err(|e| e.to_string())?;
     }
     {
@@ -664,6 +826,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         thread::Builder::new()
             .name("writer".into())
             .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_txs, moderation))
+            .map(worker)
             .map_err(|e| e.to_string())?;
     }
     for (i, req_rx) in req_rxs.into_iter().enumerate() {
@@ -675,6 +838,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         thread::Builder::new()
             .name(format!("req-worker-{i}"))
             .spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, mon_txs))
+            .map(worker)
             .map_err(|e| e.to_string())?;
     }
     for (i, mon_rx) in mon_rxs.into_iter().enumerate() {
@@ -685,6 +849,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         thread::Builder::new()
             .name(format!("req-monitor-{i}"))
             .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx))
+            .map(worker)
             .map_err(|e| e.to_string())?;
     }
     let sync_memory = Arc::new(negentropy::MemoryPool::default());
@@ -697,6 +862,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         thread::Builder::new()
             .name(format!("negentropy-{i}"))
             .spawn(move || run_negentropy(env, cfg, conns, metrics, neg_rx, sync_memory))
+            .map(worker)
             .map_err(|e| e.to_string())?;
     }
     {
@@ -704,6 +870,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         thread::Builder::new()
             .name("cron".into())
             .spawn(move || run_cron(writer_tx, shutdown))
+            .map(worker)
             .map_err(|e| e.to_string())?;
     }
 
@@ -713,6 +880,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         thread::Builder::new()
             .name("db-watch".into())
             .spawn(move || run_db_watch(env, mon_txs, shutdown))
+            .map(worker)
             .map_err(|e| e.to_string())?;
     }
 
@@ -735,11 +903,8 @@ fn run_metrics_history(
             metrics.record_history();
         }
         let seconds = observability.history_interval_secs.max(1);
-        for _ in 0..seconds {
-            if shutdown.load(Ordering::Relaxed) {
-                return;
-            }
-            thread::sleep(Duration::from_secs(1));
+        if !sleep_unless_shutdown(&shutdown, Duration::from_secs(seconds)) {
+            return;
         }
     }
 }
@@ -777,8 +942,7 @@ fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorMsg>>, shutdown: Arc<Atomic
         .and_then(|txn| most_recent_levid_ro(&txn).ok())
         .unwrap_or(0);
     broadcast_db_change(&mon_txs);
-    while !shutdown.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(100));
+    while sleep_unless_shutdown(&shutdown, Duration::from_millis(100)) {
         let cur = std::fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
@@ -945,7 +1109,7 @@ impl Routed for WriterMsg {
         match self {
             Self::AddEvent { conn_id, .. } | Self::Close { conn_id } => *conn_id,
             // Never sent by an ingester.
-            Self::Maintenance | Self::Management(_) => 0,
+            Self::Maintenance | Self::Management(_) | Self::Stop => 0,
         }
     }
 }
@@ -1110,6 +1274,7 @@ fn run_ingester(
             }
         };
         match msg {
+            IngestMsg::Stop => break,
             IngestMsg::Open { conn_id, gate } => {
                 if let Some(gate) = gate {
                     dispatch.open(conn_id, gate);
@@ -3847,5 +4012,81 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         assert!(relay.req[1].try_recv().is_err(), "nothing runs after Close");
         relay.finish();
+    }
+
+    fn relay_env(dir: &std::path::Path) -> (Env, Config) {
+        let env = Env::open(dir, EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.to_path_buf();
+        cfg.relay.auth.enabled = false;
+        (env, cfg)
+    }
+
+    // An Env the relay never releases is never `mdb_env_close`d; on macOS
+    // its two POSIX semaphores then outlive the process and, once
+    // kern.posix.sem.max is exhausted, every Env::open fails with ENOSPC.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_join_releases_env_while_handles_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, cfg) = relay_env(dir.path());
+        let env_alive = Arc::downgrade(&env.inner);
+        let handle = start(env, cfg).unwrap();
+        // A transport's clone and an open connection outlive the join.
+        let transport = handle.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = transport.next_conn_id();
+        transport.register(conn, Outbound::new(tx, 0)).await;
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "before-join"
+        }));
+        transport
+            .client_message(
+                conn,
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                json!(["EVENT", event]).to_string(),
+            )
+            .await;
+        assert!(recv_outbound(&mut rx).await.contains("true"));
+
+        let joiner = handle.clone();
+        tokio::task::spawn_blocking(move || joiner.shutdown_and_join(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(handle.is_shutdown());
+        {
+            let running = handle.threads.running.lock();
+            assert!(running.ingesters.is_empty() && running.workers.is_empty());
+        }
+        assert_eq!(env_alive.strong_count(), 0, "relay threads still hold Env");
+        // Idempotent, and the stopped writer answers instead of hanging.
+        handle.shutdown_and_join(Duration::from_secs(1)).unwrap();
+        assert!(transport
+            .manage(ManagementCmd::AllowKind { kind: 1 })
+            .await
+            .is_err());
+
+        // The closed environment reopens with the committed event intact.
+        let reopened = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        let txn = reopened.begin_ro().unwrap();
+        assert_eq!(most_recent_levid_ro(&txn).unwrap(), 1);
+    }
+
+    #[test]
+    fn dropping_last_handle_joins_relay_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, cfg) = relay_env(dir.path());
+        let env_alive = Arc::downgrade(&env.inner);
+        let handle = start(env, cfg).unwrap();
+        let clone = handle.clone();
+        drop(handle);
+        assert!(
+            env_alive.strong_count() > 0,
+            "a live handle keeps the relay up"
+        );
+        // No request_shutdown: the last drop alone must stop the threads.
+        drop(clone);
+        assert_eq!(env_alive.strong_count(), 0, "relay threads still hold Env");
     }
 }

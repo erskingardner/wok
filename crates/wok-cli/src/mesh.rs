@@ -294,13 +294,14 @@ pub(crate) fn mesh_ws_config(max_event_size: usize) -> WebSocketConfig {
 pub(crate) async fn connect_mesh(
     url: &str,
     max_event_size: usize,
-) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, WsError> {
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<WsError>> {
     let (ws, _) = tokio_tungstenite::connect_async_with_config(
         url,
         Some(mesh_ws_config(max_event_size)),
         false,
     )
-    .await?;
+    .await
+    .map_err(Box::new)?;
     Ok(ws)
 }
 

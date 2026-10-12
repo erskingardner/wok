@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Update Rustls to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake messages
+  accepted across encryption-level boundaries). Rustls is used only by the
+  CLI's outbound `wss://` and HTTPS clients (mesh, router, upload/download,
+  NIP-11 fetches) and the benchmark harness; the relay listener does not
+  terminate TLS.
+
 ### Fixed
 
 - Restricted reads no longer ask for AUTH that cannot succeed. Without a usable
@@ -21,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session on the relay as NIP-77 specifies.
 - OK reasons for storage failures start with `error:` instead of
   `Write error:`, and prefixed AUTH failures are no longer double-prefixed.
+- `relay.bind` accepts bare IPv6 literals (`::1`) and hostnames. A hostname
+  binds every address it resolves to, so `localhost` listens on both
+  `127.0.0.1` and `::1`; resolved addresses this host cannot use are skipped
+  with a warning. Bind failures now stop startup instead of leaving the
+  relay running without a WebSocket listener.
 - Authors can read their own restricted-kind events that have no `p` tag
   (for example NIP-78 kind 30078 app data). Before, REQ, COUNT, live
   delivery, and sync hid them from everyone, including the author.

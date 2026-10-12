@@ -24,7 +24,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use sha1::Digest as _;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use wok_relay::{supported_nips, Config, Outbound, OutboundFrame, RelayHandle, TransportSource};
@@ -34,9 +34,87 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("WOK_GIT_HASH");
 pub(crate) const WOK_MARK_SVG: &str = r##"<svg viewBox="0 0 1028 1028" aria-hidden="true" focusable="false"><rect width="1028" height="1028" fill="#090B0F"/><path fill="currentColor" d="M299.15 797.05C278.15 797.05 260 791.65 244.7 780.85C229.7 769.75 217.1 754 206.9 733.6C196.7 712.9 188 688.15 180.8 659.35C176.9 643.45 173.3 625.6 170 605.8C167 585.7 164.3 564.55 161.9 542.35C159.8 520.15 158 497.65 156.5 474.85C155.3 452.05 154.4 429.7 153.8 407.8C153.5 385.9 153.35 365.5 153.35 346.6C153.35 333.4 153.95 320.95 155.15 309.25C156.65 297.25 159.5 286.75 163.7 277.75C167.9 268.45 173.9 261.25 181.7 256.15C189.5 250.75 199.7 248.05 212.3 248.05C232.4 248.05 246.65 253.6 255.05 264.7C263.75 275.8 269 291.85 270.8 312.85C271.1 334.15 271.55 354.25 272.15 373.15C272.75 391.75 273.5 409.6 274.4 426.7C275.3 443.5 276.2 460 277.1 476.2C278.3 492.1 279.65 507.85 281.15 523.45C282.65 539.05 284.3 554.95 286.1 571.15C289.4 601.15 294.65 623.95 301.85 639.55C309.05 655.15 318.65 662.95 330.65 662.95C342.65 662.95 352.25 655.75 359.45 641.35C366.65 626.95 373.7 604.6 380.6 574.3C384.2 558.1 387.8 540.85 391.4 522.55C395 504.25 398.6 485.65 402.2 466.75C405.8 447.55 409.4 428.95 413 410.95C416.6 392.65 419.9 375.4 422.9 359.2C430.7 319.9 441.35 289.6 454.85 268.3C468.65 247 488.6 236.35 514.7 236.35C530 236.35 542.75 241.75 552.95 252.55C563.45 263.35 572.15 277.75 579.05 295.75C585.95 313.75 591.8 333.4 596.6 354.7C599.3 368.2 602 382.15 604.7 396.55C607.4 410.95 610.1 425.5 612.8 440.2C615.5 454.9 618.2 469.6 620.9 484.3C623.6 499 626.15 513.4 628.55 527.5C630.95 541.3 633.2 554.5 635.3 567.1C640.1 596.2 645.2 618.25 650.6 633.25C656.3 648.25 665.3 655.75 677.6 655.75C689 655.75 698.3 647.8 705.5 631.9C713 615.7 719.45 594.7 724.85 568.9C728.15 553.9 731.15 537.7 733.85 520.3C736.85 502.6 739.4 484.45 741.5 465.85C743.9 446.95 746 428.5 747.8 410.5C749.9 392.2 751.7 374.95 753.2 358.75C754.7 342.25 756.05 327.55 757.25 314.65C759.05 302.95 762.05 292.9 766.25 284.5C770.45 275.8 776.75 269.05 785.15 264.25C793.55 259.15 804.65 256.6 818.45 256.6C828.95 256.6 837.65 258.7 844.55 262.9C851.75 267.1 857.45 272.95 861.65 280.45C865.85 287.65 868.85 296.2 870.65 306.1C872.45 315.7 873.35 326.35 873.35 338.05C873.35 353.65 872.6 372.55 871.1 394.75C869.6 416.65 867.35 440.2 864.35 465.4C861.65 490.6 858.05 515.95 853.55 541.45C849.35 566.65 844.4 590.65 838.7 613.45C833.3 635.95 827.15 655.6 820.25 672.4C805.25 710.8 786.8 740.2 764.9 760.6C743 780.7 719 790.75 692.9 790.75C663.8 790.75 640.7 782.2 623.6 765.1C606.5 747.7 592.55 720.55 581.75 683.65C579.05 671.95 576.35 659.95 573.65 647.65C570.95 635.05 568.25 622.15 565.55 608.95C563.15 595.75 560.6 582.25 557.9 568.45C555.2 554.35 552.5 540.1 549.8 525.7C547.4 511 545 496.15 542.6 481.15C538.1 453.55 533.45 431.5 528.65 415C523.85 398.2 517.4 389.8 509.3 389.8C501.5 389.8 494.75 398.65 489.05 416.35C483.65 433.75 478.4 455.2 473.3 480.7C465.8 517.9 458.6 554.05 451.7 589.15C445.1 623.95 437 656.35 427.4 686.35C416.9 714.25 405.5 736.3 393.2 752.5C380.9 768.4 366.95 779.8 351.35 786.7C336.05 793.6 318.65 797.05 299.15 797.05Z"/></svg>"##;
 
-pub async fn serve(handle: RelayHandle, bind: SocketAddr) -> Result<(), std::io::Error> {
-    let listener = TcpListener::bind(bind).await?;
-    serve_listener(handle, listener).await
+/// Binds `relay.bind` / `relay.port`.
+///
+/// `host` is an IPv4 literal, an IPv6 literal (bare or bracketed), or a
+/// hostname. A literal binds exactly that address. A hostname binds every
+/// address it resolves to (`localhost` → `127.0.0.1` and `::1`); resolved
+/// addresses that are not assigned on this host, or whose family it lacks,
+/// are skipped with a warning, but at least one must bind. With port 0 every listener shares the port
+/// assigned to the first.
+pub async fn bind_listeners(host: &str, port: u16) -> std::io::Result<Vec<TcpListener>> {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        let addr = SocketAddr::new(ip, port);
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| bind_error(addr, e))?;
+        return Ok(vec![listener]);
+    }
+    let mut resolved: Vec<SocketAddr> = Vec::new();
+    let lookup = tokio::net::lookup_host((unbracketed, port))
+        .await
+        .map_err(|e| std::io::Error::new(e.kind(), format!("resolve {host:?}: {e}")))?;
+    for addr in lookup {
+        if !resolved.contains(&addr) {
+            resolved.push(addr);
+        }
+    }
+    let mut listeners = Vec::new();
+    let mut port = port;
+    let mut skipped = None;
+    for mut addr in resolved {
+        addr.set_port(port);
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                port = listener.local_addr()?.port();
+                listeners.push(listener);
+            }
+            Err(e) if is_unusable_address(&e) => {
+                tracing::warn!("skipping websocket listener on {addr}: {e}");
+                skipped.get_or_insert(bind_error(addr, e));
+            }
+            Err(e) => return Err(bind_error(addr, e)),
+        }
+    }
+    if listeners.is_empty() {
+        return Err(skipped.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{host:?} resolved to no addresses"),
+            )
+        }));
+    }
+    Ok(listeners)
+}
+
+fn bind_error(addr: SocketAddr, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("bind {addr}: {e}"))
+}
+
+/// The address is not assigned on this host, or its whole family is absent,
+/// e.g. `::1` from `/etc/hosts` on a machine with IPv6 disabled. Linux
+/// reports an unassigned address and `disable_ipv6=1` with the same errno,
+/// so the two cannot be told apart.
+fn is_unusable_address(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(libc::EAFNOSUPPORT)
+}
+
+/// Serves every listener until shutdown. NIP-98 replay state is shared, so
+/// an admin token accepted on one listener cannot be replayed on another.
+pub async fn serve(handle: RelayHandle, listeners: Vec<TcpListener>) -> std::io::Result<()> {
+    let handle = Arc::new(handle);
+    let admin_state = Arc::new(admin::AdminState::default());
+    futures_util::future::try_join_all(
+        listeners
+            .into_iter()
+            .map(|listener| accept_loop(handle.clone(), listener, admin_state.clone())),
+    )
+    .await?;
+    Ok(())
 }
 
 fn configure_accepted_stream(stream: &tokio::net::TcpStream, peer: SocketAddr, keepalive: bool) {
@@ -56,9 +134,15 @@ pub async fn serve_listener(
     handle: RelayHandle,
     listener: TcpListener,
 ) -> Result<(), std::io::Error> {
+    serve(handle, vec![listener]).await
+}
+
+async fn accept_loop(
+    handle: Arc<RelayHandle>,
+    listener: TcpListener,
+    admin_state: Arc<admin::AdminState>,
+) -> Result<(), std::io::Error> {
     tracing::info!("Started websocket server on {}", listener.local_addr()?);
-    let handle = Arc::new(handle);
-    let admin_state = Arc::new(admin::AdminState::default());
     let shutdown = handle.shutdown_handle();
     loop {
         let (stream, peer) = tokio::select! {
@@ -819,6 +903,63 @@ mod landing_tests {
 
         assert!(server.nodelay().unwrap());
         drop(client);
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn local_addrs(listeners: &[TcpListener]) -> Vec<SocketAddr> {
+        listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn ipv6_loopback_available() -> bool {
+        std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
+    }
+
+    #[tokio::test]
+    async fn binds_ipv4_literal() {
+        let addrs = local_addrs(&bind_listeners("127.0.0.1", 0).await.unwrap());
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn binds_bare_and_bracketed_ipv6_literals() {
+        if !ipv6_loopback_available() {
+            return;
+        }
+        for host in ["::1", "[::1]"] {
+            let addrs = local_addrs(&bind_listeners(host, 0).await.unwrap());
+            assert_eq!(addrs.len(), 1, "{host}");
+            assert_eq!(addrs[0].ip(), IpAddr::V6(Ipv6Addr::LOCALHOST), "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn binds_every_address_a_hostname_resolves_to_on_one_port() {
+        let resolved: BTreeSet<IpAddr> = tokio::net::lookup_host(("localhost", 0))
+            .await
+            .unwrap()
+            .map(|a| a.ip())
+            .filter(|ip| ip.is_ipv4() || ipv6_loopback_available())
+            .collect();
+        assert!(resolved.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+        let addrs = local_addrs(&bind_listeners("localhost", 0).await.unwrap());
+        let bound: BTreeSet<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+        assert_eq!(bound, resolved);
+        assert_eq!(addrs.len(), bound.len(), "one listener per address");
+        let ports: BTreeSet<u16> = addrs.iter().map(|a| a.port()).collect();
+        assert_eq!(ports.len(), 1, "all listeners share one port: {addrs:?}");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_host_is_an_error() {
+        assert!(bind_listeners("wok-no-such-host.invalid", 0).await.is_err());
     }
 }
 

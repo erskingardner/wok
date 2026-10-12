@@ -4,7 +4,6 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::BufRead;
 use std::io::Read as _;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use wok_db::{
     check_integrity, delete_events, event_json_owned, write_events_with_policy, Decompressor, Env,
@@ -437,7 +436,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     }
     wok_relay::apply_nofiles_limit(cfg.relay.nofiles).map_err(anyhow::Error::msg)?;
     let env = open_env(&cfg)?;
-    let bind: SocketAddr = format!("{}:{}", cfg.relay.bind, cfg.relay.port).parse()?;
+    let listeners = wok_ws::bind_listeners(&cfg.relay.bind, cfg.relay.port).await?;
     let unix_cfg = cfg.clone();
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     if config_path.exists() {
@@ -447,7 +446,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     let h2 = handle.clone();
     let h3 = handle.clone();
     let ws = tokio::spawn(async move {
-        if let Err(e) = wok_ws::serve(h3, bind).await {
+        if let Err(e) = wok_ws::serve(h3, listeners).await {
             tracing::error!("ws server: {e}");
         }
     });

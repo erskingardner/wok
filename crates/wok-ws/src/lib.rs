@@ -791,11 +791,10 @@ async fn handle_ws<S>(
                                     WsEvent::Message(_, bytes) => {
                                         let wire_len = bytes.len();
                                         let text = String::from_utf8(bytes).unwrap_or_else(|_| "x".into());
-                                        if !held.push(text, wire_len) {
+                                        if !connection.receive(&mut held, text, wire_len).await {
                                             tracing::info!(conn_id, peer = %peer, reason = "ingress_paused_overflow", "client terminated");
                                             break 'outer;
                                         }
-                                        connection.hand_over(&mut held).await;
                                     }
                                     WsEvent::Ping(p) => {
                                         if write_bytes(&mut wr, &encoder.encode_control(OP_PONG, &p)).await.is_err() {

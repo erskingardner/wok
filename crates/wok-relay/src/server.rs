@@ -514,8 +514,9 @@ impl ConnectionGuard {
     }
 
     /// True while earlier messages from this connection are parked behind a
-    /// full worker queue. The transport should stop reading from the client
-    /// and hold what it already read until `ingress_resumed`.
+    /// full worker queue. The transport keeps reading, so Close, EOF and
+    /// control frames still arrive, but `receive` holds client messages until
+    /// `ingress_resumed`.
     pub fn ingress_paused(&self) -> bool {
         !*self.gate.borrow()
     }
@@ -523,6 +524,23 @@ impl ConnectionGuard {
     /// Resolves once the connection may hand over messages again. Cancel-safe.
     pub async fn ingress_resumed(&self) {
         let _ = self.gate.subscribe().wait_for(|open| *open).await;
+    }
+
+    /// Pass a message read from the client to the ingester, after anything
+    /// already held. While ingress is paused it is held instead. False when
+    /// the hold is full: the client kept sending into a paused connection and
+    /// the transport should disconnect it. With ingress open nothing is held,
+    /// so the only back-pressure is the shared ingest queue.
+    #[must_use]
+    pub async fn receive(&self, held: &mut HeldMessages, text: String, wire_len: usize) -> bool {
+        while !held.is_empty() && !self.ingress_paused() {
+            self.hand_over(held).await;
+        }
+        if held.is_empty() && !self.ingress_paused() {
+            self.client_message(text).await;
+            return true;
+        }
+        held.push(text, wire_len)
     }
 
     /// Hand held messages to the ingester, in order, while ingress is not
@@ -575,7 +593,7 @@ pub const HELD_MESSAGE_OVERHEAD: usize = 64;
 const HAND_OVER_BATCH: usize = 64;
 
 /// Client messages a transport has read but not yet handed to the ingester,
-/// because the connection's ingress is paused (or they arrived together).
+/// because the connection's ingress is paused.
 /// Each costs its wire payload length plus `HELD_MESSAGE_OVERHEAD`. Reading
 /// continues while paused, so control frames and disconnects are still seen;
 /// a data message that would take the hold past its limit means the client

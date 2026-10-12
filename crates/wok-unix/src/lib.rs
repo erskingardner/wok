@@ -232,16 +232,17 @@ async fn handle_conn(
                     let mut start = 0;
                     while let Some(body) = next_frame(&buf[start..], max_frame)? {
                         start += 4 + body.len();
+                        let wire_len = body.len();
                         let text = std::str::from_utf8(body)
-                            .map_err(|_| UnixError::Message("frame not utf-8".into()))?;
-                        if !held.push(text.to_owned(), body.len()) {
+                            .map_err(|_| UnixError::Message("frame not utf-8".into()))?
+                            .to_owned();
+                        if !connection.receive(&mut held, text, wire_len).await {
                             return Err(UnixError::Message(
                                 "too many frames while ingress is paused".into(),
                             ));
                         }
                     }
                     buf.drain(..start);
-                    connection.hand_over(&mut held).await;
                 }
             }
         }
@@ -522,6 +523,36 @@ mod tests {
             .client_req
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(reqs, 1, "the held REQ reached the relay while paused");
+        handle.request_shutdown();
+    }
+
+    /// With ingress open nothing is held: frames that arrive together, well
+    /// past what the hold could take, all reach the relay and the connection
+    /// stays up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_ingress_never_charges_the_unix_hold() {
+        let (_dir, handle, mut client, task) = paused_ingress_relay().await;
+        let mut burst = Vec::new();
+        for i in 0..20 {
+            let body = format!(r#"["REQ","s{i}",{{"limit":0}}]"#);
+            burst.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            burst.extend_from_slice(body.as_bytes());
+        }
+        assert!(burst.len() > 256);
+        use tokio::io::AsyncWriteExt;
+        client.write_all(&burst).await.unwrap();
+        for _ in 0..20 {
+            let reply = read_frame(&mut client, 1 << 20).await.unwrap();
+            assert!(std::str::from_utf8(&reply).unwrap().contains("EOSE"));
+        }
+        assert!(!task.is_finished(), "a healthy pipeline was disconnected");
+        let reqs = handle
+            .metrics
+            .client_req
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reqs, 21);
+        drop(client);
+        assert_connection_ends(&handle, task).await;
         handle.request_shutdown();
     }
 

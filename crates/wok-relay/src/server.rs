@@ -138,12 +138,6 @@ impl ConnTable {
     fn remove(&self, id: u64) {
         self.map.lock().remove(&id);
     }
-    /// Stop delivering to a connection and signal its transport to close.
-    fn terminate(&self, id: u64) {
-        if let Some(out) = self.map.lock().remove(&id) {
-            out.kill();
-        }
-    }
     /// Deliver a pre-built frame, terminating the connection if it is over
     /// its pending-bytes budget (C++ slow-client termination).
     fn deliver(&self, conn_id: u64, payload: String, metrics: &Metrics) {
@@ -913,7 +907,16 @@ fn handle_client(
 ) {
     let cmd = match ClientCommand::parse(payload) {
         Ok(c) => c,
-        Err(_) if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) => return,
+        Err(failure) if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) => {
+            // The reply is suppressed, but a malformed NEG request that names
+            // a session still tears it down, as its NEG-ERR would have.
+            if let ParseFailure::NegRequest { sub_id, .. } = failure {
+                if let Ok(sub_id) = SubId::new(&sub_id) {
+                    let _ = route_tx(neg_txs, conn_id).send(NegMsg::CloseSub { conn_id, sub_id });
+                }
+            }
+            return;
+        }
         Err(ParseFailure::NegRequest { sub_id, reason }) => {
             let reason = format!("invalid: {reason}");
             let neg_tx = route_tx(neg_txs, conn_id);
@@ -1043,16 +1046,12 @@ fn handle_client(
         ClientCommand::Close { sub_id } => {
             metrics.client_close.fetch_add(1, Ordering::Relaxed);
             match SubId::new(&sub_id) {
-                Ok(sid) => forward_teardown(
-                    route_tx(req_txs, conn_id),
-                    ReqMsg::RemoveSub {
+                Ok(sid) => {
+                    let _ = route_tx(req_txs, conn_id).send(ReqMsg::RemoveSub {
                         conn_id,
                         sub_id: sid,
-                    },
-                    conns,
-                    metrics,
-                    conn_id,
-                ),
+                    });
+                }
                 Err(e) => {
                     if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
                         return;
@@ -1115,16 +1114,12 @@ fn handle_client(
                 return;
             }
             match SubId::new(&sub_id) {
-                Ok(sid) => forward_teardown(
-                    route_tx(neg_txs, conn_id),
-                    NegMsg::CloseSub {
+                Ok(sid) => {
+                    let _ = route_tx(neg_txs, conn_id).send(NegMsg::CloseSub {
                         conn_id,
                         sub_id: sid,
-                    },
-                    conns,
-                    metrics,
-                    conn_id,
-                ),
+                    });
+                }
                 Err(e) => {
                     if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
                         return;
@@ -1739,9 +1734,10 @@ fn issue_challenge(
 
 /// Charge a malformed message, which no command budget covers and which
 /// earns an error reply; without this one connection could make the relay
-/// answer without bound (#49). Refusing one leaves no relay state behind.
-/// The first refusal of an exhausted period gets one NOTICE; later ones are
-/// dropped silently until the bucket refills.
+/// answer without bound (#49). A refusal suppresses only the reply: callers
+/// still apply any teardown the reply stood for. The first refusal of an
+/// exhausted period gets one NOTICE; later ones are dropped silently until
+/// the bucket refills.
 fn admit_invalid(
     cfg: &Config,
     conns: &ConnTable,
@@ -1769,25 +1765,6 @@ fn admit_invalid(
         );
     }
     false
-}
-
-/// Forward a valid CLOSE or NEG-CLOSE. Teardown is never budgeted: dropping
-/// it would leave the subscription running while the client believes it is
-/// gone (NIP-01). The send must not block the ingester shared by other
-/// connections, so a full worker queue closes this connection instead, which
-/// tears down all of its subscriptions.
-fn forward_teardown<T>(tx: &Sender<T>, msg: T, conns: &ConnTable, metrics: &Metrics, conn_id: u64) {
-    if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(msg) {
-        tracing::warn!(conn_id, "worker queue full on CLOSE; closing connection");
-        conns.send(
-            conn_id,
-            RelayMessage::Notice {
-                message: "rate-limited: relay too busy to apply CLOSE; closing connection".into(),
-            },
-            metrics,
-        );
-        conns.terminate(conn_id);
-    }
 }
 
 /// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with
@@ -2831,42 +2808,6 @@ mod tests {
             frames.push(frame.into_text());
         }
         frames
-    }
-
-    #[tokio::test]
-    async fn teardown_on_a_full_worker_queue_closes_the_connection() {
-        // A CLOSE must neither be dropped nor block the shared ingester.
-        let conns = ConnTable::new();
-        let metrics = Metrics::default();
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
-        let out = Outbound::new(out_tx, 0);
-        let killed = out.killed();
-        conns.insert(1, out);
-        let (tx, rx) = bounded::<u8>(1);
-        tx.send(0).unwrap();
-
-        forward_teardown(&tx, 1, &conns, &metrics, 1);
-
-        assert_eq!(rx.len(), 1, "the full queue was not waited on");
-        assert!(out_rx
-            .recv()
-            .await
-            .unwrap()
-            .into_text()
-            .contains("closing connection"));
-        tokio::time::timeout(Duration::from_secs(1), killed.notified())
-            .await
-            .expect("transport was not told to close");
-        assert!(!conns.map.lock().contains_key(&1));
-
-        // With room in the queue the teardown is forwarded and nothing closes.
-        let (tx, rx) = bounded::<u8>(1);
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
-        conns.insert(2, Outbound::new(out_tx, 0));
-        forward_teardown(&tx, 7, &conns, &metrics, 2);
-        assert_eq!(rx.try_recv().unwrap(), 7);
-        assert!(out_rx.try_recv().is_err());
-        assert!(conns.map.lock().contains_key(&2));
     }
 
     fn invalid_budget_relay(burst: u32) -> (tempfile::TempDir, RelayHandle) {

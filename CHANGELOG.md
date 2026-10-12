@@ -38,10 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default 20). Before, every one earned a NOTICE, so one connection could make
   the relay answer garbage without limit. Once the budget is spent the client
   gets one `rate-limited` NOTICE and further malformed messages are ignored
-  until it refills; rejections count as `invalid_rate`. Valid CLOSE and
-  NEG-CLOSE are never budgeted, so teardown always happens, but they no longer
-  block the shared ingester on a full worker queue: the relay closes that
-  connection instead, which drops its subscriptions (#49).
+  until it refills; rejections count as `invalid_rate`. Only the reply is
+  suppressed: valid CLOSE and NEG-CLOSE are never budgeted, and a malformed
+  NEG-OPEN/NEG-MSG that names a session still closes it (#49).
 
 ### Added
 

@@ -58,9 +58,17 @@ async fn recv_matching(
 }
 
 async fn start_server(dir: &std::path::Path) -> (wok_relay::RelayHandle, std::net::SocketAddr) {
+    start_server_with(dir, |_| {}).await
+}
+
+async fn start_server_with(
+    dir: &std::path::Path,
+    configure: impl FnOnce(&mut Config),
+) -> (wok_relay::RelayHandle, std::net::SocketAddr) {
     let env = Env::open(dir, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
-    let cfg = test_cfg(dir);
+    let mut cfg = test_cfg(dir);
+    configure(&mut cfg);
     let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -186,5 +194,57 @@ async fn memory_view_survives_multiple_rounds() {
         "expected NEG-MSG on round 2, got {msgs:?}"
     );
 
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_malformed_neg_msg_still_closes_its_session() {
+    // A malformed NEG-MSG that names a session tears it down with NEG-ERR.
+    // When the malformed-message budget suppresses that reply, the session
+    // must still close (#49).
+    let dir = tempfile::tempdir().unwrap();
+    write_and_build_default_tree(dir.path());
+    let (handle, addr) = start_server_with(dir.path(), |cfg| {
+        // One token a second: no refill can land mid-test.
+        cfg.relay.abuse.invalid_rate_per_second = 1;
+        cfg.relay.abuse.invalid_burst = 1;
+    })
+    .await;
+    let mut ws = ws_connect(addr).await;
+
+    let mut client_store = wok_negentropy::Vector::new();
+    client_store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(client_store, 60_000).unwrap();
+    let init = client.initiate().unwrap();
+    let open = json!(["NEG-OPEN", "s", {}, hex::encode(&init)]);
+    ws.send(Message::Text(open.to_string().into()))
+        .await
+        .unwrap();
+    let msgs = recv_matching(&mut ws, "\"NEG-MSG\"").await;
+    assert!(msgs.iter().any(|t| t.contains("\"NEG-MSG\"")), "{msgs:?}");
+
+    // Spend the budget: the first malformed message is answered, the second
+    // earns the one rate-limited NOTICE.
+    for _ in 0..2 {
+        ws.send(Message::Text("[\"NOT-A-COMMAND\"]".into()))
+            .await
+            .unwrap();
+    }
+    let msgs = recv_matching(&mut ws, "rate-limited").await;
+    assert!(msgs.iter().any(|t| t.contains("rate-limited")), "{msgs:?}");
+
+    ws.send(Message::Text(r#"["NEG-MSG","s",123]"#.into()))
+        .await
+        .unwrap();
+    let again = json!(["NEG-MSG", "s", hex::encode(&init)]);
+    ws.send(Message::Text(again.to_string().into()))
+        .await
+        .unwrap();
+    let msgs = recv_matching(&mut ws, "\"NEG-ERR\"").await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains("closed: unknown subscription handle")),
+        "session survived a refused malformed NEG-MSG: {msgs:?}"
+    );
     handle.request_shutdown();
 }

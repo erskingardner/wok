@@ -1409,6 +1409,90 @@ async fn nip86_management_api_e2e() {
     handle.request_shutdown();
 }
 
+/// Build a raw NIP-86 POST whose signed authorization can be sent twice.
+fn nip86_request(addr: std::net::SocketAddr, key: &Keypair, body: &str) -> String {
+    use sha2::Digest;
+    let event = sign_event_with_key(
+        json!({
+            "created_at": now_secs(),
+            "kind": 27235,
+            "tags": [
+                ["u", format!("ws://{addr}")],
+                ["method", "POST"],
+                ["payload", hex::encode(sha2::Sha256::digest(body.as_bytes()))],
+            ],
+            "content": "",
+        }),
+        key,
+    );
+    let authorization = base64::engine::general_purpose::STANDARD.encode(event.to_string());
+    format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Nostr {authorization}\r\nContent-Type: application/nostr+json+rpc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip86_replay_after_disconnect_is_refused_once_command_is_queued() {
+    // A client that disconnects after its management command reached the
+    // writer must not free the signed authorization for a second run: the
+    // writer applies the queued command regardless (#51).
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (admin_pubkey, _) = admin_key.x_only_public_key();
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
+    let handle = wok_relay::start(env.clone(), cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Stall the writer: LMDB admits one write transaction at a time.
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let stall_env = env.clone();
+    let stall = std::thread::spawn(move || {
+        let txn = stall_env.begin_rw().unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+        txn.abort();
+    });
+    locked_rx.recv().unwrap();
+
+    let body = json!({"method": "banpubkey", "params": ["ab".repeat(32), "spam"]}).to_string();
+    let request = nip86_request(addr, &admin_key, &body);
+    let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+    first.write_all(request.as_bytes()).await.unwrap();
+    // Let the command reach the writer queue, then drop the connection.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let retry = tokio::time::timeout(Duration::from_secs(2), raw_http(addr, &request)).await;
+    release_tx.send(()).unwrap();
+    stall.join().unwrap();
+    let retry = retry.expect("replayed authorization reached the stalled writer");
+    assert!(retry.starts_with("HTTP/1.1 401"), "{retry}");
+    assert!(retry.contains("already been used"), "{retry}");
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip86_restrict_writes_allowlist_e2e() {
     let dir = tempfile::tempdir().unwrap();

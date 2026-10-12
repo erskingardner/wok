@@ -24,8 +24,11 @@ Method-level failures return HTTP 200 with an `error` field. Authentication
 failures return 401. Signed authorization events are single-use within
 `admin.auth_window_secs`; clients must include a unique tag (for example a
 random `nonce`) so same-second calls do not collide in the replay cache. An
-event is reserved while its request runs, so a concurrent request reusing it is
-refused; a request that fails releases it for a retry with the same event.
+event is claimed as soon as it is accepted, so a concurrent request reusing it
+is refused. A request that fails before its command reaches the relay writer
+releases the claim for a retry with the same event. Once the command is queued
+the event stays used, even if the client disconnects or the call reports an
+error, because the queued command still runs.
 
 ## Supported methods
 

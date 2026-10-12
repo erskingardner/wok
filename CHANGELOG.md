@@ -29,9 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A signed NIP-98 authorization can no longer run two admin API or NIP-86
   requests at once. Its replay-cache ID was burned only after the request
   succeeded, so concurrent requests reusing one captured header all passed the
-  check and executed. The ID is now reserved when the request is authorized and
-  released only if the request fails, so failed requests can still be retried
-  (#51).
+  check and executed. The ID is now reserved when the request is authorized.
+  It is released only when the request failed without effect, so those can
+  still be retried; a NIP-86 command that reached the writer keeps it burned
+  even if the client disconnects (#51).
 
 ### Added
 

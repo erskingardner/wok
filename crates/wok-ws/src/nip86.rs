@@ -129,13 +129,18 @@ pub async fn dispatch(
         "authorized NIP-86 management request"
     );
 
-    let outcome = execute(&handle, level, &body).await;
-    match outcome {
-        Ok(result) => {
-            replay.commit();
-            admin::json(StatusCode::OK, json!({ "result": result }))
+    // Once a command reaches the writer it is applied even if this request
+    // is cancelled or its reply reports an error, so only a failure before
+    // that point releases the replay reservation.
+    let mut reached_writer = false;
+    match execute(&handle, level, &body, &mut reached_writer).await {
+        Ok(result) => admin::json(StatusCode::OK, json!({ "result": result })),
+        Err(error) => {
+            if !reached_writer {
+                replay.release();
+            }
+            admin::json(StatusCode::OK, json!({ "error": error }))
         }
-        Err(error) => admin::json(StatusCode::OK, json!({ "error": error })),
     }
 }
 
@@ -143,6 +148,7 @@ async fn execute(
     handle: &Arc<RelayHandle>,
     level: ManagementLevel,
     body: &[u8],
+    reached_writer: &mut bool,
 ) -> Result<Value, String> {
     let request: Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid request JSON: {error}"))?;
@@ -170,11 +176,21 @@ async fn execute(
             .collect::<Vec<_>>())),
         "banpubkey" => {
             let (pubkey, reason) = hex32_reason_params(params, "pubkey")?;
-            manage(handle, ManagementCmd::BanPubkey { pubkey, reason }).await
+            manage(
+                handle,
+                ManagementCmd::BanPubkey { pubkey, reason },
+                reached_writer,
+            )
+            .await
         }
         "unbanpubkey" => {
             let (pubkey, _) = hex32_reason_params(params, "pubkey")?;
-            manage(handle, ManagementCmd::UnbanPubkey { pubkey }).await
+            manage(
+                handle,
+                ManagementCmd::UnbanPubkey { pubkey },
+                reached_writer,
+            )
+            .await
         }
         "listbannedpubkeys" => Ok(list_hex_reasons(
             &handle.moderation.read().banned_pubkeys,
@@ -182,11 +198,21 @@ async fn execute(
         )),
         "allowpubkey" => {
             let (pubkey, reason) = hex32_reason_params(params, "pubkey")?;
-            manage(handle, ManagementCmd::AllowPubkey { pubkey, reason }).await
+            manage(
+                handle,
+                ManagementCmd::AllowPubkey { pubkey, reason },
+                reached_writer,
+            )
+            .await
         }
         "unallowpubkey" => {
             let (pubkey, _) = hex32_reason_params(params, "pubkey")?;
-            manage(handle, ManagementCmd::UnallowPubkey { pubkey }).await
+            manage(
+                handle,
+                ManagementCmd::UnallowPubkey { pubkey },
+                reached_writer,
+            )
+            .await
         }
         "listallowedpubkeys" => Ok(list_hex_reasons(
             &handle.moderation.read().allowed_pubkeys,
@@ -194,11 +220,16 @@ async fn execute(
         )),
         "banevent" => {
             let (id, reason) = hex32_reason_params(params, "event id")?;
-            manage(handle, ManagementCmd::BanEvent { id, reason }).await
+            manage(
+                handle,
+                ManagementCmd::BanEvent { id, reason },
+                reached_writer,
+            )
+            .await
         }
         "allowevent" => {
             let (id, _) = hex32_reason_params(params, "event id")?;
-            manage(handle, ManagementCmd::AllowEvent { id }).await
+            manage(handle, ManagementCmd::AllowEvent { id }, reached_writer).await
         }
         "listbannedevents" => Ok(list_hex_reasons(
             &handle.moderation.read().banned_events,
@@ -211,11 +242,16 @@ async fn execute(
         "blockip" => {
             let ip = string_param(params, 0, "ip address")?;
             let reason = optional_string_param(params, 1)?;
-            manage(handle, ManagementCmd::BlockIp { ip, reason }).await
+            manage(
+                handle,
+                ManagementCmd::BlockIp { ip, reason },
+                reached_writer,
+            )
+            .await
         }
         "unblockip" => {
             let ip = string_param(params, 0, "ip address")?;
-            manage(handle, ManagementCmd::UnblockIp { ip }).await
+            manage(handle, ManagementCmd::UnblockIp { ip }, reached_writer).await
         }
         "listblockedips" => {
             let snap = handle.moderation.read();
@@ -234,11 +270,11 @@ async fn execute(
             if method == "editrole" && !handle.moderation.read().roles.contains_key(&role.id) {
                 return Err(format!("unknown role {:?}", role.id));
             }
-            manage(handle, ManagementCmd::PutRole { role }).await
+            manage(handle, ManagementCmd::PutRole { role }, reached_writer).await
         }
         "deleterole" => {
             let id = string_param(params, 0, "role id")?;
-            manage(handle, ManagementCmd::DeleteRole { id }).await
+            manage(handle, ManagementCmd::DeleteRole { id }, reached_writer).await
         }
         "assignrole" | "unassignrole" => {
             let pubkey = parse_hex32(&string_param(params, 0, "pubkey")?)?;
@@ -248,7 +284,7 @@ async fn execute(
             } else {
                 ManagementCmd::UnassignRole { pubkey, role }
             };
-            manage(handle, cmd).await
+            manage(handle, cmd, reached_writer).await
         }
         "changerelayname" => {
             let name = string_param(params, 0, "relay name")?;
@@ -264,11 +300,11 @@ async fn execute(
         }
         "allowkind" => {
             let kind = kind_param(params)?;
-            manage(handle, ManagementCmd::AllowKind { kind }).await
+            manage(handle, ManagementCmd::AllowKind { kind }, reached_writer).await
         }
         "disallowkind" => {
             let kind = kind_param(params)?;
-            manage(handle, ManagementCmd::DisallowKind { kind }).await
+            manage(handle, ManagementCmd::DisallowKind { kind }, reached_writer).await
         }
         "listallowedkinds" => {
             let snap = handle.moderation.read();
@@ -282,7 +318,13 @@ async fn execute(
     }
 }
 
-async fn manage(handle: &Arc<RelayHandle>, cmd: ManagementCmd) -> Result<Value, String> {
+async fn manage(
+    handle: &Arc<RelayHandle>,
+    cmd: ManagementCmd,
+    reached_writer: &mut bool,
+) -> Result<Value, String> {
+    // Conservative: a full writer queue also counts, so the operator re-signs.
+    *reached_writer = true;
     handle.manage(cmd).await.map(|()| json!(true))
 }
 

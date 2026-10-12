@@ -186,8 +186,10 @@ pub async fn dispatch(
         (Method::PUT, "/admin/api/config") => update_config(&handle, &body),
         _ => response(StatusCode::NOT_FOUND, "text/plain", "not found"),
     };
-    if resp.status().is_success() {
-        replay.commit();
+    // Admin handlers run synchronously and are atomic, so a non-2xx response
+    // means nothing changed.
+    if !resp.status().is_success() {
+        replay.release();
     }
     resp
 }
@@ -217,20 +219,20 @@ pub(crate) struct AuthzPolicy<'a> {
     pub require_payload: bool,
 }
 
-/// A NIP-98 event ID held in the replay cache for one in-flight request.
-/// [`commit`](Self::commit) keeps it burned after success; dropping the
-/// reservation uncommitted (a failed or cancelled request) releases it so a
-/// retryable failure doesn't force the client to re-sign. Concurrent requests
-/// carrying the same event are refused while it is held (#51).
+/// A NIP-98 event ID reserved in the replay cache by [`authorize`]. The ID
+/// stays burned for the rest of the auth window unless the caller
+/// [`release`](Self::release)s it after a failure known to have had no
+/// effect, so a client can retry without re-signing. Dropping the
+/// reservation keeps it burned: a cancelled request (client disconnect) may
+/// already have queued its mutation on the writer (#51).
 pub(crate) struct ReplayReservation<'a> {
     state: &'a AdminState,
     id: [u8; 32],
-    committed: bool,
 }
 
 impl ReplayReservation<'_> {
-    pub(crate) fn commit(mut self) {
-        self.committed = true;
+    pub(crate) fn release(self) {
+        self.state.used_auth.lock().remove(&self.id);
     }
 }
 
@@ -238,16 +240,7 @@ impl std::fmt::Debug for ReplayReservation<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplayReservation")
             .field("id", &hex::encode(self.id))
-            .field("committed", &self.committed)
             .finish()
-    }
-}
-
-impl Drop for ReplayReservation<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.state.used_auth.lock().remove(&self.id);
-        }
     }
 }
 
@@ -320,14 +313,7 @@ pub(crate) fn authorize<'a>(
     // Reserve under the same lock as the check, so two concurrent requests
     // carrying one signed event cannot both pass it.
     used.insert(id, packed.created_at());
-    Ok((
-        pubkey,
-        ReplayReservation {
-            state,
-            id,
-            committed: false,
-        },
-    ))
+    Ok((pubkey, ReplayReservation { state, id }))
 }
 
 fn single_tag<'a>(event: &'a serde_json::Value, name: &str) -> Result<&'a str, String> {
@@ -935,12 +921,12 @@ mod tests {
         // While the first request is in flight, the same signed event cannot
         // authorize a concurrent second one (#51).
         assert!(auth().unwrap_err().contains("already been used"));
-        // A failed or cancelled request releases its reservation, so the
-        // client can retry without re-signing.
-        drop(replay);
-        let (_, replay) = auth().unwrap();
-        // Success burns the ID for the rest of the window.
-        replay.commit();
+        // A request that failed without effect releases its reservation, so
+        // the client can retry without re-signing.
+        replay.release();
+        // Success, or a cancelled request that may have taken effect, keeps
+        // the ID burned for the rest of the window.
+        assert!(auth().is_ok());
         assert!(auth().unwrap_err().contains("already been used"));
 
         let wrong_payload = signed_auth(

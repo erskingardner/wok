@@ -41,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until it refills; rejections count as `invalid_rate`. Only the reply is
   suppressed: valid CLOSE and NEG-CLOSE are never budgeted, and a malformed
   NEG-OPEN/NEG-MSG that names a session still closes it (#49).
+- A busy query or sync worker can no longer stall unrelated connections. Before,
+  an ingester blocked when a worker's queue was full, which held up every
+  connection sharing that ingester, including their CLOSE and disconnect
+  cleanup. Ingesters now park work for a full worker in order and retry it
+  without blocking. A connection with parked work is paused (its socket is not
+  read) until that work moves, so the backlog stays bounded by the ingest queue
+  plus one message per paused connection, and connections that do not use the
+  busy worker keep going. Teardown is never
+  dropped: CLOSE, NEG-CLOSE and connection close still reach the worker and free
+  the subscriptions, sync sessions and memory reservations. A disconnect drops
+  that connection's parked REQs and sync messages instead of running them first.
 
 ### Added
 

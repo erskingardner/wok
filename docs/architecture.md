@@ -21,6 +21,12 @@ Invariants:
 - A single application-level writer thread commits events, management changes and
   maintenance deletions together with counters and derived tree/index updates.
 - Connection-affine ingest, query, monitor and sync worker pools route by connection ID.
+- Ingesters never block on a worker queue. A full queue parks that worker's messages
+  in order and retries them. A connection with parked messages is paused at its
+  transport until they move, so the backlog stays bounded by the ingest queue plus one
+  message per paused connection, and a stalled worker pauses only the connections
+  that use it. Teardown (CLOSE, NEG-CLOSE,
+  connection close) is never held back by the pause and never dropped.
 - Outbound queue memory is bounded by byte reservations, retained through in-flight
   writes. The shared connection guard cancels transport I/O on termination or shutdown.
 

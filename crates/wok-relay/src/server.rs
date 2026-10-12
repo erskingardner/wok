@@ -18,11 +18,11 @@ use crate::protocol::{has_reason_prefix, ClientCommand, ParseFailure, RelayMessa
 use crate::restrict::ReadRestrictor;
 use crate::source::TransportSource;
 use crate::supported_nips;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 use rand::Rng;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -46,6 +46,14 @@ use wok_query::{
 
 const AUTH_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const WRITER_BATCH_MAX: usize = 512;
+/// How long an ingester with parked messages waits for worker capacity before
+/// it looks at its own queue again.
+const PARKED_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+/// A connection's ingress gate: `true` while its transport may hand the
+/// ingester more messages. The ingester closes it while anything the
+/// connection sent is parked behind a full worker queue.
+type IngressGate = Arc<tokio::sync::watch::Sender<bool>>;
 
 /// One frame queued for a connection. Dropping the frame (after a send, or
 /// when a dead connection's queue is drained) releases its byte accounting.
@@ -238,6 +246,7 @@ pub enum IngestMsg {
     /// A connection registered; it precedes every `Client` message for it.
     Open {
         conn_id: u64,
+        gate: Option<IngressGate>,
     },
     Client {
         conn_id: u64,
@@ -345,6 +354,7 @@ pub struct ConnectionGuard {
     handle: RelayHandle,
     conn_id: u64,
     source: TransportSource,
+    gate: IngressGate,
     closed: bool,
 }
 
@@ -357,7 +367,12 @@ impl ConnectionGuard {
         &self.source
     }
 
+    /// Waits while earlier messages from this connection are parked behind a
+    /// full worker queue, which pauses reading from this client only.
     pub async fn client_message(&self, payload: String) {
+        if !*self.gate.borrow() {
+            let _ = self.gate.subscribe().wait_for(|open| *open).await;
+        }
         self.handle
             .client_message(self.conn_id, self.source.clone(), payload)
             .await;
@@ -448,11 +463,13 @@ impl RelayHandle {
             handle: self.clone(),
             conn_id,
             source,
+            gate: Arc::new(tokio::sync::watch::Sender::new(true)),
             closed: false,
         };
+        let gate = Some(guard.gate.clone());
         let _ = self
             .ingest_route(conn_id)
-            .send(IngestMsg::Open { conn_id })
+            .send(IngestMsg::Open { conn_id, gate })
             .await;
         guard
     }
@@ -491,6 +508,9 @@ impl RelayHandle {
             .map_err(|_| "relay writer shut down before replying".to_string())?
     }
 
+    /// Deliver a client message. This does not wait on the connection's
+    /// ingress gate; transports go through `ConnectionGuard::client_message`,
+    /// which does, so what they leave parked behind a full worker stays bounded.
     pub async fn client_message(&self, conn_id: u64, source: TransportSource, payload: String) {
         let _ = self
             .ingest_route(conn_id)
@@ -823,6 +843,237 @@ fn route_tx<T>(txs: &[Sender<T>], conn_id: u64) -> &Sender<T> {
     &txs[conn_id as usize % txs.len()]
 }
 
+/// One worker queue as an ingester sees it. A full queue never blocks the
+/// ingester: the message is parked, and so is every later one for that worker
+/// until the backlog drains, which keeps per-worker (and so per-connection)
+/// order. Nothing is dropped, so CLOSE and connection teardown always arrive.
+struct Lane<T> {
+    tx: Sender<T>,
+    parked: VecDeque<T>,
+}
+
+impl<T: Routed> Lane<T> {
+    fn new(tx: Sender<T>) -> Self {
+        Self {
+            tx,
+            parked: VecDeque::new(),
+        }
+    }
+
+    fn send(&mut self, msg: T, gates: &mut Gates) {
+        if self.flush(gates) {
+            match self.tx.try_send(msg) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+                Err(TrySendError::Full(msg)) => self.park(msg, gates),
+            }
+        } else {
+            self.park(msg, gates);
+        }
+    }
+
+    fn park(&mut self, msg: T, gates: &mut Gates) {
+        gates.park(msg.conn_id());
+        self.parked.push_back(msg);
+    }
+
+    /// Move parked messages into the worker queue while it has room. True when
+    /// nothing is left parked.
+    fn flush(&mut self, gates: &mut Gates) -> bool {
+        while let Some(msg) = self.parked.pop_front() {
+            let conn_id = msg.conn_id();
+            match self.tx.try_send(msg) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => gates.unpark(conn_id),
+                Err(TrySendError::Full(msg)) => {
+                    self.parked.push_front(msg);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Drop what is parked for a closed connection.
+    fn discard(&mut self, conn_id: u64, gates: &mut Gates) {
+        self.parked.retain(|msg| {
+            let keep = msg.conn_id() != conn_id;
+            if !keep {
+                gates.unpark(conn_id);
+            }
+            keep
+        });
+    }
+
+    /// Hand over the backlog at shutdown, when there is nothing left to stall.
+    fn flush_blocking(&mut self) {
+        for msg in self.parked.drain(..) {
+            let _ = self.tx.send(msg);
+        }
+    }
+}
+
+/// Worker messages the ingester routes, by the connection they belong to.
+trait Routed {
+    fn conn_id(&self) -> u64;
+}
+
+impl Routed for ReqMsg {
+    fn conn_id(&self) -> u64 {
+        match self {
+            Self::NewSub(sub) => sub.conn_id,
+            Self::SetAuth { conn_id, .. }
+            | Self::RemoveSub { conn_id, .. }
+            | Self::Close { conn_id } => *conn_id,
+        }
+    }
+}
+
+impl Routed for NegMsg {
+    fn conn_id(&self) -> u64 {
+        match self {
+            Self::Open { sub, .. } => sub.conn_id,
+            Self::Msg { conn_id, .. }
+            | Self::SetAuth { conn_id, .. }
+            | Self::CloseSub { conn_id, .. }
+            | Self::Fail { conn_id, .. }
+            | Self::Close { conn_id } => *conn_id,
+        }
+    }
+}
+
+impl Routed for WriterMsg {
+    fn conn_id(&self) -> u64 {
+        match self {
+            Self::AddEvent { conn_id, .. } | Self::Close { conn_id } => *conn_id,
+            // Never sent by an ingester.
+            Self::Maintenance | Self::Management(_) => 0,
+        }
+    }
+}
+
+/// Per-connection pausing. A connection with anything parked has its ingress
+/// gate closed, so its transport stops handing over messages until the backlog
+/// moves. What is parked is then bounded by the ingester's queue plus the one
+/// message each paused connection may already have had in flight, and
+/// connections that never touch the stalled worker are not paused.
+#[derive(Default)]
+struct Gates {
+    open: HashMap<u64, IngressGate>,
+    parked: HashMap<u64, usize>,
+}
+
+impl Gates {
+    fn park(&mut self, conn_id: u64) {
+        let parked = self.parked.entry(conn_id).or_default();
+        *parked += 1;
+        if *parked == 1 {
+            if let Some(gate) = self.open.get(&conn_id) {
+                gate.send_replace(false);
+            }
+        }
+    }
+
+    fn unpark(&mut self, conn_id: u64) {
+        let Some(parked) = self.parked.get_mut(&conn_id) else {
+            return;
+        };
+        *parked -= 1;
+        if *parked == 0 {
+            self.parked.remove(&conn_id);
+            if let Some(gate) = self.open.get(&conn_id) {
+                gate.send_replace(true);
+            }
+        }
+    }
+}
+
+/// An ingester's worker queues and the gates of its connections.
+struct Dispatch {
+    writer: Lane<WriterMsg>,
+    req: Vec<Lane<ReqMsg>>,
+    neg: Vec<Lane<NegMsg>>,
+    gates: Gates,
+}
+
+impl Dispatch {
+    fn new(writer: Sender<WriterMsg>, req: Vec<Sender<ReqMsg>>, neg: Vec<Sender<NegMsg>>) -> Self {
+        Self {
+            writer: Lane::new(writer),
+            req: req.into_iter().map(Lane::new).collect(),
+            neg: neg.into_iter().map(Lane::new).collect(),
+            gates: Gates::default(),
+        }
+    }
+
+    fn open(&mut self, conn_id: u64, gate: IngressGate) {
+        self.gates.open.insert(conn_id, gate);
+    }
+
+    fn writer(&mut self, msg: WriterMsg) {
+        self.writer.send(msg, &mut self.gates);
+    }
+
+    fn req(&mut self, msg: ReqMsg) {
+        let n = self.req.len();
+        self.req[msg.conn_id() as usize % n].send(msg, &mut self.gates);
+    }
+
+    fn neg(&mut self, msg: NegMsg) {
+        let n = self.neg.len();
+        self.neg[msg.conn_id() as usize % n].send(msg, &mut self.gates);
+    }
+
+    /// Connection teardown, which no gate holds back. Whatever is still parked
+    /// for the connection on its query and sync workers is superseded by their
+    /// `Close`, so it is dropped rather than run first. The writer keeps its
+    /// order: events a client sent before disconnecting are still written.
+    fn close(&mut self, conn_id: u64) {
+        self.gates.open.remove(&conn_id);
+        let n = self.req.len();
+        let req = &mut self.req[conn_id as usize % n];
+        req.discard(conn_id, &mut self.gates);
+        req.send(ReqMsg::Close { conn_id }, &mut self.gates);
+        let n = self.neg.len();
+        let neg = &mut self.neg[conn_id as usize % n];
+        neg.discard(conn_id, &mut self.gates);
+        neg.send(NegMsg::Close { conn_id }, &mut self.gates);
+        self.writer
+            .send(WriterMsg::Close { conn_id }, &mut self.gates);
+    }
+
+    /// True when nothing is parked on any worker.
+    fn flush(&mut self) -> bool {
+        let mut done = self.writer.flush(&mut self.gates);
+        for lane in &mut self.req {
+            done &= lane.flush(&mut self.gates);
+        }
+        for lane in &mut self.neg {
+            done &= lane.flush(&mut self.gates);
+        }
+        done
+    }
+
+    /// Sleep until a worker with parked messages has room, or `timeout`.
+    fn wait_for_capacity(&self, timeout: Duration) {
+        let mut select = crossbeam_channel::Select::new();
+        if !self.writer.parked.is_empty() {
+            select.send(&self.writer.tx);
+        }
+        for lane in self.req.iter().filter(|lane| !lane.parked.is_empty()) {
+            select.send(&lane.tx);
+        }
+        for lane in self.neg.iter().filter(|lane| !lane.parked.is_empty()) {
+            select.send(&lane.tx);
+        }
+        let _ = select.ready_timeout(timeout);
+    }
+
+    fn flush_blocking(&mut self) {
+        self.writer.flush_blocking();
+        self.req.iter_mut().for_each(Lane::flush_blocking);
+        self.neg.iter_mut().for_each(Lane::flush_blocking);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_ingester(
     env: Env,
@@ -837,11 +1088,32 @@ fn run_ingester(
     neg_txs: Vec<Sender<NegMsg>>,
 ) {
     let mut auth: HashMap<u64, AuthSession> = HashMap::new();
-    // blocking_recv is only used here, on a dedicated OS thread outside any
-    // Tokio runtime, so no async executor is stalled.
-    while let Some(msg) = rx.blocking_recv() {
+    let mut dispatch = Dispatch::new(writer_tx, req_txs, neg_txs);
+    loop {
+        // blocking_recv is only used here, on a dedicated OS thread outside
+        // any Tokio runtime, so no async executor is stalled. While messages
+        // are parked the ingester polls instead, so it can move them on as
+        // soon as their worker has room.
+        let msg = if dispatch.flush() {
+            match rx.blocking_recv() {
+                Some(msg) => msg,
+                None => break,
+            }
+        } else {
+            match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    dispatch.wait_for_capacity(PARKED_RETRY_INTERVAL);
+                    continue;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        };
         match msg {
-            IngestMsg::Open { conn_id } => {
+            IngestMsg::Open { conn_id, gate } => {
+                if let Some(gate) = gate {
+                    dispatch.open(conn_id, gate);
+                }
                 // NIP-42 lets the relay challenge at any time. Challenging on
                 // connect lets a client authenticate before its first REQ, so
                 // a restricted live subscription (e.g. NIP-46 kind 24133) is
@@ -856,9 +1128,7 @@ fn run_ingester(
                         .authenticated_connections
                         .fetch_sub(1, Ordering::Relaxed);
                 }
-                let _ = writer_tx.send(WriterMsg::Close { conn_id });
-                let _ = route_tx(&req_txs, conn_id).send(ReqMsg::Close { conn_id });
-                let _ = route_tx(&neg_txs, conn_id).send(NegMsg::Close { conn_id });
+                dispatch.close(conn_id);
             }
             IngestMsg::Client {
                 conn_id,
@@ -880,13 +1150,12 @@ fn run_ingester(
                     conn_id,
                     source,
                     &payload,
-                    &writer_tx,
-                    &req_txs,
-                    &neg_txs,
+                    &mut dispatch,
                 );
             }
         }
     }
+    dispatch.flush_blocking();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -901,9 +1170,7 @@ fn handle_client(
     conn_id: u64,
     source: TransportSource,
     payload: &str,
-    writer_tx: &Sender<WriterMsg>,
-    req_txs: &[Sender<ReqMsg>],
-    neg_txs: &[Sender<NegMsg>],
+    dispatch: &mut Dispatch,
 ) {
     let cmd = match ClientCommand::parse(payload) {
         Ok(c) => c,
@@ -912,15 +1179,14 @@ fn handle_client(
             // a session still tears it down, as its NEG-ERR would have.
             if let ParseFailure::NegRequest { sub_id, .. } = failure {
                 if let Ok(sub_id) = SubId::new(&sub_id) {
-                    let _ = route_tx(neg_txs, conn_id).send(NegMsg::CloseSub { conn_id, sub_id });
+                    dispatch.neg(NegMsg::CloseSub { conn_id, sub_id });
                 }
             }
             return;
         }
         Err(ParseFailure::NegRequest { sub_id, reason }) => {
             let reason = format!("invalid: {reason}");
-            let neg_tx = route_tx(neg_txs, conn_id);
-            neg_err(conns, metrics, neg_tx, conn_id, &sub_id, reason);
+            neg_err(conns, metrics, dispatch, conn_id, &sub_id, reason);
             return;
         }
         Err(e) => {
@@ -949,7 +1215,7 @@ fn handle_client(
                 return;
             }
             ingest_event(
-                env, cfg, conns, metrics, abuse, moderation, auth, conn_id, source, v, writer_tx,
+                env, cfg, conns, metrics, abuse, moderation, auth, conn_id, source, v, dispatch,
             );
         }
         ClientCommand::Auth(v) => {
@@ -972,16 +1238,7 @@ fn handle_client(
                 );
                 return;
             }
-            ingest_auth(
-                cfg,
-                conns,
-                metrics,
-                auth,
-                conn_id,
-                v,
-                route_tx(req_txs, conn_id),
-                route_tx(neg_txs, conn_id),
-            );
+            ingest_auth(cfg, conns, metrics, auth, conn_id, v, dispatch);
         }
         ClientCommand::Req { sub_id, filters } => {
             metrics.client_req.fetch_add(1, Ordering::Relaxed);
@@ -1002,15 +1259,7 @@ fn handle_client(
                 return;
             }
             ingest_req(
-                cfg,
-                conns,
-                metrics,
-                auth,
-                conn_id,
-                sub_id,
-                filters,
-                false,
-                route_tx(req_txs, conn_id),
+                cfg, conns, metrics, auth, conn_id, sub_id, filters, false, dispatch,
             );
         }
         ClientCommand::Count { sub_id, filters } => {
@@ -1032,22 +1281,14 @@ fn handle_client(
                 return;
             }
             ingest_req(
-                cfg,
-                conns,
-                metrics,
-                auth,
-                conn_id,
-                sub_id,
-                filters,
-                true,
-                route_tx(req_txs, conn_id),
+                cfg, conns, metrics, auth, conn_id, sub_id, filters, true, dispatch,
             );
         }
         ClientCommand::Close { sub_id } => {
             metrics.client_close.fetch_add(1, Ordering::Relaxed);
             match SubId::new(&sub_id) {
                 Ok(sid) => {
-                    let _ = route_tx(req_txs, conn_id).send(ReqMsg::RemoveSub {
+                    dispatch.req(ReqMsg::RemoveSub {
                         conn_id,
                         sub_id: sid,
                     });
@@ -1080,7 +1321,7 @@ fn handle_client(
                 sub_id,
                 Some(filter),
                 payload_hex,
-                route_tx(neg_txs, conn_id),
+                dispatch,
             );
         }
         ClientCommand::NegMsg {
@@ -1098,7 +1339,7 @@ fn handle_client(
                 sub_id,
                 None,
                 payload_hex,
-                route_tx(neg_txs, conn_id),
+                dispatch,
             );
         }
         ClientCommand::NegClose { sub_id } => {
@@ -1115,7 +1356,7 @@ fn handle_client(
             }
             match SubId::new(&sub_id) {
                 Ok(sid) => {
-                    let _ = route_tx(neg_txs, conn_id).send(NegMsg::CloseSub {
+                    dispatch.neg(NegMsg::CloseSub {
                         conn_id,
                         sub_id: sid,
                     });
@@ -1146,7 +1387,7 @@ fn ingest_event(
     conn_id: u64,
     source: TransportSource,
     orig: Value,
-    writer_tx: &Sender<WriterMsg>,
+    dispatch: &mut Dispatch,
 ) {
     let requested_kind = orig.get("kind").and_then(Value::as_u64).unwrap_or(u64::MAX);
     let policy = cfg.timestamp_policy_for_kind(requested_kind);
@@ -1412,7 +1653,7 @@ fn ingest_event(
         }
     }
 
-    let _ = writer_tx.send(WriterMsg::AddEvent {
+    dispatch.writer(WriterMsg::AddEvent {
         conn_id,
         source,
         packed: parsed.packed.into_bytes(),
@@ -1428,8 +1669,7 @@ fn ingest_auth(
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     event_json: Value,
-    req_tx: &Sender<ReqMsg>,
-    neg_tx: &Sender<NegMsg>,
+    dispatch: &mut Dispatch,
 ) {
     // C++ RelayIngester answers every AUTH failure with
     // OK <id|"?"> false "error: ...". Reasons that already carry a NIP-01
@@ -1439,7 +1679,7 @@ fn ingest_auth(
         .and_then(|v| v.as_str())
         .unwrap_or("?")
         .to_string();
-    match ingest_auth_inner(cfg, auth, conn_id, &event_json, req_tx, neg_tx) {
+    match ingest_auth_inner(cfg, auth, conn_id, &event_json, dispatch) {
         Ok(packed_id) => {
             metrics.auth_success_total.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -1479,8 +1719,7 @@ fn ingest_auth_inner(
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     event_json: &Value,
-    req_tx: &Sender<ReqMsg>,
-    neg_tx: &Sender<NegMsg>,
+    dispatch: &mut Dispatch,
 ) -> Result<[u8; 32], String> {
     // Refuse AUTH under the same condition that keeps NIP-42 out of NIP-11, so
     // `enabled = false` really disables it.
@@ -1546,11 +1785,11 @@ fn ingest_auth_inner(
     // Keep admission accounting pinned to the first identity; authenticating
     // another key must not reset the connection's abuse budget.
     asess.authed.get_or_insert(pk);
-    let _ = req_tx.send(ReqMsg::SetAuth {
+    dispatch.req(ReqMsg::SetAuth {
         conn_id,
         authed: pk,
     });
-    let _ = neg_tx.send(NegMsg::SetAuth {
+    dispatch.neg(NegMsg::SetAuth {
         conn_id,
         authed: pk,
     });
@@ -1569,7 +1808,7 @@ fn ingest_req(
     sub_id: String,
     filters: Vec<Value>,
     count_only: bool,
-    req_tx: &Sender<ReqMsg>,
+    dispatch: &mut Dispatch,
 ) {
     // C++ RelayIngester: errors raised before the sub id is known go out as
     // NOTICE "ERROR: bad req: ..."; everything after is a NIP-01 CLOSED with
@@ -1684,7 +1923,7 @@ fn ingest_req(
         }
     };
     let sub = Subscription::new(conn_id, sid, fg, count_only);
-    let _ = req_tx.send(ReqMsg::NewSub(sub));
+    dispatch.req(ReqMsg::NewSub(sub));
 }
 
 /// Reason for a read refused by the restricted-kind gate. NIP-42's
@@ -1774,13 +2013,13 @@ fn admit_invalid(
 fn neg_err(
     conns: &ConnTable,
     metrics: &Metrics,
-    neg_tx: &Sender<NegMsg>,
+    dispatch: &mut Dispatch,
     conn_id: u64,
     sub_id: &str,
     message: String,
 ) {
     if let Ok(sid) = SubId::new(sub_id) {
-        let _ = neg_tx.send(NegMsg::Fail {
+        dispatch.neg(NegMsg::Fail {
             conn_id,
             sub_id: sid,
             message,
@@ -1812,7 +2051,7 @@ fn ingest_neg_command(
     sub_id: String,
     filter: Option<Value>,
     payload_hex: String,
-    neg_tx: &Sender<NegMsg>,
+    dispatch: &mut Dispatch,
 ) {
     // NEG-MSG shares the REQ token budget: reconciliation messages each cost a
     // worker round with B-tree descents, and persistent sessions could
@@ -1832,7 +2071,7 @@ fn ingest_neg_command(
             "NEG-MSG"
         };
         let reason = format!("rate-limited: {cmd} budget exhausted");
-        neg_err(conns, metrics, neg_tx, conn_id, &sub_id, reason);
+        neg_err(conns, metrics, dispatch, conn_id, &sub_id, reason);
         return;
     }
     let sid = match SubId::new(&sub_id) {
@@ -1848,7 +2087,7 @@ fn ingest_neg_command(
     };
     if !cfg.relay.negentropy_enabled {
         let reason = "blocked: negentropy is disabled on this relay".to_string();
-        neg_err(conns, metrics, neg_tx, conn_id, &sub_id, reason);
+        neg_err(conns, metrics, dispatch, conn_id, &sub_id, reason);
         return;
     }
     if let Err(reason) = ingest_neg(
@@ -1860,9 +2099,9 @@ fn ingest_neg_command(
         sid,
         filter,
         &payload_hex,
-        neg_tx,
+        dispatch,
     ) {
-        neg_err(conns, metrics, neg_tx, conn_id, &sub_id, reason);
+        neg_err(conns, metrics, dispatch, conn_id, &sub_id, reason);
     }
 }
 
@@ -1878,14 +2117,14 @@ fn ingest_neg(
     sid: SubId,
     filter: Option<Value>,
     payload_hex: &str,
-    neg_tx: &Sender<NegMsg>,
+    dispatch: &mut Dispatch,
 ) -> Result<(), String> {
     if payload_hex.len() > 2 * 1024 * 1024 {
         return Err("invalid: negentropy payload exceeds 1 MiB".into());
     }
     let payload = wok_event::from_hex_strict(payload_hex).map_err(|e| format!("invalid: {e}"))?;
     let Some(mut filter) = filter else {
-        let _ = neg_tx.send(NegMsg::Msg {
+        dispatch.neg(NegMsg::Msg {
             conn_id,
             sub_id: sid,
             payload,
@@ -1928,7 +2167,7 @@ fn ingest_neg(
     }
     let filter_str = filter.to_string();
     let sub = Subscription::new(conn_id, sid, fg, false);
-    let _ = neg_tx.send(NegMsg::Open {
+    dispatch.neg(NegMsg::Open {
         sub,
         filter_str,
         payload,
@@ -3375,5 +3614,238 @@ mod tests {
             1
         );
         handle.request_shutdown();
+    }
+
+    /// An ingester whose worker queues the test drains itself. Connection 1
+    /// routes to `req[1]`, a two-slot queue nobody reads until the test says
+    /// so: a REQ worker stuck in a long scan. Connection 2 routes to `req[0]`.
+    struct StalledWorker {
+        ingest: tokio::sync::mpsc::Sender<IngestMsg>,
+        writer: Receiver<WriterMsg>,
+        req: Vec<Receiver<ReqMsg>>,
+        neg: Receiver<NegMsg>,
+        outbound: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+        gates: [IngressGate; 2],
+        ingester: thread::JoinHandle<()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl StalledWorker {
+        fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.auth.enabled = false;
+            config.relay.abuse.enabled = false;
+            let moderation = Arc::new(parking_lot::RwLock::new(
+                env.begin_ro()
+                    .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                    .unwrap(),
+            ));
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, outbound) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(2, Outbound::new(out_tx, 0));
+            let (writer_tx, writer) = bounded(64);
+            let (healthy_tx, healthy) = bounded(64);
+            let (stalled_tx, stalled) = bounded(2);
+            let (neg_tx, neg) = bounded(64);
+            let (ingest, ingest_rx) = tokio::sync::mpsc::channel(64);
+            let ingester = thread::spawn(move || {
+                run_ingester(
+                    env,
+                    Arc::new(parking_lot::RwLock::new(config)),
+                    conns,
+                    Arc::new(Metrics::default()),
+                    Arc::new(AbuseController::default()),
+                    moderation,
+                    ingest_rx,
+                    writer_tx,
+                    vec![healthy_tx, stalled_tx],
+                    vec![neg_tx],
+                )
+            });
+            let gates = [(); 2].map(|_| Arc::new(tokio::sync::watch::Sender::new(true)));
+            for (conn_id, gate) in [1, 2].into_iter().zip(&gates) {
+                ingest
+                    .blocking_send(IngestMsg::Open {
+                        conn_id,
+                        gate: Some(gate.clone()),
+                    })
+                    .unwrap();
+            }
+            Self {
+                ingest,
+                writer,
+                req: vec![healthy, stalled],
+                neg,
+                outbound,
+                gates,
+                ingester,
+                _dir: dir,
+            }
+        }
+
+        fn send(&self, conn_id: u64, payload: Value) {
+            self.ingest
+                .blocking_send(IngestMsg::Client {
+                    conn_id,
+                    source: TransportSource::Unix,
+                    payload: payload.to_string(),
+                })
+                .unwrap();
+        }
+
+        fn gate_open(&self, conn_id: u64) -> bool {
+            *self.gates[conn_id as usize - 1].borrow()
+        }
+
+        /// Connection 1 has six messages in flight when its worker stalls: two
+        /// fill the queue and the other four park.
+        fn fill(&self, last: Value) {
+            for i in 0..5 {
+                self.send(1, json!(["REQ", format!("s{i}"), {"kinds": [1]}]));
+            }
+            self.send(1, last);
+        }
+
+        /// Connection 2, on the same ingester, still gets its REQ to its own
+        /// worker and an immediate reply. The ingester handles messages in
+        /// order, so everything sent before this has been dispatched.
+        fn assert_other_connection_progresses(&mut self, sub_id: &str) {
+            self.send(2, json!(["REQ", sub_id, {"kinds": [1]}]));
+            match self.req[0].recv_timeout(Duration::from_secs(2)) {
+                Ok(ReqMsg::NewSub(sub)) => {
+                    assert_eq!((sub.conn_id, sub.sub_id.as_str()), (2, sub_id));
+                }
+                _ => panic!("connection 2's REQ did not reach its worker"),
+            }
+            self.send(2, json!(["NOT-A-COMMAND"]));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(frame) = self.outbound.try_recv() {
+                    assert!(frame.into_text().contains("NOTICE"));
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "connection 2 got no reply"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(self.gate_open(2), "connection 2 is never paused");
+        }
+
+        fn recv_stalled(&self) -> ReqMsg {
+            self.req[1]
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stalled worker queue never refilled")
+        }
+
+        fn finish(self) {
+            drop(self.ingest);
+            self.ingester.join().unwrap();
+        }
+    }
+
+    fn assert_new_sub(msg: ReqMsg, sub_id: &str) {
+        match msg {
+            ReqMsg::NewSub(sub) => assert_eq!((sub.conn_id, sub.sub_id.as_str()), (1, sub_id)),
+            _ => panic!("expected REQ {sub_id} for connection 1"),
+        }
+    }
+
+    /// A paused connection's transport holds its next message until the
+    /// ingester reopens the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_connection_waits_for_its_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let connection = handle
+            .register_connection(TransportSource::Unix, Outbound::new(tx, 0))
+            .await;
+        connection.gate.send_replace(false);
+        {
+            let send = connection.client_message(json!(["NOT-A-COMMAND"]).to_string());
+            tokio::pin!(send);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut send)
+                    .await
+                    .is_err(),
+                "a paused connection must not hand over messages"
+            );
+            connection.gate.send_replace(true);
+            send.await;
+        }
+        assert!(recv_outbound(&mut rx).await.contains("NOTICE"));
+        connection.close().await;
+        handle.request_shutdown();
+    }
+
+    /// A full worker queue parks messages instead of blocking the ingester,
+    /// pauses only the connection that owns them, and still delivers its
+    /// CLOSE, after its REQ, once the worker drains.
+    #[test]
+    fn full_worker_queue_does_not_stall_other_connections() {
+        let mut relay = StalledWorker::start();
+        relay.fill(json!(["CLOSE", "s0"]));
+        relay.assert_other_connection_progresses("other");
+        assert!(!relay.gate_open(1), "connection 1 is paused");
+
+        for i in 0..5 {
+            assert_new_sub(relay.recv_stalled(), &format!("s{i}"));
+        }
+        match relay.recv_stalled() {
+            ReqMsg::RemoveSub { conn_id, sub_id } => {
+                assert_eq!((conn_id, sub_id.as_str()), (1, "s0"));
+            }
+            _ => panic!("expected the parked CLOSE"),
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !relay.gate_open(1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connection 1 never resumed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        relay.finish();
+    }
+
+    /// Disconnecting behind a full worker queue must not move the stall into
+    /// connection teardown (#83 review): the Close is handled at once, drops
+    /// the connection's parked work, and reaches every worker once the stalled
+    /// one drains, so its subscriptions are removed.
+    #[test]
+    fn disconnect_behind_full_worker_queue_still_tears_down() {
+        let mut relay = StalledWorker::start();
+        relay.fill(json!(["REQ", "last", {"kinds": [1]}]));
+        relay
+            .ingest
+            .blocking_send(IngestMsg::Close { conn_id: 1 })
+            .unwrap();
+        relay.assert_other_connection_progresses("after-close");
+        assert!(matches!(
+            relay.writer.recv_timeout(Duration::from_secs(2)),
+            Ok(WriterMsg::Close { conn_id: 1 })
+        ));
+        assert!(matches!(
+            relay.neg.recv_timeout(Duration::from_secs(2)),
+            Ok(NegMsg::Close { conn_id: 1 })
+        ));
+
+        assert_new_sub(relay.recv_stalled(), "s0");
+        assert_new_sub(relay.recv_stalled(), "s1");
+        assert!(matches!(relay.recv_stalled(), ReqMsg::Close { conn_id: 1 }));
+        thread::sleep(Duration::from_millis(20));
+        assert!(relay.req[1].try_recv().is_err(), "nothing runs after Close");
+        relay.finish();
     }
 }

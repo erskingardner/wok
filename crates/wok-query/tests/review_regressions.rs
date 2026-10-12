@@ -6,7 +6,7 @@ use wok_query::{DbQuery, NostrFilterGroup, SubId, Subscription};
 #[test]
 fn review_nonmatching_search_respects_timeslice() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut events = Vec::new();
     for i in 1u64..=4096 {
@@ -46,7 +46,7 @@ fn review_nonmatching_search_respects_timeslice() {
 #[test]
 fn broad_tag_uses_selective_author_without_skipping_filter_checks() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut events = Vec::new();
     for i in 1u64..=10_000 {

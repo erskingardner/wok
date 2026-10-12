@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn progress_updates_do_not_rewrite_the_search_schema() {
         let temp = tempfile::tempdir().unwrap();
-        let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
         let dbi = env.dbis().event_search.unwrap();
         let sentinel_schema = 99_u64;
 

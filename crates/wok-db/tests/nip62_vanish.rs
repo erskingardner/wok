@@ -51,7 +51,7 @@ fn stored(env: &Env, id: &[u8; 32]) -> bool {
 #[test]
 fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
     let directory = TempDir::new().unwrap();
-    let env = Env::open(directory.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let policy = VanishPolicy {
         enabled: true,
@@ -125,7 +125,7 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
     assert!(stored(&env, &vanish_id));
 
     drop(env);
-    let reopened = Env::open(directory.path(), EnvOptions::default()).unwrap();
+    let reopened = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
     assert_eq!(
         vanish_timestamp_ro(&reopened.begin_ro().unwrap(), &author_pubkey.serialize()).unwrap(),
         Some(200)
@@ -135,7 +135,7 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
 #[test]
 fn target_validation_max_timestamp_and_kind5_tombstone_rules() {
     let directory = TempDir::new().unwrap();
-    let env = Env::open(directory.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let policy = VanishPolicy {
         enabled: true,
@@ -189,7 +189,7 @@ fn target_validation_max_timestamp_and_kind5_tombstone_rules() {
 #[test]
 fn existing_request_records_are_backfilled_for_migrations() {
     let directory = TempDir::new().unwrap();
-    let env = Env::open(directory.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut rng = rand::thread_rng();
     let author = Keypair::new(SECP256K1, &mut rng);

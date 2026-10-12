@@ -912,7 +912,7 @@ mod stalled_write_tests {
     #[allow(clippy::field_reassign_with_default)]
     async fn pong_window_starts_after_stalled_ping_write() {
         let dir = tempfile::tempdir().unwrap();
-        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::default()).unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();

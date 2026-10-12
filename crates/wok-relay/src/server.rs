@@ -2255,7 +2255,7 @@ mod tests {
     fn same_batch_ban_precedes_ordinary_and_vanish_writes() {
         for kind in [1, VANISH_KIND] {
             let dir = tempfile::tempdir().unwrap();
-            let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+            let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
             env.ensure_initialized().unwrap();
 
             let mut config = Config::default();
@@ -2332,7 +2332,7 @@ mod tests {
     #[test]
     fn multibyte_report_reason_is_bounded_and_reaches_queue() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         let first_target = [9u8; 32];
         let dropped_target = [10u8; 32];
         let mut tags = PackedEventTagBuilder::default();
@@ -2408,7 +2408,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_write_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2452,7 +2452,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pow_policy_rejects_insufficient_event_ids() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2485,7 +2485,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn query_cost_is_rejected_before_scheduling() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2517,7 +2517,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn default_private_read_fails_closed_until_auth_is_configured() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2546,7 +2546,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_connection_guard_cleans_up_registration() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2572,7 +2572,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn historical_query_concurrency_is_independent_from_live_subscription_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2605,7 +2605,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn author_storage_quota_is_enforced_by_the_single_writer() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2651,7 +2651,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn global_storage_quota_aborts_the_exceeding_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2697,7 +2697,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disk_reserve_rejects_before_opening_a_write_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();

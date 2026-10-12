@@ -1469,7 +1469,7 @@ mod main_tests {
     #[test]
     fn negentropy_build_batches_are_idempotent_and_reject_zero_size() {
         let directory = tempfile::tempdir().unwrap();
-        let env = Env::open(directory.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut events: Vec<_> = (0..5)
             .map(|offset| signed_event(1_700_000_000 + offset))

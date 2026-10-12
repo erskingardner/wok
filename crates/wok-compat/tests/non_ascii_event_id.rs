@@ -137,7 +137,7 @@ async fn start_ws(
     dir: &std::path::Path,
     deflate: bool,
 ) -> (wok_relay::RelayHandle, std::net::SocketAddr) {
-    let env = Env::open(dir, EnvOptions::default()).unwrap();
+    let env = Env::open(dir, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir, deflate, false);
     let handle = wok_relay::start(env, cfg).unwrap();
@@ -231,7 +231,7 @@ async fn em_dash_event_accepted_over_deflate_ws() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn em_dash_event_accepted_over_unix_socket() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir.path(), false, true);
     let sock_path = cfg.relay.unix.path.clone();

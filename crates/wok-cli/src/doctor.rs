@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn healthy_empty_database_passes() {
         let temp = tempfile::tempdir().unwrap();
-        let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         drop(env);
         let cfg = Config {
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn missing_plugin_is_a_failure() {
         let temp = tempfile::tempdir().unwrap();
-        let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         drop(env);
         let mut cfg = Config {

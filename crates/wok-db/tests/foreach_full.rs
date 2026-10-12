@@ -11,7 +11,7 @@ fn env_with_created_at_dups() -> Env {
     // Keep the tempdir so the env path outlives the test setup; tests are
     // short-lived processes so this is fine.
     let path = tmp.keep();
-    let env = Env::open(&path, EnvOptions::default()).unwrap();
+    let env = Env::open(&path, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut txn = env.begin_rw().unwrap();
     let dbi = env.dbis().event_created_at;

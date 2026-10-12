@@ -79,7 +79,7 @@ async fn start(
     dir: &std::path::Path,
     cfg: Config,
 ) -> (wok_relay::RelayHandle, std::net::SocketAddr) {
-    let env = Env::open(dir, EnvOptions::default()).unwrap();
+    let env = Env::open(dir, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

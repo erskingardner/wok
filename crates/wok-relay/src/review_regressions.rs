@@ -17,7 +17,7 @@ fn transaction_abort_receipts_remain_with_their_publishers() {
 }
 fn check_routing(author_quota: u64, global_quota: u64, first_ok: bool, second_ok: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut cfg = Config::default();
     cfg.db_min_free_disk_bytes = 0;

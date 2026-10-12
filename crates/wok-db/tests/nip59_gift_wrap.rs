@@ -48,7 +48,7 @@ fn write(env: &Env, event: &mut EventToWrite) {
 #[test]
 fn recipient_can_delete_gift_wrap_and_prevent_rebroadcast() {
     let dir = TempDir::new().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut rng = rand::thread_rng();
     let sender = Keypair::new(SECP256K1, &mut rng);

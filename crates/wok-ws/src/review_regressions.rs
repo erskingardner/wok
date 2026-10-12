@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_kill_interrupts_blocked_websocket_write() {
     let dir = tempfile::tempdir().unwrap();
-    let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::default()).unwrap();
+    let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
     let mut cfg = Config::default();
     cfg.relay.max_pending_outbound_bytes = 128;
     cfg.relay.auto_ping_seconds = 1;

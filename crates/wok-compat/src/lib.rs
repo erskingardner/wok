@@ -44,7 +44,7 @@ pub fn sign_event_with_key(mut ev: Value, kp: &Keypair) -> Value {
 
 pub fn temp_db() -> (TempDir, Env) {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     (dir, env)
 }

@@ -770,7 +770,7 @@ mod tests {
 
     fn test_env() -> (tempfile::TempDir, Env) {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         (dir, env)
     }
 

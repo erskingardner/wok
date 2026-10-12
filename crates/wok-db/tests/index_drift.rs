@@ -26,7 +26,7 @@ fn sign(kind: u64, content: &str, created: u64, tags: serde_json::Value) -> (Vec
 #[test]
 fn write_delete_replace_no_index_drift() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut evs = Vec::new();
     for i in 0..20 {
@@ -70,7 +70,7 @@ fn write_delete_replace_no_index_drift() {
 #[test]
 fn integrity_detects_semantic_index_drift_even_when_counts_match() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let (packed, json) = sign(1, "indexed", 1_700_000_100, json!([["t", "rust"]]));
     let view = PackedEventView::new(&packed).unwrap();
@@ -113,7 +113,7 @@ fn integrity_detects_semantic_index_drift_even_when_counts_match() {
 #[test]
 fn integrity_handles_malformed_custom_index_keys_without_panicking() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     {
         let mut txn = env.begin_rw().unwrap();
@@ -135,7 +135,7 @@ fn integrity_handles_malformed_custom_index_keys_without_panicking() {
 #[test]
 fn integrity_detects_search_index_drift() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let (packed, json) = sign(1, "searchable", 1_700_000_100, json!([]));
     let mut events = vec![EventToWrite::new(packed, json)];

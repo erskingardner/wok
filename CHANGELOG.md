@@ -45,13 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an ingester blocked when a worker's queue was full, which held up every
   connection sharing that ingester, including their CLOSE and disconnect
   cleanup. Ingesters now park work for a full worker in order and retry it
-  without blocking. A connection with parked work is paused (its socket is not
-  read) until that work moves, so the backlog stays bounded by the ingest queue
-  plus one message per paused connection, and connections that do not use the
-  busy worker keep going. Teardown is never
-  dropped: CLOSE, NEG-CLOSE and connection close still reach the worker and free
-  the subscriptions, sync sessions and memory reservations. A disconnect drops
-  that connection's parked REQs and sync messages instead of running them first.
+  without blocking; CLOSE and NEG-CLOSE are never dropped. A connection with
+  parked work stops having its client messages read until that work moves, but
+  keeps receiving events and answering pings and close frames. Connections that
+  do not use the busy worker keep going. A disconnect drops that connection's
+  parked work (REQs, sync messages and unwritten events) instead of running it
+  first, and frees its subscriptions, sync sessions and memory reservations.
 
 ### Added
 

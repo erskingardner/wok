@@ -22,11 +22,15 @@ Invariants:
   maintenance deletions together with counters and derived tree/index updates.
 - Connection-affine ingest, query, monitor and sync worker pools route by connection ID.
 - Ingesters never block on a worker queue. A full queue parks that worker's messages
-  in order and retries them. A connection with parked messages is paused at its
-  transport until they move, so the backlog stays bounded by the ingest queue plus one
-  message per paused connection, and a stalled worker pauses only the connections
-  that use it. Teardown (CLOSE, NEG-CLOSE,
-  connection close) is never held back by the pause and never dropped.
+  in order and retries them; CLOSE and NEG-CLOSE are parked like any other message
+  and never dropped. A connection with parked messages has its ingress paused: the
+  transport keeps writing outbound and handling control frames, but stops reading
+  client messages beyond about one held message until the parked ones move. The
+  backlog stays bounded by the ingest queue plus one message per paused connection,
+  and a stalled worker pauses only the connections that use it. Once the transport
+  disconnects, teardown skips the pause: it drops the connection's parked work, and a
+  worker gets `Close` only if it was handed something for that connection, so churn
+  adds no backlog.
 - Outbound queue memory is bounded by byte reservations, retained through in-flight
   writes. The shared connection guard cancels transport I/O on termination or shutdown.
 

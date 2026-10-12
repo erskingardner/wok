@@ -22,7 +22,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 use rand::Rng;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -84,6 +84,7 @@ pub struct Outbound {
     pending: Arc<AtomicU64>,
     limit: usize,
     kill: Arc<tokio::sync::Notify>,
+    gate: IngressGate,
 }
 
 impl Outbound {
@@ -93,6 +94,7 @@ impl Outbound {
             pending: Arc::new(AtomicU64::new(0)),
             limit,
             kill: Arc::new(tokio::sync::Notify::new()),
+            gate: Arc::new(tokio::sync::watch::Sender::new(true)),
         }
     }
 
@@ -501,15 +503,26 @@ impl ConnectionGuard {
         &self.source
     }
 
-    /// Waits while earlier messages from this connection are parked behind a
-    /// full worker queue, which pauses reading from this client only.
+    /// Hand a message to the ingester. This waits only for room in the
+    /// shared ingest queue, never on the ingress gate: a transport checks
+    /// `ingress_paused` itself, so a paused connection keeps writing,
+    /// pinging and handling control frames.
     pub async fn client_message(&self, payload: String) {
-        if !*self.gate.borrow() {
-            let _ = self.gate.subscribe().wait_for(|open| *open).await;
-        }
         self.handle
             .client_message(self.conn_id, self.source.clone(), payload)
             .await;
+    }
+
+    /// True while earlier messages from this connection are parked behind a
+    /// full worker queue. The transport should stop reading from the client
+    /// and hold what it already read until `ingress_resumed`.
+    pub fn ingress_paused(&self) -> bool {
+        !*self.gate.borrow()
+    }
+
+    /// Resolves once the connection may hand over messages again. Cancel-safe.
+    pub async fn ingress_resumed(&self) {
+        let _ = self.gate.subscribe().wait_for(|open| *open).await;
     }
 
     /// Cancellation covers the entire transport future, including writes and
@@ -587,6 +600,7 @@ impl RelayHandle {
         out: Outbound,
     ) -> ConnectionGuard {
         let conn_id = self.next_conn_id();
+        let gate = out.gate.clone();
         self.conns.insert(conn_id, out);
         self.metrics
             .active_connections
@@ -597,10 +611,10 @@ impl RelayHandle {
             handle: self.clone(),
             conn_id,
             source,
-            gate: Arc::new(tokio::sync::watch::Sender::new(true)),
+            gate: gate.clone(),
             closed: false,
         };
-        let gate = Some(guard.gate.clone());
+        let gate = Some(gate);
         let _ = self
             .ingest_route(conn_id)
             .send(IngestMsg::Open { conn_id, gate })
@@ -642,9 +656,18 @@ impl RelayHandle {
             .map_err(|_| "relay writer shut down before replying".to_string())?
     }
 
-    /// Deliver a client message. This does not wait on the connection's
-    /// ingress gate; transports go through `ConnectionGuard::client_message`,
-    /// which does, so what they leave parked behind a full worker stays bounded.
+    /// Close or reopen a connection's ingress gate, as parking behind a
+    /// stalled worker would. For transport tests.
+    #[doc(hidden)]
+    pub fn set_ingress_paused(&self, conn_id: u64, paused: bool) {
+        if let Some(out) = self.conns.map.lock().get(&conn_id) {
+            out.gate.send_replace(!paused);
+        }
+    }
+
+    /// Deliver a client message. Transports go through `ConnectionGuard`,
+    /// whose ingress gate keeps what they leave parked behind a full worker
+    /// bounded.
     pub async fn client_message(&self, conn_id: u64, source: TransportSource, payload: String) {
         let _ = self
             .ingest_route(conn_id)
@@ -1014,6 +1037,9 @@ fn route_tx<T>(txs: &[Sender<T>], conn_id: u64) -> &Sender<T> {
 struct Lane<T> {
     tx: Sender<T>,
     parked: VecDeque<T>,
+    /// Open connections with something already in the worker queue, and so
+    /// possibly state on the worker that their `Close` must clear.
+    delivered: HashSet<u64>,
 }
 
 impl<T: Routed> Lane<T> {
@@ -1021,13 +1047,20 @@ impl<T: Routed> Lane<T> {
         Self {
             tx,
             parked: VecDeque::new(),
+            delivered: HashSet::new(),
         }
     }
 
     fn send(&mut self, msg: T, gates: &mut Gates) {
         if self.flush(gates) {
+            let (conn_id, close) = (msg.conn_id(), msg.is_close());
             match self.tx.try_send(msg) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+                Ok(()) => {
+                    if !close {
+                        self.delivered.insert(conn_id);
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => {}
                 Err(TrySendError::Full(msg)) => self.park(msg, gates),
             }
         } else {
@@ -1044,9 +1077,15 @@ impl<T: Routed> Lane<T> {
     /// nothing is left parked.
     fn flush(&mut self, gates: &mut Gates) -> bool {
         while let Some(msg) = self.parked.pop_front() {
-            let conn_id = msg.conn_id();
+            let (conn_id, close) = (msg.conn_id(), msg.is_close());
             match self.tx.try_send(msg) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => gates.unpark(conn_id),
+                Ok(()) => {
+                    if !close {
+                        self.delivered.insert(conn_id);
+                    }
+                    gates.unpark(conn_id);
+                }
+                Err(TrySendError::Disconnected(_)) => gates.unpark(conn_id),
                 Err(TrySendError::Full(msg)) => {
                     self.parked.push_front(msg);
                     return false;
@@ -1056,8 +1095,12 @@ impl<T: Routed> Lane<T> {
         true
     }
 
-    /// Drop what is parked for a closed connection.
-    fn discard(&mut self, conn_id: u64, gates: &mut Gates) {
+    /// Connection teardown. What is parked for the connection is dropped,
+    /// and the worker gets `close` only if it was handed something before.
+    /// A closed connection therefore leaves at most one message behind, and
+    /// none at all if a stalled worker never saw it, however many connections
+    /// come and go while the worker is stuck.
+    fn close(&mut self, conn_id: u64, close: T, gates: &mut Gates) {
         self.parked.retain(|msg| {
             let keep = msg.conn_id() != conn_id;
             if !keep {
@@ -1065,6 +1108,9 @@ impl<T: Routed> Lane<T> {
             }
             keep
         });
+        if self.delivered.remove(&conn_id) {
+            self.send(close, gates);
+        }
     }
 
     /// Hand over the backlog at shutdown, when there is nothing left to stall.
@@ -1078,6 +1124,8 @@ impl<T: Routed> Lane<T> {
 /// Worker messages the ingester routes, by the connection they belong to.
 trait Routed {
     fn conn_id(&self) -> u64;
+    /// Connection teardown, which leaves the worker no state for it.
+    fn is_close(&self) -> bool;
 }
 
 impl Routed for ReqMsg {
@@ -1088,6 +1136,10 @@ impl Routed for ReqMsg {
             | Self::RemoveSub { conn_id, .. }
             | Self::Close { conn_id } => *conn_id,
         }
+    }
+
+    fn is_close(&self) -> bool {
+        matches!(self, Self::Close { .. })
     }
 }
 
@@ -1102,6 +1154,10 @@ impl Routed for NegMsg {
             | Self::Close { conn_id } => *conn_id,
         }
     }
+
+    fn is_close(&self) -> bool {
+        matches!(self, Self::Close { .. })
+    }
 }
 
 impl Routed for WriterMsg {
@@ -1111,6 +1167,10 @@ impl Routed for WriterMsg {
             // Never sent by an ingester.
             Self::Maintenance | Self::Management(_) | Self::Stop => 0,
         }
+    }
+
+    fn is_close(&self) -> bool {
+        matches!(self, Self::Close { .. })
     }
 }
 
@@ -1186,22 +1246,18 @@ impl Dispatch {
         self.neg[msg.conn_id() as usize % n].send(msg, &mut self.gates);
     }
 
-    /// Connection teardown, which no gate holds back. Whatever is still parked
-    /// for the connection on its query and sync workers is superseded by their
-    /// `Close`, so it is dropped rather than run first. The writer keeps its
-    /// order: events a client sent before disconnecting are still written.
+    /// Connection teardown, which no gate holds back. Whatever is still
+    /// parked for the connection is dropped rather than run first: its REQs
+    /// and sync messages are superseded by `Close`, and the writer already
+    /// drops events from a connection that closes in the same batch.
     fn close(&mut self, conn_id: u64) {
         self.gates.open.remove(&conn_id);
         let n = self.req.len();
-        let req = &mut self.req[conn_id as usize % n];
-        req.discard(conn_id, &mut self.gates);
-        req.send(ReqMsg::Close { conn_id }, &mut self.gates);
+        self.req[conn_id as usize % n].close(conn_id, ReqMsg::Close { conn_id }, &mut self.gates);
         let n = self.neg.len();
-        let neg = &mut self.neg[conn_id as usize % n];
-        neg.discard(conn_id, &mut self.gates);
-        neg.send(NegMsg::Close { conn_id }, &mut self.gates);
+        self.neg[conn_id as usize % n].close(conn_id, NegMsg::Close { conn_id }, &mut self.gates);
         self.writer
-            .send(WriterMsg::Close { conn_id }, &mut self.gates);
+            .close(conn_id, WriterMsg::Close { conn_id }, &mut self.gates);
     }
 
     /// True when nothing is parked on any worker.
@@ -1231,10 +1287,11 @@ impl Dispatch {
         let _ = select.ready_timeout(timeout);
     }
 
+    /// On exit, parked events still reach the writer ahead of its `Stop`.
+    /// Parked queries and sync messages are dropped: their workers are
+    /// stopping, and a stalled one must not hold up the join.
     fn flush_blocking(&mut self) {
         self.writer.flush_blocking();
-        self.req.iter_mut().for_each(Lane::flush_blocking);
-        self.neg.iter_mut().for_each(Lane::flush_blocking);
     }
 }
 
@@ -3914,44 +3971,50 @@ mod tests {
         }
     }
 
+    /// Connections that come and go behind a stalled worker leave nothing
+    /// parked: their REQs are dropped with them, and as the worker never saw
+    /// them it needs no Close. The backlog does not grow with churn.
+    #[test]
+    fn connection_churn_behind_full_worker_queue_leaves_nothing_parked() {
+        let mut relay = StalledWorker::start();
+        relay.fill(json!(["REQ", "last", {"kinds": [1]}]));
+        // Odd ids route to the stalled worker, like connection 1.
+        for conn_id in (3..203).step_by(2) {
+            let gate = Arc::new(tokio::sync::watch::Sender::new(true));
+            relay
+                .ingest
+                .blocking_send(IngestMsg::Open {
+                    conn_id,
+                    gate: Some(gate.clone()),
+                })
+                .unwrap();
+            relay.send(conn_id, json!(["REQ", "churn", {"kinds": [1]}]));
+            relay
+                .ingest
+                .blocking_send(IngestMsg::Close { conn_id })
+                .unwrap();
+        }
+        relay.assert_other_connection_progresses("after-churn");
+
+        for i in 0..5 {
+            assert_new_sub(relay.recv_stalled(), &format!("s{i}"));
+        }
+        assert_new_sub(relay.recv_stalled(), "last");
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            relay.req[1].try_recv().is_err(),
+            "closed connections left work behind"
+        );
+        assert!(relay.writer.try_recv().is_err());
+        assert!(relay.neg.try_recv().is_err());
+        relay.finish();
+    }
+
     fn assert_new_sub(msg: ReqMsg, sub_id: &str) {
         match msg {
             ReqMsg::NewSub(sub) => assert_eq!((sub.conn_id, sub.sub_id.as_str()), (1, sub_id)),
             _ => panic!("expected REQ {sub_id} for connection 1"),
         }
-    }
-
-    /// A paused connection's transport holds its next message until the
-    /// ingester reopens the gate.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn paused_connection_waits_for_its_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
-        env.ensure_initialized().unwrap();
-        let mut cfg = Config::default();
-        cfg.db = dir.path().to_path_buf();
-        cfg.relay.auth.enabled = false;
-        let handle = start(env, cfg).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
-        let connection = handle
-            .register_connection(TransportSource::Unix, Outbound::new(tx, 0))
-            .await;
-        connection.gate.send_replace(false);
-        {
-            let send = connection.client_message(json!(["NOT-A-COMMAND"]).to_string());
-            tokio::pin!(send);
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), &mut send)
-                    .await
-                    .is_err(),
-                "a paused connection must not hand over messages"
-            );
-            connection.gate.send_replace(true);
-            send.await;
-        }
-        assert!(recv_outbound(&mut rx).await.contains("NOTICE"));
-        connection.close().await;
-        handle.request_shutdown();
     }
 
     /// A full worker queue parks messages instead of blocking the ingester,
@@ -3997,14 +4060,10 @@ mod tests {
             .blocking_send(IngestMsg::Close { conn_id: 1 })
             .unwrap();
         relay.assert_other_connection_progresses("after-close");
-        assert!(matches!(
-            relay.writer.recv_timeout(Duration::from_secs(2)),
-            Ok(WriterMsg::Close { conn_id: 1 })
-        ));
-        assert!(matches!(
-            relay.neg.recv_timeout(Duration::from_secs(2)),
-            Ok(NegMsg::Close { conn_id: 1 })
-        ));
+        // Connection 1 never reached the writer or the sync worker, so they
+        // hold nothing for it to clear.
+        assert!(relay.writer.try_recv().is_err());
+        assert!(relay.neg.try_recv().is_err());
 
         assert_new_sub(relay.recv_stalled(), "s0");
         assert_new_sub(relay.recv_stalled(), "s1");

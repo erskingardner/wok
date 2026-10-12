@@ -27,7 +27,9 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use wok_relay::{supported_nips, Config, Outbound, OutboundFrame, RelayHandle, TransportSource};
+use wok_relay::{
+    supported_nips, Config, ConnectionGuard, Outbound, OutboundFrame, RelayHandle, TransportSource,
+};
 
 const SOFTWARE: &str = "git+https://github.com/erskingardner/wok.git";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -757,14 +759,31 @@ async fn handle_ws<S>(
     // future) so select! cancellation by outbound traffic or pings cannot
     // restart it.
     let mut frame_deadline = None;
+    // Messages read while the relay has paused this connection's ingress
+    // (earlier work is parked behind a busy worker). Reading goes on, so
+    // control frames are still answered and outbound keeps flowing, until
+    // about one message's worth is held; then the socket is left unread
+    // until ingress resumes.
+    let mut held = std::collections::VecDeque::new();
+    let mut held_bytes = 0usize;
+    // A pong cannot be read while reading is stopped, so a ping interval
+    // that included such a stop does not count against the peer.
+    let mut pong_excused = false;
     let io = async {
         'outer: loop {
+            let reading = held_bytes < max_message;
+            if !reading {
+                pong_excused = true;
+                // The partial-frame guard times the peer, not our pause.
+                frame_deadline = None;
+            }
             tokio::select! {
                 _ = ping.tick(), if auto_ping > 0 => {
-                    if awaiting_pong {
+                    if awaiting_pong && !pong_excused {
                         tracing::info!(conn_id, peer = %peer, reason = "pong_timeout", "client terminated");
                         break;
                     }
+                    pong_excused = false;
                     if write_bytes(&mut wr, &encoder.encode_control(OP_PING, &[])).await.is_err() {
                         break;
                     }
@@ -774,22 +793,19 @@ async fn handle_ws<S>(
                     ping.reset();
                     awaiting_pong = true;
                 }
-                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline) => {
+                _ = connection.ingress_resumed(), if !held.is_empty() => {
+                    hand_over(&connection, &mut held, &mut held_bytes).await;
+                }
+                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline), if reading => {
                     match incoming {
                         Ok(()) => {
                             for ev in incoming_events.drain(..) {
                                 match ev {
-                                    WsEvent::Message(MessageKind::Text, t) => {
-                                        match String::from_utf8(t) {
-                                            Ok(text) => connection.client_message(text).await,
-                                            Err(_) => connection.client_message("x".into()).await,
-                                        }
-                                    }
-                                    WsEvent::Message(MessageKind::Binary, b) => {
-                                        match String::from_utf8(b) {
-                                            Ok(text) => connection.client_message(text).await,
-                                            Err(_) => connection.client_message("x".into()).await,
-                                        }
+                                    WsEvent::Message(_, bytes) => {
+                                        let text = String::from_utf8(bytes).unwrap_or_else(|_| "x".into());
+                                        held_bytes += text.len();
+                                        held.push_back(text);
+                                        hand_over(&connection, &mut held, &mut held_bytes).await;
                                     }
                                     WsEvent::Ping(p) => {
                                         if write_bytes(&mut wr, &encoder.encode_control(OP_PONG, &p)).await.is_err() {
@@ -800,6 +816,9 @@ async fn handle_ws<S>(
                                         awaiting_pong = false;
                                     }
                                     WsEvent::Close(c) => {
+                                        // Anything still held is dropped, as
+                                        // the close drops the parked work
+                                        // ahead of it.
                                         let _ = write_bytes(&mut wr, &encoder.encode_control(frame::OP_CLOSE, &c)).await;
                                         break 'outer;
                                     }
@@ -829,6 +848,21 @@ async fn handle_ws<S>(
     connection.run_until_cancelled(&killed, io).await;
     connection.close().await;
     tracing::info!(conn_id, peer = %peer, transport = "websocket", "client disconnected");
+}
+
+/// Hand held messages to the relay, in order, while ingress is not paused.
+async fn hand_over(
+    connection: &ConnectionGuard,
+    held: &mut std::collections::VecDeque<String>,
+    held_bytes: &mut usize,
+) {
+    while !connection.ingress_paused() {
+        let Some(text) = held.pop_front() else {
+            break;
+        };
+        *held_bytes -= text.len();
+        connection.client_message(text).await;
+    }
 }
 
 #[cfg(test)]

@@ -209,6 +209,9 @@ async fn handle_conn(
     let (mut rd, mut wr) = stream.split();
     let reader = async {
         loop {
+            // While earlier messages are parked behind a busy worker, leave
+            // the socket unread; the writer future keeps flushing outbound.
+            connection.ingress_resumed().await;
             let mut header = [0u8; 4];
             rd.read_exact(&mut header).await?;
             let n = u32::from_be_bytes(header) as usize;

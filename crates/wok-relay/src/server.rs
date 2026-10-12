@@ -317,6 +317,13 @@ enum NegMsg {
         conn_id: u64,
         sub_id: SubId,
     },
+    /// Drop the session and send NEG-ERR from the worker, so the error is
+    /// ordered after every NEG-MSG the worker already produced for it.
+    Fail {
+        conn_id: u64,
+        sub_id: SubId,
+        message: String,
+    },
     Close {
         conn_id: u64,
     },
@@ -1622,7 +1629,8 @@ fn ingest_req(
 /// `auth-required:` tells the client to authenticate and retry, so it (and the
 /// AUTH challenge) is only sent while authenticating can change the outcome.
 /// When the relay cannot complete AUTH, or the connection already authenticated
-/// with keys the filter is not scoped to, the refusal is a final `restricted:`.
+/// with keys the filter is not scoped to, the refusal is `restricted:` so the
+/// client does not repeat the same AUTH.
 fn read_gate_refusal(
     cfg: &Config,
     conns: &ConnTable,
@@ -1652,8 +1660,9 @@ fn read_gate_refusal(
 }
 
 /// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with
-/// NEG-ERR, after which the subscription is closed. Drop any session the
-/// worker still holds under this id so both sides agree it is gone.
+/// NEG-ERR, after which the subscription is closed. The worker that owns the
+/// session sends it, after dropping the session, so no NEG-MSG for this id can
+/// follow the error. An id the worker cannot hold is answered directly.
 fn neg_err(
     conns: &ConnTable,
     metrics: &Metrics,
@@ -1663,10 +1672,12 @@ fn neg_err(
     message: String,
 ) {
     if let Ok(sid) = SubId::new(sub_id) {
-        let _ = neg_tx.send(NegMsg::CloseSub {
+        let _ = neg_tx.send(NegMsg::Fail {
             conn_id,
             sub_id: sid,
+            message,
         });
+        return;
     }
     conns.send(
         conn_id,

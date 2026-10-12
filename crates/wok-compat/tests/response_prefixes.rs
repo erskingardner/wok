@@ -124,8 +124,9 @@ async fn restricted_reads_are_final_when_auth_is_unusable() {
 }
 
 /// NIP-42 flow: `auth-required:` and a challenge, AUTH, then the same REQ id
-/// is re-sent and served. Once authenticated, a COUNT not scoped to the
-/// authenticated key is a final `restricted:` (re-authenticating cannot help).
+/// is re-sent and served. Once authenticated, a COUNT not scoped to an
+/// authenticated key is `restricted:` rather than another `auth-required:`, so
+/// a client does not loop re-authenticating with the same key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_required_only_while_authenticating_can_help() {
     let relay = Relay::new(|cfg| cfg.relay.auth.service_url = SERVICE_URL.into());
@@ -215,5 +216,55 @@ async fn neg_err_closes_the_session() {
         recv(&mut rx).await,
         json!(["NEG-ERR", "sync", "closed: unknown subscription handle"])
     );
+    conn.close().await;
+}
+
+/// The NEG-ERR is ordered after any reply the worker already owes for the
+/// session: a NEG-OPEN immediately followed by a failing NEG-MSG never yields
+/// a NEG-MSG for that id after its NEG-ERR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn neg_err_follows_in_flight_replies() {
+    let relay = Relay::new(|_| {});
+    let (conn, mut rx) = relay.connection().await;
+    for i in 0..50 {
+        let event = wok_compat::sign_event(
+            json!({"created_at":now(),"kind":1,"tags":[],"content":format!("event {i}")}),
+        );
+        send(&conn, json!(["EVENT", event])).await;
+        assert_eq!(recv(&mut rx).await[2], true);
+    }
+
+    for round in 0..20 {
+        let sid = format!("sync-{round}");
+        send(
+            &conn,
+            json!(["NEG-OPEN", sid, {"kinds":[1]}, neg_initial()]),
+        )
+        .await;
+        send(&conn, json!(["NEG-MSG", sid, "zz"])).await;
+        // Same connection, same worker: once this reply arrives, everything
+        // the worker produced for `sid` has already been sent.
+        send(
+            &conn,
+            json!(["NEG-OPEN", "barrier", {"kinds":[2]}, neg_initial()]),
+        )
+        .await;
+
+        let mut errored = false;
+        loop {
+            let reply = recv(&mut rx).await;
+            if reply[1] == "barrier" {
+                assert_eq!(reply[0], "NEG-MSG", "{reply}");
+                break;
+            }
+            assert_eq!(reply[1], sid.as_str(), "{reply}");
+            assert!(!errored, "reply after NEG-ERR: {reply}");
+            if reply[0] == "NEG-ERR" {
+                assert_reply(&reply, "NEG-ERR", &sid, "invalid: ");
+                errored = true;
+            }
+        }
+        assert!(errored, "{sid} was never refused");
+    }
     conn.close().await;
 }

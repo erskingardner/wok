@@ -392,6 +392,15 @@ pub(super) fn run_negentropy(
                     queries.remove_sub(conn_id, &sub_id);
                     sessions.remove(&(conn_id, sub_id.to_string()));
                 }
+                NegMsg::Fail {
+                    conn_id,
+                    sub_id,
+                    message,
+                } => {
+                    queries.remove_sub(conn_id, &sub_id);
+                    sessions.remove(&(conn_id, sub_id.to_string()));
+                    fail(&conns, &metrics, conn_id, sub_id.as_str(), &message);
+                }
                 NegMsg::Close { conn_id } => {
                     queries.close_conn(conn_id);
                     sessions.retain(|k, _| k.0 != conn_id);

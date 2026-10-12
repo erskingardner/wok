@@ -18,12 +18,14 @@ pub(super) fn run_writer(
     let mut closed = std::collections::HashSet::new();
     let mut maintenance_cursor = Vec::new();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut verdicts: Vec<Option<(PluginResult, String)>> = Vec::with_capacity(WRITER_BATCH_MAX);
     let mut events: Vec<EventToWrite<u64>> = Vec::with_capacity(256);
     while let Ok(msg) = rx.recv() {
         batch.clear();
         event_batch.clear();
         closed.clear();
         batch_vanish.clear();
+        verdicts.clear();
         events.clear();
         batch.push(msg);
         while batch.len() < WRITER_BATCH_MAX {
@@ -60,21 +62,51 @@ pub(super) fn run_writer(
             run_maintenance(&env, &cfg_snap, &mut maintenance_cursor);
         }
         let vanish_policy = cfg_snap.vanish_policy();
-        // A valid vanish request and an ephemeral gift wrap can arrive in the
-        // same drained writer batch. Compute the batch markers up front so a
-        // live-only event cannot be broadcast immediately before its request
-        // is persisted later in that batch.
+        // The write-policy plugin judges every event, vanish requests
+        // included, in batch order. A valid vanish request and an ephemeral
+        // gift wrap can arrive in the same drained batch, so markers are
+        // computed up front: a live-only event cannot be broadcast immediately
+        // before its request is persisted later in that batch. Only
+        // plugin-accepted requests become markers, so a rejected request
+        // suppresses nothing.
         for m in &event_batch {
             let WriterMsg::AddEvent {
                 conn_id,
+                source,
                 packed,
                 json,
-                ..
+                authed,
             } = m
             else {
+                verdicts.push(None);
                 continue;
             };
             if closed.contains(conn_id) {
+                verdicts.push(None);
+                continue;
+            }
+            let mut ok_msg = String::new();
+            let res = if cfg_snap.relay.write_policy_plugin.is_empty() {
+                PluginResult::Accept
+            } else {
+                // Transport metadata remains separate from NIP-42 auth.
+                // Event JSON is parsed only when a plugin will consume it;
+                // the normal empty-plugin path remains packed.
+                let source_type = source.plugin_type();
+                let source_info = source.plugin_info();
+                let ev_json: Value = serde_json::from_str(json).unwrap_or(json!({}));
+                plugin.accept_event(
+                    &cfg_snap.relay.write_policy_plugin,
+                    &ev_json,
+                    source_type,
+                    &source_info,
+                    authed.as_ref().map(|a| a.as_slice()),
+                    &mut ok_msg,
+                )
+            };
+            let accepted = res == PluginResult::Accept;
+            verdicts.push(Some((res, ok_msg)));
+            if !accepted {
                 continue;
             }
             let Ok(event) = PackedEventView::new(packed) else {
@@ -93,39 +125,19 @@ pub(super) fn run_writer(
                 .and_modify(|timestamp| *timestamp = (*timestamp).max(event.created_at()))
                 .or_insert(event.created_at());
         }
-        for m in event_batch.drain(..) {
+        for (m, verdict) in event_batch.drain(..).zip(verdicts.drain(..)) {
             if let WriterMsg::AddEvent {
                 conn_id,
-                source,
                 packed,
                 json,
-                authed,
+                ..
             } = m
             {
-                if closed.contains(&conn_id) {
+                let Some((res, ok_msg)) = verdict else {
                     continue;
-                }
-                let mut ok_msg = String::new();
+                };
                 let is_vanish_request =
                     PackedEventView::new(&packed).is_ok_and(|event| event.kind() == VANISH_KIND);
-                let res = if is_vanish_request || cfg_snap.relay.write_policy_plugin.is_empty() {
-                    PluginResult::Accept
-                } else {
-                    // Transport metadata remains separate from NIP-42 auth.
-                    // Event JSON is parsed only when a plugin will consume it;
-                    // the normal empty-plugin path remains packed.
-                    let source_type = source.plugin_type();
-                    let source_info = source.plugin_info();
-                    let ev_json: Value = serde_json::from_str(&json).unwrap_or(json!({}));
-                    plugin.accept_event(
-                        &cfg_snap.relay.write_policy_plugin,
-                        &ev_json,
-                        source_type,
-                        &source_info,
-                        authed.as_ref().map(|a| a.as_slice()),
-                        &mut ok_msg,
-                    )
-                };
                 if res == PluginResult::Accept {
                     {
                         let packed_view = match PackedEventView::new(&packed) {

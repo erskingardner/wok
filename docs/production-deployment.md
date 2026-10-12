@@ -77,7 +77,9 @@ impact of a compromised admin credential.
 The write-policy command is trusted operator configuration and currently runs
 through `sh -c` for strfry migration compatibility. Event JSON is sent on the
 child's standard input and is never interpolated into that command, but the
-child still runs as the `wok` user inside the relay's systemd sandbox.
+child still runs as the `wok` user inside the relay's systemd sandbox. The
+plugin sees every published event, including NIP-62 vanish requests, so a
+plugin that refuses vanish requests keeps them from deleting anything.
 
 Use an absolute command, keep the executable and its dependencies root-owned,
 and avoid shell substitutions or writable script directories. The plugin must

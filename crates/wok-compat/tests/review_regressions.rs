@@ -460,3 +460,66 @@ async fn sync_global_budget_spans_workers_and_close_releases_it() {
     first.close().await;
     second.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn author_reads_own_restricted_event_without_p_tag() {
+    let relay = Relay::new(|cfg| {
+        cfg.relay.auth.service_url = "wss://review.example".into();
+        cfg.relay.auth.restricted_read_kinds = vec![30078];
+    });
+    let (conn, mut rx) = relay.connection().await;
+    conn.client_message(json!(["REQ","challenge",{"kinds":[30078]}]).to_string())
+        .await;
+    let challenge = recv(&mut rx).await;
+    assert_eq!(challenge[0], "AUTH");
+    assert_eq!(recv(&mut rx).await[0], "CLOSED");
+    let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+    let pk = hex::encode(key.x_only_public_key().0.serialize());
+    let auth = wok_compat::sign_event_with_key(
+        json!({"created_at":now(),"kind":22242,"tags":[["relay","wss://review.example"],["challenge",challenge[1]]],"content":""}),
+        &key,
+    );
+    conn.client_message(json!(["AUTH", auth]).to_string()).await;
+    assert_eq!(recv(&mut rx).await[2], true);
+
+    conn.client_message(json!(["REQ","live",{"kinds":[30078]}]).to_string())
+        .await;
+    assert_eq!(recv(&mut rx).await, json!(["EOSE", "live"]));
+    let event = wok_compat::sign_event_with_key(
+        json!({"created_at":now(),"kind":30078,"tags":[["d","app-settings"]],"content":"settings"}),
+        &key,
+    );
+    conn.client_message(json!(["EVENT", event]).to_string())
+        .await;
+    // The live subscription and the OK may arrive in either order.
+    let mut live = None;
+    for _ in 0..2 {
+        let reply = recv(&mut rx).await;
+        match reply[0].as_str() {
+            Some("OK") => assert_eq!(reply[2], true, "{reply}"),
+            Some("EVENT") => live = Some(reply),
+            _ => panic!("unexpected reply: {reply}"),
+        }
+    }
+    let live = live.expect("author's live subscription missed own restricted event");
+    assert_eq!(live[1], "live");
+    assert_eq!(live[2], event);
+
+    for (sub, filter) in [
+        ("by-kind", json!({"kinds":[30078]})),
+        ("by-id", json!({"ids":[event["id"]]})),
+    ] {
+        conn.client_message(json!(["REQ", sub, filter]).to_string())
+            .await;
+        let delivered = recv(&mut rx).await;
+        assert_eq!(delivered[0], "EVENT", "{sub}: {delivered}");
+        assert_eq!(delivered[2], event, "{sub}");
+        assert_eq!(recv(&mut rx).await, json!(["EOSE", sub]));
+    }
+    conn.client_message(json!(["COUNT","count",{"kinds":[30078],"authors":[pk]}]).to_string())
+        .await;
+    let reply = recv(&mut rx).await;
+    assert_eq!(reply[0], "COUNT", "{reply}");
+    assert_eq!(reply[2]["count"], 1, "{reply}");
+    conn.close().await;
+}

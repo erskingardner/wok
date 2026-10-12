@@ -53,6 +53,9 @@ it is not a promise to reproduce upstream bugs.
   authenticated state to the negentropy worker and keeps one usable challenge
   per session; the pinned strfry implementation does not complete those paths
   consistently.
+- Restricted-kind events are always visible to their authenticated author.
+  The pinned strfry hides restricted events that have no `p` tag from
+  everyone, including the author.
 - Historical restricted-kind REQ filtering reads PackedEvent from the Event
   table. The pinned strfry request worker attempts to view EventPayload JSON as
   PackedEvent, unlike its live-monitor path.

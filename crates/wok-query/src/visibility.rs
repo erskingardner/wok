@@ -121,18 +121,20 @@ impl ReadRestrictor {
         let Some(pk) = authed else {
             return false;
         };
-        let mut recipient = None;
+        // Authors can always read their own events, including restricted
+        // kinds that carry no `p` tag (e.g. NIP-78 app data).
+        if pk == packed.pubkey() {
+            return true;
+        }
+        let mut recipient = false;
         packed.foreach_tag(|name, val| {
             if name == 'p' && val.len() == 32 {
-                recipient = Some(val == pk);
+                recipient = val == pk;
                 return false;
             }
             true
         });
-        let Some(recipient) = recipient else {
-            return false;
-        };
-        recipient || pk == packed.pubkey()
+        recipient
     }
 }
 
@@ -219,6 +221,16 @@ mod tests {
         let ev = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 1, 4, 0, &tags).unwrap();
         assert!(!r.should_send_to_subscriber(ev.view(), None));
         assert!(r.should_send_to_subscriber(ev.view(), Some(&[9u8; 32])));
+        assert!(r.should_send_to_subscriber(ev.view(), Some(&[2u8; 32])));
+        assert!(!r.should_send_to_subscriber(ev.view(), Some(&[3u8; 32])));
+    }
+
+    #[test]
+    fn author_reads_restricted_event_without_p_tag() {
+        let r = ReadRestrictor::new(vec![30078], true);
+        let tags = PackedEventTagBuilder::default();
+        let ev = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 1, 30078, 0, &tags).unwrap();
+        assert!(!r.should_send_to_subscriber(ev.view(), None));
         assert!(r.should_send_to_subscriber(ev.view(), Some(&[2u8; 32])));
         assert!(!r.should_send_to_subscriber(ev.view(), Some(&[3u8; 32])));
     }

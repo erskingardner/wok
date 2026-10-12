@@ -822,17 +822,31 @@ fn cmd_delete(cfg: &Config, age: Option<u64>, filter: Option<String>, dry_run: b
     Ok(())
 }
 
-/// Versions deleted per write transaction, so the relay's writer interleaves.
+/// Replacement-index entries scanned per write transaction, so the relay's
+/// writer interleaves.
 const PURGE_SUPERSEDED_BATCH: u64 = 10_000;
 
 fn cmd_purge_superseded(cfg: &Config, dry_run: bool, json: bool) -> Result<()> {
-    let env = open_env(cfg)?;
     let history = if dry_run {
-        wok_db::count_superseded_ro(&env.begin_ro()?)?
+        // Like doctor: no directory creation, initialization, or marker upgrade.
+        let env = Env::open(
+            &cfg.db,
+            EnvOptions {
+                max_readers: cfg.db_maxreaders,
+                map_size: cfg.db_mapsize,
+                no_read_ahead: cfg.db_no_read_ahead,
+                create_dir: false,
+                create_dbis: false,
+                read_only: true,
+                ..EnvOptions::default()
+            },
+        )?;
+        let txn = env.begin_ro()?;
+        wok_db::count_superseded_ro(&txn)?
     } else {
         let max_tags = cfg.relay.max_tags_per_filter;
         wok_db::purge_superseded(
-            &env,
+            &open_env(cfg)?,
             || wok_negentropy::NegentropyFilterCache::new(max_tags),
             PURGE_SUPERSEDED_BATCH,
         )?

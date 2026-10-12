@@ -25,11 +25,15 @@ wok --config /etc/wok.toml purge-superseded --json
 `wok purge-superseded` deletes every superseded version and keeps the version
 that relay reads already serve: the newest `created_at`, then the lowest ID. A
 winner hidden by expiration or moderation is kept too, and still removes the
-versions it supersedes. `--dry-run` reports the counts from a read-only scan.
+versions it supersedes. A running relay's expiration and vanish sweep may
+physically delete such a winner before the purge reaches its address; the
+older version then becomes the only one stored and is kept.
+`--dry-run` reports the counts from a read-only scan and never writes.
 `--json` emits `dry_run`, `superseded_groups`, and `superseded_events`.
 The relay can keep running. Each write transaction finishes whole replacement
-groups and commits after about 10,000 deletions, so relay writes interleave.
-Each batch re-evaluates its groups. Negentropy trees, author counts, and the
+groups and commits after scanning about 10,000 replacement-index entries, even
+when it deletes nothing, so relay writes interleave. Each batch re-evaluates
+its groups. Negentropy trees, author counts, and the
 retained-history count stay consistent, and the persistent-tree sync fast path
 returns once the count reaches zero. Deleted history cannot be recovered
 except from a backup.

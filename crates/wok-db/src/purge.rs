@@ -88,17 +88,18 @@ struct Batch {
     resume_after: Option<Vec<u8>>,
 }
 
-/// Deletes the losers of whole groups ordered after `after` until at least
-/// `max_events` are scheduled. Returns where the next transaction resumes.
+/// Scans whole replacement-index keys ordered after `after` until at least
+/// `max_entries` entries are visited, then deletes the losers it found.
+/// Every completed key is a resume point, so clean groups also yield.
 fn purge_batch<N: NegentropySink>(
     txn: &mut RwTxn<'_>,
     ne: &mut N,
     after: Option<&[u8]>,
-    max_events: u64,
+    max_entries: u64,
 ) -> Result<Batch, DbError> {
     let mut groups: Vec<Vec<u64>> = Vec::new();
-    let mut scheduled = 0u64;
-    let mut current: Option<Vec<u8>> = None;
+    let mut visited = 0u64;
+    let mut current: Option<(Vec<u8>, bool)> = None;
     let mut resume_after = None;
     let mut error = None;
     // With no start duplicate, an existing `after` key is skipped entirely.
@@ -109,25 +110,25 @@ fn purge_batch<N: NegentropySink>(
         false,
         |key, value| {
             let step = (|| {
-                if !is_replacement_key(key)? {
-                    return Ok(true);
-                }
-                if current.as_deref() != Some(key) {
-                    if let Some(previous) = current.replace(key.to_vec()) {
-                        if groups.last().is_some_and(|members| members.len() == 1) {
-                            groups.pop();
-                        } else if scheduled >= max_events {
-                            resume_after = Some(previous);
-                            return Ok(false);
-                        }
+                if current.as_ref().is_none_or(|(previous, _)| previous != key) {
+                    if visited >= max_entries {
+                        resume_after = current.take().map(|(previous, _)| previous);
+                        return Ok(false);
                     }
-                    groups.push(Vec::new());
+                    let replacement = is_replacement_key(key)?;
+                    if replacement {
+                        groups.push(Vec::new());
+                    }
+                    current = Some((key.to_vec(), replacement));
                 }
-                let members = groups.last_mut().expect("group started above");
-                if !members.is_empty() {
-                    scheduled += 1;
+                visited += 1;
+                if current
+                    .as_ref()
+                    .is_some_and(|(_, replacement)| *replacement)
+                {
+                    let members = groups.last_mut().expect("group started above");
+                    members.push(u64_from_ne_checked(value)?);
                 }
-                members.push(u64_from_ne_checked(value)?);
                 Ok::<_, DbError>(true)
             })();
             step.unwrap_or_else(|err| {
@@ -139,32 +140,32 @@ fn purge_batch<N: NegentropySink>(
     if let Some(error) = error {
         return Err(error);
     }
-    if groups.last().is_some_and(|members| members.len() == 1) {
-        groups.pop();
-    }
-    let mut losers = Vec::with_capacity(scheduled as usize);
+    groups.retain(|members| members.len() > 1);
+    let mut history = SupersededHistory {
+        groups: groups.len() as u64,
+        events: 0,
+    };
+    let mut losers = Vec::new();
     for members in &groups {
+        history.events += members.len() as u64 - 1;
         group_losers(txn, members, &mut losers)?;
     }
     delete_events(txn, ne, losers)?;
     Ok(Batch {
-        history: SupersededHistory {
-            groups: groups.len() as u64,
-            events: scheduled,
-        },
+        history,
         resume_after,
     })
 }
 
 /// Physically removes every superseded replaceable version, keeping the
 /// winner that reads already serve. Each transaction finishes whole groups
-/// and commits once it has deleted at least `max_events_per_txn` versions, so
-/// concurrent writers interleave between batches. Groups are re-evaluated in
-/// every transaction; a concurrent replacement is never undone.
+/// and commits once it has scanned at least `max_entries_per_txn` index
+/// entries, so concurrent writers interleave between batches. Groups are
+/// re-evaluated in every transaction; a concurrent replacement is never undone.
 pub fn purge_superseded<N: NegentropySink>(
     env: &Env,
     mut new_sink: impl FnMut() -> N,
-    max_events_per_txn: u64,
+    max_entries_per_txn: u64,
 ) -> Result<SupersededHistory, DbError> {
     let mut total = SupersededHistory::default();
     let mut after: Option<Vec<u8>> = None;
@@ -175,7 +176,7 @@ pub fn purge_superseded<N: NegentropySink>(
             &mut txn,
             &mut sink,
             after.as_deref(),
-            max_events_per_txn.max(1),
+            max_entries_per_txn.max(1),
         )?;
         txn.commit()?;
         total.groups += batch.history.groups;

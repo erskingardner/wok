@@ -833,3 +833,27 @@ fn purging_superseded_history_keeps_one_winner_per_address() {
     assert_eq!((again.groups, again.events), (0, 0));
     assert_eq!(stored_ids(&env), ids(&winners));
 }
+
+#[test]
+fn purging_commits_between_addresses_without_superseded_history() {
+    let key = key();
+    let current: Vec<_> = [0, 3, 10002, 30443]
+        .iter()
+        .map(|kind| event(&key, *kind, 100, json!([["d", "a"]]), "current"))
+        .collect();
+    let (_dir, env) = snapshot(&current);
+    let mut transactions = 0;
+    let purged = wok_db::purge_superseded(
+        &env,
+        || {
+            transactions += 1;
+            wok_db::NoopNegentropy
+        },
+        1,
+    )
+    .unwrap();
+    assert_eq!((purged.groups, purged.events), (0, 0));
+    // Each address is a completed unit of scan work, even with no losers.
+    assert_eq!(transactions, current.len());
+    assert_eq!(stored_ids(&env), ids(&current));
+}

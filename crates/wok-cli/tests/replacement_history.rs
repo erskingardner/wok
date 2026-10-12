@@ -182,3 +182,43 @@ fn purge_superseded_removes_retained_history_after_a_dry_run() {
         .iter()
         .any(|c| c["name"] == "replacement-history" && c["status"] == "pass"));
 }
+
+#[test]
+fn purge_superseded_dry_run_never_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let config = dir.path().join("wok.toml");
+    let events = replacement::events(3);
+    // An older v4 marker would be upgraded by any writable open.
+    drop(replacement::seed(&db, &events, 4));
+    let dry_run = |db: &std::path::Path| {
+        std::fs::write(
+            &config,
+            format!("[database]\npath={db:?}\nmap_size=67108864\nmin_free_disk_bytes=0\n"),
+        )
+        .unwrap();
+        Command::new(env!("CARGO_BIN_EXE_wok"))
+            .args(["--config", config.to_str().unwrap()])
+            .args(["purge-superseded", "--dry-run", "--json"])
+            .output()
+            .unwrap()
+    };
+
+    let before = std::fs::read(db.join("data.mdb")).unwrap();
+    let output = dry_run(&db);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let outcome: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["superseded_events"], 2);
+    assert!(
+        std::fs::read(db.join("data.mdb")).unwrap() == before,
+        "dry run changed data.mdb"
+    );
+
+    let missing = dir.path().join("missing");
+    assert!(!dry_run(&missing).status.success());
+    assert!(!missing.exists());
+}

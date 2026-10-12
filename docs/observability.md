@@ -52,6 +52,7 @@ or protect it at the reverse proxy. The endpoint is unauthenticated and sends
 | `event_rate` | Per-address EVENT/AUTH or per-author EVENT budget exhausted. |
 | `req_rate` | REQ budget exhausted. |
 | `count_rate` | COUNT budget exhausted. |
+| `invalid_rate` | Malformed-message budget exhausted. |
 | `pow` | Event did not meet the configured NIP-13 difficulty. |
 | `query_cost` | Estimated historical-query cost exceeded its ceiling. |
 | `query_concurrency` | Historical-query concurrency ceiling reached. |

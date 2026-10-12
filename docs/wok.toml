@@ -143,6 +143,9 @@ req_rate_per_second = 20
 req_burst = 40
 count_rate_per_second = 5
 count_burst = 10
+# Malformed messages, including CLOSE/NEG-CLOSE with an invalid id.
+invalid_rate_per_second = 5
+invalid_burst = 20
 max_concurrent_historical_queries = 8
 max_query_cost = 1000
 # Zero means unlimited. Secure defaults bound both global and per-author use.

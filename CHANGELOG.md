@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is released only when the request failed without effect, so those can
   still be retried; a NIP-86 command that reached the writer keeps it burned
   even if the client disconnects (#51).
+- Malformed client messages now draw on a per-address token bucket
+  (`relay.abuse.invalid_rate_per_second`, default 5, and `invalid_burst`,
+  default 20). Before, every one earned a NOTICE, so one connection could make
+  the relay answer garbage without limit. Once the budget is spent the client
+  gets one `rate-limited` NOTICE and further malformed messages are ignored
+  until it refills; rejections count as `invalid_rate`. Only the reply is
+  suppressed: valid CLOSE and NEG-CLOSE are never budgeted, and a malformed
+  NEG-OPEN/NEG-MSG that names a session still closes it (#49).
 
 ### Added
 

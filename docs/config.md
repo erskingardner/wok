@@ -228,6 +228,8 @@ All abuse settings reload live and are dashboard-editable.
 | `relay.abuse.req_burst` | `40` | Per-address REQ, NEG-OPEN, and NEG-MSG bucket capacity. |
 | `relay.abuse.count_rate_per_second` | `5` | Refilled COUNT tokens per network address each second. |
 | `relay.abuse.count_burst` | `10` | Per-address COUNT bucket capacity. |
+| `relay.abuse.invalid_rate_per_second` | `5` | Refilled tokens per network address each second for malformed messages, including CLOSE and NEG-CLOSE with an invalid subscription id. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until the bucket refills. Valid CLOSE and NEG-CLOSE are never budgeted. |
+| `relay.abuse.invalid_burst` | `20` | Per-address malformed-message bucket capacity. |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Historical scans per connection; zero rejects new scans. |
 | `relay.abuse.max_query_cost` | `1000` | Conservative pre-scan filter cost ceiling; zero is unlimited. |
 | `relay.abuse.max_stored_events` | `10000000` | Global durable event ceiling; the entire write transaction aborts before exceeding it. |

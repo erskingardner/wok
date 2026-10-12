@@ -12,6 +12,19 @@ pub enum BudgetKind {
     Event,
     Req,
     Count,
+    /// Malformed messages, which earn an error reply and change nothing
+    /// (#49).
+    Invalid,
+}
+
+/// Outcome of a budget check that distinguishes the first refusal of an
+/// exhausted period, so the relay can explain itself once and then stay
+/// quiet until the bucket refills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Admitted,
+    FirstRefusal,
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -24,6 +37,8 @@ enum Principal {
 struct Bucket {
     tokens: f64,
     last: Instant,
+    /// A refusal was already reported since the last admission.
+    refusal_reported: bool,
 }
 
 #[derive(Debug, Default)]
@@ -44,15 +59,26 @@ impl AbuseController {
         kind: BudgetKind,
         cfg: &AbuseConfig,
     ) -> bool {
+        self.admit_source_reporting(source, kind, cfg) == Admission::Admitted
+    }
+
+    /// [`admit_source`](Self::admit_source), reporting whether a refusal is
+    /// the first since the source was last admitted.
+    pub fn admit_source_reporting(
+        &self,
+        source: &TransportSource,
+        kind: BudgetKind,
+        cfg: &AbuseConfig,
+    ) -> Admission {
         if !cfg.enabled {
-            return true;
+            return Admission::Admitted;
         }
         let principal = match source {
             TransportSource::Ip(ip) => Principal::Ip(match ip {
                 std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
                 std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
             }),
-            TransportSource::Unix => return true,
+            TransportSource::Unix => return Admission::Admitted,
         };
         let (rate, burst) = spec(kind, cfg);
         self.admit(principal, kind, rate, burst)
@@ -63,7 +89,7 @@ impl AbuseController {
             return true;
         }
         let (rate, burst) = spec(kind, cfg);
-        self.admit(Principal::Ip(ip.to_vec()), kind, rate, burst)
+        self.admit(Principal::Ip(ip.to_vec()), kind, rate, burst) == Admission::Admitted
     }
 
     pub fn admit_pubkey(&self, pubkey: &[u8; 32], kind: BudgetKind, cfg: &AbuseConfig) -> bool {
@@ -74,7 +100,7 @@ impl AbuseController {
             BudgetKind::Event => (cfg.pubkey_event_rate_per_second, cfg.pubkey_event_burst),
             _ => spec(kind, cfg),
         };
-        self.admit(Principal::Pubkey(*pubkey), kind, rate, burst)
+        self.admit(Principal::Pubkey(*pubkey), kind, rate, burst) == Admission::Admitted
     }
 
     fn admit(
@@ -83,9 +109,9 @@ impl AbuseController {
         kind: BudgetKind,
         rate_per_second: u32,
         burst: u32,
-    ) -> bool {
+    ) -> Admission {
         if rate_per_second == 0 || burst == 0 {
-            return true;
+            return Admission::Admitted;
         }
         let now = Instant::now();
         let mut state = self.state.lock();
@@ -102,15 +128,21 @@ impl AbuseController {
             .or_insert_with(|| Bucket {
                 tokens: burst as f64,
                 last: now,
+                refusal_reported: false,
             });
         let elapsed = now.duration_since(bucket.last).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * rate_per_second as f64).min(burst as f64);
         bucket.last = now;
         if bucket.tokens < 1.0 {
-            return false;
+            if bucket.refusal_reported {
+                return Admission::Refused;
+            }
+            bucket.refusal_reported = true;
+            return Admission::FirstRefusal;
         }
         bucket.tokens -= 1.0;
-        true
+        bucket.refusal_reported = false;
+        Admission::Admitted
     }
 }
 
@@ -120,6 +152,7 @@ fn spec(kind: BudgetKind, cfg: &AbuseConfig) -> (u32, u32) {
         BudgetKind::Event => (cfg.event_rate_per_second, cfg.event_burst),
         BudgetKind::Req => (cfg.req_rate_per_second, cfg.req_burst),
         BudgetKind::Count => (cfg.count_rate_per_second, cfg.count_burst),
+        BudgetKind::Invalid => (cfg.invalid_rate_per_second, cfg.invalid_burst),
     }
 }
 
@@ -157,6 +190,30 @@ mod tests {
         let pubkey = [7u8; 32];
         assert!(limiter.admit_pubkey(&pubkey, BudgetKind::Event, &cfg));
         assert!(!limiter.admit_pubkey(&pubkey, BudgetKind::Event, &cfg));
+    }
+
+    #[test]
+    fn only_the_first_refusal_of_an_exhausted_period_is_reported() {
+        let mut cfg = crate::Config::default().relay.abuse;
+        // One token per 100ms: slow enough that back-to-back checks under a
+        // loaded test run do not refill in between.
+        cfg.invalid_rate_per_second = 10;
+        cfg.invalid_burst = 1;
+        let limiter = AbuseController::default();
+        let source = TransportSource::ip_address("127.0.0.1".parse().unwrap());
+        let admit = || limiter.admit_source_reporting(&source, BudgetKind::Invalid, &cfg);
+        assert_eq!(admit(), Admission::Admitted);
+        assert_eq!(admit(), Admission::FirstRefusal);
+        assert_eq!(admit(), Admission::Refused);
+        // After a refill the next exhausted period is reported again.
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(admit(), Admission::Admitted);
+        assert_eq!(admit(), Admission::FirstRefusal);
+        // Unix-socket clients are local and exempt.
+        assert_eq!(
+            limiter.admit_source_reporting(&TransportSource::Unix, BudgetKind::Invalid, &cfg),
+            Admission::Admitted
+        );
     }
 
     #[test]

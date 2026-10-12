@@ -9,7 +9,7 @@
 mod writer;
 use writer::*;
 
-use crate::abuse::{leading_zero_bits, AbuseController, BudgetKind};
+use crate::abuse::{leading_zero_bits, AbuseController, Admission, BudgetKind};
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
 use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
@@ -907,6 +907,16 @@ fn handle_client(
 ) {
     let cmd = match ClientCommand::parse(payload) {
         Ok(c) => c,
+        Err(failure) if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) => {
+            // The reply is suppressed, but a malformed NEG request that names
+            // a session still tears it down, as its NEG-ERR would have.
+            if let ParseFailure::NegRequest { sub_id, .. } = failure {
+                if let Ok(sub_id) = SubId::new(&sub_id) {
+                    let _ = route_tx(neg_txs, conn_id).send(NegMsg::CloseSub { conn_id, sub_id });
+                }
+            }
+            return;
+        }
         Err(ParseFailure::NegRequest { sub_id, reason }) => {
             let reason = format!("invalid: {reason}");
             let neg_tx = route_tx(neg_txs, conn_id);
@@ -1043,6 +1053,9 @@ fn handle_client(
                     });
                 }
                 Err(e) => {
+                    if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
+                        return;
+                    }
                     conns.send(
                         conn_id,
                         RelayMessage::notice_error(format!("bad close: {e}")),
@@ -1090,6 +1103,9 @@ fn handle_client(
         }
         ClientCommand::NegClose { sub_id } => {
             if !cfg.relay.negentropy_enabled {
+                if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
+                    return;
+                }
                 conns.send(
                     conn_id,
                     RelayMessage::notice_error("bad msg: negentropy disabled"),
@@ -1105,6 +1121,9 @@ fn handle_client(
                     });
                 }
                 Err(e) => {
+                    if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
+                        return;
+                    }
                     conns.send(
                         conn_id,
                         RelayMessage::notice_error(format!("negentropy error: {e}")),
@@ -1711,6 +1730,41 @@ fn issue_challenge(
         });
         conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
     }
+}
+
+/// Charge a malformed message, which no command budget covers and which
+/// earns an error reply; without this one connection could make the relay
+/// answer without bound (#49). A refusal suppresses only the reply: callers
+/// still apply any teardown the reply stood for. The first refusal of an
+/// exhausted period gets one NOTICE; later ones are dropped silently until
+/// the bucket refills.
+fn admit_invalid(
+    cfg: &Config,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    abuse: &AbuseController,
+    source: &TransportSource,
+    conn_id: u64,
+) -> bool {
+    let admission = abuse.admit_source_reporting(source, BudgetKind::Invalid, &cfg.relay.abuse);
+    if admission == Admission::Admitted {
+        return true;
+    }
+    metrics
+        .abuse_invalid_rate_rejections
+        .fetch_add(1, Ordering::Relaxed);
+    if admission == Admission::FirstRefusal {
+        conns.send(
+            conn_id,
+            RelayMessage::Notice {
+                message: "rate-limited: too many invalid messages; ignoring them until the \
+                          budget refills"
+                    .into(),
+            },
+            metrics,
+        );
+    }
+    false
 }
 
 /// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with
@@ -2741,6 +2795,134 @@ mod tests {
             drop(txn);
             handle.request_shutdown();
         }
+    }
+
+    /// Collect outbound frames until the connection stays quiet for 300ms.
+    async fn drain_outbound(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+    ) -> Vec<String> {
+        let mut frames = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
+        {
+            frames.push(frame.into_text());
+        }
+        frames
+    }
+
+    fn invalid_budget_relay(burst: u32) -> (tempfile::TempDir, RelayHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        // One token a second: no refill can land mid-test on a loaded runner.
+        cfg.relay.abuse.invalid_rate_per_second = 1;
+        cfg.relay.abuse.invalid_burst = burst;
+        let handle = start(env, cfg).unwrap();
+        (dir, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_messages_are_rate_limited_with_one_notice() {
+        // Each malformed message used to earn a free NOTICE (#49). Malformed
+        // CLOSEs (invalid subscription id) leave no state and share the budget.
+        let (_dir, handle) = invalid_budget_relay(5);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        let source = || TransportSource::ip_address("127.0.0.1".parse().unwrap());
+        let before = handle
+            .metrics
+            .abuse_invalid_rate_rejections
+            .load(Ordering::Relaxed);
+
+        for i in 0..20 {
+            let payload = if i % 2 == 0 {
+                "[\"NOT-A-COMMAND\"]".to_string()
+            } else {
+                json!(["CLOSE", ""]).to_string()
+            };
+            handle.client_message(conn, source(), payload).await;
+        }
+        let frames = drain_outbound(&mut rx).await;
+        let rate_limited = frames
+            .iter()
+            .filter(|f| f.contains("rate-limited: too many invalid messages"))
+            .count();
+        assert_eq!(rate_limited, 1, "{frames:?}");
+        assert!(frames.len() <= 7, "{frames:?}");
+        let rejected = handle
+            .metrics
+            .abuse_invalid_rate_rejections
+            .load(Ordering::Relaxed)
+            - before;
+        assert!(rejected >= 13, "{rejected}");
+
+        // Budgeted commands are unaffected.
+        handle
+            .client_message(
+                conn,
+                source(),
+                json!(["REQ", "ok", {"limit": 1}]).to_string(),
+            )
+            .await;
+        let frames = drain_outbound(&mut rx).await;
+        assert!(frames.iter().any(|f| f.contains("EOSE")), "{frames:?}");
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_is_honored_after_another_connection_exhausts_the_budget() {
+        // NIP-01 CLOSE stops a subscription. A neighbour behind the same
+        // address spending the malformed-message budget must not leave it
+        // running.
+        let (_dir, handle) = invalid_budget_relay(1);
+        let source = || TransportSource::ip_address("127.0.0.1".parse().unwrap());
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let a = handle.next_conn_id();
+        handle.register(a, Outbound::new(a_tx, 0)).await;
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let b = handle.next_conn_id();
+        handle.register(b, Outbound::new(b_tx, 0)).await;
+
+        handle
+            .client_message(
+                b,
+                source(),
+                json!(["REQ", "live", {"kinds": [1]}]).to_string(),
+            )
+            .await;
+        assert!(recv_outbound(&mut b_rx).await.contains("EOSE"));
+        for _ in 0..5 {
+            handle
+                .client_message(a, source(), "[\"NOT-A-COMMAND\"]".into())
+                .await;
+        }
+        drain_outbound(&mut a_rx).await;
+        handle
+            .client_message(b, source(), json!(["CLOSE", "live"]).to_string())
+            .await;
+        // Let the CLOSE reach the subscription worker before publishing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let event = sign_event(json!({
+            "created_at": now_secs(),
+            "kind": 1,
+            "tags": [],
+            "content": "after close",
+        }));
+        handle
+            .client_message(a, source(), json!(["EVENT", event]).to_string())
+            .await;
+        assert!(recv_outbound(&mut a_rx).await.contains("true"));
+        let frames = drain_outbound(&mut b_rx).await;
+        assert!(
+            !frames.iter().any(|f| f.contains("after close")),
+            "closed subscription still delivered: {frames:?}"
+        );
+        handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

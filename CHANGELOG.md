@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Update Rustls to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake messages
+  accepted across encryption-level boundaries). Rustls is used only by the
+  CLI's outbound `wss://` and HTTPS clients (mesh, router, upload/download,
+  NIP-11 fetches) and the benchmark harness; the relay listener does not
+  terminate TLS.
+
 ### Fixed
 
 - Restricted reads no longer ask for AUTH that cannot succeed. Without a usable

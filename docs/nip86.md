@@ -71,6 +71,12 @@ role (built-in or custom), and operator admin pubkeys. With
 `restrict_writes = false` (the default) the allowlist is recorded but does
 not gate writes.
 
+NIP-62 vanish requests (kind 62) are exempt from pubkey bans and the write
+allowlist: NIP-62 requires relays that restrict who can post to honor them
+regardless of the user's status. A banned author's vanish request is stored
+and erases their events, but stays hidden from reads while the ban stands.
+Event-id bans and the kind allowlist still apply to vanish requests.
+
 Blocked IPs are refused at connection admission for both WebSocket upgrades
 and plain HTTP — **including the management endpoint itself**. Blocking the
 operator's own address locks out remote management until the block is lifted

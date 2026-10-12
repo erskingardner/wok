@@ -81,7 +81,9 @@ pub fn management_level(
 
 /// Whether `pubkey` may write events under the current moderation state.
 /// Bans always win; `relay.auth.restrict_writes` then gates everyone not on
-/// the allowlist, not holding a role, and not an operator admin.
+/// the allowlist, not holding a role, and not an operator admin. NIP-62
+/// vanish requests skip this check: they are honored regardless of the
+/// user's status.
 pub fn write_permitted(cfg: &Config, snap: &ModerationSnapshot, pubkey: &[u8; 32]) -> bool {
     if snap.banned_pubkeys.contains_key(pubkey) {
         return false;

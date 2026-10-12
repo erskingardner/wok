@@ -148,20 +148,27 @@ pub(super) fn run_writer(
                         let mut author = [0u8; 32];
                         author.copy_from_slice(packed_view.pubkey());
                         let stored_checks = env.begin_ro().and_then(|txn| {
-                            Ok::<_, wok_db::DbError>((
-                                if is_vanish_request {
-                                    false
-                                } else {
-                                    is_event_vanished_ro(&txn, packed_view)?
-                                },
-                                moderation_reason_ro(&txn, packed_view)?,
-                                // Recheck allowlist/role eligibility against
-                                // committed state: a ban/revocation may have
-                                // landed after the ingester's snapshot check.
-                                // Vanish requests bypass their own markers,
-                                // but not moderation or write restrictions.
-                                stored_write_permitted(&txn, &cfg_snap, &author)?,
-                            ))
+                            // Recheck moderation and allowlist/role
+                            // eligibility against committed state: a
+                            // ban/revocation may have landed after the
+                            // ingester's snapshot check. Vanish requests
+                            // bypass their own markers, the author ban and
+                            // write restrictions (NIP-62: honored regardless
+                            // of the user's status), but not event-id bans or
+                            // the kind policy.
+                            Ok::<_, wok_db::DbError>(if is_vanish_request {
+                                (
+                                    false,
+                                    moderation_reason_ignoring_author_ro(&txn, packed_view)?,
+                                    true,
+                                )
+                            } else {
+                                (
+                                    is_event_vanished_ro(&txn, packed_view)?,
+                                    moderation_reason_ro(&txn, packed_view)?,
+                                    stored_write_permitted(&txn, &cfg_snap, &author)?,
+                                )
+                            })
                         });
                         let (vanished, moderated, write_allowed) = match stored_checks {
                             Ok((vanished, moderated, write_allowed)) => (

@@ -357,6 +357,24 @@ pub fn moderation_reason_ro(
     txn: &RoTxn<'_>,
     packed: PackedEventView<'_>,
 ) -> Result<Option<ModerationReason>, DbError> {
+    moderation_reason_inner(txn, packed, true)
+}
+
+/// [`moderation_reason_ro`] without the author ban. The relay admits NIP-62
+/// vanish requests from banned authors, but event-id bans and the kind
+/// policy still apply to them.
+pub fn moderation_reason_ignoring_author_ro(
+    txn: &RoTxn<'_>,
+    packed: PackedEventView<'_>,
+) -> Result<Option<ModerationReason>, DbError> {
+    moderation_reason_inner(txn, packed, false)
+}
+
+fn moderation_reason_inner(
+    txn: &RoTxn<'_>,
+    packed: PackedEventView<'_>,
+    check_author: bool,
+) -> Result<Option<ModerationReason>, DbError> {
     let Some(dbi) = txn.env().dbis().moderation else {
         return Ok(None);
     };
@@ -366,9 +384,10 @@ pub fn moderation_reason_ro(
     {
         return Ok(Some(ModerationReason::BannedEvent));
     }
-    if txn
-        .get(dbi, &prefixed(PREFIX_BANNED_PUBKEY, packed.pubkey()))?
-        .is_some()
+    if check_author
+        && txn
+            .get(dbi, &prefixed(PREFIX_BANNED_PUBKEY, packed.pubkey()))?
+            .is_some()
     {
         return Ok(Some(ModerationReason::BannedAuthor));
     }
@@ -861,6 +880,42 @@ mod tests {
         assert!(is_event_moderated_ro(&txn, by_banned_author.view()).unwrap());
         assert!(is_event_moderated_ro(&txn, banned_id.view()).unwrap());
         assert!(!is_event_moderated_ro(&txn, clean.view()).unwrap());
+    }
+
+    #[test]
+    fn ignoring_author_ban_keeps_event_ban_and_kind_policy() {
+        let (_dir, env) = test_env();
+        let pk = [1u8; 32];
+        let id = [2u8; 32];
+        let mut txn = env.begin_rw().unwrap();
+        ban_pubkey(&mut txn, &pk, "").unwrap();
+        ban_event(&mut txn, &id, "").unwrap();
+        disallow_kind(&mut txn, 62).unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro().unwrap();
+        let tags = wok_event::PackedEventTagBuilder::default();
+        let by_banned_author =
+            wok_event::PackedEventBuilder::build(&[3u8; 32], &pk, 1, 1, 0, &tags).unwrap();
+        let banned_id = wok_event::PackedEventBuilder::build(&id, &pk, 1, 1, 0, &tags).unwrap();
+        let disallowed_kind =
+            wok_event::PackedEventBuilder::build(&[4u8; 32], &pk, 1, 62, 0, &tags).unwrap();
+        assert_eq!(
+            moderation_reason_ro(&txn, by_banned_author.view()).unwrap(),
+            Some(ModerationReason::BannedAuthor)
+        );
+        assert_eq!(
+            moderation_reason_ignoring_author_ro(&txn, by_banned_author.view()).unwrap(),
+            None
+        );
+        assert_eq!(
+            moderation_reason_ignoring_author_ro(&txn, banned_id.view()).unwrap(),
+            Some(ModerationReason::BannedEvent)
+        );
+        assert_eq!(
+            moderation_reason_ignoring_author_ro(&txn, disallowed_kind.view()).unwrap(),
+            Some(ModerationReason::KindNotAllowed)
+        );
     }
 
     #[test]

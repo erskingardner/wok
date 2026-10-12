@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session on the relay as NIP-77 specifies.
 - OK reasons for storage failures start with `error:` instead of
   `Write error:`, and prefixed AUTH failures are no longer double-prefixed.
+- Authors can read their own restricted-kind events that have no `p` tag
+  (for example NIP-78 kind 30078 app data). Before, REQ, COUNT, live
+  delivery, and sync hid them from everyone, including the author.
 
 ## [0.7.0] - 2026-09-08
 

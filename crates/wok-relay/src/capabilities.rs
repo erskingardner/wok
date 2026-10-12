@@ -32,15 +32,12 @@ impl CapabilityCondition {
         match self {
             Self::Always => true,
             Self::AdminEnabled => cfg.admin.enabled && !cfg.admin.pubkeys.is_empty(),
-            Self::AuthConfigured => {
-                cfg.relay.auth.enabled && !cfg.relay.auth.service_url.is_empty()
-            }
+            Self::AuthConfigured => cfg.auth_usable(),
             Self::CountEnabled => cfg.relay.max_filter_limit_count > 0,
             Self::NegentropyEnabled => cfg.relay.negentropy_enabled,
             Self::Nip59Safe => {
                 cfg.events.ephemeral_persistence == EphemeralPersistence::LiveOnly
-                    && cfg.relay.auth.enabled
-                    && !cfg.relay.auth.service_url.is_empty()
+                    && cfg.auth_usable()
                     && cfg.relay.auth.restricted_read_kinds.contains(&1059)
                     && cfg.relay.auth.restrict_read_to_involved_pubkey
             }

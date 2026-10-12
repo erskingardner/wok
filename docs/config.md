@@ -149,7 +149,10 @@ control boundary.
 | `relay.auth.restrict_read_to_involved_pubkey` | `true` | Restrict authenticated reads to the author or first `p`-tag recipient. |
 | `relay.auth.restrict_writes` | `false` | Only NIP-86 allowlisted or role-holding pubkeys (and operator admins) may write. See [nip86.md](nip86.md). |
 
-Private reads fail closed until `service_url` is configured. Clearing
+Private reads fail closed until `service_url` is configured. While AUTH is
+unusable, those reads are refused with `restricted:` and no AUTH challenge, so
+NIP-42 clients do not attempt an AUTH that cannot succeed; with
+`enabled = false` the relay refuses AUTH outright. Clearing
 `restricted_read_kinds` restores unrestricted history, but Wok stops
 advertising NIP-59.
 

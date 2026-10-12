@@ -174,7 +174,7 @@ pub(super) fn run_writer(
                                     RelayMessage::Ok {
                                         event_id: to_hex(packed_view.id()),
                                         accepted: false,
-                                        message: format!("Write error: {error}"),
+                                        message: format!("error: {error}"),
                                     },
                                     &metrics,
                                 );
@@ -332,7 +332,7 @@ pub(super) fn run_writer(
                             RelayMessage::Ok {
                                 event_id: id_hex,
                                 accepted: false,
-                                message: format!("Write error: disk space check failed: {error}"),
+                                message: format!("error: disk space check failed: {error}"),
                             },
                             &metrics,
                         );
@@ -395,7 +395,7 @@ pub(super) fn run_writer(
                         RelayMessage::Ok {
                             event_id: id_hex,
                             accepted: false,
-                            message: format!("Write error: {error}"),
+                            message: format!("error: {error}"),
                         },
                         &metrics,
                     );
@@ -445,7 +445,7 @@ pub(super) fn run_writer(
                         .fetch_add(1, Ordering::Relaxed);
                     (false, "blocked: author storage quota exceeded".into())
                 }
-                EventWriteStatus::Pending => (false, "Write error: pending".into()),
+                EventWriteStatus::Pending => (false, "error: write still pending".into()),
             };
             conns.send(
                 *conn_id,

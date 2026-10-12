@@ -275,6 +275,28 @@ impl RelayMessage {
     }
 }
 
+/// Machine-readable prefixes defined by NIP-01 (plus NIP-42's `auth-required`)
+/// for OK, CLOSED and NEG-ERR reasons.
+const REASON_PREFIXES: &[&str] = &[
+    "auth-required",
+    "blocked",
+    "duplicate",
+    "error",
+    "invalid",
+    "mute",
+    "pow",
+    "rate-limited",
+    "restricted",
+];
+
+/// True when `reason` already starts with a standard `prefix: ` so it can be
+/// sent as is.
+pub fn has_reason_prefix(reason: &str) -> bool {
+    reason
+        .split_once(": ")
+        .is_some_and(|(prefix, _)| REASON_PREFIXES.contains(&prefix))
+}
+
 pub fn parse_sub_id(s: &str) -> Result<SubId, String> {
     SubId::new(s).map_err(|e| e.to_string())
 }
@@ -312,5 +334,16 @@ mod tests {
             message.to_json(),
             r#"["CLOSED","sub","auth-required: authenticate first"]"#
         );
+    }
+
+    #[test]
+    fn reason_prefix_detection_only_accepts_standard_words() {
+        assert!(has_reason_prefix(
+            "restricted: too many authenticated identities"
+        ));
+        assert!(has_reason_prefix("auth-required: authenticate first"));
+        assert!(!has_reason_prefix("challenge string mismatch"));
+        assert!(!has_reason_prefix("Write error: disk full"));
+        assert!(!has_reason_prefix("restricted:no space"));
     }
 }

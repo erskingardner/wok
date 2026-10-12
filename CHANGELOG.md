@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Restricted reads no longer ask for AUTH that cannot succeed. Without a usable
+  NIP-42 setup (auth disabled or no `service_url`), REQ, COUNT, and NEG-OPEN
+  for restricted kinds are refused with `restricted:` and no challenge, and
+  AUTH replies `blocked:`. `relay.auth.enabled = false` now actually refuses
+  AUTH. An authenticated COUNT that is not scoped to the authenticated key gets
+  `restricted:` instead of a repeated `auth-required:`.
+- NIP-77 refusals that name a subscription (malformed hex or filter, negentropy
+  disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, so sync
+  clients stop waiting. Every NEG-ERR, including rate limits, now closes the
+  session on the relay as NIP-77 specifies.
+- OK reasons for storage failures start with `error:` instead of
+  `Write error:`, and prefixed AUTH failures are no longer double-prefixed.
+
 ## [0.7.0] - 2026-09-08
 
 ### Fixed

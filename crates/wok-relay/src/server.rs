@@ -14,7 +14,7 @@ use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
 use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
 use crate::plugin::{PluginEventSifter, PluginResult};
-use crate::protocol::{ClientCommand, RelayMessage};
+use crate::protocol::{has_reason_prefix, ClientCommand, RelayMessage};
 use crate::restrict::ReadRestrictor;
 use crate::source::TransportSource;
 use crate::supported_nips;
@@ -1005,106 +1005,37 @@ fn handle_client(
             filter,
             payload_hex,
         } => {
-            let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-            if !abuse.admit_source(&source, BudgetKind::Req, &cfg.relay.abuse)
-                || pubkey
-                    .as_ref()
-                    .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
-            {
-                metrics
-                    .abuse_req_rate_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                conns.send(
-                    conn_id,
-                    RelayMessage::NegErr {
-                        sub_id,
-                        message: "rate-limited: NEG-OPEN budget exhausted".into(),
-                        extra: None,
-                    },
-                    metrics,
-                );
-                return;
-            }
-            if !cfg.relay.negentropy_enabled {
-                conns.send(
-                    conn_id,
-                    RelayMessage::notice_error("bad msg: negentropy disabled"),
-                    metrics,
-                );
-                return;
-            }
-            if let Err(e) = ingest_neg(
+            ingest_neg_command(
                 cfg,
                 conns,
                 metrics,
+                abuse,
+                &source,
                 auth,
                 conn_id,
-                &sub_id,
+                sub_id,
                 Some(filter),
-                &payload_hex,
-                true,
+                payload_hex,
                 route_tx(neg_txs, conn_id),
-            ) {
-                conns.send(
-                    conn_id,
-                    RelayMessage::notice_error(format!("negentropy error: {e}")),
-                    metrics,
-                );
-            }
+            );
         }
         ClientCommand::NegMsg {
             sub_id,
             payload_hex,
         } => {
-            // NEG-MSG shares the REQ token budget: reconciliation messages
-            // each cost a worker round with B-tree descents, and persistent
-            // sessions could otherwise stream them back-to-back forever.
-            let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-            if !abuse.admit_source(&source, BudgetKind::Req, &cfg.relay.abuse)
-                || pubkey
-                    .as_ref()
-                    .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
-            {
-                metrics
-                    .abuse_req_rate_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                conns.send(
-                    conn_id,
-                    RelayMessage::NegErr {
-                        sub_id,
-                        message: "rate-limited: NEG-MSG budget exhausted".into(),
-                        extra: None,
-                    },
-                    metrics,
-                );
-                return;
-            }
-            if !cfg.relay.negentropy_enabled {
-                conns.send(
-                    conn_id,
-                    RelayMessage::notice_error("bad msg: negentropy disabled"),
-                    metrics,
-                );
-                return;
-            }
-            if let Err(e) = ingest_neg(
+            ingest_neg_command(
                 cfg,
                 conns,
                 metrics,
+                abuse,
+                &source,
                 auth,
                 conn_id,
-                &sub_id,
+                sub_id,
                 None,
-                &payload_hex,
-                false,
+                payload_hex,
                 route_tx(neg_txs, conn_id),
-            ) {
-                conns.send(
-                    conn_id,
-                    RelayMessage::notice_error(format!("negentropy error: {e}")),
-                    metrics,
-                );
-            }
+            );
         }
         ClientCommand::NegClose { sub_id } => {
             if !cfg.relay.negentropy_enabled {
@@ -1309,7 +1240,7 @@ fn ingest_event(
 
     let mut authed = None;
     if found_protected && !is_vanish_request {
-        if !cfg.relay.auth.enabled || cfg.relay.auth.service_url.is_empty() {
+        if !cfg.auth_usable() {
             conns.send(
                 conn_id,
                 RelayMessage::Ok {
@@ -1434,7 +1365,8 @@ fn ingest_auth(
     neg_tx: &Sender<NegMsg>,
 ) {
     // C++ RelayIngester answers every AUTH failure with
-    // OK <id|"?"> false "error: ...".
+    // OK <id|"?"> false "error: ...". Reasons that already carry a NIP-01
+    // prefix keep it rather than gaining a second one.
     let event_id = event_json
         .get("id")
         .and_then(|v| v.as_str())
@@ -1463,7 +1395,11 @@ fn ingest_auth(
                 RelayMessage::Ok {
                     event_id,
                     accepted: false,
-                    message: format!("error: {e}"),
+                    message: if has_reason_prefix(&e) {
+                        e
+                    } else {
+                        format!("error: {e}")
+                    },
                 },
                 metrics,
             );
@@ -1479,8 +1415,15 @@ fn ingest_auth_inner(
     req_tx: &Sender<ReqMsg>,
     neg_tx: &Sender<NegMsg>,
 ) -> Result<[u8; 32], String> {
+    // Refuse AUTH under the same condition that keeps NIP-42 out of NIP-11, so
+    // `enabled = false` really disables it.
+    if !cfg.relay.auth.enabled {
+        return Err("blocked: AUTH is disabled on this relay".into());
+    }
     if cfg.relay.auth.service_url.is_empty() {
-        return Err("relay needs serviceUrl to be configured before AUTH can work".into());
+        return Err(
+            "blocked: relay needs service_url to be configured before AUTH can work".into(),
+        );
     }
     let policy = TimestampPolicy::from_now(
         cfg.events.reject_newer_than_secs,
@@ -1656,21 +1599,10 @@ fn ingest_req(
         r.is_filter_group_fully_restricted(&fg) && authed.is_none()
     };
     if requires_auth {
-        if let std::collections::hash_map::Entry::Vacant(e) = auth.entry(conn_id) {
-            let challenge = gen_challenge();
-            e.insert(AuthSession {
-                challenge: challenge.clone(),
-                authed: None,
-                identities: Vec::new(),
-            });
-            conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
-        }
+        let reason = read_gate_refusal(cfg, conns, metrics, auth, conn_id);
         conns.send(
             conn_id,
-            RelayMessage::closed_error(
-                &sub_id,
-                "auth-required: requested filter requires authentication",
-            ),
+            RelayMessage::closed_error(&sub_id, reason),
             metrics,
         );
         return;
@@ -1686,103 +1618,202 @@ fn ingest_req(
     let _ = req_tx.send(ReqMsg::NewSub(sub));
 }
 
+/// Reason for a read refused by the restricted-kind gate. NIP-42's
+/// `auth-required:` tells the client to authenticate and retry, so it (and the
+/// AUTH challenge) is only sent while authenticating can change the outcome.
+/// When the relay cannot complete AUTH, or the connection already authenticated
+/// with keys the filter is not scoped to, the refusal is a final `restricted:`.
+fn read_gate_refusal(
+    cfg: &Config,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    auth: &mut HashMap<u64, AuthSession>,
+    conn_id: u64,
+) -> &'static str {
+    if !cfg.auth_usable() {
+        return "restricted: requested filter requires authentication, which this relay does not offer";
+    }
+    if auth
+        .get(&conn_id)
+        .is_some_and(|session| !session.identities.is_empty())
+    {
+        return "restricted: requested filter is not scoped to an authenticated pubkey";
+    }
+    if let std::collections::hash_map::Entry::Vacant(e) = auth.entry(conn_id) {
+        let challenge = gen_challenge();
+        e.insert(AuthSession {
+            challenge: challenge.clone(),
+            authed: None,
+            identities: Vec::new(),
+        });
+        conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
+    }
+    "auth-required: requested filter requires authentication"
+}
+
+/// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with
+/// NEG-ERR, after which the subscription is closed. Drop any session the
+/// worker still holds under this id so both sides agree it is gone.
+fn neg_err(
+    conns: &ConnTable,
+    metrics: &Metrics,
+    neg_tx: &Sender<NegMsg>,
+    conn_id: u64,
+    sub_id: &str,
+    message: String,
+) {
+    if let Ok(sid) = SubId::new(sub_id) {
+        let _ = neg_tx.send(NegMsg::CloseSub {
+            conn_id,
+            sub_id: sid,
+        });
+    }
+    conns.send(
+        conn_id,
+        RelayMessage::NegErr {
+            sub_id: sub_id.to_string(),
+            message,
+            extra: None,
+        },
+        metrics,
+    );
+}
+
+/// NEG-OPEN (`filter` is `Some`) or NEG-MSG. Every refusal that can name the
+/// subscription is a NEG-ERR; only an unaddressable sub id falls back to NOTICE.
+#[allow(clippy::too_many_arguments)]
+fn ingest_neg_command(
+    cfg: &Config,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    abuse: &AbuseController,
+    source: &TransportSource,
+    auth: &mut HashMap<u64, AuthSession>,
+    conn_id: u64,
+    sub_id: String,
+    filter: Option<Value>,
+    payload_hex: String,
+    neg_tx: &Sender<NegMsg>,
+) {
+    // NEG-MSG shares the REQ token budget: reconciliation messages each cost a
+    // worker round with B-tree descents, and persistent sessions could
+    // otherwise stream them back-to-back forever.
+    let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
+    if !abuse.admit_source(source, BudgetKind::Req, &cfg.relay.abuse)
+        || pubkey
+            .as_ref()
+            .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
+    {
+        metrics
+            .abuse_req_rate_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        let cmd = if filter.is_some() {
+            "NEG-OPEN"
+        } else {
+            "NEG-MSG"
+        };
+        let reason = format!("rate-limited: {cmd} budget exhausted");
+        neg_err(conns, metrics, neg_tx, conn_id, &sub_id, reason);
+        return;
+    }
+    let sid = match SubId::new(&sub_id) {
+        Ok(sid) => sid,
+        Err(e) => {
+            conns.send(
+                conn_id,
+                RelayMessage::notice_error(format!("negentropy error: {e}")),
+                metrics,
+            );
+            return;
+        }
+    };
+    if !cfg.relay.negentropy_enabled {
+        let reason = "blocked: negentropy is disabled on this relay".to_string();
+        neg_err(conns, metrics, neg_tx, conn_id, &sub_id, reason);
+        return;
+    }
+    if let Err(reason) = ingest_neg(
+        cfg,
+        conns,
+        metrics,
+        auth,
+        conn_id,
+        sid,
+        filter,
+        &payload_hex,
+        neg_tx,
+    ) {
+        neg_err(conns, metrics, neg_tx, conn_id, &sub_id, reason);
+    }
+}
+
+/// Validate a NEG-OPEN / NEG-MSG and hand it to the negentropy worker. `Err`
+/// carries a complete NIP-01-style reason for the caller's NEG-ERR.
+#[allow(clippy::too_many_arguments)]
 fn ingest_neg(
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
-    sub_id: &str,
+    sid: SubId,
     filter: Option<Value>,
     payload_hex: &str,
-    is_open: bool,
     neg_tx: &Sender<NegMsg>,
 ) -> Result<(), String> {
     if payload_hex.len() > 2 * 1024 * 1024 {
-        return Err("negentropy payload exceeds 1 MiB".into());
+        return Err("invalid: negentropy payload exceeds 1 MiB".into());
     }
-    let payload = wok_event::from_hex_strict(payload_hex).map_err(|e| e.to_string())?;
-    if is_open {
-        let Some(mut filter) = filter else {
-            return Err("negentropy query missing elements".into());
-        };
-        if !filter.is_object() {
-            return Err("negentropy filter must be an object".into());
-        }
-        let max_limit = cfg.relay.max_sync_events.saturating_add(1);
-        let fg = NostrFilterGroup::from_value(
-            &filter,
-            max_limit,
-            cfg.relay.max_tags_per_filter,
-            cfg.relay.max_and_entries,
-        )
-        .map_err(|e| e.to_string())?;
-        let query_cost = fg.estimated_cost(false);
-        if cfg.relay.abuse.enabled
-            && cfg.relay.abuse.max_query_cost != 0
-            && query_cost > cfg.relay.abuse.max_query_cost
-        {
-            metrics
-                .abuse_query_cost_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            conns.send(
-                conn_id,
-                RelayMessage::NegErr {
-                    sub_id: sub_id.to_string(),
-                    message: format!(
-                        "rate-limited: estimated query cost {query_cost} exceeds {}",
-                        cfg.relay.abuse.max_query_cost
-                    ),
-                    extra: None,
-                },
-                metrics,
-            );
-            return Ok(());
-        }
-        let r = restrictor(cfg);
-        if r.is_filter_group_fully_restricted(&fg)
-            && auth.get(&conn_id).and_then(|a| a.authed).is_none()
-        {
-            if let std::collections::hash_map::Entry::Vacant(e) = auth.entry(conn_id) {
-                let challenge = gen_challenge();
-                e.insert(AuthSession {
-                    challenge: challenge.clone(),
-                    authed: None,
-                    identities: Vec::new(),
-                });
-                conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
-            }
-            conns.send(
-                conn_id,
-                RelayMessage::NegErr {
-                    sub_id: sub_id.to_string(),
-                    message: "auth-required: requested filter requires authentication".into(),
-                    extra: None,
-                },
-                metrics,
-            );
-            return Ok(());
-        }
-        if let Some(obj) = filter.as_object_mut() {
-            obj.remove("since");
-            obj.remove("until");
-        }
-        let filter_str = filter.to_string();
-        let sid = SubId::new(sub_id).map_err(|e| e.to_string())?;
-        let sub = Subscription::new(conn_id, sid, fg, false);
-        let _ = neg_tx.send(NegMsg::Open {
-            sub,
-            filter_str,
-            payload,
-        });
-    } else {
-        let sid = SubId::new(sub_id).map_err(|e| e.to_string())?;
+    let payload = wok_event::from_hex_strict(payload_hex).map_err(|e| format!("invalid: {e}"))?;
+    let Some(mut filter) = filter else {
         let _ = neg_tx.send(NegMsg::Msg {
             conn_id,
             sub_id: sid,
             payload,
         });
+        return Ok(());
+    };
+    if !filter.is_object() {
+        return Err("invalid: negentropy filter must be an object".into());
     }
+    let max_limit = cfg.relay.max_sync_events.saturating_add(1);
+    let fg = NostrFilterGroup::from_value(
+        &filter,
+        max_limit,
+        cfg.relay.max_tags_per_filter,
+        cfg.relay.max_and_entries,
+    )
+    .map_err(|e| format!("invalid: {e}"))?;
+    let query_cost = fg.estimated_cost(false);
+    if cfg.relay.abuse.enabled
+        && cfg.relay.abuse.max_query_cost != 0
+        && query_cost > cfg.relay.abuse.max_query_cost
+    {
+        metrics
+            .abuse_query_cost_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        return Err(format!(
+            "rate-limited: estimated query cost {query_cost} exceeds {}",
+            cfg.relay.abuse.max_query_cost
+        ));
+    }
+    let r = restrictor(cfg);
+    if r.is_filter_group_fully_restricted(&fg)
+        && auth.get(&conn_id).and_then(|a| a.authed).is_none()
+    {
+        return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
+    }
+    if let Some(obj) = filter.as_object_mut() {
+        obj.remove("since");
+        obj.remove("until");
+    }
+    let filter_str = filter.to_string();
+    let sub = Subscription::new(conn_id, sid, fg, false);
+    let _ = neg_tx.send(NegMsg::Open {
+        sub,
+        filter_str,
+        payload,
+    });
     Ok(())
 }
 
@@ -2485,11 +2516,11 @@ mod tests {
             )
             .await;
 
-        let challenge = recv_outbound(&mut rx).await;
+        // AUTH cannot succeed without service_url, so the refusal is final:
+        // no challenge, and `restricted:` rather than `auth-required:`.
         let closed = recv_outbound(&mut rx).await;
-        assert!(challenge.contains("\"AUTH\""), "{challenge}");
         assert!(
-            closed.contains("\"CLOSED\"") && closed.contains("auth-required"),
+            closed.starts_with(r#"["CLOSED","private","restricted: "#),
             "{closed}"
         );
         handle.request_shutdown();

@@ -23,7 +23,14 @@ Request and response bodies follow the pinned spec:
 Method-level failures return HTTP 200 with an `error` field. Authentication
 failures return 401. Signed authorization events are single-use within
 `admin.auth_window_secs`; clients must include a unique tag (for example a
-random `nonce`) so same-second calls do not collide in the replay cache.
+random `nonce`) so same-second calls do not collide in the replay cache. An
+event is claimed as soon as it is accepted, so a concurrent request reusing it
+is refused. A request rejected before it submits a command to the relay writer
+(bad parameters, a signer without a management role) releases the claim for a
+retry with the same event. Once a command is submitted the event stays used,
+even if the client disconnects or the call reports an error, because a queued
+command still runs. A full writer queue also keeps the claim, so sign a new
+event to retry.
 
 ## Supported methods
 

@@ -12,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use wok_relay::{management_level, ManagementCmd, ManagementLevel, RelayHandle, Role};
+use wok_relay::{management_level, Config, ManagementCmd, ManagementLevel, RelayHandle, Role};
 
 pub const RPC_CONTENT_TYPE: &str = "application/nostr+json+rpc";
 const MAX_RPC_BODY: usize = 64 * 1024;
@@ -99,55 +99,78 @@ pub async fn dispatch(
         Ok(body) => body,
         Err(error) => return admin::response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
     };
-    let (signer_hex, replay_id, replay_created_at) = match admin::authorize(
-        authorization.as_deref(),
-        &Method::POST,
-        &body,
-        &cfg,
-        &state,
-        &admin::AuthzPolicy {
-            url_ok: &|signed| relay_url_matches(&cfg.admin.public_url, signed),
-            require_config_admin: false,
-            // Pinned NIP-86 makes the NIP-98 payload tag unconditional.
-            require_payload: true,
-        },
-    ) {
-        Ok(ok) => ok,
-        Err(error) => return admin::unauthorized(&error),
-    };
-    let signer = match parse_hex32(&signer_hex) {
-        Ok(signer) => signer,
-        Err(error) => return admin::unauthorized(&error),
-    };
-    let level = management_level(&cfg, &handle.moderation.read(), &signer);
-    if level == ManagementLevel::None {
-        return admin::unauthorized("NIP-98 signer has no management role on this relay");
-    }
+    let (signer_hex, level, replay) =
+        match authorize_manager(authorization.as_deref(), &body, &cfg, &state, |signer| {
+            management_level(&cfg, &handle.moderation.read(), signer)
+        }) {
+            Ok(ok) => ok,
+            Err(error) => return admin::unauthorized(&error),
+        };
     tracing::info!(
         manager = %signer_hex,
         level = ?level,
         "authorized NIP-86 management request"
     );
 
-    let outcome = execute(&handle, level, &body).await;
-    match outcome {
-        Ok(result) => {
-            admin::commit_replay_id(
-                &state,
-                replay_id,
-                replay_created_at,
-                cfg.admin.auth_window_secs,
-            );
-            admin::json(StatusCode::OK, json!({ "result": result }))
+    // Once a command reaches the writer it is applied even if this request
+    // is cancelled or its reply reports an error, so only a failure before
+    // that point releases the replay reservation.
+    let mut reached_writer = false;
+    match execute(&handle, level, &body, &mut reached_writer).await {
+        Ok(result) => admin::json(StatusCode::OK, json!({ "result": result })),
+        Err(error) => {
+            if !reached_writer {
+                replay.release();
+            }
+            admin::json(StatusCode::OK, json!({ "error": error }))
         }
-        Err(error) => admin::json(StatusCode::OK, json!({ "error": error })),
     }
+}
+
+/// Verify a NIP-86 request's NIP-98 authorization and that its signer holds a
+/// management role, returning the signer, its level and the replay
+/// reservation.
+fn authorize_manager<'a>(
+    authorization: Option<&str>,
+    body: &[u8],
+    cfg: &Config,
+    state: &'a AdminState,
+    level_of: impl FnOnce(&[u8; 32]) -> ManagementLevel,
+) -> Result<(String, ManagementLevel, admin::ReplayReservation<'a>), String> {
+    let (signer_hex, replay) = admin::authorize(
+        authorization,
+        &Method::POST,
+        body,
+        cfg,
+        state,
+        &admin::AuthzPolicy {
+            url_ok: &|signed| relay_url_matches(&cfg.admin.public_url, signed),
+            require_config_admin: false,
+            // Pinned NIP-86 makes the NIP-98 payload tag unconditional.
+            require_payload: true,
+        },
+    )?;
+    // A rejected signer ran nothing, so release its slot: otherwise any key
+    // could fill the shared replay cache and lock out real managers.
+    let level = match parse_hex32(&signer_hex) {
+        Ok(signer) => level_of(&signer),
+        Err(error) => {
+            replay.release();
+            return Err(error);
+        }
+    };
+    if level == ManagementLevel::None {
+        replay.release();
+        return Err("NIP-98 signer has no management role on this relay".into());
+    }
+    Ok((signer_hex, level, replay))
 }
 
 async fn execute(
     handle: &Arc<RelayHandle>,
     level: ManagementLevel,
     body: &[u8],
+    reached_writer: &mut bool,
 ) -> Result<Value, String> {
     let request: Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid request JSON: {error}"))?;
@@ -175,11 +198,21 @@ async fn execute(
             .collect::<Vec<_>>())),
         "banpubkey" => {
             let (pubkey, reason) = hex32_reason_params(params, "pubkey")?;
-            manage(handle, ManagementCmd::BanPubkey { pubkey, reason }).await
+            manage(
+                handle,
+                ManagementCmd::BanPubkey { pubkey, reason },
+                reached_writer,
+            )
+            .await
         }
         "unbanpubkey" => {
             let (pubkey, _) = hex32_reason_params(params, "pubkey")?;
-            manage(handle, ManagementCmd::UnbanPubkey { pubkey }).await
+            manage(
+                handle,
+                ManagementCmd::UnbanPubkey { pubkey },
+                reached_writer,
+            )
+            .await
         }
         "listbannedpubkeys" => Ok(list_hex_reasons(
             &handle.moderation.read().banned_pubkeys,
@@ -187,11 +220,21 @@ async fn execute(
         )),
         "allowpubkey" => {
             let (pubkey, reason) = hex32_reason_params(params, "pubkey")?;
-            manage(handle, ManagementCmd::AllowPubkey { pubkey, reason }).await
+            manage(
+                handle,
+                ManagementCmd::AllowPubkey { pubkey, reason },
+                reached_writer,
+            )
+            .await
         }
         "unallowpubkey" => {
             let (pubkey, _) = hex32_reason_params(params, "pubkey")?;
-            manage(handle, ManagementCmd::UnallowPubkey { pubkey }).await
+            manage(
+                handle,
+                ManagementCmd::UnallowPubkey { pubkey },
+                reached_writer,
+            )
+            .await
         }
         "listallowedpubkeys" => Ok(list_hex_reasons(
             &handle.moderation.read().allowed_pubkeys,
@@ -199,11 +242,16 @@ async fn execute(
         )),
         "banevent" => {
             let (id, reason) = hex32_reason_params(params, "event id")?;
-            manage(handle, ManagementCmd::BanEvent { id, reason }).await
+            manage(
+                handle,
+                ManagementCmd::BanEvent { id, reason },
+                reached_writer,
+            )
+            .await
         }
         "allowevent" => {
             let (id, _) = hex32_reason_params(params, "event id")?;
-            manage(handle, ManagementCmd::AllowEvent { id }).await
+            manage(handle, ManagementCmd::AllowEvent { id }, reached_writer).await
         }
         "listbannedevents" => Ok(list_hex_reasons(
             &handle.moderation.read().banned_events,
@@ -216,11 +264,16 @@ async fn execute(
         "blockip" => {
             let ip = string_param(params, 0, "ip address")?;
             let reason = optional_string_param(params, 1)?;
-            manage(handle, ManagementCmd::BlockIp { ip, reason }).await
+            manage(
+                handle,
+                ManagementCmd::BlockIp { ip, reason },
+                reached_writer,
+            )
+            .await
         }
         "unblockip" => {
             let ip = string_param(params, 0, "ip address")?;
-            manage(handle, ManagementCmd::UnblockIp { ip }).await
+            manage(handle, ManagementCmd::UnblockIp { ip }, reached_writer).await
         }
         "listblockedips" => {
             let snap = handle.moderation.read();
@@ -239,11 +292,11 @@ async fn execute(
             if method == "editrole" && !handle.moderation.read().roles.contains_key(&role.id) {
                 return Err(format!("unknown role {:?}", role.id));
             }
-            manage(handle, ManagementCmd::PutRole { role }).await
+            manage(handle, ManagementCmd::PutRole { role }, reached_writer).await
         }
         "deleterole" => {
             let id = string_param(params, 0, "role id")?;
-            manage(handle, ManagementCmd::DeleteRole { id }).await
+            manage(handle, ManagementCmd::DeleteRole { id }, reached_writer).await
         }
         "assignrole" | "unassignrole" => {
             let pubkey = parse_hex32(&string_param(params, 0, "pubkey")?)?;
@@ -253,7 +306,7 @@ async fn execute(
             } else {
                 ManagementCmd::UnassignRole { pubkey, role }
             };
-            manage(handle, cmd).await
+            manage(handle, cmd, reached_writer).await
         }
         "changerelayname" => {
             let name = string_param(params, 0, "relay name")?;
@@ -269,11 +322,11 @@ async fn execute(
         }
         "allowkind" => {
             let kind = kind_param(params)?;
-            manage(handle, ManagementCmd::AllowKind { kind }).await
+            manage(handle, ManagementCmd::AllowKind { kind }, reached_writer).await
         }
         "disallowkind" => {
             let kind = kind_param(params)?;
-            manage(handle, ManagementCmd::DisallowKind { kind }).await
+            manage(handle, ManagementCmd::DisallowKind { kind }, reached_writer).await
         }
         "listallowedkinds" => {
             let snap = handle.moderation.read();
@@ -287,7 +340,13 @@ async fn execute(
     }
 }
 
-async fn manage(handle: &Arc<RelayHandle>, cmd: ManagementCmd) -> Result<Value, String> {
+async fn manage(
+    handle: &Arc<RelayHandle>,
+    cmd: ManagementCmd,
+    reached_writer: &mut bool,
+) -> Result<Value, String> {
+    // Conservative: a full writer queue also counts, so the operator re-signs.
+    *reached_writer = true;
     handle.manage(cmd).await.map(|()| json!(true))
 }
 
@@ -366,6 +425,68 @@ fn list_hex_reasons(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use secp256k1::{Keypair, SECP256K1};
+    use sha2::Digest;
+
+    fn signed_rpc_auth(key: &Keypair, url: &str, body: &[u8], nonce: usize) -> String {
+        let (pubkey, _) = key.x_only_public_key();
+        let mut event = json!({
+            "pubkey": hex::encode(pubkey.serialize()),
+            "created_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            "kind": 27235,
+            "tags": [
+                ["u", url],
+                ["method", "POST"],
+                ["payload", hex::encode(sha2::Sha256::digest(body))],
+                ["nonce", nonce.to_string()],
+            ],
+            "content": "",
+        });
+        let id = wok_event::event_id_hash(&event).unwrap();
+        event["id"] = json!(hex::encode(id));
+        event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, key).as_ref()));
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(event.to_string())
+        )
+    }
+
+    #[test]
+    fn rejected_non_managers_do_not_fill_the_replay_cache() {
+        // A validly signed request from a key with no management role must
+        // not hold a replay-cache slot, or anyone could fill the cache and
+        // lock out real administrators.
+        let mut rng = rand::thread_rng();
+        let admin_key = Keypair::new(SECP256K1, &mut rng);
+        let stranger = Keypair::new(SECP256K1, &mut rng);
+        let admin_pubkey = admin_key.x_only_public_key().0.serialize();
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        let state = AdminState::default();
+        let url = "wss://relay.example";
+        let body = br#"{"method":"supportedmethods","params":[]}"#;
+        let level_of = |signer: &[u8; 32]| {
+            if *signer == admin_pubkey {
+                ManagementLevel::Admin
+            } else {
+                ManagementLevel::None
+            }
+        };
+
+        for nonce in 0..=admin::MAX_REPLAY_IDS {
+            let header = signed_rpc_auth(&stranger, url, body, nonce);
+            let error = authorize_manager(Some(&header), body, &cfg, &state, level_of).unwrap_err();
+            assert!(error.contains("no management role"), "{error}");
+        }
+        let header = signed_rpc_auth(&admin_key, url, body, 0);
+        let (_, level, _) = authorize_manager(Some(&header), body, &cfg, &state, level_of).unwrap();
+        assert_eq!(level, ManagementLevel::Admin);
+    }
 
     #[test]
     fn relay_url_matching_accepts_scheme_and_slash_variants() {

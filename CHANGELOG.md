@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they had published, contrary to NIP-62's requirement that relays which
   restrict who can post honor vanish regardless of the user's status. Event-id
   bans, the kind allowlist and `relay.nip62.enabled` still apply.
+- A signed NIP-98 authorization can no longer run two admin API or NIP-86
+  requests at once. Its replay-cache ID was burned only after the request
+  succeeded, so concurrent requests reusing one captured header all passed the
+  check and executed. The ID is now reserved when the request is authorized.
+  It is released only when the request failed without effect, so those can
+  still be retried; a NIP-86 command that reached the writer keeps it burned
+  even if the client disconnects (#51).
 
 ### Added
 

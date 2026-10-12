@@ -189,4 +189,9 @@ impl QueryScheduler {
     pub fn set_max_total_events_per_req(&mut self, maximum: u64) {
         self.max_total_events_per_req = maximum;
     }
+
+    /// Applies to queries added afterwards; see [`DbQuery::new`].
+    pub fn set_count_dedup_budget(&mut self, budget: u64) {
+        self.count_dedup_budget = budget;
+    }
 }

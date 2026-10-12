@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until it refills; rejections count as `invalid_rate`. Only the reply is
   suppressed: valid CLOSE and NEG-CLOSE are never budgeted, and a malformed
   NEG-OPEN/NEG-MSG that names a session still closes it (#49).
+- Three settings documented as live now take effect on reload instead of
+  keeping their startup value until restart: `relay.write_policy_timeout_secs`
+  (the write-policy plugin's deadline), `relay.max_subs_per_connection`, and
+  the COUNT dedup budget derived from `relay.max_filter_limit_count`. An
+  operator who shortened the plugin timeout to contain a hanging plugin was
+  still waiting the old duration (#54).
 
 ### Added
 

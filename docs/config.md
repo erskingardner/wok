@@ -217,7 +217,7 @@ All abuse settings reload live and are dashboard-editable.
 | `relay.abuse.enabled` | `true` | Enable this protection layer. |
 | `relay.abuse.connection_rate_per_second` | `10` | Refilled connection tokens per network address each second. |
 | `relay.abuse.connection_burst` | `50` | Connection token-bucket capacity. |
-| `relay.abuse.event_rate_per_second` | `50` | Refilled EVENT tokens per connection each second. |
+| `relay.abuse.event_rate_per_second` | `50` | Refilled EVENT tokens per connection each second; AUTH draws on the same bucket. |
 | `relay.abuse.event_burst` | `100` | Per-connection EVENT bucket capacity. |
 | `relay.abuse.pubkey_event_rate_per_second` | `25` | Refilled publication tokens per event author each second. |
 | `relay.abuse.pubkey_event_burst` | `50` | Per-author publication bucket capacity. |

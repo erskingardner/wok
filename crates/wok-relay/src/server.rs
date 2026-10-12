@@ -924,6 +924,24 @@ fn handle_client(
         }
         ClientCommand::Auth(v) => {
             metrics.client_auth.fetch_add(1, Ordering::Relaxed);
+            // AUTH costs what an EVENT costs (parse, id hash, Schnorr verify),
+            // so it draws on the same per-source budget.
+            if !abuse.admit_source(&source, BudgetKind::Event, &cfg.relay.abuse) {
+                metrics
+                    .abuse_event_rate_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                let id = v.get("id").and_then(Value::as_str).unwrap_or("?");
+                conns.send(
+                    conn_id,
+                    RelayMessage::Ok {
+                        event_id: id.into(),
+                        accepted: false,
+                        message: "rate-limited: AUTH budget exhausted".into(),
+                    },
+                    metrics,
+                );
+                return;
+            }
             ingest_auth(
                 cfg,
                 conns,
@@ -1438,6 +1456,11 @@ fn ingest_auth_inner(
             "blocked: relay needs service_url to be configured before AUTH can work".into(),
         );
     }
+    // Only a connection that was issued a challenge can authenticate, so
+    // refuse the rest before spending a signature verification on them.
+    let asess = auth
+        .get_mut(&conn_id)
+        .ok_or("no auth status available for connection")?;
     let policy = TimestampPolicy::from_now(
         cfg.events.reject_newer_than_secs,
         cfg.events.reject_older_than_secs,
@@ -1449,9 +1472,6 @@ fn ingest_auth_inner(
     if packed.kind() != AUTH_KIND {
         return Err("wrong event kind, expected 22242".into());
     }
-    let asess = auth
-        .get_mut(&conn_id)
-        .ok_or("no auth status available for connection")?;
     let mut found_challenge = false;
     let mut found_relay = false;
     let expected = normalize_relay_url(&cfg.relay.auth.service_url);
@@ -2539,6 +2559,83 @@ mod tests {
         assert!(
             closed.starts_with(r#"["CLOSED","private","restricted: "#),
             "{closed}"
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_without_a_challenge_is_refused_before_signature_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.service_url = "wss://auth.example".into();
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        let mut auth = sign_event(json!({
+            "created_at": now_secs(),
+            "kind": AUTH_KIND,
+            "tags": [["relay", "wss://auth.example"], ["challenge", "never-issued"]],
+            "content": "",
+        }));
+        auth["sig"] = json!("00".repeat(64));
+        handle
+            .client_message(
+                conn,
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                json!(["AUTH", auth]).to_string(),
+            )
+            .await;
+
+        // No challenge was ever issued, so the bad signature is never checked.
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.contains("no auth status available for connection"),
+            "{reply}"
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_is_charged_to_the_event_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.service_url = "wss://auth.example".into();
+        cfg.relay.abuse.event_rate_per_second = 1;
+        cfg.relay.abuse.event_burst = 1;
+        let handle = start(env, cfg).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        for _ in 0..2 {
+            handle
+                .client_message(
+                    conn,
+                    TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    json!(["AUTH", {"id":"ab"}]).to_string(),
+                )
+                .await;
+        }
+
+        let first = recv_outbound(&mut rx).await;
+        assert!(!first.contains("rate-limited:"), "{first}");
+        let second = recv_outbound(&mut rx).await;
+        assert_eq!(
+            second,
+            r#"["OK","ab",false,"rate-limited: AUTH budget exhausted"]"#
+        );
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_event_rate_rejections
+                .load(Ordering::Relaxed),
+            1
         );
         handle.request_shutdown();
     }

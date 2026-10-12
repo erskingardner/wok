@@ -442,16 +442,19 @@ impl RelayHandle {
         self.metrics
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
-        let _ = self
-            .ingest_route(conn_id)
-            .send(IngestMsg::Open { conn_id })
-            .await;
-        ConnectionGuard {
+        // Build the guard before waiting on ingress, so cancelling here still
+        // runs its cleanup.
+        let guard = ConnectionGuard {
             handle: self.clone(),
             conn_id,
             source,
             closed: false,
-        }
+        };
+        let _ = self
+            .ingest_route(conn_id)
+            .send(IngestMsg::Open { conn_id })
+            .await;
+        guard
     }
 
     /// Apply the connection-opening budget before transport registration.
@@ -2584,6 +2587,59 @@ mod tests {
         })
         .await
         .expect("connection guard cleanup");
+        assert!(rx.recv().await.is_none());
+        handle.request_shutdown();
+    }
+
+    /// Registration waits for ingress capacity; cancelling it there must still
+    /// release the outbound entry and the connection count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_registration_cleans_up_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.ingester_threads = 1;
+        let handle = start(env, cfg).unwrap();
+
+        // Stall the ingester on the config lock, held off the runtime, then
+        // fill its queue.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let config = handle.config.clone();
+        let stall = std::thread::spawn(move || {
+            let _guard = config.write();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let filler = handle.next_conn_id();
+        while tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.client_message(filler, TransportSource::Unix, "[]".into()),
+        )
+        .await
+        .is_ok()
+        {}
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let registration = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.register_connection(TransportSource::Unix, Outbound::new(tx, 0)),
+        )
+        .await;
+        assert!(registration.is_err(), "registration should be waiting");
+        release_tx.send(()).unwrap();
+        stall.join().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.metrics.active_connections.load(Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled registration cleanup");
         assert!(rx.recv().await.is_none());
         handle.request_shutdown();
     }

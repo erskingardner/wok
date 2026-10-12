@@ -84,7 +84,7 @@ async fn sigterm_closes_cleanly_and_preserves_acknowledged_event() {
         wok_db::EnvOptions {
             read_only: true,
             create_dbis: false,
-            ..Default::default()
+            ..wok_db::EnvOptions::for_tests()
         },
     )
     .unwrap();

@@ -546,7 +546,7 @@ mod tests {
                 create_dir: false,
                 create_dbis: false,
                 read_only: true,
-                ..EnvOptions::default()
+                ..EnvOptions::for_tests()
             },
         )
         .unwrap();

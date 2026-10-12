@@ -411,7 +411,7 @@ mod tests {
             EnvOptions {
                 create_dir: false,
                 create_dbis: false,
-                ..EnvOptions::default()
+                ..EnvOptions::for_tests()
             },
         )
         .unwrap();
@@ -443,7 +443,7 @@ mod tests {
             EnvOptions {
                 create_dir: false,
                 create_dbis: false,
-                ..EnvOptions::default()
+                ..EnvOptions::for_tests()
             },
         )
         .unwrap();
@@ -497,7 +497,7 @@ mod tests {
                     read_only: true,
                     create_dbis: false,
                     create_dir: false,
-                    ..EnvOptions::default()
+                    ..EnvOptions::for_tests()
                 },
             )
             .unwrap();

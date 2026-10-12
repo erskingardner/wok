@@ -235,6 +235,10 @@ pub struct RelayHandle {
 }
 
 pub enum IngestMsg {
+    /// A connection registered; it precedes every `Client` message for it.
+    Open {
+        conn_id: u64,
+    },
     Client {
         conn_id: u64,
         source: TransportSource,
@@ -438,12 +442,19 @@ impl RelayHandle {
         self.metrics
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
-        ConnectionGuard {
+        // Build the guard before waiting on ingress, so cancelling here still
+        // runs its cleanup.
+        let guard = ConnectionGuard {
             handle: self.clone(),
             conn_id,
             source,
             closed: false,
-        }
+        };
+        let _ = self
+            .ingest_route(conn_id)
+            .send(IngestMsg::Open { conn_id })
+            .await;
+        guard
     }
 
     /// Apply the connection-opening budget before transport registration.
@@ -830,6 +841,15 @@ fn run_ingester(
     // Tokio runtime, so no async executor is stalled.
     while let Some(msg) = rx.blocking_recv() {
         match msg {
+            IngestMsg::Open { conn_id } => {
+                // NIP-42 lets the relay challenge at any time. Challenging on
+                // connect lets a client authenticate before its first REQ, so
+                // a restricted live subscription (e.g. NIP-46 kind 24133) is
+                // not refused and re-sent while ephemeral replies go by.
+                if cfg.read().auth_usable() {
+                    issue_challenge(&conns, &metrics, &mut auth, conn_id);
+                }
+            }
             IngestMsg::Close { conn_id } => {
                 if auth.remove(&conn_id).and_then(|a| a.authed).is_some() {
                     metrics
@@ -1285,16 +1305,7 @@ fn ingest_event(
         }
         match auth.get(&conn_id) {
             None => {
-                let challenge = gen_challenge();
-                auth.insert(
-                    conn_id,
-                    AuthSession {
-                        challenge: challenge.clone(),
-                        authed: None,
-                        identities: Vec::new(),
-                    },
-                );
-                conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
+                issue_challenge(conns, metrics, auth, conn_id);
                 conns.send(
                     conn_id,
                     RelayMessage::Ok {
@@ -1673,6 +1684,18 @@ fn read_gate_refusal(
     {
         return "restricted: requested filter is not scoped to an authenticated pubkey";
     }
+    issue_challenge(conns, metrics, auth, conn_id);
+    "auth-required: requested filter requires authentication"
+}
+
+/// Send the connection's NIP-42 challenge unless it already has one; a session
+/// keeps a single challenge so an AUTH signed for it stays valid.
+fn issue_challenge(
+    conns: &ConnTable,
+    metrics: &Metrics,
+    auth: &mut HashMap<u64, AuthSession>,
+    conn_id: u64,
+) {
     if let std::collections::hash_map::Entry::Vacant(e) = auth.entry(conn_id) {
         let challenge = gen_challenge();
         e.insert(AuthSession {
@@ -1682,7 +1705,6 @@ fn read_gate_refusal(
         });
         conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
     }
-    "auth-required: requested filter requires authentication"
 }
 
 /// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with
@@ -2671,6 +2693,59 @@ mod tests {
         })
         .await
         .expect("connection guard cleanup");
+        assert!(rx.recv().await.is_none());
+        handle.request_shutdown();
+    }
+
+    /// Registration waits for ingress capacity; cancelling it there must still
+    /// release the outbound entry and the connection count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_registration_cleans_up_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.ingester_threads = 1;
+        let handle = start(env, cfg).unwrap();
+
+        // Stall the ingester on the config lock, held off the runtime, then
+        // fill its queue.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let config = handle.config.clone();
+        let stall = std::thread::spawn(move || {
+            let _guard = config.write();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let filler = handle.next_conn_id();
+        while tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.client_message(filler, TransportSource::Unix, "[]".into()),
+        )
+        .await
+        .is_ok()
+        {}
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let registration = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.register_connection(TransportSource::Unix, Outbound::new(tx, 0)),
+        )
+        .await;
+        assert!(registration.is_err(), "registration should be waiting");
+        release_tx.send(()).unwrap();
+        stall.join().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.metrics.active_connections.load(Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled registration cleanup");
         assert!(rx.recv().await.is_none());
         handle.request_shutdown();
     }

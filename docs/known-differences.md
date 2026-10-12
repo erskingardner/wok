@@ -97,6 +97,11 @@ regression test. Differential parity alone is not a reason to retain it.
   pinned strfry still challenges and then rejects every AUTH. An authenticated
   COUNT that is not scoped to an authenticated key is `restricted:`, not
   another `auth-required:`. `relay.auth.enabled = false` now also refuses AUTH.
+- NIP-42: while AUTH is usable, the challenge is sent when the connection
+  opens, not only after a restricted request is refused. A client can then
+  authenticate before its first REQ, so a restricted live subscription such
+  as a NIP-46 kind-24133 response feed does not miss ephemeral replies while
+  it is refused, authenticated, and re-sent.
 - NIP-77: NEG-OPEN and NEG-MSG refusals (malformed envelope, hex, or filter;
   negentropy disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, and
   every NEG-ERR closes the session. Only an unusable subscription id still

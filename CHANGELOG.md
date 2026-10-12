@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- While NIP-42 is usable, the AUTH challenge is sent as soon as a connection
+  opens instead of only after a restricted request is refused. NIP-46 clients
+  such as Bunker46 can authenticate before subscribing to restricted kind
+  24133, so the bunker's ephemeral replies are no longer lost while the
+  client re-subscribes (#64).
 - Restricted reads no longer ask for AUTH that cannot succeed. Without a usable
   NIP-42 setup (auth disabled or no `service_url`), REQ, COUNT, and NEG-OPEN
   for restricted kinds are refused with `restricted:` and no challenge, and

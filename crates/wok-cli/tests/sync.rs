@@ -317,6 +317,8 @@ async fn all_users_gift_wraps_transfer_then_require_the_correct_nip42_identity()
     let server = serve(&dst).await;
     for (i, key) in keys.iter().enumerate() {
         let (mut ws, _) = tokio_tungstenite::connect_async(&server.url).await.unwrap();
+        let challenge = recv(&mut ws).await;
+        assert_eq!(challenge[0], "AUTH");
         ws.send(Message::Text(
             json!(["REQ", "broad", {}]).to_string().into(),
         ))
@@ -328,8 +330,6 @@ async fn all_users_gift_wraps_transfer_then_require_the_correct_nip42_identity()
         ))
         .await
         .unwrap();
-        let challenge = recv(&mut ws).await;
-        assert_eq!(challenge[0], "AUTH");
         assert_eq!(recv(&mut ws).await[0], "CLOSED");
         let auth = sign(
             json!({"kind":22242,"created_at":now(),"tags":[["relay",server.url],["challenge",challenge[1]]],"content":""}),

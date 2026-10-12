@@ -120,6 +120,7 @@ Available operator commands:
 | `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse` |
 | `scan`, `event <levId>`, `info`, `delete`, `compact`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |
 | `doctor [--json]` | Config, storage, index, payload, negentropy, capacity, and runtime-path diagnostics |
+| `purge-superseded [--dry-run] [--json]` | Delete replaceable versions superseded at their address, keeping the version reads serve |
 | `reindex --confirm-relay-stopped [--backup <dir>]` | Stage and verify rebuilt indexes, atomically promote them, and retain the original DB |
 | `dict stats/train/compress/decompress` | zstd dictionary management (ZDICT training included) |
 | `negentropy list/add/build` | persistent trees; build uses bounded, restart-safe batches |

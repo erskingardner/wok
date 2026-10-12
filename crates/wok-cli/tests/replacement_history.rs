@@ -111,3 +111,74 @@ fn doctor_and_migration_report_history_while_preserving_lossless_records() {
         source_bytes
     );
 }
+
+#[test]
+fn purge_superseded_removes_retained_history_after_a_dry_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let config = dir.path().join("wok.toml");
+    let events: Vec<_> = [0, 3, 30443, 1]
+        .into_iter()
+        .flat_map(replacement::events)
+        .collect();
+    drop(replacement::seed(&db, &events, 5));
+    std::fs::write(
+        &config,
+        format!("[database]\npath={db:?}\nmap_size=67108864\nmin_free_disk_bytes=0\n"),
+    )
+    .unwrap();
+    let wok = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_wok"))
+            .args(["--config", config.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    // Export is a physical archive; scan would hide superseded versions.
+    let stored_kinds = || -> Vec<u64> {
+        let output = Command::new(env!("CARGO_BIN_EXE_wok"))
+            .args(["--config", config.to_str().unwrap(), "export"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mut kinds: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["kind"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        kinds.sort();
+        kinds
+    };
+
+    let dry_run = wok(&["purge-superseded", "--dry-run", "--json"]);
+    assert_eq!(dry_run["dry_run"], true);
+    assert_eq!(dry_run["superseded_groups"], 3);
+    assert_eq!(dry_run["superseded_events"], 6);
+    assert_eq!(stored_kinds().len(), 12);
+
+    let purged = wok(&["purge-superseded", "--json"]);
+    assert_eq!(purged["dry_run"], false);
+    assert_eq!(purged["superseded_groups"], 3);
+    assert_eq!(purged["superseded_events"], 6);
+    // One version per address and every regular event survive.
+    assert_eq!(stored_kinds(), [0, 1, 1, 1, 3, 30443]);
+
+    let report = wok(&["doctor", "--json"]);
+    assert_eq!(report["integrity"]["superseded_groups"], 0);
+    assert_eq!(report["integrity"]["superseded_events"], 0);
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"] == "replacement-history" && c["status"] == "pass"));
+}

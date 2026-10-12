@@ -167,6 +167,15 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete replaceable versions superseded by a newer one at the same address
+    PurgeSuperseded {
+        /// Report what would be deleted without changing the database
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit the machine-readable outcome
+        #[arg(long)]
+        json: bool,
+    },
     Compact {
         output_file: PathBuf,
     },
@@ -340,6 +349,7 @@ async fn main() -> Result<()> {
             filter,
             dry_run,
         } => cmd_delete(&cfg, age, filter, dry_run),
+        Command::PurgeSuperseded { dry_run, json } => cmd_purge_superseded(&cfg, dry_run, json),
         Command::Compact { output_file } => cmd_compact(&cfg, &output_file),
         Command::Monitor => cmd_monitor(&cfg),
         Command::Dict { cmd } => cmd_dict(&cfg, cmd),
@@ -809,6 +819,39 @@ fn cmd_delete(cfg: &Config, age: Option<u64>, filter: Option<String>, dry_run: b
     let mut sink = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
     delete_events(&mut txn, &mut sink, levs)?;
     txn.commit()?;
+    Ok(())
+}
+
+/// Versions deleted per write transaction, so the relay's writer interleaves.
+const PURGE_SUPERSEDED_BATCH: u64 = 10_000;
+
+fn cmd_purge_superseded(cfg: &Config, dry_run: bool, json: bool) -> Result<()> {
+    let env = open_env(cfg)?;
+    let history = if dry_run {
+        wok_db::count_superseded_ro(&env.begin_ro()?)?
+    } else {
+        let max_tags = cfg.relay.max_tags_per_filter;
+        wok_db::purge_superseded(
+            &env,
+            || wok_negentropy::NegentropyFilterCache::new(max_tags),
+            PURGE_SUPERSEDED_BATCH,
+        )?
+    };
+    if json {
+        let outcome = serde_json::json!({
+            "dry_run": dry_run,
+            "superseded_groups": history.groups,
+            "superseded_events": history.events,
+        });
+        cli_println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        let verb = if dry_run { "Would delete" } else { "Deleted" };
+        cli_println!(
+            "{verb} {} superseded events in {} replacement groups.",
+            history.events,
+            history.groups
+        );
+    }
     Ok(())
 }
 

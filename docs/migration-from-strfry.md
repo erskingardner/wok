@@ -78,6 +78,8 @@ It also records `superseded_groups` and `superseded_events` for retained
 replaceable history. Preflight warns about these versions and migration reports
 the retained counts. This is advisory: all source records are preserved exactly,
 while relay queries expose only the newest version per replacement address.
+After migration, `wok purge-superseded` can delete the retained versions; see
+[mesh and maintenance](mesh-and-maintenance.md#storage-checks-and-repair).
 
 ## Config review
 

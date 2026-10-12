@@ -17,6 +17,23 @@ quota-rejected writes leave existing records intact. Address-based deletions
 remove all matching versions at or before the deletion timestamp. Reindex and
 migration continue to preserve physical history.
 
+```console
+wok --config /etc/wok.toml purge-superseded --dry-run
+wok --config /etc/wok.toml purge-superseded --json
+```
+
+`wok purge-superseded` deletes every superseded version and keeps the version
+that relay reads already serve: the newest `created_at`, then the lowest ID. A
+winner hidden by expiration or moderation is kept too, and still removes the
+versions it supersedes. `--dry-run` reports the counts from a read-only scan.
+`--json` emits `dry_run`, `superseded_groups`, and `superseded_events`.
+The relay can keep running. Each write transaction finishes whole replacement
+groups and commits after about 10,000 deletions, so relay writes interleave.
+Each batch re-evaluates its groups. Negentropy trees, author counts, and the
+retained-history count stay consistent, and the persistent-tree sync fast path
+returns once the count reaches zero. Deleted history cannot be recovered
+except from a backup.
+
 With the relay stopped, `wok reindex --confirm-relay-stopped` can repair derived
 indexes and author counts while retaining the original database as a backup.
 It preserves the stored sequence even when the newest events have been deleted.

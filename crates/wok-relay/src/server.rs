@@ -525,6 +525,22 @@ impl ConnectionGuard {
         let _ = self.gate.subscribe().wait_for(|open| *open).await;
     }
 
+    /// Hand held messages to the ingester, in order, while ingress is not
+    /// paused. At most `HAND_OVER_BATCH` per call, so a transport that calls
+    /// this from its `select!` gets back to its outbound traffic in between.
+    pub async fn hand_over(&self, held: &mut HeldMessages) {
+        for _ in 0..HAND_OVER_BATCH {
+            if self.ingress_paused() {
+                break;
+            }
+            let Some((text, cost)) = held.queue.pop_front() else {
+                break;
+            };
+            held.bytes -= cost;
+            self.client_message(text).await;
+        }
+    }
+
     /// Cancellation covers the entire transport future, including writes and
     /// ingress backpressure. The caller then closes this guard exactly once.
     pub async fn run_until_cancelled<F: std::future::Future>(
@@ -550,6 +566,51 @@ impl ConnectionGuard {
     pub async fn close(mut self) {
         self.handle.finish_connection(self.conn_id).await;
         self.closed = true;
+    }
+}
+
+/// Memory charged per held message on top of its payload, so that empty or
+/// tiny messages still use up the hold.
+pub const HELD_MESSAGE_OVERHEAD: usize = 64;
+const HAND_OVER_BATCH: usize = 64;
+
+/// Client messages a transport has read but not yet handed to the ingester,
+/// because the connection's ingress is paused (or they arrived together).
+/// Each costs its wire payload length plus `HELD_MESSAGE_OVERHEAD`. Reading
+/// continues while paused, so control frames and disconnects are still seen;
+/// a data message that would take the hold past its limit means the client
+/// keeps sending into a stalled relay, and the transport ends the connection.
+pub struct HeldMessages {
+    queue: VecDeque<(String, usize)>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl HeldMessages {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Hold a message whose payload was `wire_len` bytes on the wire. A single
+    /// message is always held; otherwise false, and nothing is held, when the
+    /// limit would be exceeded.
+    #[must_use]
+    pub fn push(&mut self, text: String, wire_len: usize) -> bool {
+        let cost = wire_len.saturating_add(HELD_MESSAGE_OVERHEAD);
+        if !self.queue.is_empty() && self.bytes.saturating_add(cost) > self.limit {
+            return false;
+        }
+        self.bytes += cost;
+        self.queue.push_back((text, cost));
+        true
     }
 }
 
@@ -1033,7 +1094,8 @@ fn route_tx<T>(txs: &[Sender<T>], conn_id: u64) -> &Sender<T> {
 /// One worker queue as an ingester sees it. A full queue never blocks the
 /// ingester: the message is parked, and so is every later one for that worker
 /// until the backlog drains, which keeps per-worker (and so per-connection)
-/// order. Nothing is dropped, so CLOSE and connection teardown always arrive.
+/// order. Parked messages, protocol CLOSE and NEG-CLOSE included, are only
+/// dropped when their connection closes: see `Lane::close`.
 struct Lane<T> {
     tx: Sender<T>,
     parked: VecDeque<T>,

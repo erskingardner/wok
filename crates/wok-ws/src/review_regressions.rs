@@ -70,9 +70,13 @@ struct Peer {
 
 impl Peer {
     async fn send(&mut self, msg: serde_json::Value) {
+        self.send_raw(msg.to_string().as_bytes()).await;
+    }
+
+    async fn send_raw(&mut self, text: &[u8]) {
         let frame = self
             .encoder
-            .encode_message(MessageKind::Text, msg.to_string().as_bytes())
+            .encode_message(MessageKind::Text, text)
             .unwrap();
         self.io.write_all(&frame).await.unwrap();
     }
@@ -126,12 +130,16 @@ fn signed_note() -> serde_json::Value {
     event
 }
 
-/// While ingress is paused (earlier work parked behind a busy worker), the
-/// WebSocket keeps delivering outbound frames and answering control frames,
-/// holds client messages until ingress resumes, and a client Close still
-/// tears the connection down.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn paused_ingress_keeps_websocket_output_and_control() {
+/// The largest message, and so the hold, in the paused-ingress tests.
+const HOLD: usize = 4096;
+
+/// A relay with one WebSocket client whose subscription "live" is open.
+async fn paused_ingress_relay() -> (
+    tempfile::TempDir,
+    Arc<RelayHandle>,
+    Peer,
+    tokio::task::JoinHandle<()>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
     let mut cfg = Config::default();
@@ -144,7 +152,7 @@ async fn paused_ingress_keeps_websocket_output_and_control() {
         stream,
         handle.clone(),
         "127.0.0.1:9000".parse().unwrap(),
-        1 << 20,
+        HOLD,
         false,
         false,
     ));
@@ -157,6 +165,24 @@ async fn paused_ingress_keeps_websocket_output_and_control() {
     peer.send(serde_json::json!(["REQ", "live", {"kinds": [1]}]))
         .await;
     assert!(peer.next_text().await.contains("EOSE"));
+    (dir, handle, peer, task)
+}
+
+async fn assert_connection_ends(handle: &RelayHandle, task: tokio::task::JoinHandle<()>) {
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("connection did not close")
+        .unwrap();
+    assert_eq!(handle.metrics.active_connections.load(Ordering::Relaxed), 0);
+}
+
+/// While ingress is paused (earlier work parked behind a busy worker), the
+/// WebSocket keeps delivering outbound frames and answering control frames,
+/// holds client messages until ingress resumes, and a client Close still
+/// tears the connection down, even with the hold full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_ingress_keeps_websocket_output_and_control() {
+    let (_dir, handle, mut peer, task) = paused_ingress_relay().await;
     let conn_id = 1;
     let reqs = || handle.metrics.client_req.load(Ordering::Relaxed);
     assert_eq!(reqs(), 1);
@@ -186,18 +212,29 @@ async fn paused_ingress_keeps_websocket_output_and_control() {
     assert!(peer.next_text().await.contains("\"EOSE\",\"held\""));
     assert_eq!(reqs(), 2);
 
-    // Paused again, a Close still ends the connection; the held REQ goes
-    // with it.
+    // Paused again with the hold filled to its limit, a Close still ends
+    // the connection; the held messages go with it.
     handle.set_ingress_paused(conn_id, true);
-    peer.send(serde_json::json!(["REQ", "dropped", {"limit": 0}]))
-        .await;
+    for _ in 0..HOLD / wok_relay::HELD_MESSAGE_OVERHEAD {
+        peer.send_raw(b"").await;
+    }
     peer.control(frame::OP_CLOSE, &[]).await;
     assert!(matches!(peer.next().await, WsEvent::Close(_)));
-    tokio::time::timeout(Duration::from_secs(2), task)
-        .await
-        .expect("connection did not close")
-        .unwrap();
-    assert_eq!(handle.metrics.active_connections.load(Ordering::Relaxed), 0);
+    assert_connection_ends(&handle, task).await;
     assert_eq!(reqs(), 2);
+    handle.request_shutdown();
+}
+
+/// A client that keeps sending into a paused connection is closed once its
+/// hold is full, even empty messages counting, instead of buffering without
+/// bound until the worker recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_ingress_closes_a_websocket_that_overflows_its_hold() {
+    let (_dir, handle, mut peer, task) = paused_ingress_relay().await;
+    handle.set_ingress_paused(1, true);
+    for _ in 0..=HOLD / wok_relay::HELD_MESSAGE_OVERHEAD {
+        peer.send_raw(b"").await;
+    }
+    assert_connection_ends(&handle, task).await;
     handle.request_shutdown();
 }

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use wok_relay::{Config, Outbound, OutboundFrame, RelayHandle, TransportSource};
+use wok_relay::{Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource};
 
 #[derive(Debug, thiserror::Error)]
 pub enum UnixError {
@@ -208,24 +208,43 @@ async fn handle_conn(
     tracing::info!(conn_id, transport = "unix", "client connected");
     let (mut rd, mut wr) = stream.split();
     let reader = async {
+        // The socket stays read while ingress is paused (earlier messages
+        // parked behind a busy worker), so a disconnect is still seen; frames
+        // read meanwhile are held, and a client that overflows the hold is
+        // closed. `read_buf` keeps partial frames across select! cancellation.
+        let mut buf = Vec::with_capacity(READ_CHUNK);
+        let mut held = HeldMessages::new(max_frame);
         loop {
-            // While earlier messages are parked behind a busy worker, leave
-            // the socket unread; the writer future keeps flushing outbound.
-            connection.ingress_resumed().await;
-            let mut header = [0u8; 4];
-            rd.read_exact(&mut header).await?;
-            let n = u32::from_be_bytes(header) as usize;
-            if n > max_frame {
-                return Err(UnixError::Message(format!("frame too large: {n}")));
+            if buf.capacity() - buf.len() < READ_CHUNK {
+                buf.reserve(READ_CHUNK);
             }
-            let mut body = vec![0u8; n];
-            rd.read_exact(&mut body).await?;
-            let text = String::from_utf8(body)
-                .map_err(|_| UnixError::Message("frame not utf-8".into()))?;
-            connection.client_message(text).await;
+            tokio::select! {
+                _ = connection.ingress_resumed(), if !held.is_empty() => {
+                    connection.hand_over(&mut held).await;
+                }
+                n = rd.read_buf(&mut buf) => {
+                    if n? == 0 {
+                        while !held.is_empty() && !connection.ingress_paused() {
+                            connection.hand_over(&mut held).await;
+                        }
+                        return Ok(());
+                    }
+                    let mut start = 0;
+                    while let Some(body) = next_frame(&buf[start..], max_frame)? {
+                        start += 4 + body.len();
+                        let text = std::str::from_utf8(body)
+                            .map_err(|_| UnixError::Message("frame not utf-8".into()))?;
+                        if !held.push(text.to_owned(), body.len()) {
+                            return Err(UnixError::Message(
+                                "too many frames while ingress is paused".into(),
+                            ));
+                        }
+                    }
+                    buf.drain(..start);
+                    connection.hand_over(&mut held).await;
+                }
+            }
         }
-        #[allow(unreachable_code)]
-        Ok::<_, UnixError>(())
     };
     let writer = async {
         while let Some(frame) = rx.recv().await {
@@ -249,6 +268,20 @@ async fn handle_conn(
     connection.close().await;
     tracing::info!(conn_id, transport = "unix", "client disconnected");
     result
+}
+
+const READ_CHUNK: usize = 8 * 1024;
+
+/// The first complete frame's body in `buf`, if one is there.
+fn next_frame(buf: &[u8], max_frame: usize) -> Result<Option<&[u8]>, UnixError> {
+    let Some(header) = buf.first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let n = u32::from_be_bytes(*header) as usize;
+    if n > max_frame {
+        return Err(UnixError::Message(format!("frame too large: {n}")));
+    }
+    Ok(buf.get(4..4 + n))
 }
 
 pub async fn write_frame(stream: &mut UnixStream, body: &[u8]) -> Result<(), UnixError> {
@@ -425,5 +458,83 @@ mod tests {
         remove_bound_socket(&path, identity).unwrap();
 
         assert!(path.exists());
+    }
+
+    /// A relay and one Unix client connected through `handle_conn`, with its
+    /// subscription "live" open. Frames are limited to 256 bytes, which is
+    /// also the paused-ingress hold.
+    #[allow(clippy::field_reassign_with_default)]
+    async fn paused_ingress_relay() -> (
+        tempfile::TempDir,
+        std::sync::Arc<wok_relay::RelayHandle>,
+        UnixStream,
+        tokio::task::JoinHandle<Result<(), super::UnixError>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let mut cfg = wok_relay::Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        cfg.relay.unix.max_frame_bytes = 256;
+        let handle = std::sync::Arc::new(wok_relay::start(env, cfg.clone()).unwrap());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(super::handle_conn(
+            server,
+            handle.clone(),
+            std::sync::Arc::new(cfg),
+        ));
+        write_frame(&mut client, br#"["REQ","live",{"kinds":[1]}]"#)
+            .await
+            .unwrap();
+        let eose = read_frame(&mut client, 1 << 20).await.unwrap();
+        assert!(std::str::from_utf8(&eose).unwrap().contains("EOSE"));
+        (dir, handle, client, task)
+    }
+
+    async fn assert_connection_ends(
+        handle: &wok_relay::RelayHandle,
+        task: tokio::task::JoinHandle<Result<(), super::UnixError>>,
+    ) {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("connection did not close")
+            .unwrap();
+        let active = handle
+            .metrics
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(active, 0);
+    }
+
+    /// A peer that disconnects while its ingress is paused, with nothing
+    /// outbound to fail, is still cleaned up before the worker recovers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_ingress_still_sees_a_unix_disconnect() {
+        let (_dir, handle, mut client, task) = paused_ingress_relay().await;
+        handle.set_ingress_paused(1, true);
+        write_frame(&mut client, br#"["REQ","held",{"limit":0}]"#)
+            .await
+            .unwrap();
+        drop(client);
+        assert_connection_ends(&handle, task).await;
+        let reqs = handle
+            .metrics
+            .client_req
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reqs, 1, "the held REQ reached the relay while paused");
+        handle.request_shutdown();
+    }
+
+    /// A client that keeps sending into a paused connection is closed once
+    /// its hold is full, even empty frames counting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_ingress_closes_a_unix_client_that_overflows_its_hold() {
+        let (_dir, handle, mut client, task) = paused_ingress_relay().await;
+        handle.set_ingress_paused(1, true);
+        for _ in 0..=256 / wok_relay::HELD_MESSAGE_OVERHEAD {
+            write_frame(&mut client, b"").await.unwrap();
+        }
+        assert_connection_ends(&handle, task).await;
+        handle.request_shutdown();
     }
 }

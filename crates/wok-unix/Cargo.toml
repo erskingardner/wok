@@ -19,3 +19,4 @@ wok-relay = { path = "../wok-relay" }
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
+wok-db = { path = "../wok-db" }

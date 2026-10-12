@@ -26,7 +26,7 @@ proptest! {
         operations in proptest::collection::vec(operation(), 0..129),
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let dbi = env.dbis().event_payload;
         let mut model = BTreeMap::<u64, Vec<u8>>::new();

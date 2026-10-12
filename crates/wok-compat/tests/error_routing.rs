@@ -45,7 +45,7 @@ struct Rig {
 }
 
 async fn start_rig(dir: &std::path::Path) -> Rig {
-    let env = Env::open(dir, EnvOptions::default()).unwrap();
+    let env = Env::open(dir, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir);
     let handle = wok_relay::start(env, cfg).unwrap();

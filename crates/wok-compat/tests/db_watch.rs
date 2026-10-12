@@ -22,7 +22,7 @@ fn now_secs() -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_writer_triggers_live_delivery() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut cfg = Config::default();
     cfg.db = dir.path().to_path_buf();

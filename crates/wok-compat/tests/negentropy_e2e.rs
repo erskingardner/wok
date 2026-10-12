@@ -58,7 +58,7 @@ async fn recv_matching(
 }
 
 async fn start_server(dir: &std::path::Path) -> (wok_relay::RelayHandle, std::net::SocketAddr) {
-    let env = Env::open(dir, EnvOptions::default()).unwrap();
+    let env = Env::open(dir, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let cfg = test_cfg(dir);
     let handle = wok_relay::start(env, cfg).unwrap();
@@ -73,7 +73,7 @@ async fn start_server(dir: &std::path::Path) -> (wok_relay::RelayHandle, std::ne
 }
 
 fn write_and_build_default_tree(dir: &std::path::Path) {
-    let env = Env::open(dir, EnvOptions::default()).unwrap();
+    let env = Env::open(dir, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut evs = Vec::new();
     for i in 0..3u64 {

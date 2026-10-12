@@ -358,7 +358,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let database = root.path().join("db");
         let backup = root.path().join("backup");
-        let env = Env::open(&database, EnvOptions::default()).unwrap();
+        let env = Env::open(&database, EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let (packed, json) = signed_event();
         let mut events = vec![EventToWrite::new(packed.clone(), json)];
@@ -411,7 +411,7 @@ mod tests {
             EnvOptions {
                 create_dir: false,
                 create_dbis: false,
-                ..EnvOptions::default()
+                ..EnvOptions::for_tests()
             },
         )
         .unwrap();
@@ -443,7 +443,7 @@ mod tests {
             EnvOptions {
                 create_dir: false,
                 create_dbis: false,
-                ..EnvOptions::default()
+                ..EnvOptions::for_tests()
             },
         )
         .unwrap();
@@ -456,7 +456,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let database = root.path().join("db");
             let backup = root.path().join("backup");
-            let env = Env::open(&database, EnvOptions::default()).unwrap();
+            let env = Env::open(&database, EnvOptions::for_tests()).unwrap();
             env.ensure_initialized().unwrap();
             let (packed, json) = signed_event();
             let mut events = [EventToWrite::new(packed, json)];
@@ -497,7 +497,7 @@ mod tests {
                     read_only: true,
                     create_dbis: false,
                     create_dir: false,
-                    ..EnvOptions::default()
+                    ..EnvOptions::for_tests()
                 },
             )
             .unwrap();

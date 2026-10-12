@@ -57,7 +57,7 @@ fn sign_with_tags(content: &str, created: u64, tags: &[&str]) -> (Vec<u8>, Strin
 #[test]
 fn scan_kinds_and_limit() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut evs = Vec::new();
     let mut ids = Vec::new();
@@ -87,7 +87,7 @@ fn scan_kinds_and_limit() {
 #[test]
 fn nip91_historical_scan_uses_one_seed_and_verifies_the_full_event() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let inputs = [
         ("black", 100, &["meme", "cat", "black"][..]),
@@ -145,7 +145,7 @@ fn nip91_historical_scan_uses_one_seed_and_verifies_the_full_event() {
 #[test]
 fn request_wide_limit_caps_deduplicated_multi_filter_results_but_not_count() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut events = Vec::new();
     for i in 0..5 {
@@ -187,7 +187,7 @@ fn request_wide_limit_caps_deduplicated_multi_filter_results_but_not_count() {
 #[test]
 fn count_dedup_budget_caps_multi_filter_scans_as_limited() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut events = Vec::new();
     for i in 0..5 {
@@ -219,7 +219,7 @@ fn count_dedup_budget_caps_multi_filter_scans_as_limited() {
 #[test]
 fn deep_author_kind_pages_are_complete_and_non_overlapping() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut rng = rand::thread_rng();
     let key = Keypair::new(SECP256K1, &mut rng);
@@ -308,7 +308,7 @@ fn deep_author_kind_pages_are_complete_and_non_overlapping() {
 #[test]
 fn nip91_and_tag_seeds_a_single_cursor() {
     let tmp = TempDir::new().unwrap();
-    let env = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let txn = env.begin_ro().unwrap();
 

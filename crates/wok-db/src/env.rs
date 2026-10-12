@@ -54,6 +54,20 @@ impl Default for EnvOptions {
     }
 }
 
+impl EnvOptions {
+    /// Defaults with a 1 GiB map for tests and fixtures.
+    ///
+    /// Each open env reserves `map_size` of virtual address space, so many
+    /// concurrently running tests at the 10 TiB production default exhaust it
+    /// and fail with `ENOMEM`. Not for production databases.
+    pub fn for_tests() -> Self {
+        Self {
+            map_size: 1 << 30,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Dbis {
     pub meta: MDB_dbi,
@@ -522,7 +536,7 @@ mod tests {
     #[test]
     fn explicit_read_only_environment_supports_reads_and_refuses_writes() {
         let temp = tempfile::tempdir().unwrap();
-        let writable = Env::open(temp.path(), EnvOptions::default()).unwrap();
+        let writable = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
         writable.ensure_initialized().unwrap();
         drop(writable);
 
@@ -532,7 +546,7 @@ mod tests {
                 create_dir: false,
                 create_dbis: false,
                 read_only: true,
-                ..EnvOptions::default()
+                ..EnvOptions::for_tests()
             },
         )
         .unwrap();

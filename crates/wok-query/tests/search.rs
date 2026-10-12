@@ -46,7 +46,7 @@ fn contents(env: &Env, lev_ids: &[u64]) -> Vec<String> {
 #[test]
 fn search_is_ranked_then_limited_and_honors_structured_filters() {
     let temp = TempDir::new().unwrap();
-    let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut events = vec![
         sign(1, "Nostr search makes relays useful", 100),
@@ -79,7 +79,7 @@ fn search_is_ranked_then_limited_and_honors_structured_filters() {
 #[test]
 fn search_ignores_extensions_and_is_unicode_case_insensitive() {
     let temp = TempDir::new().unwrap();
-    let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut events = vec![sign(1, "A CAFÉ for Nostr users", 100)];
     let mut txn = env.begin_rw().unwrap();
@@ -103,7 +103,7 @@ fn search_ignores_extensions_and_is_unicode_case_insensitive() {
 #[test]
 fn delete_removes_search_postings_and_missing_index_is_backfilled() {
     let temp = TempDir::new().unwrap();
-    let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut events = vec![sign(1, "backfill sentinel", 100)];
     let mut txn = env.begin_rw().unwrap();
@@ -150,7 +150,7 @@ fn delete_removes_search_postings_and_missing_index_is_backfilled() {
 #[test]
 fn multiple_search_filters_are_merged_by_quality() {
     let temp = TempDir::new().unwrap();
-    let env = Env::open(temp.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut events = vec![
         sign(1, "common first", 100),

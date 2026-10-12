@@ -6,7 +6,7 @@ use wok_db::{check_integrity, Env, EnvOptions, EventToWrite, NoopNegentropy};
 fn fixture() -> (tempfile::TempDir, Env, Vec<u8>) {
     use secp256k1::{Keypair, SECP256K1};
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
     let public = key.x_only_public_key().0.serialize();

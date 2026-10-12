@@ -655,7 +655,7 @@ mod tests {
         let source_config = temp.path().join("strfry.conf");
         let output = temp.path().join("wok-output");
 
-        let source = Env::open(&source_db, EnvOptions::default()).unwrap();
+        let source = Env::open(&source_db, EnvOptions::for_tests()).unwrap();
         {
             let mut txn = source.begin_rw().unwrap();
             txn.put_u64(
@@ -716,9 +716,9 @@ mod tests {
             source_data_before,
             "migration modified the source data.mdb"
         );
-        let source = Env::open(&source_db, EnvOptions::default()).unwrap();
+        let source = Env::open(&source_db, EnvOptions::for_tests()).unwrap();
         assert_eq!(source.db_version().unwrap(), wok_event::STRFRY_DB_VERSION);
-        let target = Env::open(output.join("db"), EnvOptions::default()).unwrap();
+        let target = Env::open(output.join("db"), EnvOptions::for_tests()).unwrap();
         target.ensure_initialized().unwrap();
         assert_eq!(target.db_version().unwrap(), wok_event::WOK_DB_VERSION);
         assert_eq!(event_fingerprint(&target).unwrap(), source_fingerprint);

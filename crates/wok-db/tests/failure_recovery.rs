@@ -49,7 +49,7 @@ fn crash_child_leaves_a_write_transaction_uncommitted() {
     }
 
     let path = std::env::var_os(CRASH_DB_ENV).expect("child database path");
-    let env = Env::open(path, EnvOptions::default()).unwrap();
+    let env = Env::open(path, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut event = signed_event("must not survive abort", 1_800_000_001);
     let mut txn = env.begin_rw().unwrap();
@@ -69,7 +69,7 @@ fn crash_child_leaves_a_write_transaction_uncommitted() {
 #[test]
 fn restart_after_writer_crash_preserves_only_committed_events() {
     let directory = TempDir::new().unwrap();
-    let env = Env::open(directory.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut baseline = signed_event("committed baseline", 1_800_000_000);
     write_and_commit(&env, &mut baseline);
@@ -90,7 +90,7 @@ fn restart_after_writer_crash_preserves_only_committed_events() {
         "crash fixture unexpectedly exited cleanly"
     );
 
-    let reopened = Env::open(directory.path(), EnvOptions::default()).unwrap();
+    let reopened = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
     reopened.ensure_initialized().unwrap();
     let txn = reopened.begin_ro().unwrap();
     let report = check_integrity(&txn).unwrap();

@@ -4,7 +4,7 @@ use wok_db::{Env, EnvOptions};
 #[test]
 fn review_cursor_key_must_be_owned_by_transaction() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut txn = env.begin_rw().unwrap();
     txn.put_u64(env.dbis().event, 1, b"value", 0).unwrap();
@@ -34,7 +34,7 @@ fn stored_event(id: u8, timestamp: u64, kind: u64) -> wok_db::EventToWrite {
 fn sequence_and_author_counts_survive_deletion_abort_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut txn = env.begin_rw().unwrap();
         let mut events = vec![stored_event(1, 1, 1), stored_event(2, 2, 1)];
@@ -50,7 +50,7 @@ fn sequence_and_author_counts_survive_deletion_abort_and_reopen() {
         assert_eq!(aborted[0].lev_id, 3);
         txn.abort();
     }
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     let mut txn = env.begin_rw().unwrap();
     assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 1);
     let mut events = [stored_event(4, 4, 1)];
@@ -63,7 +63,7 @@ fn sequence_and_author_counts_survive_deletion_abort_and_reopen() {
 #[test]
 fn quota_uses_net_replacement_and_deletion_effect() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut txn = env.begin_rw().unwrap();
     let mut events = [
@@ -91,7 +91,7 @@ fn v4_upgrade_preserves_records_and_initializes_state_lazily() {
     let dir = tempfile::tempdir().unwrap();
     let original;
     {
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut txn = env.begin_rw().unwrap();
         let mut events = [stored_event(1, 1, 1)];
@@ -107,7 +107,7 @@ fn v4_upgrade_preserves_records_and_initializes_state_lazily() {
             .unwrap();
         txn.commit().unwrap();
     }
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     assert_eq!(env.db_version().unwrap(), wok_event::WOK_DB_VERSION);
     let mut txn = env.begin_rw().unwrap();
     assert_eq!(txn.get_u64(env.dbis().event, 1).unwrap().unwrap(), original);
@@ -123,7 +123,7 @@ fn v4_upgrade_preserves_records_and_initializes_state_lazily() {
 fn reindex_preserves_deleted_tail_and_rebuilds_author_counts() {
     let source_dir = tempfile::tempdir().unwrap();
     let target_dir = tempfile::tempdir().unwrap();
-    let source = Env::open(source_dir.path(), EnvOptions::default()).unwrap();
+    let source = Env::open(source_dir.path(), EnvOptions::for_tests()).unwrap();
     source.ensure_initialized().unwrap();
     let mut txn = source.begin_rw().unwrap();
     let mut events = [stored_event(1, 1, 1), stored_event(2, 2, 1)];
@@ -139,7 +139,7 @@ fn reindex_preserves_deleted_tail_and_rebuilds_author_counts() {
     txn.put(source.dbis().state.unwrap(), &key, &999u64.to_le_bytes(), 0)
         .unwrap();
     txn.commit().unwrap();
-    let target = Env::open(target_dir.path(), EnvOptions::default()).unwrap();
+    let target = Env::open(target_dir.path(), EnvOptions::for_tests()).unwrap();
     let mut txn = target.begin_rw().unwrap();
     wok_db::rebuild_primary_and_event_indices(&source.begin_ro().unwrap(), &mut txn).unwrap();
     txn.commit().unwrap();
@@ -154,7 +154,7 @@ fn reindex_preserves_deleted_tail_and_rebuilds_author_counts() {
 #[test]
 fn duplicate_cursor_seek_returns_database_owned_key_and_value() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut txn = env.begin_rw().unwrap();
     let key = wok_db::keys::make_key_string_u64(&[8; 32], 42);
@@ -177,7 +177,7 @@ fn duplicate_cursor_seek_returns_database_owned_key_and_value() {
 #[test]
 fn unused_author_counts_stay_absent_until_requested_after_mutations() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut key = vec![b'a'];
     key.extend_from_slice(&[9; 32]);
@@ -203,7 +203,7 @@ fn unused_author_counts_stay_absent_until_requested_after_mutations() {
     assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 2);
     txn.commit().unwrap();
     drop(env);
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     let mut txn = env.begin_rw().unwrap();
     wok_db::delete_event_basic(&mut txn, events[0].lev_id).unwrap();
     txn.commit().unwrap();
@@ -219,7 +219,7 @@ fn unused_author_counts_stay_absent_until_requested_after_mutations() {
 #[test]
 fn enabling_quota_counts_preexisting_events_and_disabling_keeps_cache_current() {
     let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let mut txn = env.begin_rw().unwrap();
     let mut events = [stored_event(1, 1, 1), stored_event(2, 2, 1)];

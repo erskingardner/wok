@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn stored_write_permitted_sees_committed_revocations() {
         let dir = tempfile::tempdir().unwrap();
-        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::default()).unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
         let mut cfg = Config::default();
         cfg.relay.auth.restrict_writes = true;
         let admin_pk = [1u8; 32];

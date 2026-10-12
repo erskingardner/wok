@@ -49,7 +49,7 @@ or protect it at the reverse proxy. The endpoint is unauthenticated and sends
 | Value | Trigger |
 |---|---|
 | `connection_rate` | Network-address connection bucket exhausted. |
-| `event_rate` | Per-connection or per-author EVENT budget exhausted (AUTH included). |
+| `event_rate` | Per-address EVENT/AUTH or per-author EVENT budget exhausted. |
 | `req_rate` | REQ budget exhausted. |
 | `count_rate` | COUNT budget exhausted. |
 | `pow` | Event did not meet the configured NIP-13 difficulty. |

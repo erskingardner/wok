@@ -61,6 +61,7 @@ pub(super) fn run_writer(
             }
         }
         let cfg_snap = cfg.read().clone();
+        plugin.set_timeout(cfg_snap.relay.write_policy_timeout_secs);
         if maintenance_requested {
             run_maintenance(&env, &cfg_snap, &mut maintenance_cursor);
         }

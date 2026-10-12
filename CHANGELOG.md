@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do not use the busy worker keep going. A disconnect drops that connection's
   parked work (REQs, sync messages and unwritten events) instead of running it
   first, and frees its subscriptions, sync sessions and memory reservations.
+- Three settings documented as live now take effect on reload instead of
+  keeping their startup value until restart: `relay.write_policy_timeout_secs`
+  (the write-policy plugin's deadline), `relay.max_subs_per_connection`, and
+  the COUNT dedup budget derived from `relay.max_filter_limit_count`. An
+  operator who shortened the plugin timeout to contain a hanging plugin was
+  still waiting the old duration (#54).
 
 ### Added
 

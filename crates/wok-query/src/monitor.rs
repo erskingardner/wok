@@ -44,12 +44,24 @@ impl ActiveMonitors {
         }
     }
 
+    /// Apply a reloaded per-connection cap. Subscriptions over a lowered cap
+    /// stay and can still be replaced; new ids are refused until the count
+    /// drops.
+    pub fn set_max_subs(&mut self, max_subs: usize) {
+        self.max_subs = max_subs;
+    }
+
     pub fn add_sub(&mut self, sub: Subscription, _curr_event_id: u64) -> bool {
-        self.remove_sub(sub.conn_id, &sub.sub_id);
-        let conn = self.conns.entry(sub.conn_id).or_default();
-        if conn.len() >= self.max_subs {
+        // Only a new id takes a slot. Replacing an open one must succeed even
+        // when a lowered cap leaves the connection over it, or the client
+        // keeps an id that silently stops receiving.
+        let open = self.conns.get(&sub.conn_id);
+        let replacing = open.is_some_and(|conn| conn.contains_key(&sub.sub_id));
+        if !replacing && open.map_or(0, |conn| conn.len()) >= self.max_subs {
             return false;
         }
+        self.remove_sub(sub.conn_id, &sub.sub_id);
+        let conn = self.conns.entry(sub.conn_id).or_default();
         let conn_id = sub.conn_id;
         let sub_id = sub.sub_id.clone();
         conn.insert(sub_id.clone(), sub);

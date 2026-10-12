@@ -159,7 +159,7 @@ pub async fn dispatch(
         Err(error) => return response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
     };
     let absolute_url = format!("{}{}", cfg.admin.public_url, path_and_query);
-    let (admin_pubkey, replay_id, replay_created_at) = match authorize(
+    let (admin_pubkey, replay) = match authorize(
         authorization.as_deref(),
         &method,
         &body,
@@ -187,12 +187,7 @@ pub async fn dispatch(
         _ => response(StatusCode::NOT_FOUND, "text/plain", "not found"),
     };
     if resp.status().is_success() {
-        commit_replay_id(
-            &state,
-            replay_id,
-            replay_created_at,
-            cfg.admin.auth_window_secs,
-        );
+        replay.commit();
     }
     resp
 }
@@ -222,15 +217,50 @@ pub(crate) struct AuthzPolicy<'a> {
     pub require_payload: bool,
 }
 
-/// Verify a NIP-98 authorization event against the caller's policy.
-pub(crate) fn authorize(
+/// A NIP-98 event ID held in the replay cache for one in-flight request.
+/// [`commit`](Self::commit) keeps it burned after success; dropping the
+/// reservation uncommitted (a failed or cancelled request) releases it so a
+/// retryable failure doesn't force the client to re-sign. Concurrent requests
+/// carrying the same event are refused while it is held (#51).
+pub(crate) struct ReplayReservation<'a> {
+    state: &'a AdminState,
+    id: [u8; 32],
+    committed: bool,
+}
+
+impl ReplayReservation<'_> {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl std::fmt::Debug for ReplayReservation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayReservation")
+            .field("id", &hex::encode(self.id))
+            .field("committed", &self.committed)
+            .finish()
+    }
+}
+
+impl Drop for ReplayReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.state.used_auth.lock().remove(&self.id);
+        }
+    }
+}
+
+/// Verify a NIP-98 authorization event against the caller's policy and
+/// reserve its ID against replay.
+pub(crate) fn authorize<'a>(
     authorization: Option<&str>,
     method: &Method,
     body: &[u8],
     cfg: &Config,
-    state: &AdminState,
+    state: &'a AdminState,
     policy: &AuthzPolicy<'_>,
-) -> Result<(String, [u8; 32], u64), String> {
+) -> Result<(String, ReplayReservation<'a>), String> {
     let encoded = authorization
         .and_then(|value| value.strip_prefix("Nostr "))
         .ok_or_else(|| "missing Nostr authorization".to_string())?;
@@ -287,28 +317,17 @@ pub(crate) fn authorize(
     if used.len() >= MAX_REPLAY_IDS {
         return Err("NIP-98 replay cache is full".into());
     }
-    // The ID is NOT burned here: it is committed only after the request
-    // completes with a 2xx, so a retryable failure (validation 400, config
-    // write 500) doesn't force the client to re-sign.
-    Ok((pubkey, id, packed.created_at()))
-}
-
-/// Burn a replay-cache ID after its request completed successfully.
-pub(crate) fn commit_replay_id(
-    state: &AdminState,
-    id: [u8; 32],
-    created_at: u64,
-    window_secs: u64,
-) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut used = state.used_auth.lock();
-    used.retain(|_, c| c.abs_diff(now) <= window_secs);
-    if used.len() < MAX_REPLAY_IDS {
-        used.insert(id, created_at);
-    }
+    // Reserve under the same lock as the check, so two concurrent requests
+    // carrying one signed event cannot both pass it.
+    used.insert(id, packed.created_at());
+    Ok((
+        pubkey,
+        ReplayReservation {
+            state,
+            id,
+            committed: false,
+        },
+    ))
 }
 
 fn single_tag<'a>(event: &'a serde_json::Value, name: &str) -> Result<&'a str, String> {
@@ -906,54 +925,23 @@ mod tests {
         let state = AdminState::default();
         let body = br#"{"history":{"max_points":10}}"#;
         let header = signed_auth(&key, "https://relay.example/admin/api/config", "PUT", body);
-        let (_, replay_id, replay_created_at) = authorize(
-            Some(&header),
-            &Method::PUT,
-            body,
-            &cfg,
-            &state,
-            &AuthzPolicy {
-                url_ok: &|signed| signed == "https://relay.example/admin/api/config",
-                require_config_admin: true,
-                require_payload: false,
-            },
-        )
-        .unwrap();
-        // Not yet burned: a retry of a failed request with the same signed
-        // event is still allowed until the 2xx commit.
-        assert!(authorize(
-            Some(&header),
-            &Method::PUT,
-            body,
-            &cfg,
-            &state,
-            &AuthzPolicy {
-                url_ok: &|signed| signed == "https://relay.example/admin/api/config",
-                require_config_admin: true,
-                require_payload: false,
-            },
-        )
-        .is_ok());
-        commit_replay_id(
-            &state,
-            replay_id,
-            replay_created_at,
-            cfg.admin.auth_window_secs,
-        );
-        assert!(authorize(
-            Some(&header),
-            &Method::PUT,
-            body,
-            &cfg,
-            &state,
-            &AuthzPolicy {
-                url_ok: &|signed| signed == "https://relay.example/admin/api/config",
-                require_config_admin: true,
-                require_payload: false,
-            },
-        )
-        .unwrap_err()
-        .contains("already been used"));
+        let policy = AuthzPolicy {
+            url_ok: &|signed| signed == "https://relay.example/admin/api/config",
+            require_config_admin: true,
+            require_payload: false,
+        };
+        let auth = || authorize(Some(&header), &Method::PUT, body, &cfg, &state, &policy);
+        let (_, replay) = auth().unwrap();
+        // While the first request is in flight, the same signed event cannot
+        // authorize a concurrent second one (#51).
+        assert!(auth().unwrap_err().contains("already been used"));
+        // A failed or cancelled request releases its reservation, so the
+        // client can retry without re-signing.
+        drop(replay);
+        let (_, replay) = auth().unwrap();
+        // Success burns the ID for the rest of the window.
+        replay.commit();
+        assert!(auth().unwrap_err().contains("already been used"));
 
         let wrong_payload = signed_auth(
             &key,

@@ -99,7 +99,7 @@ pub async fn dispatch(
         Ok(body) => body,
         Err(error) => return admin::response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
     };
-    let (signer_hex, replay_id, replay_created_at) = match admin::authorize(
+    let (signer_hex, replay) = match admin::authorize(
         authorization.as_deref(),
         &Method::POST,
         &body,
@@ -132,12 +132,7 @@ pub async fn dispatch(
     let outcome = execute(&handle, level, &body).await;
     match outcome {
         Ok(result) => {
-            admin::commit_replay_id(
-                &state,
-                replay_id,
-                replay_created_at,
-                cfg.admin.auth_window_secs,
-            );
+            replay.commit();
             admin::json(StatusCode::OK, json!({ "result": result }))
         }
         Err(error) => admin::json(StatusCode::OK, json!({ "error": error })),

@@ -23,7 +23,9 @@ Request and response bodies follow the pinned spec:
 Method-level failures return HTTP 200 with an `error` field. Authentication
 failures return 401. Signed authorization events are single-use within
 `admin.auth_window_secs`; clients must include a unique tag (for example a
-random `nonce`) so same-second calls do not collide in the replay cache.
+random `nonce`) so same-second calls do not collide in the replay cache. An
+event is reserved while its request runs, so a concurrent request reusing it is
+refused; a request that fails releases it for a retry with the same event.
 
 ## Supported methods
 

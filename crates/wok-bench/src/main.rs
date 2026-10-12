@@ -1239,9 +1239,30 @@ fn start_target(
 
 fn stop_target(child: &mut Option<Child>) {
     if let Some(child) = child {
-        let _ = child.kill();
-        let _ = child.wait();
+        stop_relay(child);
     }
+}
+
+/// Graceful stop first so the relay closes LMDB. On macOS a SIGKILLed relay
+/// leaks its two POSIX semaphores once the trial's temp database is deleted;
+/// enough trials exhaust kern.posix.sem.max (docs/production-deployment.md).
+/// SIGUSR1 is the graceful shutdown signal of both Wok and strfry.
+fn stop_relay(child: &mut Child) {
+    let terminated = Command::new("kill")
+        .args(["-USR1", &child.id().to_string()])
+        .status()
+        .is_ok_and(|status| status.success());
+    if terminated {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 type WebSocketClient =
@@ -2064,8 +2085,7 @@ fn ws_search_trial(
         }
         Ok::<_, anyhow::Error>((done, returned, mismatches, elapsed))
     });
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_relay(&mut child);
     let (done, returned, mismatches, elapsed) = out?;
     let qps = done as f64 / elapsed.as_secs_f64();
     let notes = format!("{done} ranked NIP-50 REQs over {n} events, {returned} verified results");
@@ -2309,8 +2329,7 @@ fn cold_start_trial(
         Ok::<_, anyhow::Error>(())
     });
     let ms = start.elapsed().as_micros().max(1) as u64 / 1000;
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_relay(&mut child);
     out?;
     hist.record(ms.saturating_mul(1000))?;
     Ok(ms)

@@ -171,12 +171,8 @@ struct Reader {
 impl Reader {
     async fn connect(endpoint: &str) -> Self {
         let mut wire = Wire::connect(endpoint).await.unwrap();
-        wire.send(json!(["REQ","challenge",{"kinds":[4]}]))
-            .await
-            .unwrap();
         let auth = wire.recv().await.unwrap();
         assert_eq!(auth[0], "AUTH", "{auth}");
-        assert_eq!(wire.recv().await.unwrap()[0], "CLOSED");
         wire.send(json!(["REQ","live",{"kinds":[0,1,4,5,1059],"limit":0}]))
             .await
             .unwrap();
@@ -458,6 +454,7 @@ async fn generated_privacy_lifecycle_matches_model_over_both_transports() {
         let keys = keys();
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut publisher = Wire::connect(&fixture.endpoints[0]).await.unwrap();
+        assert_eq!(publisher.recv().await.unwrap()[0], "AUTH");
         let mut readers = vec![
             Reader::connect(&fixture.endpoints[0]).await,
             Reader::connect(&fixture.endpoints[1]).await,
@@ -615,14 +612,10 @@ async fn in_flight_sync_revokes_on_auth_policy_deletion_ban_and_expiry() {
             let mut publisher = Wire::connect(&fixture.endpoints[1 - transport])
                 .await
                 .unwrap();
+            assert_eq!(publisher.recv().await.unwrap()[0], "AUTH");
             let mut reader = Wire::connect(&fixture.endpoints[transport]).await.unwrap();
-            reader
-                .send(json!(["REQ","challenge",{"kinds":[4]}]))
-                .await
-                .unwrap();
             let challenge = reader.recv().await.unwrap();
             assert_eq!(challenge[0], "AUTH");
-            assert_eq!(reader.recv().await.unwrap()[0], "CLOSED");
             let tags = if change == "expiry" {
                 json!([["expiration", (now() + 3).to_string()]])
             } else {

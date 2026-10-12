@@ -154,6 +154,54 @@ async fn auth_required_only_while_authenticating_can_help() {
     conn.close().await;
 }
 
+/// NIP-46 over a relay that restricts kind 24133: the client subscribes to its
+/// responses and publishes a request straight away. The response is ephemeral
+/// and reaches only live subscriptions, so if the relay challenged only after
+/// refusing the REQ, the response could arrive while the client was still
+/// authenticating and re-subscribing, and be lost. With AUTH usable, the
+/// challenge comes on connect so the client can authenticate before its first
+/// REQ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_challenge_is_sent_on_connect() {
+    let relay = Relay::new(|cfg| {
+        cfg.relay.auth.service_url = SERVICE_URL.into();
+        cfg.relay.auth.restricted_read_kinds = vec![24133];
+    });
+    let client_key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+    let client_pk = hex::encode(client_key.x_only_public_key().0.serialize());
+
+    let (client, mut client_rx) = relay.connection().await;
+    let challenge = recv(&mut client_rx).await;
+    assert_eq!(challenge[0], "AUTH", "{challenge}");
+    let auth = wok_compat::sign_event_with_key(
+        json!({"created_at":now(),"kind":22242,
+            "tags":[["relay",SERVICE_URL],["challenge",challenge[1]]],"content":""}),
+        &client_key,
+    );
+    send(&client, json!(["AUTH", auth])).await;
+    assert_eq!(recv(&mut client_rx).await[2], true);
+    send(
+        &client,
+        json!(["REQ", "nip46", {"kinds":[24133],"#p":[client_pk]}]),
+    )
+    .await;
+    assert_eq!(recv(&mut client_rx).await, json!(["EOSE", "nip46"]));
+
+    let (bunker, mut bunker_rx) = relay.connection().await;
+    assert_eq!(recv(&mut bunker_rx).await[0], "AUTH");
+    let response = wok_compat::sign_event(
+        json!({"created_at":now(),"kind":24133,"tags":[["p",client_pk]],"content":"ack"}),
+    );
+    send(&bunker, json!(["EVENT", response])).await;
+    assert_eq!(recv(&mut bunker_rx).await[2], true);
+
+    let delivered = recv(&mut client_rx).await;
+    assert_eq!(delivered[0], "EVENT", "{delivered}");
+    assert_eq!(delivered[2]["id"], response["id"], "{delivered}");
+    client.close().await;
+    bunker.close().await;
+}
+
 /// Every NEG-OPEN / NEG-MSG refusal that can name its subscription is a
 /// NEG-ERR, so sync clients stop waiting; only an unusable sub id is a NOTICE.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

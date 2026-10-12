@@ -235,6 +235,10 @@ pub struct RelayHandle {
 }
 
 pub enum IngestMsg {
+    /// A connection registered; it precedes every `Client` message for it.
+    Open {
+        conn_id: u64,
+    },
     Client {
         conn_id: u64,
         source: TransportSource,
@@ -438,6 +442,10 @@ impl RelayHandle {
         self.metrics
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .ingest_route(conn_id)
+            .send(IngestMsg::Open { conn_id })
+            .await;
         ConnectionGuard {
             handle: self.clone(),
             conn_id,
@@ -830,6 +838,15 @@ fn run_ingester(
     // Tokio runtime, so no async executor is stalled.
     while let Some(msg) = rx.blocking_recv() {
         match msg {
+            IngestMsg::Open { conn_id } => {
+                // NIP-42 lets the relay challenge at any time. Challenging on
+                // connect lets a client authenticate before its first REQ, so
+                // a restricted live subscription (e.g. NIP-46 kind 24133) is
+                // not refused and re-sent while ephemeral replies go by.
+                if cfg.read().auth_usable() {
+                    issue_challenge(&conns, &metrics, &mut auth, conn_id);
+                }
+            }
             IngestMsg::Close { conn_id } => {
                 if auth.remove(&conn_id).and_then(|a| a.authed).is_some() {
                     metrics
@@ -1267,16 +1284,7 @@ fn ingest_event(
         }
         match auth.get(&conn_id) {
             None => {
-                let challenge = gen_challenge();
-                auth.insert(
-                    conn_id,
-                    AuthSession {
-                        challenge: challenge.clone(),
-                        authed: None,
-                        identities: Vec::new(),
-                    },
-                );
-                conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
+                issue_challenge(conns, metrics, auth, conn_id);
                 conns.send(
                     conn_id,
                     RelayMessage::Ok {
@@ -1653,6 +1661,18 @@ fn read_gate_refusal(
     {
         return "restricted: requested filter is not scoped to an authenticated pubkey";
     }
+    issue_challenge(conns, metrics, auth, conn_id);
+    "auth-required: requested filter requires authentication"
+}
+
+/// Send the connection's NIP-42 challenge unless it already has one; a session
+/// keeps a single challenge so an AUTH signed for it stays valid.
+fn issue_challenge(
+    conns: &ConnTable,
+    metrics: &Metrics,
+    auth: &mut HashMap<u64, AuthSession>,
+    conn_id: u64,
+) {
     if let std::collections::hash_map::Entry::Vacant(e) = auth.entry(conn_id) {
         let challenge = gen_challenge();
         e.insert(AuthSession {
@@ -1662,7 +1682,6 @@ fn read_gate_refusal(
         });
         conns.send(conn_id, RelayMessage::Auth { challenge }, metrics);
     }
-    "auth-required: requested filter requires authentication"
 }
 
 /// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with

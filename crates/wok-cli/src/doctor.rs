@@ -310,7 +310,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
                         "replacement-history",
                         history_status,
                         format!(
-                            "{} superseded events in {} replacement groups; retained history is hidden from relay reads",
+                            "{} superseded events in {} replacement groups; retained history is hidden from relay reads and `wok purge-superseded` deletes it",
                             integrity.superseded_events, integrity.superseded_groups,
                         ),
                     );

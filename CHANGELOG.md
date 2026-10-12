@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NIP-11 fetches) and the benchmark harness; the relay listener does not
   terminate TLS.
 
+### Added
+
+- `wok purge-superseded` deletes older versions of replaceable and addressable
+  events retained by a strfry migration or written before 0.7.0, keeping the
+  version relay reads serve. `--dry-run` reports counts without changing the
+  database, and `--json` prints a summary. It runs alongside the relay in
+  bounded write transactions. Doctor's `replacement-history` warning points to
+  it.
+
 ### Fixed
 
 - While NIP-42 is usable, the AUTH challenge is sent as soon as a connection

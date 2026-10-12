@@ -18,6 +18,7 @@ pub mod lookup;
 pub mod migration;
 pub mod moderation;
 pub mod payload;
+pub mod purge;
 pub mod reindex;
 pub mod schema;
 pub mod search;
@@ -55,6 +56,7 @@ pub use payload::{
     encode_raw_payload, encode_zstd_payload, event_json_owned, get_event_json, parse_payload,
     Decompressor, PayloadView, PAYLOAD_RAW, PAYLOAD_ZSTD,
 };
+pub use purge::{count_superseded_ro, purge_superseded, SupersededHistory};
 pub use reindex::{rebuild_primary_and_event_indices, ReindexStats};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use search::{

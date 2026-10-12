@@ -754,3 +754,106 @@ fn corrupt_replacement_indices_do_not_report_spurious_counter_drift() {
         .iter()
         .any(|issue| issue.category == "counter-drift"));
 }
+
+#[test]
+fn purging_superseded_history_keeps_one_winner_per_address() {
+    let a = key();
+    let b = key();
+    let mut events = Vec::new();
+    let mut winners = Vec::new();
+    for key in [&a, &b] {
+        for kind in [0, 3, 41, 10000, 19999] {
+            let versions: Vec<_> = [200, 300, 100]
+                .iter()
+                .map(|t| event(key, kind, *t, json!([["d", "ignored"]]), "version"))
+                .collect();
+            winners.push(versions[1].clone());
+            events.extend(versions);
+        }
+        for d in ["x", "y"] {
+            let old = event(key, 30443, 100, json!([["d", d]]), "old");
+            // A hidden winner still wins; older versions must not survive it.
+            let newest = event(
+                key,
+                30443,
+                200,
+                json!([["d", d], ["expiration", "150"]]),
+                "newest",
+            );
+            winners.push(newest.clone());
+            events.extend([newest, old]);
+        }
+        let mut ties: Vec<_> = (0..3)
+            .map(|i| event(key, 10002, 500, json!([]), &format!("tie{i}")))
+            .collect();
+        ties.sort_by_key(|v| v["id"].as_str().unwrap().to_owned());
+        winners.push(ties[0].clone());
+        events.extend(ties.into_iter().rev());
+        for time in [100, 200] {
+            let regular = event(key, 1, time, json!([["d", "x"]]), "regular");
+            winners.push(regular.clone());
+            events.push(regular);
+        }
+    }
+    let groups = 2 * (5 + 2 + 1);
+    let superseded = 2 * (5 * 2 + 2 + 2);
+    let (_dir, env) = snapshot(&events);
+    let before = wok_db::count_superseded_ro(&env.begin_ro().unwrap()).unwrap();
+    assert_eq!((before.groups, before.events), (groups, superseded));
+    assert_eq!(stored_ids(&env), ids(&events), "counting must not delete");
+
+    // One version per transaction exercises resumption between groups.
+    let purged =
+        wok_db::purge_superseded(&env, || wok_negentropy::NegentropyFilterCache::new(3), 1)
+            .unwrap();
+    assert_eq!((purged.groups, purged.events), (groups, superseded));
+    assert_eq!(stored_ids(&env), ids(&winners));
+
+    let txn = env.begin_ro().unwrap();
+    let report = wok_db::check_integrity(&txn).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    assert_eq!((report.superseded_groups, report.superseded_events), (0, 0));
+    // A zero counter is what restores the persistent-tree fast path.
+    assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), Some(0));
+    wok_negentropy::verify_tree(&txn, 1, "{}").unwrap();
+    drop(txn);
+    let mut txn = env.begin_rw().unwrap();
+    for key in [&a, &b] {
+        let pubkey = key.x_only_public_key().0.serialize();
+        assert_eq!(
+            wok_db::state::author_count(&mut txn, &pubkey).unwrap(),
+            (winners.len() / 2) as u64
+        );
+    }
+    txn.abort();
+
+    let again =
+        wok_db::purge_superseded(&env, || wok_negentropy::NegentropyFilterCache::new(3), 1000)
+            .unwrap();
+    assert_eq!((again.groups, again.events), (0, 0));
+    assert_eq!(stored_ids(&env), ids(&winners));
+}
+
+#[test]
+fn purging_commits_between_addresses_without_superseded_history() {
+    let key = key();
+    let current: Vec<_> = [0, 3, 10002, 30443]
+        .iter()
+        .map(|kind| event(&key, *kind, 100, json!([["d", "a"]]), "current"))
+        .collect();
+    let (_dir, env) = snapshot(&current);
+    let mut transactions = 0;
+    let purged = wok_db::purge_superseded(
+        &env,
+        || {
+            transactions += 1;
+            wok_db::NoopNegentropy
+        },
+        1,
+    )
+    .unwrap();
+    assert_eq!((purged.groups, purged.events), (0, 0));
+    // Each address is a completed unit of scan work, even with no losers.
+    assert_eq!(transactions, current.len());
+    assert_eq!(stored_ids(&env), ids(&current));
+}

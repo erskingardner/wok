@@ -2973,8 +2973,23 @@ mod tests {
             cfg.relay.write_policy_plugin = format!("sh {}", script.display());
             cfg.relay.write_policy_timeout_secs = 30;
         });
-        handle.config.write().relay.write_policy_timeout_secs = 1;
         let (conn, mut rx) = live_conn(&handle).await;
+        // Baseline under the startup 30s timeout: the slow plugin's 3s answer
+        // is accepted, so the writer is running before the reload.
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "before reload",
+        }));
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", event]).to_string())
+            .await;
+        let response = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text();
+        assert!(response.contains("true"), "{response}");
+
+        handle.config.write().relay.write_policy_timeout_secs = 1;
         let event = sign_event(json!({
             "created_at": now_secs(), "kind": 1, "tags": [], "content": "slow plugin",
         }));
@@ -3000,24 +3015,54 @@ mod tests {
     async fn live_reload_applies_the_subscription_cap() {
         // The monitor captured max_subs_per_connection at startup (#54).
         let (_dir, handle) = live_reload_relay(|_, _| {});
-        handle.config.write().relay.max_subs_per_connection = 1;
         let (conn, mut rx) = live_conn(&handle).await;
+        let req = |sub: &str| json!(["REQ", sub, {"kinds": [1]}]).to_string();
+        // Baseline under the startup cap, so the monitor is running before
+        // the reload.
         for sub in ["a", "b"] {
-            handle
-                .client_message(
-                    conn,
-                    local_source(),
-                    json!(["REQ", sub, {"kinds": [1]}]).to_string(),
-                )
-                .await;
+            handle.client_message(conn, local_source(), req(sub)).await;
+            assert!(recv_outbound(&mut rx).await.contains("EOSE"));
         }
+        handle.config.write().relay.max_subs_per_connection = 1;
+
+        // Now over the lowered cap: replacing an open id still works, a new
+        // id is refused.
+        handle.client_message(conn, local_source(), req("a")).await;
+        handle.client_message(conn, local_source(), req("c")).await;
         let frames = drain_outbound(&mut rx).await;
         assert!(
             frames
                 .iter()
                 .any(|f| f.contains("too many concurrent REQs")),
-            "second subscription accepted over the reloaded cap: {frames:?}"
+            "new subscription accepted over the reloaded cap: {frames:?}"
         );
+        assert_eq!(
+            frames.iter().filter(|f| f.contains("too many")).count(),
+            1,
+            "replacing an open subscription was refused: {frames:?}"
+        );
+
+        let (publisher, mut publisher_rx) = live_conn(&handle).await;
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "live after reload",
+        }));
+        handle
+            .client_message(
+                publisher,
+                local_source(),
+                json!(["EVENT", event]).to_string(),
+            )
+            .await;
+        assert!(recv_outbound(&mut publisher_rx).await.contains("true"));
+        let frames = drain_outbound(&mut rx).await;
+        for sub in ["a", "b"] {
+            assert!(
+                frames
+                    .iter()
+                    .any(|f| f.starts_with(&format!("[\"EVENT\",\"{sub}\""))),
+                "subscription {sub} stopped receiving: {frames:?}"
+            );
+        }
         handle.request_shutdown();
     }
 
@@ -3038,15 +3083,18 @@ mod tests {
                 .await;
             assert!(recv_outbound(&mut rx).await.contains("true"));
         }
-        handle.config.write().relay.max_filter_limit_count = 10;
         // Two filters skip the single-filter HyperLogLog path and dedup.
+        let count = json!(["COUNT", "c", {"kinds": [1]}, {"kinds": [1], "limit": 100}]).to_string();
+        // Baseline under the startup limit, so the REQ worker is running
+        // before the reload.
         handle
-            .client_message(
-                conn,
-                local_source(),
-                json!(["COUNT", "c", {"kinds": [1]}, {"kinds": [1], "limit": 100}]).to_string(),
-            )
+            .client_message(conn, local_source(), count.clone())
             .await;
+        let response = recv_outbound(&mut rx).await;
+        assert!(response.contains("\"limited\":true"), "{response}");
+
+        handle.config.write().relay.max_filter_limit_count = 10;
+        handle.client_message(conn, local_source(), count).await;
         let response = recv_outbound(&mut rx).await;
         assert!(response.contains("\"count\":5"), "{response}");
         handle.request_shutdown();

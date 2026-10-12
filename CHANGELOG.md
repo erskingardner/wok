@@ -14,12 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLI's outbound `wss://` and HTTPS clients (mesh, router, upload/download,
   NIP-11 fetches) and the benchmark harness; the relay listener does not
   terminate TLS.
-- NIP-62 vanish requests (kind 62) now go through the write-policy plugin,
-  NIP-13 proof of work, and the per-author EVENT budget like any other event.
-  Before, a validly signed vanish request skipped all three, so a plugin-only
-  allowlist could not refuse it and only the per-address budget limited them.
-  A request the plugin rejects no longer suppresses that author's other events
-  in the same writer batch (#48).
+- NIP-62 vanish requests (kind 62) now pay NIP-13 proof of work and the
+  per-author EVENT budget like any other event. Before, a validly signed vanish
+  request skipped both and only the per-address budget limited them. They
+  still bypass the write-policy plugin, now documented: NIP-62 requires relays
+  that restrict who can post to honor vanish regardless of the user's status
+  (#48).
 
 ### Added
 

@@ -2381,50 +2381,39 @@ mod tests {
     }
 
     #[test]
-    fn write_policy_plugin_decides_vanish_requests_before_batch_markers() {
+    fn write_policy_plugin_cannot_veto_vanish_requests() {
+        // NIP-62: relays that restrict who can post MUST honor vanish requests
+        // regardless of the user's status. An author who lost plugin approval
+        // can still erase what they published while approved.
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), small_map_env_options()).unwrap();
         env.ensure_initialized().unwrap();
-        let script = dir.path().join("deny-vanish.sh");
+        let script = dir.path().join("reject-all.sh");
         std::fs::write(
             &script,
             "#!/bin/sh\nwhile read line; do\n\
              id=$(echo \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n\
-             case \"$line\" in\n\
-             *'\"kind\":62'*) echo '{\"id\":\"'$id'\",\"action\":\"reject\",\"msg\":\"blocked: vanish denied by plugin\"}' ;;\n\
-             *) echo '{\"id\":\"'$id'\",\"action\":\"accept\"}' ;;\n\
-             esac\ndone\n",
+             echo '{\"id\":\"'$id'\",\"action\":\"reject\",\"msg\":\"blocked: not registered\"}'\n\
+             done\n",
         )
         .unwrap();
-
-        let mut config = Config::default();
-        config.db = dir.path().to_path_buf();
-        config.relay.nip62.service_url = "wss://relay.example.com".into();
-        config.relay.write_policy_plugin = format!("sh {}", script.display());
-        let config = Arc::new(parking_lot::RwLock::new(config));
-        let conns = Arc::new(ConnTable::new());
-        let metrics = Arc::new(Metrics::default());
-        let moderation = Arc::new(parking_lot::RwLock::new(
-            env.begin_ro()
-                .and_then(|txn| load_moderation_snapshot_ro(&txn))
-                .unwrap(),
-        ));
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
-        conns.insert(1, Outbound::new(out_tx, 0));
-
-        // Same drained batch: the author's vanish request, then an older note.
-        // A plugin-rejected request must not suppress the note.
         let author = [7u8; 32];
-        let (writer_tx, writer_rx) = bounded(4);
-        for (id, created_at, kind, tags) in [
-            (
-                [8u8; 32],
-                200,
-                VANISH_KIND,
-                json!([["relay", "ALL_RELAYS"]]),
-            ),
-            ([9u8; 32], 100, 1, json!([])),
-        ] {
+        let note_id = [9u8; 32];
+        let vanish_id = [8u8; 32];
+
+        let publish = |plugin: String, id: [u8; 32], created_at: u64, kind: u64, tags: Value| {
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.nip62.service_url = "wss://relay.example.com".into();
+            config.relay.write_policy_plugin = plugin;
+            let conns = Arc::new(ConnTable::new());
+            let moderation = Arc::new(parking_lot::RwLock::new(
+                env.begin_ro()
+                    .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                    .unwrap(),
+            ));
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
             let packed = PackedEventBuilder::build(
                 &id,
                 &author,
@@ -2434,6 +2423,7 @@ mod tests {
                 &PackedEventTagBuilder::default(),
             )
             .unwrap();
+            let (writer_tx, writer_rx) = bounded(1);
             writer_tx
                 .send(WriterMsg::AddEvent {
                     conn_id: 1,
@@ -2452,27 +2442,36 @@ mod tests {
                     authed: None,
                 })
                 .unwrap();
-        }
-        drop(writer_tx);
+            drop(writer_tx);
+            run_writer(
+                env.clone(),
+                Arc::new(parking_lot::RwLock::new(config)),
+                conns,
+                Arc::new(Metrics::default()),
+                writer_rx,
+                Vec::new(),
+                moderation,
+            );
+            out_rx.try_recv().unwrap().into_text()
+        };
 
-        run_writer(
-            env.clone(),
-            config,
-            conns,
-            metrics,
-            writer_rx,
-            Vec::new(),
-            moderation,
-        );
-
-        let vanish = out_rx.try_recv().unwrap().into_text();
-        assert!(vanish.contains(&to_hex(&[8u8; 32])), "{vanish}");
-        assert!(vanish.contains("vanish denied by plugin"), "{vanish}");
-        let note = out_rx.try_recv().unwrap().into_text();
-        assert!(note.contains(&to_hex(&[9u8; 32])), "{note}");
+        let note = publish(String::new(), note_id, 100, 1, json!([]));
         assert!(note.contains("true"), "{note}");
+        let vanish = publish(
+            format!("sh {}", script.display()),
+            vanish_id,
+            200,
+            VANISH_KIND,
+            json!([["relay", "ALL_RELAYS"]]),
+        );
+        assert!(vanish.contains(&to_hex(&vanish_id)), "{vanish}");
+        assert!(vanish.contains("true"), "{vanish}");
+        // The note is suppressed immediately; physical deletion is a later sweep.
         let txn = env.begin_ro().unwrap();
-        assert_eq!(txn.entries(env.dbis().event).unwrap(), 1);
+        let (_, stored) = wok_db::lookup_event_by_id_ro(&txn, &note_id)
+            .unwrap()
+            .unwrap();
+        assert!(is_event_vanished_ro(&txn, PackedEventView::new(&stored).unwrap()).unwrap());
     }
 
     #[test]

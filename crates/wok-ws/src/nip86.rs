@@ -12,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use wok_relay::{management_level, ManagementCmd, ManagementLevel, RelayHandle, Role};
+use wok_relay::{management_level, Config, ManagementCmd, ManagementLevel, RelayHandle, Role};
 
 pub const RPC_CONTENT_TYPE: &str = "application/nostr+json+rpc";
 const MAX_RPC_BODY: usize = 64 * 1024;
@@ -99,30 +99,13 @@ pub async fn dispatch(
         Ok(body) => body,
         Err(error) => return admin::response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
     };
-    let (signer_hex, replay) = match admin::authorize(
-        authorization.as_deref(),
-        &Method::POST,
-        &body,
-        &cfg,
-        &state,
-        &admin::AuthzPolicy {
-            url_ok: &|signed| relay_url_matches(&cfg.admin.public_url, signed),
-            require_config_admin: false,
-            // Pinned NIP-86 makes the NIP-98 payload tag unconditional.
-            require_payload: true,
-        },
-    ) {
-        Ok(ok) => ok,
-        Err(error) => return admin::unauthorized(&error),
-    };
-    let signer = match parse_hex32(&signer_hex) {
-        Ok(signer) => signer,
-        Err(error) => return admin::unauthorized(&error),
-    };
-    let level = management_level(&cfg, &handle.moderation.read(), &signer);
-    if level == ManagementLevel::None {
-        return admin::unauthorized("NIP-98 signer has no management role on this relay");
-    }
+    let (signer_hex, level, replay) =
+        match authorize_manager(authorization.as_deref(), &body, &cfg, &state, |signer| {
+            management_level(&cfg, &handle.moderation.read(), signer)
+        }) {
+            Ok(ok) => ok,
+            Err(error) => return admin::unauthorized(&error),
+        };
     tracing::info!(
         manager = %signer_hex,
         level = ?level,
@@ -142,6 +125,45 @@ pub async fn dispatch(
             admin::json(StatusCode::OK, json!({ "error": error }))
         }
     }
+}
+
+/// Verify a NIP-86 request's NIP-98 authorization and that its signer holds a
+/// management role, returning the signer, its level and the replay
+/// reservation.
+fn authorize_manager<'a>(
+    authorization: Option<&str>,
+    body: &[u8],
+    cfg: &Config,
+    state: &'a AdminState,
+    level_of: impl FnOnce(&[u8; 32]) -> ManagementLevel,
+) -> Result<(String, ManagementLevel, admin::ReplayReservation<'a>), String> {
+    let (signer_hex, replay) = admin::authorize(
+        authorization,
+        &Method::POST,
+        body,
+        cfg,
+        state,
+        &admin::AuthzPolicy {
+            url_ok: &|signed| relay_url_matches(&cfg.admin.public_url, signed),
+            require_config_admin: false,
+            // Pinned NIP-86 makes the NIP-98 payload tag unconditional.
+            require_payload: true,
+        },
+    )?;
+    // A rejected signer ran nothing, so release its slot: otherwise any key
+    // could fill the shared replay cache and lock out real managers.
+    let level = match parse_hex32(&signer_hex) {
+        Ok(signer) => level_of(&signer),
+        Err(error) => {
+            replay.release();
+            return Err(error);
+        }
+    };
+    if level == ManagementLevel::None {
+        replay.release();
+        return Err("NIP-98 signer has no management role on this relay".into());
+    }
+    Ok((signer_hex, level, replay))
 }
 
 async fn execute(
@@ -403,6 +425,68 @@ fn list_hex_reasons(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use secp256k1::{Keypair, SECP256K1};
+    use sha2::Digest;
+
+    fn signed_rpc_auth(key: &Keypair, url: &str, body: &[u8], nonce: usize) -> String {
+        let (pubkey, _) = key.x_only_public_key();
+        let mut event = json!({
+            "pubkey": hex::encode(pubkey.serialize()),
+            "created_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            "kind": 27235,
+            "tags": [
+                ["u", url],
+                ["method", "POST"],
+                ["payload", hex::encode(sha2::Sha256::digest(body))],
+                ["nonce", nonce.to_string()],
+            ],
+            "content": "",
+        });
+        let id = wok_event::event_id_hash(&event).unwrap();
+        event["id"] = json!(hex::encode(id));
+        event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, key).as_ref()));
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(event.to_string())
+        )
+    }
+
+    #[test]
+    fn rejected_non_managers_do_not_fill_the_replay_cache() {
+        // A validly signed request from a key with no management role must
+        // not hold a replay-cache slot, or anyone could fill the cache and
+        // lock out real administrators.
+        let mut rng = rand::thread_rng();
+        let admin_key = Keypair::new(SECP256K1, &mut rng);
+        let stranger = Keypair::new(SECP256K1, &mut rng);
+        let admin_pubkey = admin_key.x_only_public_key().0.serialize();
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        let state = AdminState::default();
+        let url = "wss://relay.example";
+        let body = br#"{"method":"supportedmethods","params":[]}"#;
+        let level_of = |signer: &[u8; 32]| {
+            if *signer == admin_pubkey {
+                ManagementLevel::Admin
+            } else {
+                ManagementLevel::None
+            }
+        };
+
+        for nonce in 0..=admin::MAX_REPLAY_IDS {
+            let header = signed_rpc_auth(&stranger, url, body, nonce);
+            let error = authorize_manager(Some(&header), body, &cfg, &state, level_of).unwrap_err();
+            assert!(error.contains("no management role"), "{error}");
+        }
+        let header = signed_rpc_auth(&admin_key, url, body, 0);
+        let (_, level, _) = authorize_manager(Some(&header), body, &cfg, &state, level_of).unwrap();
+        assert_eq!(level, ManagementLevel::Admin);
+    }
 
     #[test]
     fn relay_url_matching_accepts_scheme_and_slash_variants() {

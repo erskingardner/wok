@@ -1490,6 +1490,20 @@ async fn nip86_replay_after_disconnect_is_refused_once_command_is_queued() {
     let retry = retry.expect("replayed authorization reached the stalled writer");
     assert!(retry.starts_with("HTTP/1.1 401"), "{retry}");
     assert!(retry.contains("already been used"), "{retry}");
+    // The disconnected request had reached the writer: its ban still lands.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !handle
+        .moderation
+        .read()
+        .banned_pubkeys
+        .contains_key(&[0xab; 32])
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first banpubkey never reached the writer"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     handle.request_shutdown();
 }
 

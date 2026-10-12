@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wok_relay::{Config, EphemeralPersistence, RelayHandle};
 
 const MAX_ADMIN_BODY: usize = 64 * 1024;
-const MAX_REPLAY_IDS: usize = 4096;
+pub(crate) const MAX_REPLAY_IDS: usize = 4096;
 
 #[derive(Default)]
 pub struct AdminState {

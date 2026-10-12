@@ -86,6 +86,7 @@ pub struct Metrics {
     pub abuse_event_rate_rejections: AtomicU64,
     pub abuse_req_rate_rejections: AtomicU64,
     pub abuse_count_rate_rejections: AtomicU64,
+    pub abuse_control_rate_rejections: AtomicU64,
     pub abuse_pow_rejections: AtomicU64,
     pub abuse_query_cost_rejections: AtomicU64,
     pub abuse_query_concurrency_rejections: AtomicU64,
@@ -136,6 +137,7 @@ impl Metrics {
                 + g(&self.abuse_event_rate_rejections)
                 + g(&self.abuse_req_rate_rejections)
                 + g(&self.abuse_count_rate_rejections)
+                + g(&self.abuse_control_rate_rejections)
                 + g(&self.abuse_pow_rejections)
                 + g(&self.abuse_query_cost_rejections)
                 + g(&self.abuse_query_concurrency_rejections)
@@ -186,6 +188,7 @@ impl Metrics {
                 "wok_abuse_rejections_total{{reason=\"event_rate\"}} {}\n",
                 "wok_abuse_rejections_total{{reason=\"req_rate\"}} {}\n",
                 "wok_abuse_rejections_total{{reason=\"count_rate\"}} {}\n",
+                "wok_abuse_rejections_total{{reason=\"control_rate\"}} {}\n",
                 "wok_abuse_rejections_total{{reason=\"pow\"}} {}\n",
                 "wok_abuse_rejections_total{{reason=\"query_cost\"}} {}\n",
                 "wok_abuse_rejections_total{{reason=\"query_concurrency\"}} {}\n",
@@ -224,6 +227,7 @@ impl Metrics {
             g(&self.abuse_event_rate_rejections),
             g(&self.abuse_req_rate_rejections),
             g(&self.abuse_count_rate_rejections),
+            g(&self.abuse_control_rate_rejections),
             g(&self.abuse_pow_rejections),
             g(&self.abuse_query_cost_rejections),
             g(&self.abuse_query_concurrency_rejections),

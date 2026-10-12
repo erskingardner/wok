@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is released only when the request failed without effect, so those can
   still be retried; a NIP-86 command that reached the writer keeps it burned
   even if the client disconnects (#51).
+- Malformed client messages, CLOSE and NEG-CLOSE now draw on a per-address
+  token bucket (`relay.abuse.control_rate_per_second`, default 20, and
+  `control_burst`, default 200). Before, they were free: one connection could
+  make the relay answer every malformed message with a NOTICE and push every
+  CLOSE onto a worker queue without limit. Once the budget is spent the client
+  gets one `rate-limited` NOTICE and further such messages are ignored until
+  it refills. Rejections are counted as `control_rate` (#49).
 
 ### Added
 

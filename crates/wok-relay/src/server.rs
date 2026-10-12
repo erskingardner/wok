@@ -2243,6 +2243,15 @@ mod tests {
             .into_text()
     }
 
+    // The default 10 TiB map is reserved per env; tests that never grow the
+    // database keep it small so parallel runs do not exhaust address space.
+    fn small_map_env_options() -> EnvOptions {
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        }
+    }
+
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2566,7 +2575,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_without_a_challenge_is_refused_before_signature_verification() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
@@ -2602,7 +2611,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_is_charged_to_the_event_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();

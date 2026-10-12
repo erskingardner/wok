@@ -1225,7 +1225,7 @@ fn ingest_event(
         return;
     }
 
-    if cfg.relay.abuse.enabled && !is_vanish_request {
+    if cfg.relay.abuse.enabled {
         if leading_zero_bits(packed.id()) < cfg.relay.abuse.min_pow_difficulty as u16 {
             metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
             conns.send(
@@ -2381,6 +2381,100 @@ mod tests {
     }
 
     #[test]
+    fn write_policy_plugin_cannot_veto_vanish_requests() {
+        // NIP-62: relays that restrict who can post MUST honor vanish requests
+        // regardless of the user's status. An author who lost plugin approval
+        // can still erase what they published while approved.
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let script = dir.path().join("reject-all.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nwhile read line; do\n\
+             id=$(echo \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n\
+             echo '{\"id\":\"'$id'\",\"action\":\"reject\",\"msg\":\"blocked: not registered\"}'\n\
+             done\n",
+        )
+        .unwrap();
+        let author = [7u8; 32];
+        let note_id = [9u8; 32];
+        let vanish_id = [8u8; 32];
+
+        let publish = |plugin: String, id: [u8; 32], created_at: u64, kind: u64, tags: Value| {
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.nip62.service_url = "wss://relay.example.com".into();
+            config.relay.write_policy_plugin = plugin;
+            let conns = Arc::new(ConnTable::new());
+            let moderation = Arc::new(parking_lot::RwLock::new(
+                env.begin_ro()
+                    .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                    .unwrap(),
+            ));
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let packed = PackedEventBuilder::build(
+                &id,
+                &author,
+                created_at,
+                kind,
+                0,
+                &PackedEventTagBuilder::default(),
+            )
+            .unwrap();
+            let (writer_tx, writer_rx) = bounded(1);
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    packed: packed.into_bytes(),
+                    json: json!({
+                        "id": to_hex(&id),
+                        "pubkey": to_hex(&author),
+                        "created_at": created_at,
+                        "kind": kind,
+                        "tags": tags,
+                        "content": "",
+                        "sig": "00".repeat(64),
+                    })
+                    .to_string(),
+                    authed: None,
+                })
+                .unwrap();
+            drop(writer_tx);
+            run_writer(
+                env.clone(),
+                Arc::new(parking_lot::RwLock::new(config)),
+                conns,
+                Arc::new(Metrics::default()),
+                writer_rx,
+                Vec::new(),
+                moderation,
+            );
+            out_rx.try_recv().unwrap().into_text()
+        };
+
+        let note = publish(String::new(), note_id, 100, 1, json!([]));
+        assert!(note.contains("true"), "{note}");
+        let vanish = publish(
+            format!("sh {}", script.display()),
+            vanish_id,
+            200,
+            VANISH_KIND,
+            json!([["relay", "ALL_RELAYS"]]),
+        );
+        assert!(vanish.contains(&to_hex(&vanish_id)), "{vanish}");
+        assert!(vanish.contains("true"), "{vanish}");
+        // The note is suppressed immediately; physical deletion is a later sweep.
+        let txn = env.begin_ro().unwrap();
+        let (_, stored) = wok_db::lookup_event_by_id_ro(&txn, &note_id)
+            .unwrap()
+            .unwrap();
+        assert!(is_event_vanished_ro(&txn, PackedEventView::new(&stored).unwrap()).unwrap());
+    }
+
+    #[test]
     fn multibyte_report_reason_is_bounded_and_reaches_queue() {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
@@ -2529,6 +2623,78 @@ mod tests {
         assert_eq!(
             handle.metrics.abuse_pow_rejections.load(Ordering::Relaxed),
             1
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vanish_requests_pay_pow_and_author_budget() {
+        let vanish = |kp: &Keypair, content: &str| {
+            sign_event_with_key(
+                json!({
+                    "created_at": now_secs(),
+                    "kind": VANISH_KIND,
+                    "tags": [["relay", "ALL_RELAYS"]],
+                    "content": content,
+                }),
+                kp,
+            )
+        };
+        let start_relay = |configure: &dyn Fn(&mut Config)| {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut cfg = Config::default();
+            cfg.db = dir.path().to_path_buf();
+            cfg.relay.auth.enabled = false;
+            cfg.relay.nip62.service_url = "wss://relay.example.com".into();
+            configure(&mut cfg);
+            (dir, start(env, cfg).unwrap())
+        };
+        let source = || TransportSource::ip_address("127.0.0.1".parse().unwrap());
+        let mut rng = rand::thread_rng();
+        let kp = Keypair::new(SECP256K1, &mut rng);
+
+        let (_dir, handle) = start_relay(&|cfg| cfg.relay.abuse.min_pow_difficulty = 255);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        handle
+            .client_message(
+                conn,
+                source(),
+                json!(["EVENT", vanish(&kp, "no-pow")]).to_string(),
+            )
+            .await;
+        let response = recv_outbound(&mut rx).await;
+        assert!(
+            response.contains("pow: difficulty 255 required"),
+            "{response}"
+        );
+        handle.request_shutdown();
+
+        let (_dir, handle) = start_relay(&|cfg| {
+            cfg.relay.abuse.pubkey_event_rate_per_second = 1;
+            cfg.relay.abuse.pubkey_event_burst = 1;
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        for content in ["first", "second"] {
+            handle
+                .client_message(
+                    conn,
+                    source(),
+                    json!(["EVENT", vanish(&kp, content)]).to_string(),
+                )
+                .await;
+        }
+        let responses = [recv_outbound(&mut rx).await, recv_outbound(&mut rx).await];
+        assert!(
+            responses
+                .iter()
+                .any(|r| r.contains("rate-limited: author EVENT budget exhausted")),
+            "{responses:?}"
         );
         handle.request_shutdown();
     }

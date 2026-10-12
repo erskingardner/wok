@@ -108,6 +108,8 @@ pub(super) fn run_writer(
                 let mut ok_msg = String::new();
                 let is_vanish_request =
                     PackedEventView::new(&packed).is_ok_and(|event| event.kind() == VANISH_KIND);
+                // NIP-62: relays that restrict who can post MUST honor vanish
+                // regardless of the user's status, so the plugin cannot veto it.
                 let res = if is_vanish_request || cfg_snap.relay.write_policy_plugin.is_empty() {
                     PluginResult::Accept
                 } else {

@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Authors can read their own restricted-kind events that have no `p` tag
   (for example NIP-78 kind 30078 app data). Before, REQ, COUNT, live
   delivery, and sync hid them from everyone, including the author.
+- AUTH is rate-limited and no longer verifies signatures for connections that
+  were never sent a challenge. It draws on the per-address EVENT budget and
+  replies `rate-limited: AUTH budget exhausted` once that runs out, so a few
+  connections can no longer tie up every ingester thread with signature checks.
 
 ## [0.7.0] - 2026-09-08
 

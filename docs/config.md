@@ -217,14 +217,14 @@ All abuse settings reload live and are dashboard-editable.
 | `relay.abuse.enabled` | `true` | Enable this protection layer. |
 | `relay.abuse.connection_rate_per_second` | `10` | Refilled connection tokens per network address each second. |
 | `relay.abuse.connection_burst` | `50` | Connection token-bucket capacity. |
-| `relay.abuse.event_rate_per_second` | `50` | Refilled EVENT tokens per connection each second. |
-| `relay.abuse.event_burst` | `100` | Per-connection EVENT bucket capacity. |
+| `relay.abuse.event_rate_per_second` | `50` | Refilled EVENT and AUTH tokens per network address each second. |
+| `relay.abuse.event_burst` | `100` | Per-address EVENT and AUTH bucket capacity. |
 | `relay.abuse.pubkey_event_rate_per_second` | `25` | Refilled publication tokens per event author each second. |
 | `relay.abuse.pubkey_event_burst` | `50` | Per-author publication bucket capacity. |
-| `relay.abuse.req_rate_per_second` | `20` | Refilled REQ tokens per connection each second. |
-| `relay.abuse.req_burst` | `40` | Per-connection REQ bucket capacity. |
-| `relay.abuse.count_rate_per_second` | `5` | Refilled COUNT tokens per connection each second. |
-| `relay.abuse.count_burst` | `10` | Per-connection COUNT bucket capacity. |
+| `relay.abuse.req_rate_per_second` | `20` | Refilled REQ, NEG-OPEN, and NEG-MSG tokens per network address each second. |
+| `relay.abuse.req_burst` | `40` | Per-address REQ, NEG-OPEN, and NEG-MSG bucket capacity. |
+| `relay.abuse.count_rate_per_second` | `5` | Refilled COUNT tokens per network address each second. |
+| `relay.abuse.count_burst` | `10` | Per-address COUNT bucket capacity. |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Historical scans per connection; zero rejects new scans. |
 | `relay.abuse.max_query_cost` | `1000` | Conservative pre-scan filter cost ceiling; zero is unlimited. |
 | `relay.abuse.max_stored_events` | `10000000` | Global durable event ceiling; the entire write transaction aborts before exceeding it. |

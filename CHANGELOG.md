@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still bypass the write-policy plugin, now documented: NIP-62 requires relays
   that restrict who can post to honor vanish regardless of the user's status
   (#48).
+- NIP-62 vanish requests are now honored from banned authors and, with
+  `relay.auth.restrict_writes`, from pubkeys not on the write allowlist. Before,
+  both were refused, so an author who lost write access could not erase what
+  they had published, contrary to NIP-62's requirement that relays which
+  restrict who can post honor vanish regardless of the user's status. Event-id
+  bans, the kind allowlist and `relay.nip62.enabled` still apply.
 
 ### Added
 

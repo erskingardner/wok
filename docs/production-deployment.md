@@ -77,11 +77,15 @@ impact of a compromised admin credential.
 The write-policy command is trusted operator configuration and currently runs
 through `sh -c` for strfry migration compatibility. Event JSON is sent on the
 child's standard input and is never interpolated into that command, but the
-child still runs as the `wok` user inside the relay's systemd sandbox. The
-plugin is not consulted for NIP-62 vanish requests: NIP-62 requires relays that
-restrict who can post to honor them regardless of the user's status, so an
-author dropped from a plugin allowlist can still erase what they published.
-Vanish requests still pay proof of work and the per-author EVENT budget.
+child still runs as the `wok` user inside the relay's systemd sandbox.
+
+NIP-62 requires relays that restrict who can post to honor vanish requests
+regardless of the user's status. The plugin is not consulted for them, and
+neither pubkey bans nor `relay.auth.restrict_writes` refuse them, so an author
+who was rejected by the plugin, dropped from the allowlist, or banned can still
+erase what they published. Vanish requests still pay proof of work and the
+per-author EVENT budget, and event-id bans, the kind allowlist, and
+`relay.nip62.enabled` still apply.
 
 Use an absolute command, keep the executable and its dependencies root-owned,
 and avoid shell substitutions or writable script directories. The plugin must

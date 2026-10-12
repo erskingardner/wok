@@ -29,9 +29,9 @@ use std::thread;
 use std::time::Duration;
 use wok_db::{
     backfill_vanish_markers, is_event_vanished_ro, load_moderation_snapshot_ro,
-    lookup_event_by_id_ro, moderation_reason_ro, most_recent_levid_ro, report_event,
-    sweep_vanished_events, Decompressor, Env, EventToWrite, EventWriteStatus, ModerationSnapshot,
-    MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
+    lookup_event_by_id_ro, moderation_reason_ignoring_author_ro, moderation_reason_ro,
+    most_recent_levid_ro, report_event, sweep_vanished_events, Decompressor, Env, EventToWrite,
+    EventWriteStatus, ModerationSnapshot, MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
@@ -1161,6 +1161,7 @@ fn ingest_event(
         kind = packed.kind(),
         "validated inbound event"
     );
+    let is_vanish_request = packed.kind() == VANISH_KIND;
     {
         let snap = moderation.read();
         let mut id = [0u8; 32];
@@ -1180,6 +1181,12 @@ fn ingest_event(
                 &metrics.moderation_banned_event_rejections,
                 "restricted: event is banned by the relay operator".to_string(),
             ))
+        } else if is_vanish_request {
+            // NIP-62: relays that restrict who can post MUST honor vanish
+            // requests regardless of the user's status, so author bans and
+            // write restrictions do not apply. Event-id bans and the kind
+            // policy above still do.
+            None
         } else if snap.banned_pubkeys.contains_key(&pubkey) {
             Some((
                 &metrics.moderation_banned_author_rejections,
@@ -1207,7 +1214,6 @@ fn ingest_event(
             return;
         }
     }
-    let is_vanish_request = packed.kind() == VANISH_KIND;
     if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
         conns.send(
             conn_id,
@@ -2302,80 +2308,112 @@ mod tests {
         assert!(event_matches_vanish_markers(gift.view(), &markers));
     }
 
+    fn revocation(pubkey: [u8; 32], ban: bool) -> ManagementCmd {
+        if ban {
+            ManagementCmd::BanPubkey {
+                pubkey,
+                reason: "revoked".into(),
+            }
+        } else {
+            ManagementCmd::UnallowPubkey { pubkey }
+        }
+    }
+
     #[test]
-    fn same_batch_ban_precedes_ordinary_and_vanish_writes() {
-        for kind in [1, VANISH_KIND] {
-            let dir = tempfile::tempdir().unwrap();
-            let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
-            env.ensure_initialized().unwrap();
+    fn same_batch_revocation_precedes_ordinary_writes_but_not_vanish() {
+        // A ban or allowlist revocation committed after the ingester's
+        // snapshot check still refuses an ordinary event. NIP-62 requires
+        // vanish to be honored regardless of the user's status, so a vanish
+        // request is still written.
+        for ban in [true, false] {
+            for kind in [1, VANISH_KIND] {
+                same_batch_revocation_case(kind, ban);
+            }
+        }
+    }
 
-            let mut config = Config::default();
-            config.db = dir.path().to_path_buf();
-            config.relay.nip62.enabled = true;
-            config.relay.nip62.service_url = "wss://relay.example.com".into();
-            let config = Arc::new(parking_lot::RwLock::new(config));
-            let conns = Arc::new(ConnTable::new());
-            let metrics = Arc::new(Metrics::default());
-            let moderation = Arc::new(parking_lot::RwLock::new(
-                env.begin_ro()
-                    .and_then(|txn| load_moderation_snapshot_ro(&txn))
-                    .unwrap(),
-            ));
-            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
-            conns.insert(1, Outbound::new(out_tx, 0));
+    fn same_batch_revocation_case(kind: u64, ban: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
 
-            let author = [kind as u8; 32];
-            let id = [(kind as u8).saturating_add(1); 32];
-            let tags = PackedEventTagBuilder::default();
-            let packed = PackedEventBuilder::build(&id, &author, 1, kind, 0, &tags).unwrap();
-            let json = json!({
-                "id": to_hex(&id),
-                "pubkey": to_hex(&author),
-                "created_at": 1,
-                "kind": kind,
-                "tags": [["relay", "ALL_RELAYS"]],
-                "content": "",
-                "sig": "00".repeat(64),
+        let mut config = Config::default();
+        config.db = dir.path().to_path_buf();
+        config.relay.nip62.enabled = true;
+        config.relay.nip62.service_url = "wss://relay.example.com".into();
+        config.relay.auth.restrict_writes = true;
+        let config = Arc::new(parking_lot::RwLock::new(config));
+        let conns = Arc::new(ConnTable::new());
+        let metrics = Arc::new(Metrics::default());
+        let author = [kind as u8; 32];
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::allow_pubkey(&mut txn, &author, "").unwrap();
+        txn.commit().unwrap();
+        let moderation = Arc::new(parking_lot::RwLock::new(
+            env.begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                .unwrap(),
+        ));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+
+        let id = [(kind as u8).saturating_add(1); 32];
+        let tags = PackedEventTagBuilder::default();
+        let packed = PackedEventBuilder::build(&id, &author, 1, kind, 0, &tags).unwrap();
+        let json = json!({
+            "id": to_hex(&id),
+            "pubkey": to_hex(&author),
+            "created_at": 1,
+            "kind": kind,
+            "tags": [["relay", "ALL_RELAYS"]],
+            "content": "",
+            "sig": "00".repeat(64),
+        })
+        .to_string();
+
+        let (writer_tx, writer_rx) = bounded(4);
+        writer_tx
+            .send(WriterMsg::AddEvent {
+                conn_id: 1,
+                source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                packed: packed.into_bytes(),
+                json,
+                authed: None,
             })
-            .to_string();
+            .unwrap();
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        writer_tx
+            .send(WriterMsg::Management(ManagementMsg {
+                cmd: revocation(author, ban),
+                reply,
+            }))
+            .unwrap();
+        drop(writer_tx);
 
-            let (writer_tx, writer_rx) = bounded(4);
-            writer_tx
-                .send(WriterMsg::AddEvent {
-                    conn_id: 1,
-                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
-                    packed: packed.into_bytes(),
-                    json,
-                    authed: None,
-                })
-                .unwrap();
-            let (reply, reply_rx) = tokio::sync::oneshot::channel();
-            writer_tx
-                .send(WriterMsg::Management(ManagementMsg {
-                    cmd: ManagementCmd::BanPubkey {
-                        pubkey: author,
-                        reason: "same batch".into(),
-                    },
-                    reply,
-                }))
-                .unwrap();
-            drop(writer_tx);
+        run_writer(
+            env.clone(),
+            config,
+            conns,
+            metrics,
+            writer_rx,
+            Vec::new(),
+            moderation,
+        );
 
-            run_writer(
-                env.clone(),
-                config,
-                conns,
-                metrics,
-                writer_rx,
-                Vec::new(),
-                moderation,
-            );
-
-            assert!(reply_rx.blocking_recv().unwrap().is_ok());
-            let response = out_rx.try_recv().unwrap().into_text();
+        assert!(reply_rx.blocking_recv().unwrap().is_ok());
+        let response = out_rx.try_recv().unwrap().into_text();
+        let txn = env.begin_ro().unwrap();
+        if kind == VANISH_KIND {
+            assert!(response.contains("true"), "{response}");
+            assert_eq!(txn.entries(env.dbis().event).unwrap(), 1);
+        } else {
             assert!(response.contains("false"), "{response}");
-            assert!(response.contains("author is banned"), "{response}");
-            let txn = env.begin_ro().unwrap();
+            let refusal = if ban {
+                "author is banned"
+            } else {
+                "writes are restricted"
+            };
+            assert!(response.contains(refusal), "{response}");
             assert_eq!(txn.entries(env.dbis().event).unwrap(), 0);
         }
     }
@@ -2625,6 +2663,84 @@ mod tests {
             1
         );
         handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restricted_writes_and_bans_cannot_veto_vanish_requests() {
+        // NIP-62: relays that restrict who can post MUST honor vanish requests
+        // regardless of the user's status. Losing allowlist membership or
+        // being banned must not stop an author erasing what they published.
+        for ban in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut cfg = Config::default();
+            cfg.db = dir.path().to_path_buf();
+            cfg.relay.auth.enabled = false;
+            cfg.relay.auth.restrict_writes = true;
+            cfg.relay.nip62.service_url = "wss://relay.example.com".into();
+            let handle = start(env.clone(), cfg).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+            let conn = handle.next_conn_id();
+            handle.register(conn, Outbound::new(tx, 0)).await;
+            let source = || TransportSource::ip_address("127.0.0.1".parse().unwrap());
+            let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
+            let author = kp.x_only_public_key().0.serialize();
+
+            handle
+                .manage(ManagementCmd::AllowPubkey {
+                    pubkey: author,
+                    reason: String::new(),
+                })
+                .await
+                .unwrap();
+            let note = sign_event_with_key(
+                json!({
+                    "created_at": now_secs() - 60,
+                    "kind": 1,
+                    "tags": [],
+                    "content": "published while allowlisted",
+                }),
+                &kp,
+            );
+            handle
+                .client_message(conn, source(), json!(["EVENT", note]).to_string())
+                .await;
+            let response = recv_outbound(&mut rx).await;
+            assert!(response.contains("true"), "{response}");
+
+            handle.manage(revocation(author, ban)).await.unwrap();
+            let vanish = sign_event_with_key(
+                json!({
+                    "created_at": now_secs(),
+                    "kind": VANISH_KIND,
+                    "tags": [["relay", "wss://relay.example.com"]],
+                    "content": "",
+                }),
+                &kp,
+            );
+            handle
+                .client_message(conn, source(), json!(["EVENT", vanish]).to_string())
+                .await;
+            let response = recv_outbound(&mut rx).await;
+            assert!(
+                response.contains(vanish["id"].as_str().unwrap()),
+                "{response}"
+            );
+            assert!(response.contains("true"), "{response}");
+
+            let note_id: [u8; 32] = hex::decode(note["id"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let txn = env.begin_ro().unwrap();
+            let (_, stored) = wok_db::lookup_event_by_id_ro(&txn, &note_id)
+                .unwrap()
+                .unwrap();
+            assert!(is_event_vanished_ro(&txn, PackedEventView::new(&stored).unwrap()).unwrap());
+            drop(txn);
+            handle.request_shutdown();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

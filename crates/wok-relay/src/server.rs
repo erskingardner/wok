@@ -138,6 +138,12 @@ impl ConnTable {
     fn remove(&self, id: u64) {
         self.map.lock().remove(&id);
     }
+    /// Stop delivering to a connection and signal its transport to close.
+    fn terminate(&self, id: u64) {
+        if let Some(out) = self.map.lock().remove(&id) {
+            out.kill();
+        }
+    }
     /// Deliver a pre-built frame, terminating the connection if it is over
     /// its pending-bytes budget (C++ slow-client termination).
     fn deliver(&self, conn_id: u64, payload: String, metrics: &Metrics) {
@@ -907,7 +913,7 @@ fn handle_client(
 ) {
     let cmd = match ClientCommand::parse(payload) {
         Ok(c) => c,
-        Err(_) if !admit_control(cfg, conns, metrics, abuse, &source, conn_id) => return,
+        Err(_) if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) => return,
         Err(ParseFailure::NegRequest { sub_id, reason }) => {
             let reason = format!("invalid: {reason}");
             let neg_tx = route_tx(neg_txs, conn_id);
@@ -1036,17 +1042,21 @@ fn handle_client(
         }
         ClientCommand::Close { sub_id } => {
             metrics.client_close.fetch_add(1, Ordering::Relaxed);
-            if !admit_control(cfg, conns, metrics, abuse, &source, conn_id) {
-                return;
-            }
             match SubId::new(&sub_id) {
-                Ok(sid) => {
-                    let _ = route_tx(req_txs, conn_id).send(ReqMsg::RemoveSub {
+                Ok(sid) => forward_teardown(
+                    route_tx(req_txs, conn_id),
+                    ReqMsg::RemoveSub {
                         conn_id,
                         sub_id: sid,
-                    });
-                }
+                    },
+                    conns,
+                    metrics,
+                    conn_id,
+                ),
                 Err(e) => {
+                    if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
+                        return;
+                    }
                     conns.send(
                         conn_id,
                         RelayMessage::notice_error(format!("bad close: {e}")),
@@ -1093,10 +1103,10 @@ fn handle_client(
             );
         }
         ClientCommand::NegClose { sub_id } => {
-            if !admit_control(cfg, conns, metrics, abuse, &source, conn_id) {
-                return;
-            }
             if !cfg.relay.negentropy_enabled {
+                if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
+                    return;
+                }
                 conns.send(
                     conn_id,
                     RelayMessage::notice_error("bad msg: negentropy disabled"),
@@ -1105,13 +1115,20 @@ fn handle_client(
                 return;
             }
             match SubId::new(&sub_id) {
-                Ok(sid) => {
-                    let _ = route_tx(neg_txs, conn_id).send(NegMsg::CloseSub {
+                Ok(sid) => forward_teardown(
+                    route_tx(neg_txs, conn_id),
+                    NegMsg::CloseSub {
                         conn_id,
                         sub_id: sid,
-                    });
-                }
+                    },
+                    conns,
+                    metrics,
+                    conn_id,
+                ),
                 Err(e) => {
+                    if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
+                        return;
+                    }
                     conns.send(
                         conn_id,
                         RelayMessage::notice_error(format!("negentropy error: {e}")),
@@ -1720,16 +1737,12 @@ fn issue_challenge(
     }
 }
 
-/// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with
-/// NEG-ERR, after which the subscription is closed. The worker that owns the
-/// session sends it, after dropping the session, so no NEG-MSG for this id can
-/// follow the error. An id the worker cannot hold is answered directly.
-/// Charge a message no command budget covers: a malformed message (each
-/// earns an error reply), CLOSE or NEG-CLOSE (each queues worker work).
-/// Without this one connection could make the relay answer or enqueue
-/// without bound (#49). The first refusal of an exhausted period gets one
-/// NOTICE; later ones are dropped silently until the bucket refills.
-fn admit_control(
+/// Charge a malformed message, which no command budget covers and which
+/// earns an error reply; without this one connection could make the relay
+/// answer without bound (#49). Refusing one leaves no relay state behind.
+/// The first refusal of an exhausted period gets one NOTICE; later ones are
+/// dropped silently until the bucket refills.
+fn admit_invalid(
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
@@ -1737,19 +1750,19 @@ fn admit_control(
     source: &TransportSource,
     conn_id: u64,
 ) -> bool {
-    let admission = abuse.admit_source_reporting(source, BudgetKind::Control, &cfg.relay.abuse);
+    let admission = abuse.admit_source_reporting(source, BudgetKind::Invalid, &cfg.relay.abuse);
     if admission == Admission::Admitted {
         return true;
     }
     metrics
-        .abuse_control_rate_rejections
+        .abuse_invalid_rate_rejections
         .fetch_add(1, Ordering::Relaxed);
     if admission == Admission::FirstRefusal {
         conns.send(
             conn_id,
             RelayMessage::Notice {
-                message: "rate-limited: too many invalid or CLOSE messages; ignoring them until \
-                          the budget refills"
+                message: "rate-limited: too many invalid messages; ignoring them until the \
+                          budget refills"
                     .into(),
             },
             metrics,
@@ -1758,6 +1771,29 @@ fn admit_control(
     false
 }
 
+/// Forward a valid CLOSE or NEG-CLOSE. Teardown is never budgeted: dropping
+/// it would leave the subscription running while the client believes it is
+/// gone (NIP-01). The send must not block the ingester shared by other
+/// connections, so a full worker queue closes this connection instead, which
+/// tears down all of its subscriptions.
+fn forward_teardown<T>(tx: &Sender<T>, msg: T, conns: &ConnTable, metrics: &Metrics, conn_id: u64) {
+    if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(msg) {
+        tracing::warn!(conn_id, "worker queue full on CLOSE; closing connection");
+        conns.send(
+            conn_id,
+            RelayMessage::Notice {
+                message: "rate-limited: relay too busy to apply CLOSE; closing connection".into(),
+            },
+            metrics,
+        );
+        conns.terminate(conn_id);
+    }
+}
+
+/// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with
+/// NEG-ERR, after which the subscription is closed. The worker that owns the
+/// session sends it, after dropping the session, so no NEG-MSG for this id can
+/// follow the error. An id the worker cannot hold is answered directly.
 fn neg_err(
     conns: &ConnTable,
     metrics: &Metrics,
@@ -2797,52 +2833,91 @@ mod tests {
         frames
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unbudgeted_messages_are_rate_limited_with_one_notice() {
-        // Malformed messages and CLOSE/NEG-CLOSE used to be free: each bad
-        // one earned a NOTICE and each CLOSE a worker message (#49).
+    #[tokio::test]
+    async fn teardown_on_a_full_worker_queue_closes_the_connection() {
+        // A CLOSE must neither be dropped nor block the shared ingester.
+        let conns = ConnTable::new();
+        let metrics = Metrics::default();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = Outbound::new(out_tx, 0);
+        let killed = out.killed();
+        conns.insert(1, out);
+        let (tx, rx) = bounded::<u8>(1);
+        tx.send(0).unwrap();
+
+        forward_teardown(&tx, 1, &conns, &metrics, 1);
+
+        assert_eq!(rx.len(), 1, "the full queue was not waited on");
+        assert!(out_rx
+            .recv()
+            .await
+            .unwrap()
+            .into_text()
+            .contains("closing connection"));
+        tokio::time::timeout(Duration::from_secs(1), killed.notified())
+            .await
+            .expect("transport was not told to close");
+        assert!(!conns.map.lock().contains_key(&1));
+
+        // With room in the queue the teardown is forwarded and nothing closes.
+        let (tx, rx) = bounded::<u8>(1);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(2, Outbound::new(out_tx, 0));
+        forward_teardown(&tx, 7, &conns, &metrics, 2);
+        assert_eq!(rx.try_recv().unwrap(), 7);
+        assert!(out_rx.try_recv().is_err());
+        assert!(conns.map.lock().contains_key(&2));
+    }
+
+    fn invalid_budget_relay(burst: u32) -> (tempfile::TempDir, RelayHandle) {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), small_map_env_options()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
         cfg.relay.auth.enabled = false;
+        // One token a second: no refill can land mid-test on a loaded runner.
+        cfg.relay.abuse.invalid_rate_per_second = 1;
+        cfg.relay.abuse.invalid_burst = burst;
         let handle = start(env, cfg).unwrap();
+        (dir, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_messages_are_rate_limited_with_one_notice() {
+        // Each malformed message used to earn a free NOTICE (#49). Malformed
+        // CLOSEs (invalid subscription id) leave no state and share the budget.
+        let (_dir, handle) = invalid_budget_relay(5);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
         let source = || TransportSource::ip_address("127.0.0.1".parse().unwrap());
-        let rate_limited = |frames: &[String]| {
-            frames
-                .iter()
-                .filter(|f| f.contains("rate-limited: too many"))
-                .count()
-        };
+        let before = handle
+            .metrics
+            .abuse_invalid_rate_rejections
+            .load(Ordering::Relaxed);
 
-        for _ in 0..400 {
-            handle
-                .client_message(conn, source(), "[\"NOT-A-COMMAND\"]".into())
-                .await;
+        for i in 0..20 {
+            let payload = if i % 2 == 0 {
+                "[\"NOT-A-COMMAND\"]".to_string()
+            } else {
+                json!(["CLOSE", ""]).to_string()
+            };
+            handle.client_message(conn, source(), payload).await;
         }
         let frames = drain_outbound(&mut rx).await;
-        assert!(frames.len() < 400, "every malformed message was answered");
-        assert_eq!(rate_limited(&frames), 1, "{frames:?}");
-
-        for i in 0..400 {
-            handle
-                .client_message(
-                    conn,
-                    source(),
-                    json!(["CLOSE", format!("s{i}")]).to_string(),
-                )
-                .await;
-        }
-        let frames = drain_outbound(&mut rx).await;
-        assert!(rate_limited(&frames) <= 1, "{frames:?}");
-        assert!(
-            frames.iter().all(|f| f.contains("rate-limited")),
-            "{frames:?}"
-        );
+        let rate_limited = frames
+            .iter()
+            .filter(|f| f.contains("rate-limited: too many invalid messages"))
+            .count();
+        assert_eq!(rate_limited, 1, "{frames:?}");
+        assert!(frames.len() <= 7, "{frames:?}");
+        let rejected = handle
+            .metrics
+            .abuse_invalid_rate_rejections
+            .load(Ordering::Relaxed)
+            - before;
+        assert!(rejected >= 13, "{rejected}");
 
         // Budgeted commands are unaffected.
         handle
@@ -2854,6 +2929,58 @@ mod tests {
             .await;
         let frames = drain_outbound(&mut rx).await;
         assert!(frames.iter().any(|f| f.contains("EOSE")), "{frames:?}");
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_is_honored_after_another_connection_exhausts_the_budget() {
+        // NIP-01 CLOSE stops a subscription. A neighbour behind the same
+        // address spending the malformed-message budget must not leave it
+        // running.
+        let (_dir, handle) = invalid_budget_relay(1);
+        let source = || TransportSource::ip_address("127.0.0.1".parse().unwrap());
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let a = handle.next_conn_id();
+        handle.register(a, Outbound::new(a_tx, 0)).await;
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let b = handle.next_conn_id();
+        handle.register(b, Outbound::new(b_tx, 0)).await;
+
+        handle
+            .client_message(
+                b,
+                source(),
+                json!(["REQ", "live", {"kinds": [1]}]).to_string(),
+            )
+            .await;
+        assert!(recv_outbound(&mut b_rx).await.contains("EOSE"));
+        for _ in 0..5 {
+            handle
+                .client_message(a, source(), "[\"NOT-A-COMMAND\"]".into())
+                .await;
+        }
+        drain_outbound(&mut a_rx).await;
+        handle
+            .client_message(b, source(), json!(["CLOSE", "live"]).to_string())
+            .await;
+        // Let the CLOSE reach the subscription worker before publishing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let event = sign_event(json!({
+            "created_at": now_secs(),
+            "kind": 1,
+            "tags": [],
+            "content": "after close",
+        }));
+        handle
+            .client_message(a, source(), json!(["EVENT", event]).to_string())
+            .await;
+        assert!(recv_outbound(&mut a_rx).await.contains("true"));
+        let frames = drain_outbound(&mut b_rx).await;
+        assert!(
+            !frames.iter().any(|f| f.contains("after close")),
+            "closed subscription still delivered: {frames:?}"
+        );
         handle.request_shutdown();
     }
 

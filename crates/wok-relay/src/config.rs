@@ -236,9 +236,9 @@ pub struct AbuseConfig {
     pub req_burst: u32,
     pub count_rate_per_second: u32,
     pub count_burst: u32,
-    /// Malformed messages, CLOSE and NEG-CLOSE per network address.
-    pub control_rate_per_second: u32,
-    pub control_burst: u32,
+    /// Malformed messages per network address.
+    pub invalid_rate_per_second: u32,
+    pub invalid_burst: u32,
     pub max_concurrent_historical_queries: usize,
     pub max_query_cost: u64,
     pub max_stored_events: u64,
@@ -420,10 +420,8 @@ impl Default for Config {
                     req_burst: 40,
                     count_rate_per_second: 5,
                     count_burst: 10,
-                    // Burst matches the default max_subs_per_connection so a
-                    // client can close every subscription at once.
-                    control_rate_per_second: 20,
-                    control_burst: 200,
+                    invalid_rate_per_second: 5,
+                    invalid_burst: 20,
                     max_concurrent_historical_queries: 8,
                     max_query_cost: 1_000,
                     max_stored_events: 10_000_000,
@@ -926,8 +924,8 @@ impl Config {
                 (
                     a.count_rate_per_second,
                     a.count_burst,
-                    a.control_rate_per_second,
-                    a.control_burst,
+                    a.invalid_rate_per_second,
+                    a.invalid_burst,
                     a.max_concurrent_historical_queries,
                     a.max_query_cost,
                     a.max_stored_events,
@@ -1016,7 +1014,7 @@ impl Config {
                 ),
                 ("req", a.req_rate_per_second, a.req_burst),
                 ("count", a.count_rate_per_second, a.count_burst),
-                ("control", a.control_rate_per_second, a.control_burst),
+                ("invalid", a.invalid_rate_per_second, a.invalid_burst),
             ] {
                 if rate == 0 || burst == 0 {
                     warnings.push(format!(
@@ -1960,8 +1958,8 @@ mod tests {
             "req_burst",
             "count_rate_per_second",
             "count_burst",
-            "control_rate_per_second",
-            "control_burst",
+            "invalid_rate_per_second",
+            "invalid_burst",
             "max_query_cost",
             "max_stored_events",
             "max_stored_events_per_pubkey",

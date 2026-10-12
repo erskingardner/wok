@@ -12,9 +12,9 @@ pub enum BudgetKind {
     Event,
     Req,
     Count,
-    /// Messages no command budget covers: malformed messages, CLOSE and
-    /// NEG-CLOSE (#49).
-    Control,
+    /// Malformed messages, which earn an error reply and change nothing
+    /// (#49).
+    Invalid,
 }
 
 /// Outcome of a budget check that distinguishes the first refusal of an
@@ -152,7 +152,7 @@ fn spec(kind: BudgetKind, cfg: &AbuseConfig) -> (u32, u32) {
         BudgetKind::Event => (cfg.event_rate_per_second, cfg.event_burst),
         BudgetKind::Req => (cfg.req_rate_per_second, cfg.req_burst),
         BudgetKind::Count => (cfg.count_rate_per_second, cfg.count_burst),
-        BudgetKind::Control => (cfg.control_rate_per_second, cfg.control_burst),
+        BudgetKind::Invalid => (cfg.invalid_rate_per_second, cfg.invalid_burst),
     }
 }
 
@@ -197,11 +197,11 @@ mod tests {
         let mut cfg = crate::Config::default().relay.abuse;
         // One token per 100ms: slow enough that back-to-back checks under a
         // loaded test run do not refill in between.
-        cfg.control_rate_per_second = 10;
-        cfg.control_burst = 1;
+        cfg.invalid_rate_per_second = 10;
+        cfg.invalid_burst = 1;
         let limiter = AbuseController::default();
         let source = TransportSource::ip_address("127.0.0.1".parse().unwrap());
-        let admit = || limiter.admit_source_reporting(&source, BudgetKind::Control, &cfg);
+        let admit = || limiter.admit_source_reporting(&source, BudgetKind::Invalid, &cfg);
         assert_eq!(admit(), Admission::Admitted);
         assert_eq!(admit(), Admission::FirstRefusal);
         assert_eq!(admit(), Admission::Refused);
@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(admit(), Admission::FirstRefusal);
         // Unix-socket clients are local and exempt.
         assert_eq!(
-            limiter.admit_source_reporting(&TransportSource::Unix, BudgetKind::Control, &cfg),
+            limiter.admit_source_reporting(&TransportSource::Unix, BudgetKind::Invalid, &cfg),
             Admission::Admitted
         );
     }

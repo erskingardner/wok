@@ -52,6 +52,11 @@ impl PluginEventSifter {
         }
     }
 
+    /// Apply a reloaded `relay.write_policy_timeout_secs` to later round trips.
+    pub fn set_timeout(&mut self, timeout_secs: u64) {
+        self.timeout = Duration::from_secs(timeout_secs.max(1));
+    }
+
     pub fn accept_event(
         &mut self,
         plugin_cmd: &str,

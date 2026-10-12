@@ -44,6 +44,12 @@ impl ActiveMonitors {
         }
     }
 
+    /// Apply a reloaded per-connection cap. Existing subscriptions over a
+    /// lowered cap stay; new ones are refused until the count drops.
+    pub fn set_max_subs(&mut self, max_subs: usize) {
+        self.max_subs = max_subs;
+    }
+
     pub fn add_sub(&mut self, sub: Subscription, _curr_event_id: u64) -> bool {
         self.remove_sub(sub.conn_id, &sub.sub_id);
         let conn = self.conns.entry(sub.conn_id).or_default();

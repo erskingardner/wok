@@ -1977,6 +1977,7 @@ fn run_req_worker(
         let cfg_snap = cfg.read();
         queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
         queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
+        queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
         let txn = match env.begin_ro() {
             Ok(t) => t,
             Err(_) => continue,
@@ -2124,6 +2125,7 @@ fn run_req_monitor(
             batch.push(more);
         }
         let cfg_snap = cfg.read();
+        monitors.set_max_subs(cfg_snap.relay.max_subs_per_connection);
         let r = restrictor(&cfg_snap);
         let global_visibility = read_visibility(&cfg_snap, vec![]);
         let txn = match env.begin_ro() {
@@ -2922,6 +2924,131 @@ mod tests {
             !frames.iter().any(|f| f.contains("after close")),
             "closed subscription still delivered: {frames:?}"
         );
+        handle.request_shutdown();
+    }
+
+    /// A running relay whose config the test can change live, like a reload.
+    fn live_reload_relay(
+        configure: impl FnOnce(&mut Config, &std::path::Path),
+    ) -> (tempfile::TempDir, RelayHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        configure(&mut cfg, dir.path());
+        let handle = start(env, cfg).unwrap();
+        (dir, handle)
+    }
+
+    async fn live_conn(
+        handle: &RelayHandle,
+    ) -> (u64, tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle.next_conn_id();
+        handle.register(conn, Outbound::new(tx, 0)).await;
+        (conn, rx)
+    }
+
+    fn local_source() -> TransportSource {
+        TransportSource::ip_address("127.0.0.1".parse().unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_reload_applies_the_write_policy_timeout() {
+        // The writer captured the timeout at startup, so lowering it had no
+        // effect until a restart (#54).
+        let (_dir, handle) = live_reload_relay(|cfg, dir| {
+            let script = dir.join("slow-accept.sh");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nwhile read line; do\n\
+                 id=$(echo \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n\
+                 sleep 3\n\
+                 echo '{\"id\":\"'$id'\",\"action\":\"accept\"}'\n\
+                 done\n",
+            )
+            .unwrap();
+            cfg.relay.write_policy_plugin = format!("sh {}", script.display());
+            cfg.relay.write_policy_timeout_secs = 30;
+        });
+        handle.config.write().relay.write_policy_timeout_secs = 1;
+        let (conn, mut rx) = live_conn(&handle).await;
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "slow plugin",
+        }));
+        let started = std::time::Instant::now();
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", event]).to_string())
+            .await;
+        let response = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text();
+        assert!(response.contains("false"), "{response}");
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "plugin ran {:?} past the reloaded 1s timeout",
+            started.elapsed()
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_reload_applies_the_subscription_cap() {
+        // The monitor captured max_subs_per_connection at startup (#54).
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        handle.config.write().relay.max_subs_per_connection = 1;
+        let (conn, mut rx) = live_conn(&handle).await;
+        for sub in ["a", "b"] {
+            handle
+                .client_message(
+                    conn,
+                    local_source(),
+                    json!(["REQ", sub, {"kinds": [1]}]).to_string(),
+                )
+                .await;
+        }
+        let frames = drain_outbound(&mut rx).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.contains("too many concurrent REQs")),
+            "second subscription accepted over the reloaded cap: {frames:?}"
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_reload_applies_the_count_dedup_budget() {
+        // The REQ worker sized its COUNT dedup budget from the startup
+        // max_filter_limit_count, so raising the limit live still capped a
+        // multi-filter COUNT at the old value (#54).
+        let (_dir, handle) = live_reload_relay(|cfg, _| cfg.relay.max_filter_limit_count = 2);
+        let (conn, mut rx) = live_conn(&handle).await;
+        for i in 0..5u64 {
+            let event = sign_event(json!({
+                "created_at": now_secs() - 10 + i, "kind": 1, "tags": [],
+                "content": format!("count-{i}"),
+            }));
+            handle
+                .client_message(conn, local_source(), json!(["EVENT", event]).to_string())
+                .await;
+            assert!(recv_outbound(&mut rx).await.contains("true"));
+        }
+        handle.config.write().relay.max_filter_limit_count = 10;
+        // Two filters skip the single-filter HyperLogLog path and dedup.
+        handle
+            .client_message(
+                conn,
+                local_source(),
+                json!(["COUNT", "c", {"kinds": [1]}, {"kinds": [1], "limit": 100}]).to_string(),
+            )
+            .await;
+        let response = recv_outbound(&mut rx).await;
+        assert!(response.contains("\"count\":5"), "{response}");
         handle.request_shutdown();
     }
 

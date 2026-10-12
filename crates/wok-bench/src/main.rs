@@ -1237,11 +1237,42 @@ fn start_target(
     Ok((format!("ws://127.0.0.1:{port}"), Some(child)))
 }
 
-fn stop_target(child: &mut Option<Child>) {
+fn stop_target(child: &mut Option<Child>, url: &str) {
     if let Some(child) = child {
-        let _ = child.kill();
-        let _ = child.wait();
+        stop_relay(child, url);
     }
+}
+
+/// Graceful stop first so the relay closes LMDB. On macOS a SIGKILLed relay
+/// leaks its two POSIX semaphores once the trial's temp database is deleted;
+/// enough trials exhaust kern.posix.sem.max (docs/production-deployment.md).
+/// SIGUSR1 is the graceful shutdown signal of both Wok and strfry, but strfry
+/// exits only when a connection closes during shutdown, never when already
+/// idle. A control WebSocket held across the signal supplies that close
+/// (docs/benchmark-strfry-soak-comparison-2026-09-07.md).
+fn stop_relay(child: &mut Child, url: &str) {
+    let control = tokio_tungstenite::tungstenite::connect(url).ok();
+    let signalled = Command::new("kill")
+        .args(["-USR1", &child.id().to_string()])
+        .status()
+        .is_ok_and(|status| status.success());
+    if let Some((mut socket, _)) = control {
+        // Let the relay enter graceful shutdown before the disconnect.
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = socket.close(None);
+        let _ = socket.flush();
+    }
+    if signalled {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 type WebSocketClient =
@@ -1605,7 +1636,7 @@ fn ws_publish_target_trial(
         let elapsed = start.elapsed();
         Ok::<_, anyhow::Error>((accepted, rejected, elapsed, latencies))
     });
-    stop_target(&mut child);
+    stop_target(&mut child, &url);
     let (accepted, rejected, elapsed, latencies) = out?;
     for latency in latencies {
         hist.record(latency)
@@ -1740,7 +1771,7 @@ fn ws_query_trial(
         }
         Ok::<_, anyhow::Error>((done, results, mismatches, elapsed))
     });
-    stop_target(&mut child);
+    stop_target(&mut child, &url);
     let (done, results, mismatches, elapsed) = out?;
     let qps = done as f64 / elapsed.as_secs_f64();
     let notes = format!("{done} mixed REQs, {results} events returned");
@@ -1838,7 +1869,7 @@ fn deep_history_trial(
         let _ = socket.close(None).await;
         Ok::<_, anyhow::Error>((seen.len() as u64, mismatches, elapsed, latencies))
     });
-    stop_target(&mut child);
+    stop_target(&mut child, &url);
     let (seen, mut mismatches, elapsed, latencies) = out?;
     for latency in latencies {
         hist.record(latency)
@@ -1954,7 +1985,7 @@ fn mixed_read_write_trial(
         let (query_result, write_result) = tokio::join!(query_future, write_future);
         Ok::<_, anyhow::Error>((query_result?, write_result?))
     });
-    stop_target(&mut child);
+    stop_target(&mut child, &url);
     let ((completed, results, mut mismatches, elapsed, latencies), accepted) = out?;
     for latency in latencies {
         hist.record(latency)
@@ -1999,10 +2030,10 @@ fn ws_search_trial(
 
     let port = free_port();
     let mut child = spawn_relay(bin, dbdir, port)?;
+    let url = format!("ws://127.0.0.1:{port}/");
     let out = rt.block_on(async {
         use tokio_tungstenite::tungstenite::Message;
 
-        let url = format!("ws://127.0.0.1:{port}/");
         let mut sockets = Vec::new();
         for _ in 0..4 {
             sockets.push(connect_retry(&url).await?);
@@ -2064,8 +2095,7 @@ fn ws_search_trial(
         }
         Ok::<_, anyhow::Error>((done, returned, mismatches, elapsed))
     });
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_relay(&mut child, &url);
     let (done, returned, mismatches, elapsed) = out?;
     let qps = done as f64 / elapsed.as_secs_f64();
     let notes = format!("{done} ranked NIP-50 REQs over {n} events, {returned} verified results");
@@ -2182,7 +2212,7 @@ fn live_fanout_trial(
         }
         Ok::<_, anyhow::Error>((delivered, elapsed))
     });
-    stop_target(&mut child);
+    stop_target(&mut child, &url);
     let (delivered, elapsed) = out?;
     let expected = n * subs as u64;
     let eps = delivered as f64 / elapsed.as_secs_f64();
@@ -2278,7 +2308,7 @@ fn idle_connections_trial(
         }
         Ok::<_, anyhow::Error>((opened, open_elapsed))
     });
-    stop_target(&mut child);
+    stop_target(&mut child, &url);
     let (opened, elapsed) = out?;
     let mismatches = u64::from(opened != connections);
     let rate = opened as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
@@ -2297,9 +2327,9 @@ fn cold_start_trial(
     let port = free_port();
     let start = Instant::now();
     let mut child = spawn_relay(bin, dbdir, port)?;
+    let url = format!("ws://127.0.0.1:{port}/");
     let out = rt.block_on(async {
         use tokio_tungstenite::tungstenite::Message;
-        let url = format!("ws://127.0.0.1:{port}/");
         let mut ws = connect_retry(&url).await?;
         ws.send(Message::Text(
             r#"["REQ","s",{"kinds":[1],"limit":1}]"#.into(),
@@ -2309,8 +2339,7 @@ fn cold_start_trial(
         Ok::<_, anyhow::Error>(())
     });
     let ms = start.elapsed().as_micros().max(1) as u64 / 1000;
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_relay(&mut child, &url);
     out?;
     hist.record(ms.saturating_mul(1000))?;
     Ok(ms)

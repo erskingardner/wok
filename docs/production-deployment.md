@@ -72,6 +72,38 @@ impact of a compromised admin credential.
 - Run `wok doctor` after an unclean stop and before returning the instance to
   service. Run `wok integrity` periodically and retain its exit status.
 
+## LMDB semaphores on macOS
+
+On macOS, lmdb-sys builds LMDB with `MDB_USE_POSIX_SEM`. Every open
+environment creates two named POSIX semaphores (`/MDBr<hash>` and
+`/MDBw<hash>`, hashed from the `lock.mdb` device and inode). LMDB unlinks them
+only in `mdb_env_close` in the last process using the environment, or when a
+later exclusive open of the same `lock.mdb` file clears stale names. Linux
+builds use robust mutexes inside `lock.mdb` and are not affected.
+
+A process that exits with an `Env` still open leaks both semaphores until
+reboot. Causes include `kill -9`, a panic in a release build
+(`panic = "abort"`), `process::exit`, and relay threads that are still running
+at exit. A live relay database reclaims its own pair the next time it opens.
+Leaks accumulate when the lock file is gone: test temp directories, deleted
+scratch databases, replaced migration outputs. macOS cannot list these
+semaphores, and their names cannot be recomputed once the inode is gone.
+
+The table is system-wide (`sysctl kern.posix.sem.max`, default 10000). When it
+fills up, every `Env::open` fails with `Lmdb(28, "No space left on device")`
+(ENOSPC from `sem_open`) even when disk and memory are free. Remedies:
+
+- Reboot. This clears all named semaphores.
+- Or raise the limit until the next reboot:
+  `sudo sysctl -w kern.posix.sem.max=20000`.
+
+Wok closes its environments on a clean stop. `wok relay` joins every relay
+thread after SIGINT, SIGTERM, or SIGUSR1
+(`RelayHandle::shutdown_and_join`). Dropping the last `RelayHandle` also stops
+and joins the threads, so tests that start a relay release their `Env` before
+they return. Code that starts a relay must not leak a handle (`mem::forget`,
+a detached task that never ends) or keep its own `Env` clone past shutdown.
+
 ## Write-policy plugins
 
 The write-policy command is trusted operator configuration and currently runs

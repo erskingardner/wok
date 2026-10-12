@@ -19,7 +19,9 @@ pub(super) fn run_writer(
     let mut maintenance_cursor = Vec::new();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
     let mut events: Vec<EventToWrite<u64>> = Vec::with_capacity(256);
-    while let Ok(msg) = rx.recv() {
+    let mut stop = false;
+    while !stop {
+        let Ok(msg) = rx.recv() else { break };
         batch.clear();
         event_batch.clear();
         closed.clear();
@@ -51,6 +53,9 @@ pub(super) fn run_writer(
                 let _ = msg.reply.send(result);
             } else if matches!(m, WriterMsg::Maintenance) {
                 maintenance_requested = true;
+            } else if matches!(m, WriterMsg::Stop) {
+                // Finish this batch; anything queued behind Stop is dropped.
+                stop = true;
             } else {
                 event_batch.push(m);
             }
@@ -605,8 +610,7 @@ pub(super) fn event_matches_vanish_markers(
 }
 
 pub(super) fn run_cron(writer: Sender<WriterMsg>, shutdown: Arc<AtomicBool>) {
-    while !shutdown.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(2));
+    while sleep_unless_shutdown(&shutdown, Duration::from_secs(2)) {
         if writer.try_send(WriterMsg::Maintenance).is_err() && writer.is_full() {
             tracing::debug!("writer busy; maintenance deferred");
         }

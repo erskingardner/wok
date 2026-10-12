@@ -26,6 +26,11 @@ the fuzz workflow. Inputs are seeded at protocol and WebSocket length boundaries
 and retained between runs. This remains a bounded fuzz smoke test; iteration
 counts and exercised branches are not coverage of every possible input.
 
+On macOS, if every LMDB-backed test fails at `Env::open` with
+`Lmdb(28, "No space left on device")` even though the disk has space, the
+system POSIX semaphore table is full of leaked LMDB semaphores. See "LMDB
+semaphores on macOS" in `production-deployment.md`.
+
 The GitHub ruleset is separate from workflow configuration. Defining mandatory
 jobs within a workflow does not make passing checks a prerequisite for pushing
 to master. Branch-rule changes require a separate repository-policy decision.

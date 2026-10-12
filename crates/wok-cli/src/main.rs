@@ -497,6 +497,16 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         tracing::info!("Graceful shutdown in progress: {n} connections remaining");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+    // Join the relay threads so their Env clones drop and LMDB closes the
+    // environment before exit; on macOS an unclosed env leaks its POSIX
+    // semaphores until reboot.
+    let joined = tokio::task::spawn_blocking(move || {
+        handle.shutdown_and_join(std::time::Duration::from_secs(10))
+    })
+    .await?;
+    if let Err(e) = joined {
+        tracing::warn!("{e}");
+    }
     Ok(())
 }
 
@@ -1308,6 +1318,9 @@ fn cmd_integrity(cfg: &Config) -> Result<()> {
     let report = check_integrity(&txn)?;
     cli_println!("{report:?}");
     if !report.ok() {
+        // process::exit skips destructors; close the env first.
+        drop(txn);
+        drop(env);
         std::process::exit(1);
     }
     Ok(())

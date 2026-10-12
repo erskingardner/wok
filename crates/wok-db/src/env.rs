@@ -123,6 +123,9 @@ unsafe impl Send for EnvInner {}
 // once and remain valid until `mdb_env_close`.
 unsafe impl Sync for EnvInner {}
 
+// On macOS, `mdb_env_close` is also the only place LMDB unlinks the env's two
+// named POSIX semaphores. An `Env` still open at process exit leaks them until
+// reboot (docs/production-deployment.md).
 impl Drop for EnvInner {
     fn drop(&mut self) {
         unsafe { mdb_env_close(self.env) }

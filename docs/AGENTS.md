@@ -19,7 +19,7 @@ Operator and design documentation. Code remains the authority for current behavi
 | --- | --- |
 | `migration-from-strfry.md` | `wok migrate strfry` |
 | `cutover.md` | Cutover / rollback |
-| `production-deployment.md` | Hardening a live relay |
+| `production-deployment.md` | Hardening a live relay; macOS LMDB semaphore exhaustion (ENOSPC at `Env::open`) |
 | `security.md` | Threat model, fuzzing, unsafe policy |
 | `observability.md` | Metrics / tracing |
 | `admin-dashboard.md` | `/admin` |

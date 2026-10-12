@@ -519,11 +519,23 @@ async fn cpp_peer_syncs_both_directions_including_all_users_gift_wraps() {
         eprintln!("skip: optional strfry reference missing");
         return;
     }
-    struct ChildGuard(std::process::Child);
+    struct ChildGuard(std::process::Child, std::path::PathBuf);
     impl Drop for ChildGuard {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+            // SIGKILL skips mdb_env_close. Reopening the same lock file
+            // unlinks the dead relay's POSIX semaphores before the temp
+            // directory (and with it the only way to name them) is removed.
+            let _ = wok_db::Env::open(
+                &self.1,
+                wok_db::EnvOptions {
+                    read_only: true,
+                    create_dir: false,
+                    create_dbis: false,
+                    ..wok_db::EnvOptions::for_tests()
+                },
+            );
         }
     }
     let source = tempfile::tempdir().unwrap();
@@ -585,6 +597,7 @@ async fn cpp_peer_syncs_both_directions_including_all_users_gift_wraps() {
             .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
             .spawn()
             .unwrap(),
+        db.clone(),
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {

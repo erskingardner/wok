@@ -140,6 +140,20 @@ async fn paused_ingress_relay() -> (
     Peer,
     tokio::task::JoinHandle<()>,
 ) {
+    paused_ingress_relay_with(HOLD, 1 << 16).await
+}
+
+/// `paused_ingress_relay` with a given largest message (and so hold) and
+/// in-memory stream buffer size in each direction.
+async fn paused_ingress_relay_with(
+    max_message: usize,
+    pipe: usize,
+) -> (
+    tempfile::TempDir,
+    Arc<RelayHandle>,
+    Peer,
+    tokio::task::JoinHandle<()>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
     let mut cfg = Config::default();
@@ -147,12 +161,12 @@ async fn paused_ingress_relay() -> (
     cfg.relay.auth.enabled = false;
     cfg.relay.auto_ping_seconds = 0;
     let handle = Arc::new(wok_relay::start(env, cfg).unwrap());
-    let (io, stream) = tokio::io::duplex(1 << 16);
+    let (io, stream) = tokio::io::duplex(pipe);
     let task = tokio::spawn(handle_ws(
         stream,
         handle.clone(),
         "127.0.0.1:9000".parse().unwrap(),
-        HOLD,
+        max_message,
         false,
         false,
     ));
@@ -235,6 +249,118 @@ async fn paused_ingress_closes_a_websocket_that_overflows_its_hold() {
     for _ in 0..=HOLD / wok_relay::HELD_MESSAGE_OVERHEAD {
         peer.send_raw(b"").await;
     }
+    assert_connection_ends(&handle, task).await;
+    handle.request_shutdown();
+}
+
+/// A message read just as ingress resumes hands over one batch of a large
+/// hold, not all of it, so outbound frames and Pongs are written between
+/// batches. The ingester is stalled so that handing over the whole hold,
+/// more than the shared ingest queue takes, would block the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_ingress_hands_over_a_large_hold_in_batches() {
+    const HELD: usize = 6000;
+    // Small enough that unread Pongs block the relay's writes.
+    const PIPE: usize = 4096;
+    let (_dir, handle, mut peer, task) = paused_ingress_relay_with(1 << 20, PIPE).await;
+    let conn_id = 1;
+    handle.set_ingress_paused(conn_id, true);
+    for _ in 0..HELD {
+        peer.send(serde_json::json!(["CLOSE", "x"])).await;
+    }
+    peer.control(frame::OP_PING, b"held").await;
+    assert!(matches!(peer.next().await, WsEvent::Pong(p) if p == b"held"));
+
+    // Block the connection on writing Pongs the peer does not read, so the
+    // next message is read only after ingress has resumed.
+    for _ in 0..40 {
+        peer.control(frame::OP_PING, &[b'p'; 125]).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Queue an event for the live subscription behind those Pongs.
+    let (observer_tx, mut observer) = tokio::sync::mpsc::unbounded_channel();
+    let observer_id = handle.next_conn_id();
+    handle
+        .register(observer_id, Outbound::new(observer_tx, 0))
+        .await;
+    handle
+        .client_message(
+            observer_id,
+            TransportSource::Unix,
+            serde_json::json!(["REQ", "observer", {"kinds": [1]}]).to_string(),
+        )
+        .await;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let publisher = handle.next_conn_id();
+    handle.register(publisher, Outbound::new(tx, 0)).await;
+    handle
+        .client_message(
+            publisher,
+            TransportSource::Unix,
+            serde_json::json!(["EVENT", signed_note()]).to_string(),
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(frame) = observer.recv().await {
+            if frame.text.starts_with("[\"EVENT\",\"observer\"") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the event was not published");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Stall the ingester on the config lock, held off the runtime.
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let config = handle.config.clone();
+    let stall = std::thread::spawn(move || {
+        let _guard = config.write();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv().unwrap();
+
+    let mut trigger = Vec::new();
+    trigger.extend(
+        peer.encoder
+            .encode_message(
+                MessageKind::Text,
+                serde_json::json!(["REQ", "after", {"limit": 0}])
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap(),
+    );
+    trigger.extend(peer.encoder.encode_control(frame::OP_PING, b"after"));
+    peer.io.write_all(&trigger).await.unwrap();
+    handle.set_ingress_paused(conn_id, false);
+
+    let (mut ponged, mut delivered) = (false, false);
+    while !(ponged && delivered) {
+        match peer.next().await {
+            WsEvent::Pong(p) => ponged |= p == b"after",
+            WsEvent::Message(_, text) => {
+                let text = String::from_utf8(text).unwrap();
+                assert!(text.starts_with("[\"EVENT\",\"live\""), "got {text}");
+                delivered = true;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let closes = || handle.metrics.client_close.load(Ordering::Relaxed);
+    assert!(closes() < HELD as u64);
+
+    // Released, the rest of the hold goes through ahead of the new message.
+    release_tx.send(()).unwrap();
+    stall.join().unwrap();
+    assert!(peer.next_text().await.contains("\"EOSE\",\"after\""));
+    assert_eq!(closes(), HELD as u64);
+    assert!(!task.is_finished(), "a resumed connection was disconnected");
+    peer.control(frame::OP_CLOSE, &[]).await;
+    assert!(matches!(peer.next().await, WsEvent::Close(_)));
     assert_connection_ends(&handle, task).await;
     handle.request_shutdown();
 }

@@ -529,18 +529,28 @@ impl ConnectionGuard {
     /// Pass a message read from the client to the ingester, after anything
     /// already held. While ingress is paused it is held instead. False when
     /// the hold is full: the client kept sending into a paused connection and
-    /// the transport should disconnect it. With ingress open nothing is held,
-    /// so the only back-pressure is the shared ingest queue.
+    /// the transport should disconnect it.
+    ///
+    /// Once ingress resumes, this hands over one batch of what is held and
+    /// queues the message behind the rest, so the transport gets back to its
+    /// outbound traffic and its `ingress_resumed` arm drains the remainder.
+    /// With ingress open the hold never refuses a message; it hands over more
+    /// only while past its limit, so it stays within one message of it.
     #[must_use]
     pub async fn receive(&self, held: &mut HeldMessages, text: String, wire_len: usize) -> bool {
-        while !held.is_empty() && !self.ingress_paused() {
+        self.hand_over(held).await;
+        while held.over_limit() && !self.ingress_paused() {
             self.hand_over(held).await;
         }
-        if held.is_empty() && !self.ingress_paused() {
-            self.client_message(text).await;
-            return true;
+        if self.ingress_paused() {
+            return held.push(text, wire_len);
         }
-        held.push(text, wire_len)
+        if held.is_empty() {
+            self.client_message(text).await;
+        } else {
+            held.push_back(text, wire_len);
+        }
+        true
     }
 
     /// Hand held messages to the ingester, in order, while ingress is not
@@ -593,11 +603,13 @@ pub const HELD_MESSAGE_OVERHEAD: usize = 64;
 const HAND_OVER_BATCH: usize = 64;
 
 /// Client messages a transport has read but not yet handed to the ingester,
-/// because the connection's ingress is paused.
+/// because the connection's ingress is paused or, once it resumes, because
+/// they are handed over a batch at a time.
 /// Each costs its wire payload length plus `HELD_MESSAGE_OVERHEAD`. Reading
 /// continues while paused, so control frames and disconnects are still seen;
-/// a data message that would take the hold past its limit means the client
-/// keeps sending into a stalled relay, and the transport ends the connection.
+/// a data message that would take the hold past its limit while paused means
+/// the client keeps sending into a stalled relay, and the transport ends the
+/// connection.
 pub struct HeldMessages {
     queue: VecDeque<(String, usize)>,
     bytes: usize,
@@ -617,6 +629,10 @@ impl HeldMessages {
         self.queue.is_empty()
     }
 
+    fn over_limit(&self) -> bool {
+        self.bytes > self.limit
+    }
+
     /// Hold a message whose payload was `wire_len` bytes on the wire. A single
     /// message is always held; otherwise false, and nothing is held, when the
     /// limit would be exceeded.
@@ -626,9 +642,15 @@ impl HeldMessages {
         if !self.queue.is_empty() && self.bytes.saturating_add(cost) > self.limit {
             return false;
         }
+        self.push_back(text, wire_len);
+        true
+    }
+
+    /// Queue a message behind what is held, regardless of the limit.
+    fn push_back(&mut self, text: String, wire_len: usize) {
+        let cost = wire_len.saturating_add(HELD_MESSAGE_OVERHEAD);
         self.bytes += cost;
         self.queue.push_back((text, cost));
-        true
     }
 }
 

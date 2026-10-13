@@ -27,7 +27,11 @@ Invariants:
   ingress paused: the transport keeps reading the socket, writing outbound and
   handling control frames, Close and EOF, but holds client messages until the parked
   ones move. The hold is charged payload plus a fixed per-message overhead, up to the
-  maximum message size; a client that sends past it is disconnected. The backlog stays
+  maximum message size; a client that sends past it while paused is disconnected. Once
+  ingress resumes the hold is handed over a batch per pass of the transport loop, so
+  outbound and control traffic keep flowing; messages read meanwhile queue behind it,
+  and the transport stops reading, rather than disconnecting, while those take it past
+  its limit. The backlog stays
   bounded by the ingest queue plus one message per paused connection, and a stalled
   worker pauses only the connections that use it. Connection teardown skips the pause:
   it drops the connection's parked and held work, and a worker gets `Close` only if it

@@ -239,6 +239,23 @@ async fn paused_ingress_keeps_websocket_output_and_control() {
     handle.request_shutdown();
 }
 
+/// One maximum-size message, which with its overhead alone exceeds the hold,
+/// is still held while paused without stopping reads: later control frames
+/// and a Close are handled before ingress resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_ingress_keeps_reading_after_a_maximum_size_message() {
+    let (_dir, handle, mut peer, task) = paused_ingress_relay().await;
+    handle.set_ingress_paused(1, true);
+    peer.send_raw(&[b' '; HOLD]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    peer.control(frame::OP_PING, b"after-max").await;
+    assert!(matches!(peer.next().await, WsEvent::Pong(p) if p == b"after-max"));
+    peer.control(frame::OP_CLOSE, &[]).await;
+    assert!(matches!(peer.next().await, WsEvent::Close(_)));
+    assert_connection_ends(&handle, task).await;
+    handle.request_shutdown();
+}
+
 /// A client that keeps sending into a paused connection is closed once its
 /// hold is full, even empty messages counting, instead of buffering without
 /// bound until the worker recovers.

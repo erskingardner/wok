@@ -764,10 +764,11 @@ async fn handle_ws<S>(
     // so control frames, Close and EOF are still handled while paused. Once
     // ingress resumes the hold is handed over a batch per pass of the loop,
     // with messages read meanwhile queued behind it; reading stops only while
-    // those have taken it past its limit.
+    // those have taken it past its limit, and starts again if ingress pauses.
     let mut held = HeldMessages::new(max_message);
     let io = async {
         'outer: loop {
+            let draining = connection.draining(&held);
             tokio::select! {
                 _ = ping.tick(), if auto_ping > 0 => {
                     if awaiting_pong {
@@ -786,7 +787,8 @@ async fn handle_ws<S>(
                 _ = connection.ingress_resumed(), if !held.is_empty() => {
                     connection.hand_over(&mut held).await;
                 }
-                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline), if !held.over_limit() => {
+                _ = connection.ingress_pauses(), if draining => {}
+                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline), if !draining => {
                     match incoming {
                         Ok(()) => {
                             for ev in incoming_events.drain(..) {

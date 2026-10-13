@@ -526,6 +526,20 @@ impl ConnectionGuard {
         let _ = self.gate.subscribe().wait_for(|open| *open).await;
     }
 
+    /// Resolves once ingress is paused. Cancel-safe. A transport that stopped
+    /// reading to drain an over-limit hold waits on this to start again.
+    pub async fn ingress_pauses(&self) {
+        let _ = self.gate.subscribe().wait_for(|open| !*open).await;
+    }
+
+    /// True while the transport should stop reading: ingress is open and
+    /// messages queued behind the hold have taken it past its limit, so the
+    /// `ingress_resumed` arm hands it over first. While paused the transport
+    /// always reads, and the hold's limit decides what it takes.
+    pub fn draining(&self, held: &HeldMessages) -> bool {
+        held.over_limit() && !self.ingress_paused()
+    }
+
     /// Pass a message read from the client to the ingester, after anything
     /// already held. While ingress is paused it is held instead. False when
     /// the hold is full: the client kept sending into a paused connection and
@@ -535,7 +549,7 @@ impl ConnectionGuard {
     /// queued behind it, whatever the limit: only the transport's
     /// `ingress_resumed` arm hands the hold over, a batch per pass, so the
     /// transport gets back to its outbound traffic in between. The transport
-    /// stops reading while the hold is `over_limit`, which bounds it.
+    /// stops reading while `draining`, which bounds it.
     #[must_use]
     pub async fn receive(&self, held: &mut HeldMessages, text: String, wire_len: usize) -> bool {
         if self.ingress_paused() {
@@ -625,10 +639,7 @@ impl HeldMessages {
         self.queue.is_empty()
     }
 
-    /// True when messages queued behind the hold after ingress resumed have
-    /// taken it past its limit. The transport stops reading until the
-    /// `ingress_resumed` arm has handed enough over.
-    pub fn over_limit(&self) -> bool {
+    fn over_limit(&self) -> bool {
         self.bytes > self.limit
     }
 

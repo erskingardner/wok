@@ -526,21 +526,41 @@ impl ConnectionGuard {
         let _ = self.gate.subscribe().wait_for(|open| *open).await;
     }
 
+    /// Resolves once ingress is paused. Cancel-safe. A transport that stopped
+    /// reading to drain an over-limit hold waits on this to start again.
+    pub async fn ingress_pauses(&self) {
+        let _ = self.gate.subscribe().wait_for(|open| !*open).await;
+    }
+
+    /// True while the transport should stop reading: ingress is open and
+    /// messages queued behind the hold have taken it past its limit, so the
+    /// `ingress_resumed` arm hands it over first. While paused the transport
+    /// always reads, and the hold's limit decides what it takes.
+    pub fn draining(&self, held: &HeldMessages) -> bool {
+        held.over_limit() && !self.ingress_paused()
+    }
+
     /// Pass a message read from the client to the ingester, after anything
     /// already held. While ingress is paused it is held instead. False when
     /// the hold is full: the client kept sending into a paused connection and
-    /// the transport should disconnect it. With ingress open nothing is held,
-    /// so the only back-pressure is the shared ingest queue.
+    /// the transport should disconnect it.
+    ///
+    /// Once ingress resumes, a message read while anything is still held is
+    /// queued behind it, whatever the limit: only the transport's
+    /// `ingress_resumed` arm hands the hold over, a batch per pass, so the
+    /// transport gets back to its outbound traffic in between. The transport
+    /// stops reading while `draining`, which bounds it.
     #[must_use]
     pub async fn receive(&self, held: &mut HeldMessages, text: String, wire_len: usize) -> bool {
-        while !held.is_empty() && !self.ingress_paused() {
-            self.hand_over(held).await;
+        if self.ingress_paused() {
+            return held.push(text, wire_len);
         }
-        if held.is_empty() && !self.ingress_paused() {
+        if held.is_empty() {
             self.client_message(text).await;
-            return true;
+        } else {
+            held.push_back(text, wire_len);
         }
-        held.push(text, wire_len)
+        true
     }
 
     /// Hand held messages to the ingester, in order, while ingress is not
@@ -593,11 +613,13 @@ pub const HELD_MESSAGE_OVERHEAD: usize = 64;
 const HAND_OVER_BATCH: usize = 64;
 
 /// Client messages a transport has read but not yet handed to the ingester,
-/// because the connection's ingress is paused.
+/// because the connection's ingress is paused or, once it resumes, because
+/// they are handed over a batch at a time.
 /// Each costs its wire payload length plus `HELD_MESSAGE_OVERHEAD`. Reading
 /// continues while paused, so control frames and disconnects are still seen;
-/// a data message that would take the hold past its limit means the client
-/// keeps sending into a stalled relay, and the transport ends the connection.
+/// a data message that would take the hold past its limit while paused means
+/// the client keeps sending into a stalled relay, and the transport ends the
+/// connection.
 pub struct HeldMessages {
     queue: VecDeque<(String, usize)>,
     bytes: usize,
@@ -617,6 +639,10 @@ impl HeldMessages {
         self.queue.is_empty()
     }
 
+    fn over_limit(&self) -> bool {
+        self.bytes > self.limit
+    }
+
     /// Hold a message whose payload was `wire_len` bytes on the wire. A single
     /// message is always held; otherwise false, and nothing is held, when the
     /// limit would be exceeded.
@@ -626,9 +652,15 @@ impl HeldMessages {
         if !self.queue.is_empty() && self.bytes.saturating_add(cost) > self.limit {
             return false;
         }
+        self.push_back(text, wire_len);
+        true
+    }
+
+    /// Queue a message behind what is held, regardless of the limit.
+    fn push_back(&mut self, text: String, wire_len: usize) {
+        let cost = wire_len.saturating_add(HELD_MESSAGE_OVERHEAD);
         self.bytes += cost;
         self.queue.push_back((text, cost));
-        true
     }
 }
 

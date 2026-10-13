@@ -211,18 +211,24 @@ async fn handle_conn(
         // The socket stays read while ingress is paused (earlier messages
         // parked behind a busy worker), so a disconnect is still seen; frames
         // read meanwhile are held, and a client that overflows the hold is
-        // closed. `read_buf` keeps partial frames across select! cancellation.
+        // closed. Once ingress resumes the hold is handed over a batch per
+        // pass, frames read meanwhile queued behind it; reading stops only
+        // while those have taken it past its limit, and starts again if
+        // ingress pauses. `read_buf` keeps partial frames across select!
+        // cancellation.
         let mut buf = Vec::with_capacity(READ_CHUNK);
         let mut held = HeldMessages::new(max_frame);
         loop {
             if buf.capacity() - buf.len() < READ_CHUNK {
                 buf.reserve(READ_CHUNK);
             }
+            let draining = connection.draining(&held);
             tokio::select! {
                 _ = connection.ingress_resumed(), if !held.is_empty() => {
                     connection.hand_over(&mut held).await;
                 }
-                n = rd.read_buf(&mut buf) => {
+                _ = connection.ingress_pauses(), if draining => {}
+                n = rd.read_buf(&mut buf), if !draining => {
                     if n? == 0 {
                         while !held.is_empty() && !connection.ingress_paused() {
                             connection.hand_over(&mut held).await;
@@ -523,6 +529,20 @@ mod tests {
             .client_req
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(reqs, 1, "the held REQ reached the relay while paused");
+        handle.request_shutdown();
+    }
+
+    /// One maximum-size frame, which with its overhead alone exceeds the
+    /// hold, is still held while paused without stopping reads, so a later
+    /// disconnect is cleaned up before ingress resumes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_ingress_sees_a_unix_disconnect_after_a_maximum_size_frame() {
+        let (_dir, handle, mut client, task) = paused_ingress_relay().await;
+        handle.set_ingress_paused(1, true);
+        write_frame(&mut client, &[b' '; 256]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(client);
+        assert_connection_ends(&handle, task).await;
         handle.request_shutdown();
     }
 

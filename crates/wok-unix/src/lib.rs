@@ -211,7 +211,10 @@ async fn handle_conn(
         // The socket stays read while ingress is paused (earlier messages
         // parked behind a busy worker), so a disconnect is still seen; frames
         // read meanwhile are held, and a client that overflows the hold is
-        // closed. `read_buf` keeps partial frames across select! cancellation.
+        // closed. Once ingress resumes the hold is handed over a batch per
+        // pass, frames read meanwhile queued behind it; reading stops only
+        // while those have taken it past its limit. `read_buf` keeps partial
+        // frames across select! cancellation.
         let mut buf = Vec::with_capacity(READ_CHUNK);
         let mut held = HeldMessages::new(max_frame);
         loop {
@@ -222,7 +225,7 @@ async fn handle_conn(
                 _ = connection.ingress_resumed(), if !held.is_empty() => {
                     connection.hand_over(&mut held).await;
                 }
-                n = rd.read_buf(&mut buf) => {
+                n = rd.read_buf(&mut buf), if !held.over_limit() => {
                     if n? == 0 {
                         while !held.is_empty() && !connection.ingress_paused() {
                             connection.hand_over(&mut held).await;

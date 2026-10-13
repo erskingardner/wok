@@ -761,7 +761,10 @@ async fn handle_ws<S>(
     let mut frame_deadline = None;
     // Messages read while the relay has paused this connection's ingress
     // (earlier work is parked behind a busy worker). The socket stays read,
-    // so control frames, Close and EOF are still handled while paused.
+    // so control frames, Close and EOF are still handled while paused. Once
+    // ingress resumes the hold is handed over a batch per pass of the loop,
+    // with messages read meanwhile queued behind it; reading stops only while
+    // those have taken it past its limit.
     let mut held = HeldMessages::new(max_message);
     let io = async {
         'outer: loop {
@@ -783,7 +786,7 @@ async fn handle_ws<S>(
                 _ = connection.ingress_resumed(), if !held.is_empty() => {
                     connection.hand_over(&mut held).await;
                 }
-                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline) => {
+                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline), if !held.over_limit() => {
                     match incoming {
                         Ok(()) => {
                             for ev in incoming_events.drain(..) {

@@ -253,15 +253,17 @@ async fn paused_ingress_closes_a_websocket_that_overflows_its_hold() {
     handle.request_shutdown();
 }
 
-/// A message read just as ingress resumes hands over one batch of a large
-/// hold, not all of it, so outbound frames and Pongs are written between
-/// batches. The ingester is stalled so that handing over the whole hold,
-/// more than the shared ingest queue takes, would block the connection.
+/// Messages read just as ingress resumes, even a burst of them in one read,
+/// queue behind a large hold rather than handing it over, so outbound frames
+/// and Pongs are written between batches. The ingester is stalled so that
+/// handing over the whole hold, more than the shared ingest queue takes,
+/// would block the connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_ingress_hands_over_a_large_hold_in_batches() {
     const HELD: usize = 6000;
-    // Small enough that unread Pongs block the relay's writes.
-    const PIPE: usize = 4096;
+    // Enough data frames in one read to walk the hold a batch per frame.
+    const BURST: usize = 600;
+    const PIPE: usize = 1 << 16;
     let (_dir, handle, mut peer, task) = paused_ingress_relay_with(1 << 20, PIPE).await;
     let conn_id = 1;
     handle.set_ingress_paused(conn_id, true);
@@ -273,7 +275,7 @@ async fn resumed_ingress_hands_over_a_large_hold_in_batches() {
 
     // Block the connection on writing Pongs the peer does not read, so the
     // next message is read only after ingress has resumed.
-    for _ in 0..40 {
+    for _ in 0..PIPE / 127 + 24 {
         peer.control(frame::OP_PING, &[b'p'; 125]).await;
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -324,6 +326,13 @@ async fn resumed_ingress_hands_over_a_large_hold_in_batches() {
     locked_rx.recv().unwrap();
 
     let mut trigger = Vec::new();
+    for _ in 0..BURST {
+        trigger.extend(
+            peer.encoder
+                .encode_message(MessageKind::Text, br#"["CLOSE","x"]"#)
+                .unwrap(),
+        );
+    }
     trigger.extend(
         peer.encoder
             .encode_message(
@@ -357,7 +366,7 @@ async fn resumed_ingress_hands_over_a_large_hold_in_batches() {
     release_tx.send(()).unwrap();
     stall.join().unwrap();
     assert!(peer.next_text().await.contains("\"EOSE\",\"after\""));
-    assert_eq!(closes(), HELD as u64);
+    assert_eq!(closes(), (HELD + BURST) as u64);
     assert!(!task.is_finished(), "a resumed connection was disconnected");
     peer.control(frame::OP_CLOSE, &[]).await;
     assert!(matches!(peer.next().await, WsEvent::Close(_)));

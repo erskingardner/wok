@@ -41,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until it refills; rejections count as `invalid_rate`. Only the reply is
   suppressed: valid CLOSE and NEG-CLOSE are never budgeted, and a malformed
   NEG-OPEN/NEG-MSG that names a session still closes it (#49).
+- A busy query or sync worker can no longer stall unrelated connections. Before,
+  an ingester blocked when a worker's queue was full, which held up every
+  connection sharing that ingester, including their CLOSE and disconnect
+  cleanup. Ingesters now park work for a full worker in order and retry it
+  without blocking. A connection with parked work has its new messages held
+  until that work moves, but keeps receiving events, answering pings and
+  noticing Close and disconnects; a client that keeps sending past the hold
+  (its maximum message size) is disconnected. Connections that do not use the
+  busy worker keep going. A disconnect drops that connection's parked and held
+  work (REQs, CLOSEs, sync messages and unwritten events) instead of running it,
+  and frees its subscriptions, sync sessions and memory reservations.
 - Three settings documented as live now take effect on reload instead of
   keeping their startup value until restart: `relay.write_policy_timeout_secs`
   (the write-policy plugin's deadline), `relay.max_subs_per_connection`, and

@@ -22,5 +22,8 @@ pub use config::{Config, EphemeralPersistence, StrfryConfigTranslation};
 pub use moderation::{management_level, write_permitted, ManagementCmd, ManagementLevel, Role};
 pub use protocol::{ClientCommand, RelayMessage};
 pub use rlimit::apply_nofiles_limit;
-pub use server::{start, ConnectionGuard, Outbound, OutboundFrame, RelayHandle};
+pub use server::{
+    start, ConnectionGuard, HeldMessages, Outbound, OutboundFrame, RelayHandle,
+    HELD_MESSAGE_OVERHEAD,
+};
 pub use source::TransportSource;

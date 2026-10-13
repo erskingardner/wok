@@ -27,7 +27,9 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use wok_relay::{supported_nips, Config, Outbound, OutboundFrame, RelayHandle, TransportSource};
+use wok_relay::{
+    supported_nips, Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource,
+};
 
 const SOFTWARE: &str = "git+https://github.com/erskingardner/wok.git";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -757,6 +759,10 @@ async fn handle_ws<S>(
     // future) so select! cancellation by outbound traffic or pings cannot
     // restart it.
     let mut frame_deadline = None;
+    // Messages read while the relay has paused this connection's ingress
+    // (earlier work is parked behind a busy worker). The socket stays read,
+    // so control frames, Close and EOF are still handled while paused.
+    let mut held = HeldMessages::new(max_message);
     let io = async {
         'outer: loop {
             tokio::select! {
@@ -774,21 +780,20 @@ async fn handle_ws<S>(
                     ping.reset();
                     awaiting_pong = true;
                 }
+                _ = connection.ingress_resumed(), if !held.is_empty() => {
+                    connection.hand_over(&mut held).await;
+                }
                 incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline) => {
                     match incoming {
                         Ok(()) => {
                             for ev in incoming_events.drain(..) {
                                 match ev {
-                                    WsEvent::Message(MessageKind::Text, t) => {
-                                        match String::from_utf8(t) {
-                                            Ok(text) => connection.client_message(text).await,
-                                            Err(_) => connection.client_message("x".into()).await,
-                                        }
-                                    }
-                                    WsEvent::Message(MessageKind::Binary, b) => {
-                                        match String::from_utf8(b) {
-                                            Ok(text) => connection.client_message(text).await,
-                                            Err(_) => connection.client_message("x".into()).await,
+                                    WsEvent::Message(_, bytes) => {
+                                        let wire_len = bytes.len();
+                                        let text = String::from_utf8(bytes).unwrap_or_else(|_| "x".into());
+                                        if !connection.receive(&mut held, text, wire_len).await {
+                                            tracing::info!(conn_id, peer = %peer, reason = "ingress_paused_overflow", "client terminated");
+                                            break 'outer;
                                         }
                                     }
                                     WsEvent::Ping(p) => {
@@ -800,13 +805,25 @@ async fn handle_ws<S>(
                                         awaiting_pong = false;
                                     }
                                     WsEvent::Close(c) => {
+                                        // What ingress still accepts goes
+                                        // through; anything held behind a
+                                        // pause is dropped, as the close drops
+                                        // the parked work ahead of it.
+                                        while !held.is_empty() && !connection.ingress_paused() {
+                                            connection.hand_over(&mut held).await;
+                                        }
                                         let _ = write_bytes(&mut wr, &encoder.encode_control(frame::OP_CLOSE, &c)).await;
                                         break 'outer;
                                     }
                                 }
                             }
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            while !held.is_empty() && !connection.ingress_paused() {
+                                connection.hand_over(&mut held).await;
+                            }
+                            break;
+                        }
                     }
                 }
                 out = rx.recv() => {

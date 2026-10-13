@@ -2970,6 +2970,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "wok-db",
  "wok-event",
  "wok-relay",
 ]

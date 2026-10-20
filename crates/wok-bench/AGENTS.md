@@ -7,6 +7,7 @@ Never opens a user database. Each trial uses a disposable temp dir, a determinis
 ## Layout
 
 - `Cargo.toml`
-- `src/main.rs` — entire harness (profiles, scenarios, JSONL + markdown output)
+- `src/main.rs` — harness, profiles, scenarios, JSONL + markdown output
+- `src/clients.rs` — `--scenario clients`: client-realistic load with abuse controls and AUTH on (outbox and MDK-shaped Marmot clients, refusal counts, oracle checks)
 
 Methodology: `docs/benchmarks.md`. Campaign wrappers: `scripts/benchmark-*.sh`. Do not treat `bench-results/` at the repo root as source.

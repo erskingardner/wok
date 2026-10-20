@@ -51,15 +51,19 @@ impl QueryScheduler {
         }
     }
 
-    /// Schedule a query, snapshotting the newest event id it may return. It
-    /// replaces a query of the same kind (REQ or COUNT) with the same id. False
-    /// when the connection already runs `max_subs_per_connection` queries.
+    /// Schedule a query. Its snapshot, the newest local event id it may
+    /// return, is taken now unless the caller already fixed it (a REQ's is
+    /// fixed at admission). It replaces a query of the same kind (REQ or
+    /// COUNT) with the same id. False when the connection already runs
+    /// `max_subs_per_connection` queries.
     pub fn add_sub(
         &mut self,
         txn: &RoTxn<'_>,
         mut sub: Subscription,
     ) -> Result<bool, wok_db::DbError> {
-        sub.latest_event_id = most_recent_levid_ro(txn)?;
+        if sub.latest_event_id == u64::MAX {
+            sub.latest_event_id = most_recent_levid_ro(txn)?;
+        }
         self.remove_query(sub.conn_id, &sub.sub_id, sub.count_only);
         let conn = self.conns.entry(sub.conn_id).or_default();
         if conn.len() >= self.max_subs_per_connection {

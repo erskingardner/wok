@@ -50,6 +50,11 @@ it is not a promise to reproduce upstream bugs.
   database, which works there because it stores ephemeral events for five
   minutes. Wok's live-only ephemeral events cannot be caught up, so they were
   lost while the history was being sent.
+  - The history covers what was stored when the REQ was admitted. Anything
+    stored later is delivered live, even when the filter's `limit` (such as
+    `limit: 0`) keeps it out of the history. In pinned strfry the boundary is
+    when the req worker starts the scan, so an event committed between the
+    REQ's arrival and that point is history and can be cut by `limit`.
   - Everything that arrives while the history is sent follows EOSE, as NIP-01
     defines EOSE as the boundary to "events newly received in real-time".
     Pinned strfry sends stored events committed during the scan before EOSE.

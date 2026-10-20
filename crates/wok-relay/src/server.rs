@@ -41,8 +41,8 @@ use wok_negentropy::{DeferredSink, NegentropyFilterCache};
 mod negentropy;
 use negentropy::run_negentropy;
 use wok_query::{
-    ActiveMonitors, FilterValidator, NostrFilterGroup, PendingBuffer, PendingEvent, QueryScheduler,
-    SubId, Subscription,
+    ActiveMonitors, FilterValidator, HeldEvent, NostrFilterGroup, PendingBuffer, PendingEvent,
+    QueryScheduler, SubId, Subscription,
 };
 
 const AUTH_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -419,8 +419,9 @@ pub struct ManagementMsg {
 }
 
 enum ReqMsg {
-    /// Send a REQ's history. Its `MonitorMsg::Register` is already queued on
-    /// the req monitor, so the snapshot this takes cannot miss live matches.
+    /// Send a REQ's history up to the snapshot fixed at admission. Its
+    /// `MonitorMsg::Register` is already queued on the req monitor, so the
+    /// scan's `HistoryDone` cannot reach the monitor first.
     Scan(Subscription),
     /// Answer a COUNT. COUNT ids are separate from REQ ids.
     Count(Subscription),
@@ -1487,9 +1488,9 @@ struct Dispatch {
     writer: Lane<WriterMsg>,
     req: Vec<Lane<ReqMsg>>,
     /// A REQ's or CLOSE's message for the req worker follows its monitor
-    /// message: the worker never snapshots a REQ's history before the monitor
-    /// queue holds its registration, and both see a connection's REQs and
-    /// CLOSEs in the same order.
+    /// message: a REQ's history never finishes before the monitor queue holds
+    /// its registration, and both see a connection's REQs and CLOSEs in the
+    /// same order.
     mon: Vec<Lane<MonitorMsg, ReqMsg>>,
     neg: Vec<Lane<NegMsg>>,
     gates: Gates,
@@ -1836,7 +1837,7 @@ fn handle_client(
                 return;
             }
             ingest_req(
-                cfg, conns, metrics, auth, subs, conn_id, sub_id, filters, false, dispatch,
+                env, cfg, conns, metrics, auth, subs, conn_id, sub_id, filters, false, dispatch,
             );
         }
         ClientCommand::Count { sub_id, filters } => {
@@ -1858,7 +1859,7 @@ fn handle_client(
                 return;
             }
             ingest_req(
-                cfg, conns, metrics, auth, subs, conn_id, sub_id, filters, true, dispatch,
+                env, cfg, conns, metrics, auth, subs, conn_id, sub_id, filters, true, dispatch,
             );
         }
         ClientCommand::Close { sub_id } => {
@@ -2376,6 +2377,7 @@ fn ingest_auth_inner(
 
 #[allow(clippy::too_many_arguments)]
 fn ingest_req(
+    env: &Env,
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
@@ -2408,8 +2410,15 @@ fn ingest_req(
     match admitted {
         Ok(sub) if count_only => dispatch.req(ReqMsg::Count(sub)),
         Ok(mut sub) => {
-            // Live matching starts before the history snapshot is taken, so
-            // nothing published after this REQ falls between the two.
+            // The history sends what is stored now, the monitor everything
+            // stored or published after. Each event is the job of exactly
+            // one of them, whatever the history's limits keep out.
+            let Ok(snapshot) = env.begin_ro().and_then(|txn| most_recent_levid_ro(&txn)) else {
+                let reason = "error: could not read the database".to_string();
+                refuse_req(conns, metrics, subs, dispatch, conn_id, &sub_id, reason);
+                return;
+            };
+            sub.latest_event_id = snapshot;
             sub.generation = subs.next_generation();
             subs.insert(conn_id, sub.sub_id.clone(), sub.generation);
             dispatch.subscription(MonitorMsg::Register(sub.clone()), ReqMsg::Scan(sub));
@@ -2886,8 +2895,6 @@ fn run_req_worker(
                         sub.generation,
                         sub.count_only,
                     );
-                    // A REQ's snapshot is taken here, after its registration
-                    // reached the monitor queue.
                     let reason = match queries.add_sub(&txn, sub) {
                         Ok(true) => None,
                         Ok(false) => {
@@ -3212,11 +3219,14 @@ fn run_req_monitor(
         for msg in control.drain(..).chain(data.drain(..)) {
             match msg {
                 MonitorMsg::Register(mut sub) => {
-                    // Everything the monitor matches from here on is held for
-                    // this subscription until its history is sent.
-                    sub.latest_event_id = curr_event_id;
+                    // Stored events after the REQ's history snapshot are the
+                    // monitor's. Those it already matched are re-read when the
+                    // history is done; everything it matches from here on is
+                    // held until then.
+                    let live_from = curr_event_id.max(sub.latest_event_id);
+                    sub.latest_event_id = live_from;
                     let buffer =
-                        PendingBuffer::new(curr_event_id, cfg_snap.relay.max_live_buffer_bytes);
+                        PendingBuffer::new(live_from, cfg_snap.relay.max_live_buffer_bytes);
                     monitors.add_pending(sub, buffer);
                 }
                 MonitorMsg::Remove { conn_id, sub_id } => {
@@ -3233,9 +3243,10 @@ fn run_req_monitor(
                         continue;
                     }
                     let buffer = monitors.pending_mut(conn_id, &sub_id).unwrap();
-                    // Stored events after the snapshot that the buffer lacks
-                    // are re-read: all of them once it overflowed, else those
-                    // this monitor matched before it saw the registration.
+                    // Stored events after the history snapshot that the buffer
+                    // lacks are re-read: all of them once it overflowed, else
+                    // those this monitor matched before it saw the
+                    // registration. The buffer holds only later ones.
                     let reread_to = if buffer.stored_overflowed() {
                         curr_event_id
                     } else {
@@ -3269,9 +3280,11 @@ fn run_req_monitor(
                             reread_to,
                         );
                     }
+                    // Held events were matched against the policy of their
+                    // time; send only what this connection may still read.
                     for event in buffer.into_events() {
                         match event {
-                            PendingEvent::Stored(lev) if lev > delivered => send_buffered_stored(
+                            PendingEvent::Stored(lev) => send_buffered_stored(
                                 &txn,
                                 &mut decomp,
                                 &conns,
@@ -3282,10 +3295,19 @@ fn run_req_monitor(
                                 &visibility,
                                 lev,
                             ),
-                            // The history already sent it.
-                            PendingEvent::Stored(_) => {}
-                            PendingEvent::Ephemeral(json) => {
-                                conns.send_event(conn_id, sub_id.as_str(), &json, &metrics);
+                            PendingEvent::Ephemeral(event) => {
+                                let readable =
+                                    PackedEventView::new(&event.packed).is_ok_and(|packed| {
+                                        visibility.allows(&txn, packed).unwrap_or(false)
+                                    });
+                                if readable {
+                                    conns.send_event(
+                                        conn_id,
+                                        sub_id.as_str(),
+                                        &event.json,
+                                        &metrics,
+                                    );
+                                }
                             }
                         }
                     }
@@ -3373,41 +3395,52 @@ fn run_req_monitor(
                     curr_event_id = latest;
                 }
                 MonitorMsg::Ephemeral { packed, json } => {
-                    let Ok(packed) = PackedEventView::new(&packed) else {
-                        continue;
-                    };
-                    // Live-only events skip the database, but not the
-                    // moderation policy: id/author/kind checks all apply.
-                    if !global_visibility
-                        .globally_visible(&txn, packed)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let search_terms = if monitors.event_requires_content(packed) {
-                        Some(wok_db::event_search_terms(&json).unwrap_or_default())
-                    } else {
-                        None
-                    };
-                    let recipients = monitors.process_ephemeral(packed, search_terms.as_ref());
-                    let mut live = Vec::new();
-                    // One copy shared by every pending subscription it matches.
-                    let mut held: Option<Arc<str>> = None;
-                    for recipient in recipients {
-                        let pk = authed
-                            .get(&recipient.conn_id)
-                            .map(|authed| authed.as_slice())
-                            .unwrap_or(&[]);
-                        if !r.should_send_to_identities(packed, pk) {
+                    let (live, pending) = {
+                        let Ok(event) = PackedEventView::new(&packed) else {
+                            continue;
+                        };
+                        // Live-only events skip the database, but not the
+                        // moderation policy: id/author/kind checks all apply.
+                        if !global_visibility
+                            .globally_visible(&txn, event)
+                            .unwrap_or(false)
+                        {
                             continue;
                         }
-                        if !recipient.pending {
-                            live.push((recipient.conn_id, recipient.sub_id));
-                        } else if let Some(buffer) =
-                            monitors.pending_mut(recipient.conn_id, &recipient.sub_id)
-                        {
-                            let event = held.get_or_insert_with(|| json.as_str().into()).clone();
-                            let (dropped, overflowed) = buffer.push_ephemeral(event);
+                        let search_terms = if monitors.event_requires_content(event) {
+                            Some(wok_db::event_search_terms(&json).unwrap_or_default())
+                        } else {
+                            None
+                        };
+                        let recipients = monitors.process_ephemeral(event, search_terms.as_ref());
+                        let mut live = Vec::new();
+                        let mut pending = Vec::new();
+                        for recipient in recipients {
+                            let pk = authed
+                                .get(&recipient.conn_id)
+                                .map(|authed| authed.as_slice())
+                                .unwrap_or(&[]);
+                            if !r.should_send_to_identities(event, pk) {
+                                continue;
+                            }
+                            let target = (recipient.conn_id, recipient.sub_id);
+                            if recipient.pending {
+                                pending.push(target);
+                            } else {
+                                live.push(target);
+                            }
+                        }
+                        (live, pending)
+                    };
+                    conns.send_event_batch(&live, &json, &metrics);
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    // One copy shared by every pending subscription it matches.
+                    let held = Arc::new(HeldEvent { packed, json });
+                    for (conn_id, sub_id) in pending {
+                        if let Some(buffer) = monitors.pending_mut(conn_id, &sub_id) {
+                            let (dropped, overflowed) = buffer.push_ephemeral(held.clone());
                             metrics
                                 .live_buffer_dropped_ephemeral
                                 .fetch_add(dropped, Ordering::Relaxed);
@@ -3418,7 +3451,6 @@ fn run_req_monitor(
                             }
                         }
                     }
-                    conns.send_event_batch(&live, &json, &metrics);
                 }
             }
         }
@@ -4980,6 +5012,7 @@ mod tests {
     /// event shows the monitor has matched that event.
     struct MonitorHarness {
         env: Env,
+        cfg: Arc<parking_lot::RwLock<Config>>,
         tx: Sender<MonitorMsg>,
         metrics: Arc<Metrics>,
         subject: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
@@ -5004,13 +5037,14 @@ mod tests {
             conns.insert(2, Outbound::new(observer_tx, 0));
             let metrics = Arc::new(Metrics::default());
             let (tx, rx) = bounded(64);
+            let cfg = Arc::new(parking_lot::RwLock::new(cfg));
             let thread = {
-                let (env, metrics) = (env.clone(), metrics.clone());
-                let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+                let (env, cfg, metrics) = (env.clone(), cfg.clone(), metrics.clone());
                 thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx))
             };
             let mut harness = Self {
                 env,
+                cfg,
                 tx,
                 metrics,
                 subject,
@@ -5018,7 +5052,7 @@ mod tests {
                 thread: Some(thread),
                 _dir: dir,
             };
-            harness.send(MonitorMsg::Register(Self::sub(2, "all", json!({}), 1)));
+            harness.send(MonitorMsg::Register(Self::sub(2, "all", json!({}), 1, 0)));
             harness.send(MonitorMsg::HistoryDone {
                 conn_id: 2,
                 sub_id: SubId::new("all").unwrap(),
@@ -5030,11 +5064,25 @@ mod tests {
             harness
         }
 
-        fn sub(conn_id: u64, sub_id: &str, filter: Value, generation: u64) -> Subscription {
+        /// A REQ as the ingester admits it, with its history snapshot.
+        fn sub(
+            conn_id: u64,
+            sub_id: &str,
+            filter: Value,
+            generation: u64,
+            snapshot: u64,
+        ) -> Subscription {
             let group = NostrFilterGroup::from_value(&filter, 500, 3, 16).unwrap();
             let mut sub = Subscription::new(conn_id, SubId::new(sub_id).unwrap(), group, false);
             sub.generation = generation;
+            sub.latest_event_id = snapshot;
             sub
+        }
+
+        fn register(&self, generation: u64, filter: Value, snapshot: u64) {
+            self.send(MonitorMsg::Register(Self::sub(
+                1, "x", filter, generation, snapshot,
+            )));
         }
 
         fn send(&self, msg: MonitorMsg) {
@@ -5053,8 +5101,12 @@ mod tests {
         }
 
         fn parse(kind: u64, content: &str) -> wok_event::ParsedEvent {
+            Self::parse_at(kind, content, now_secs())
+        }
+
+        fn parse_at(kind: u64, content: &str, created_at: u64) -> wok_event::ParsedEvent {
             let event = sign_event(json!({
-                "created_at": now_secs(), "kind": kind, "tags": [], "content": content,
+                "created_at": created_at, "kind": kind, "tags": [], "content": content,
             }));
             wok_event::parse_and_verify_event(
                 &event,
@@ -5072,9 +5124,9 @@ mod tests {
             assert_eq!(event[2]["id"], id, "{event}");
         }
 
-        /// Store a kind-1 event, tell the monitor and wait until it matched
-        /// it. Returns its local event id and event id.
-        fn store(&mut self, content: &str) -> (u64, String) {
+        /// Store a kind-1 event without telling the monitor. Returns its
+        /// local event id and event id.
+        fn write(&self, content: &str) -> (u64, String) {
             let parsed = Self::parse(1, content);
             let id = to_hex(parsed.packed.view().id());
             let mut txn = self.env.begin_rw().unwrap();
@@ -5083,13 +5135,23 @@ mod tests {
                 .unwrap();
             txn.commit().unwrap();
             let lev = most_recent_levid_ro(&self.env.begin_ro().unwrap()).unwrap();
+            (lev, id)
+        }
+
+        /// Store a kind-1 event, tell the monitor and wait until it matched it.
+        fn store(&mut self, content: &str) -> (u64, String) {
+            let (lev, id) = self.write(content);
             self.send(MonitorMsg::DbChange);
             self.observe(&id);
             (lev, id)
         }
 
         fn ephemeral(&mut self, content: &str) -> String {
-            let parsed = Self::parse(20_001, content);
+            self.ephemeral_at(content, now_secs())
+        }
+
+        fn ephemeral_at(&mut self, content: &str, created_at: u64) -> String {
+            let parsed = Self::parse_at(20_001, content, created_at);
             let id = to_hex(parsed.packed.view().id());
             self.send(MonitorMsg::Ephemeral {
                 packed: parsed.packed.into_bytes(),
@@ -5165,27 +5227,26 @@ mod tests {
     }
 
     /// Matches that arrive while the history is sent are held, then follow
-    /// EOSE in arrival order. Stored events the history already sent (up to
-    /// its snapshot) are dropped, so each event reaches the client once.
+    /// EOSE in arrival order. History from a stale generation sends nothing.
     #[test]
-    fn monitor_sends_held_matches_after_eose_once_each() {
+    fn monitor_sends_held_matches_after_eose_in_arrival_order() {
         let mut h = MonitorHarness::start(0);
-        h.store("before the REQ");
-        h.send(MonitorMsg::Register(MonitorHarness::sub(
-            1,
-            "x",
-            json!({"kinds": [1, 20001]}),
-            7,
-        )));
-        let (snapshot, _) = h.store("in the history");
+        let (snapshot, _) = h.store("before the REQ");
+        h.register(7, json!({"kinds": [1, 20001]}), snapshot);
+        let (_, stored) = h.store("after the REQ");
         let ephemeral = h.ephemeral("live only");
-        let (_, after) = h.store("after the snapshot");
+        let (_, later) = h.store("later");
         assert!(h.frames().is_empty(), "nothing goes out before EOSE");
 
         assert!(h.history_done(6, snapshot).is_empty(), "stale generation");
         assert_eq!(
             h.history_done(7, snapshot),
-            [eose_frame(), event_frame(&ephemeral), event_frame(&after)]
+            [
+                eose_frame(),
+                event_frame(&stored),
+                event_frame(&ephemeral),
+                event_frame(&later)
+            ]
         );
         let (_, live) = h.store("live");
         assert_eq!(h.frames(), [event_frame(&live)]);
@@ -5199,16 +5260,27 @@ mod tests {
         let mut h = MonitorHarness::start(0);
         let (snapshot, _) = h.store("in the history");
         let (_, gap) = h.store("committed after the snapshot");
-        h.send(MonitorMsg::Register(MonitorHarness::sub(
-            1,
-            "x",
-            json!({"kinds": [1]}),
-            1,
-        )));
+        h.register(1, json!({"kinds": [1]}), snapshot);
         let (_, held) = h.store("held");
         assert_eq!(
             h.history_done(1, snapshot),
             [eose_frame(), event_frame(&gap), event_frame(&held)]
+        );
+    }
+
+    /// Stored events up to the snapshot are the history's, even when the
+    /// monitor matches them only after the registration: it leaves them alone.
+    #[test]
+    fn monitor_leaves_events_up_to_the_snapshot_to_the_history() {
+        let mut h = MonitorHarness::start(0);
+        let (snapshot, history) = h.write("stored before the REQ, matched after it");
+        h.register(1, json!({"kinds": [1]}), snapshot);
+        h.send(MonitorMsg::DbChange);
+        h.observe(&history);
+        let (_, live) = h.store("after the REQ");
+        assert_eq!(
+            h.history_done(1, snapshot),
+            [eose_frame(), event_frame(&live)]
         );
     }
 
@@ -5217,12 +5289,7 @@ mod tests {
     #[test]
     fn monitor_overflow_rereads_stored_and_drops_ephemeral() {
         let mut h = MonitorHarness::start(2 * wok_query::pending::STORED_ENTRY_BYTES);
-        h.send(MonitorMsg::Register(MonitorHarness::sub(
-            1,
-            "x",
-            json!({"kinds": [1, 20001]}),
-            1,
-        )));
+        h.register(1, json!({"kinds": [1, 20001]}), 0);
         let ids: Vec<String> = (0..3).map(|i| h.store(&format!("stored {i}")).1).collect();
         assert_eq!(h.metrics.live_buffer_overflows.load(Ordering::Relaxed), 1);
         h.ephemeral("too big for the buffer");
@@ -5237,6 +5304,25 @@ mod tests {
         assert_eq!(h.history_done(1, 0), expected);
     }
 
+    /// Held events are checked against the read policy again when they are
+    /// sent: one that expired or became restricted while the history was
+    /// sent is dropped.
+    #[test]
+    fn monitor_rechecks_held_events_against_the_current_policy() {
+        let mut h = MonitorHarness::start(0);
+        h.register(1, json!({"kinds": [1, 20001]}), 0);
+        h.ephemeral_at("expires while held", now_secs() - 10);
+        let (_, stored) = h.store("stored");
+        h.cfg.write().events.ephemeral_lifetime_secs = 5;
+        assert_eq!(h.history_done(1, 0), [eose_frame(), event_frame(&stored)]);
+
+        h.register(2, json!({"kinds": [1, 20001]}), 0);
+        h.ephemeral("restricted while held");
+        h.store("restricted while held");
+        h.cfg.write().relay.auth.restricted_read_kinds = vec![1, 20001];
+        assert_eq!(h.history_done(2, 0), [eose_frame()]);
+    }
+
     /// A refusal's CLOSED ends only the generation it was for: a later REQ
     /// that reused the id keeps running, and history finished for a refused
     /// or replaced generation sends no EOSE.
@@ -5245,14 +5331,9 @@ mod tests {
         let mut h = MonitorHarness::start(0);
         let x = || SubId::new("x").unwrap();
         let filter = json!({"kinds": [1]});
-        h.send(MonitorMsg::Register(MonitorHarness::sub(
-            1,
-            "x",
-            filter.clone(),
-            1,
-        )));
+        h.register(1, filter.clone(), 0);
         assert_eq!(h.history_done(1, 0), [eose_frame()]);
-        h.send(MonitorMsg::Register(MonitorHarness::sub(1, "x", filter, 3)));
+        h.register(3, filter, 0);
         let closed = |generation| MonitorMsg::Closed {
             conn_id: 1,
             sub_id: x(),

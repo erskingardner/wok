@@ -1,34 +1,45 @@
 //! Live matches held for a subscription while its history is being sent.
 //!
-//! A REQ is registered with the live monitor before its history scan
-//! snapshots the database, so nothing published after the REQ falls between
-//! the two. Until the scan finishes, matches wait here in arrival order:
-//! stored events as their local event id, live-only (ephemeral) events as
-//! their JSON. The buffer is bounded. Past the bound, stored events are
-//! dropped and later re-read from the database, and ephemeral events, which
-//! cannot be re-read, are dropped oldest first.
+//! A REQ's history covers what was stored when the REQ was admitted; the live
+//! monitor covers everything after, starting before the history scan does, so
+//! nothing published after the REQ is missed. Until the scan finishes,
+//! matches wait here in arrival order: stored events as their local event id,
+//! live-only (ephemeral) events in full, so their visibility can be checked
+//! again when they are sent. The buffer is bounded. Past the bound, stored
+//! events are dropped and later re-read from the database, and ephemeral
+//! events, which cannot be re-read, are dropped oldest first.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Bytes charged for a buffered stored event.
 pub const STORED_ENTRY_BYTES: usize = 16;
-/// Bytes charged for a buffered ephemeral event on top of its JSON.
+/// Bytes charged for a buffered ephemeral event on top of its payloads.
 pub const EPHEMERAL_ENTRY_OVERHEAD: usize = 64;
+
+/// A live-only event that never reaches the database.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HeldEvent {
+    /// PackedEvent bytes, to check visibility again before sending.
+    pub packed: Vec<u8>,
+    pub json: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingEvent {
     /// A stored event, by local event id.
     Stored(u64),
-    /// A live-only event that never reaches the database.
-    Ephemeral(Arc<str>),
+    /// A live-only event, shared by every subscription that holds it.
+    Ephemeral(Arc<HeldEvent>),
 }
 
 impl PendingEvent {
     fn cost(&self) -> usize {
         match self {
             Self::Stored(_) => STORED_ENTRY_BYTES,
-            Self::Ephemeral(json) => json.len().saturating_add(EPHEMERAL_ENTRY_OVERHEAD),
+            Self::Ephemeral(event) => {
+                (event.packed.len() + event.json.len()).saturating_add(EPHEMERAL_ENTRY_OVERHEAD)
+            }
         }
     }
 }
@@ -45,9 +56,9 @@ pub struct PendingBuffer {
 }
 
 impl PendingBuffer {
-    /// `live_from` is the newest local event id the monitor had already
-    /// matched when it registered the subscription: the buffer only sees
-    /// stored events after it.
+    /// `live_from` is the local event id after which stored matches are the
+    /// buffer's: the REQ's history snapshot, or the newest event the monitor
+    /// had already matched when it registered the subscription, if later.
     pub fn new(live_from: u64, limit: usize) -> Self {
         Self {
             events: VecDeque::new(),
@@ -93,24 +104,25 @@ impl PendingBuffer {
     }
 
     /// Buffer an ephemeral match. Returns how many ephemeral events were
-    /// dropped, oldest first, to bound the buffer; that can include this one
-    /// if it is larger than the whole bound. Stored events give way first,
+    /// dropped, oldest first, to bound the buffer. An event larger than the
+    /// whole bound is the only one dropped. Stored events give way first,
     /// since those can be re-read; the second value is true if this push made
     /// them overflow.
-    pub fn push_ephemeral(&mut self, json: Arc<str>) -> (u64, bool) {
-        let event = PendingEvent::Ephemeral(json);
+    pub fn push_ephemeral(&mut self, event: Arc<HeldEvent>) -> (u64, bool) {
+        let event = PendingEvent::Ephemeral(event);
         let cost = event.cost();
+        if self.limit != 0 && cost > self.limit {
+            return (1, false);
+        }
         let overflowed = !self.fits(cost) && self.stored != 0;
         if overflowed {
             self.drop_stored();
         }
         let mut dropped = 0;
         while !self.fits(cost) {
-            let Some(oldest) = self.events.pop_front() else {
-                // Larger than the whole bound on its own.
-                return (dropped + 1, overflowed);
-            };
-            // Only ephemeral events are left once stored ones overflowed.
+            // Only ephemeral events are left once stored ones overflowed, and
+            // the event fits an empty buffer.
+            let oldest = self.events.pop_front().expect("fits an empty buffer");
             self.bytes -= oldest.cost();
             dropped += 1;
         }
@@ -146,22 +158,29 @@ impl PendingBuffer {
 mod tests {
     use super::*;
 
-    fn ephemeral(len: usize) -> Arc<str> {
-        "x".repeat(len).into()
+    fn ephemeral(json: &str) -> Arc<HeldEvent> {
+        Arc::new(HeldEvent {
+            packed: Vec::new(),
+            json: json.into(),
+        })
+    }
+
+    fn sized(len: usize) -> Arc<HeldEvent> {
+        ephemeral(&"x".repeat(len))
     }
 
     #[test]
     fn keeps_arrival_order() {
         let mut buffer = PendingBuffer::new(7, 0);
         assert!(!buffer.push_stored(8));
-        assert_eq!(buffer.push_ephemeral("{}".into()), (0, false));
+        assert_eq!(buffer.push_ephemeral(ephemeral("{}")), (0, false));
         assert!(!buffer.push_stored(9));
         assert_eq!(buffer.live_from(), 7);
         assert_eq!(
             buffer.into_events(),
             [
                 PendingEvent::Stored(8),
-                PendingEvent::Ephemeral("{}".into()),
+                PendingEvent::Ephemeral(ephemeral("{}")),
                 PendingEvent::Stored(9),
             ]
         );
@@ -185,28 +204,35 @@ mod tests {
     fn ephemeral_overflow_drops_stored_first_then_oldest_ephemeral() {
         let one = 100 + EPHEMERAL_ENTRY_OVERHEAD;
         let mut buffer = PendingBuffer::new(0, 2 * one + STORED_ENTRY_BYTES);
-        assert_eq!(buffer.push_ephemeral(ephemeral(100)), (0, false));
+        assert_eq!(buffer.push_ephemeral(sized(100)), (0, false));
         assert!(!buffer.push_stored(1));
-        assert_eq!(buffer.push_ephemeral(ephemeral(100)), (0, false));
+        assert_eq!(buffer.push_ephemeral(sized(100)), (0, false));
         // The third ephemeral first displaces the recoverable stored entry,
         // then the oldest ephemeral.
-        let newest: Arc<str> = "y".repeat(100).into();
+        let newest = ephemeral(&"y".repeat(100));
         assert_eq!(buffer.push_ephemeral(newest.clone()), (1, true));
         assert!(buffer.stored_overflowed());
         assert_eq!(
             buffer.into_events(),
             [
-                PendingEvent::Ephemeral(ephemeral(100)),
+                PendingEvent::Ephemeral(sized(100)),
                 PendingEvent::Ephemeral(newest),
             ]
         );
     }
 
+    /// An event too large for the bound is dropped alone: what the buffer
+    /// already holds stays, stored events included.
     #[test]
-    fn an_ephemeral_larger_than_the_bound_is_dropped() {
+    fn an_ephemeral_larger_than_the_bound_is_dropped_alone() {
         let mut buffer = PendingBuffer::new(0, 128);
-        assert_eq!(buffer.push_ephemeral(ephemeral(10)), (0, false));
-        assert_eq!(buffer.push_ephemeral(ephemeral(1000)), (2, false));
-        assert!(buffer.is_empty());
+        assert_eq!(buffer.push_ephemeral(sized(10)), (0, false));
+        assert!(!buffer.push_stored(1));
+        assert_eq!(buffer.push_ephemeral(sized(1000)), (1, false));
+        assert!(!buffer.stored_overflowed());
+        assert_eq!(
+            buffer.into_events(),
+            [PendingEvent::Ephemeral(sized(10)), PendingEvent::Stored(1)]
+        );
     }
 }

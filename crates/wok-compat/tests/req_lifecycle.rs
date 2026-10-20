@@ -326,6 +326,32 @@ async fn stored_events_committed_during_history_arrive_exactly_once() {
     );
 }
 
+/// History covers what was stored when the REQ arrived; everything stored
+/// after reaches the client live, even if its `limit` keeps the history empty
+/// and the req worker starts the scan late, behind another long one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_limit_zero_req_gets_every_event_stored_after_it() {
+    let relay = Relay::new(true, |cfg| cfg.relay.req_worker_threads = 1);
+    let busy = relay.client().await;
+    busy.send(json!(["REQ", "busy", {"kinds": [1], "#t": ["hist"], "limit": HISTORY + 1_000}]))
+        .await;
+    let mut client = relay.client().await;
+    client
+        .send(json!(["REQ", "x", {"kinds": [1], "#t": ["fresh"], "limit": 0}]))
+        .await;
+    let mut ids = Vec::new();
+    for i in 0..20 {
+        ids.push(client.publish(1, "fresh", &format!("fresh {i}")).await);
+    }
+    client
+        .recv_until(|c| c.has("EOSE", "x") && c.accepted == ids.len() && c.got_all("x", &ids))
+        .await;
+    client.settle(Duration::from_millis(300)).await;
+    let seen = client.delivered("x");
+    assert_eq!(seen.len(), ids.len());
+    assert!(seen.values().all(|n| *n == 1));
+}
+
 /// Once a REQ replaces a subscription, the old filter delivers nothing more,
 /// and nothing published for the new one is lost during the swap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

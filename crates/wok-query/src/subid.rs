@@ -63,6 +63,9 @@ pub struct Subscription {
     pub sub_id: SubId,
     pub filter_group: crate::filter::NostrFilterGroup,
     pub count_only: bool,
+    /// The newest local event id the history scan may return, then the live
+    /// monitor's cursor. `u64::MAX` until set: `QueryScheduler::add_sub`
+    /// takes a snapshot for queries that arrive without one.
     pub latest_event_id: u64,
     /// Distinguishes successive REQs that reuse one subscription id, so a
     /// stage can ignore work left over from a replaced one.

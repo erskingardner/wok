@@ -57,10 +57,13 @@ database upgrade or startup-wide scan is required.
 
 ## REQ lifecycle
 
-A REQ is live before its history is read. Nothing published after the REQ can
-fall between the history snapshot and the live filter, including live-only
-(ephemeral) events, which never reach LMDB and so cannot be caught up later.
-No stage waits on another along the way.
+A REQ is live before its history is read. When the REQ is admitted, the
+newest local event id splits the work: the history sends what was stored up
+to it, the live monitor everything stored or published after. Each event is
+the job of exactly one of them, so nothing is missed or sent twice, whatever
+the history's `limit` keeps out. That includes live-only (ephemeral) events,
+which never reach LMDB and so cannot be caught up later. No stage waits on
+another along the way.
 
 1. **Admission, on the ingester.** Before any worker sees the REQ, the ingester
    checks parsing and filter limits, query cost, AUTH and the subscription cap.
@@ -68,29 +71,31 @@ No stage waits on another along the way.
    still sending history as well as live ones; a REQ reusing an open id always
    fits. A refusal is `CLOSED`. NIP-01 makes a REQ replace the subscription it
    names, so a refused one still ends it (step 5). The ingester keeps each
-   connection's open REQ ids and gives every REQ a new generation.
+   connection's open REQ ids, gives every REQ a new generation, and fixes its
+   history snapshot.
 2. **Registration, on the req monitor.** The ingester queues `Register` for the
    connection's req monitor, and the history scan for its req worker only once
-   `Register` is in the monitor queue. The monitor replaces any subscription
-   with that id and matches the new one against every event it handles from
-   then on, as for a live subscription. Matches are held in a per-subscription
-   buffer instead of being sent: stored events by local event id, live-only
-   events as JSON.
-3. **History, on the req worker.** The worker snapshots the newest local event
-   id, scans up to it, then posts `HistoryDone{generation, snapshot}` to the
-   monitor and moves on. It never waits for a reply.
+   `Register` is in the monitor queue, so the scan's result can never reach the
+   monitor first. The monitor replaces any subscription with that id and
+   matches the new one against every later event, as for a live subscription.
+   Matches are held in a per-subscription buffer instead of being sent: stored
+   events by local event id, live-only events in full.
+3. **History, on the req worker.** The worker scans up to the snapshot, then
+   posts `HistoryDone{generation, snapshot}` to the monitor and moves on. It
+   never waits for a reply.
 4. **Going live, on the req monitor.** For the current generation only, the
    monitor sends EOSE, then the held matches in arrival order, then delivers
-   live. Held stored events up to the snapshot are dropped: the history sent
-   them. NIP-01 defines EOSE as the boundary to "events newly received in
+   live. NIP-01 defines EOSE as the boundary to "events newly received in
    real-time", so everything held follows it, including stored events
-   committed during the scan (strfry sends those first).
+   committed during the scan (strfry sends those first). Held events are
+   checked against the read policy again before they are sent.
    - Stored events after the snapshot that the buffer lacks are re-read from
      LMDB after EOSE. That happens when the monitor matched commits past the
      snapshot before it saw `Register`, or when the stored part of the buffer
      outgrew `relay.max_live_buffer_bytes`.
    - Live-only events cannot be re-read. A full buffer drops the oldest and
-     counts them (`wok_live_buffer_dropped_ephemeral_total`).
+     counts them (`wok_live_buffer_dropped_ephemeral_total`); one larger than
+     the whole bound is dropped alone.
 5. **CLOSE, replacement, refusal, disconnect.** CLOSE queues `Remove` for the
    monitor and, behind it, a cancel for the worker. A refused REQ that names an
    open subscription does the same, and its CLOSED travels from the worker
@@ -107,7 +112,7 @@ neither cancels the other.
 
 Each req monitor drains its queue in batches and applies subscription changes
 (`Register`, `Remove`, `HistoryDone`, CLOSED, AUTH, disconnect) before the
-events queued with them. A REQ then also sees events published just before
-it, CLOSE takes effect sooner, and EOSE does not wait behind the batch's
+events queued with them. A REQ then also sees live-only events published just
+before it, CLOSE takes effect sooner, and EOSE does not wait behind the batch's
 fan-out. Each kind keeps its own order, and per-connection order holds because
 a connection's subscriptions all live on one monitor.

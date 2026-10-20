@@ -225,6 +225,16 @@ fn nip01_duplicate_filters_still_parse() {
 }
 
 #[test]
+fn nip01_kinds_4_to_44_are_regular() {
+    // Includes kind 41, which the pinned strfry replaces per author.
+    for kind in 4..45 {
+        assert!(!wok_event::is_replaceable_kind(kind), "kind {kind}");
+        assert!(!wok_event::is_param_replaceable_kind(kind), "kind {kind}");
+        assert!(!wok_event::is_ephemeral_kind(kind), "kind {kind}");
+    }
+}
+
+#[test]
 fn nip02_kind3_is_replaceable() {
     assert!(wok_event::is_replaceable_kind(3));
 }

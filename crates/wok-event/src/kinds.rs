@@ -1,9 +1,12 @@
-//! Kind classification matching `src/EventUtils.h`.
+//! Kind classification following pinned NIP-01.
 
 use crate::EventError;
 
+/// NIP-01 replaceable kinds: 0, 3 and 10000 <= n < 20000. Kind 41 (NIP-28
+/// channel metadata) is regular, because each channel is named by an `e` tag;
+/// the pinned strfry `src/EventUtils.h` replaces it per author.
 pub fn is_replaceable_kind(kind: u64) -> bool {
-    kind == 0 || kind == 3 || kind == 41 || (10_000..20_000).contains(&kind)
+    kind == 0 || kind == 3 || (10_000..20_000).contains(&kind)
 }
 
 pub fn is_param_replaceable_kind(kind: u64) -> bool {
@@ -55,7 +58,7 @@ mod tests {
     fn kind_ranges() {
         assert!(is_replaceable_kind(0));
         assert!(is_replaceable_kind(3));
-        assert!(is_replaceable_kind(41));
+        assert!(!is_replaceable_kind(41));
         assert!(is_replaceable_kind(10_000));
         assert!(!is_replaceable_kind(20_000));
         assert!(is_param_replaceable_kind(30_000));

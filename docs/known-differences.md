@@ -139,3 +139,8 @@ regression test. Differential parity alone is not a reason to retain it.
   by its virtual empty `d` (or a later short `d`), so distinct addresses
   replace one another, and it never matches that deletion against its target.
   Indexing a hash of long values would lift this limit.
+- NIP-01 kind ranges: kind 41 (NIP-28 channel metadata) is regular. The pinned
+  strfry treats it as replaceable per author, so metadata for a second channel
+  deleted the first channel's. Migrated kind 41 history stays stored and
+  becomes visible, and the superseded-version count is redone on the first
+  writable open (see [lmdb-v3.md](lmdb-v3.md)).

@@ -3,7 +3,11 @@ use crate::keys::make_key_string_u64;
 use crate::{DbError, RoTxn, RwTxn};
 
 pub(crate) const HIGH_WATER: &[u8] = b"sequence";
-pub(crate) const SUPERSEDED_EVENTS: &[u8] = b"superseded-events";
+pub(crate) const SUPERSEDED_EVENTS: &[u8] = b"superseded-versions";
+/// The count kept while kind 41 was classified as replaceable. A writable open
+/// by such a release writes it again, so wherever it is present the current
+/// count may be stale.
+pub(crate) const LEGACY_SUPERSEDED_EVENTS: &[u8] = b"superseded-events";
 pub const POLICY_GENERATION: &[u8] = b"visibility";
 
 pub(crate) fn decode(raw: &[u8]) -> Result<u64, DbError> {
@@ -180,7 +184,23 @@ pub fn superseded_events_ro(txn: &RoTxn<'_>) -> Result<Option<u64>, DbError> {
     let Some(dbi) = txn.env().dbis().state else {
         return Ok(None);
     };
+    if txn.get(dbi, LEGACY_SUPERSEDED_EVENTS)?.is_some() {
+        return Ok(None);
+    }
     txn.get(dbi, SUPERSEDED_EVENTS)?.map(decode).transpose()
+}
+
+/// Drop a count that may have been kept under the old kind classification,
+/// so that writable initialization counts again.
+pub(crate) fn discard_legacy_superseded_events(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
+    let Some(dbi) = txn.env().dbis().state else {
+        return Ok(());
+    };
+    if txn.del(dbi, LEGACY_SUPERSEDED_EVENTS, None)? {
+        txn.del(dbi, SUPERSEDED_EVENTS, None)?;
+        txn.superseded_events = None;
+    }
+    Ok(())
 }
 
 /// One ordered index scan on first initialization of an older database.

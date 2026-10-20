@@ -27,6 +27,18 @@ fn event(key: &Keypair, kind: u64, time: u64, tags: Value, content: &str) -> Val
 // Rebuild all derived indexes, then verify structural integrity. The read fix
 // must not depend on physical deletion, insertion order, or damaged indexes.
 fn snapshot(events: &[Value]) -> (TempDir, Env) {
+    let records: Vec<_> = events
+        .iter()
+        .map(|event| {
+            let parsed =
+                parse_and_verify_event(event, &EventLimits::default(), None, true, false).unwrap();
+            (parsed.packed.into_bytes(), parsed.json)
+        })
+        .collect();
+    snapshot_records(&records)
+}
+
+fn snapshot_records(records: &[(Vec<u8>, String)]) -> (TempDir, Env) {
     let source_dir = tempfile::tempdir().unwrap();
     let source = Env::open(
         source_dir.path(),
@@ -39,16 +51,13 @@ fn snapshot(events: &[Value]) -> (TempDir, Env) {
     source.ensure_initialized().unwrap();
     {
         let mut txn = source.begin_rw().unwrap();
-        for (index, event) in events.iter().enumerate() {
-            let parsed =
-                parse_and_verify_event(event, &EventLimits::default(), None, true, false).unwrap();
+        for (index, (packed, json)) in records.iter().enumerate() {
             let lev = index as u64 + 1;
-            txn.put_u64(source.dbis().event, lev, &parsed.packed.into_bytes(), 0)
-                .unwrap();
+            txn.put_u64(source.dbis().event, lev, packed, 0).unwrap();
             txn.put_u64(
                 source.dbis().event_payload,
                 lev,
-                &wok_db::encode_raw_payload(&parsed.json),
+                &wok_db::encode_raw_payload(json),
                 0,
             )
             .unwrap();
@@ -69,12 +78,9 @@ fn snapshot(events: &[Value]) -> (TempDir, Env) {
         wok_db::rebuild_primary_and_event_indices(&source.begin_ro().unwrap(), &mut txn).unwrap();
         // Keep the persistent match-all negentropy tree structurally correct too.
         let mut tree = wok_negentropy::open_rw(&mut txn, 1).unwrap();
-        for event in events {
-            tree.insert(
-                event["created_at"].as_u64().unwrap(),
-                &hex::decode(event["id"].as_str().unwrap()).unwrap(),
-            )
-            .unwrap();
+        for (packed, _) in records {
+            let packed = PackedEventView::new(packed).unwrap();
+            tree.insert(packed.created_at(), packed.id()).unwrap();
         }
         tree.backend.flush().unwrap();
         drop(tree);
@@ -125,7 +131,7 @@ fn ids(events: &[Value]) -> Vec<String> {
 #[test]
 fn all_replaceable_kinds_hide_imported_history_in_req_and_count() {
     let key = key();
-    for kind in [0, 3, 41, 10000, 10002, 19999, 30000, 30023, 30443, 39999] {
+    for kind in [0, 3, 10000, 10002, 19999, 30000, 30023, 30443, 39999] {
         let old = event(&key, kind, 100, json!([["d", "address"]]), "old");
         let newest = event(&key, kind, 300, json!([["d", "address"]]), "newest");
         let middle = event(&key, kind, 200, json!([["d", "address"]]), "middle");
@@ -167,7 +173,8 @@ fn addresses_authors_kinds_and_regular_events_remain_independent() {
             }
         }
     }
-    for kind in [1, 2, 9999, 40000, 65535] {
+    // NIP-01: 4 <= n < 45 is regular, so kind 41 channel metadata is too.
+    for kind in [1, 2, 41, 44, 9999, 40000, 65535] {
         for time in [10, 20] {
             let regular = event(&a, kind, time, json!([["d", "a"]]), "regular");
             events.push(regular.clone());
@@ -464,6 +471,96 @@ async fn long_d_tags_cannot_merge_distinct_addresses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn channel_metadata_for_each_channel_survives() {
+    // NIP-01 makes 4 <= n < 45 regular. NIP-28 kind 41 names its channel
+    // with an e tag, so one author's metadata for two channels is two
+    // events, not a replacement.
+    let key = key();
+    let (dir, env) = snapshot(&[]);
+    let (handle, mut wire) = server(env, dir.path()).await;
+    let channels = ["aa".repeat(32), "bb".repeat(32)];
+    let mut published = Vec::new();
+    for (time, channel) in [(100, &channels[0]), (200, &channels[1])] {
+        let metadata = event(&key, 41, time, json!([["e", channel]]), "{}");
+        assert_eq!(publish(&mut wire, &metadata).await[2], true);
+        published.push(metadata);
+    }
+    for (filter, expected) in [
+        (json!({"kinds": [41]}), published.clone()),
+        (
+            json!({"kinds": [41], "#e": [channels[0]]}),
+            vec![published[0].clone()],
+        ),
+    ] {
+        wire.send(json!(["REQ", "channels", filter])).await.unwrap();
+        let mut stored = Vec::new();
+        loop {
+            let frame = wire.recv().await.unwrap();
+            match frame[0].as_str() {
+                Some("EVENT") => stored.push(frame[2].clone()),
+                Some("EOSE") => break,
+                _ => panic!("unexpected {frame}"),
+            }
+        }
+        assert_eq!(ids(&stored), ids(&expected), "{filter}");
+    }
+    handle.request_shutdown();
+}
+
+#[test]
+fn kind41_history_packed_as_replaceable_is_regular_after_upgrade() {
+    // strfry and earlier Wok releases packed kind 41 with a virtual empty d
+    // and counted extra versions per author as superseded history under the
+    // state key "superseded-events". Both versions must now be visible, and
+    // the count is redone on the next writable open.
+    let key = key();
+    let channels = ["aa".repeat(32), "bb".repeat(32)];
+    let records: Vec<_> = [(100, &channels[0]), (200, &channels[1])]
+        .into_iter()
+        .map(|(time, channel)| {
+            let metadata = event(&key, 41, time, json!([["e", channel]]), "{}");
+            let parsed =
+                parse_and_verify_event(&metadata, &EventLimits::default(), None, true, false)
+                    .unwrap();
+            let view = parsed.packed.view();
+            let mut tags = wok_event::PackedEventTagBuilder::default();
+            tags.add('d', b"").unwrap();
+            tags.add('e', &hex::decode(channel).unwrap()).unwrap();
+            let legacy =
+                wok_event::PackedEventBuilder::build(view.id(), view.pubkey(), time, 41, 0, &tags)
+                    .unwrap();
+            (metadata, (legacy.into_bytes(), parsed.json))
+        })
+        .collect();
+    let (published, records): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+    let (_dir, env) = snapshot_records(&records);
+    let state = env.dbis().state.unwrap();
+    {
+        // What a writable open by an older release leaves behind.
+        let mut txn = env.begin_rw().unwrap();
+        txn.clear(state).unwrap();
+        txn.put(state, b"superseded-events", &1u64.to_le_bytes(), 0)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let txn = env.begin_ro().unwrap();
+    assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), None);
+    let report = wok_db::check_integrity(&txn).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    assert_eq!((report.superseded_groups, report.superseded_events), (0, 0));
+    drop(txn);
+    assert_eq!(query(&env, &[json!({})], false), ids(&published));
+
+    env.ensure_initialized().unwrap();
+    let txn = env.begin_ro().unwrap();
+    assert!(txn.get(state, b"superseded-events").unwrap().is_none());
+    assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), Some(0));
+    assert!(wok_db::check_integrity(&txn).unwrap().ok());
+    drop(txn);
+    assert_eq!(query(&env, &[json!({})], false), ids(&published));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn negentropy_hides_stale_ids_with_and_without_a_matching_persistent_tree() {
     let key = key();
     let mut events = Vec::new();
@@ -558,7 +655,7 @@ fn write_with_quota(
 
 #[test]
 fn replacement_writer_removes_all_versions_atomically_and_uses_net_quota() {
-    for kind in [0, 3, 41, 10000, 19999, 30000, 30443, 39999] {
+    for kind in [0, 3, 10000, 19999, 30000, 30443, 39999] {
         let key = key();
         let events: Vec<_> = [300, 100, 200]
             .iter()
@@ -698,7 +795,7 @@ fn integrity_reports_retained_versions_without_treating_them_as_corruption() {
 #[test]
 fn physical_tree_fast_path_tracks_retained_history_transactionally() {
     let key = key();
-    for kind in [0, 3, 41, 10002, 30443] {
+    for kind in [0, 3, 10002, 30443] {
         let old = event(&key, kind, 100, json!([]), "old");
         let newest = event(&key, kind, 200, json!([]), "newest");
         let (_dir, env) = snapshot(std::slice::from_ref(&old));
@@ -813,7 +910,7 @@ fn purging_superseded_history_keeps_one_winner_per_address() {
     let mut events = Vec::new();
     let mut winners = Vec::new();
     for key in [&a, &b] {
-        for kind in [0, 3, 41, 10000, 19999] {
+        for kind in [0, 3, 10000, 19999] {
             let versions: Vec<_> = [200, 300, 100]
                 .iter()
                 .map(|t| event(key, kind, *t, json!([["d", "ignored"]]), "version"))
@@ -840,14 +937,16 @@ fn purging_superseded_history_keeps_one_winner_per_address() {
         ties.sort_by_key(|v| v["id"].as_str().unwrap().to_owned());
         winners.push(ties[0].clone());
         events.extend(ties.into_iter().rev());
-        for time in [100, 200] {
-            let regular = event(key, 1, time, json!([["d", "x"]]), "regular");
-            winners.push(regular.clone());
-            events.push(regular);
+        for kind in [1, 41] {
+            for time in [100, 200] {
+                let regular = event(key, kind, time, json!([["d", "x"]]), "regular");
+                winners.push(regular.clone());
+                events.push(regular);
+            }
         }
     }
-    let groups = 2 * (5 + 2 + 1);
-    let superseded = 2 * (5 * 2 + 2 + 2);
+    let groups = 2 * (4 + 2 + 1);
+    let superseded = 2 * (4 * 2 + 2 + 2);
     let (_dir, env) = snapshot(&events);
     let before = wok_db::count_superseded_ro(&env.begin_ro().unwrap()).unwrap();
     assert_eq!((before.groups, before.events), (groups, superseded));

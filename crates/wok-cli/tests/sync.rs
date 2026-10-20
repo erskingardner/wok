@@ -763,7 +763,7 @@ async fn clean_replacement_databases_sync_above_the_memory_view_event_limit() {
         "[relay]\nmax_sync_events=1\n[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n";
     let lc = config(local.path(), options);
     let rc = config(remote.path(), options);
-    let events: Vec<_> = [0, 3, 41, 10002, 30443].into_iter().map(event).collect();
+    let events: Vec<_> = [0, 3, 10000, 10002, 30443].into_iter().map(event).collect();
     import(&lc, &events);
     import(&rc, &events);
     let server = serve(&rc).await;

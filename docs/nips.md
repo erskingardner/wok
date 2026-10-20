@@ -34,7 +34,8 @@ characters, as required by current NIP-01. Prefix filters are rejected.
 NIP-01 replacement is enforced when reading, even if a lossless migration
 retained multiple versions. Kinds 0, 3 (contact lists), and 10000–19999 select
 the newest event per author and kind; kinds 30000–39999 additionally use the
-first `d` tag (missing means empty). Equal timestamps select the lowest
+first `d` tag (missing means empty). Kind 41 (NIP-28 channel metadata) is
+regular, as NIP-01 makes every kind from 4 to 44. Equal timestamps select the lowest
 lexical event ID. The winner is determined across stored versions before
 request filters: an old ID, `until`, tag, or search filter cannot resurrect a
 superseded event. An expired or moderated winner does not expose older stored

@@ -110,6 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not indexed, so the event was keyed by an empty `d` and distinct addresses
   replaced one another (`d=""`, a 300-byte `d` and a 301-byte `d`), and such a
   deletion never matched its target.
+- Kind 41 (NIP-28 channel metadata) is a regular event, as NIP-01 makes every
+  kind from 4 to 44. It was replaced per author, so metadata for a second
+  channel deleted the first channel's. Migrated kind 41 history becomes
+  visible, and the superseded-version count is redone once on the next
+  writable open (state key `superseded-versions` replaces `superseded-events`).
 
 ## [0.7.0] - 2026-09-08
 

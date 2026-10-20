@@ -7,8 +7,8 @@ No registry, Kubernetes cluster, or Nix installation is required.
 The initial automated workload measures scaled publication, live fanout, and
 idle connections. It verifies publication receipts and complete live delivery,
 then checks the relay database offline after graceful shutdown. This packages
-existing benchmark capabilities; it is not the adversarial overload/recovery
-suite or the authenticated large-sync campaign proposed in the plan.
+existing benchmark capabilities; it is not an adversarial overload/recovery
+suite or an authenticated large-sync campaign.
 
 ## Local start
 

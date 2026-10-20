@@ -28,9 +28,9 @@ creates a tag itself.
 
 ## Release assets
 
-Each archive contains `wok`, `README.md`, `CHANGELOG.md`, `LICENSE`, the
-example `wok.toml`, and the complete `docs/` tree so README links and the Wok
-logo remain available offline. `SHA256SUMS` covers all published archives. Wok
+Each archive contains `wok`, `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`,
+`SECURITY.md`, `LICENSE`, the example `wok.toml`, and the complete `docs/` tree
+so README links and the Wok logo remain available offline. `SHA256SUMS` covers all published archives. Wok
 currently uses Unix-specific process, signal, and socket APIs, so Windows
 artifacts are not published.
 

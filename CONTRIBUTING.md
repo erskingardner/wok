@@ -77,8 +77,11 @@ CLI or tests.
 
 - Tokio owns network I/O only. LMDB transactions, cursors and mmap slices never
   cross an `.await`. Copy data out before awaiting.
-- There is one LMDB writer. Everything that mutates the database goes through
-  it.
+- Inside the relay, one writer thread performs every database mutation.
+  Other `wok` commands that change the database, such as `import`, `delete`,
+  `purge-superseded` and `negentropy build`, write from their own process,
+  and LMDB runs only one write transaction at a time across processes.
+  `reindex` needs the relay and every other writer stopped.
 - Hashing and stored JSON go through `wok_event::json`, not stock `serde_json`.
   Event identity (id, signature, tags, content, stored payload) must survive
   migration unchanged.

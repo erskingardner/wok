@@ -1,10 +1,9 @@
 # Client-realistic baseline at default limits — October 20, 2026
 
 This is the first measurement of Wok's default limits with abuse controls and
-AUTH on, under traffic shaped like real clients. It is step 0 of the
-[configuration presets proposal](config-presets-proposal.md)
-(PR [#89](https://github.com/erskingardner/wok/pull/89))
-(§6). The proposal's later steps change defaults and will be measured against
+AUTH on, under traffic shaped like real clients. It is step 0 (§6) of the
+[configuration presets proposal](config-presets-proposal.md), PR
+[#89](https://github.com/erskingardner/wok/pull/89). The proposal's later steps change defaults and will be measured against
 these numbers. Per-trial reports, with every class row and refusal row, are in
 the [JSON companion](benchmark-clients-baseline-2026-10-20.json).
 

@@ -892,9 +892,10 @@ fn verify_history(
     let returned = history.len() as u64;
     if let [m] = filters {
         let expected = oracle.expected(m, policy, identities);
-        // Wok's monitor sends events written during the scan just before EOSE
-        // (the catch-up in `MonitorMsg::NewSub`), so only the stored part of
-        // a history is bounded by `limit`.
+        // strfry, and Wok before #95, send events written during the scan just
+        // before EOSE (a catch-up after the history), so only the stored part
+        // of a history is bounded by `limit`. Current Wok sends them after
+        // EOSE, as live events.
         if m.limit.is_some_and(|limit| corpus.len() as u64 > limit) {
             return Verdict::Mismatch(format!(
                 "{} stored events returned for limit {}",
@@ -1740,10 +1741,12 @@ impl Session {
             }
             Some("NOTICE") if frame.len() == 2 => {
                 let reason = text(&frame, 1).unwrap_or_default();
-                // Over `max_subs_per_connection` (or without a monitor) Wok
-                // still sends the history, then this NOTICE, then EOSE, and
-                // never delivers live events, where NIP-01 asks for CLOSED. One req worker
-                // serves a connection, so the next EOSE is that subscription.
+                // Over `max_subs_per_connection` (or, in Wok, without a
+                // monitor) strfry and Wok before #95 still send the history,
+                // then this NOTICE, then EOSE, and never deliver live events,
+                // where NIP-01 asks for CLOSED (current Wok sends CLOSED). One
+                // req worker serves a connection, so the next EOSE is that
+                // subscription.
                 if reason.contains("too many concurrent REQs")
                     || reason.contains("monitor unavailable")
                 {

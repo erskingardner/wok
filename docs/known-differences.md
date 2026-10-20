@@ -127,3 +127,9 @@ regression test. Differential parity alone is not a reason to retain it.
   the same first-recipient/author policy, moderation, vanish and expiry checks.
   Multiple successfully authenticated identities remain valid on one connection
   (up to 64); the first identity remains the connection's rate-limit identity.
+- A validated EVENT is committed even when its connection closes before the
+  writer reaches it; only the OK is lost. The pinned strfry writer drops events
+  whose connection closed within the same write batch, which lost posts from
+  clients that publish and hang up at once. An EVENT still parked in an
+  ingester because the writer queue is full is dropped when its connection
+  closes, which keeps memory bounded under writer backpressure.

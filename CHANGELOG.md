@@ -99,6 +99,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were never sent a challenge. It draws on the per-address EVENT budget and
   replies `rate-limited: AUTH budget exhausted` once that runs out, so a few
   connections can no longer tie up every ingester thread with signature checks.
+- Events are stored even when the publisher disconnects right after sending
+  them. The writer dropped every EVENT whose connection closed within the same
+  write batch, so bots, CLI tools and mobile apps that publish and hang up lost
+  posts (of eight such publishers, one event was stored). Only the OK is lost
+  now. An EVENT still parked behind a full writer queue is dropped when its
+  connection closes, as before.
 
 ## [0.7.0] - 2026-09-08
 

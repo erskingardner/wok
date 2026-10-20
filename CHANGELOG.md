@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the COUNT dedup budget derived from `relay.max_filter_limit_count`. An
   operator who shortened the plugin timeout to contain a hanging plugin was
   still waiting the old duration (#54).
+- Ephemeral gift wraps (kind 21059) are restricted reads by default:
+  `relay.auth.restricted_read_kinds` now defaults to `[4, 1059, 21059]`.
+  Before, any unauthenticated subscription to kind 21059, or to everything,
+  received wraps addressed to someone else, recipient tag included, while
+  NIP-59 was advertised. NIP-59 is now advertised only while both gift-wrap
+  kinds are restricted; configs that list restricted kinds explicitly need
+  21059 added.
 
 ### Added
 

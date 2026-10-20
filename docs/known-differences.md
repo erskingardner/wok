@@ -149,3 +149,7 @@ regression test. Differential parity alone is not a reason to retain it.
   block a kind 5 from being stored. The pinned strfry exempts neither, so
   deleting a deletion removed it with its tombstone and the original event
   could be published again.
+- NIP-59: kind 21059 ephemeral gift wraps are restricted reads by default,
+  alongside kinds 4 and 1059, and NIP-59 is advertised only while both
+  gift-wrap kinds are restricted. The previous default let any
+  unauthenticated subscriber receive wraps addressed to someone else.

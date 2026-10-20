@@ -72,6 +72,41 @@ impl Conn {
         serde_json::from_str(&frame.into_text()).unwrap()
     }
 
+    /// The next frame, if one arrives within a short grace period.
+    async fn try_recv(&mut self) -> Option<Value> {
+        let frame = tokio::time::timeout(Duration::from_millis(300), self.rx.recv())
+            .await
+            .ok()??;
+        Some(serde_json::from_str(&frame.into_text()).unwrap())
+    }
+
+    /// Answer the challenge sent on connect as `key`.
+    async fn auth(&mut self, key: &Keypair) {
+        let challenge = self.recv().await;
+        assert_eq!(challenge[0], "AUTH", "{challenge}");
+        let event = sign_event_with_key(
+            json!({
+                "created_at": now(),
+                "kind": 22242,
+                "tags": [["relay", AUTH_RELAY], ["challenge", challenge[1]]],
+                "content": "",
+            }),
+            key,
+        );
+        self.send(json!(["AUTH", event])).await;
+        let reply = self.recv().await;
+        assert_eq!(reply[0], "OK", "{reply}");
+        assert_eq!(reply[2], true, "{reply}");
+    }
+
+    /// Subscribe and wait until stored events are done, so live delivery
+    /// applies from here on.
+    async fn subscribe(&mut self, sub_id: &str, filter: Value) {
+        self.send(json!(["REQ", sub_id, filter])).await;
+        let eose = self.recv().await;
+        assert_eq!(eose, json!(["EOSE", sub_id]));
+    }
+
     /// Publish and return the OK reply.
     async fn publish(&mut self, event: &Value) -> Value {
         self.send(json!(["EVENT", event])).await;
@@ -100,6 +135,17 @@ impl Conn {
 
 fn key() -> Keypair {
     Keypair::new(SECP256K1, &mut rand::thread_rng())
+}
+
+const AUTH_RELAY: &str = "wss://conformance.test";
+
+/// A relay where NIP-42 AUTH can succeed.
+fn auth_relay() -> Relay {
+    Relay::new(|cfg| cfg.relay.auth.service_url = AUTH_RELAY.into())
+}
+
+fn pubkey_hex(key: &Keypair) -> String {
+    hex::encode(key.x_only_public_key().0.serialize())
 }
 
 #[test]
@@ -396,6 +442,51 @@ fn nip02_kind3_is_replaceable() {
 fn nip59_gift_wrap_kinds() {
     assert!(wok_event::GIFT_WRAP_KINDS.contains(&1059));
     assert!(wok_event::GIFT_WRAP_KINDS.contains(&21059));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip59_ephemeral_gift_wraps_reach_only_their_recipient() {
+    // Kind 21059 is live-only, so its privacy rests on live delivery alone.
+    let relay = auth_relay();
+    let recipient = key();
+    let mut anonymous = relay.connect().await;
+    assert_eq!(anonymous.recv().await[0], "AUTH");
+    anonymous
+        .send(json!(["REQ", "wraps", {"kinds": [21059]}]))
+        .await;
+    let refused = anonymous.recv().await;
+    assert_eq!(refused[0], "CLOSED", "{refused}");
+    assert!(
+        refused[2].as_str().unwrap().starts_with("auth-required:"),
+        "{refused}"
+    );
+    anonymous.subscribe("everything", json!({})).await;
+    let mut stranger = relay.connect().await;
+    stranger.auth(&key()).await;
+    stranger.subscribe("wraps", json!({"kinds": [21059]})).await;
+    let mut inbox = relay.connect().await;
+    inbox.auth(&recipient).await;
+    inbox
+        .subscribe(
+            "inbox",
+            json!({"kinds": [21059], "#p": [pubkey_hex(&recipient)]}),
+        )
+        .await;
+
+    let mut publisher = relay.connect().await;
+    assert_eq!(publisher.recv().await[0], "AUTH");
+    let wrap = sign_event(json!({
+        "created_at": now(),
+        "kind": 21059,
+        "tags": [["p", pubkey_hex(&recipient)]],
+        "content": "sealed",
+    }));
+    assert_eq!(publisher.publish(&wrap).await[2], true);
+
+    let delivered = inbox.recv().await;
+    assert_eq!(delivered, json!(["EVENT", "inbox", wrap]));
+    assert_eq!(anonymous.try_recv().await, None);
+    assert_eq!(stranger.try_recv().await, None);
 }
 
 #[test]

@@ -146,7 +146,8 @@ regression test. Differential parity alone is not a reason to retain it.
   another, never matches that deletion against its target, and refuses such
   filters. Records migrated from strfry or stored by earlier Wok releases keep
   their packing, so these limits remain for them until `wok reindex` packs
-  them again from their payloads (see `lmdb-v3.md`). The repair keeps a
+  them again from their payloads (see `lmdb-v3.md`) and deletes the stored
+  versions that a deletion with such a long `a` tag names. The repair keeps a
   record that packs differently in any other way, such as kind 41 history
   packed with a virtual `d`.
 - NIP-01 kind ranges: kind 41 (NIP-28 channel metadata) is regular. The pinned

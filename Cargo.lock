@@ -2951,6 +2951,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "url",
  "wok-db",

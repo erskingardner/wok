@@ -61,6 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Configuration presets. The optional top-level key `preset` selects a named
+  set of defaults; configuration resolves as built-in defaults, then the
+  preset's overlay, then the file. `public`, the built-in defaults, is the
+  only preset and is selected when the key is absent, so no default changes.
+  Unknown preset names are rejected. `wok config show` prints the effective
+  configuration with each value's origin (default, preset, or file and line),
+  and `--overrides` prints only the keys the file changes from its preset.
+  Files written by dashboard saves and `wok migrate strfry` now include
+  `preset = "public"`.
 - `wok purge-superseded` deletes older versions of replaceable and addressable
   events retained by a strfry migration or written before 0.7.0, keeping the
   version relay reads serve. `--dry-run` reports counts without changing the

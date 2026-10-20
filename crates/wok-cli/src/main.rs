@@ -11,6 +11,7 @@ use wok_db::{
 };
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 use wok_negentropy::Storage;
+mod config_show;
 mod doctor;
 mod mesh;
 mod migrate;
@@ -108,6 +109,11 @@ enum Command {
     },
     Relay,
     Info,
+    /// Inspect the configuration file
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     /// Diagnose configuration, storage, indexes, payloads, and runtime paths
     Doctor {
         /// Emit the complete machine-readable report
@@ -226,6 +232,16 @@ enum MigrateCmd {
 }
 
 #[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print the effective configuration and where each value comes from
+    Show {
+        /// Print only keys the file sets to a value other than its preset's
+        #[arg(long)]
+        overrides: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum DictCmd {
     Stats {
         #[arg(long)]
@@ -316,11 +332,19 @@ async fn main() -> Result<()> {
                 }
             };
         }
+        Command::Config {
+            cmd: ConfigCmd::Show { overrides },
+        } => {
+            let shown = config_show::run(&config, overrides)?;
+            cli_print!("{shown}");
+            return Ok(());
+        }
         cmd => cmd,
     };
     let cfg = load_cfg(&config)?;
     match cmd {
         Command::Migrate { .. } => unreachable!("migration was dispatched before config load"),
+        Command::Config { .. } => unreachable!("config was dispatched before config load"),
         Command::Relay => cmd_relay(cfg, config).await,
         Command::Info => cmd_info(&cfg),
         Command::Doctor { json } => cmd_doctor(&cfg, &config, json),
@@ -432,6 +456,11 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 }
 
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
+    tracing::info!(
+        preset = %cfg.preset,
+        wok = env!("CARGO_PKG_VERSION"),
+        "starting relay"
+    );
     if let Some(warning) = cfg.auth_configuration_warning() {
         tracing::warn!("{warning}; restricted reads fail closed");
     }

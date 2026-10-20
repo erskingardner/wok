@@ -122,6 +122,7 @@ struct MarmotUser {
     invitees: Vec<String>,
 }
 
+#[derive(Clone)]
 struct Group {
     gid: String,
     members: Vec<usize>,
@@ -445,7 +446,8 @@ impl Plan {
         let mut marmot = Vec::new();
         let mut groups = Vec::new();
         if opts.marmot_clients > 0 {
-            let pool = opts.marmot_clients + 250;
+            // Directory batches draw 200 others; each burst invites N others.
+            let pool = (opts.marmot_clients + 250).max(opts.marmot_invitees + 1);
             let users: Vec<Keypair> = (0..pool).map(|_| b.fresh()).collect();
             let user_pk: Vec<String> = users.iter().map(pubkey_hex).collect();
             for (u, keys) in users.iter().enumerate() {
@@ -797,53 +799,95 @@ enum Verdict {
     Mismatch(String),
 }
 
+/// The relay's own cuts: `max_filter_limit` per filter and
+/// `max_total_events_per_req` per REQ. Wok applies them without telling the
+/// client (C1), so a history may come back short only when one explains it.
+#[derive(Clone, Copy, Debug)]
+struct Caps {
+    filter: u64,
+    req: u64,
+}
+
+impl Caps {
+    fn from_config(cfg: &wok_relay::Config) -> Self {
+        let cap = |n: u64| if n == 0 { u64::MAX } else { n };
+        Self {
+            filter: cap(cfg.relay.max_filter_limit),
+            req: cap(cfg.relay.max_total_events_per_req),
+        }
+    }
+}
+
+/// Whether one received event may be delivered at all: known (imported or
+/// published during the run), unaltered, matching, and visible to the
+/// connection. Checked as each EVENT arrives, so a refusal that follows
+/// cannot discard a leak.
+fn event_problem(
+    oracle: &Oracle,
+    published: &HashMap<String, Published>,
+    policy: &ReadPolicy,
+    identities: &[String],
+    filters: &[Matcher],
+    event: &Value,
+) -> Option<String> {
+    let Some(id) = event["id"].as_str() else {
+        return Some(format!("event without id: {event}"));
+    };
+    if !filters.iter().any(|m| m.matches(event)) {
+        return Some(format!("event {id} does not match the filter"));
+    }
+    if !policy.visible(event, identities) {
+        return Some(format!(
+            "restricted event {id} reached a connection that is not its recipient"
+        ));
+    }
+    match (oracle.by_id.get(id), published.get(id)) {
+        (Some(&index), _) if oracle.events[index] != *event => {
+            Some(format!("altered corpus event {id}"))
+        }
+        (Some(_), _) => None,
+        (None, Some(p)) if p.event != *event => Some(format!("altered published event {id}")),
+        (None, Some(_)) => None,
+        (None, None) => Some(format!("unknown event {id}")),
+    }
+}
+
 /// Check one subscription's history (everything before EOSE).
 ///
 /// Events published during the run may also match, so the corpus part is
 /// checked as a newest-first prefix of the oracle's answer: a relay that
 /// returns the newest `limit` of everything it holds always returns a prefix
 /// of the corpus matches, wherever the published events fall. The prefix is
-/// tie-tolerant because Wok orders equal timestamps by insertion (B2).
+/// tie-tolerant because Wok orders equal timestamps by insertion (B2). A
+/// history shorter than the filter asks for is `Truncated` when a relay cap
+/// explains it, and a mismatch otherwise.
 fn verify_history(
     oracle: &Oracle,
     published: &HashMap<String, Published>,
     policy: &ReadPolicy,
     identities: &[String],
     filters: &[Matcher],
+    caps: Caps,
     history: &[Value],
 ) -> Verdict {
     let mut seen = HashSet::new();
     let mut corpus = Vec::new();
     let mut extra = 0usize;
     for event in history {
-        let Some(id) = event["id"].as_str() else {
-            return Verdict::Mismatch(format!("event without id: {event}"));
-        };
+        if let Some(problem) = event_problem(oracle, published, policy, identities, filters, event)
+        {
+            return Verdict::Mismatch(problem);
+        }
+        let id = event["id"].as_str().unwrap_or_default();
         if !seen.insert(id) {
             return Verdict::Mismatch(format!("duplicate event {id}"));
         }
-        if !filters.iter().any(|m| m.matches(event)) {
-            return Verdict::Mismatch(format!("event {id} does not match the filter"));
-        }
-        if !policy.visible(event, identities) {
-            return Verdict::Mismatch(format!(
-                "restricted event {id} reached a connection that is not its recipient"
-            ));
-        }
-        if let Some(&index) = oracle.by_id.get(id) {
-            if oracle.events[index] != *event {
-                return Verdict::Mismatch(format!("altered corpus event {id}"));
-            }
-            corpus.push(index);
-        } else if let Some(p) = published.get(id) {
-            if p.event != *event {
-                return Verdict::Mismatch(format!("altered published event {id}"));
-            }
-            extra += 1;
-        } else {
-            return Verdict::Mismatch(format!("unknown event {id}"));
+        match oracle.by_id.get(id) {
+            Some(&index) => corpus.push(index),
+            None => extra += 1,
         }
     }
+    let returned = history.len() as u64;
     if let [m] = filters {
         let expected = oracle.expected(m, policy, identities);
         // Wok's monitor sends events written during the scan just before EOSE
@@ -869,34 +913,63 @@ fn verify_history(
         } else if corpus.len() > expected.len() {
             return Verdict::Mismatch("more corpus events than the filter matches".into());
         }
-        let under_limit = m.limit.is_none_or(|limit| (history.len() as u64) < limit);
+        let under_limit = m.limit.is_none_or(|limit| returned < limit);
         if corpus.len() < expected.len() && under_limit {
             let wanted = (expected.len() + extra).min(m.limit.map_or(usize::MAX, |l| l as usize));
-            return Verdict::Truncated {
-                returned: history.len(),
-                expected: wanted,
-            };
+            // Catch-up events count towards `returned`, so this is an upper
+            // bound on what the relay's cap admitted.
+            if returned >= caps.filter.min(caps.req) {
+                return Verdict::Truncated {
+                    returned: history.len(),
+                    expected: wanted,
+                };
+            }
+            return Verdict::Mismatch(format!(
+                "history ended after {returned} of {wanted} matching events, below every relay cap"
+            ));
         }
         return Verdict::Complete;
     }
-    let mut union = HashSet::new();
+    let mut full = HashSet::new();
+    let mut capped = HashSet::new();
     for m in filters {
-        let mut expected = oracle.expected(m, policy, identities);
-        if let Some(limit) = m.limit {
-            expected.truncate(limit as usize);
-        }
-        union.extend(expected);
+        let expected = oracle.expected(m, policy, identities);
+        let take = |n: u64| {
+            expected
+                .iter()
+                .take(n.min(usize::MAX as u64) as usize)
+                .copied()
+        };
+        let limit = m.limit.unwrap_or(u64::MAX);
+        full.extend(take(limit));
+        capped.extend(take(limit.min(caps.filter)));
     }
-    if corpus.iter().any(|i| !union.contains(i)) {
+    if corpus.iter().any(|i| !full.contains(i)) {
         return Verdict::Mismatch("event outside every filter's newest events".into());
     }
-    if corpus.len() < union.len() && extra == 0 {
+    if corpus.len() == full.len() {
+        return Verdict::Complete;
+    }
+    // A published event can take a slot only in a filter with a `limit`.
+    let displaceable = filters.iter().any(|m| m.limit.is_some());
+    if displaceable && corpus.len() + extra >= full.len() {
+        return Verdict::Complete;
+    }
+    // The per-filter cap explains a short union only where it cuts a filter;
+    // within the cap, published events can take slots as under a `limit`.
+    let per_filter_cut = capped.len() < full.len()
+        && corpus.iter().all(|i| capped.contains(i))
+        && corpus.len() + extra >= capped.len();
+    if per_filter_cut || returned >= caps.req {
         return Verdict::Truncated {
             returned: history.len(),
-            expected: union.len(),
+            expected: full.len(),
         };
     }
-    Verdict::Complete
+    Verdict::Mismatch(format!(
+        "history ended after {returned} of {} matching events, below every relay cap",
+        full.len()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,6 +1364,7 @@ struct Ctx {
     plan: Arc<Plan>,
     oracle: Oracle,
     policy: ReadPolicy,
+    caps: Caps,
     published: Mutex<HashMap<String, Published>>,
     stats: Mutex<Stats>,
     start: Instant,
@@ -1389,6 +1463,8 @@ struct Session {
     auth_waiting: Vec<String>,
     /// Publications refused with `auth-required:`, resent after AUTH.
     auth_events: Vec<String>,
+    /// NOTICEs that refuse the live part of the next subscription to EOSE.
+    live_refusals: std::collections::VecDeque<String>,
     subs: HashMap<String, Sub>,
     negs: HashMap<String, NegState>,
     ids_fetches: usize,
@@ -1415,6 +1491,29 @@ fn user_address(ctx: &Ctx, user: usize) -> Option<IpAddr> {
 }
 
 impl Session {
+    fn new(ctx: &Arc<Ctx>, label: String, conn: WsConn, keys: Option<Keypair>, seed: u64) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            label,
+            conn,
+            keys,
+            identities: Vec::new(),
+            challenge: None,
+            auth: Auth::None,
+            auth_waiting: Vec::new(),
+            auth_events: Vec::new(),
+            live_refusals: std::collections::VecDeque::new(),
+            subs: HashMap::new(),
+            negs: HashMap::new(),
+            ids_fetches: 0,
+            pending: HashMap::new(),
+            retries: Vec::new(),
+            burst: None,
+            gone: false,
+            rng: rand::rngs::StdRng::seed_from_u64(seed),
+        }
+    }
+
     async fn connect(
         ctx: &Arc<Ctx>,
         label: String,
@@ -1435,25 +1534,7 @@ impl Session {
                         class.completed += 1;
                         record_us(&mut class.done, micros(started.elapsed()));
                     }
-                    return Some(Self {
-                        ctx: ctx.clone(),
-                        label,
-                        conn,
-                        keys,
-                        identities: Vec::new(),
-                        challenge: None,
-                        auth: Auth::None,
-                        auth_waiting: Vec::new(),
-                        auth_events: Vec::new(),
-                        subs: HashMap::new(),
-                        negs: HashMap::new(),
-                        ids_fetches: 0,
-                        pending: HashMap::new(),
-                        retries: Vec::new(),
-                        burst: None,
-                        gone: false,
-                        rng: rand::rngs::StdRng::seed_from_u64(seed),
-                    });
+                    return Some(Self::new(ctx, label, conn, keys, seed));
                 }
                 Err(ConnectFailure::Refused(reason)) => {
                     {
@@ -1657,7 +1738,17 @@ impl Session {
             }
             Some("NOTICE") if frame.len() == 2 => {
                 let reason = text(&frame, 1).unwrap_or_default();
-                self.ctx.stats().refusal("notice", &reason);
+                // Over `max_subs_per_connection` (or without a monitor) Wok
+                // still sends the history, then this NOTICE, then EOSE, and
+                // never delivers live events (audit A9). One req worker
+                // serves a connection, so the next EOSE is that subscription.
+                if reason.contains("too many concurrent REQs")
+                    || reason.contains("monitor unavailable")
+                {
+                    self.live_refusals.push_back(reason);
+                } else {
+                    self.ctx.stats().refusal("notice", &reason);
+                }
             }
             Some("AUTH") if frame.len() == 2 => self.challenge = text(&frame, 1),
             Some("NEG-MSG") if frame.len() == 3 => {
@@ -1700,7 +1791,20 @@ impl Session {
         }
         if sub.eose.is_none() {
             sub.first_event.get_or_insert(at);
-            sub.history.push(event);
+            let problem = event_problem(
+                &ctx.oracle,
+                &ctx.published(),
+                &ctx.policy,
+                &sub.identities,
+                &sub.matchers,
+                &event,
+            );
+            match problem {
+                Some(problem) => ctx
+                    .stats()
+                    .mismatch(sub.class, format!("{label} {sid}: {problem}")),
+                None => sub.history.push(event),
+            }
             return;
         }
         // After EOSE only events published during the run can arrive.
@@ -1738,6 +1842,7 @@ impl Session {
             return;
         }
         sub.eose = Some(at);
+        let live_refusal = self.live_refusals.pop_front();
         sub.oldest = sub
             .history
             .iter()
@@ -1751,6 +1856,7 @@ impl Session {
                 &ctx.policy,
                 &sub.identities,
                 &sub.matchers,
+                ctx.caps,
                 &sub.history,
             )
         };
@@ -1776,6 +1882,11 @@ impl Session {
             Verdict::Mismatch(detail) => {
                 stats.mismatch(sub.class, format!("{label} {sid}: {detail}"));
             }
+        }
+        if let Some(reason) = live_refusal {
+            sub.refused = true;
+            stats.refusal(sub.class, &reason);
+            stats.class(sub.class).refused += 1;
         }
         drop(stats);
         sub.history = Vec::new();
@@ -2040,6 +2151,11 @@ impl Session {
         {
             let published = ctx.published();
             for id in &need {
+                let mut raw = [0u8; 32];
+                if hex::decode_to_slice(id, &mut raw).is_ok() && neg.held.contains(&raw) {
+                    problems.push(format!("need {id} is already held by the client"));
+                    break;
+                }
                 let known_corpus = ctx
                     .oracle
                     .by_id
@@ -2100,6 +2216,9 @@ impl Session {
                 "{} {sid}: NEG session for group {} did not finish",
                 self.label, neg.group
             ));
+        }
+        for reason in &self.live_refusals {
+            stats.refusal("notice", reason);
         }
         if !self.pending.is_empty() && !self.gone {
             stats.error(format!(
@@ -2774,6 +2893,7 @@ pub async fn run(input: RunInput<'_>) -> Result<(ClientsReport, Histogram<u64>)>
                 .collect(),
             involved_only: config.relay.auth.restrict_read_to_involved_pubkey,
         },
+        caps: Caps::from_config(config),
         published: Mutex::new(HashMap::new()),
         stats: Mutex::new(Stats::default()),
         start,
@@ -3106,14 +3226,37 @@ mod tests {
         }
     }
 
+    const NO_CAPS: Caps = Caps {
+        filter: u64::MAX,
+        req: u64::MAX,
+    };
+
     fn check(
         oracle: &Oracle,
         published: &HashMap<String, Published>,
         filters: &[Value],
         history: &[Value],
     ) -> Verdict {
+        check_with(oracle, published, filters, NO_CAPS, history)
+    }
+
+    fn check_with(
+        oracle: &Oracle,
+        published: &HashMap<String, Published>,
+        filters: &[Value],
+        caps: Caps,
+        history: &[Value],
+    ) -> Verdict {
         let matchers: Vec<Matcher> = filters.iter().map(Matcher::new).collect();
-        verify_history(oracle, published, &open_policy(), &[], &matchers, history)
+        verify_history(
+            oracle,
+            published,
+            &open_policy(),
+            &[],
+            &matchers,
+            caps,
+            history,
+        )
     }
 
     #[test]
@@ -3165,27 +3308,51 @@ mod tests {
     }
 
     #[test]
-    fn short_history_without_refusal_is_reported_as_truncation() {
+    fn short_history_is_truncation_only_when_a_relay_cap_explains_it() {
         let corpus: Vec<Value> = (0..5)
             .map(|i| event(&format!("e{i}"), 100 + i, 1, json!([])))
             .collect();
         let oracle = Oracle::new(corpus.clone());
         let none = HashMap::new();
         let newest: Vec<Value> = corpus.iter().rev().take(3).cloned().collect();
-        assert_eq!(
-            check(&oracle, &none, &[json!({"kinds":[1]})], &newest),
-            Verdict::Truncated {
-                returned: 3,
-                expected: 5
+        let truncated = Verdict::Truncated {
+            returned: 3,
+            expected: 5,
+        };
+        for caps in [
+            Caps {
+                filter: 3,
+                req: u64::MAX,
+            },
+            Caps {
+                filter: u64::MAX,
+                req: 3,
+            },
+        ] {
+            for filter in [json!({"kinds":[1]}), json!({"kinds":[1],"limit":10})] {
+                assert_eq!(
+                    check_with(&oracle, &none, &[filter], caps, &newest),
+                    truncated
+                );
             }
-        );
-        assert_eq!(
-            check(&oracle, &none, &[json!({"kinds":[1],"limit":10})], &newest),
-            Verdict::Truncated {
-                returned: 3,
-                expected: 5
-            }
-        );
+        }
+        // Below every cap, missing events are a failure, not a measurement.
+        let caps = Caps {
+            filter: 500,
+            req: 2_000,
+        };
+        for history in [&newest[..], &[]] {
+            assert!(matches!(
+                check_with(
+                    &oracle,
+                    &none,
+                    &[json!({"kinds":[1],"limit":10})],
+                    caps,
+                    history
+                ),
+                Verdict::Mismatch(_)
+            ));
+        }
     }
 
     #[test]
@@ -3283,6 +3450,7 @@ mod tests {
                 &policy,
                 &[],
                 &filters,
+                NO_CAPS,
                 std::slice::from_ref(&dm)
             ),
             Verdict::Mismatch(_)
@@ -3294,6 +3462,7 @@ mod tests {
                 &policy,
                 &["carol".into()],
                 &filters,
+                NO_CAPS,
                 std::slice::from_ref(&dm)
             ),
             Verdict::Mismatch(_)
@@ -3305,17 +3474,26 @@ mod tests {
                 &policy,
                 &["bob".into()],
                 &filters,
+                NO_CAPS,
                 std::slice::from_ref(&dm)
             ),
             Verdict::Complete
         );
         assert_eq!(
-            verify_history(&oracle, &none, &policy, &["alice".into()], &filters, &[dm]),
+            verify_history(
+                &oracle,
+                &none,
+                &policy,
+                &["alice".into()],
+                &filters,
+                NO_CAPS,
+                &[dm]
+            ),
             Verdict::Complete
         );
         // An unauthenticated history that leaves the DM out is complete.
         assert_eq!(
-            verify_history(&oracle, &none, &policy, &[], &filters, &[]),
+            verify_history(&oracle, &none, &policy, &[], &filters, NO_CAPS, &[]),
             Verdict::Complete
         );
     }
@@ -3342,8 +3520,22 @@ mod tests {
             ),
             Verdict::Complete
         );
-        assert_eq!(
+        // Short with no cap to explain it fails; the per-REQ cap explains it.
+        assert!(matches!(
             check(&oracle, &none, &filters, &[corpus[1].clone()]),
+            Verdict::Mismatch(_)
+        ));
+        assert_eq!(
+            check_with(
+                &oracle,
+                &none,
+                &filters,
+                Caps {
+                    filter: u64::MAX,
+                    req: 1
+                },
+                &[corpus[1].clone()]
+            ),
             Verdict::Truncated {
                 returned: 1,
                 expected: 2
@@ -3351,6 +3543,22 @@ mod tests {
         );
         assert!(matches!(
             check(&oracle, &none, &filters, &[corpus[2].clone()]),
+            Verdict::Mismatch(_)
+        ));
+        // A catch-up event cannot hide a missing event when no filter has a
+        // `limit` it could have displaced.
+        let live = event("p0", 500, 7, json!([["e", "x"]]));
+        let published = HashMap::from([(
+            "p0".to_owned(),
+            Published {
+                event: live.clone(),
+                sent: Instant::now(),
+                accepted: Some(true),
+                acked: None,
+            },
+        )]);
+        assert!(matches!(
+            check(&oracle, &published, &filters, &[live, corpus[1].clone()]),
             Verdict::Mismatch(_)
         ));
     }
@@ -3471,6 +3679,167 @@ mod tests {
             wok_relay::Config::default().relay.abuse.req_burst
         );
         assert!(defaults.effective.relay.real_ip_header.is_empty());
+    }
+
+    /// A session over channels instead of a socket, against `corpus`.
+    fn offline_session(corpus: Vec<Value>, groups: Vec<Group>, keys: Option<Keypair>) -> Session {
+        let start = Instant::now();
+        let plan = Plan {
+            events: Vec::new(),
+            anchor: 1_800_000_000,
+            popular: Vec::new(),
+            popular_pk: Vec::new(),
+            hot_roots: Vec::new(),
+            client_notes: Vec::new(),
+            outbox: Vec::new(),
+            marmot: Vec::new(),
+            groups,
+        };
+        let ctx = Arc::new(Ctx {
+            addr: SocketAddr::from(([127, 0, 0, 1], 9)),
+            service_url: "ws://127.0.0.1:9".into(),
+            opts: small_options(),
+            nodelay: true,
+            plan: Arc::new(plan),
+            oracle: Oracle::new(corpus),
+            policy: open_policy(),
+            caps: NO_CAPS,
+            published: Mutex::new(HashMap::new()),
+            stats: Mutex::new(Stats::default()),
+            start,
+            end: start + Duration::from_secs(60),
+            drain_end: start + Duration::from_secs(62),
+        });
+        let (out, _) = mpsc::unbounded_channel();
+        let (_, inbound) = mpsc::unbounded_channel();
+        let conn = WsConn {
+            out,
+            inbound,
+            deflate: false,
+        };
+        Session::new(&ctx, "test".into(), conn, keys, 1)
+    }
+
+    #[test]
+    fn an_event_leaked_before_closed_is_still_a_mismatch() {
+        let dm = json!({"id":"dm","pubkey":"alice","created_at":1,"kind":4,"tags":[["p","bob"]],"content":"","sig":"s"});
+        let keys = Keypair::new(SECP256K1, &mut rand::rngs::StdRng::seed_from_u64(3));
+        let mut s = offline_session(vec![dm.clone()], Vec::new(), Some(keys));
+        s.challenge = Some("c".into());
+        s.req(
+            "l2",
+            "live.dm_nip04",
+            Mode::Live,
+            vec![json!({"kinds":[4],"#p":["bob"]})],
+        );
+        let at = Instant::now();
+        s.on_message(at, json!(["EVENT", "l2", dm]));
+        s.on_message(
+            at,
+            json!([
+                "CLOSED",
+                "l2",
+                "auth-required: requested filter requires authentication"
+            ]),
+        );
+        assert!(
+            matches!(s.auth, Auth::Pending(..)),
+            "the client answers with AUTH"
+        );
+        let stats = s.ctx.stats();
+        assert_eq!(stats.mismatches, 1, "{:?}", stats.mismatch_samples);
+        assert!(stats.mismatch_samples[0].contains("restricted event dm"));
+    }
+
+    #[test]
+    fn a_notice_before_eose_refuses_that_subscriptions_live_part() {
+        let note = event("n", 100, 1, json!([]));
+        let mut s = offline_session(vec![note.clone()], Vec::new(), None);
+        s.req(
+            "l0",
+            "live.home_feed",
+            Mode::Live,
+            vec![json!({"kinds":[1]})],
+        );
+        s.req("l1", "live.thread", Mode::Live, vec![json!({"kinds":[1]})]);
+        let at = Instant::now();
+        s.on_message(at, json!(["EVENT", "l0", note.clone()]));
+        s.on_message(at, json!(["EOSE", "l0"]));
+        s.on_message(at, json!(["EVENT", "l1", note]));
+        s.on_message(at, json!(["NOTICE", "ERROR: too many concurrent REQs"]));
+        s.on_message(at, json!(["EOSE", "l1"]));
+        {
+            let mut stats = s.ctx.stats();
+            assert_eq!(stats.mismatches, 0, "{:?}", stats.mismatch_samples);
+            assert_eq!(stats.class("live.thread").refused, 1);
+            assert_eq!(stats.class("live.home_feed").refused, 0);
+            assert!(stats
+                .refusals
+                .contains_key("ERROR: too many concurrent REQs"));
+        }
+        let live: Vec<&str> = s.finish().iter().map(|r| r.class).collect();
+        assert_eq!(
+            live,
+            ["live.home_feed"],
+            "only the admitted subscription is checked for deliveries"
+        );
+    }
+
+    #[test]
+    fn a_nip77_need_the_client_already_holds_is_a_mismatch() {
+        let gid = "ab".repeat(32);
+        let id = |b: u8| hex::encode([b; 32]);
+        let corpus = vec![
+            json!({"id":id(1),"pubkey":"k1","created_at":10,"kind":445,"tags":[["h",gid]],"content":"","sig":"s"}),
+            json!({"id":id(2),"pubkey":"k2","created_at":11,"kind":445,"tags":[["h",gid]],"content":"","sig":"s"}),
+        ];
+        let groups = vec![Group {
+            gid,
+            members: vec![0],
+        }];
+        for (need, problem) in [
+            (vec![2u8], None),
+            (vec![1, 2], Some("already held")),
+            (vec![], Some("missing need")),
+        ] {
+            let mut s = offline_session(corpus.clone(), groups.clone(), None);
+            let mut store = wok_negentropy::Vector::new();
+            store.insert(10, &[1; 32]).unwrap();
+            store.seal().unwrap();
+            let neg = NegState {
+                group: 0,
+                started: Instant::now(),
+                first: None,
+                client: wok_negentropy::Negentropy::new(store, 60_000).unwrap(),
+                held: HashSet::from([[1u8; 32]]),
+                have: Vec::new(),
+                need: need.iter().map(|b| vec![*b; 32]).collect(),
+            };
+            s.finish_neg(Instant::now(), neg);
+            let stats = s.ctx.stats();
+            match problem {
+                None => assert_eq!(stats.mismatches, 0, "{:?}", stats.mismatch_samples),
+                Some(text) => assert!(
+                    stats.mismatch_samples.iter().any(|m| m.contains(text)),
+                    "{need:?}: {:?}",
+                    stats.mismatch_samples
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn large_bursts_get_every_requested_invitee() {
+        let opts = ClientsOptions {
+            outbox_clients: 0,
+            marmot_clients: 1,
+            marmot_groups: 1,
+            marmot_invitees: 300,
+            max_follows: 1,
+            ..small_options()
+        };
+        let plan = Plan::generate(&opts, 5, 1_800_000_000);
+        assert_eq!(plan.marmot[0].invitees.len(), 300);
     }
 
     pub(super) fn small_options() -> ClientsOptions {

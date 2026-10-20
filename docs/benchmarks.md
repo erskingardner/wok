@@ -129,8 +129,9 @@ before starting the relay.
 Refusals are the measurement. Each `CLOSED`, `OK false`, `NOTICE`, `NEG-ERR`
 and HTTP 429 is grouped by its reason, with digits collapsed. The report names
 the configuration key responsible and lists the subscription classes it
-refused. Histories that come back short with no refusal are reported as
-silently truncated. Per class, the report gives time to first EVENT and time
+refused. A history that comes back short with no refusal is reported as
+silently truncated when `max_filter_limit` or `max_total_events_per_req`
+explains the cut. Any other short history fails the trial. Per class, the report gives time to first EVENT and time
 to EOSE (for NIP-77, to the first reply and to completion), OK latency for
 publications, and publish-to-delivery latency, each at p50 and p99.
 
@@ -138,11 +139,16 @@ Correctness still decides `ok`, as in every other scenario:
 
 - every history must be the newest events of an independent oracle over the
   imported corpus, allowing for events published during the run;
-- no restricted event may reach a connection that is not its recipient;
+- no restricted event may reach a connection that is not its recipient,
+  checked as each EVENT arrives, including for subscriptions later refused;
 - every live subscription must receive each accepted, matching event
   published after its EOSE;
 - each NIP-77 pass must report exactly the corpus events the client lacked,
-  plus only 445s published into that group.
+  plus only 445s published into that group, and none it already holds.
+
+A subscription that Wok refuses with a NOTICE just before its EOSE (over
+`max_subs_per_connection`) is counted as refused and left out of the
+live-delivery check.
 
 `--expect-no-refusals` also fails the trial on any refusal. That flag is the
 acceptance check for proposed defaults

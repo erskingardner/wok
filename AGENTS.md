@@ -9,7 +9,7 @@ License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MS
 | Path | What it is |
 | --- | --- |
 | `crates/` | Cargo workspace members (relay, storage, transports, CLI, tests) |
-| `docs/` | Architecture, NIPs, config, migration, ops, benchmark reports |
+| `docs/` | Architecture, NIPs, config, migration, ops, benchmark methodology |
 | `scripts/` | Release checks and benchmark campaign wrappers |
 | `contrib/` | Packaging extras (systemd unit) |
 | `fuzz/` | Separate cargo-fuzz workspace for untrusted-input targets |
@@ -49,7 +49,7 @@ clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicate
 - Advertise only NIPs with observable relay behavior and conformance coverage (`wok-relay` capabilities catalog).
 - Safe crates `forbid(unsafe_code)`. LMDB/OS FFI is isolated and documented (`wok-db` env/txn, `wok-cli` doctor/migrate, `wok-relay` rlimit).
 
-Source-of-truth order: pinned NIPs → explicit Wok decisions in `docs/` and `PLAN.md` → lossless migration / event identity → pinned strfry as historical/differential reference.
+Source-of-truth order: pinned NIPs → explicit Wok decisions in `docs/` → lossless migration / event identity → pinned strfry as historical/differential reference.
 
 ## Commands
 
@@ -75,4 +75,5 @@ cargo test -p wok-compat --test cpp_export --test cpp_negentropy
 - Compatibility: `docs/compatibility-policy.md`, `docs/known-differences.md`
 - NIPs: `docs/nips.md` (pin: `656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab`)
 - Config sample: `docs/wok.toml`
-- Living plan / non-goals: `PLAN.md`
+- Non-goals: `docs/architecture.md`
+- Contributor workflow and PR expectations: `CONTRIBUTING.md`; vulnerability reporting: `SECURITY.md`

@@ -172,34 +172,6 @@ rotated relay order, and correctness gates before speed. Local process
 comparisons, two-host load campaigns, and same-host Unix/WebSocket comparisons
 are separate experiments so network RTT is not confused with transport cost.
 
-Historical controlled post-hardening campaign — Wok `fa9b061`, Linux x86-64,
-100,000 realistic events, and three order-rotated repetitions. All 96 two-host
-and same-host result rows passed that harness's correctness gates. The September 5
-audit found that those gates did not verify receipt ownership or exact query sets;
-the corrected harness now does. Client TCP_NODELAY is now explicit and enabled
-by default. These older figures are not measurements of the current fixes:
-
-
-| Median scenario | Wok WebSocket | Wok Unix | strfry WebSocket |
-|---|---:|---:|---:|
-| historical query | 90.6 req/s | **2,909.5 req/s** | 90.6 req/s |
-| mixed read/write | 22.8 req/s | **1,005.6 req/s** | 22.8 req/s |
-| accepted publication | 2,929 events/s | 2,939 events/s | **4,450 events/s** |
-| fanout delivery | **32,865 deliveries/s** | 31,987 deliveries/s | 28,277 deliveries/s |
-| connection opens | 4,319 conn/s | **18,469 conn/s** | 3,837 conn/s |
-| deep-history pages | 104.7 pages/s | **136.0 pages/s** | 115.6 pages/s |
-
-The table is the same-host transport experiment, not an Internet-facing
-capacity claim. In the two-host experiment, Wok WebSocket publication reached
-2,963 events/s: 5.1% above the v0.2.0 campaign while the strfry control moved
-down 1.4%, narrowing the publication gap from 70.5% to 60.0%. Wok fanout improved
-13.7% and ran 15.8% ahead of strfry. At the 10,000-connection same-host peak,
-server RSS was 478 MiB for Wok WebSocket, 455 MiB for Wok Unix, and 292 MiB for
-strfry WebSocket. Full latency, resource, limitation, and artifact provenance
-details are in the [post-hardening benchmark
-report](docs/benchmark-security-hardening-2026-08-14.md); the focused A/B is in
-the [WebSocket optimization report](docs/websocket-performance-2026-08-14.md).
-
 Reproduce:
 
 ```bash
@@ -208,11 +180,8 @@ cargo build --release -p wok-cli -p wok-bench
   --strfry /path/to/strfry --wok ./target/release/wok --seed 1
 ```
 
-Details and methodology: [docs/benchmarks.md](docs/benchmarks.md);
-historical single-run local sample:
-[docs/sample-bench-results.jsonl](docs/sample-bench-results.jsonl),
-[docs/sample-bench-summary.md](docs/sample-bench-summary.md).
-NIP-50 design, semantics, and scale results: [docs/nip50-search.md](docs/nip50-search.md).
+Details and methodology: [docs/benchmarks.md](docs/benchmarks.md).
+NIP-50 design, semantics, and search workload: [docs/nip50-search.md](docs/nip50-search.md).
 
 ## Differences from strfry
 
@@ -263,17 +232,12 @@ Summary:
 - [Observability](docs/observability.md)
 - [Operator dashboard](docs/admin-dashboard.md)
 - [Benchmark methodology](docs/benchmarks.md)
-- [Post-hardening benchmark](docs/benchmark-security-hardening-2026-08-14.md)
-- [WebSocket optimization report](docs/websocket-performance-2026-08-14.md)
-- [Wok v0.2.0 benchmark](docs/benchmark-v0.2.0-2026-08-14.md)
-- [2026-08-14 transport benchmark](docs/transport-benchmark-2026-08-14.md)
 - [Mesh and maintenance](docs/mesh-and-maintenance.md)
 - [Cutover / rollback](docs/cutover.md)
 - [Security](docs/security.md)
 - [Reliability validation and CI gates](docs/reliability.md)
 - [Local and two-VM load lab](docs/load-lab.md)
 - [Known differences](docs/known-differences.md)
-- [Definition-of-done report](docs/FINAL.md)
 
 ## Development
 
@@ -286,6 +250,9 @@ cargo test -p wok-compat --test nip_conformance --test e2e_transports
 cargo test -p wok-db --test cpp_roundtrip
 cargo test -p wok-compat --test cpp_export --test cpp_negentropy
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, conventions, and what a pull
+request needs. Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
 Fast property tests live beside the relevant crates. The composed libFuzzer
 target and scheduled sanitizer workflow are documented in

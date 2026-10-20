@@ -109,6 +109,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before EOSE, as in strfry. A client that sends CLOSE at EOSE no longer gets
   them.
 
+### Removed
+
+- Dated benchmark, soak, lab and audit reports, the definition-of-done report
+  and `PLAN.md` are no longer kept in the repository or shipped in release
+  archives. `docs/` now holds only design, policy, operations and benchmark
+  methodology; results belong in pull requests.
+
 ### Fixed
 
 - Ephemeral events published while a REQ's history was being sent were lost.

@@ -116,3 +116,12 @@ events queued with them. A REQ then also sees live-only events published just
 before it, CLOSE takes effect sooner, and EOSE does not wait behind the batch's
 fan-out. Each kind keeps its own order, and per-connection order holds because
 a connection's subscriptions all live on one monitor.
+
+## Non-goals
+
+- Storage-backend independence is deferred. LMDB stays until a concrete backend
+  or operational requirement justifies an abstraction and a comparative benchmark.
+- No implicit strfry migration, production strfry mutation, or mixed writers.
+  Older Wok writers must be stopped before the v5 upgrade; rollback restores a
+  backup rather than lowering the marker. See [storage format](lmdb-v3.md).
+- No CBOR transport.

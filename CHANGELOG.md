@@ -61,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wok-bench --scenario clients` measures default limits the way clients hit
+  them. Abuse controls and AUTH stay on, or the scenario runs a supplied relay
+  TOML (`--relay-config`). It simulates outbox clients with about 30
+  subscriptions each and MDK-shaped Marmot clients: AUTHed inboxes, per-group
+  NIP-77 passes, directory batches and add-member bursts. It reports time to
+  first EVENT and to EOSE per subscription class, and counts refusals by
+  reason. The 2026-10-20 baseline is in
+  `docs/benchmark-clients-baseline-2026-10-20.md`.
 - `wok purge-superseded` deletes older versions of replaceable and addressable
   events retained by a strfry migration or written before 0.7.0, keeping the
   version relay reads serve. `--dry-run` reports counts without changing the

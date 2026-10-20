@@ -11,6 +11,8 @@
 
 #![forbid(unsafe_code)]
 
+mod clients;
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
@@ -95,6 +97,46 @@ struct Args {
     /// Result label used with --target-url or --target-unix.
     #[arg(long, default_value = "remote")]
     target_label: String,
+    /// Wok TOML that --scenario clients runs against (default: built-in
+    /// defaults). Abuse controls and AUTH stay as the file sets them; only the
+    /// database path, listen address and port, Unix socket, real-IP header and
+    /// an empty AUTH service URL are replaced for the disposable trial.
+    #[arg(long)]
+    relay_config: Option<PathBuf>,
+    /// Outbox clients simulated by --scenario clients (about 30 subscriptions each).
+    #[arg(long, default_value_t = 20)]
+    clients: usize,
+    /// Marmot (MDK-shaped) clients simulated by --scenario clients.
+    #[arg(long, default_value_t = 4)]
+    marmot_clients: usize,
+    /// Groups per Marmot client: one live 445 #h subscription and one NIP-77 pass each.
+    #[arg(long, default_value_t = 10)]
+    marmot_groups: usize,
+    /// Gift wraps in each Marmot add-member burst (one commit plus N Welcomes).
+    #[arg(long, default_value_t = 10)]
+    marmot_invitees: usize,
+    /// Largest outbox follow list; sizes are log-uniform from 100 up to this.
+    #[arg(long, default_value_t = 2_000)]
+    max_follows: usize,
+    /// Seconds of activity in --scenario clients, before a 2 s delivery drain.
+    #[arg(long, default_value_t = 15)]
+    clients_duration_secs: u64,
+    /// Milliseconds between re-REQs of each replaced subscription.
+    #[arg(long, default_value_t = 3_000)]
+    replace_interval_ms: u64,
+    /// Background publications per second in --scenario clients (0 disables).
+    #[arg(long, default_value_t = 20.0)]
+    publish_rate: f64,
+    /// Simulated clients per source address; 0 sends every client from the
+    /// bench host's own address.
+    #[arg(long, default_value_t = 1)]
+    clients_per_address: usize,
+    /// Offer permessage-deflate from --scenario clients connections.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    client_deflate: bool,
+    /// Fail --scenario clients when any request is refused.
+    #[arg(long)]
+    expect_no_refusals: bool,
 }
 
 impl Args {
@@ -136,6 +178,8 @@ struct Trial {
     binary_sha256: String,
     profile: String,
     client_tcp_nodelay: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clients: Option<clients::ClientsReport>,
 }
 
 #[derive(Serialize)]
@@ -264,6 +308,7 @@ fn main() -> Result<()> {
         "idle_connections",
         "duplicate_import",
         "cold_start",
+        "clients",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -273,6 +318,16 @@ fn main() -> Result<()> {
     } else {
         profile_scenarios
     };
+    if args.relay_config.is_some() && !scenarios.contains(&"clients") {
+        anyhow::bail!("--relay-config is used only by --scenario clients");
+    }
+    if args.clients_per_address > 0
+        && (args.clients + args.marmot_clients).div_ceil(args.clients_per_address) > 1 << 22
+    {
+        anyhow::bail!(
+            "--clients-per-address leaves more addresses than the 10.64.0.0/10 range holds"
+        );
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -381,7 +436,7 @@ fn main() -> Result<()> {
         for scenario in &scenarios {
             let mut relays: Vec<&str> = if args.has_external_target() {
                 vec![args.target_label.as_str()]
-            } else if *scenario == "nip50_search" {
+            } else if matches!(*scenario, "nip50_search" | "clients") {
                 vec!["wok"]
             } else {
                 RELAYS.to_vec()
@@ -453,6 +508,7 @@ fn run_trial(
     #[allow(unused_assignments)]
     let mut notes = String::new();
     let mut throughput = 0.0f64;
+    let mut clients_report = None;
 
     let bin = if args.has_external_target() {
         None
@@ -736,6 +792,32 @@ fn run_trial(
                 }
             }
         }
+        "clients" => {
+            let bin = local_bin()?;
+            match clients_trial(
+                rt,
+                args,
+                bin,
+                dir.path(),
+                corpus_path,
+                workload_seed,
+                &mut hist,
+            ) {
+                Ok((rate, nts, report)) => {
+                    throughput = rate;
+                    notes = nts;
+                    ok = report.ok();
+                    mismatches += report.mismatches;
+                    errors += report.errors;
+                    clients_report = Some(report);
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e}");
+                }
+            }
+        }
         _ => {
             notes = "unrecognized scenario".into();
             ok = false;
@@ -743,6 +825,7 @@ fn run_trial(
     }
 
     Ok(Trial {
+        clients: clients_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -780,6 +863,7 @@ fn failed_trial(
     notes: String,
 ) -> Trial {
     Trial {
+        clients: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -2345,6 +2429,142 @@ fn cold_start_trial(
     Ok(ms)
 }
 
+fn clients_options(args: &Args) -> clients::ClientsOptions {
+    clients::ClientsOptions {
+        outbox_clients: args.clients,
+        marmot_clients: args.marmot_clients,
+        marmot_groups: args.marmot_groups,
+        marmot_invitees: args.marmot_invitees,
+        max_follows: args.max_follows,
+        duration_secs: args.clients_duration_secs,
+        replace_interval_ms: args.replace_interval_ms,
+        publish_rate: args.publish_rate,
+        publishers: 4,
+        clients_per_address: args.clients_per_address,
+        deflate: args.client_deflate,
+        expect_no_refusals: args.expect_no_refusals,
+    }
+}
+
+fn import_with_config(bin: &Path, conf: &Path, dbdir: &Path, jsonl: &Path) -> Result<()> {
+    let status = Command::new(bin)
+        .arg("--config")
+        .arg(conf)
+        .args(["import", "--no-verify"])
+        .current_dir(dbdir)
+        .stdin(Stdio::from(std::fs::File::open(jsonl)?))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    anyhow::ensure!(status.success(), "import of {} failed", jsonl.display());
+    Ok(())
+}
+
+fn log_tail(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(5)..].join(" | ")
+}
+
+/// Client-realistic load with abuse controls and AUTH on (see clients.rs).
+/// The relay gets the background corpus plus the scenario's own corpus, both
+/// imported with the trial's config before it starts.
+fn clients_trial(
+    rt: &tokio::runtime::Runtime,
+    args: &Args,
+    bin: &Path,
+    dbdir: &Path,
+    corpus_path: &Path,
+    workload_seed: u64,
+    hist: &mut Histogram<u64>,
+) -> Result<(f64, String, clients::ClientsReport)> {
+    let anchor = args.base_timestamp.expect("campaign timestamp set");
+    anyhow::ensure!(
+        anchor <= unix_timestamp()?,
+        "--scenario clients publishes live events, so --base-timestamp cannot be in the future"
+    );
+    let opts = clients_options(args);
+    let port = free_port();
+    let prepared = clients::prepare_config(
+        dbdir,
+        port,
+        args.relay_config.as_deref(),
+        opts.clients_per_address > 0,
+    )?;
+    let plan = clients::Plan::generate(&opts, workload_seed, anchor);
+    let scenario_corpus = dbdir.join("clients-corpus.jsonl");
+    {
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&scenario_corpus)?);
+        for event in &plan.events {
+            writeln!(file, "{}", wok_event::json::to_tao_string(event))?;
+        }
+    }
+    import_with_config(bin, &prepared.path, dbdir, corpus_path)?;
+    import_with_config(bin, &prepared.path, dbdir, &scenario_corpus)?;
+    let background = read_event_values(corpus_path)?;
+    let log = dbdir.join("relay.log");
+    let mut child = Command::new(bin)
+        .arg("--config")
+        .arg(&prepared.path)
+        .arg("relay")
+        .current_dir(dbdir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log)?))
+        .spawn()
+        .with_context(|| format!("spawn {}", bin.display()))?;
+    let url = format!("ws://127.0.0.1:{port}");
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            anyhow::bail!("relay exited during startup ({status}): {}", log_tail(&log));
+        }
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            break;
+        }
+        if Instant::now() > deadline {
+            stop_relay(&mut child, &url);
+            anyhow::bail!("relay did not listen within 30 s: {}", log_tail(&log));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let outcome = rt.block_on(clients::run(clients::RunInput {
+        addr,
+        plan,
+        background,
+        config: &prepared.effective,
+        relay_config: prepared.source.clone(),
+        config_overrides: prepared.overrides.clone(),
+        opts,
+        nodelay: CLIENT_NODELAY.load(std::sync::atomic::Ordering::Relaxed),
+    }));
+    stop_relay(&mut child, &url);
+    let (report, eose) = outcome?;
+    hist.add(&eose).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let top: Vec<String> = report
+        .refusals
+        .iter()
+        .take(3)
+        .map(|row| format!("{} x{}", row.reason, row.count))
+        .collect();
+    let notes = format!(
+        "{} outbox + {} Marmot clients ({} groups, {} invitees): {} subscriptions, {} refusals [{}], {} truncated, {} missed deliveries; deflate {}/{} connections; latency is time to EOSE",
+        report.options.outbox_clients,
+        report.options.marmot_clients,
+        report.options.marmot_groups,
+        report.options.marmot_invitees,
+        report.subscriptions,
+        report.refusals_total,
+        top.join("; "),
+        report.truncated_total,
+        report.missed_deliveries,
+        report.deflate_negotiated,
+        report.connections,
+    );
+    let rate = report.eose_count() as f64 / report.elapsed_secs.max(f64::EPSILON);
+    Ok((rate, notes, report))
+}
+
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
@@ -2387,10 +2607,37 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             t.notes
         ));
     }
-    let selection = args.scenario.as_ref().map_or_else(
+    for t in trials {
+        if let Some(report) = &t.clients {
+            s.push_str(&clients::render_markdown(report, &t.relay, t.repetition));
+        }
+    }
+    let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
         |scenario| format!("--scenario {scenario}"),
     );
+    if args.scenario.as_deref() == Some("clients") {
+        if let Some(path) = &args.relay_config {
+            selection.push_str(&format!(" --relay-config \"{}\"", path.display()));
+        }
+        selection.push_str(&format!(
+            " --clients {} --marmot-clients {} --marmot-groups {} --marmot-invitees {} --max-follows {} --clients-duration-secs {} --replace-interval-ms {} --publish-rate {} --clients-per-address {} --client-deflate {} --events {}",
+            args.clients,
+            args.marmot_clients,
+            args.marmot_groups,
+            args.marmot_invitees,
+            args.max_follows,
+            args.clients_duration_secs,
+            args.replace_interval_ms,
+            args.publish_rate,
+            args.clients_per_address,
+            args.client_deflate,
+            args.events.unwrap_or_default(),
+        ));
+        if args.expect_no_refusals {
+            selection.push_str(" --expect-no-refusals");
+        }
+    }
     let target = if let Some(path) = &args.target_unix {
         format!(
             " --target-unix \"{}\" --target-label {}",

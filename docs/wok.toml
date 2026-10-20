@@ -1,5 +1,9 @@
 # Complete Wok configuration reference with built-in defaults.
 
+# Named preset this file overlays. Settings resolve as built-in defaults, then
+# the preset, then this file. Only "public" (the built-in defaults) exists.
+preset = "public"
+
 [admin]
 # Serve the signed-out operator shell at /admin.
 enabled = false

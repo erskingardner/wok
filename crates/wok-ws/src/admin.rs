@@ -451,17 +451,21 @@ pub(crate) fn apply_config_patch(
     };
     let patch: ConfigPatch = serde_json::from_slice(body)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let mut next = current;
-    apply_patch(&mut next, patch);
-    let encoded = next
-        .to_toml()
-        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let verified =
-        Config::parse_toml(&encoded).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let (encoded, verified) =
+        patched_config(current, patch).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     atomic_write_config(&path, encoded.as_bytes())
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     handle.config.write().apply_reload(verified);
     Ok(())
+}
+
+/// Apply a patch and encode the whole result as the file to persist, checked
+/// by parsing it back. The encoding keeps the running `preset`.
+fn patched_config(mut config: Config, patch: ConfigPatch) -> Result<(String, Config), String> {
+    apply_patch(&mut config, patch);
+    let encoded = config.to_toml()?;
+    let verified = Config::parse_toml(&encoded)?;
+    Ok((encoded, verified))
 }
 
 fn apply_patch(config: &mut Config, patch: ConfigPatch) {
@@ -873,6 +877,7 @@ mod tests {
     use super::*;
     use secp256k1::{Keypair, SECP256K1};
     use serde_json::json;
+    use wok_relay::Preset;
 
     fn signed_auth_with_nonce(
         key: &Keypair,
@@ -1124,6 +1129,21 @@ mod tests {
             "info": {"admin_pubkeys": []}
         }))
         .is_err());
+    }
+
+    #[test]
+    fn config_patch_keeps_the_preset() {
+        let current =
+            Config::parse_toml("preset = \"public\"\n[relay.info]\nname = \"before\"\n").unwrap();
+        let patch: ConfigPatch =
+            serde_json::from_value(json!({"info": {"name": "after"}})).unwrap();
+        let (encoded, verified) = patched_config(current, patch).unwrap();
+        assert!(
+            encoded.lines().any(|line| line == "preset = \"public\""),
+            "{encoded}"
+        );
+        assert_eq!(verified.preset, Preset::Public);
+        assert_eq!(verified.relay.info.name, "after");
     }
 
     #[test]

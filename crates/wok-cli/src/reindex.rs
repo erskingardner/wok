@@ -401,8 +401,9 @@ mod tests {
         let (current, current_json) = signed(json!([["r", &url]]), "current");
         let (repacked, legacy_json) = signed(json!([["r", &url], ["t", "short"]]), "legacy");
         // Versions of a long address keyed by the empty d, a newer one stored
-        // at its own address, and a deletion of the address between them.
-        // Repacked, the deletion removes the versions at or before it.
+        // at its own address, and a deletion of the address after the oldest.
+        // Repacked, the deletion removes the oldest; the middle one stays as
+        // superseded history.
         let author = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
         let d = "x".repeat(300);
         let address = format!(
@@ -416,7 +417,7 @@ mod tests {
         let (middle, middle_json) =
             signed_by(&author, 30000, 1_700_000_050, json!([["d", &d]]), "middle");
         let (deletion, deletion_json) =
-            signed_by(&author, 5, 1_700_000_060, json!([["a", &address]]), "");
+            signed_by(&author, 5, 1_700_000_030, json!([["a", &address]]), "");
         // What strfry and earlier Wok releases stored: the long values dropped.
         let legacy_packing = |packed: &[u8]| {
             let view = wok_event::PackedEventView::new(packed).unwrap();
@@ -451,10 +452,10 @@ mod tests {
             for (lev, (packed, json)) in [
                 (&legacy, &legacy_json),
                 (&current, &current_json),
-                (&legacy_older, &older_json),
+                (&legacy_middle, &middle_json),
                 (&newer, &newer_json),
                 (&legacy_deletion, &deletion_json),
-                (&legacy_middle, &middle_json),
+                (&legacy_older, &older_json),
             ]
             .into_iter()
             .enumerate()
@@ -488,10 +489,10 @@ mod tests {
             let all = vec![
                 &legacy,
                 &current,
-                &legacy_older,
+                &legacy_middle,
                 &newer,
                 &legacy_deletion,
-                &legacy_middle,
+                &legacy_older,
             ];
             for (tree_id, records) in [(1, all), (2, vec![&current])] {
                 let mut tree = wok_negentropy::open_rw(&mut txn, tree_id).unwrap();
@@ -516,35 +517,30 @@ mod tests {
             ..Config::default()
         };
         let outcome = run(&cfg, Some(&backup), true).unwrap();
-        assert_eq!(outcome.events, 4);
-        assert_eq!(outcome.payloads, 4);
+        assert_eq!(outcome.events, 5);
+        assert_eq!(outcome.payloads, 5);
         assert_eq!(outcome.repacked_long_tag_records, 4);
         assert_eq!(outcome.skipped_long_tag_records, 0);
-        assert_eq!(outcome.deleted_under_repaired_deletions, 2);
-        assert_eq!((outcome.negentropy_trees, outcome.negentropy_items), (2, 6));
+        assert_eq!(outcome.deleted_under_repaired_deletions, 1);
+        assert_eq!((outcome.negentropy_trees, outcome.negentropy_items), (2, 7));
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(database.join("reindex-manifest.json")).unwrap())
                 .unwrap();
-        assert_eq!(manifest["deleted_under_repaired_deletions"], 2);
-        assert_eq!(manifest["events"], 4);
+        assert_eq!(manifest["deleted_under_repaired_deletions"], 1);
+        assert_eq!(manifest["events"], 5);
 
-        // The backup is the original, deleted versions included.
+        // The backup is the original, the deleted version included.
         let original = open_existing(&backup);
         assert_eq!(
             outcome.source_event_fingerprint_sha256,
             hex::encode(event_fingerprint(&original).unwrap().sha256)
         );
-        {
-            let txn = original.begin_ro().unwrap();
-            assert_eq!(
-                wok_db::get_packed_ro(&txn, 3).unwrap().unwrap(),
-                legacy_older
-            );
-            assert_eq!(
-                wok_db::get_packed_ro(&txn, 6).unwrap().unwrap(),
-                legacy_middle
-            );
-        }
+        assert_eq!(
+            wok_db::get_packed_ro(&original.begin_ro().unwrap(), 6)
+                .unwrap()
+                .unwrap(),
+            legacy_older
+        );
         let repaired = open_existing(&database);
         assert_eq!(
             outcome.event_fingerprint_sha256,
@@ -552,25 +548,26 @@ mod tests {
         );
         assert_eq!(
             event_fingerprint_without_hashed_tag_values(&repaired).unwrap(),
-            event_fingerprint_excluding(&original, &[3, 6].into(), true).unwrap()
+            event_fingerprint_excluding(&original, &[6].into(), true).unwrap()
         );
         let txn = repaired.begin_ro().unwrap();
         assert_eq!(wok_db::get_packed_ro(&txn, 1).unwrap().unwrap(), repacked);
         assert_eq!(wok_db::get_packed_ro(&txn, 2).unwrap().unwrap(), current);
+        assert_eq!(wok_db::get_packed_ro(&txn, 3).unwrap().unwrap(), middle);
         assert_eq!(wok_db::get_packed_ro(&txn, 4).unwrap().unwrap(), newer);
         assert_eq!(wok_db::get_packed_ro(&txn, 5).unwrap().unwrap(), deletion);
-        for lev in [3, 6] {
-            assert!(wok_db::get_packed_ro(&txn, lev).unwrap().is_none());
-            assert!(wok_db::get_payload_ro(&txn, lev).unwrap().is_none());
-        }
+        assert!(wok_db::get_packed_ro(&txn, 6).unwrap().is_none());
+        assert!(wok_db::get_payload_ro(&txn, 6).unwrap().is_none());
         // Deleting the newest record leaves the sequence where it was.
         assert_eq!(wok_db::state::high_water_ro(&txn).unwrap(), Some(6));
         let report = check_integrity(&txn).unwrap();
         assert!(report.ok(), "{:?}", report.issues);
         assert_eq!(report.legacy_long_tag_records, 0);
-        assert_eq!(report.superseded_events, 0);
-        assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), Some(0));
-        assert_eq!(wok_negentropy::verify_tree(&txn, 1, "{}").unwrap(), 4);
+        assert_eq!(report.superseded_events, 1);
+        assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), Some(1));
+        // Trees keep superseded history, as the writer and verification do:
+        // the match-all tree holds the middle version reads hide.
+        assert_eq!(wok_negentropy::verify_tree(&txn, 1, "{}").unwrap(), 5);
         assert_eq!(wok_negentropy::verify_tree(&txn, 2, &filter).unwrap(), 2);
         let mut hits = Vec::new();
         wok_query::foreach_by_filter(&txn, &json!({"#r": [&url]}), 100, 3, 16, |lev_id| {
@@ -598,7 +595,7 @@ mod tests {
                 again.repacked_long_tag_records,
                 again.deleted_under_repaired_deletions
             ),
-            (4, 0, 0)
+            (5, 0, 0)
         );
         assert_eq!(
             again.event_fingerprint_sha256,

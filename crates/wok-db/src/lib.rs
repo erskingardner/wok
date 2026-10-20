@@ -45,8 +45,8 @@ pub use lookup::{
     lookup_event_by_id_ro, most_recent_levid_ro,
 };
 pub use migration::{
-    event_fingerprint, event_fingerprint_without_hashed_tag_values, snapshot_lmdb_readonly,
-    EventFingerprint,
+    event_fingerprint, event_fingerprint_excluding, event_fingerprint_without_hashed_tag_values,
+    snapshot_lmdb_readonly, EventFingerprint,
 };
 pub use moderation::{
     allow_event, allow_kind, allow_pubkey, allowed_pubkey_reason_ro, assign_role, ban_event,

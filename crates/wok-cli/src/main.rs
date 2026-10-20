@@ -577,6 +577,12 @@ fn cmd_reindex(
                 outcome.skipped_long_tag_records
             );
         }
+        if outcome.deleted_under_repaired_deletions != 0 {
+            cli_println!(
+                "Deleted {} versions under repaired deletion requests; the backup keeps them.",
+                outcome.deleted_under_repaired_deletions
+            );
+        }
         cli_println!("Database: {}", outcome.database.display());
         cli_println!("Original backup: {}", outcome.backup.display());
         cli_println!("Fingerprint: {}", outcome.event_fingerprint_sha256);

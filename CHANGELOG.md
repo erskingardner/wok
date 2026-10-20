@@ -82,6 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `--overrides` prints only the keys the file changes from its preset.
   Files written by dashboard saves and `wok migrate strfry` now include
   `preset = "public"`.
+- `wok-bench --scenario clients` measures default limits the way clients hit
+  them. Abuse controls and AUTH stay on, or the scenario runs a supplied relay
+  TOML (`--relay-config`). It simulates outbox clients with about 30
+  subscriptions each and MDK-shaped Marmot clients: AUTHed inboxes, per-group
+  NIP-77 passes, directory batches and add-member bursts. It reports time to
+  first EVENT and to EOSE per subscription class, and counts refusals by
+  reason. It measures the default changes planned in #97.
 - `relay.max_live_buffer_bytes` (default 262144) bounds the live matches held
   for one subscription while its history is sent. Past it, stored events are
   re-read from the database after EOSE and the oldest ephemeral events are

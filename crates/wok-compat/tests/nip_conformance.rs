@@ -1,10 +1,106 @@
 //! Independently grounded NIP tests. NIPs pin: 656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab
 
-use serde_json::json;
-use wok_compat::sign_event;
+use secp256k1::{Keypair, SECP256K1};
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use wok_compat::{sign_event, sign_event_with_key};
 use wok_event::{parse_and_verify_event, EventLimits};
 use wok_query::NostrFilterGroup;
-use wok_relay::{ClientCommand, RelayMessage};
+use wok_relay::{
+    ClientCommand, ConnectionGuard, Outbound, OutboundFrame, RelayHandle, RelayMessage,
+    TransportSource,
+};
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// An in-process relay for observing NIP behavior on the wire protocol.
+struct Relay {
+    handle: RelayHandle,
+    _dir: tempfile::TempDir,
+}
+
+impl Relay {
+    fn new(configure: impl FnOnce(&mut wok_relay::Config)) -> Self {
+        let (dir, env) = wok_compat::temp_db();
+        let mut cfg = wok_relay::Config {
+            db: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        configure(&mut cfg);
+        Self {
+            handle: wok_relay::start(env, cfg).unwrap(),
+            _dir: dir,
+        }
+    }
+
+    async fn connect(&self) -> Conn {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let guard = self
+            .handle
+            .register_connection(TransportSource::Unix, Outbound::new(tx, 0))
+            .await;
+        Conn { guard, rx }
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.handle.request_shutdown();
+    }
+}
+
+struct Conn {
+    guard: ConnectionGuard,
+    rx: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+}
+
+impl Conn {
+    async fn send(&self, message: Value) {
+        self.guard.client_message(message.to_string()).await;
+    }
+
+    async fn recv(&mut self) -> Value {
+        let frame = tokio::time::timeout(Duration::from_secs(3), self.rx.recv())
+            .await
+            .expect("relay reply")
+            .expect("connection open");
+        serde_json::from_str(&frame.into_text()).unwrap()
+    }
+
+    /// Publish and return the OK reply.
+    async fn publish(&mut self, event: &Value) -> Value {
+        self.send(json!(["EVENT", event])).await;
+        let reply = self.recv().await;
+        assert_eq!(reply[0], "OK", "{reply}");
+        assert_eq!(reply[1], event["id"], "{reply}");
+        reply
+    }
+
+    /// Stored events matching `filter`, up to EOSE.
+    async fn history(&mut self, filter: Value) -> Vec<Value> {
+        self.send(json!(["REQ", "history", filter])).await;
+        let mut events = Vec::new();
+        loop {
+            let frame = self.recv().await;
+            match frame[0].as_str() {
+                Some("EVENT") => events.push(frame[2].clone()),
+                Some("EOSE") => break,
+                _ => panic!("unexpected {frame}"),
+            }
+        }
+        self.send(json!(["CLOSE", "history"])).await;
+        events
+    }
+}
+
+fn key() -> Keypair {
+    Keypair::new(SECP256K1, &mut rand::thread_rng())
+}
 
 #[test]
 fn nip01_event_id_and_sig() {
@@ -104,6 +200,63 @@ fn nip01_eose_encoding() {
 #[test]
 fn nip09_kind5_is_deletion() {
     assert_eq!(wok_event::DELETION_KIND, 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip09_deleting_a_deletion_request_has_no_effect() {
+    // "Publishing a deletion request event against a deletion request has no
+    // effect." The deletion request and its tombstone both stay in force.
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    let key = key();
+    let signed = |kind: u64, tags: Value, content: &str| {
+        sign_event_with_key(
+            json!({"created_at": now(), "kind": kind, "tags": tags, "content": content}),
+            &key,
+        )
+    };
+    let note = signed(1, json!([]), "first");
+    let d1 = signed(5, json!([["e", note["id"]]]), "");
+    let d2 = signed(5, json!([["e", d1["id"]]]), "");
+    for event in [&note, &d1, &d2] {
+        assert_eq!(conn.publish(event).await[2], true);
+    }
+    let ids = |events: &[&Value]| {
+        let mut ids: Vec<_> = events.iter().map(|event| event["id"].clone()).collect();
+        ids.sort_by_key(|id| id.as_str().unwrap().to_owned());
+        ids
+    };
+    let mut stored: Vec<_> = conn
+        .history(json!({"ids": [note["id"], d1["id"], d2["id"]]}))
+        .await
+        .into_iter()
+        .map(|event| event["id"].clone())
+        .collect();
+    stored.sort_by_key(|id| id.as_str().unwrap().to_owned());
+    assert_eq!(stored, ids(&[&d1, &d2]));
+    let reply = conn.publish(&note).await;
+    assert_eq!(reply[2], false, "{reply}");
+    assert!(
+        reply[3].as_str().unwrap().starts_with("deleted:"),
+        "{reply}"
+    );
+
+    // A request against a deletion request that arrives first does not
+    // tombstone it either: the later deletion request is stored and applied.
+    let note = signed(1, json!([]), "second");
+    let d1 = signed(5, json!([["e", note["id"]]]), "");
+    let d2 = signed(5, json!([["e", d1["id"]]]), "");
+    for event in [&note, &d2, &d1] {
+        assert_eq!(conn.publish(event).await[2], true);
+    }
+    let mut stored: Vec<_> = conn
+        .history(json!({"ids": [note["id"], d1["id"], d2["id"]]}))
+        .await
+        .into_iter()
+        .map(|event| event["id"].clone())
+        .collect();
+    stored.sort_by_key(|id| id.as_str().unwrap().to_owned());
+    assert_eq!(stored, ids(&[&d1, &d2]));
 }
 
 #[test]

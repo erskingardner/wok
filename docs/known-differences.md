@@ -144,3 +144,8 @@ regression test. Differential parity alone is not a reason to retain it.
   deleted the first channel's. Migrated kind 41 history stays stored and
   becomes visible, and the superseded-version count is redone on the first
   writable open (see [lmdb-v3.md](lmdb-v3.md)).
+- NIP-09: a deletion request against a deletion request has no effect. A kind
+  5 `e` tag never deletes a stored kind 5, and an earlier tombstone does not
+  block a kind 5 from being stored. The pinned strfry exempts neither, so
+  deleting a deletion removed it with its tombstone and the original event
+  could be published again.

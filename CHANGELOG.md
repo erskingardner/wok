@@ -115,6 +115,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel deleted the first channel's. Migrated kind 41 history becomes
   visible, and the superseded-version count is redone once on the next
   writable open (state key `superseded-versions` replaces `superseded-events`).
+- A deletion request against a deletion request has no effect, as NIP-09
+  requires. Before, a kind 5 deleting an earlier kind 5 removed it with its
+  tombstone, and the originally deleted event could be published again.
 
 ## [0.7.0] - 2026-09-08
 

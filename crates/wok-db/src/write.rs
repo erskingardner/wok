@@ -13,7 +13,7 @@ use crate::DbError;
 use lmdb_sys::{MDB_dbi, MDB_APPEND, MDB_NOOVERWRITE};
 use wok_event::{
     is_event_a_before_event_b, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag, sha256,
-    to_hex, PackedEventView, GIFT_WRAP_KINDS,
+    to_hex, PackedEventView, DELETION_KIND, GIFT_WRAP_KINDS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,8 +540,13 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
 
         // NIP-62 requests cannot be removed or preemptively tombstoned by a
-        // kind 5 event. Validity and duplicate checks still apply.
-        if !is_vanish_request && deletion_exists(txn, packed.id(), packed.pubkey())? {
+        // kind 5 event, and NIP-09 gives a deletion request against a
+        // deletion request no effect. Validity and duplicate checks still
+        // apply.
+        if !is_vanish_request
+            && packed.kind() != DELETION_KIND
+            && deletion_exists(txn, packed.id(), packed.pubkey())?
+        {
             *status = EventWriteStatus::Deleted;
             continue;
         }
@@ -657,6 +662,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                         Ok(Some((lev, buf))) => match PackedEventView::new(&buf) {
                             Ok(other) => {
                                 let mut can_delete = other.kind() != VANISH_KIND
+                                    && other.kind() != DELETION_KIND
                                     && other.pubkey() == packed.pubkey();
                                 if !can_delete && GIFT_WRAP_KINDS.contains(&other.kind()) {
                                     other.foreach_tag(|on, ov| {

@@ -3,9 +3,28 @@ use crate::subid::{SubId, Subscription};
 use std::collections::{HashMap, VecDeque};
 use wok_db::{most_recent_levid_ro, RoTxn};
 
+/// A connection's queries, by subscription id and whether they answer a COUNT.
+/// REQ and COUNT ids are separate namespaces: neither replaces the other.
+type QueryKey = (SubId, bool);
+
+/// A query whose scan failed. The scheduler has already dropped it.
+#[derive(Debug)]
+pub struct QueryFailure {
+    pub sub: Subscription,
+    pub error: wok_db::DbError,
+}
+
+impl std::fmt::Display for QueryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "query {} failed: {}", self.sub.sub_id, self.error)
+    }
+}
+
+impl std::error::Error for QueryFailure {}
+
 pub struct QueryScheduler {
     pub ensure_exists: bool,
-    conns: HashMap<u64, HashMap<SubId, usize>>,
+    conns: HashMap<u64, HashMap<QueryKey, usize>>,
     queries: Vec<Option<DbQuery>>,
     free: Vec<usize>,
     running: VecDeque<usize>,
@@ -32,13 +51,16 @@ impl QueryScheduler {
         }
     }
 
+    /// Schedule a query, snapshotting the newest event id it may return. It
+    /// replaces a query of the same kind (REQ or COUNT) with the same id. False
+    /// when the connection already runs `max_subs_per_connection` queries.
     pub fn add_sub(
         &mut self,
         txn: &RoTxn<'_>,
         mut sub: Subscription,
     ) -> Result<bool, wok_db::DbError> {
         sub.latest_event_id = most_recent_levid_ro(txn)?;
-        self.remove_sub(sub.conn_id, &sub.sub_id);
+        self.remove_query(sub.conn_id, &sub.sub_id, sub.count_only);
         let conn = self.conns.entry(sub.conn_id).or_default();
         if conn.len() >= self.max_subs_per_connection {
             return Ok(false);
@@ -55,14 +77,20 @@ impl QueryScheduler {
                 self.queries.len() - 1
             }
         };
-        conn.insert(self.queries[idx].as_ref().unwrap().sub.sub_id.clone(), idx);
+        let sub = &self.queries[idx].as_ref().unwrap().sub;
+        conn.insert((sub.sub_id.clone(), sub.count_only), idx);
         self.running.push_front(idx);
         Ok(true)
     }
 
+    /// Drop the subscription (non-COUNT) query with this id, if it is running.
     pub fn remove_sub(&mut self, conn_id: u64, sub_id: &SubId) {
+        self.remove_query(conn_id, sub_id, false);
+    }
+
+    fn remove_query(&mut self, conn_id: u64, sub_id: &SubId, count_only: bool) {
         if let Some(map) = self.conns.get_mut(&conn_id) {
-            if let Some(idx) = map.remove(sub_id) {
+            if let Some(idx) = map.remove(&(sub_id.clone(), count_only)) {
                 if self.queries[idx].take().is_some() {
                     self.running.retain(|queued| *queued != idx);
                     self.free.push(idx);
@@ -91,7 +119,7 @@ impl QueryScheduler {
         time_budget_us: u64,
         on_event: F,
         on_complete: C,
-    ) -> Result<(), wok_db::DbError>
+    ) -> Result<(), QueryFailure>
     where
         F: FnMut(&Subscription, u64, Option<&[u8]>),
         C: FnMut(&Subscription, u64, Option<String>, bool),
@@ -112,7 +140,7 @@ impl QueryScheduler {
         visibility: V,
         mut on_event: F,
         mut on_complete: C,
-    ) -> Result<(), wok_db::DbError>
+    ) -> Result<(), QueryFailure>
     where
         V: Fn(&Subscription) -> crate::visibility::ReadVisibility,
         F: FnMut(&Subscription, u64, Option<&[u8]>),
@@ -156,21 +184,21 @@ impl QueryScheduler {
         };
         let complete = match result {
             Ok(complete) => complete,
-            Err(e) => {
+            Err(error) => {
                 // A mid-scan error must not leak the slot: recycle it and
                 // drop the sub from the conn map exactly like completion,
                 // or the connection's concurrent-query budget is permanently
                 // reduced by one per error.
                 let q = self.queries[idx].take().unwrap();
                 self.free.push(idx);
-                self.remove_sub(q.sub.conn_id, &q.sub.sub_id);
-                return Err(e);
+                self.remove_query(q.sub.conn_id, &q.sub.sub_id, q.sub.count_only);
+                return Err(QueryFailure { sub: q.sub, error });
             }
         };
         if complete {
             let q = self.queries[idx].take().unwrap();
             self.free.push(idx);
-            self.remove_sub(q.sub.conn_id, &q.sub.sub_id);
+            self.remove_query(q.sub.conn_id, &q.sub.sub_id, q.sub.count_only);
             on_complete(&q.sub, q.sent_count(), q.hll_hex(), q.count_dedup_limited());
         } else {
             self.running.push_back(idx);

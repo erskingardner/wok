@@ -64,6 +64,9 @@ pub struct Subscription {
     pub filter_group: crate::filter::NostrFilterGroup,
     pub count_only: bool,
     pub latest_event_id: u64,
+    /// Distinguishes successive REQs that reuse one subscription id, so a
+    /// stage can ignore work left over from a replaced one.
+    pub generation: u64,
 }
 
 impl Subscription {
@@ -79,6 +82,7 @@ impl Subscription {
             filter_group,
             count_only,
             latest_event_id: u64::MAX,
+            generation: 0,
         }
     }
 }

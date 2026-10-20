@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Update Rustls to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349
+  (client session secrets in `Debug` output, data sent after an ECH rejection,
+  unbounded Brotli certificate decompression, and a key-exchange downgrade).
+  As before, only the CLI's outbound clients and the benchmark harness use
+  Rustls.
 - Update Rustls to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake messages
   accepted across encryption-level boundaries). Rustls is used only by the
   CLI's outbound `wss://` and HTTPS clients (mesh, router, upload/download,

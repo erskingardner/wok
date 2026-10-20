@@ -159,10 +159,15 @@ regression test. Differential parity alone is not a reason to retain it.
   alongside kinds 4 and 1059, and NIP-59 is advertised only while both
   gift-wrap kinds are restricted. The previous default let any
   unauthenticated subscriber receive wraps addressed to someone else.
-- NIP-42: a kind 22242 event sent as EVENT is refused with
-  `invalid: AUTH events must be sent with AUTH`, and is neither stored nor
-  broadcast. The pinned strfry accepts it like any ephemeral event and
-  delivers it to matching subscriptions, which NIP-42 forbids.
+- NIP-42: kind 22242 events reach no client. One sent as EVENT is refused
+  with `invalid: AUTH events must be sent with AUTH`. `wok import` refuses
+  one, as do `wok sync` and `wok router` downloads, in either ephemeral mode.
+  `wok migrate strfry` and `wok reindex` keep stored records unchanged. Such
+  a record, or one committed by another writer, is hidden from REQ, COUNT,
+  live delivery, NIP-77 and router/sync uploads until the ephemeral purge
+  removes it. The pinned strfry treats kind 22242 like any ephemeral event:
+  it stores it and delivers it to matching subscriptions, which NIP-42
+  forbids.
 - NIP-01 event ids are hashed over the NIP-01 preimage, which includes U+007F
   verbatim like go-nostr, nostr-tools and serde_json. strfry's tao serializer
   escapes it as `\u007f`, so a correctly signed event containing DEL was

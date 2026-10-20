@@ -5,6 +5,7 @@
 //! down (remote -> DB) and/or up (DB -> remote), hot-reloads the config on
 //! change, and follows C++ reconnection and plugin semantics.
 
+use crate::AUTH_EVENT_REFUSAL;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use wok_db::{Decompressor, Env, EventToWrite};
-use wok_event::{parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView};
+use wok_event::{parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView, AUTH_KIND};
 use wok_query::NostrFilterGroup;
 use wok_relay::plugin::{PluginEventSifter, PluginResult};
 use wok_relay::Config;
@@ -660,6 +661,9 @@ fn flush_router_batch(env: &Env, cfg: &Config, batch: &mut Vec<Value>) -> Result
             true,
             IdPreimage::Nip01OrLegacy,
         ) {
+            Ok(p) if p.packed.view().kind() == AUTH_KIND => {
+                tracing::warn!("router: downloaded event rejected: {AUTH_EVENT_REFUSAL}")
+            }
             Ok(p) => evs.push(EventToWrite::new(p.packed.into_bytes(), p.json)),
             Err(e) => tracing::warn!("router: downloaded event rejected: {e}"),
         }

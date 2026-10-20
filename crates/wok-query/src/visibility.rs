@@ -165,6 +165,14 @@ impl ReadVisibility {
         txn: &wok_db::RoTxn<'_>,
         event: PackedEventView<'_>,
     ) -> Result<bool, wok_db::DbError> {
+        // NIP-42: relays MUST exclude kind 22242 from broadcast. Wok's ingest
+        // paths refuse one, but a record migrated from strfry or committed by
+        // another writer is hidden from every read. Being ephemeral, it also
+        // has an expiration record, which keeps physical trees on per-event
+        // checks.
+        if event.kind() == wok_event::AUTH_KIND {
+            return Ok(false);
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -223,6 +231,33 @@ mod tests {
         assert!(r.should_send_to_subscriber(ev.view(), Some(&[9u8; 32])));
         assert!(r.should_send_to_subscriber(ev.view(), Some(&[2u8; 32])));
         assert!(!r.should_send_to_subscriber(ev.view(), Some(&[3u8; 32])));
+    }
+
+    #[test]
+    fn auth_events_are_hidden_from_every_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let txn = env.begin_ro().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let author = [2u8; 32];
+        let visibility = ReadVisibility {
+            identities: vec![author],
+            ephemeral_lifetime_secs: Some(3600),
+            ..ReadVisibility::default()
+        };
+        let tags = PackedEventTagBuilder::default();
+        for (kind, visible) in [(22241, true), (22242, false), (22243, true)] {
+            let ev = PackedEventBuilder::build(&[1u8; 32], &author, now, kind, 1, &tags).unwrap();
+            assert_eq!(
+                visibility.allows(&txn, ev.view()).unwrap(),
+                visible,
+                "kind {kind}"
+            );
+        }
     }
 
     #[test]

@@ -91,6 +91,10 @@ fn store_downloads(
             true,
             IdPreimage::Nip01OrLegacy,
         ) {
+            Ok(parsed) if parsed.packed.view().kind() == AUTH_KIND => {
+                report.rejected += 1;
+                tracing::warn!(error = AUTH_EVENT_REFUSAL, "sync download rejected");
+            }
             Ok(parsed) => writes.push(EventToWrite::new(parsed.packed.into_bytes(), parsed.json)),
             Err(error) => {
                 report.rejected += 1;

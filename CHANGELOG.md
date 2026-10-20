@@ -133,6 +133,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A kind 22242 AUTH event sent with EVENT is refused with
   `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
   to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.
+- `wok import`, `wok sync` and `wok router` no longer store kind 22242 AUTH
+  events; import and sync count them as rejected. They stored them in either
+  ephemeral mode, and the relay then delivered them to live subscriptions. A
+  22242 already in the database, from strfry or another writer, is now hidden
+  from REQ, COUNT, live delivery and NIP-77 sync.
 - Event ids are checked against the NIP-01 preimage, which includes U+007F
   (DEL) verbatim. Events with DEL in a tag or content, signed by go-nostr,
   nostr-tools or anything built on serde_json, were refused with

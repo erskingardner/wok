@@ -9,7 +9,7 @@ use wok_db::{
     check_integrity, delete_events, event_json_owned, write_events_with_policy, Decompressor, Env,
     EnvOptions, EventToWrite,
 };
-use wok_event::{parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView};
+use wok_event::{parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView, AUTH_KIND};
 use wok_negentropy::Storage;
 mod doctor;
 mod mesh;
@@ -621,28 +621,38 @@ fn cmd_import(
     Ok(())
 }
 
+/// NIP-42 forbids broadcasting kind 22242. The relay refuses it as EVENT, and
+/// imports and downloads refuse it with this reason, so no ingest path stores
+/// one.
+const AUTH_EVENT_REFUSAL: &str = "kind 22242 AUTH events are never stored";
+
 fn parse_import_line(
     line: &str,
     fried: bool,
     no_verify: bool,
     limits: &EventLimits,
 ) -> Result<EventToWrite> {
-    if fried {
+    let event = if fried {
         let (packed, json) = parse_fried(line)?;
-        return Ok(EventToWrite::new(packed, json));
+        EventToWrite::new(packed, json)
+    } else {
+        let v: serde_json::Value = wok_event::json::parse_strict(line)?;
+        // Imported lines are stored events, possibly hashed with the legacy
+        // preimage by strfry or an earlier Wok release.
+        let parsed = parse_and_verify_event_with(
+            &v,
+            limits,
+            None,
+            !no_verify,
+            false,
+            IdPreimage::Nip01OrLegacy,
+        )?;
+        EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+    };
+    if PackedEventView::new(&event.packed)?.kind() == AUTH_KIND {
+        bail!(AUTH_EVENT_REFUSAL);
     }
-    let v: serde_json::Value = wok_event::json::parse_strict(line)?;
-    // Imported lines are stored events, possibly hashed with the legacy
-    // preimage by strfry or an earlier Wok release.
-    let parsed = parse_and_verify_event_with(
-        &v,
-        limits,
-        None,
-        !no_verify,
-        false,
-        IdPreimage::Nip01OrLegacy,
-    )?;
-    Ok(EventToWrite::new(parsed.packed.into_bytes(), parsed.json))
+    Ok(event)
 }
 
 fn parse_fried(line: &str) -> Result<(Vec<u8>, String)> {

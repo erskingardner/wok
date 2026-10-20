@@ -21,6 +21,8 @@ fn now() -> u64 {
 /// An in-process relay for observing NIP behavior on the wire protocol.
 struct Relay {
     handle: RelayHandle,
+    /// The relay's own LMDB environment, for writes that bypass its writer.
+    env: wok_db::Env,
     _dir: tempfile::TempDir,
 }
 
@@ -33,7 +35,8 @@ impl Relay {
         };
         configure(&mut cfg);
         Self {
-            handle: wok_relay::start(env, cfg).unwrap(),
+            handle: wok_relay::start(env.clone(), cfg).unwrap(),
+            env,
             _dir: dir,
         }
     }
@@ -366,6 +369,62 @@ async fn nip42_auth_events_sent_as_event_are_never_stored_or_broadcast() {
             .history(json!({"ids": [auth["id"]]}))
             .await
             .is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip42_auth_events_written_by_other_writers_are_never_sent() {
+    // strfry, an older release or any outside writer can commit a kind 22242
+    // straight to LMDB. The relay picks such commits up through its DB-change
+    // monitor and must still send the event to no client, live or stored.
+    for persistence in [
+        wok_relay::EphemeralPersistence::LiveOnly,
+        wok_relay::EphemeralPersistence::Ttl,
+    ] {
+        let relay = Relay::new(|cfg| cfg.events.ephemeral_persistence = persistence);
+        let mut by_kind = relay.connect().await;
+        by_kind.subscribe("auth", json!({"kinds": [22242]})).await;
+        by_kind.subscribe("marker", json!({"kinds": [1]})).await;
+        let mut everything = relay.connect().await;
+        everything.subscribe("everything", json!({})).await;
+
+        let auth = sign_event(json!({
+            "created_at": now() - 2,
+            "kind": 22242,
+            "tags": [["relay", AUTH_RELAY], ["challenge", "replayed"]],
+            "content": "",
+        }));
+        let marker = sign_event(json!({
+            "created_at": now(),
+            "kind": 1,
+            "tags": [],
+            "content": "marker",
+        }));
+        // Committed first, a delivered AUTH event would precede the marker.
+        wok_compat::write_event_to_env(&relay.env, &auth);
+        wok_compat::write_event_to_env(&relay.env, &marker);
+        let auth_id = hex::decode(auth["id"].as_str().unwrap()).unwrap();
+        assert!(
+            wok_db::lookup_event_by_id_ro(&relay.env.begin_ro().unwrap(), &auth_id)
+                .unwrap()
+                .is_some(),
+            "{persistence:?}"
+        );
+
+        let live = json!(["EVENT", "marker", marker]);
+        assert_eq!(by_kind.recv().await, live, "{persistence:?}");
+        let live = json!(["EVENT", "everything", marker]);
+        assert_eq!(everything.recv().await, live, "{persistence:?}");
+        assert!(by_kind.history(json!({"kinds": [22242]})).await.is_empty());
+        assert_eq!(everything.history(json!({})).await, [marker]);
+        by_kind
+            .send(json!(["COUNT", "count", {"kinds": [22242]}]))
+            .await;
+        let count = by_kind.recv().await;
+        assert_eq!(
+            (&count[0], &count[2]["count"]),
+            (&json!("COUNT"), &json!(0))
+        );
     }
 }
 

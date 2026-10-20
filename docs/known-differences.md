@@ -165,9 +165,10 @@ regression test. Differential parity alone is not a reason to retain it.
   `wok migrate strfry` and `wok reindex` keep stored records unchanged. Such
   a record, or one committed by another writer, is hidden from REQ, COUNT,
   live delivery, NIP-77 and router/sync uploads until the ephemeral purge
-  removes it. The pinned strfry treats kind 22242 like any ephemeral event:
-  it stores it and delivers it to matching subscriptions, which NIP-42
-  forbids.
+  removes it. Operator tools still reach it: `wok scan` finds it and
+  `wok delete --filter '{"kinds":[22242]}'` removes it, even offline. The
+  pinned strfry treats kind 22242 like any ephemeral event: it stores it and
+  delivers it to matching subscriptions, which NIP-42 forbids.
 - NIP-01 event ids are hashed over the NIP-01 preimage, which includes U+007F
   verbatim like go-nostr, nostr-tools and serde_json. strfry's tao serializer
   escapes it as `\u007f`, so a correctly signed event containing DEL was

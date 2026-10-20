@@ -143,6 +143,9 @@ pub struct ReadVisibility {
     pub restrictor: ReadRestrictor,
     pub identities: Vec<[u8; 32]>,
     pub ephemeral_lifetime_secs: Option<u64>,
+    /// Set only by operator tools that address stored records. Client reads
+    /// never set it: NIP-42 forbids sending kind 22242 to any client.
+    pub include_auth_events: bool,
 }
 
 impl ReadVisibility {
@@ -167,10 +170,10 @@ impl ReadVisibility {
     ) -> Result<bool, wok_db::DbError> {
         // NIP-42: relays MUST exclude kind 22242 from broadcast. Wok's ingest
         // paths refuse one, but a record migrated from strfry or committed by
-        // another writer is hidden from every read. Being ephemeral, it also
-        // has an expiration record, which keeps physical trees on per-event
-        // checks.
-        if event.kind() == wok_event::AUTH_KIND {
+        // another writer is hidden from every client read. Being ephemeral,
+        // it also has an expiration record, which keeps physical trees on
+        // per-event checks.
+        if event.kind() == wok_event::AUTH_KIND && !self.include_auth_events {
             return Ok(false);
         }
         let now = std::time::SystemTime::now()
@@ -258,6 +261,12 @@ mod tests {
                 "kind {kind}"
             );
         }
+        let operator = ReadVisibility {
+            include_auth_events: true,
+            ..visibility
+        };
+        let auth = PackedEventBuilder::build(&[1u8; 32], &author, now, 22242, 1, &tags).unwrap();
+        assert!(operator.allows(&txn, auth.view()).unwrap());
     }
 
     #[test]

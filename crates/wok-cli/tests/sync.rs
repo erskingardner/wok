@@ -632,6 +632,75 @@ async fn auth_events_from_import_sync_and_router_are_neither_stored_nor_delivere
 }
 
 #[test]
+fn operators_can_reindex_scan_and_delete_a_stored_auth_event() {
+    // `wok import` refuses kind 22242, but `wok migrate strfry` or another
+    // writer can leave one stored. Clients never see it; operator tools must.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "");
+    let note = event(1);
+    import(&cfg, std::slice::from_ref(&note));
+    let auth = sign(
+        json!({"kind":22242,"created_at":now(),"tags":[["challenge","migrated"]],"content":""}),
+        &key(),
+    );
+    {
+        let env = wok_db::Env::open(
+            dir.path().join("db"),
+            wok_db::EnvOptions {
+                map_size: 67108864,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = wok_event::parse_and_verify_event(
+            &auth,
+            &wok_event::EventLimits::default(),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let mut events = vec![wok_db::EventToWrite::new(
+            parsed.packed.into_bytes(),
+            parsed.json,
+        )];
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+    }
+    // A rebuilt tree must still match the physical records doctor counts.
+    let output = cli(&cfg, &["reindex", "--confirm-relay-stopped"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = cli(&cfg, &["doctor", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = cli(&cfg, &["scan", "{\"kinds\":[22242]}"]);
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        auth
+    );
+    let output = cli(&cfg, &["delete", "--filter", "{\"kinds\":[22242]}"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = cli(&cfg, &["export"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        note
+    );
+}
+
+#[test]
 fn stream_command_is_removed_from_the_cli() {
     let output = Command::new(env!("CARGO_BIN_EXE_wok"))
         .arg("stream")

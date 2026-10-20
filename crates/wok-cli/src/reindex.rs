@@ -3,10 +3,13 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wok_db::{
-    bump_negentropy_mod_counter, check_integrity, event_fingerprint,
-    event_fingerprint_without_hashed_tag_values, foreach_negentropy_filter,
-    rebuild_primary_and_event_indices, Env, EnvOptions, PackedEventRebuild,
+    check_integrity, event_fingerprint, event_fingerprint_without_hashed_tag_values,
+    foreach_negentropy_filter, rebuild_primary_and_event_indices, Env, EnvOptions,
+    PackedEventRebuild,
 };
+
+/// Primary records scanned per batch when rebuilding a negentropy tree.
+const NEGENTROPY_BUILD_BATCH: usize = 10_000;
 use wok_relay::Config;
 
 #[derive(Debug, Serialize)]
@@ -274,68 +277,25 @@ fn validate_primary_payloads(env: &Env, max_event_size: usize) -> Result<()> {
 }
 
 fn rebuild_negentropy(env: &Env) -> Result<(u64, u64)> {
-    // A tree holds every stored record its filter matches, as the writer and
-    // `wok negentropy build` keep it; reads apply visibility (superseded,
-    // expired, vanished or moderated records) on top.
-    let mut trees = {
+    let tree_ids = {
         let txn = env.begin_ro()?;
-        let mut filters = Vec::new();
-        foreach_negentropy_filter(&txn, |id, filter| {
-            filters.push((id, filter.to_string()));
+        let mut tree_ids = Vec::new();
+        foreach_negentropy_filter(&txn, |id, _| {
+            tree_ids.push(id);
             true
         })?;
-        let mut trees = Vec::with_capacity(filters.len());
-        for (tree_id, filter) in filters {
-            let filter: serde_json::Value = serde_json::from_str(&filter)?;
-            let filter =
-                wok_query::NostrFilterGroup::from_value(&filter, u64::MAX, usize::MAX, usize::MAX)?;
-            trees.push((tree_id, filter, Vec::new()));
-        }
-        let mut error = None;
-        wok_db::foreach_event_from(
-            &txn,
-            0,
-            |lev_id, packed| match wok_event::PackedEventView::new(packed) {
-                Ok(packed) => {
-                    for (_, filter, records) in &mut trees {
-                        if filter.does_match(packed) {
-                            records.push((packed.created_at(), packed.id().to_vec()));
-                        }
-                    }
-                    true
-                }
-                Err(err) => {
-                    error = Some(anyhow::anyhow!("levId {lev_id}: {err}"));
-                    false
-                }
-            },
-        )?;
-        if let Some(error) = error {
-            return Err(error);
-        }
-        trees
+        tree_ids
     };
+    // A tree holds every stored record its filter matches, as the writer and
+    // `wok negentropy build` keep it; reads apply visibility (superseded,
+    // expired, vanished or moderated records) on top. Building one tree at a
+    // time in bounded batches keeps memory independent of the database size.
     let mut total_items = 0u64;
-    for (tree_id, _, records) in &mut trees {
-        let mut txn = env.begin_rw()?;
-        {
-            let mut tree = wok_negentropy::open_rw(&mut txn, *tree_id)?;
-            for (timestamp, id) in records.iter() {
-                tree.insert(*timestamp, id)?;
-            }
-            tree.backend.flush()?;
-        }
-        txn.commit()?;
-        total_items = total_items.saturating_add(records.len() as u64);
-        records.clear();
-        records.shrink_to_fit();
+    for tree_id in &tree_ids {
+        let items = crate::build_negentropy_tree(env, *tree_id, NEGENTROPY_BUILD_BATCH)?;
+        total_items = total_items.saturating_add(items);
     }
-    if !trees.is_empty() {
-        let mut txn = env.begin_rw()?;
-        bump_negentropy_mod_counter(&mut txn)?;
-        txn.commit()?;
-    }
-    Ok((trees.len() as u64, total_items))
+    Ok((tree_ids.len() as u64, total_items))
 }
 
 fn default_backup_path(database: &Path) -> Result<PathBuf> {
@@ -493,7 +453,7 @@ mod tests {
                 wok_db::insert_negentropy_filter(&mut txn, &filter).unwrap(),
                 2
             );
-            bump_negentropy_mod_counter(&mut txn).unwrap();
+            wok_db::bump_negentropy_mod_counter(&mut txn).unwrap();
             let all = vec![&legacy, &current, &legacy_older, &newer];
             for (tree_id, records) in [(1, all), (2, vec![&current])] {
                 let mut tree = wok_negentropy::open_rw(&mut txn, tree_id).unwrap();

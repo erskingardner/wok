@@ -1246,7 +1246,9 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
         NegCmd::Build {
             tree_id,
             batch_size,
-        } => build_negentropy_tree(&env, tree_id, batch_size)?,
+        } => {
+            build_negentropy_tree(&env, tree_id, batch_size)?;
+        }
     }
     Ok(())
 }
@@ -1254,7 +1256,8 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
 /// Populate a tree through bounded primary-table scans and short write
 /// transactions. Inserts are idempotent, so rerunning this after interruption
 /// safely resumes the outcome without requiring a separate progress file.
-fn build_negentropy_tree(env: &Env, tree_id: u64, batch_size: usize) -> Result<()> {
+/// Returns how many items were newly inserted.
+fn build_negentropy_tree(env: &Env, tree_id: u64, batch_size: usize) -> Result<u64> {
     if batch_size == 0 {
         bail!("--batch-size must be at least 1");
     }
@@ -1328,7 +1331,7 @@ fn build_negentropy_tree(env: &Env, tree_id: u64, batch_size: usize) -> Result<(
         first_batch = false;
     }
     tracing::info!(tree_id, scanned, inserted, "negentropy build complete");
-    Ok(())
+    Ok(inserted)
 }
 
 struct NegentropyScanBatch {

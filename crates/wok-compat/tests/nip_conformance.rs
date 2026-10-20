@@ -1,10 +1,152 @@
 //! Independently grounded NIP tests. NIPs pin: 656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab
 
-use serde_json::json;
-use wok_compat::sign_event;
+use secp256k1::{Keypair, SECP256K1};
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use wok_compat::{sign_event, sign_event_with_key};
 use wok_event::{parse_and_verify_event, EventLimits};
 use wok_query::NostrFilterGroup;
-use wok_relay::{ClientCommand, RelayMessage};
+use wok_relay::{
+    ClientCommand, ConnectionGuard, Outbound, OutboundFrame, RelayHandle, RelayMessage,
+    TransportSource,
+};
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// An in-process relay for observing NIP behavior on the wire protocol.
+struct Relay {
+    handle: RelayHandle,
+    _dir: tempfile::TempDir,
+}
+
+impl Relay {
+    fn new(configure: impl FnOnce(&mut wok_relay::Config)) -> Self {
+        let (dir, env) = wok_compat::temp_db();
+        let mut cfg = wok_relay::Config {
+            db: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        configure(&mut cfg);
+        Self {
+            handle: wok_relay::start(env, cfg).unwrap(),
+            _dir: dir,
+        }
+    }
+
+    async fn connect(&self) -> Conn {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let guard = self
+            .handle
+            .register_connection(TransportSource::Unix, Outbound::new(tx, 0))
+            .await;
+        Conn { guard, rx }
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.handle.request_shutdown();
+    }
+}
+
+struct Conn {
+    guard: ConnectionGuard,
+    rx: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+}
+
+impl Conn {
+    async fn send(&self, message: Value) {
+        self.guard.client_message(message.to_string()).await;
+    }
+
+    async fn recv(&mut self) -> Value {
+        let frame = tokio::time::timeout(Duration::from_secs(3), self.rx.recv())
+            .await
+            .expect("relay reply")
+            .expect("connection open");
+        serde_json::from_str(&frame.into_text()).unwrap()
+    }
+
+    /// The next frame, if one arrives within a short grace period.
+    async fn try_recv(&mut self) -> Option<Value> {
+        let frame = tokio::time::timeout(Duration::from_millis(300), self.rx.recv())
+            .await
+            .ok()??;
+        Some(serde_json::from_str(&frame.into_text()).unwrap())
+    }
+
+    /// Answer the challenge sent on connect as `key`.
+    async fn auth(&mut self, key: &Keypair) {
+        let challenge = self.recv().await;
+        assert_eq!(challenge[0], "AUTH", "{challenge}");
+        let event = sign_event_with_key(
+            json!({
+                "created_at": now(),
+                "kind": 22242,
+                "tags": [["relay", AUTH_RELAY], ["challenge", challenge[1]]],
+                "content": "",
+            }),
+            key,
+        );
+        self.send(json!(["AUTH", event])).await;
+        let reply = self.recv().await;
+        assert_eq!(reply[0], "OK", "{reply}");
+        assert_eq!(reply[2], true, "{reply}");
+    }
+
+    /// Subscribe and wait until stored events are done, so live delivery
+    /// applies from here on.
+    async fn subscribe(&mut self, sub_id: &str, filter: Value) {
+        self.send(json!(["REQ", sub_id, filter])).await;
+        let eose = self.recv().await;
+        assert_eq!(eose, json!(["EOSE", sub_id]));
+    }
+
+    /// Publish and return the OK reply.
+    async fn publish(&mut self, event: &Value) -> Value {
+        self.send(json!(["EVENT", event])).await;
+        let reply = self.recv().await;
+        assert_eq!(reply[0], "OK", "{reply}");
+        assert_eq!(reply[1], event["id"], "{reply}");
+        reply
+    }
+
+    /// Stored events matching `filter`, up to EOSE.
+    async fn history(&mut self, filter: Value) -> Vec<Value> {
+        self.send(json!(["REQ", "history", filter])).await;
+        let mut events = Vec::new();
+        loop {
+            let frame = self.recv().await;
+            match frame[0].as_str() {
+                Some("EVENT") => events.push(frame[2].clone()),
+                Some("EOSE") => break,
+                _ => panic!("unexpected {frame}"),
+            }
+        }
+        self.send(json!(["CLOSE", "history"])).await;
+        events
+    }
+}
+
+fn key() -> Keypair {
+    Keypair::new(SECP256K1, &mut rand::thread_rng())
+}
+
+const AUTH_RELAY: &str = "wss://conformance.test";
+
+/// A relay where NIP-42 AUTH can succeed.
+fn auth_relay() -> Relay {
+    Relay::new(|cfg| cfg.relay.auth.service_url = AUTH_RELAY.into())
+}
+
+fn pubkey_hex(key: &Keypair) -> String {
+    hex::encode(key.x_only_public_key().0.serialize())
+}
 
 #[test]
 fn nip01_event_id_and_sig() {
@@ -106,6 +248,63 @@ fn nip09_kind5_is_deletion() {
     assert_eq!(wok_event::DELETION_KIND, 5);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip09_deleting_a_deletion_request_has_no_effect() {
+    // "Publishing a deletion request event against a deletion request has no
+    // effect." The deletion request and its tombstone both stay in force.
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    let key = key();
+    let signed = |kind: u64, tags: Value, content: &str| {
+        sign_event_with_key(
+            json!({"created_at": now(), "kind": kind, "tags": tags, "content": content}),
+            &key,
+        )
+    };
+    let note = signed(1, json!([]), "first");
+    let d1 = signed(5, json!([["e", note["id"]]]), "");
+    let d2 = signed(5, json!([["e", d1["id"]]]), "");
+    for event in [&note, &d1, &d2] {
+        assert_eq!(conn.publish(event).await[2], true);
+    }
+    let ids = |events: &[&Value]| {
+        let mut ids: Vec<_> = events.iter().map(|event| event["id"].clone()).collect();
+        ids.sort_by_key(|id| id.as_str().unwrap().to_owned());
+        ids
+    };
+    let mut stored: Vec<_> = conn
+        .history(json!({"ids": [note["id"], d1["id"], d2["id"]]}))
+        .await
+        .into_iter()
+        .map(|event| event["id"].clone())
+        .collect();
+    stored.sort_by_key(|id| id.as_str().unwrap().to_owned());
+    assert_eq!(stored, ids(&[&d1, &d2]));
+    let reply = conn.publish(&note).await;
+    assert_eq!(reply[2], false, "{reply}");
+    assert!(
+        reply[3].as_str().unwrap().starts_with("deleted:"),
+        "{reply}"
+    );
+
+    // A request against a deletion request that arrives first does not
+    // tombstone it either: the later deletion request is stored and applied.
+    let note = signed(1, json!([]), "second");
+    let d1 = signed(5, json!([["e", note["id"]]]), "");
+    let d2 = signed(5, json!([["e", d1["id"]]]), "");
+    for event in [&note, &d2, &d1] {
+        assert_eq!(conn.publish(event).await[2], true);
+    }
+    let mut stored: Vec<_> = conn
+        .history(json!({"ids": [note["id"], d1["id"], d2["id"]]}))
+        .await
+        .into_iter()
+        .map(|event| event["id"].clone())
+        .collect();
+    stored.sort_by_key(|id| id.as_str().unwrap().to_owned());
+    assert_eq!(stored, ids(&[&d1, &d2]));
+}
+
 #[test]
 fn nip40_expiration_too_small_rejected() {
     let ev = json!({
@@ -128,6 +327,46 @@ fn nip70_protected_tag_constant() {
 #[test]
 fn nip42_auth_kind() {
     assert_eq!(wok_event::AUTH_KIND, 22242);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip42_auth_events_sent_as_event_are_never_stored_or_broadcast() {
+    // "Relays MUST exclude kind: 22242 events from being broadcasted to any
+    // client." Covers both ephemeral modes, since `ttl` would also store it.
+    for persistence in [
+        wok_relay::EphemeralPersistence::LiveOnly,
+        wok_relay::EphemeralPersistence::Ttl,
+    ] {
+        let relay = Relay::new(|cfg| cfg.events.ephemeral_persistence = persistence);
+        let mut by_kind = relay.connect().await;
+        by_kind.subscribe("auth", json!({"kinds": [22242]})).await;
+        let mut everything = relay.connect().await;
+        everything.subscribe("everything", json!({})).await;
+
+        let mut publisher = relay.connect().await;
+        let auth = sign_event(json!({
+            "created_at": now(),
+            "kind": 22242,
+            "tags": [["relay", AUTH_RELAY], ["challenge", "replayed"]],
+            "content": "",
+        }));
+        let reply = publisher.publish(&auth).await;
+        assert_eq!(
+            reply,
+            json!([
+                "OK",
+                auth["id"],
+                false,
+                "invalid: AUTH events must be sent with AUTH"
+            ])
+        );
+        assert_eq!(by_kind.try_recv().await, None, "{persistence:?}");
+        assert_eq!(everything.try_recv().await, None, "{persistence:?}");
+        assert!(publisher
+            .history(json!({"ids": [auth["id"]]}))
+            .await
+            .is_empty());
+    }
 }
 
 #[test]
@@ -225,6 +464,16 @@ fn nip01_duplicate_filters_still_parse() {
 }
 
 #[test]
+fn nip01_kinds_4_to_44_are_regular() {
+    // Includes kind 41, which the pinned strfry replaces per author.
+    for kind in 4..45 {
+        assert!(!wok_event::is_replaceable_kind(kind), "kind {kind}");
+        assert!(!wok_event::is_param_replaceable_kind(kind), "kind {kind}");
+        assert!(!wok_event::is_ephemeral_kind(kind), "kind {kind}");
+    }
+}
+
+#[test]
 fn nip02_kind3_is_replaceable() {
     assert!(wok_event::is_replaceable_kind(3));
 }
@@ -233,6 +482,51 @@ fn nip02_kind3_is_replaceable() {
 fn nip59_gift_wrap_kinds() {
     assert!(wok_event::GIFT_WRAP_KINDS.contains(&1059));
     assert!(wok_event::GIFT_WRAP_KINDS.contains(&21059));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip59_ephemeral_gift_wraps_reach_only_their_recipient() {
+    // Kind 21059 is live-only, so its privacy rests on live delivery alone.
+    let relay = auth_relay();
+    let recipient = key();
+    let mut anonymous = relay.connect().await;
+    assert_eq!(anonymous.recv().await[0], "AUTH");
+    anonymous
+        .send(json!(["REQ", "wraps", {"kinds": [21059]}]))
+        .await;
+    let refused = anonymous.recv().await;
+    assert_eq!(refused[0], "CLOSED", "{refused}");
+    assert!(
+        refused[2].as_str().unwrap().starts_with("auth-required:"),
+        "{refused}"
+    );
+    anonymous.subscribe("everything", json!({})).await;
+    let mut stranger = relay.connect().await;
+    stranger.auth(&key()).await;
+    stranger.subscribe("wraps", json!({"kinds": [21059]})).await;
+    let mut inbox = relay.connect().await;
+    inbox.auth(&recipient).await;
+    inbox
+        .subscribe(
+            "inbox",
+            json!({"kinds": [21059], "#p": [pubkey_hex(&recipient)]}),
+        )
+        .await;
+
+    let mut publisher = relay.connect().await;
+    assert_eq!(publisher.recv().await[0], "AUTH");
+    let wrap = sign_event(json!({
+        "created_at": now(),
+        "kind": 21059,
+        "tags": [["p", pubkey_hex(&recipient)]],
+        "content": "sealed",
+    }));
+    assert_eq!(publisher.publish(&wrap).await[2], true);
+
+    let delivered = inbox.recv().await;
+    assert_eq!(delivered, json!(["EVENT", "inbox", wrap]));
+    assert_eq!(anonymous.try_recv().await, None);
+    assert_eq!(stranger.try_recv().await, None);
 }
 
 #[test]

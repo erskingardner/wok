@@ -12,7 +12,8 @@ Byte layouts and validation follow pinned strfry for migration/event-identity, b
 
 ## When changing this crate
 
-- Ingress parsing goes through `json::parse_strict`. Hashing and stored JSON go through `json::to_tao_string` (tao::json byte parity: duplicate keys rejected, U+007F escaped, compact sorted keys).
+- Ingress parsing goes through `json::parse_strict`. Stored JSON goes through `json::to_tao_string` (tao::json byte parity: duplicate keys rejected, U+007F escaped, compact sorted keys).
+- Event ids hash the NIP-01 preimage (`json::write_nip01`), which differs from tao only in writing U+007F verbatim. `legacy_event_id_hash` / `IdPreimage::Nip01OrLegacy` accept the tao preimage strfry hashed, for stored events only; never for published EVENTs.
 - JSON nesting is capped at 128 (DoS hardening; documented in `docs/known-differences.md`).
 - PackedEvent integers are native endian. Fried import/export is little-endian-only.
 - Downstream crates (`wok-db`, `wok-query`, `wok-relay`) depend on the public API in `src/lib.rs`.

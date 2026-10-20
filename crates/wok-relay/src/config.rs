@@ -345,9 +345,10 @@ impl Default for Config {
                 auth: AuthConfig {
                     enabled: true,
                     service_url: String::new(),
-                    // Private messages and gift wraps fail closed until the
-                    // operator configures the relay URL required by NIP-42.
-                    restricted_read_kinds: vec![4, 1059],
+                    // Private messages and gift wraps, including NIP-59's
+                    // ephemeral kind 21059, fail closed until the operator
+                    // configures the relay URL required by NIP-42.
+                    restricted_read_kinds: vec![4, 1059, 21059],
                     restrict_read_to_involved_pubkey: true,
                     restrict_writes: false,
                 },
@@ -1913,8 +1914,8 @@ mod tests {
                 .any(|c| c.contains("relay.auth changed") && c.contains("DROPPED: [4]")),
             "{changes:?}"
         );
-        // Omitting [relay.auth] merges factory defaults [4, 1059]; starting
-        // from a superset the defaults would drop ([4, 44, 1059]) is the
+        // Omitting [relay.auth] merges factory defaults [4, 1059, 21059];
+        // starting from a superset the defaults would drop ([4, 44, 1059]) is the
         // issue's omit-reverts-to-defaults fail-open path.
         let superset =
             Config::parse_toml("[relay.auth]\nrestricted_read_kinds = [4, 44, 1059]\n").unwrap();
@@ -2033,7 +2034,7 @@ mod tests {
         assert!(c.relay.auth.restricted_read_kinds.is_empty());
         assert_eq!(
             Config::default().relay.auth.restricted_read_kinds,
-            vec![4, 1059]
+            vec![4, 1059, 21059]
         );
     }
 

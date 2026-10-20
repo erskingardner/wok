@@ -271,7 +271,11 @@ fn check_state(
                     report.issue("malformed-value", "author_counts", error.to_string());
                 }
             }
-        } else if key == crate::state::HIGH_WATER || key == crate::state::POLICY_GENERATION || key == crate::state::SUPERSEDED_EVENTS {
+        } else if key == crate::state::HIGH_WATER
+            || key == crate::state::POLICY_GENERATION
+            || key == crate::state::SUPERSEDED_EVENTS
+            || key == crate::state::LEGACY_SUPERSEDED_EVENTS
+        {
             match crate::state::decode(raw) {
                 Ok(sequence) if key == crate::state::HIGH_WATER && sequence < largest_id => {
                     report.metadata_errors += 1;

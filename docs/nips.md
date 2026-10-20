@@ -14,10 +14,10 @@ arbitrary list.
 | 11 | Relay information | `wok-ws` | `nip_conformance.rs` | always |
 | 13 | Proof of work | leading-zero validation + NIP-11 minimum | relay tests | `relay.abuse.enabled` and `min_pow_difficulty > 0` |
 | 40 | Expiration | packed expiration + cron | `nip_conformance.rs` | always |
-| 42 | AUTH | ingest AUTH, multiple authenticated keys per connection | unit + multi-key e2e when serviceUrl set | AUTH enabled and serviceUrl set |
+| 42 | AUTH | ingest AUTH, multiple authenticated keys per connection, kind 22242 refused as EVENT and never broadcast | unit + multi-key e2e when serviceUrl set, `nip_conformance.rs` | AUTH enabled and serviceUrl set |
 | 45 | COUNT + mergeable HyperLogLog | REQ worker + `wok-query` HLL | `nip_conformance.rs`, `e2e_transports.rs`, HLL unit vectors | `maxFilterLimitCount > 0` |
 | 50 | Search capability | transactional LMDB term/bigram index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs` | always |
-| 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, restricted kind 1059 with involved-pubkey enforcement, and `events.ephemeral_persistence = "live_only"` |
+| 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, restricted kinds 1059 and 21059 with involved-pubkey enforcement, and `events.ephemeral_persistence = "live_only"` |
 | 62 | Request to Vanish | persistent maximum-timestamp markers, immediate query/rebroadcast suppression, gift-wrap recipient cleanup, and bounded physical deletion | `nip62_vanish.rs`, relay e2e | `relay.nip62.enabled` |
 | 70 | Protected events | `-` tag + AUTH | `nip_conformance.rs` | always |
 | 77 | Negentropy | `wok-negentropy` | protocol unit tests | `negentropy.enabled` |
@@ -34,7 +34,8 @@ characters, as required by current NIP-01. Prefix filters are rejected.
 NIP-01 replacement is enforced when reading, even if a lossless migration
 retained multiple versions. Kinds 0, 3 (contact lists), and 10000–19999 select
 the newest event per author and kind; kinds 30000–39999 additionally use the
-first `d` tag (missing means empty). Equal timestamps select the lowest
+first `d` tag (missing means empty). Kind 41 (NIP-28 channel metadata) is
+regular, as NIP-01 makes every kind from 4 to 44. Equal timestamps select the lowest
 lexical event ID. The winner is determined across stored versions before
 request filters: an old ID, `until`, tag, or search filter cannot resurrect a
 superseded event. An expired or moderated winner does not expose older stored

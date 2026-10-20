@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the COUNT dedup budget derived from `relay.max_filter_limit_count`. An
   operator who shortened the plugin timeout to contain a hanging plugin was
   still waiting the old duration (#54).
+- Ephemeral gift wraps (kind 21059) are restricted reads by default:
+  `relay.auth.restricted_read_kinds` now defaults to `[4, 1059, 21059]`.
+  Before, any unauthenticated subscription to kind 21059, or to everything,
+  received wraps addressed to someone else, recipient tag included, while
+  NIP-59 was advertised. NIP-59 is now advertised only while both gift-wrap
+  kinds are restricted; configs that list restricted kinds explicitly need
+  21059 added.
 
 ### Added
 
@@ -99,6 +106,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were never sent a challenge. It draws on the per-address EVENT budget and
   replies `rate-limited: AUTH budget exhausted` once that runs out, so a few
   connections can no longer tie up every ingester thread with signature checks.
+- Events are stored even when the publisher disconnects right after sending
+  them. The writer dropped every EVENT whose connection closed within the same
+  write batch, so bots, CLI tools and mobile apps that publish and hang up lost
+  posts (of eight such publishers, one event was stored). Only the OK is lost
+  now. An EVENT still parked behind a full writer queue is dropped when its
+  connection closes, as before.
+- Addressable events whose first `d` tag is longer than 255 bytes, and kind 5
+  `a` tags longer than 255 bytes, are refused with `invalid:`. Such values are
+  not indexed, so the event was keyed by an empty `d` and distinct addresses
+  replaced one another (`d=""`, a 300-byte `d` and a 301-byte `d`), and such a
+  deletion never matched its target.
+- Kind 41 (NIP-28 channel metadata) is a regular event, as NIP-01 makes every
+  kind from 4 to 44. It was replaced per author, so metadata for a second
+  channel deleted the first channel's. Migrated kind 41 history becomes
+  visible, and the superseded-version count is redone once on the next
+  writable open (state key `superseded-versions` replaces `superseded-events`).
+- A deletion request against a deletion request has no effect, as NIP-09
+  requires. Before, a kind 5 deleting an earlier kind 5 removed it with its
+  tombstone, and the originally deleted event could be published again.
+- A kind 22242 AUTH event sent with EVENT is refused with
+  `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
+  to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.
+- Event ids are checked against the NIP-01 preimage, which includes U+007F
+  (DEL) verbatim. Events with DEL in a tag or content, signed by go-nostr,
+  nostr-tools or anything built on serde_json, were refused with
+  `invalid: bad event id` because Wok, like strfry, escaped it as `\u007f`.
+  Stored payloads keep that escaping. `wok import`, `wok sync` and
+  `wok router` downloads also accept the legacy id, so data from strfry and
+  earlier Wok releases still verifies.
 
 ## [0.7.0] - 2026-09-08
 

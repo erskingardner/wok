@@ -69,6 +69,11 @@ All event settings reload live and are available in the dashboard.
 | `events.max_num_tags` | `2000` | Maximum tags on one event. |
 | `events.max_tag_val_size` | `1024` | Maximum bytes in one tag value. |
 
+Single-letter tag values longer than 255 bytes are stored but not indexed, so
+filters cannot match them. Because an address must be indexed, an addressable
+event whose first `d` tag is longer than 255 bytes, and a kind 5 `a` tag longer
+than 255 bytes, are refused with `invalid:` whatever `max_tag_val_size` allows.
+
 The 1 MiB event ceiling accommodates bounded extended-length NIP-44 payloads,
 including kind 1059 gift wraps and kind 445 MLS group events. Wok does not
 decrypt or identify NIP-44 content, so this remains a global event limit and is
@@ -145,7 +150,7 @@ control boundary.
 |---|---:|---|
 | `relay.auth.enabled` | `true` | Enable NIP-42 authentication. |
 | `relay.auth.service_url` | empty | Public relay URL placed in and checked against AUTH challenges. |
-| `relay.auth.restricted_read_kinds` | `[4, 1059]` | Kinds hidden from unauthenticated historical reads. |
+| `relay.auth.restricted_read_kinds` | `[4, 1059, 21059]` | Kinds hidden from unauthenticated historical and live reads. |
 | `relay.auth.restrict_read_to_involved_pubkey` | `true` | Restrict authenticated reads to the author or first `p`-tag recipient. |
 | `relay.auth.restrict_writes` | `false` | Only NIP-86 allowlisted or role-holding pubkeys (and operator admins) may write. NIP-62 vanish requests are exempt. See [nip86.md](nip86.md). |
 
@@ -157,7 +162,8 @@ unusable, those reads are refused with `restricted:` and no AUTH challenge, so
 NIP-42 clients do not attempt an AUTH that cannot succeed; with
 `enabled = false` the relay refuses AUTH outright. Clearing
 `restricted_read_kinds` restores unrestricted history, but Wok stops
-advertising NIP-59.
+advertising NIP-59, which needs both gift-wrap kinds (1059 and the live-only
+ephemeral 21059) restricted.
 
 Keep `restrict_read_to_involved_pubkey` at `true` unless you understand the
 interplay: with `false`, the per-event delivery filter is skipped entirely

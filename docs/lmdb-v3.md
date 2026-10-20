@@ -42,6 +42,31 @@ creation flags on the private snapshot.
 
 `e`/`p` tag values stored as raw 32 bytes. Replaceable kinds prepend virtual `d=""`. Param-replaceable append virtual `d=""`. Ephemeral kinds set expiration=1.
 
+A single-letter tag value longer than 255 bytes does not fit `len`. strfry v3
+and earlier Wok releases drop that tag. Wok packs it as `0xFF` followed by the
+SHA-256 of the value (33 bytes). Other packed values are UTF-8, which never
+contains `0xFF`, or 32-byte `e`/`p` ids, so the hashed form cannot equal a
+value packed as is. Keys derived from tags use the packed value, so
+`Event__tag` and `Event__replace` hold the hashed form, and filter values are
+hashed the same way before they are looked up or matched, in history scans and
+live monitors alike. `Event__replaceDeletion` already keys by
+`sha256(a-tag)`, which for a hashed `a` tag is the 32 bytes after the marker.
+Writing an addressable event with a hashed `d`, or a deletion with a hashed
+`a`, reads the original value from the event's payload to form the address.
+
+The database version is unchanged. Values of 255 bytes or fewer pack exactly
+as before, so existing records and their index entries stay valid, and
+integrity, which derives the expected index entries from PackedEvent, accepts
+records of either packing. Migration and reindex copy PackedEvent unchanged,
+so records packed by strfry or by earlier Wok releases keep the values they
+dropped: filters cannot match those values, and an addressable record whose
+first `d` was dropped keeps the address it was keyed by (the virtual empty `d`
+or a later short `d`). An earlier Wok release opening a database written by
+this one derives the same index keys from hashed values, but does not
+recognize a hashed deletion `a` tag. If it deletes such a deletion request, the
+request's `Event__replaceDeletion` entry stays behind; `wok integrity` reports
+it and `wok reindex` removes it. Writers must still not be mixed.
+
 ## EventPayload
 
 - `0x00` + UTF-8 JSON (compact, keys `content,created_at,id,kind,pubkey,sig,tags`)

@@ -4,13 +4,19 @@ use crate::subid::QueryError;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use wok_db::{parse_search_query, search_term_set, SearchQuery, SearchTermSet};
-use wok_event::{from_lower_hex_exact, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE};
+use wok_event::{
+    from_lower_hex_exact, indexed_tag_value, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE,
+};
 
 pub const DEFAULT_MAX_AND_ENTRIES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct FilterSetBytes {
+    /// Sorted values in the form PackedEvent and the indexes hold them: tag
+    /// values longer than `MAX_INDEXED_TAG_VAL_SIZE` are hashed.
     items: Vec<Vec<u8>>,
+    /// The original value of each hashed item.
+    originals: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl FilterSetBytes {
@@ -20,13 +26,11 @@ impl FilterSetBytes {
         min_size: usize,
         max_size: usize,
     ) -> Result<Self, QueryError> {
-        if max_size > MAX_INDEXED_TAG_VAL_SIZE {
-            return Err(QueryError::msg("maxSize bigger than max indexed tag size"));
-        }
         let arr = arr
             .as_array()
             .ok_or_else(|| QueryError::msg("not an array"))?;
         let mut items = Vec::new();
+        let mut originals = BTreeMap::new();
         for i in arr {
             let s = i
                 .as_str()
@@ -42,19 +46,41 @@ impl FilterSetBytes {
             if bytes.len() > max_size {
                 return Err(QueryError::msg("filter item too large"));
             }
-            items.push(bytes);
+            if bytes.len() > MAX_INDEXED_TAG_VAL_SIZE {
+                let hashed = indexed_tag_value(&bytes).into_owned();
+                originals.insert(hashed.clone(), bytes);
+                items.push(hashed);
+            } else {
+                items.push(bytes);
+            }
         }
         items.sort();
         items.dedup();
-        let total: usize = items.iter().map(|i| i.len()).sum();
+        let total: usize = items
+            .iter()
+            .map(|item| originals.get(item).unwrap_or(item).len())
+            .sum();
         if total > 65535 {
             return Err(QueryError::msg("total filter items too large"));
         }
-        Ok(Self { items })
+        Ok(Self { items, originals })
     }
 
+    /// Tag values of any length. A value can match only an event that packed
+    /// the same value, so the 65535-byte total is the only bound.
+    pub fn parse_tag_values(arr: &Value) -> Result<Self, QueryError> {
+        Self::parse(arr, false, 0, usize::MAX)
+    }
+
+    /// The `n`th value as PackedEvent holds it.
     pub fn at(&self, n: usize) -> &[u8] {
         &self.items[n]
+    }
+
+    /// The `n`th value as the filter gave it.
+    pub fn original(&self, n: usize) -> &[u8] {
+        let item = &self.items[n];
+        self.originals.get(item).unwrap_or(item)
     }
 
     pub fn size(&self) -> usize {
@@ -73,6 +99,7 @@ impl FilterSetBytes {
 
     fn remove_all(&mut self, excluded: &Self) {
         self.items.retain(|item| !excluded.does_match(item));
+        self.originals.retain(|item, _| !excluded.does_match(item));
     }
 }
 
@@ -205,7 +232,7 @@ impl NostrFilter {
                     let set = if tag == 'p' || tag == 'e' {
                         FilterSetBytes::parse(v, true, 32, 32)
                     } else {
-                        FilterSetBytes::parse(v, false, 0, MAX_INDEXED_TAG_VAL_SIZE)
+                        FilterSetBytes::parse_tag_values(v)
                     }
                     .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
                     f.tags.insert(tag, set);
@@ -224,7 +251,7 @@ impl NostrFilter {
                     let set = if tag == 'p' || tag == 'e' {
                         FilterSetBytes::parse(v, true, 32, 32)
                     } else {
-                        FilterSetBytes::parse(v, false, 0, MAX_INDEXED_TAG_VAL_SIZE)
+                        FilterSetBytes::parse_tag_values(v)
                     }
                     .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
                     f.and_tags.insert(tag, set);
@@ -621,6 +648,43 @@ mod tests {
         assert!(!f.does_match(ev.view()));
         let ev = packed_note(1, 2, 15, 2, &[]);
         assert!(!f.does_match(ev.view()));
+    }
+
+    #[test]
+    fn long_tag_values_match_their_hashed_packed_form() {
+        let longest = "z".repeat(wok_event::MAX_INDEXED_TAG_VAL_SIZE);
+        let long = "z".repeat(300);
+        let longer = "z".repeat(301);
+        let packed = |value: &str| {
+            let indexed = indexed_tag_value(value.as_bytes());
+            packed_note(1, 2, 15, 30000, &[("d", &indexed)])
+        };
+        for (value, other) in [(&longest, &long), (&long, &longer), (&longer, &long)] {
+            for key in ["#d", "&d"] {
+                let f = NostrFilter::parse(&json!({ key: [value] }), 500, 3, 16).unwrap();
+                assert!(f.does_match(packed(value).view()), "{key} {}", value.len());
+                assert!(!f.does_match(packed(other).view()), "{key} {}", value.len());
+            }
+        }
+
+        let f = NostrFilter::parse(&json!({"#d": [&long, "short", &long]}), 500, 3, 16).unwrap();
+        let values = &f.tags[&'d'];
+        assert_eq!(values.size(), 2);
+        let originals: HashSet<_> = (0..2).map(|n| values.original(n)).collect();
+        assert_eq!(originals, HashSet::from([long.as_bytes(), &b"short"[..]]));
+
+        // A required long value leaves only the other OR alternative.
+        let f = NostrFilter::parse(&json!({"&d": [&long], "#d": [&long, &longer]}), 500, 3, 16)
+            .unwrap();
+        assert_eq!(f.tags[&'d'].size(), 1);
+        assert_eq!(f.tags[&'d'].original(0), longer.as_bytes());
+
+        // The total bound counts the values as sent, not their hashes.
+        let many: Vec<_> = (0..70)
+            .map(|n| format!("{n:02}{}", "z".repeat(998)))
+            .collect();
+        assert!(NostrFilter::parse(&json!({"#r": many}), 500, 3, 16).is_err());
+        assert!(NostrFilter::parse(&json!({"#r": &many[..65]}), 500, 3, 16).is_ok());
     }
 
     #[test]

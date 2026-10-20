@@ -112,11 +112,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   posts (of eight such publishers, one event was stored). Only the OK is lost
   now. An EVENT still parked behind a full writer queue is dropped when its
   connection closes, as before.
-- Addressable events whose first `d` tag is longer than 255 bytes, and kind 5
-  `a` tags longer than 255 bytes, are refused with `invalid:`. Such values are
-  not indexed, so the event was keyed by an empty `d` and distinct addresses
-  replaced one another (`d=""`, a 300-byte `d` and a 301-byte `d`), and such a
-  deletion never matched its target.
+- Single-letter tag values longer than 255 bytes are indexed by their SHA-256.
+  They were not indexed at all, so an addressable event whose first `d` tag
+  was that long was keyed by an empty `d` and distinct addresses replaced one
+  another (`d=""`, a 300-byte `d` and a 301-byte `d`), a kind 5 `a` tag that
+  long never deleted its target, and `#x` filters for such values were
+  refused. Events stored by earlier releases or migrated from strfry keep
+  their packing, so filters still cannot match their long values.
 - Kind 41 (NIP-28 channel metadata) is a regular event, as NIP-01 makes every
   kind from 4 to 44. It was replaced per author, so metadata for a second
   channel deleted the first channel's. Migrated kind 41 history becomes

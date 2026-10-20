@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::kinds::{
     is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag,
 };
-use crate::packed::{PackedEvent, PackedEventBuilder, PackedEventTagBuilder};
+use crate::packed::{indexed_tag_value, PackedEvent, PackedEventBuilder, PackedEventTagBuilder};
 use crate::{EventError, MAX_INDEXED_TAG_VAL_SIZE};
 
 /// Default ceiling for normalized event JSON. This is intentionally far below
@@ -165,7 +165,6 @@ pub fn nostr_json_to_packed_event(
 
     let mut tag_builder = PackedEventTagBuilder::default();
     let mut expiration = 0u64;
-    let mut address_d_seen = !is_param_replaceable_kind(kind);
 
     if is_replaceable_kind(kind) {
         // Prepend virtual d-tag. Any later d-tags will be ignored during indexing.
@@ -203,17 +202,6 @@ pub fn nostr_json_to_packed_event(
                     tag_val.len()
                 )));
             }
-            // Values longer than MAX_INDEXED_TAG_VAL_SIZE are not indexed. An
-            // address keyed by a later d tag, or by the virtual empty one,
-            // would make distinct addresses replace each other.
-            if tag_name == "d" && !address_d_seen {
-                address_d_seen = true;
-                if tag_val.len() > MAX_INDEXED_TAG_VAL_SIZE {
-                    return Err(EventError::msg(format!(
-                        "addressable event d tag longer than {MAX_INDEXED_TAG_VAL_SIZE} bytes"
-                    )));
-                }
-            }
             if tag_name == "e" || tag_name == "p" {
                 if tag_val.len() != 64 {
                     return Err(EventError::msg(format!(
@@ -226,13 +214,6 @@ pub fn nostr_json_to_packed_event(
                 }
                 continue;
             } else if tag_name == "a" && kind == 5 {
-                // An unindexed address could never be matched against the
-                // events it asks to delete.
-                if tag_val.len() > MAX_INDEXED_TAG_VAL_SIZE {
-                    return Err(EventError::msg(format!(
-                        "deletion a tag longer than {MAX_INDEXED_TAG_VAL_SIZE} bytes"
-                    )));
-                }
                 let (tag_kind, tag_pubkey, _d) = parse_a_tag(tag_val)?;
                 let _ = tag_kind;
                 if tag_pubkey.as_slice() != pubkey.as_slice() {
@@ -240,9 +221,12 @@ pub fn nostr_json_to_packed_event(
                 }
             }
 
-            if tag_val.len() <= MAX_INDEXED_TAG_VAL_SIZE {
-                tag_builder.add(tag_name.chars().next().unwrap(), tag_val.as_bytes())?;
-            }
+            // Long values are packed by hash, so an address with a long d or a
+            // long deletion a tag stays distinct and can be matched.
+            tag_builder.add(
+                tag_name.chars().next().unwrap(),
+                &indexed_tag_value(tag_val.as_bytes()),
+            )?;
         } else if tag_name == "expiration" && expiration == 0 {
             expiration = parse_uint64(tag_val)?;
             if expiration < 100 {
@@ -380,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn unindexable_addresses_are_rejected() {
+    fn long_tag_values_are_packed_by_hash() {
         let event = |kind: u64, tags: Value| {
             json!({
                 "id": "11".repeat(32),
@@ -392,37 +376,48 @@ mod tests {
                 "sig": "00".repeat(64),
             })
         };
-        let limits = EventLimits::default();
+        let pack = |kind: u64, tags: Value| {
+            nostr_json_to_packed_event(&event(kind, tags), &EventLimits::default()).unwrap()
+        };
         let longest = "z".repeat(MAX_INDEXED_TAG_VAL_SIZE);
-        let too_long = "z".repeat(MAX_INDEXED_TAG_VAL_SIZE + 1);
-        let packed =
-            nostr_json_to_packed_event(&event(30000, json!([["d", longest]])), &limits).unwrap();
+        let long = "z".repeat(MAX_INDEXED_TAG_VAL_SIZE + 1);
+        let hashed = indexed_tag_value(long.as_bytes()).into_owned();
+        assert_eq!(hashed.len(), 33);
+
+        let packed = pack(30000, json!([["d", longest]]));
         assert_eq!(packed.view().first_d_tag().unwrap(), longest.as_bytes());
-        for tags in [
-            json!([["d", too_long]]),
-            // A later short d must not become the address either.
-            json!([["d", too_long], ["d", "short"]]),
-        ] {
-            assert!(nostr_json_to_packed_event(&event(30000, tags), &limits).is_err());
+        // The first d is the address even when it is long, and the virtual
+        // empty d stays last.
+        for tags in [json!([["d", long]]), json!([["d", long], ["d", "short"]])] {
+            let packed = pack(30000, tags);
+            assert_eq!(packed.view().first_d_tag().unwrap(), hashed);
+            assert_eq!(packed.view().tags().last().unwrap().value, b"");
         }
-        // Only the first d tag of an addressable event is its address.
-        for (kind, tags) in [
-            (30000, json!([["d", "short"], ["d", too_long]])),
-            (1, json!([["d", too_long]])),
-            (10002, json!([["d", too_long]])),
-        ] {
-            assert!(nostr_json_to_packed_event(&event(kind, tags), &limits).is_ok());
-        }
+        let packed = pack(30000, json!([["d", "short"], ["d", long]]));
+        assert_eq!(packed.view().first_d_tag().unwrap(), b"short");
+        // Replaceable kinds keep their leading virtual empty d.
+        let packed = pack(10002, json!([["d", long]]));
+        assert_eq!(packed.view().first_d_tag().unwrap(), b"");
+        let packed = pack(1, json!([["r", long], ["t", "short"], ["title", long]]));
+        let tags = packed.view().tags();
+        assert_eq!(tags.len(), 2);
+        assert_eq!((tags[0].name, &tags[0].value), ('r', &hashed));
+        assert_eq!((tags[1].name, &tags[1].value[..]), ('t', &b"short"[..]));
 
         let pubkey = "22".repeat(32);
-        let prefix = format!("30000:{pubkey}:");
-        let deletion = |d_len: usize| {
-            let address = format!("{prefix}{}", "z".repeat(d_len));
-            event(5, json!([["a", address]]))
-        };
-        let fits = MAX_INDEXED_TAG_VAL_SIZE - prefix.len();
-        assert!(nostr_json_to_packed_event(&deletion(fits), &limits).is_ok());
-        assert!(nostr_json_to_packed_event(&deletion(fits + 1), &limits).is_err());
+        let address = format!("30000:{pubkey}:{long}");
+        let packed = pack(5, json!([["a", address]]));
+        assert_eq!(
+            packed.view().tags()[0].value,
+            indexed_tag_value(address.as_bytes()).into_owned()
+        );
+        // A long address must still name the author of the deletion.
+        let other = format!("30000:{}:{long}", "33".repeat(32));
+        assert!(nostr_json_to_packed_event(
+            &event(5, json!([["a", other]])),
+            &EventLimits::default()
+        )
+        .is_err());
     }
 
     #[test]

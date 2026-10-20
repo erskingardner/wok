@@ -427,36 +427,8 @@ async fn publish(wire: &mut Wire, event: &Value) -> Value {
     ok
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn long_d_tags_cannot_merge_distinct_addresses() {
-    // Single-letter tag values over 255 bytes are not indexed, so an address
-    // with a longer d used to be keyed by the virtual empty d: d="",
-    // d=300 bytes and d=301 bytes replaced one another. Until long values are
-    // indexed by hash, such addresses and deletion a tags are refused.
-    let key = key();
-    let (dir, env) = snapshot(&[]);
-    let (handle, mut wire) = server(env, dir.path()).await;
-    let empty = event(&key, 30000, 100, json!([["d", ""]]), "empty d");
-    assert_eq!(publish(&mut wire, &empty).await[2], true);
-    for (time, len) in [(200, 300), (300, 301)] {
-        let long = event(&key, 30000, time, json!([["d", "z".repeat(len)]]), "long");
-        let ok = publish(&mut wire, &long).await;
-        assert_eq!(ok[2], false, "{ok}");
-        assert!(ok[3].as_str().unwrap().starts_with("invalid:"), "{ok}");
-    }
-    let address = format!(
-        "30000:{}:{}",
-        empty["pubkey"].as_str().unwrap(),
-        "z".repeat(300)
-    );
-    let deletion = event(&key, 5, 400, json!([["a", address]]), "");
-    let ok = publish(&mut wire, &deletion).await;
-    assert_eq!(ok[2], false, "{ok}");
-    assert!(ok[3].as_str().unwrap().starts_with("invalid:"), "{ok}");
-
-    wire.send(json!(["REQ", "addresses", {"kinds": [30000, 5]}]))
-        .await
-        .unwrap();
+async fn history(wire: &mut Wire, filter: Value) -> Vec<Value> {
+    wire.send(json!(["REQ", "history", filter])).await.unwrap();
     let mut stored = Vec::new();
     loop {
         let frame = wire.recv().await.unwrap();
@@ -466,7 +438,79 @@ async fn long_d_tags_cannot_merge_distinct_addresses() {
             _ => panic!("unexpected {frame}"),
         }
     }
-    assert_eq!(ids(&stored), ids(&[empty]));
+    wire.send(json!(["CLOSE", "history"])).await.unwrap();
+    stored
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_d_tags_keep_distinct_addresses() {
+    // Single-letter tag values over 255 bytes are indexed by hash. Without
+    // that, d="", a 300-byte d and a 301-byte d were one address, and a
+    // deletion a tag naming a long d never matched it.
+    let key = key();
+    let (dir, env) = snapshot(&[]);
+    let (handle, mut wire) = server(env, dir.path()).await;
+    let pubkey = key.x_only_public_key().0.to_string();
+    let (d300, d301) = ("z".repeat(300), "z".repeat(301));
+    let empty = event(&key, 30000, 100, json!([["d", ""]]), "empty d");
+    let long = event(&key, 30000, 200, json!([["d", &d300]]), "300");
+    let longer = event(&key, 30000, 300, json!([["d", &d301]]), "301");
+    for event in [&empty, &long, &longer] {
+        assert_eq!(publish(&mut wire, event).await[2], true);
+    }
+    assert_eq!(
+        ids(&history(&mut wire, json!({"kinds": [30000]})).await),
+        ids(&[empty.clone(), long.clone(), longer.clone()])
+    );
+    for (d, expected) in [(&d300, &long), (&d301, &longer)] {
+        let found = history(&mut wire, json!({"kinds": [30000], "#d": [d]})).await;
+        assert_eq!(
+            ids(&found),
+            ids(std::slice::from_ref(expected)),
+            "d {}",
+            d.len()
+        );
+    }
+
+    // A live #d subscription for a long value sees its replacement, which
+    // replaces only that address.
+    wire.send(json!(["REQ", "live", {"#d": [&d300]}]))
+        .await
+        .unwrap();
+    assert_eq!(wire.recv().await.unwrap()[2]["id"], long["id"]);
+    assert_eq!(wire.recv().await.unwrap()[0], "EOSE");
+    let replacement = event(&key, 30000, 250, json!([["d", &d300]]), "300 again");
+    wire.send(json!(["EVENT", replacement])).await.unwrap();
+    let mut frames = vec![wire.recv().await.unwrap(), wire.recv().await.unwrap()];
+    frames.sort_by_key(|frame| frame[0].as_str().unwrap().to_owned());
+    assert_eq!(frames[0][0], "EVENT", "{frames:?}");
+    assert_eq!(frames[0][2]["id"], replacement["id"]);
+    assert_eq!(frames[1][0], "OK", "{frames:?}");
+    assert_eq!(frames[1][2], true, "{frames:?}");
+    wire.send(json!(["CLOSE", "live"])).await.unwrap();
+    assert_eq!(
+        ids(&history(&mut wire, json!({"kinds": [30000]})).await),
+        ids(&[empty.clone(), replacement, longer.clone()])
+    );
+
+    // A deletion a tag naming the long address deletes it and nothing else,
+    // and stays matchable by #a.
+    let address = format!("30000:{pubkey}:{d300}");
+    let deletion = event(&key, 5, 400, json!([["a", &address]]), "");
+    assert_eq!(publish(&mut wire, &deletion).await[2], true);
+    assert_eq!(
+        ids(&history(&mut wire, json!({"kinds": [30000, 5]})).await),
+        ids(&[empty, longer, deletion.clone()])
+    );
+    assert_eq!(
+        ids(&history(&mut wire, json!({"#a": [&address]})).await),
+        ids(std::slice::from_ref(&deletion))
+    );
+    // An older version of the deleted address cannot come back.
+    let stale = event(&key, 30000, 350, json!([["d", &d300]]), "stale");
+    let ok = publish(&mut wire, &stale).await;
+    assert_eq!(ok[2], false, "{ok}");
+    assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
     handle.request_shutdown();
 }
 
@@ -773,6 +817,65 @@ fn address_deletion_removes_all_eligible_versions_and_keeps_newer_versions() {
     );
     assert_eq!(stored_ids(&env), ids(&[events[0].clone(), other, deletion]));
     wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap();
+}
+
+#[test]
+fn long_addresses_are_deleted_and_tombstoned_through_their_hashes() {
+    // A 200-byte d is packed as is but its a tag is hashed; a 300-byte d is
+    // hashed as well. Either deletion removes and tombstones the address, and
+    // removing the deletion request removes its hashed tombstone too.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    for d in ["y".repeat(200), "z".repeat(300)] {
+        let versions: Vec<_> = [100, 200]
+            .iter()
+            .map(|t| event(&key, 30443, *t, json!([["d", &d]]), "version"))
+            .collect();
+        let other = event(&key, 30443, 100, json!([["d", "short"]]), "other");
+        let mut input = versions.clone();
+        input.push(other.clone());
+        let (_dir, env) = snapshot(&input);
+        let address = format!("30443:{pubkey}:{d}");
+        assert!(address.len() > wok_event::MAX_INDEXED_TAG_VAL_SIZE);
+        let deletion = event(&key, 5, 300, json!([["a", &address]]), "delete");
+        assert_eq!(
+            write_with_quota(&env, &deletion, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+        assert_eq!(
+            stored_ids(&env),
+            ids(&[other.clone(), deletion.clone()]),
+            "d {}",
+            d.len()
+        );
+        let stale = event(&key, 30443, 250, json!([["d", &d]]), "stale");
+        assert_eq!(
+            write_with_quota(&env, &stale, 0, true),
+            wok_db::EventWriteStatus::Deleted,
+            "d {}",
+            d.len()
+        );
+        assert!(wok_db::check_integrity(&env.begin_ro().unwrap())
+            .unwrap()
+            .ok());
+
+        let id = hex::decode(deletion["id"].as_str().unwrap()).unwrap();
+        let (lev, _) = wok_db::lookup_event_by_id_ro(&env.begin_ro().unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [lev]).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event_replace_deletion).unwrap(), 0);
+        assert!(wok_db::check_integrity(&txn).unwrap().ok());
+        drop(txn);
+        let fresh = event(&key, 30443, 250, json!([["d", &d]]), "fresh");
+        assert_eq!(
+            write_with_quota(&env, &fresh, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+    }
 }
 
 #[test]

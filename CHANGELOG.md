@@ -178,6 +178,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A deletion request against a deletion request has no effect, as NIP-09
   requires. Before, a kind 5 deleting an earlier kind 5 removed it with its
   tombstone, and the originally deleted event could be published again.
+- A deletion's `a` tag naming a replaceable event, `<kind>:<pubkey>:` for
+  kinds 0, 3 and 10000–19999, deletes that author's versions up to the
+  request's `created_at` and refuses such versions published later, as NIP-09
+  asks and as for addressable events. Such deletions did nothing. Deletion
+  requests already stored, including those migrated from strfry, gain their
+  tombstones from `wok reindex`; until then `wok doctor` warns
+  (`replaceable-tombstones`).
 - A kind 22242 AUTH event sent with EVENT is refused with
   `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
   to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.

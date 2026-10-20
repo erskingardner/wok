@@ -45,9 +45,10 @@ Coverage is in `wok-compat/tests/replaceable_events.rs`.
 New winning publications remove all older stored versions at that address in
 the same transaction, including negentropy and author-quota accounting. An
 incoming stale event is rejected against the global winner, independent of
-local insertion order. For addressable events, NIP-09 `a`-tag deletions remove
-every matching version at or before the deletion timestamp, preserving newer
-versions.
+local insertion order. NIP-09 `a`-tag deletions of addressable events, and of
+replaceable events (named `<kind>:<pubkey>:`, with an empty `d`), remove every
+matching version at or before the deletion timestamp, preserving newer
+versions, and refuse such versions that arrive later.
 
 Persistent negentropy trees represent physical storage. A transactional count
 of retained superseded versions keeps clean databases on the persistent-tree

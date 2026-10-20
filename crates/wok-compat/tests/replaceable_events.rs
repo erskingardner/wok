@@ -542,6 +542,51 @@ async fn long_d_tags_keep_distinct_addresses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tag_deletions_remove_and_tombstone_replaceable_events() {
+    // NIP-01 names a replaceable event `<kind>:<pubkey>:`, with an empty d,
+    // and NIP-09 deletes its versions up to the request's created_at.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    for kind in [0, 10002] {
+        let versions: Vec<_> = [100, 200]
+            .iter()
+            .map(|t| event(&key, kind, *t, json!([]), "version"))
+            .collect();
+        // Imported history keeps both versions stored.
+        let (dir, env) = snapshot(&versions);
+        let (handle, mut wire) = server(env, dir.path()).await;
+        let filter = json!({"kinds": [kind], "authors": [&pubkey]});
+        assert_eq!(
+            ids(&history(&mut wire, filter.clone()).await),
+            ids(&versions[1..])
+        );
+        let address = format!("{kind}:{pubkey}:");
+        let deletion = event(&key, 5, 300, json!([["a", &address]]), "");
+        assert_eq!(publish(&mut wire, &deletion).await[2], true);
+        // The older version would be the winner had it survived.
+        assert!(
+            history(&mut wire, filter.clone()).await.is_empty(),
+            "kind {kind}"
+        );
+        // Neither a deleted version nor another one up to the request's
+        // created_at can come back.
+        let at_deletion = event(&key, kind, 300, json!([]), "at deletion");
+        for stale in versions.iter().chain([&at_deletion]) {
+            let ok = publish(&mut wire, stale).await;
+            assert_eq!(ok[2], false, "kind {kind}: {ok}");
+            assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+        }
+        let newer = event(&key, kind, 301, json!([]), "newer");
+        assert_eq!(publish(&mut wire, &newer).await[2], true);
+        assert_eq!(
+            ids(&history(&mut wire, filter).await),
+            ids(std::slice::from_ref(&newer))
+        );
+        handle.request_shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn channel_metadata_for_each_channel_survives() {
     // NIP-01 makes 4 <= n < 45 regular. NIP-28 kind 41 names its channel
     // with an e tag, so one author's metadata for two channels is two
@@ -903,6 +948,145 @@ fn long_addresses_are_deleted_and_tombstoned_through_their_hashes() {
             wok_db::EventWriteStatus::Written
         );
     }
+}
+
+#[test]
+fn replaceable_address_deletion_removes_eligible_versions_and_keeps_newer_versions() {
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    for kind in [0, 3, 10000, 19999] {
+        let versions: Vec<_> = [300, 100, 200]
+            .iter()
+            .map(|t| event(&key, kind, *t, json!([]), "version"))
+            .collect();
+        // Neither another author's version nor the addressable `30000:pk:`
+        // shares the address.
+        let other_author = event(&self::key(), kind, 100, json!([]), "other author");
+        let addressable = event(&key, 30000, 100, json!([]), "addressable");
+        let mut input = versions.clone();
+        input.extend([other_author.clone(), addressable.clone()]);
+        let (_dir, env) = snapshot(&input);
+        let deletion = event(
+            &key,
+            5,
+            250,
+            json!([["a", format!("{kind}:{pubkey}:")]]),
+            "delete",
+        );
+        assert_eq!(
+            write_with_quota(&env, &deletion, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+        assert_eq!(
+            stored_ids(&env),
+            ids(&[
+                versions[0].clone(),
+                other_author,
+                addressable,
+                deletion.clone()
+            ]),
+            "kind {kind}"
+        );
+        assert_eq!(
+            env.begin_ro()
+                .unwrap()
+                .entries(env.dbis().event_replace_deletion)
+                .unwrap(),
+            1
+        );
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
+        assert_eq!(report.legacy_replaceable_deletions, 0);
+        wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap();
+
+        // Once the newer version is gone too, the tombstone refuses older ones.
+        let (_dir, env) = snapshot(&versions[1..]);
+        assert_eq!(
+            write_with_quota(&env, &deletion, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+        assert_eq!(stored_ids(&env), ids(std::slice::from_ref(&deletion)));
+        for time in [150, 250] {
+            let stale = event(&key, kind, time, json!([]), "stale");
+            assert_eq!(
+                write_with_quota(&env, &stale, 0, true),
+                wok_db::EventWriteStatus::Deleted,
+                "kind {kind} at {time}"
+            );
+        }
+        let newer = event(&key, kind, 251, json!([]), "newer");
+        assert_eq!(
+            write_with_quota(&env, &newer, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+
+        // Removing the request removes its tombstone.
+        let id = hex::decode(deletion["id"].as_str().unwrap()).unwrap();
+        let (lev, _) = wok_db::lookup_event_by_id_ro(&env.begin_ro().unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [lev]).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event_replace_deletion).unwrap(), 0);
+        assert!(wok_db::check_integrity(&txn).unwrap().ok());
+    }
+
+    // A replaceable event's address has an empty d; `10002:pk:x` names nothing.
+    let version = event(&key, 10002, 100, json!([["d", "x"]]), "version");
+    let (_dir, env) = snapshot(std::slice::from_ref(&version));
+    let deletion = event(
+        &key,
+        5,
+        200,
+        json!([["a", format!("10002:{pubkey}:x")]]),
+        "",
+    );
+    assert_eq!(
+        write_with_quota(&env, &deletion, 0, true),
+        wok_db::EventWriteStatus::Written
+    );
+    assert_eq!(stored_ids(&env), ids(&[version, deletion]));
+    let txn = env.begin_ro().unwrap();
+    assert_eq!(txn.entries(env.dbis().event_replace_deletion).unwrap(), 0);
+}
+
+#[test]
+fn deletions_stored_without_replaceable_tombstones_get_them_from_reindex() {
+    // strfry and earlier Wok releases did not tombstone `<kind>:<pubkey>:`.
+    // Integrity accepts their deletion requests without it and counts them.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    let version = event(&key, 10002, 100, json!([]), "version");
+    let deletion = event(&key, 5, 200, json!([["a", format!("10002:{pubkey}:")]]), "");
+    let (_dir, env) = snapshot(&[version.clone(), deletion.clone()]);
+    {
+        let mut txn = env.begin_rw().unwrap();
+        txn.clear(env.dbis().event_replace_deletion).unwrap();
+        txn.commit().unwrap();
+    }
+    let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    assert_eq!(report.legacy_replaceable_deletions, 1);
+    assert_eq!(report.expected_index_entries, report.actual_index_entries);
+
+    let (_repaired_dir, repaired, _) = reindex(&env);
+    let report = wok_db::check_integrity(&repaired.begin_ro().unwrap()).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    assert_eq!(report.legacy_replaceable_deletions, 0);
+    // The version the request predates is not deleted, but later versions up
+    // to its created_at are refused.
+    assert_eq!(stored_ids(&repaired), ids(&[version, deletion]));
+    let stale = event(&key, 10002, 150, json!([]), "stale");
+    assert_eq!(
+        write_with_quota(&env, &stale, 0, false),
+        wok_db::EventWriteStatus::Written
+    );
+    assert_eq!(
+        write_with_quota(&repaired, &stale, 0, false),
+        wok_db::EventWriteStatus::Deleted
+    );
 }
 
 #[test]

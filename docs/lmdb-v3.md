@@ -96,6 +96,25 @@ strfry records byte for byte. Repacking changes the record's PackedEvent bytes,
 and so `event_fingerprint`, but removing the hashed values gives the previous
 bytes back, so the repair loses nothing.
 
+## Event__replaceDeletion
+
+A kind 5 record keys `Event__replaceDeletion` by `sha256(a tag) || created_at`
+for each `a` tag that names an address of its own author: an addressable kind
+(30000–39999), or a replaceable kind (0, 3, 10000–19999) with an empty `d`,
+`<kind>:<pubkey>:`. A writer refuses an addressable or replaceable event when
+the hash of its own canonical `a` tag has an entry at or after its
+`created_at`. strfry, and Wok 0.7.0 and earlier, index addressable kinds only.
+
+Deletion requests that strfry or an earlier Wok release stored therefore lack
+the entries of replaceable addresses. Integrity accepts their absence, so
+migration and older databases still verify, and counts such records as
+`legacy_replaceable_deletions`; `wok doctor` warns while any remain and
+`wok reindex` derives the entries. The versions such a request predates stay
+stored. An earlier Wok release opening a database written by this one does not
+derive those entries, so its integrity check reports them as unexpected, and
+if it deletes such a deletion request the entry stays behind; `wok integrity`
+reports it and `wok reindex` removes it.
+
 ## EventPayload
 
 - `0x00` + UTF-8 JSON (compact, keys `content,created_at,id,kind,pubkey,sig,tags`)

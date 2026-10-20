@@ -66,6 +66,14 @@ already stored. Nothing is lost: removing the hashed values from a repacked
 record gives its previous bytes back, and the original stays in the backup.
 See [lmdb-v3.md](lmdb-v3.md#packedevent).
 
+Reindex also tombstones replaceable events that deletion requests stored by
+strfry or Wok 0.7.0 and earlier name by `a` tag (`<kind>:<pubkey>:`). Those
+releases did not index them, so older versions of such an event can still be
+published. Integrity JSON counts the requests as `legacy_replaceable_deletions`,
+and doctor emits a `replaceable-tombstones` warning while it is nonzero. The
+versions a request predates stay stored, as before. See
+[lmdb-v3.md](lmdb-v3.md#eventreplacedeletion).
+
 ## Outbound connections
 
 `wok sync`, `wok router`, `wok upload`, and `wok download`

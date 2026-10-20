@@ -34,6 +34,11 @@ pub struct IntegrityReport {
     /// `wok reindex` would pack again. Advisory, counted where payloads are
     /// decoded (databases with the search table).
     pub legacy_long_tag_records: u64,
+    /// Deletion requests stored by strfry or earlier Wok releases that lack
+    /// the tombstone of a plain replaceable address (`<kind>:<pubkey>:`) one
+    /// of their `a` tags names, which those releases did not index. Advisory:
+    /// `wok reindex` adds the tombstones.
+    pub legacy_replaceable_deletions: u64,
     pub expected_index_entries: u64,
     pub actual_index_entries: u64,
     pub missing_payloads: Vec<u64>,
@@ -415,10 +420,14 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
         *authors
             .entry(packed.pubkey().try_into().expect("validated packed pubkey"))
             .or_default() += 1;
+        let mut lacks_legacy_entries = false;
         for entry in event_index_entries(dbis, lev_id, packed) {
-            report.expected_index_entries += 1;
             match entry_exists(txn, &entry) {
                 Ok(true) => {}
+                Ok(false) if entry.legacy_optional => {
+                    lacks_legacy_entries = true;
+                    continue;
+                }
                 Ok(false) => {
                     report.missing_index_entries += 1;
                     report.issue("missing-index", entry.name, format!("levId {lev_id}"));
@@ -428,6 +437,10 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
                     report.issue("lookup", entry.name, error.to_string());
                 }
             }
+            report.expected_index_entries += 1;
+        }
+        if lacks_legacy_entries {
+            report.legacy_replaceable_deletions += 1;
         }
         if let Some(search_dbi) = dbis.event_search {
             let payload = match txn.get_u64(dbis.event_payload, lev_id) {
@@ -457,6 +470,7 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
                             dbi: search_dbi,
                             key,
                             value,
+                            legacy_optional: false,
                         };
                         report.expected_index_entries += 1;
                         match entry_exists(txn, &entry) {

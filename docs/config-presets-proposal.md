@@ -1,7 +1,8 @@
 # Limits, defaults and configuration presets: proposal
 
-Status: **proposal for discussion**. No code has changed. Written on
-2026-10-20 against `ef4650c` (0.7.0).
+Status: **proposal**. The owner's decisions are recorded in §8, and three
+questions remain open. No code has changed. Written on 2026-10-20 against
+`ef4650c` (0.7.0).
 
 This builds on the 2026-10-20 NIP compliance and client-workload audit, which
 is cited here by finding ID (C2–C7, B3, B13, W1–W10). That audit reproduced the
@@ -10,7 +11,7 @@ configuration model and an implementation plan.
 
 The owner's decisions it works from:
 - The defaults target a general public relay.
-- Running Wok as a Marmot app relay is the primary real use case.
+- Running Wok as a Marmot relay is the primary real use case.
 - Operators need configuration that is easy to understand, an admin screen
   that explains each trade-off, and preset templates.
 
@@ -20,7 +21,7 @@ so.
 
 ## 0. Summary
 
-- **Presets.** Add one top-level key, `preset = "public" | "app" | "private"`.
+- **Presets.** Add one top-level key, `preset = "public" | "marmot"`.
   Configuration resolves in three layers: built-in defaults, then the preset,
   then the operator's file. The built-in defaults *are* the public preset. A
   preset is a small TOML overlay that ships in the binary and is published in
@@ -114,7 +115,7 @@ Columns:
 
 | Setting | Now | Protects | Collides with | Public |
 |---|---|---|---|---|
-| `max_event_size` | 1 MiB | Memory per message and per stored record | <ul><li>Marmot Welcomes carry the full ratchet tree.</li><li>Add commits carry every new member's KeyPackage.</li><li>Both grow linearly with group size. MDK accepts single events up to 5 MiB and uses extended-length NIP-44.</li></ul> | Keep 1 MiB. The app preset uses 4 MiB (provisional; measure Welcome size at 100, 500 and 1,000 members) |
+| `max_event_size` | 1 MiB | Memory per message and per stored record | <ul><li>Marmot Welcomes carry the full ratchet tree.</li><li>Add commits carry every new member's KeyPackage.</li><li>Both grow linearly with group size. MDK accepts single events up to 5 MiB and uses extended-length NIP-44.</li></ul> | Keep 1 MiB. The marmot preset uses 4 MiB (provisional; measure Welcome size at 100, 500 and 1,000 members) |
 | `max_num_tags` | 2,000 | Write amplification: each single-letter tag adds a tag-index entry | Kind-3, 10000 and 30000 lists of heavy users (F9) | **5,000** (measure write cost) |
 | `max_tag_val_size` | 1,024 B | Bloat from long single-letter tag values | <ul><li>One long `r`, `t` or `a` value rejects the whole event.</li><li>Values of 256–1,024 B are stored but not indexed (A2, bug).</li></ul> | Keep until A2's hashed index lands, then 4,096 |
 | `reject_newer_than_secs` | 900 | Future-dated events pinned to the top of feeds | Clocks more than 15 min fast (rare) | Keep |
@@ -149,7 +150,7 @@ Columns:
 | `query_timeslice_budget_us` | 10,000 | Fairness between running scans | The W5 latency is structural, not caused by this knob | Keep (advanced) |
 | `abuse.max_concurrent_historical_queries` | 8 | Scan fairness per connection | A ninth concurrent scan is refused instead of waiting (F2) | Keep 8, but **queue** the excess (bounded by `max_subs_per_connection`) |
 | `abuse.max_query_cost` | 1,000 | Expensive scans, checked before a cursor opens | <ul><li>Rejects `authors[150]`, an 11-kind feed and 45-filter batches.</li><li>Lets 100k-cursor fan-outs through (F5).</li><li>Uses the wrong prefix (C4).</li></ul> | **New model, ceiling 20,000** (§3.4) |
-| `filter_validation.enabled` and its rules | off | Optional structural rules, inherited from a strfry plugin | <ul><li>Once enabled, its own `max_filters_per_req = 3` and `max_kinds_per_filter = 3` break most clients.</li><li>`require_author_or_tag` breaks Marmot and outbox clients (F13).</li></ul> | Keep off. Drop the duplicate counts (F3). Add `require_scoped_filters`, which the app preset uses (§3.7) |
+| `filter_validation.enabled` and its rules | off | Optional structural rules, inherited from a strfry plugin | <ul><li>Once enabled, its own `max_filters_per_req = 3` and `max_kinds_per_filter = 3` break most clients.</li><li>`require_author_or_tag` breaks Marmot and outbox clients (F13).</li></ul> | Keep off. Drop the duplicate counts (F3). Add `require_scoped_filters`, which the marmot preset uses (§3.7) |
 | *hard:* tag filter value | 255 B | Index key size | `#d`, `#a` and `#r` values over 255 B cannot be queried | Fix with A2 hashing (bug track) |
 | *hard:* one filter's value set | 65,535 decoded B | Memory per set | At most 2,047 authors or `#p` per filter (F12) | Keep. Document it, because it caps outbox lists before the byte cap does |
 
@@ -189,7 +190,7 @@ Columns:
 | Setting | Now | Protects | Collides with | Public |
 |---|---|---|---|---|
 | `auth.enabled` | true | — | — | Keep |
-| `auth.service_url` | empty | AUTH cannot complete until this is set, and restricted reads fail closed | DM and gift-wrap clients get `restricted:` with no challenge | Keep empty, because it depends on the deployment. The app and private presets **refuse to start** without it |
+| `auth.service_url` | empty | AUTH cannot complete until this is set, and restricted reads fail closed | DM and gift-wrap clients get `restricted:` with no challenge | Keep empty, because it depends on the deployment. The marmot preset **refuses to start** without it |
 | `auth.restricted_read_kinds` | `[4, 1059]` | Metadata of private messages | <ul><li>21059 can be read by anyone (A5).</li><li>78 and 30078 are open (B13).</li></ul> | Becomes `recipient_only_kinds = [4, 1059, 21059]` and `owner_only_kinds = [78, 30078]` (§3.6) |
 | `auth.restrict_read_to_involved_pubkey` | true | The per-event delivery filter | Setting it to `false` leaks restricted kinds in mixed REQs | **Remove** the `false` mode. Its intent becomes `authenticated_kinds` (§3.6) |
 | `auth.restrict_writes` | false | Allowlist | Checks the event author, so 445 and 1059 from throwaway keys are refused (C7) | **Replace** with `write_policy`, checked against the AUTHed identity |
@@ -240,7 +241,7 @@ contact = "mailto:ops@example.com"
   file. Each layer replaces individual keys and does not reset whole sections.
   This is the existing `merge_toml` with one more layer. Unknown keys are still
   rejected.
-- **Where presets live:** `crates/wok-relay/presets/{app,private}.toml`,
+- **Where presets live:** `crates/wok-relay/presets/marmot.toml` (and later ones),
   compiled in with `include_str!` and copied to `docs/presets/`. The public
   preset is the built-in defaults, so `public.toml` is empty apart from
   comments. An overlay contains only the keys it changes, which keeps each one
@@ -252,7 +253,7 @@ contact = "mailto:ops@example.com"
   events.reject_older_than_secs = 0           # preset public
   relay.abuse.per_connection.req_burst = 100  # preset public
   relay.auth.service_url = "wss://relay…"     # wok.toml:9
-  relay.abuse.event_burst = 500               # wok.toml:14 (preset app: 300)
+  relay.abuse.event_burst = 500               # wok.toml:14 (preset marmot: 300)
   ```
 
   `wok config show --overrides` prints only what the file changes relative to
@@ -260,8 +261,8 @@ contact = "mailto:ops@example.com"
 - **Reload:** changing `preset` on reload is allowed. Every effective change
   goes through the existing `security_scope_changes` warnings. Changes to read
   or write policy are logged at `warn`, naming the old and new policy.
-- **Validation per preset:** `app` and `private` refuse to start without
-  `relay.auth.service_url`, because they depend on AUTH. `public` keeps today's
+- **Validation per preset:** `marmot` refuses to start without
+  `relay.auth.service_url`, because gift-wrap reads depend on AUTH. `public` keeps today's
   warning.
 - **Dashboard writes** patch the file in place with `toml_edit`. The patch
   keeps comments, key order and `preset`, and writes only keys whose value
@@ -330,7 +331,8 @@ authenticated_multiplier = 4  # an AUTHed connection gets 4× each per-connectio
   still stops a client from streaming rounds forever.
 - The per-address backstop still applies to AUTHed connections on `open`
   relays, because on a public relay AUTH costs nothing (any key works). On
-  `members` relays the private preset raises the backstops.
+  `members` relays the operator can raise the backstops (see the later
+  `private` sketch in §4.3).
 - If a connection is over `max_concurrent_historical_queries`, the REQ waits in
   a per-connection FIFO. That FIFO is bounded by `max_subs_per_connection`, and
   a REQ is refused only when the FIFO is full (F2).
@@ -484,9 +486,10 @@ Use this for an open relay that any client can use: feeds, outbox lookups,
 DMs and gift-wrap inboxes. It is every "Public" value in §2, with the model
 from §3. The overlay file is empty, because these are the built-in defaults.
 
-### 4.2 `app`: Marmot app relay
+### 4.2 `marmot`: Marmot relay
 
-Use this for a relay that a Marmot app ships as a default. It carries:
+Use this for a relay dedicated to Marmot traffic, such as the default relays
+a Marmot app ships with. It carries:
 - group messages (445);
 - Welcomes in gift wraps (1059);
 - KeyPackages (30443);
@@ -500,7 +503,7 @@ no relay requirements, so several of them describe MDK's behaviour rather
 than the spec.
 
 ```toml
-# presets/app.toml: overlay on public
+# presets/marmot.toml: overlay on public
 [events]
 max_event_size = 4194304                 # 4 MiB: Welcomes and Add commits grow with group size (provisional)
 
@@ -544,7 +547,7 @@ neg_msg_burst = 500
     one thing the throwaway keys withhold: which account posts to which `#h`.
   - The preset therefore accepts unauthenticated writes for its kinds, and
     gives up per-identity rate limits to do so. Operators who need write
-    gating should use `private`.
+    gating need an allowlisted setup (§4.3).
 - **Reads:**
   - 1059 can be read only by its recipient after AUTH. MDK authenticates its
     receive connection with the account key.
@@ -585,13 +588,17 @@ neg_msg_burst = 500
   - Expect several connections per device per relay: authenticated receive,
     anonymous publish, anonymous directory, and short-lived inspection.
 
-### 4.3 `private`: allowlisted community or team relay
+### 4.3 Later: `private`, an allowlisted relay
 
-Use this when only members may read or write, and outsiders can still deliver
+The first round ships `public` and `marmot` only. Other setups become presets
+when there is a concrete deployment for them. The access model in §3.6 still
+lands in step 7, because allowlisted operators need the C7 fix whatever the
+preset. This sketch shows what an allowlisted preset would look like on top of
+that model: only members may read or write, and outsiders can still deliver
 DMs and Welcomes to members.
 
 ```toml
-# presets/private.toml: overlay on public
+# presets/private.toml (later): overlay on public
 [relay.auth]
 read_policy = "members"
 write_policy = "members"
@@ -613,38 +620,38 @@ to which group, which is inherent to an allowlisted relay. NIP-11 reports
 ### 4.4 Selecting and overriding
 
 ```toml
-preset = "app"
+preset = "marmot"
 
 [relay.auth]
-service_url = "wss://relay.example-app.com"   # required by app and private
+service_url = "wss://relay.example.com"   # required by the marmot preset
 
 [relay.abuse]
 event_burst = 500        # override: larger groups than the preset assumes
 ```
 
 `wok config show` would then print
-`relay.abuse.event_burst = 500 # wok.toml:7 (preset app: 300)`. The dashboard
+`relay.abuse.event_burst = 500 # wok.toml:7 (preset marmot: 300)`. The dashboard
 shows the same override with a "Reset to preset" control.
 
 ### 4.5 Side by side
 
-| Setting | public | app | private |
-|---|---|---|---|
-| `read_policy` / `write_policy` | open / open | open / open | members / members |
-| `accepted_kinds` | all | Marmot set | all |
-| `max_event_size` | 1 MiB | 4 MiB | 1 MiB |
-| `max_filter_limit` | 2,000 | 5,000 | 2,000 |
-| `recipient_only_kinds` | 4, 1059, 21059 | 4, 1059, 21059 | 4, 1059, 21059 |
-| `owner_only_kinds` | 78, 30078 | 78, 30078 | 78, 30078 |
-| `inbox_kinds` | — | — | 1059, 21059 |
-| `require_scoped_filters` | off | on | off |
-| per-connection REQ | 20/s, burst 100 | 50/s, burst 300 | 20/s, burst 100, ×4 (all AUTHed) |
-| per-connection NEG-MSG | 50/s, burst 200 | 50/s, burst 500 | 50/s, burst 200, ×4 |
-| per-address REQ backstop | 200/s, burst 1,000 | 200/s, burst 1,000 | 1,000/s, burst 5,000 |
-| `event_burst` per address | 100 | 300 | 500 |
-| `reject_older_than_secs` | 0 | 0 | 0 |
-| `service_url` required | warn | yes | yes |
-| NIP-11 `auth_required` / `restricted_writes` | false / false | false / true | true / true |
+| Setting | public | marmot |
+|---|---|---|
+| `read_policy` / `write_policy` | open / open | open / open |
+| `accepted_kinds` | all | Marmot set |
+| `max_event_size` | 1 MiB | 4 MiB |
+| `max_websocket_payload_size` | 2 MiB | 8 MiB |
+| `max_filter_limit` | 2,000 | 5,000 |
+| `recipient_only_kinds` | 4, 1059, 21059 | 4, 1059, 21059 |
+| `owner_only_kinds` | 78, 30078 | 78, 30078 |
+| `require_scoped_filters` | off | on |
+| per-connection REQ | 20/s, burst 100 | 50/s, burst 300 |
+| per-connection NEG-MSG | 50/s, burst 200 | 50/s, burst 500 |
+| per-address REQ backstop | 200/s, burst 1,000 | 200/s, burst 1,000 |
+| `event_burst` per address | 100 | 300 |
+| `reject_older_than_secs` | 0 | 0 |
+| `service_url` required | warn | yes |
+| NIP-11 `auth_required` / `restricted_writes` | false / false | false / true |
 
 ## 5. Explaining the knobs
 
@@ -793,7 +800,7 @@ scenario (`wok-bench --scenario clients`) based on the audit's W1–W10:
   - A NIP-77 pass per group at startup, for G in 10, 50 and 100.
   - Directory batches of 200 authors with explicit limits.
   - Add-member bursts of one commit plus N Welcomes, for N in 10, 100 and 250.
-  - Record the largest Welcome and commit sizes; they set the app preset's
+  - Record the largest Welcome and commit sizes; they set the marmot preset's
     `max_event_size`.
   - MDK refuses loopback relays unless `allow_loopback_relay_endpoints` is
     set.
@@ -865,7 +872,7 @@ the reviewer sees each default next to its mechanism.
    - Translate the old keys with deprecation warnings.
    - Add `require_scoped_filters` (F13).
    - NIP-11 `auth_required`, `restricted_writes` and `max_subid_length`.
-   - Add the `app` and `private` presets.
+   - Add the `marmot` preset.
    - Privacy and access tests on a `members` relay:
      - a gift wrap or 21059 from a throwaway key, `p`-tagged to a member, is
        accepted;
@@ -881,42 +888,40 @@ the reviewer sees each default next to its mechanism.
    - the runtime `max_scan_entries_per_req` (after NIP-67, C1);
    - complete replaceable fetches (after the C6 planner fix);
    - per-group and per-recipient quotas;
-   - per-kind retention for the app preset.
+   - per-kind retention for the marmot preset;
+   - further presets, starting with `private` (§4.3).
 
-Steps 3–6 can be reordered. Step 7 must come before the `app` and `private`
-presets ship.
+Steps 3–6 can be reordered. Step 7 must come before the `marmot` preset
+ships.
 
-## 8. Decisions for the owner
+## 8. Decisions
 
-1. **Lower `created_at` bound:**
-   - *Recommended:* off by default, with an operator-set bound that always
-     exempts replaceable, addressable, 5 and 62.
-   - *Alternative:* keep 3 years with the exemptions.
-2. **NIP-78 owner-only reads in the public default:**
-   - *Recommended:* yes. Current NIP-78 says relays SHOULD restrict 78 and
-     30078 to their owner, but apps that publish public data in 30078 would
-     stop being readable by others.
-   - *Alternative:* restrict them only in the app and private presets.
-3. **App preset writes:**
-   - *Recommended:* open, which keeps group membership unlinkable at the relay
-     and relies on per-address limits.
-   - *Alternative:* `authenticated`, which gives per-identity limits but
-     links identities to groups.
-4. **App preset scope:**
-   - *Recommended:* `accepted_kinds` limited to the Marmot set, a narrow relay.
-   - *Alternative:* a general relay with Marmot tuning.
-5. **Key names:**
-   - *Recommended:* keep the current names, add new keys, and translate only
-     the access keys.
-   - *Alternative:* a full regrouping by concern, with a one-shot rewrite
-     command.
-6. **Preset versioning:**
+### Decided (2026-10-20)
+
+1. **Preset names:** `public` (the default) and `marmot`. The Marmot preset
+   is named for what it is, not for a generic "app relay". Other setups,
+   such as `private`, become presets later.
+2. **Lower `created_at` bound:** off by default. An operator-set bound
+   always exempts replaceable, addressable, 5 and 62.
+3. **NIP-78:** kinds 78 and 30078 are owner-only in the public default, as
+   current NIP-78 recommends. Apps that publish public data in 30078 will no
+   longer be readable by others on Wok.
+4. **Marmot preset writes:** open. Group membership stays unlinkable at the
+   relay, and abuse control relies on per-connection and per-address limits.
+5. **Marmot preset scope:** `accepted_kinds` is limited to the Marmot set,
+   so it is a narrow relay rather than a general one with Marmot tuning.
+6. **Key names:** keep the current names, add new keys, and translate only
+   the access keys.
+
+### Open
+
+7. **Preset versioning:**
    - *Recommended:* presets follow releases, with release notes.
    - *Alternative:* `preset = "public@0.8"` pins.
-7. **Cost-refusal prefix:**
+8. **Cost-refusal prefix:**
    - *Recommended:* `blocked:`.
    - *Alternative:* `error:`. Both tell clients that a retry won't help.
-8. **`default_limit` and `max_limit`:**
+9. **`default_limit` and `max_limit`:**
    - *Recommended:* keep one knob at 2,000, so filters without a `limit`
      (common in outbox metadata fetches) are not cut.
    - *Alternative:* split them, with `default_limit = 500` for filters

@@ -251,10 +251,10 @@ const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The relay's OS threads, shared by every `RelayHandle` clone.
 ///
-/// The threads own the only `Env` clones `start` makes. LMDB closes the
-/// environment (and, on macOS, unlinks its two named POSIX semaphores) only
-/// when the last clone drops, so a process that exits with these threads
-/// still running leaks those semaphores until reboot. Explicit
+/// The threads, and this struct, own the only `Env` clones `start` makes.
+/// LMDB closes the environment (and, on macOS, unlinks its two named POSIX
+/// semaphores) only when the last clone drops, so a process that exits with
+/// these threads still running leaks those semaphores until reboot. Explicit
 /// `RelayHandle::shutdown_and_join`, or dropping the last handle, stops and
 /// joins them first.
 struct RelayThreads {
@@ -263,6 +263,13 @@ struct RelayThreads {
     ingest: Vec<tokio::sync::mpsc::Sender<IngestMsg>>,
     writer_tx: Sender<WriterMsg>,
     running: Mutex<RunningThreads>,
+    /// Released only once every thread is joined. A thread that read from
+    /// LMDB clears its reader slot, in the environment's lock-file mapping,
+    /// from a thread-local destructor after its closure returns. Were the
+    /// last clone dropped by one exiting thread while another was still in
+    /// that destructor, the close would unmap the slot under it (SIGSEGV).
+    /// Joining waits for thread-local destructors.
+    env: Mutex<Option<Env>>,
 }
 
 #[derive(Default)]
@@ -295,6 +302,7 @@ impl RelayThreads {
         running.ingesters = ingesters;
         running.workers = workers;
         if running.ingesters.is_empty() && running.workers.is_empty() {
+            drop(self.env.lock().take());
             return Ok(());
         }
         let names: Vec<_> = running
@@ -1038,6 +1046,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
             ingest: ingest_txs.clone(),
             writer_tx: writer_tx.clone(),
             running: Mutex::new(RunningThreads::default()),
+            env: Mutex::new(Some(env.clone())),
         }),
     };
     // Registered as each thread spawns, for `RelayThreads::stop_and_join`.

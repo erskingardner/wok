@@ -125,6 +125,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A deletion request against a deletion request has no effect, as NIP-09
   requires. Before, a kind 5 deleting an earlier kind 5 removed it with its
   tombstone, and the originally deleted event could be published again.
+- A kind 22242 AUTH event sent with EVENT is refused with
+  `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
+  to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.
 
 ## [0.7.0] - 2026-09-08
 

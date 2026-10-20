@@ -329,6 +329,46 @@ fn nip42_auth_kind() {
     assert_eq!(wok_event::AUTH_KIND, 22242);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip42_auth_events_sent_as_event_are_never_stored_or_broadcast() {
+    // "Relays MUST exclude kind: 22242 events from being broadcasted to any
+    // client." Covers both ephemeral modes, since `ttl` would also store it.
+    for persistence in [
+        wok_relay::EphemeralPersistence::LiveOnly,
+        wok_relay::EphemeralPersistence::Ttl,
+    ] {
+        let relay = Relay::new(|cfg| cfg.events.ephemeral_persistence = persistence);
+        let mut by_kind = relay.connect().await;
+        by_kind.subscribe("auth", json!({"kinds": [22242]})).await;
+        let mut everything = relay.connect().await;
+        everything.subscribe("everything", json!({})).await;
+
+        let mut publisher = relay.connect().await;
+        let auth = sign_event(json!({
+            "created_at": now(),
+            "kind": 22242,
+            "tags": [["relay", AUTH_RELAY], ["challenge", "replayed"]],
+            "content": "",
+        }));
+        let reply = publisher.publish(&auth).await;
+        assert_eq!(
+            reply,
+            json!([
+                "OK",
+                auth["id"],
+                false,
+                "invalid: AUTH events must be sent with AUTH"
+            ])
+        );
+        assert_eq!(by_kind.try_recv().await, None, "{persistence:?}");
+        assert_eq!(everything.try_recv().await, None, "{persistence:?}");
+        assert!(publisher
+            .history(json!({"ids": [auth["id"]]}))
+            .await
+            .is_empty());
+    }
+}
+
 #[test]
 fn nip45_count_encoding() {
     let s = RelayMessage::Count {

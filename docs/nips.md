@@ -14,7 +14,7 @@ arbitrary list.
 | 11 | Relay information | `wok-ws` | `nip_conformance.rs` | always |
 | 13 | Proof of work | leading-zero validation + NIP-11 minimum | relay tests | `relay.abuse.enabled` and `min_pow_difficulty > 0` |
 | 40 | Expiration | packed expiration + cron | `nip_conformance.rs` | always |
-| 42 | AUTH | ingest AUTH, multiple authenticated keys per connection | unit + multi-key e2e when serviceUrl set | AUTH enabled and serviceUrl set |
+| 42 | AUTH | ingest AUTH, multiple authenticated keys per connection, kind 22242 refused as EVENT and never broadcast | unit + multi-key e2e when serviceUrl set, `nip_conformance.rs` | AUTH enabled and serviceUrl set |
 | 45 | COUNT + mergeable HyperLogLog | REQ worker + `wok-query` HLL | `nip_conformance.rs`, `e2e_transports.rs`, HLL unit vectors | `maxFilterLimitCount > 0` |
 | 50 | Search capability | transactional LMDB term/bigram index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs` | always |
 | 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, restricted kinds 1059 and 21059 with involved-pubkey enforcement, and `events.ephemeral_persistence = "live_only"` |

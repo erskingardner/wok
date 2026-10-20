@@ -1755,6 +1755,20 @@ fn ingest_event(
         kind = packed.kind(),
         "validated inbound event"
     );
+    // NIP-42: relays MUST exclude kind 22242 from broadcast. One sent as an
+    // EVENT is neither stored nor delivered to any subscription.
+    if packed.kind() == AUTH_KIND {
+        conns.send(
+            conn_id,
+            RelayMessage::Ok {
+                event_id: id_hex,
+                accepted: false,
+                message: "invalid: AUTH events must be sent with AUTH".into(),
+            },
+            metrics,
+        );
+        return;
+    }
     let is_vanish_request = packed.kind() == VANISH_KIND;
     {
         let snap = moderation.read();

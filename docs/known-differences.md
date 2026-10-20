@@ -153,3 +153,7 @@ regression test. Differential parity alone is not a reason to retain it.
   alongside kinds 4 and 1059, and NIP-59 is advertised only while both
   gift-wrap kinds are restricted. The previous default let any
   unauthenticated subscriber receive wraps addressed to someone else.
+- NIP-42: a kind 22242 event sent as EVENT is refused with
+  `invalid: AUTH events must be sent with AUTH`, and is neither stored nor
+  broadcast. The pinned strfry accepts it like any ephemeral event and
+  delivers it to matching subscriptions, which NIP-42 forbids.

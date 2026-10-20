@@ -1,7 +1,7 @@
 # Limits, defaults and configuration presets: proposal
 
-Status: **proposal**. The owner's decisions are recorded in §8, and three
-questions remain open. No code has changed. Written on 2026-10-20 against
+Status: **approved plan**. The owner's decisions are recorded in §8. No code
+has changed yet. Written on 2026-10-20 against
 `ef4650c` (0.7.0).
 
 This builds on the 2026-10-20 NIP compliance and client-workload audit, which
@@ -894,9 +894,7 @@ the reviewer sees each default next to its mechanism.
 Steps 3–6 can be reordered. Step 7 must come before the `marmot` preset
 ships.
 
-## 8. Decisions
-
-### Decided (2026-10-20)
+## 8. Decisions (2026-10-20)
 
 1. **Preset names:** `public` (the default) and `marmot`. The Marmot preset
    is named for what it is, not for a generic "app relay". Other setups,
@@ -913,20 +911,14 @@ ships.
 6. **Key names:** keep the current names, add new keys, and translate only
    the access keys.
 
-### Open
-
-7. **Preset versioning:**
-   - *Recommended:* presets follow releases, with release notes.
-   - *Alternative:* `preset = "public@0.8"` pins.
-8. **Cost-refusal prefix:**
-   - *Recommended:* `blocked:`.
-   - *Alternative:* `error:`. Both tell clients that a retry won't help.
-9. **`default_limit` and `max_limit`:**
-   - *Recommended:* keep one knob at 2,000, so filters without a `limit`
-     (common in outbox metadata fetches) are not cut.
-   - *Alternative:* split them, with `default_limit = 500` for filters
-     without a `limit` and `max_limit = 2000` for the clamp. That saves
-     bandwidth on lazy broad queries, but cuts those fetches at 500.
+7. **Preset versioning:** presets follow releases. Every change to a
+   preset value is listed in the release notes under "Preset changes".
+   There are no `preset = "public@0.8"` pins.
+8. **Cost-refusal prefix:** `blocked:`, which tells clients that resending
+   the same request won't help.
+9. **`default_limit` and `max_limit`:** one knob, `max_filter_limit = 2000`,
+   drives both. Filters without a `limit`, which are common in outbox
+   metadata fetches, are not cut.
 
 ## Appendix: hard-coded limits
 

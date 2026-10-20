@@ -145,7 +145,8 @@ Correctness still decides `ok`, as in every other scenario:
   plus only 445s published into that group.
 
 `--expect-no-refusals` also fails the trial on any refusal. That flag is the
-acceptance check for proposed defaults (docs/config-presets-proposal.md §6).
+acceptance check for proposed defaults
+([configuration presets proposal](config-presets-proposal.md) §6, PR #89).
 
 ```bash
 cargo build --release -p wok-cli -p wok-bench

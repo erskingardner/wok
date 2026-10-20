@@ -44,8 +44,8 @@ the keys it changes; [presets/](presets/) has a copy of each.
 |---|---|
 | `public` | A general public relay. Its values are the built-in defaults, so its overlay is empty. |
 
-Further presets, starting with `marmot`, and the planned default changes are
-described in [config-presets-proposal.md](config-presets-proposal.md).
+Further presets, starting with `marmot`, are planned; see
+[#97](https://github.com/erskingardner/wok/issues/97).
 
 `wok config show` prints the effective configuration, one dotted key per line,
 with the origin of each value: `default`, `preset <name>`, or the file and

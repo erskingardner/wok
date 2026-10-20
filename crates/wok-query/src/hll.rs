@@ -62,7 +62,8 @@ pub fn offset_for_filter(filter: &NostrFilter) -> Option<usize> {
     if values.size() != 1 {
         return None;
     }
-    let value = values.at(0);
+    // NIP-45 derives the offset from the value as sent, not its indexed form.
+    let value = values.original(0);
     let seed: [u8; 32] = if matches!(tag, 'e' | 'p') {
         value.try_into().ok()?
     } else if value.len() == 64 {
@@ -109,6 +110,19 @@ mod tests {
         let seed = wok_event::sha256(b"arbitrary-target");
         assert_eq!(
             offset_for_filter(&filter(json!({"#t":["arbitrary-target"]}))),
+            Some(usize::from(seed[16] >> 4) + 8)
+        );
+
+        // Values too long to index as is still use the value as sent.
+        let long_address = format!("30023:{pubkey}:{}", "z".repeat(300));
+        assert_eq!(
+            offset_for_filter(&filter(json!({"#a":[long_address]}))),
+            Some(18)
+        );
+        let long = "z".repeat(300);
+        let seed = wok_event::sha256(long.as_bytes());
+        assert_eq!(
+            offset_for_filter(&filter(json!({"#r":[long]}))),
             Some(usize::from(seed[16] >> 4) + 8)
         );
     }

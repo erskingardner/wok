@@ -81,7 +81,9 @@ it is not a promise to reproduce upstream bugs.
   affect migrated stored bytes, so they cannot be casually changed.
 - The initial Wok v4 database retains the v3 PackedEvent, payload, index, and
   negentropy layouts. This makes the first migration lossless, but is not a
-  commitment that later Wok versions retain those internal layouts.
+  commitment that later Wok versions retain those internal layouts. Wok now
+  also packs single-letter tag values longer than 255 bytes, by hash, where v3
+  drops them; shorter values pack exactly as in v3.
 
 Each correction cites a pinned NIP or a Wok safety requirement and adds a
 regression test. Differential parity alone is not a reason to retain it.
@@ -132,12 +134,17 @@ regression test. Differential parity alone is not a reason to retain it.
   clients that publish and hang up at once. An EVENT still parked in an
   ingester because the writer queue is full is dropped when its connection
   closes, which keeps memory bounded under writer backpressure.
-- NIP-01 addresses: an addressable event whose first `d` tag is longer than
-  255 bytes, and a kind 5 `a` tag longer than 255 bytes, are refused with
-  `invalid:`. Such values are not indexed. The pinned strfry keys that event
-  by its virtual empty `d` (or a later short `d`), so distinct addresses
-  replace one another, and it never matches that deletion against its target.
-  Indexing a hash of long values would lift this limit.
+- NIP-01 tag filters and addresses: single-letter tag values longer than 255
+  bytes are packed and indexed as a marker byte and their SHA-256, so `#x`
+  filters match them, an addressable event whose first `d` tag is that long
+  has its own address, and a kind 5 `a` tag that long deletes and tombstones
+  its target. An addressable event whose `a` tag would exceed
+  `events.max_tag_val_size` is refused with `invalid:`, so every stored
+  address can be named by an `a` tag. The pinned strfry drops such values: it keys that event by its
+  virtual empty `d` (or a later short `d`), so distinct addresses replace one
+  another, never matches that deletion against its target, and refuses such
+  filters. Records migrated from strfry or stored by earlier Wok releases keep
+  their packing, so these limits remain for them (see `lmdb-v3.md`).
 - NIP-01 kind ranges: kind 41 (NIP-28 channel metadata) is regular. The pinned
   strfry treats it as replaceable per author, so metadata for a second channel
   deleted the first channel's. Migrated kind 41 history stays stored and

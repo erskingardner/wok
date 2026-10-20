@@ -511,6 +511,28 @@ async fn long_d_tags_keep_distinct_addresses() {
     let ok = publish(&mut wire, &stale).await;
     assert_eq!(ok[2], false, "{ok}");
     assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+
+    // Every stored address fits the a tag that names it: `30000:`, 64 hex
+    // digits and `:` leave max_tag_val_size - 71 bytes for d.
+    let max = EventLimits::default().max_tag_val_size;
+    for len in [max - 70, max] {
+        let unnamed = event(&key, 30000, 500, json!([["d", "z".repeat(len)]]), "");
+        let ok = publish(&mut wire, &unnamed).await;
+        assert_eq!(ok[2], false, "{ok}");
+        assert!(ok[3].as_str().unwrap().starts_with("invalid:"), "{ok}");
+    }
+    let d_max = "z".repeat(max - 71);
+    let longest = event(&key, 30000, 500, json!([["d", &d_max]]), "longest");
+    assert_eq!(publish(&mut wire, &longest).await[2], true);
+    let address = format!("30000:{pubkey}:{d_max}");
+    assert_eq!(address.len(), max);
+    let deletion = event(&key, 5, 600, json!([["a", &address]]), "");
+    assert_eq!(publish(&mut wire, &deletion).await[2], true);
+    assert!(
+        history(&mut wire, json!({"kinds": [30000], "#d": [&d_max]}))
+            .await
+            .is_empty()
+    );
     handle.request_shutdown();
 }
 

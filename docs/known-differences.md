@@ -138,7 +138,9 @@ regression test. Differential parity alone is not a reason to retain it.
   bytes are packed and indexed as a marker byte and their SHA-256, so `#x`
   filters match them, an addressable event whose first `d` tag is that long
   has its own address, and a kind 5 `a` tag that long deletes and tombstones
-  its target. The pinned strfry drops such values: it keys that event by its
+  its target. An addressable event whose `a` tag would exceed
+  `events.max_tag_val_size` is refused with `invalid:`, so every stored
+  address can be named by an `a` tag. The pinned strfry drops such values: it keys that event by its
   virtual empty `d` (or a later short `d`), so distinct addresses replace one
   another, never matches that deletion against its target, and refuses such
   filters. Records migrated from strfry or stored by earlier Wok releases keep

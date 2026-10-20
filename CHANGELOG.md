@@ -117,8 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was that long was keyed by an empty `d` and distinct addresses replaced one
   another (`d=""`, a 300-byte `d` and a 301-byte `d`), a kind 5 `a` tag that
   long never deleted its target, and `#x` filters for such values were
-  refused. Events stored by earlier releases or migrated from strfry keep
-  their packing, so filters still cannot match their long values.
+  refused. An addressable event is refused with `invalid:` when the `a` tag
+  naming it would exceed `events.max_tag_val_size`, so every stored address
+  can still be deleted by `a` tag. Events stored by earlier releases or
+  migrated from strfry keep their packing, so filters still cannot match
+  their long values.
 - Kind 41 (NIP-28 channel metadata) is a regular event, as NIP-01 makes every
   kind from 4 to 44. It was replaced per author, so metadata for a second
   channel deleted the first channel's. Migrated kind 41 history becomes

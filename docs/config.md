@@ -72,8 +72,11 @@ All event settings reload live and are available in the dashboard.
 Single-letter tag values longer than 255 bytes are indexed by their SHA-256,
 so up to `max_tag_val_size` a `#x` filter matches them, an addressable event
 whose first `d` tag is that long keeps its own address, and a kind 5 `a` tag
-that long deletes its target. Records stored by earlier Wok releases or
-migrated from strfry lack such values in their indexes; see
+that long deletes its target. An addressable event is refused with `invalid:`
+when the `a` tag naming it (`kind:pubkey:d`) would exceed `max_tag_val_size`,
+so its first `d` is at most `max_tag_val_size` minus 71 bytes and every stored
+address can be referenced and deleted. Records stored by earlier Wok releases
+or migrated from strfry lack long values in their indexes; see
 [lmdb-v3.md](lmdb-v3.md#packedevent).
 
 The 1 MiB event ceiling accommodates bounded extended-length NIP-44 payloads,

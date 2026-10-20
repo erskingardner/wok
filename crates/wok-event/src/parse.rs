@@ -165,6 +165,7 @@ pub fn nostr_json_to_packed_event(
 
     let mut tag_builder = PackedEventTagBuilder::default();
     let mut expiration = 0u64;
+    let mut address_d_seen = !is_param_replaceable_kind(kind);
 
     if is_replaceable_kind(kind) {
         // Prepend virtual d-tag. Any later d-tags will be ignored during indexing.
@@ -201,6 +202,17 @@ pub fn nostr_json_to_packed_event(
                     "tag val too large: {}",
                     tag_val.len()
                 )));
+            }
+            // An address must fit the a tag that names it, `kind:pubkey:d`,
+            // under the same limit, or no event could reference or delete it.
+            if tag_name == "d" && !address_d_seen {
+                address_d_seen = true;
+                let a_tag_len = kind.to_string().len() + 1 + 64 + 1 + tag_val.len();
+                if a_tag_len > limits.max_tag_val_size {
+                    return Err(EventError::msg(format!(
+                        "d tag too large: its a tag would be {a_tag_len} bytes"
+                    )));
+                }
             }
             if tag_name == "e" || tag_name == "p" {
                 if tag_val.len() != 64 {
@@ -404,7 +416,32 @@ mod tests {
         assert_eq!((tags[0].name, &tags[0].value), ('r', &hashed));
         assert_eq!((tags[1].name, &tags[1].value[..]), ('t', &b"short"[..]));
 
+        // An address must fit the a tag that names it: `30000:` plus 64 hex
+        // digits and `:` leave max_tag_val_size - 71 bytes for the first d.
+        let limits = EventLimits::default();
+        let fits = "z".repeat(limits.max_tag_val_size - 71);
+        let too_long = "z".repeat(limits.max_tag_val_size - 70);
+        let packed = pack(30000, json!([["d", fits]]));
+        assert_eq!(
+            packed.view().first_d_tag().unwrap(),
+            indexed_tag_value(fits.as_bytes()).into_owned()
+        );
+        for tags in [
+            json!([["d", too_long]]),
+            json!([["d", "z".repeat(limits.max_tag_val_size)]]),
+        ] {
+            assert!(nostr_json_to_packed_event(&event(30000, tags), &limits).is_err());
+        }
+        // Only the address is held to that: later d tags and other kinds are
+        // not named by an a tag.
+        pack(30000, json!([["d", "short"], ["d", too_long]]));
+        pack(1, json!([["d", too_long]]));
+        pack(10002, json!([["d", too_long]]));
+
         let pubkey = "22".repeat(32);
+        let deletion = format!("30000:{pubkey}:{fits}");
+        assert_eq!(deletion.len(), limits.max_tag_val_size);
+        pack(5, json!([["a", deletion]]));
         let address = format!("30000:{pubkey}:{long}");
         let packed = pack(5, json!([["a", address]]));
         assert_eq!(

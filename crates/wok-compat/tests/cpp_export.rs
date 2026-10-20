@@ -121,7 +121,7 @@ fn cpp_write_rust_read_query() {
         "content": "from-cpp",
     }));
     strfry_import(&conf, std::slice::from_ref(&ev));
-    let env = Env::open(db, EnvOptions::default()).unwrap();
+    let env = Env::open(db, EnvOptions::for_tests()).unwrap();
     assert_eq!(env.db_version().unwrap(), 3);
     let txn = env.begin_ro().unwrap();
     let mut decomp = Decompressor::new();
@@ -225,7 +225,7 @@ fn strfry_v3_database_is_read_only_to_wok() {
         "content": "cpp-a",
     }));
     strfry_import(&conf, &[a]);
-    let env = Env::open(db, EnvOptions::default()).unwrap();
+    let env = Env::open(db, EnvOptions::for_tests()).unwrap();
     let error = match env.begin_rw() {
         Ok(_) => panic!("Wok unexpectedly opened a write transaction on strfry v3"),
         Err(error) => error,

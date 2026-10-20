@@ -2,8 +2,9 @@
 
 Wok uses strict TOML configuration. Copy [wok.toml](wok.toml), or start with
 the file produced by `wok migrate strfry`. Omitted settings inherit the
-defaults below; unknown keys, wrong types, invalid admin URLs, invalid log
-filters, and out-of-range history settings are rejected.
+selected [preset](#preset), whose values are the defaults below; unknown keys,
+unknown preset names, wrong types, invalid admin URLs, invalid log filters,
+and out-of-range history settings are rejected.
 
 The legacy HOCON-subset reader is used only for explicit strfry migration.
 It accepts named objects, arrays, and anonymous object blocks inside arrays
@@ -27,6 +28,42 @@ NIP-62, and local history. Database/listener/thread/socket settings are omitted
 because they require restart. Admin credentials, proxy trust, authentication
 policy, external plugin paths, and diagnostic logging switches remain
 file-only to avoid remote self-lockout or security-boundary changes.
+
+## Preset
+
+| Key | Default | Reload | Dashboard | Meaning |
+|---|---:|---|---|---|
+| `preset` | `public` | Live | No | Named set of defaults this file overlays. |
+
+Settings resolve in three layers: the built-in defaults, then the preset's
+overlay, then this file. Each layer replaces individual keys, not whole
+sections. A preset ships in the binary as a small TOML overlay containing only
+the keys it changes; [presets/](presets/) has a copy of each.
+
+| Preset | Use |
+|---|---|
+| `public` | A general public relay. Its values are the built-in defaults, so its overlay is empty. |
+
+Further presets, starting with `marmot`, are planned; see
+[#97](https://github.com/erskingardner/wok/issues/97).
+
+`wok config show` prints the effective configuration, one dotted key per line,
+with the origin of each value: `default`, `preset <name>`, or the file and
+line that set it. When the file sets a value other than the preset's, the
+preset's value follows in parentheses. `wok config show --overrides` prints
+only those keys. The output is itself valid TOML.
+
+```text
+preset = "public"                                      # wok.toml:1
+relay.abuse.event_burst = 500                          # wok.toml:11 (preset public: 100)
+relay.auth.service_url = "wss://relay.example.com"     # wok.toml:8 (preset public: "")
+relay.bind = "127.0.0.1"                               # default
+```
+
+Changing `preset` on reload is allowed. The reload log names the preset change,
+and every resulting security-scope change is warn-logged like any other
+reload. Restart settings keep their startup values. Dashboard saves keep the
+file's `preset`.
 
 ## Admin
 

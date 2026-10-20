@@ -18,7 +18,7 @@ pub use capabilities::{
     relay_capabilities, supported_nips, CapabilityCondition, RelayCapability,
     RELAY_CAPABILITY_CATALOG,
 };
-pub use config::{Config, EphemeralPersistence, StrfryConfigTranslation};
+pub use config::{Config, EphemeralPersistence, Preset, StrfryConfigTranslation};
 pub use moderation::{management_level, write_permitted, ManagementCmd, ManagementLevel, Role};
 pub use protocol::{ClientCommand, RelayMessage};
 pub use rlimit::apply_nofiles_limit;

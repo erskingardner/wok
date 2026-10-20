@@ -74,6 +74,10 @@ max_filter_limit_count = 1000000
 # Zero means unlimited.
 max_total_events_per_req = 2000
 max_subs_per_connection = 200
+# Per subscription: live matches held while its history is sent. Past it,
+# stored events are re-read from the database and the oldest ephemeral events
+# are dropped. Zero means unlimited.
+max_live_buffer_bytes = 262144
 max_pending_outbound_bytes = 33554432
 # Executable path; empty disables the external write-policy plugin.
 write_policy_plugin = ""

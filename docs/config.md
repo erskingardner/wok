@@ -115,7 +115,8 @@ interface or protect the path at the reverse proxy.
 | `relay.max_and_entries` | `16` | Live | Yes | Maximum distinct values across all NIP-91 `&` query keys in one filter; zero disables NIP-91 and removes it from NIP-11. |
 | `relay.max_filter_limit_count` | `1000000` | Live | Yes | Maximum COUNT filter limit. |
 | `relay.max_total_events_per_req` | `2000` | Live | Yes | Deduplicated historical events across a REQ; zero is unlimited. |
-| `relay.max_subs_per_connection` | `200` | Live | Yes | Simultaneous subscriptions per connection. |
+| `relay.max_subs_per_connection` | `200` | Live | Yes | Simultaneous subscriptions per connection, counting those still sending history. A REQ over it gets `CLOSED`; reusing an open id is always allowed. |
+| `relay.max_live_buffer_bytes` | `262144` | Live (new subscriptions) | No | Live matches held for one subscription while its history is sent, before EOSE. Past it, stored events are re-read from the database after the history, and the oldest ephemeral events are dropped (`wok_live_buffer_dropped_ephemeral_total`). Zero is unlimited. |
 | `relay.max_pending_outbound_bytes` | `33554432` | Live (new connections) | Yes | Pending output budget before slow-client disconnect. |
 | `relay.write_policy_plugin` | empty | Live | No | External executable for publication decisions; empty disables it. |
 | `relay.write_policy_timeout_secs` | `10` | Live | Yes | Maximum wait for the configured write-policy plugin. |

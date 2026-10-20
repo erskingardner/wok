@@ -3,8 +3,9 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wok_db::{
-    bump_negentropy_mod_counter, check_integrity, event_fingerprint, foreach_negentropy_filter,
-    rebuild_primary_and_event_indices, Env, EnvOptions,
+    bump_negentropy_mod_counter, check_integrity, event_fingerprint,
+    event_fingerprint_without_hashed_tag_values, foreach_negentropy_filter,
+    rebuild_primary_and_event_indices, Env, EnvOptions, PackedEventRebuild,
 };
 use wok_relay::Config;
 
@@ -17,6 +18,10 @@ pub struct ReindexOutcome {
     pub index_entries: u64,
     pub negentropy_trees: u64,
     pub negentropy_items: u64,
+    pub repacked_long_tag_records: u64,
+    pub skipped_long_tag_records: u64,
+    /// Fingerprint of the original database, which is kept as the backup.
+    pub source_event_fingerprint_sha256: String,
     pub event_fingerprint_sha256: String,
 }
 
@@ -31,6 +36,9 @@ struct ReindexManifest {
     index_entries: u64,
     negentropy_trees: u64,
     negentropy_items: u64,
+    repacked_long_tag_records: u64,
+    skipped_long_tag_records: u64,
+    source_event_fingerprint_sha256: String,
     event_fingerprint_sha256: String,
 }
 
@@ -73,6 +81,7 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
     ensure_reindexable(&source_integrity)?;
     validate_primary_payloads(&source, cfg.events.max_event_size)?;
     let before = event_fingerprint(&source)?;
+    let before_unhashed = event_fingerprint_without_hashed_tag_values(&source)?;
 
     let staging = tempfile::Builder::new()
         .prefix(".wok-reindex-")
@@ -92,7 +101,11 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
     let stats = {
         let source_txn = source.begin_ro()?;
         let mut target_txn = target.begin_rw()?;
-        let stats = rebuild_primary_and_event_indices(&source_txn, &mut target_txn)?;
+        let stats = rebuild_primary_and_event_indices(
+            &source_txn,
+            &mut target_txn,
+            PackedEventRebuild::RepackLongTags,
+        )?;
         target_txn.commit()?;
         stats
     };
@@ -102,11 +115,15 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
     if !target_integrity.ok() {
         bail!("staged database failed integrity verification: {target_integrity:#?}");
     }
+    // Repacking only adds hashed tag values to records that dropped them.
     let after = event_fingerprint(&target)?;
-    if before != after {
+    if event_fingerprint_without_hashed_tag_values(&target)? != before_unhashed
+        || (stats.repacked_long_tag_records == 0 && before != after)
+    {
         bail!("event fingerprint changed while rebuilding indexes");
     }
 
+    let source_fingerprint = hex::encode(before.sha256);
     let fingerprint = hex::encode(after.sha256);
     let manifest = ReindexManifest {
         format_version: 1,
@@ -121,6 +138,9 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
         index_entries: stats.index_entries,
         negentropy_trees,
         negentropy_items,
+        repacked_long_tag_records: stats.repacked_long_tag_records,
+        skipped_long_tag_records: stats.skipped_long_tag_records,
+        source_event_fingerprint_sha256: source_fingerprint.clone(),
         event_fingerprint_sha256: fingerprint.clone(),
     };
     std::fs::write(
@@ -153,7 +173,7 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
 
     let promoted = Env::open(&database, options).context("open promoted database")?;
     let promoted_integrity = check_integrity(&promoted.begin_ro()?)?;
-    if !promoted_integrity.ok() || event_fingerprint(&promoted)? != before {
+    if !promoted_integrity.ok() || event_fingerprint(&promoted)? != after {
         bail!(
             "promoted database verification failed; original database is preserved at {}",
             backup.display()
@@ -168,6 +188,9 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
         index_entries: stats.index_entries,
         negentropy_trees,
         negentropy_items,
+        repacked_long_tag_records: stats.repacked_long_tag_records,
+        skipped_long_tag_records: stats.skipped_long_tag_records,
+        source_event_fingerprint_sha256: source_fingerprint,
         event_fingerprint_sha256: fingerprint,
     })
 }
@@ -251,54 +274,68 @@ fn validate_primary_payloads(env: &Env, max_event_size: usize) -> Result<()> {
 }
 
 fn rebuild_negentropy(env: &Env) -> Result<(u64, u64)> {
-    let filters = {
+    // A tree holds every stored record its filter matches, as the writer and
+    // `wok negentropy build` keep it; reads apply visibility (superseded,
+    // expired, vanished or moderated records) on top.
+    let mut trees = {
         let txn = env.begin_ro()?;
         let mut filters = Vec::new();
         foreach_negentropy_filter(&txn, |id, filter| {
             filters.push((id, filter.to_string()));
             true
         })?;
-        filters
-    };
-    let mut total_items = 0u64;
-    for (tree_id, filter) in &filters {
-        let records = {
-            let txn = env.begin_ro()?;
-            let filter: serde_json::Value = serde_json::from_str(filter)?;
-            let mut records = Vec::new();
-            wok_query::foreach_by_filter(
-                &txn,
-                &filter,
-                u64::MAX,
-                usize::MAX,
-                usize::MAX,
-                |lev_id| {
-                    if let Ok(Some(packed)) = wok_db::get_packed_ro(&txn, lev_id) {
-                        if let Ok(packed) = wok_event::PackedEventView::new(&packed) {
+        let mut trees = Vec::with_capacity(filters.len());
+        for (tree_id, filter) in filters {
+            let filter: serde_json::Value = serde_json::from_str(&filter)?;
+            let filter =
+                wok_query::NostrFilterGroup::from_value(&filter, u64::MAX, usize::MAX, usize::MAX)?;
+            trees.push((tree_id, filter, Vec::new()));
+        }
+        let mut error = None;
+        wok_db::foreach_event_from(
+            &txn,
+            0,
+            |lev_id, packed| match wok_event::PackedEventView::new(packed) {
+                Ok(packed) => {
+                    for (_, filter, records) in &mut trees {
+                        if filter.does_match(packed) {
                             records.push((packed.created_at(), packed.id().to_vec()));
                         }
                     }
-                },
-            )?;
-            records
-        };
+                    true
+                }
+                Err(err) => {
+                    error = Some(anyhow::anyhow!("levId {lev_id}: {err}"));
+                    false
+                }
+            },
+        )?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        trees
+    };
+    let mut total_items = 0u64;
+    for (tree_id, _, records) in &mut trees {
         let mut txn = env.begin_rw()?;
         {
             let mut tree = wok_negentropy::open_rw(&mut txn, *tree_id)?;
-            for (timestamp, id) in &records {
+            for (timestamp, id) in records.iter() {
                 tree.insert(*timestamp, id)?;
             }
             tree.backend.flush()?;
         }
         txn.commit()?;
         total_items = total_items.saturating_add(records.len() as u64);
+        records.clear();
+        records.shrink_to_fit();
     }
-    if !filters.is_empty() {
+    if !trees.is_empty() {
         let mut txn = env.begin_rw()?;
         bump_negentropy_mod_counter(&mut txn)?;
         txn.commit()?;
     }
-    Ok((filters.len() as u64, total_items))
+    Ok((trees.len() as u64, total_items))
 }
 
 fn default_backup_path(database: &Path) -> Result<PathBuf> {
@@ -333,24 +370,191 @@ mod tests {
     use wok_db::{write_events, EventToWrite, NoopNegentropy};
     use wok_event::{parse_and_verify_event, EventLimits};
 
-    fn signed_event() -> (Vec<u8>, String) {
-        use secp256k1::{Keypair, SECP256K1};
-        let mut rng = rand::thread_rng();
-        let keypair = Keypair::new(SECP256K1, &mut rng);
+    fn signed(tags: serde_json::Value, content: &str) -> (Vec<u8>, String) {
+        let keypair = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+        signed_by(&keypair, 1, 1_700_000_000, tags, content)
+    }
+
+    fn signed_by(
+        keypair: &secp256k1::Keypair,
+        kind: u64,
+        created_at: u64,
+        tags: serde_json::Value,
+        content: &str,
+    ) -> (Vec<u8>, String) {
+        use secp256k1::SECP256K1;
         let (pubkey, _) = keypair.x_only_public_key();
         let mut event = json!({
-            "created_at": 1_700_000_000u64,
-            "kind": 1,
-            "tags": [["t", "reindex"]],
-            "content": "repair me",
+            "created_at": created_at,
+            "kind": kind,
+            "tags": tags,
+            "content": content,
             "pubkey": hex::encode(pubkey.serialize()),
         });
         let id = wok_event::event_id_hash(&event).unwrap();
         event["id"] = json!(hex::encode(id));
-        event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &keypair).as_ref()));
+        event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, keypair).as_ref()));
         let parsed =
             parse_and_verify_event(&event, &EventLimits::default(), None, true, false).unwrap();
         (parsed.packed.into_bytes(), parsed.json)
+    }
+
+    fn signed_event() -> (Vec<u8>, String) {
+        signed(json!([["t", "reindex"]]), "repair me")
+    }
+
+    fn open_existing(path: &Path) -> Env {
+        Env::open(
+            path,
+            EnvOptions {
+                create_dir: false,
+                create_dbis: false,
+                ..EnvOptions::for_tests()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repacks_records_that_dropped_long_tag_values() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("db");
+        let backup = root.path().join("backup");
+        let url = format!("https://example.com/{}", "r".repeat(300));
+        let (current, current_json) = signed(json!([["r", &url]]), "current");
+        let (repacked, legacy_json) = signed(json!([["r", &url], ["t", "short"]]), "legacy");
+        // A version of a long address keyed by the empty d, and a newer one
+        // stored at its own address. Repacked, the older is superseded.
+        let author = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+        let d = "x".repeat(300);
+        let (older, older_json) =
+            signed_by(&author, 30000, 1_700_000_000, json!([["d", &d]]), "older");
+        let (newer, newer_json) =
+            signed_by(&author, 30000, 1_700_000_100, json!([["d", &d]]), "newer");
+        // What strfry and earlier Wok releases stored: the long values dropped.
+        let legacy_packing = |packed: &[u8]| {
+            let view = wok_event::PackedEventView::new(packed).unwrap();
+            let mut tags = wok_event::PackedEventTagBuilder::default();
+            for tag in view.tags() {
+                if wok_event::hashed_tag_value_digest(&tag.value).is_none() {
+                    tags.add(tag.name, &tag.value).unwrap();
+                }
+            }
+            wok_event::PackedEventBuilder::build(
+                view.id(),
+                view.pubkey(),
+                view.created_at(),
+                view.kind(),
+                view.expiration(),
+                &tags,
+            )
+            .unwrap()
+            .into_bytes()
+        };
+        let legacy = legacy_packing(&repacked);
+        let legacy_older = legacy_packing(&older);
+        let filter = json!({"#r": [&url]}).to_string();
+        {
+            let staging = tempfile::tempdir().unwrap();
+            let source = Env::open(staging.path(), EnvOptions::for_tests()).unwrap();
+            source.ensure_initialized().unwrap();
+            let mut txn = source.begin_rw().unwrap();
+            for (lev, (packed, json)) in [
+                (&legacy, &legacy_json),
+                (&current, &current_json),
+                (&legacy_older, &older_json),
+                (&newer, &newer_json),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let lev = lev as u64 + 1;
+                txn.put_u64(source.dbis().event, lev, packed, 0).unwrap();
+                txn.put_u64(
+                    source.dbis().event_payload,
+                    lev,
+                    &wok_db::encode_raw_payload(json),
+                    0,
+                )
+                .unwrap();
+            }
+            txn.commit().unwrap();
+            let env = Env::open(&database, EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut txn = env.begin_rw().unwrap();
+            rebuild_primary_and_event_indices(
+                &source.begin_ro().unwrap(),
+                &mut txn,
+                PackedEventRebuild::Copy,
+            )
+            .unwrap();
+            // Only the current record's packing matches the filtered tree.
+            assert_eq!(
+                wok_db::insert_negentropy_filter(&mut txn, &filter).unwrap(),
+                2
+            );
+            bump_negentropy_mod_counter(&mut txn).unwrap();
+            let all = vec![&legacy, &current, &legacy_older, &newer];
+            for (tree_id, records) in [(1, all), (2, vec![&current])] {
+                let mut tree = wok_negentropy::open_rw(&mut txn, tree_id).unwrap();
+                for packed in records {
+                    let packed = wok_event::PackedEventView::new(packed).unwrap();
+                    tree.insert(packed.created_at(), packed.id()).unwrap();
+                }
+                tree.backend.flush().unwrap();
+            }
+            txn.commit().unwrap();
+            let txn = env.begin_ro().unwrap();
+            let report = check_integrity(&txn).unwrap();
+            assert!(report.ok(), "{:?}", report.issues);
+            assert_eq!(report.legacy_long_tag_records, 2);
+            assert_eq!(report.superseded_events, 0);
+            assert_eq!(wok_negentropy::verify_tree(&txn, 2, &filter).unwrap(), 1);
+        }
+
+        let cfg = Config {
+            db: database.clone(),
+            ..Config::default()
+        };
+        let outcome = run(&cfg, Some(&backup), true).unwrap();
+        assert_eq!(outcome.events, 4);
+        assert_eq!(outcome.repacked_long_tag_records, 2);
+        assert_eq!(outcome.skipped_long_tag_records, 0);
+        assert_eq!((outcome.negentropy_trees, outcome.negentropy_items), (2, 6));
+
+        let original = open_existing(&backup);
+        assert_eq!(
+            outcome.source_event_fingerprint_sha256,
+            hex::encode(event_fingerprint(&original).unwrap().sha256)
+        );
+        let repaired = open_existing(&database);
+        assert_eq!(
+            outcome.event_fingerprint_sha256,
+            hex::encode(event_fingerprint(&repaired).unwrap().sha256)
+        );
+        assert_ne!(
+            outcome.event_fingerprint_sha256,
+            outcome.source_event_fingerprint_sha256
+        );
+        let txn = repaired.begin_ro().unwrap();
+        assert_eq!(wok_db::get_packed_ro(&txn, 1).unwrap().unwrap(), repacked);
+        assert_eq!(wok_db::get_packed_ro(&txn, 2).unwrap().unwrap(), current);
+        assert_eq!(wok_db::get_packed_ro(&txn, 3).unwrap().unwrap(), older);
+        let report = check_integrity(&txn).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
+        assert_eq!(report.legacy_long_tag_records, 0);
+        assert_eq!(report.superseded_events, 1);
+        assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), Some(1));
+        // Trees keep superseded history, as the writer and verification do.
+        assert_eq!(wok_negentropy::verify_tree(&txn, 1, "{}").unwrap(), 4);
+        assert_eq!(wok_negentropy::verify_tree(&txn, 2, &filter).unwrap(), 2);
+        let mut hits = Vec::new();
+        wok_query::foreach_by_filter(&txn, &json!({"#r": [&url]}), 100, 3, 16, |lev_id| {
+            hits.push(lev_id)
+        })
+        .unwrap();
+        hits.sort();
+        assert_eq!(hits, [1, 2]);
     }
 
     #[test]

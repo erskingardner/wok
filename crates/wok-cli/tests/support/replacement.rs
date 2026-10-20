@@ -66,7 +66,12 @@ pub fn seed(path: &Path, events: &[Value], version: u64) -> Env {
     let env = open(path);
     {
         let mut txn = env.begin_rw().unwrap();
-        wok_db::rebuild_primary_and_event_indices(&source.begin_ro().unwrap(), &mut txn).unwrap();
+        wok_db::rebuild_primary_and_event_indices(
+            &source.begin_ro().unwrap(),
+            &mut txn,
+            wok_db::PackedEventRebuild::Copy,
+        )
+        .unwrap();
         let mut tree = wok_negentropy::open_rw(&mut txn, 1).unwrap();
         for event in events {
             tree.insert(

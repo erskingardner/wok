@@ -57,6 +57,17 @@ pub fn snapshot_lmdb_readonly(
 /// Hash the complete logical event records without decompressing or
 /// reserializing them. Length framing makes the digest unambiguous.
 pub fn event_fingerprint(env: &Env) -> Result<EventFingerprint, DbError> {
+    fingerprint(env, false)
+}
+
+/// [`event_fingerprint`] over PackedEvent records without their hashed tag
+/// values, which reindex adds to records that dropped long values. It stays
+/// the same across such a repack.
+pub fn event_fingerprint_without_hashed_tag_values(env: &Env) -> Result<EventFingerprint, DbError> {
+    fingerprint(env, true)
+}
+
+fn fingerprint(env: &Env, without_hashed_tag_values: bool) -> Result<EventFingerprint, DbError> {
     let txn = env.begin_ro()?;
     let mut hasher = Sha256::new();
     let mut count = 0u64;
@@ -64,9 +75,14 @@ pub fn event_fingerprint(env: &Env) -> Result<EventFingerprint, DbError> {
     foreach_event_from(&txn, 0, |lev_id, packed| {
         match txn.get_u64(env.dbis().event_payload, lev_id) {
             Ok(Some(payload)) => {
+                let packed = if without_hashed_tag_values {
+                    crate::long_tags::without_hashed_tag_values(packed)
+                } else {
+                    std::borrow::Cow::Borrowed(packed)
+                };
                 hasher.update(lev_id.to_be_bytes());
                 hasher.update((packed.len() as u64).to_be_bytes());
-                hasher.update(packed);
+                hasher.update(&*packed);
                 hasher.update((payload.len() as u64).to_be_bytes());
                 hasher.update(payload);
                 count += 1;

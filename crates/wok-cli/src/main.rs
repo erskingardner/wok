@@ -114,7 +114,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Rebuild all derived indexes into a staged database and promote it
+    /// Rebuild all derived indexes into a staged database and promote it,
+    /// repacking records that dropped long tag values
     Reindex {
         /// Required acknowledgement that no relay or DB utility is using the database
         #[arg(long)]
@@ -540,6 +541,13 @@ fn cmd_reindex(
         cli_println!("{}", serde_json::to_string_pretty(&outcome)?);
     } else {
         cli_println!("Reindexed {} events.", outcome.events);
+        if outcome.repacked_long_tag_records != 0 || outcome.skipped_long_tag_records != 0 {
+            cli_println!(
+                "Repacked {} records with their long tag values; kept {} whose payload packs differently.",
+                outcome.repacked_long_tag_records,
+                outcome.skipped_long_tag_records
+            );
+        }
         cli_println!("Database: {}", outcome.database.display());
         cli_println!("Original backup: {}", outcome.backup.display());
         cli_println!("Fingerprint: {}", outcome.event_fingerprint_sha256);

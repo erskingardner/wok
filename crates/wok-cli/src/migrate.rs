@@ -31,6 +31,7 @@ struct MigrationManifest {
     event_count: u64,
     superseded_groups: u64,
     superseded_events: u64,
+    legacy_long_tag_records: u64,
     event_fingerprint_sha256: String,
     target_data_sha256: String,
     source_config_sha256: String,
@@ -282,6 +283,7 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
         event_count: before.count,
         superseded_groups: source_integrity.superseded_groups,
         superseded_events: source_integrity.superseded_events,
+        legacy_long_tag_records: target_integrity.legacy_long_tag_records,
         event_fingerprint_sha256: hex::encode(before.sha256),
         target_data_sha256: sha256_file(&staging_db.join("data.mdb"))?,
         source_config_sha256: sha256_bytes(&source_config_bytes),
@@ -322,6 +324,12 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
         println!(
             "Retained {} superseded events in {} replacement groups; relay reads serve only the winners.",
             source_integrity.superseded_events, source_integrity.superseded_groups,
+        );
+    }
+    if target_integrity.legacy_long_tag_records != 0 {
+        println!(
+            "Kept {} records as strfry packed them, without their single-letter tag values longer than 255 bytes; `wok reindex --confirm-relay-stopped` indexes those values.",
+            target_integrity.legacy_long_tag_records,
         );
     }
     println!("Wok config: {}", final_config.display());

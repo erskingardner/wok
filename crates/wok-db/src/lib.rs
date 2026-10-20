@@ -14,6 +14,7 @@ pub mod error;
 pub mod fbs;
 pub mod integrity;
 pub mod keys;
+pub mod long_tags;
 pub mod lookup;
 pub mod migration;
 pub mod moderation;
@@ -34,13 +35,19 @@ pub use fbs::{
     Meta, NegentropyFilterRec,
 };
 pub use integrity::{check_integrity, IntegrityIssue, IntegrityReport};
+pub use long_tags::{
+    lacks_long_tag_values, long_tag_packing, without_hashed_tag_values, LongTagPacking,
+};
 pub use lookup::{
     bump_negentropy_mod_counter, foreach_created_at, foreach_event_from, foreach_negentropy_filter,
     foreach_negentropy_filter_rw, get_compression_dictionary_ro, get_packed_ro, get_payload_ro,
     insert_compression_dictionary, insert_negentropy_filter, is_event_superseded_ro,
     lookup_event_by_id_ro, most_recent_levid_ro,
 };
-pub use migration::{event_fingerprint, snapshot_lmdb_readonly, EventFingerprint};
+pub use migration::{
+    event_fingerprint, event_fingerprint_without_hashed_tag_values, snapshot_lmdb_readonly,
+    EventFingerprint,
+};
 pub use moderation::{
     allow_event, allow_kind, allow_pubkey, allowed_pubkey_reason_ro, assign_role, ban_event,
     ban_pubkey, banned_event_reason_ro, banned_pubkey_reason_ro, block_ip, blocked_ip_reason_ro,
@@ -57,7 +64,7 @@ pub use payload::{
     Decompressor, PayloadView, PAYLOAD_RAW, PAYLOAD_ZSTD,
 };
 pub use purge::{count_superseded_ro, purge_superseded, SupersededHistory};
-pub use reindex::{rebuild_primary_and_event_indices, ReindexStats};
+pub use reindex::{rebuild_primary_and_event_indices, PackedEventRebuild, ReindexStats};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use search::{
     event_content, event_search_terms, index_event_search, normalize_search_terms,

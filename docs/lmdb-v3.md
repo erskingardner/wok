@@ -57,15 +57,44 @@ Writing an addressable event with a hashed `d`, or a deletion with a hashed
 The database version is unchanged. Values of 255 bytes or fewer pack exactly
 as before, so existing records and their index entries stay valid, and
 integrity, which derives the expected index entries from PackedEvent, accepts
-records of either packing. Migration and reindex copy PackedEvent unchanged,
-so records packed by strfry or by earlier Wok releases keep the values they
-dropped: filters cannot match those values, and an addressable record whose
-first `d` was dropped keeps the address it was keyed by (the virtual empty `d`
-or a later short `d`). An earlier Wok release opening a database written by
-this one derives the same index keys from hashed values, but does not
-recognize a hashed deletion `a` tag. If it deletes such a deletion request, the
-request's `Event__replaceDeletion` entry stays behind; `wok integrity` reports
-it and `wok reindex` removes it. Writers must still not be mixed.
+records of either packing. Migration copies PackedEvent unchanged and opening
+a database never repacks it, so records packed by strfry or by earlier Wok
+releases keep the values they dropped until `wok reindex` restores them:
+filters cannot match those
+values, an addressable record whose first `d` was dropped keeps the address it
+was keyed by (the virtual empty `d` or a later short `d`), so a new version of
+its real address does not replace it and an `a`-tag deletion does not remove
+it, and a deletion whose long `a` tag was dropped has no
+`Event__replaceDeletion` entry. `wok integrity` counts the records that
+`wok reindex` would repack as `legacy_long_tag_records`, and `wok doctor`
+warns while any remain. An earlier
+Wok release opening a database written by this one derives the same index keys
+from hashed values, but does not recognize a hashed deletion `a` tag. If it
+deletes such a deletion request, the request's `Event__replaceDeletion` entry
+stays behind; `wok integrity` reports it and `wok reindex` removes it. Writers
+must still not be mixed.
+
+`wok reindex` repacks legacy records while it copies them into the staging
+database (see [Integrity](#integrity)). It already decodes every payload, and
+selects the records whose JSON has more single-letter tag values longer than
+255 bytes than their PackedEvent has hashed values. It packs each one again from
+its payload, with every event limit lifted (a legacy row may hold a first `d`
+longer than a new event may use), and accepts the result only if
+removing the hashed values gives the stored bytes back. Any other difference
+copies the record unchanged and counts it as skipped: kind 41 records that
+older releases packed with a virtual `d`, or a long `e` or `p` value, which Wok
+refuses. A repacked record keeps its local ID and payload; its indexes, the
+superseded-version count and negentropy trees are derived from the new packing
+like everything else reindex builds. A legacy addressable record can join a
+newer version at its real address, where reads hide it as superseded history,
+and a version it hid at the empty `d` becomes visible again. A legacy deletion
+gains its tombstone, so older versions of its address are refused from then on;
+versions already stored are not deleted. Nothing repacks implicitly. Finding
+legacy records means decoding every payload, which at writable open would make
+the first start after an upgrade scan the whole database, and migration keeps
+strfry records byte for byte. Repacking changes the record's PackedEvent bytes,
+and so `event_fingerprint`, but removing the hashed values gives the previous
+bytes back, so the repair loses nothing.
 
 ## EventPayload
 
@@ -87,10 +116,16 @@ config, plugin, and socket-path problems.
 
 `wok reindex --confirm-relay-stopped` repairs damage confined to derived
 event/negentropy indexes or author counters. It copies authoritative Meta, filter, dictionary,
-PackedEvent, and EventPayload records into a sibling staging database, derives
-all indexes again, verifies the event fingerprint and integrity report, then
-renames the original to a retained backup and atomically promotes the staged
-directory. It preserves a valid sequence and discards author counters for lazy
+PackedEvent, and EventPayload records into a sibling staging database,
+repacking PackedEvent records that dropped long tag values (see
+[PackedEvent](#packedevent)), derives all indexes again (negentropy trees hold
+every stored record their filter matches), verifies the integrity
+report and the event fingerprint, then renames the original to a retained
+backup and atomically promotes the staged directory. When it repacks records,
+the fingerprint it verifies leaves out hashed tag values, which are the only
+bytes a repack adds; otherwise the full fingerprint must be unchanged. The
+manifest records the fingerprints of the original and of the result, and how
+many records were repacked and skipped. It preserves a valid sequence and discards author counters for lazy
 reconstruction from the rebuilt indexes. It refuses primary, payload, or
 metadata corruption, including a malformed or regressed sequence; the highest
 surviving event cannot establish the sequence of a previously deleted tail.

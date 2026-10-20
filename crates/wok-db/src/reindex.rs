@@ -1,15 +1,33 @@
 //! Build a fresh database from authoritative primary records and derive every
 //! event secondary index from PackedEvent again.
 
+use crate::long_tags::{long_tag_packing, LongTagPacking};
 use crate::write::event_index_entries;
 use crate::{index_event_search, payload::Decompressor, search::initialize_search_index_state};
 use crate::{DbError, RoTxn, RwTxn};
+use std::borrow::Cow;
+
+/// What a rebuild does with each PackedEvent record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedEventRebuild {
+    /// Copy every record unchanged.
+    Copy,
+    /// Pack records that lack single-letter tag values longer than 255 bytes
+    /// again from their payloads, as [`crate::long_tags`] allows, and copy
+    /// the others unchanged.
+    RepackLongTags,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReindexStats {
     pub events: u64,
     pub payloads: u64,
     pub index_entries: u64,
+    /// Records packed again with their long tag values.
+    pub repacked_long_tag_records: u64,
+    /// Records lacking long tag values that were copied unchanged, because
+    /// packing their payload again changes more than those values.
+    pub skipped_long_tag_records: u64,
 }
 
 fn copy_table(
@@ -39,6 +57,7 @@ fn copy_table(
 pub fn rebuild_primary_and_event_indices(
     source: &RoTxn<'_>,
     target: &mut RwTxn<'_>,
+    packing: PackedEventRebuild,
 ) -> Result<ReindexStats, DbError> {
     let source_dbis = source.env().dbis();
     let target_dbis = target.env().dbis();
@@ -103,6 +122,8 @@ pub fn rebuild_primary_and_event_indices(
     let mut events = 0u64;
     let mut last_lev_id = 0u64;
     let mut index_entries = 0u64;
+    let mut repacked_long_tag_records = 0u64;
+    let mut skipped_long_tag_records = 0u64;
     let mut error = None;
     let mut decompressor = Decompressor::new();
     source.foreach_full(source_dbis.event, &[], &[], false, |key, packed_bytes| {
@@ -110,26 +131,6 @@ pub fn rebuild_primary_and_event_indices(
             error = Some(DbError::msg("Event key is not 8 bytes"));
             return false;
         };
-        let packed = match wok_event::PackedEventView::new(packed_bytes) {
-            Ok(packed) => packed,
-            Err(err) => {
-                error = Some(DbError::msg(format!("levId {lev_id}: {err}")));
-                return false;
-            }
-        };
-        if let Err(err) = target.put(target_dbis.event, key, packed_bytes, 0) {
-            error = Some(err);
-            return false;
-        }
-        for entry in event_index_entries(target_dbis, lev_id, packed) {
-            match target.put(entry.dbi, &entry.key, &entry.value, 0) {
-                Ok(_) => index_entries += 1,
-                Err(err) => {
-                    error = Some(err);
-                    return false;
-                }
-            }
-        }
         let payload = match source.get_u64(source_dbis.event_payload, lev_id) {
             Ok(Some(payload)) => payload.to_vec(),
             Ok(None) => {
@@ -148,6 +149,44 @@ pub fn rebuild_primary_and_event_indices(
                 return false;
             }
         };
+        let packed_bytes = match packing {
+            PackedEventRebuild::Copy => Cow::Borrowed(packed_bytes),
+            PackedEventRebuild::RepackLongTags => match long_tag_packing(packed_bytes, &json) {
+                Ok(LongTagPacking::Complete) => Cow::Borrowed(packed_bytes),
+                Ok(LongTagPacking::Repack(repacked)) => {
+                    repacked_long_tag_records += 1;
+                    Cow::Owned(repacked)
+                }
+                Ok(LongTagPacking::Mismatch) => {
+                    skipped_long_tag_records += 1;
+                    Cow::Borrowed(packed_bytes)
+                }
+                Err(err) => {
+                    error = Some(DbError::msg(format!("levId {lev_id}: {err}")));
+                    return false;
+                }
+            },
+        };
+        let packed = match wok_event::PackedEventView::new(&packed_bytes) {
+            Ok(packed) => packed,
+            Err(err) => {
+                error = Some(DbError::msg(format!("levId {lev_id}: {err}")));
+                return false;
+            }
+        };
+        if let Err(err) = target.put(target_dbis.event, key, &packed_bytes, 0) {
+            error = Some(err);
+            return false;
+        }
+        for entry in event_index_entries(target_dbis, lev_id, packed) {
+            match target.put(entry.dbi, &entry.key, &entry.value, 0) {
+                Ok(_) => index_entries += 1,
+                Err(err) => {
+                    error = Some(err);
+                    return false;
+                }
+            }
+        }
         if let Err(err) = index_event_search(target, lev_id, &json) {
             error = Some(err);
             return false;
@@ -171,5 +210,7 @@ pub fn rebuild_primary_and_event_indices(
         events,
         payloads,
         index_entries,
+        repacked_long_tag_records,
+        skipped_long_tag_records,
     })
 }

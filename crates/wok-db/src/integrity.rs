@@ -29,6 +29,11 @@ pub struct IntegrityReport {
     /// Advisory only: lossless migration is allowed to preserve this history.
     pub superseded_groups: u64,
     pub superseded_events: u64,
+    /// Records whose PackedEvent lacks single-letter tag values longer than
+    /// 255 bytes, as packed by strfry or by earlier Wok releases, and that
+    /// `wok reindex` would pack again. Advisory, counted where payloads are
+    /// decoded (databases with the search table).
+    pub legacy_long_tag_records: u64,
     pub expected_index_entries: u64,
     pub actual_index_entries: u64,
     pub missing_payloads: Vec<u64>,
@@ -437,6 +442,13 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
                     return true;
                 }
             };
+            // Unparseable JSON is reported by the search check below.
+            if matches!(
+                crate::long_tags::long_tag_packing(value, &json),
+                Ok(crate::long_tags::LongTagPacking::Repack(_))
+            ) {
+                report.legacy_long_tag_records += 1;
+            }
             match search_index_entries(lev_id, &json) {
                 Ok(entries) => {
                     for (key, value) in entries {

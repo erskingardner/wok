@@ -23,7 +23,7 @@ pub use kinds::{is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kin
 pub use packed::{
     hashed_tag_value_digest, indexed_tag_value, is_event_a_before_event_b, PackedEvent,
     PackedEventBuilder, PackedEventTag, PackedEventTagBuilder, PackedEventView,
-    HASHED_TAG_VAL_MARKER,
+    HASHED_TAG_VAL_MARKER, PACKED_HEADER_LEN,
 };
 pub use parse::{
     from_hex, from_hex_exact, from_hex_strict, from_lower_hex_exact, normalize_event_json,

@@ -100,6 +100,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database, and `--json` prints a summary. It runs alongside the relay in
   bounded write transactions. Doctor's `replacement-history` warning points to
   it.
+- `wok reindex` restores single-letter tag values longer than 255 bytes to
+  records that strfry or earlier Wok releases packed without them, so `#x`
+  filters match those values, a long first `d` becomes the record's own
+  address, and a long deletion `a` tag tombstones its address. While it builds
+  the staged database it packs each such record again from its payload, and
+  copies it unchanged unless the only difference is the restored values; kind
+  41 history packed with a virtual `d` is copied unchanged. Indexes, the
+  superseded-version count and negentropy trees are rebuilt from the result.
+  Reindex then verifies the fingerprint without hashed tag values (the full
+  fingerprint when nothing was repacked). Its outcome and manifest report
+  `repacked_long_tag_records`, `skipped_long_tag_records` and the original's
+  fingerprint as `source_event_fingerprint_sha256`. Integrity reports
+  `legacy_long_tag_records`, doctor warns while it is nonzero, and the
+  migration manifest records it. Migration still copies records unchanged.
 
 ### Changed
 
@@ -142,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thread clearing its LMDB reader slot on exit could race another thread
   closing the database. The database now closes only after every relay thread
   has exited.
+- `wok reindex` rebuilt negentropy trees from what relay reads serve, so a
+  database with superseded versions (retained by a strfry migration, or created
+  when reindex repacks a long address next to a newer version) came out with
+  trees that `wok doctor` reported as inconsistent with the primary records.
+  Trees now hold every stored record their filter matches, as the writer and
+  `wok negentropy build` keep them; syncs still apply read visibility.
 - While NIP-42 is usable, the AUTH challenge is sent as soon as a connection
   opens instead of only after a restricted request is refused. NIP-46 clients
   such as Bunker46 can authenticate before subscribing to restricted kind
@@ -185,8 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused. An addressable event is refused with `invalid:` when the `a` tag
   naming it would exceed `events.max_tag_val_size`, so every stored address
   can still be deleted by `a` tag. Events stored by earlier releases or
-  migrated from strfry keep their packing, so filters still cannot match
-  their long values.
+  migrated from strfry keep their packing, so filters cannot match their long
+  values until `wok reindex` repacks them.
 - Kind 41 (NIP-28 channel metadata) is a regular event, as NIP-01 makes every
   kind from 4 to 44. It was replaced per author, so metadata for a second
   channel deleted the first channel's. Migrated kind 41 history becomes

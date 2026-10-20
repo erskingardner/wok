@@ -23,7 +23,7 @@ Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default conf
 | Migration | `migrate strfry` (`--check` preflight) |
 | Relay | `relay` |
 | Diagnostics | `doctor`, `integrity`, `info`, `config show` |
-| Maintenance | `reindex`, `compact`, `dict`, `negentropy` |
+| Maintenance | `reindex`, `purge-superseded`, `compact`, `dict`, `negentropy` |
 | Data | `import`, `export`, `scan`, `event`, `delete`, `monitor` |
 | Mesh | `router`, `sync`, `upload`, `download` |
 

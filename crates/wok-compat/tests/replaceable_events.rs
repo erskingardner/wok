@@ -75,7 +75,12 @@ fn snapshot_records(records: &[(Vec<u8>, String)]) -> (TempDir, Env) {
     .unwrap();
     {
         let mut txn = env.begin_rw().unwrap();
-        wok_db::rebuild_primary_and_event_indices(&source.begin_ro().unwrap(), &mut txn).unwrap();
+        wok_db::rebuild_primary_and_event_indices(
+            &source.begin_ro().unwrap(),
+            &mut txn,
+            wok_db::PackedEventRebuild::Copy,
+        )
+        .unwrap();
         // Keep the persistent match-all negentropy tree structurally correct too.
         let mut tree = wok_negentropy::open_rw(&mut txn, 1).unwrap();
         for (packed, _) in records {
@@ -1131,4 +1136,231 @@ fn purging_commits_between_addresses_without_superseded_history() {
     // Each address is a completed unit of scan work, even with no losers.
     assert_eq!(transactions, current.len());
     assert_eq!(stored_ids(&env), ids(&current));
+}
+
+fn packing(event: &Value) -> (Vec<u8>, String) {
+    let parsed = parse_and_verify_event(event, &EventLimits::default(), None, true, false).unwrap();
+    (parsed.packed.into_bytes(), parsed.json)
+}
+
+/// What strfry and earlier Wok releases stored: every single-letter tag value
+/// longer than 255 bytes dropped.
+fn legacy_packing(event: &Value) -> (Vec<u8>, String) {
+    let (packed, json) = packing(event);
+    let view = PackedEventView::new(&packed).unwrap();
+    let mut tags = wok_event::PackedEventTagBuilder::default();
+    for tag in view.tags() {
+        if wok_event::hashed_tag_value_digest(&tag.value).is_none() {
+            tags.add(tag.name, &tag.value).unwrap();
+        }
+    }
+    let legacy = wok_event::PackedEventBuilder::build(
+        view.id(),
+        view.pubkey(),
+        view.created_at(),
+        view.kind(),
+        view.expiration(),
+        &tags,
+    )
+    .unwrap();
+    (legacy.into_bytes(), json)
+}
+
+fn stored_records(env: &Env) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let txn = env.begin_ro().unwrap();
+    let mut records = Vec::new();
+    wok_db::foreach_event_from(&txn, 0, |lev, raw| {
+        let payload = txn.get_u64(env.dbis().event_payload, lev).unwrap().unwrap();
+        records.push((raw.to_vec(), payload.to_vec()));
+        true
+    })
+    .unwrap();
+    records
+}
+
+#[test]
+fn reindex_restores_long_tag_values_to_legacy_records() {
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    let (d300, d301, d400) = ("x".repeat(300), "y".repeat(301), "z".repeat(400));
+    let url = format!("https://example.com/{}", "r".repeat(300));
+    let target_address = format!("30443:{pubkey}:{d400}");
+    let empty_d = event(&key, 30000, 100, json!([["d", ""]]), "empty d");
+    let long301 = event(&key, 30000, 150, json!([["d", &d301]]), "301");
+    let long300 = event(&key, 30000, 200, json!([["d", &d300]]), "300");
+    let newer300 = event(&key, 30000, 300, json!([["d", &d300]]), "300 again");
+    let target = event(&key, 30443, 400, json!([["d", &d400]]), "target");
+    let deletion = event(&key, 5, 500, json!([["a", &target_address]]), "");
+    let legacy_note = event(&key, 1, 100, json!([["r", &url]]), "legacy");
+    let current_note = event(&key, 1, 200, json!([["r", &url]]), "current");
+    let plain = event(&key, 1, 300, json!([["t", "short"]]), "plain");
+    let channel = event(
+        &key,
+        41,
+        100,
+        json!([["e", "aa".repeat(32)], ["r", &url]]),
+        "{}",
+    );
+    // Older releases packed kind 41 with a virtual d, so it cannot repack.
+    let (_, channel_json) = packing(&channel);
+    let mut tags = wok_event::PackedEventTagBuilder::default();
+    tags.add('d', b"").unwrap();
+    tags.add('e', &[0xaa; 32]).unwrap();
+    let id = hex::decode(channel["id"].as_str().unwrap()).unwrap();
+    let author = key.x_only_public_key().0.serialize();
+    let channel_legacy = wok_event::PackedEventBuilder::build(&id, &author, 100, 41, 0, &tags)
+        .unwrap()
+        .into_bytes();
+    let records = vec![
+        packing(&empty_d),
+        legacy_packing(&long301),
+        legacy_packing(&long300),
+        packing(&newer300),
+        legacy_packing(&target),
+        legacy_packing(&deletion),
+        legacy_packing(&legacy_note),
+        packing(&current_note),
+        packing(&plain),
+        (channel_legacy.clone(), channel_json),
+    ];
+    let (_dir, env) = snapshot_records(&records);
+
+    // The legacy rows: long values unmatched, long addresses collapsed onto
+    // the empty d, and the long deletion without a tombstone.
+    let txn = env.begin_ro().unwrap();
+    let report = wok_db::check_integrity(&txn).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    // The kind 41 record lacks its long value too, but cannot be repacked.
+    assert_eq!(report.legacy_long_tag_records, 5);
+    assert_eq!((report.superseded_groups, report.superseded_events), (1, 2));
+    drop(txn);
+    assert_eq!(
+        query(&env, &[json!({"#r": [&url]})], false),
+        ids(std::slice::from_ref(&current_note))
+    );
+    assert_eq!(
+        query(&env, &[json!({"kinds": [30000]})], false),
+        ids(&[long300.clone(), newer300.clone()])
+    );
+    let older301 = event(&key, 30000, 120, json!([["d", &d301]]), "older 301");
+    let stale_target = event(&key, 30443, 450, json!([["d", &d400]]), "stale");
+    for probe in [&older301, &stale_target] {
+        assert_eq!(
+            write_with_quota(&env, probe, 0, false),
+            wok_db::EventWriteStatus::Written
+        );
+    }
+
+    let (_repaired_dir, repaired, stats) = reindex(&env);
+    assert_eq!(stats.events, 10);
+    assert_eq!(
+        (
+            stats.repacked_long_tag_records,
+            stats.skipped_long_tag_records
+        ),
+        (5, 1)
+    );
+    // Repacked records equal what Wok packs today; the others and every
+    // payload are untouched.
+    let before = stored_records(&env);
+    let after = stored_records(&repaired);
+    for (index, (record, event)) in after
+        .iter()
+        .zip([
+            &empty_d,
+            &long301,
+            &long300,
+            &newer300,
+            &target,
+            &deletion,
+            &legacy_note,
+            &current_note,
+            &plain,
+        ])
+        .enumerate()
+    {
+        assert_eq!(record.0, packing(event).0, "record {index}");
+        assert_eq!(record.1, before[index].1, "payload {index}");
+    }
+    assert_eq!(after[9], before[9]);
+    assert_eq!(after[9].0, channel_legacy);
+    assert_ne!(
+        wok_db::event_fingerprint(&repaired).unwrap(),
+        wok_db::event_fingerprint(&env).unwrap()
+    );
+    assert_eq!(
+        wok_db::event_fingerprint_without_hashed_tag_values(&repaired).unwrap(),
+        wok_db::event_fingerprint_without_hashed_tag_values(&env).unwrap()
+    );
+
+    let txn = repaired.begin_ro().unwrap();
+    let report = wok_db::check_integrity(&txn).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    assert_eq!(report.legacy_long_tag_records, 0);
+    assert_eq!((report.superseded_groups, report.superseded_events), (1, 1));
+    assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), Some(1));
+    drop(txn);
+    assert_eq!(
+        query(&repaired, &[json!({"#r": [&url]})], false),
+        ids(&[legacy_note, current_note])
+    );
+    assert_eq!(
+        query(&repaired, &[json!({"kinds": [30000]})], false),
+        ids(&[empty_d, long301, newer300.clone()])
+    );
+    assert_eq!(
+        query(
+            &repaired,
+            &[json!({"kinds": [30000], "#d": [&d300]})],
+            false
+        ),
+        ids(&[newer300])
+    );
+    assert_eq!(
+        query(&repaired, &[json!({"#a": [&target_address]})], false),
+        ids(&[deletion])
+    );
+    // The long addresses are their own now, and the deletion tombstones its
+    // target.
+    assert_eq!(
+        write_with_quota(&repaired, &older301, 0, false),
+        wok_db::EventWriteStatus::Replaced
+    );
+    assert_eq!(
+        write_with_quota(&repaired, &stale_target, 0, false),
+        wok_db::EventWriteStatus::Deleted
+    );
+
+    let (_again_dir, again, stats) = reindex(&repaired);
+    assert_eq!(
+        (
+            stats.repacked_long_tag_records,
+            stats.skipped_long_tag_records
+        ),
+        (0, 1)
+    );
+    assert_eq!(stored_records(&again), after);
+}
+
+/// Rebuild `source` as `wok reindex` does, repacking long tag values.
+fn reindex(source: &Env) -> (TempDir, Env, wok_db::ReindexStats) {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    let stats = wok_db::rebuild_primary_and_event_indices(
+        &source.begin_ro().unwrap(),
+        &mut txn,
+        wok_db::PackedEventRebuild::RepackLongTags,
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    (dir, env, stats)
 }

@@ -314,6 +314,18 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
                             integrity.superseded_events, integrity.superseded_groups,
                         ),
                     );
+                    report.add(
+                        "long-tag-packing",
+                        if integrity.legacy_long_tag_records == 0 {
+                            CheckStatus::Pass
+                        } else {
+                            CheckStatus::Warn
+                        },
+                        format!(
+                            "{} records lack single-letter tag values longer than 255 bytes in their indexes (packed by strfry or an earlier Wok); `wok reindex --confirm-relay-stopped` repacks them",
+                            integrity.legacy_long_tag_records,
+                        ),
+                    );
                     report.integrity = Some(integrity);
                 }
                 Err(error) => report.add("integrity", CheckStatus::Fail, error.to_string()),

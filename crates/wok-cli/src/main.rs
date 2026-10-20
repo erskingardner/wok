@@ -120,7 +120,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Rebuild all derived indexes into a staged database and promote it
+    /// Rebuild all derived indexes into a staged database and promote it,
+    /// repacking records that dropped long tag values
     Reindex {
         /// Required acknowledgement that no relay or DB utility is using the database
         #[arg(long)]
@@ -569,6 +570,13 @@ fn cmd_reindex(
         cli_println!("{}", serde_json::to_string_pretty(&outcome)?);
     } else {
         cli_println!("Reindexed {} events.", outcome.events);
+        if outcome.repacked_long_tag_records != 0 || outcome.skipped_long_tag_records != 0 {
+            cli_println!(
+                "Repacked {} records with their long tag values; kept {} whose payload packs differently.",
+                outcome.repacked_long_tag_records,
+                outcome.skipped_long_tag_records
+            );
+        }
         cli_println!("Database: {}", outcome.database.display());
         cli_println!("Original backup: {}", outcome.backup.display());
         cli_println!("Fingerprint: {}", outcome.event_fingerprint_sha256);
@@ -1238,7 +1246,9 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
         NegCmd::Build {
             tree_id,
             batch_size,
-        } => build_negentropy_tree(&env, tree_id, batch_size)?,
+        } => {
+            build_negentropy_tree(&env, tree_id, batch_size)?;
+        }
     }
     Ok(())
 }
@@ -1246,7 +1256,8 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
 /// Populate a tree through bounded primary-table scans and short write
 /// transactions. Inserts are idempotent, so rerunning this after interruption
 /// safely resumes the outcome without requiring a separate progress file.
-fn build_negentropy_tree(env: &Env, tree_id: u64, batch_size: usize) -> Result<()> {
+/// Returns how many items were newly inserted.
+fn build_negentropy_tree(env: &Env, tree_id: u64, batch_size: usize) -> Result<u64> {
     if batch_size == 0 {
         bail!("--batch-size must be at least 1");
     }
@@ -1320,7 +1331,7 @@ fn build_negentropy_tree(env: &Env, tree_id: u64, batch_size: usize) -> Result<(
         first_batch = false;
     }
     tracing::info!(tree_id, scanned, inserted, "negentropy build complete");
-    Ok(())
+    Ok(inserted)
 }
 
 struct NegentropyScanBatch {

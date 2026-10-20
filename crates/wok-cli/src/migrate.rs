@@ -654,6 +654,7 @@ mod tests {
         assert_eq!(parsed.relay.port, 7777);
         assert!(translated.contains("[database]"));
         assert!(translated.contains("[relay]"));
+        assert!(translated.lines().any(|line| line == "preset = \"public\""));
     }
 
     #[test]

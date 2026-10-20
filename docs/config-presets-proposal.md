@@ -910,7 +910,6 @@ ships.
    so it is a narrow relay rather than a general one with Marmot tuning.
 6. **Key names:** keep the current names, add new keys, and translate only
    the access keys.
-
 7. **Preset versioning:** presets follow releases. Every change to a
    preset value is listed in the release notes under "Preset changes".
    There are no `preset = "public@0.8"` pins.

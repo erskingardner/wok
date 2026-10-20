@@ -69,6 +69,11 @@ All event settings reload live and are available in the dashboard.
 | `events.max_num_tags` | `2000` | Maximum tags on one event. |
 | `events.max_tag_val_size` | `1024` | Maximum bytes in one tag value. |
 
+Single-letter tag values longer than 255 bytes are stored but not indexed, so
+filters cannot match them. Because an address must be indexed, an addressable
+event whose first `d` tag is longer than 255 bytes, and a kind 5 `a` tag longer
+than 255 bytes, are refused with `invalid:` whatever `max_tag_val_size` allows.
+
 The 1 MiB event ceiling accommodates bounded extended-length NIP-44 payloads,
 including kind 1059 gift wraps and kind 445 MLS group events. Wok does not
 decrypt or identify NIP-44 content, so this remains a global event limit and is

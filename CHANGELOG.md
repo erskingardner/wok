@@ -105,6 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   posts (of eight such publishers, one event was stored). Only the OK is lost
   now. An EVENT still parked behind a full writer queue is dropped when its
   connection closes, as before.
+- Addressable events whose first `d` tag is longer than 255 bytes, and kind 5
+  `a` tags longer than 255 bytes, are refused with `invalid:`. Such values are
+  not indexed, so the event was keyed by an empty `d` and distinct addresses
+  replaced one another (`d=""`, a 300-byte `d` and a 301-byte `d`), and such a
+  deletion never matched its target.
 
 ## [0.7.0] - 2026-09-08
 

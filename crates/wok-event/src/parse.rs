@@ -165,6 +165,7 @@ pub fn nostr_json_to_packed_event(
 
     let mut tag_builder = PackedEventTagBuilder::default();
     let mut expiration = 0u64;
+    let mut address_d_seen = !is_param_replaceable_kind(kind);
 
     if is_replaceable_kind(kind) {
         // Prepend virtual d-tag. Any later d-tags will be ignored during indexing.
@@ -202,6 +203,17 @@ pub fn nostr_json_to_packed_event(
                     tag_val.len()
                 )));
             }
+            // Values longer than MAX_INDEXED_TAG_VAL_SIZE are not indexed. An
+            // address keyed by a later d tag, or by the virtual empty one,
+            // would make distinct addresses replace each other.
+            if tag_name == "d" && !address_d_seen {
+                address_d_seen = true;
+                if tag_val.len() > MAX_INDEXED_TAG_VAL_SIZE {
+                    return Err(EventError::msg(format!(
+                        "addressable event d tag longer than {MAX_INDEXED_TAG_VAL_SIZE} bytes"
+                    )));
+                }
+            }
             if tag_name == "e" || tag_name == "p" {
                 if tag_val.len() != 64 {
                     return Err(EventError::msg(format!(
@@ -214,6 +226,13 @@ pub fn nostr_json_to_packed_event(
                 }
                 continue;
             } else if tag_name == "a" && kind == 5 {
+                // An unindexed address could never be matched against the
+                // events it asks to delete.
+                if tag_val.len() > MAX_INDEXED_TAG_VAL_SIZE {
+                    return Err(EventError::msg(format!(
+                        "deletion a tag longer than {MAX_INDEXED_TAG_VAL_SIZE} bytes"
+                    )));
+                }
                 let (tag_kind, tag_pubkey, _d) = parse_a_tag(tag_val)?;
                 let _ = tag_kind;
                 if tag_pubkey.as_slice() != pubkey.as_slice() {
@@ -358,6 +377,52 @@ mod tests {
         });
         let packed = nostr_json_to_packed_event(&v, &EventLimits::default()).unwrap();
         assert_eq!(packed.view().first_d_tag().unwrap(), b"");
+    }
+
+    #[test]
+    fn unindexable_addresses_are_rejected() {
+        let event = |kind: u64, tags: Value| {
+            json!({
+                "id": "11".repeat(32),
+                "pubkey": "22".repeat(32),
+                "created_at": 1,
+                "kind": kind,
+                "content": "",
+                "tags": tags,
+                "sig": "00".repeat(64),
+            })
+        };
+        let limits = EventLimits::default();
+        let longest = "z".repeat(MAX_INDEXED_TAG_VAL_SIZE);
+        let too_long = "z".repeat(MAX_INDEXED_TAG_VAL_SIZE + 1);
+        let packed =
+            nostr_json_to_packed_event(&event(30000, json!([["d", longest]])), &limits).unwrap();
+        assert_eq!(packed.view().first_d_tag().unwrap(), longest.as_bytes());
+        for tags in [
+            json!([["d", too_long]]),
+            // A later short d must not become the address either.
+            json!([["d", too_long], ["d", "short"]]),
+        ] {
+            assert!(nostr_json_to_packed_event(&event(30000, tags), &limits).is_err());
+        }
+        // Only the first d tag of an addressable event is its address.
+        for (kind, tags) in [
+            (30000, json!([["d", "short"], ["d", too_long]])),
+            (1, json!([["d", too_long]])),
+            (10002, json!([["d", too_long]])),
+        ] {
+            assert!(nostr_json_to_packed_event(&event(kind, tags), &limits).is_ok());
+        }
+
+        let pubkey = "22".repeat(32);
+        let prefix = format!("30000:{pubkey}:");
+        let deletion = |d_len: usize| {
+            let address = format!("{prefix}{}", "z".repeat(d_len));
+            event(5, json!([["a", address]]))
+        };
+        let fits = MAX_INDEXED_TAG_VAL_SIZE - prefix.len();
+        assert!(nostr_json_to_packed_event(&deletion(fits), &limits).is_ok());
+        assert!(nostr_json_to_packed_event(&deletion(fits + 1), &limits).is_err());
     }
 
     #[test]

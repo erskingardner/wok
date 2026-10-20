@@ -133,3 +133,9 @@ regression test. Differential parity alone is not a reason to retain it.
   clients that publish and hang up at once. An EVENT still parked in an
   ingester because the writer queue is full is dropped when its connection
   closes, which keeps memory bounded under writer backpressure.
+- NIP-01 addresses: an addressable event whose first `d` tag is longer than
+  255 bytes, and a kind 5 `a` tag longer than 255 bytes, are refused with
+  `invalid:`. Such values are not indexed. The pinned strfry keys that event
+  by its virtual empty `d` (or a later short `d`), so distinct addresses
+  replace one another, and it never matches that deletion against its target.
+  Indexing a hash of long values would lift this limit.

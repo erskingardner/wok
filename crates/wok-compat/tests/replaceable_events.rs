@@ -412,6 +412,57 @@ async fn websocket_history_count_and_live_updates_only_serve_current_versions() 
     }
 }
 
+async fn publish(wire: &mut Wire, event: &Value) -> Value {
+    wire.send(json!(["EVENT", event])).await.unwrap();
+    let ok = wire.recv().await.unwrap();
+    assert_eq!(ok[0], "OK", "{ok}");
+    assert_eq!(ok[1], event["id"], "{ok}");
+    ok
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_d_tags_cannot_merge_distinct_addresses() {
+    // Single-letter tag values over 255 bytes are not indexed, so an address
+    // with a longer d used to be keyed by the virtual empty d: d="",
+    // d=300 bytes and d=301 bytes replaced one another. Until long values are
+    // indexed by hash, such addresses and deletion a tags are refused.
+    let key = key();
+    let (dir, env) = snapshot(&[]);
+    let (handle, mut wire) = server(env, dir.path()).await;
+    let empty = event(&key, 30000, 100, json!([["d", ""]]), "empty d");
+    assert_eq!(publish(&mut wire, &empty).await[2], true);
+    for (time, len) in [(200, 300), (300, 301)] {
+        let long = event(&key, 30000, time, json!([["d", "z".repeat(len)]]), "long");
+        let ok = publish(&mut wire, &long).await;
+        assert_eq!(ok[2], false, "{ok}");
+        assert!(ok[3].as_str().unwrap().starts_with("invalid:"), "{ok}");
+    }
+    let address = format!(
+        "30000:{}:{}",
+        empty["pubkey"].as_str().unwrap(),
+        "z".repeat(300)
+    );
+    let deletion = event(&key, 5, 400, json!([["a", address]]), "");
+    let ok = publish(&mut wire, &deletion).await;
+    assert_eq!(ok[2], false, "{ok}");
+    assert!(ok[3].as_str().unwrap().starts_with("invalid:"), "{ok}");
+
+    wire.send(json!(["REQ", "addresses", {"kinds": [30000, 5]}]))
+        .await
+        .unwrap();
+    let mut stored = Vec::new();
+    loop {
+        let frame = wire.recv().await.unwrap();
+        match frame[0].as_str() {
+            Some("EVENT") => stored.push(frame[2].clone()),
+            Some("EOSE") => break,
+            _ => panic!("unexpected {frame}"),
+        }
+    }
+    assert_eq!(ids(&stored), ids(&[empty]));
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn negentropy_hides_stale_ids_with_and_without_a_matching_persistent_tree() {
     let key = key();

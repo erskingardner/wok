@@ -132,7 +132,3 @@ not establish behavior for every large private sync, sustained saturation,
 multi-host network faults, disk power loss, or a continuous multi-hour sync
 session. Container results are labeled as such and are not bare-metal capacity
 claims. Longer campaigns and production observation remain complementary.
-
-## Recorded campaigns
-
-- [2026-09-05: one-hour Linux ARM64 container and hosted x86-64 canary](reliability-2026-09-05.md)

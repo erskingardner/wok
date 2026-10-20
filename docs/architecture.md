@@ -54,3 +54,12 @@ initialized, a counter stays transactionally current through inserts, replacemen
 and deletions, including while quotas are disabled. Enabling a quota may therefore
 require a one-time author-index scan for an author without a cached count; no
 database upgrade or startup-wide scan is required.
+
+## Non-goals
+
+- Storage-backend independence is deferred. LMDB stays until a concrete backend
+  or operational requirement justifies an abstraction and a comparative benchmark.
+- No implicit strfry migration, production strfry mutation, or mixed writers.
+  Older Wok writers must be stopped before the v5 upgrade; rollback restores a
+  backup rather than lowering the marker. See [storage format](lmdb-v3.md).
+- No CBOR transport.

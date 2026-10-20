@@ -75,6 +75,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded write transactions. Doctor's `replacement-history` warning points to
   it.
 
+### Removed
+
+- Dated benchmark, soak, lab and audit reports, the definition-of-done report
+  and `PLAN.md` are no longer kept in the repository or shipped in release
+  archives. `docs/` now holds only design, policy, operations and benchmark
+  methodology; results belong in pull requests.
+
 ### Fixed
 
 - While NIP-42 is usable, the AUTH challenge is sent as soon as a connection

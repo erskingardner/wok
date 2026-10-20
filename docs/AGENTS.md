@@ -1,6 +1,6 @@
 # docs/
 
-Operator and design documentation. Code remains the authority for current behavior; these files explain policy, ops, and historical evidence.
+Operator and design documentation. Code remains the authority for current behavior; these files explain design, policy, and operations.
 
 ## Start here
 
@@ -31,8 +31,8 @@ Operator and design documentation. Code remains the authority for current behavi
 | `nip50-search.md` | Search semantics and scoring |
 | `nip86.md` | Management API: methods, levels, ban/role semantics |
 
-## Evidence / reports
+## What does not belong here
 
-Dated benchmark writeups (`benchmark-*.md`, `websocket-performance-*.md`, `transport-benchmark-*.md`), `sample-bench-*.md` / `.jsonl`, and `FINAL.md` (definition-of-done). `wok.svg` is the logo.
+Docs describe how Wok works and how to run it. Do not commit plans, proposals, audits, code reviews, or dated benchmark, soak, and lab run reports. Put findings and results in the pull request or issue, and keep only the reusable methodology (how to run and read a benchmark) in these files. `wok.svg` is the logo.
 
 When behavior changes, update the relevant doc in the same change: NIPs → `nips.md` + capabilities; strfry diffs → `known-differences.md`; config keys → `config.md` + `wok.toml`.

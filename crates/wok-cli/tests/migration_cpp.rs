@@ -83,7 +83,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
         wok_db::EnvOptions {
             read_only: true,
             create_dbis: false,
-            ..Default::default()
+            ..wok_db::EnvOptions::for_tests()
         },
     )
     .unwrap();
@@ -92,7 +92,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
         wok_db::EnvOptions {
             read_only: true,
             create_dbis: false,
-            ..Default::default()
+            ..wok_db::EnvOptions::for_tests()
         },
     )
     .unwrap();

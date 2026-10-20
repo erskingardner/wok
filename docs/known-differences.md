@@ -53,6 +53,9 @@ it is not a promise to reproduce upstream bugs.
   - Everything that arrives while the history is sent follows EOSE, as NIP-01
     defines EOSE as the boundary to "events newly received in real-time".
     Pinned strfry sends stored events committed during the scan before EOSE.
+    Clients treat events after EOSE as new, and the stream before EOSE stays
+    strictly newest-first. The cost: a fetch-and-close client that sends
+    CLOSE at EOSE does not get events that arrived during the scan.
   - The held matches are bounded per subscription
     (`relay.max_live_buffer_bytes`). Past the bound, stored events are re-read
     from the database and the oldest ephemeral events are dropped and counted.

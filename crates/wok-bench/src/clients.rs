@@ -3,7 +3,8 @@
 //! The other scenarios turn `[relay.abuse]` and `[relay.auth]` off and send
 //! one REQ at a time, so they cannot say whether a limit refuses real
 //! clients. This scenario keeps both on (or runs a supplied relay TOML) and
-//! models the traffic shapes of the 2026-10-20 client-workload audit:
+//! models the client traffic shapes W1–W10 of the limits plan (tracking issue
+//! #97, whose appendix also defines the C and F finding IDs cited below):
 //!
 //! - outbox clients that open about 30 subscriptions at once (W1): 15
 //!   fetch-and-close (W2–W5), 5 replaced every few seconds (W6) and 10 live
@@ -170,7 +171,7 @@ struct Builder {
 impl Builder {
     /// Unique, shuffled timestamps: 7919 is coprime with SPAN, so the first
     /// SPAN values of `counter * 7919 mod SPAN` are distinct. Unique times keep
-    /// `limit` cuts independent of tie order (audit B2).
+    /// `limit` cuts independent of tie order (see `verify_history`).
     fn ts(&mut self) -> u64 {
         assert!(
             self.counter < SPAN,
@@ -858,7 +859,8 @@ fn event_problem(
 /// checked as a newest-first prefix of the oracle's answer: a relay that
 /// returns the newest `limit` of everything it holds always returns a prefix
 /// of the corpus matches, wherever the published events fall. The prefix is
-/// tie-tolerant because Wok orders equal timestamps by insertion (B2). A
+/// tie-tolerant because Wok orders equal timestamps by insertion, not by
+/// lowest ID as NIP-01 asks. A
 /// history shorter than the filter asks for is `Truncated` when a relay cap
 /// explains it, and a mismatch otherwise.
 fn verify_history(
@@ -1740,7 +1742,7 @@ impl Session {
                 let reason = text(&frame, 1).unwrap_or_default();
                 // Over `max_subs_per_connection` (or without a monitor) Wok
                 // still sends the history, then this NOTICE, then EOSE, and
-                // never delivers live events (audit A9). One req worker
+                // never delivers live events, where NIP-01 asks for CLOSED. One req worker
                 // serves a connection, so the next EOSE is that subscription.
                 if reason.contains("too many concurrent REQs")
                     || reason.contains("monitor unavailable")

@@ -78,11 +78,11 @@ result/limit verification). Use `--scenario <name>` to isolate one scenario.
 
 Every scenario above runs with `[relay.abuse]` and `[relay.auth]` disabled and
 sends one REQ at a time, so none of them can say whether a default limit
-refuses real clients. Wok-only `--scenario clients` keeps both on and models
-the traffic shapes from the 2026-10-20 client-workload audit (W1–W10):
+refuses real clients. Wok-only `--scenario clients` keeps both on. It models
+the client traffic shapes W1–W10 that the limits plan cites
+([#97](https://github.com/erskingardner/wok/issues/97)):
 
-- **Outbox clients** (`--clients`, default 20). Each opens 30 subscriptions at
-  once on connect:
+- **Outbox clients.** Each opens 30 subscriptions at once on connect:
   - 15 fetch-and-close (REQ → EOSE → CLOSE): `authors[follows] ×
     kinds[0,3,10002,10050]` metadata, profile and relay-list lookups, `ids`,
     threads, a 45-filter `#e` reaction batch, notification and feed pages, an
@@ -92,67 +92,46 @@ the traffic shapes from the 2026-10-20 client-workload audit (W1–W10):
   - 10 live: home feed, notifications, NIP-04 and NIP-17 DM inboxes, own
     replaceables, zaps, three open threads and a hashtag.
 
-  Follow lists are log-uniform from 100 to `--max-follows` (default 2,000).
-  Clients AUTH when a DM subscription is answered `auth-required:` and then
-  send it again.
-- **Marmot clients** (`--marmot-clients`, default 4), modelled on MDK:
+  Follow lists are log-uniform from 100 to `--max-follows`. Clients AUTH when
+  a DM subscription is answered `auth-required:` and then send it again.
+- **Marmot clients**, modelled on MDK:
   - an AUTHed receive connection with a `{"kinds":[1059],"#p":[me]}` inbox;
-  - per group (`--marmot-groups`), a live `{"kinds":[445],"#h":[gid]}` and a
-    NIP-77 pass on the same filter (MDK's `limit` 16,385), then `ids` fetches
-    of at most 64 for what the pass reports missing;
+  - per group, a live `{"kinds":[445],"#h":[gid]}` and a NIP-77 pass on the
+    same filter (MDK's `limit` 16,385), then `ids` fetches of at most 64 for
+    what the pass reports missing;
   - an anonymous directory connection with two batches of
     `{"authors":[200],"kinds":[0,10002,10050,30443],"limit":800}`;
   - an anonymous publish connection that sends one add-member burst: a 445
-    commit plus `--marmot-invitees` 1059 gift wraps from throwaway keys,
-    sized like an Add commit and a Welcome for that group. As MDK does, it
-    retries `rate-limited:` publications with backoff and authenticates
-    after `auth-required:`.
-- **Background publishing** (`--publish-rate`, default 20/s over four
-  connections): popular authors' notes, replies to watched threads,
-  reactions to clients' notes, and 445s into the groups.
+    commit plus one 1059 gift wrap per invitee, from throwaway keys, sized
+    like an Add commit and a Welcome for that group. As MDK does, it retries
+    `rate-limited:` publications with backoff and authenticates after
+    `auth-required:`.
+- **Background publishing** over four connections: popular authors' notes,
+  replies to watched threads, reactions to clients' notes, and 445s into the
+  groups.
 
-Each simulated client sends from its own address through `X-Forwarded-For`.
-The trial config sets `relay.real_ip_header` to that header. With
-`--clients-per-address N`, N clients share an address (CGNAT, office NAT).
-With `--clients-per-address 0`, every client uses the bench host's own address.
-Connections negotiate permessage-deflate (`--client-deflate false` turns it
-off) through wok-ws's codec in client mode.
+Each simulated client sends from its own address through `X-Forwarded-For`,
+and the trial config sets `relay.real_ip_header` to that header. Connections
+negotiate permessage-deflate through wok-ws's codec in client mode. The
+scenario imports the `--events` background corpus plus its own deterministic
+corpus (about 30,000 events at the defaults) before it starts the relay.
 
-`--relay-config <wok.toml>` runs against a supplied file instead of the
-built-in defaults; abuse controls and AUTH stay as that file sets them. The
-trial replaces only the database path, bind address and port, the Unix
-socket, the real-IP header and, when it is empty, `relay.auth.service_url`.
-The report lists each override. The scenario imports the `--events`
-background corpus plus its own deterministic corpus (about 30,000 events)
-before starting the relay.
+### Options
 
-Refusals are the measurement. Each `CLOSED`, `OK false`, `NOTICE`, `NEG-ERR`
-and HTTP 429 is grouped by its reason, with digits collapsed. The report names
-the configuration key responsible and lists the subscription classes it
-refused. A history that comes back short with no refusal is reported as
-silently truncated when `max_filter_limit` or `max_total_events_per_req`
-explains the cut. Any other short history fails the trial. Per class, the report gives time to first EVENT and time
-to EOSE (for NIP-77, to the first reply and to completion), OK latency for
-publications, and publish-to-delivery latency, each at p50 and p99.
-
-Correctness still decides `ok`, as in every other scenario:
-
-- every history must be the newest events of an independent oracle over the
-  imported corpus, allowing for events published during the run;
-- no restricted event may reach a connection that is not its recipient,
-  checked as each EVENT arrives, including for subscriptions later refused;
-- every live subscription must receive each accepted, matching event
-  published after its EOSE;
-- each NIP-77 pass must report exactly the corpus events the client lacked,
-  plus only 445s published into that group, and none it already holds.
-
-A subscription that Wok refuses with a NOTICE just before its EOSE (over
-`max_subs_per_connection`) is counted as refused and left out of the
-live-delivery check.
-
-`--expect-no-refusals` also fails the trial on any refusal. That flag is the
-acceptance check for proposed defaults
-([configuration presets proposal](config-presets-proposal.md) §6, PR #89).
+| Option | Default | Meaning |
+|---|---:|---|
+| `--relay-config <wok.toml>` | built-in defaults | Relay file to run. Abuse controls and AUTH stay as it sets them. The trial replaces only the database path, bind address and port, the Unix socket, the real-IP header and, when it is empty, `relay.auth.service_url`; the report lists each override |
+| `--clients` | 20 | Outbox clients |
+| `--max-follows` | 2,000 | Largest outbox follow list |
+| `--marmot-clients` | 4 | Marmot clients (three connections each) |
+| `--marmot-groups` | 10 | Groups per Marmot client |
+| `--marmot-invitees` | 10 | Gift wraps per add-member burst |
+| `--clients-duration-secs` | 15 | Activity before a 2 s delivery drain |
+| `--replace-interval-ms` | 3,000 | Interval between re-REQs of each replaced subscription |
+| `--publish-rate` | 20 | Background publications per second (0 turns them off) |
+| `--clients-per-address` | 1 | Clients per source address, e.g. 4 for CGNAT; 0 sends every client from the bench host's own address |
+| `--client-deflate` | `true` | Offer permessage-deflate |
+| `--expect-no-refusals` | off | Fail the trial on any refusal. This is the acceptance check for proposed defaults in #97 |
 
 ```bash
 cargo build --release -p wok-cli -p wok-bench
@@ -161,10 +140,51 @@ cargo build --release -p wok-cli -p wok-bench
   --marmot-groups 50 --marmot-invitees 100 [--relay-config preset.toml]
 ```
 
+### Reading the output
+
+Refusals are the measurement. Each `CLOSED`, `OK false`, `NOTICE`, `NEG-ERR`
+and HTTP 429 is grouped by its reason, with digits collapsed.
+
+`summary.md` has one section per trial with two tables:
+
+- **Classes.** One row per subscription or publication class. The W1–W6
+  classes are named after the traffic shape they model, for example
+  `w2.metadata`, `live.home_feed` and `marmot.neg`. Each row gives:
+  - how many requests were sent, completed and refused;
+  - how many histories were truncated;
+  - events received in history and live;
+  - p50 and p99 of time to first EVENT and of time to done.
+
+  "Done" is EOSE for subscriptions, completion for NIP-77, OK for
+  publications, completion for a whole burst, and publish-to-receipt for
+  `delivery.*`.
+- **Refusals.** One row per reason, with the configuration key responsible
+  and the classes it refused.
+
+A history that comes back short with no refusal is reported as truncated
+when `max_filter_limit` or `max_total_events_per_req` explains the cut. Any
+other short history fails the trial. `results.jsonl` holds the same data in
+each trial's `clients` field, for comparing a change against an earlier run.
+
+Correctness still decides `ok`, as in every other scenario:
+
+- every history must be the newest events of an independent oracle over the
+  imported corpus, allowing for events published during the run;
+- no restricted event may reach a connection that is not its recipient. This
+  is checked as each EVENT arrives, including on subscriptions refused later;
+- every live subscription must receive each accepted, matching event
+  published after its EOSE;
+- each NIP-77 pass must report exactly the corpus events the client lacked,
+  plus only 445s published into that group, and none it already holds.
+
+A subscription that Wok refuses with a NOTICE just before its EOSE (over
+`max_subs_per_connection`) is counted as refused and left out of the
+live-delivery check. Wok's monitor also sends events committed during a scan
+just before EOSE, so a history may hold more than `limit` events; only its
+stored part is bounded by `limit`.
+
 CI runs a small version as a unit test against an in-process relay with
-default limits (`clients::tests`). The
-[2026-10-20 baseline](benchmark-clients-baseline-2026-10-20.md) records
-today's refusals.
+default limits (`clients::tests`).
 
 ## Portable Docker lab
 

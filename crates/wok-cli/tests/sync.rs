@@ -55,6 +55,14 @@ fn cli(config: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 fn import(config: &Path, events: &[Value]) {
+    let output = import_output(config, events);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+fn import_output(config: &Path, events: &[Value]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_wok"))
         .arg("--config")
         .arg(config)
@@ -71,12 +79,7 @@ fn import(config: &Path, events: &[Value]) {
             writeln!(input, "{}", wok_event::json::to_tao_string(event)).unwrap();
         }
     }
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    child.wait_with_output().unwrap()
 }
 struct Server {
     handle: wok_relay::RelayHandle,
@@ -455,6 +458,245 @@ fn import_failure_is_nonzero_and_logging_does_not_contaminate_exports() {
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
         good
+    );
+}
+
+type Client =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn subscribe(ws: &mut Client, sub: &str, filter: Value) {
+    ws.send(Message::Text(
+        json!(["REQ", sub, filter]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(recv(ws).await, json!(["EOSE", sub]));
+}
+
+/// A peer that offers `events` over NIP-77 and answers every REQ with them,
+/// like a strfry relay that stored them.
+async fn serving_peer(events: Vec<Value>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut vector = wok_negentropy::Vector::new();
+        for event in &events {
+            vector
+                .insert(
+                    event["created_at"].as_u64().unwrap(),
+                    &hex::decode(event["id"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap();
+        }
+        vector.seal().unwrap();
+        let mut negentropy = wok_negentropy::Negentropy::new(vector, 60_000).unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let message: Value = serde_json::from_str(&text).unwrap();
+            let replies: Vec<Value> = match message[0].as_str().unwrap() {
+                "NEG-OPEN" | "NEG-MSG" => {
+                    let payload = if message[0] == "NEG-OPEN" {
+                        &message[3]
+                    } else {
+                        &message[2]
+                    };
+                    let response = negentropy
+                        .reconcile(&hex::decode(payload.as_str().unwrap()).unwrap())
+                        .unwrap();
+                    vec![json!(["NEG-MSG", message[1], hex::encode(response)])]
+                }
+                "REQ" => events
+                    .iter()
+                    .map(|event| json!(["EVENT", message[1], event]))
+                    .chain([json!(["EOSE", message[1]])])
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for reply in replies {
+                ws.send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    (url, task)
+}
+
+struct KillOnDrop(std::process::Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_events_from_import_sync_and_router_are_neither_stored_nor_delivered() {
+    // NIP-42: relays MUST exclude kind 22242 from broadcast. These writers
+    // skip EVENT ingest, and the relay delivers their commits to live
+    // subscribers through its DB-change monitor.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(
+        dir.path(),
+        "[events]\nephemeral_persistence=\"ttl\"\n[relay.auth]\nenabled=false\n",
+    );
+    let server = serve(&cfg).await;
+    let (mut by_kind, _) = tokio_tungstenite::connect_async(&server.url).await.unwrap();
+    subscribe(&mut by_kind, "auth", json!({"kinds": [22242]})).await;
+    subscribe(&mut by_kind, "marker", json!({"kinds": [1]})).await;
+    let (mut everything, _) = tokio_tungstenite::connect_async(&server.url).await.unwrap();
+    subscribe(&mut everything, "everything", json!({})).await;
+    // Each AUTH event is older than its marker and commits with it, so it
+    // would be delivered first on the same connection.
+    let feed = || {
+        let auth = sign(
+            json!({
+                "kind": 22242,
+                "created_at": now() - 2,
+                "tags": [["relay", server.url], ["challenge", "replayed"]],
+                "content": "",
+            }),
+            &key(),
+        );
+        (auth, event(1))
+    };
+
+    let (auth, marker) = feed();
+    let output = import_output(&cfg, &[auth, marker.clone()]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("kind 22242 AUTH events are never stored")
+    );
+    assert_eq!(recv(&mut by_kind).await, json!(["EVENT", "marker", marker]));
+    assert_eq!(
+        recv(&mut everything).await,
+        json!(["EVENT", "everything", marker])
+    );
+
+    let (auth, marker) = feed();
+    let (url, peer) = serving_peer(vec![auth, marker.clone()]).await;
+    let output = sync(&cfg, &url, &["--dir", "down", "--json"]);
+    assert!(!output.status.success());
+    let report = summary(&output);
+    assert_eq!(
+        (report["written"].as_u64(), report["rejected"].as_u64()),
+        (Some(1), Some(1))
+    );
+    peer.await.unwrap();
+    assert_eq!(recv(&mut by_kind).await, json!(["EVENT", "marker", marker]));
+    assert_eq!(
+        recv(&mut everything).await,
+        json!(["EVENT", "everything", marker])
+    );
+
+    let (auth, marker) = feed();
+    let (url, peer) = serving_peer(vec![auth, marker.clone()]).await;
+    let routes = dir.path().join("router.conf");
+    std::fs::write(
+        &routes,
+        format!("streams {{\n  peer {{\n    dir = \"down\"\n    urls = [\"{url}\"]\n  }}\n}}\n"),
+    )
+    .unwrap();
+    let router = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_wok"))
+            .arg("--config")
+            .arg(&cfg)
+            .arg("router")
+            .arg(&routes)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(recv(&mut by_kind).await, json!(["EVENT", "marker", marker]));
+    assert_eq!(
+        recv(&mut everything).await,
+        json!(["EVENT", "everything", marker])
+    );
+    drop(router);
+    peer.await.unwrap();
+
+    let exported = cli(&cfg, &["export"]);
+    assert!(exported.status.success());
+    let kinds: Vec<u64> = String::from_utf8(exported.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["kind"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(kinds, [1, 1, 1]);
+}
+
+#[test]
+fn operators_can_reindex_scan_and_delete_a_stored_auth_event() {
+    // `wok import` refuses kind 22242, but `wok migrate strfry` or another
+    // writer can leave one stored. Clients never see it; operator tools must.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "");
+    let note = event(1);
+    import(&cfg, std::slice::from_ref(&note));
+    let auth = sign(
+        json!({"kind":22242,"created_at":now(),"tags":[["challenge","migrated"]],"content":""}),
+        &key(),
+    );
+    {
+        let env = wok_db::Env::open(
+            dir.path().join("db"),
+            wok_db::EnvOptions {
+                map_size: 67108864,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = wok_event::parse_and_verify_event(
+            &auth,
+            &wok_event::EventLimits::default(),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let mut events = vec![wok_db::EventToWrite::new(
+            parsed.packed.into_bytes(),
+            parsed.json,
+        )];
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+    }
+    // A rebuilt tree must still match the physical records doctor counts.
+    let output = cli(&cfg, &["reindex", "--confirm-relay-stopped"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = cli(&cfg, &["doctor", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = cli(&cfg, &["scan", "{\"kinds\":[22242]}"]);
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        auth
+    );
+    let output = cli(&cfg, &["delete", "--filter", "{\"kinds\":[22242]}"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = cli(&cfg, &["export"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        note
     );
 }
 

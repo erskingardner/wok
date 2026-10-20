@@ -2528,6 +2528,7 @@ fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::
         restrictor: restrictor(cfg),
         identities,
         ephemeral_lifetime_secs: Some(cfg.events.ephemeral_lifetime_secs),
+        include_auth_events: false,
     }
 }
 

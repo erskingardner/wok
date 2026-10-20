@@ -1046,12 +1046,43 @@ impl DbQuery {
     }
 }
 
+/// Records matching `filter`, for operator tools that address stored records
+/// (`wok scan`, `wok delete`, `wok dict`, `wok reindex`). Global visibility
+/// applies, but kind 22242 AUTH events, hidden from clients, are included.
 pub fn foreach_by_filter<F>(
     txn: &RoTxn<'_>,
     filter: &serde_json::Value,
     max_limit: u64,
     max_tags: usize,
     max_and_entries: usize,
+    cb: F,
+) -> Result<(), crate::subid::QueryError>
+where
+    F: FnMut(u64),
+{
+    let visibility = ReadVisibility {
+        include_auth_events: true,
+        ..ReadVisibility::default()
+    };
+    foreach_visible_by_filter(
+        txn,
+        filter,
+        max_limit,
+        max_tags,
+        max_and_entries,
+        visibility,
+        cb,
+    )
+}
+
+/// Records matching `filter` that `visibility` lets a reader see.
+pub fn foreach_visible_by_filter<F>(
+    txn: &RoTxn<'_>,
+    filter: &serde_json::Value,
+    max_limit: u64,
+    max_tags: usize,
+    max_and_entries: usize,
+    visibility: ReadVisibility,
     mut cb: F,
 ) -> Result<(), crate::subid::QueryError>
 where
@@ -1061,6 +1092,7 @@ where
         crate::filter::NostrFilterGroup::from_value(filter, max_limit, max_tags, max_and_entries)?;
     let sub = Subscription::new(1, crate::subid::SubId::new(".").unwrap(), fg, false);
     let mut q = DbQuery::new(sub, 0, 0);
+    q.visibility = visibility;
     q.process(txn, |_, lev| cb(lev), u64::MAX)
         .map_err(|e| crate::subid::QueryError::msg(e.to_string()))?;
     Ok(())

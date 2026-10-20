@@ -1456,6 +1456,37 @@ fn reindex_restores_long_tag_values_to_legacy_records() {
     assert_eq!(stored_records(&again), after);
 }
 
+#[test]
+fn reindex_deletes_under_long_addresses_spelled_with_a_padded_kind() {
+    // `a` tags accept a kind with leading zeros. The write path deletes the
+    // versions such a tag names, and reindex must too, not fail.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    let d = "x".repeat(300);
+    let version = event(&key, 30000, 100, json!([["d", &d]]), "version");
+    let deletion = event(
+        &key,
+        5,
+        200,
+        json!([["a", format!("030000:{pubkey}:{d}")]]),
+        "",
+    );
+
+    let (_dir, env) = snapshot(std::slice::from_ref(&version));
+    assert_eq!(
+        write_with_quota(&env, &deletion, 0, true),
+        wok_db::EventWriteStatus::Written
+    );
+    assert_eq!(stored_ids(&env), ids(std::slice::from_ref(&deletion)));
+
+    let (_dir, env) = snapshot_records(&[legacy_packing(&version), legacy_packing(&deletion)]);
+    let (_repaired_dir, repaired, stats) = reindex(&env);
+    assert_eq!(stats.deleted_versions, BTreeSet::from([1]));
+    assert_eq!(stored_ids(&repaired), ids(&[deletion]));
+    let report = wok_db::check_integrity(&repaired.begin_ro().unwrap()).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+}
+
 /// Rebuild `source` as `wok reindex` does, repacking long tag values.
 fn reindex(source: &Env) -> (TempDir, Env, wok_db::ReindexStats) {
     let dir = tempfile::tempdir().unwrap();

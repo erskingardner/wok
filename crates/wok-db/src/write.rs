@@ -471,74 +471,6 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
     Ok(lev_id)
 }
 
-/// Whether a deletion request tombstones the address of the addressable event
-/// `packed`, whose first `d` value as packed is `d`, at or after its
-/// `created_at`, so that it is refused on arrival.
-fn address_tombstoned(
-    txn: &RwTxn<'_>,
-    packed: PackedEventView<'_>,
-    json: &str,
-    d: &[u8],
-) -> Result<bool, DbError> {
-    // Hash the raw d-tag bytes, like C++ (no UTF-8 round-trip).
-    // A deletion hashes the whole a tag, so a hashed d needs
-    // its original value.
-    let d_tag = original_tag_value(json, "d", d)?;
-    let mut a_tag = Vec::with_capacity(24 + 64 + 1 + d_tag.len());
-    a_tag.extend_from_slice(packed.kind().to_string().as_bytes());
-    a_tag.push(b':');
-    a_tag.extend_from_slice(to_hex(packed.pubkey()).as_bytes());
-    a_tag.push(b':');
-    a_tag.extend_from_slice(&d_tag);
-    let search_str = sha256(&a_tag);
-    let search_key = make_key_string_u64(&search_str, u64::MAX);
-    let mut tombstoned = false;
-    let mut scan_err: Option<DbError> = None;
-    txn.foreach_full(
-        txn.env().dbis().event_replace_deletion,
-        &search_key,
-        &u64::MAX.to_ne_bytes(),
-        true,
-        |k, _v| {
-            // C++ ParsedKey_StringUint64 throws on malformed keys.
-            match parse_key_string_u64(k) {
-                Ok((s, n)) => {
-                    if s != search_str.as_slice() {
-                        return false;
-                    }
-                    if n >= packed.created_at() {
-                        tombstoned = true;
-                    }
-                }
-                Err(e) => {
-                    scan_err = Some(e);
-                }
-            }
-            false
-        },
-    )?;
-    if let Some(e) = scan_err {
-        return Err(e);
-    }
-    Ok(tombstoned)
-}
-
-/// Whether [`write_events`] would refuse the stored version `packed` because a
-/// deletion request tombstones its address.
-pub(crate) fn version_tombstoned(
-    txn: &RwTxn<'_>,
-    packed: PackedEventView<'_>,
-    json: &str,
-) -> Result<bool, DbError> {
-    if !is_param_replaceable_kind(packed.kind()) {
-        return Ok(false);
-    }
-    match packed.first_d_tag() {
-        Some(d) => address_tombstoned(txn, packed, json, &d),
-        None => Ok(false),
-    }
-}
-
 /// Push to `lev_ids` each stored version that the `a` tag value `tag_val` of
 /// the deletion request `deletion` deletes: every version of the addressable
 /// event it names, when the request's author published it, up to the
@@ -784,11 +716,47 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                     lev_ids_to_delete.extend(candidates);
                 }
 
-                if is_param_replaceable_kind(packed.kind())
-                    && *status == EventWriteStatus::Pending
-                    && address_tombstoned(txn, packed, json, &replace)?
+                if is_param_replaceable_kind(packed.kind()) && *status == EventWriteStatus::Pending
                 {
-                    *status = EventWriteStatus::Deleted;
+                    // Hash the raw d-tag bytes, like C++ (no UTF-8 round-trip).
+                    // A deletion hashes the whole a tag, so a hashed d needs
+                    // its original value.
+                    let d_tag = original_tag_value(json, "d", &replace)?;
+                    let mut a_tag = Vec::with_capacity(24 + 64 + 1 + d_tag.len());
+                    a_tag.extend_from_slice(packed.kind().to_string().as_bytes());
+                    a_tag.push(b':');
+                    a_tag.extend_from_slice(to_hex(packed.pubkey()).as_bytes());
+                    a_tag.push(b':');
+                    a_tag.extend_from_slice(&d_tag);
+                    let search_str = sha256(&a_tag);
+                    let search_key = make_key_string_u64(&search_str, u64::MAX);
+                    let mut scan_err: Option<DbError> = None;
+                    txn.foreach_full(
+                        txn.env().dbis().event_replace_deletion,
+                        &search_key,
+                        &u64::MAX.to_ne_bytes(),
+                        true,
+                        |k, _v| {
+                            // C++ ParsedKey_StringUint64 throws on malformed keys.
+                            match parse_key_string_u64(k) {
+                                Ok((s, n)) => {
+                                    if s != search_str.as_slice() {
+                                        return false;
+                                    }
+                                    if n >= packed.created_at() {
+                                        *status = EventWriteStatus::Deleted;
+                                    }
+                                }
+                                Err(e) => {
+                                    scan_err = Some(e);
+                                }
+                            }
+                            false
+                        },
+                    )?;
+                    if let Some(e) = scan_err {
+                        return Err(e);
+                    }
                 }
             }
         }

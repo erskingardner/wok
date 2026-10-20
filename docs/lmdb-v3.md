@@ -129,8 +129,8 @@ report and the event fingerprint, then renames the original to a retained
 backup and atomically promotes the staged directory. When it repacks records,
 the fingerprint it verifies leaves out hashed tag values, which are the only
 bytes a repack adds; otherwise the full fingerprint must be unchanged. When it
-deletes versions, it compares against the original's fingerprint without them,
-and a tombstone in the result must refuse each one. The manifest records the
+deletes versions, it compares against the original's fingerprint without
+exactly those records, each of which must be stored. The manifest records the
 fingerprints of the original and of the result, how many records were
 repacked and skipped, and how many versions were deleted
 (`deleted_under_repaired_deletions`). It preserves a valid sequence, including

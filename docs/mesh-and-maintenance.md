@@ -73,9 +73,9 @@ the repack. Deletion requests whose `a` tags are 255 bytes or shorter are not
 applied again. The outcome and manifest count the deleted versions as
 `deleted_under_repaired_deletions`, and the original database in the backup
 still holds them. Verification accounts for them explicitly: the result must
-match the original's fingerprint without those versions, and a tombstone in
-the result must refuse each of them. Nothing else changes: removing the hashed
-values from a repacked record gives its previous bytes back.
+match the original's fingerprint without exactly those versions. Nothing else
+changes: removing the hashed values from a repacked record gives its previous
+bytes back.
 See [lmdb-v3.md](lmdb-v3.md#packedevent).
 
 ## Outbound connections

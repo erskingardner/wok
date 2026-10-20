@@ -2,9 +2,7 @@
 //! event secondary index from PackedEvent again.
 
 use crate::long_tags::{long_tag_packing, LongTagPacking};
-use crate::write::{
-    delete_event_basic, event_index_entries, long_address_deletions, version_tombstoned,
-};
+use crate::write::{delete_event_basic, event_index_entries, long_address_deletions};
 use crate::{index_event_search, payload::Decompressor, search::initialize_search_index_state};
 use crate::{DbError, RoTxn, RwTxn};
 use std::borrow::Cow;
@@ -293,16 +291,8 @@ fn delete_versions_under_long_addresses(
     let mut index_entries = 0u64;
     for &lev_id in &lev_ids {
         let version = stored(target, lev_id)?;
-        let view = PackedEventView::new(&version)?;
-        let json = payload_json(source, decompressor, lev_id)?;
-        // The tombstone that refuses such a version on arrival must cover
-        // every version deleted here.
-        if !version_tombstoned(target, view, &json)? {
-            return Err(DbError::msg(format!(
-                "levId {lev_id}: no deletion request tombstones the version to delete"
-            )));
-        }
-        index_entries += event_index_entries(dbis, lev_id, view).len() as u64;
+        index_entries +=
+            event_index_entries(dbis, lev_id, PackedEventView::new(&version)?).len() as u64;
         if !delete_event_basic(target, lev_id)? {
             return Err(DbError::msg(format!("event {lev_id} has no payload")));
         }

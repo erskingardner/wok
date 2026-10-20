@@ -48,7 +48,9 @@ incoming stale event is rejected against the global winner, independent of
 local insertion order. NIP-09 `a`-tag deletions of addressable events, and of
 replaceable events (named `<kind>:<pubkey>:`, with an empty `d`), remove every
 matching version at or before the deletion timestamp, preserving newer
-versions, and refuse such versions that arrive later.
+versions, and refuse such versions that arrive later. A deletion `a` tag whose
+kind has leading zeros is refused with `invalid:`, so every tombstone is found
+by the canonical spelling of its address.
 
 Persistent negentropy trees represent physical storage. A transactional count
 of retained superseded versions keeps clean databases on the persistent-tree

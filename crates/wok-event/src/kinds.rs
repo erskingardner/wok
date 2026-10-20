@@ -50,6 +50,18 @@ pub fn parse_a_tag(input: &str) -> Result<(u64, [u8; 32], String), EventError> {
     Ok((kind, pk, d_tag))
 }
 
+/// Parse an `a` tag like [`parse_a_tag`], with the kind also written in
+/// canonical decimal, without leading zeros. Wok tombstones an address by the
+/// hash of its canonical spelling, so a deletion naming `030000:<pubkey>:<d>`
+/// would delete the stored versions but not refuse later ones.
+pub fn parse_canonical_a_tag(input: &str) -> Result<(u64, [u8; 32], String), EventError> {
+    let address = parse_a_tag(input)?;
+    if input.starts_with('0') && !input.starts_with("0:") {
+        return Err(EventError::msg("a tag kind has leading zeros"));
+    }
+    Ok(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +103,29 @@ mod tests {
         assert!(parse_a_tag(&format!(" 30023:{pk}:")).is_err());
         assert!(parse_a_tag(&format!("65536:{pk}:")).is_err());
         assert!(parse_a_tag(&format!("30023:{}:", pk.to_uppercase())).is_err());
+    }
+
+    #[test]
+    fn canonical_a_tag_kinds_have_no_leading_zeros() {
+        let pk = "aa".repeat(32);
+        for address in [
+            format!("0:{pk}:"),
+            format!("10002:{pk}:"),
+            format!("30023:{pk}:d"),
+        ] {
+            assert_eq!(
+                parse_canonical_a_tag(&address).unwrap(),
+                parse_a_tag(&address).unwrap()
+            );
+        }
+        for address in [
+            format!("00:{pk}:"),
+            format!("010002:{pk}:"),
+            format!("030023:{pk}:d"),
+        ] {
+            assert!(parse_a_tag(&address).is_ok());
+            assert!(parse_canonical_a_tag(&address).is_err(), "{address}");
+        }
+        assert!(parse_canonical_a_tag(&format!("+30023:{pk}:")).is_err());
     }
 }

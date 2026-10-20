@@ -14,8 +14,8 @@ use lmdb_sys::{MDB_dbi, MDB_APPEND, MDB_NOOVERWRITE};
 use std::collections::HashMap;
 use wok_event::{
     hashed_tag_value_digest, indexed_tag_value, is_event_a_before_event_b,
-    is_param_replaceable_kind, is_replaceable_kind, parse_a_tag, sha256, to_hex, PackedEventView,
-    DELETION_KIND, GIFT_WRAP_KINDS, MAX_INDEXED_TAG_VAL_SIZE,
+    is_param_replaceable_kind, is_replaceable_kind, parse_a_tag, parse_canonical_a_tag, sha256,
+    to_hex, PackedEventView, DELETION_KIND, GIFT_WRAP_KINDS, MAX_INDEXED_TAG_VAL_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,12 +230,20 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
                 idx.replace_deletion
                     .push(make_key_string_u64(digest, packed.created_at()));
             } else if let Ok(val) = std::str::from_utf8(tag_val) {
+                // The tombstone is the hash of the tag as written, and events
+                // look up the canonical spelling of their address. Ingest
+                // refuses kinds with leading zeros. An addressable kind spelled
+                // that way, which strfry and earlier releases stored, derives
+                // its entry as before; it never matches.
                 if let Ok((kind, pubkey, d)) = parse_a_tag(val) {
                     if pubkey.as_slice() == packed.pubkey() {
                         let key = make_key_string_u64(&sha256(tag_val), packed.created_at());
                         if is_param_replaceable_kind(kind) {
                             idx.replace_deletion.push(key);
-                        } else if is_replaceable_kind(kind) && d.is_empty() {
+                        } else if is_replaceable_kind(kind)
+                            && d.is_empty()
+                            && parse_canonical_a_tag(val).is_ok()
+                        {
                             idx.replaceable_deletion.push(key);
                         }
                     }
@@ -498,7 +506,8 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
 /// or replaceable event it names, when the request's author published it, up
 /// to the request's `created_at`. A replaceable event's address has an empty
 /// `d` (`<kind>:<pubkey>:`). `long_addresses` maps each hashed value to its
-/// original. Other addresses delete nothing.
+/// original. Other addresses, and kinds spelled with leading zeros, delete
+/// nothing, as their tombstones refuse nothing.
 fn push_address_deletions(
     txn: &RwTxn<'_>,
     deletion: PackedEventView<'_>,
@@ -510,7 +519,7 @@ fn push_address_deletions(
         Some(digest) => long_addresses.get(digest).map(String::as_str),
         None => std::str::from_utf8(tag_val).ok(),
     };
-    let Some((kind, pubkey, d_tag)) = address.and_then(|s| parse_a_tag(s).ok()) else {
+    let Some((kind, pubkey, d_tag)) = address.and_then(|s| parse_canonical_a_tag(s).ok()) else {
         return Ok(());
     };
     let replaces =

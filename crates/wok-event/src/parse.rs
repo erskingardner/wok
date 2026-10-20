@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::kinds::{
-    is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag,
+    is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_canonical_a_tag,
 };
 use crate::packed::{indexed_tag_value, PackedEvent, PackedEventBuilder, PackedEventTagBuilder};
 use crate::{EventError, MAX_INDEXED_TAG_VAL_SIZE};
@@ -226,8 +226,9 @@ pub fn nostr_json_to_packed_event(
                 }
                 continue;
             } else if tag_name == "a" && kind == 5 {
-                let (tag_kind, tag_pubkey, _d) = parse_a_tag(tag_val)?;
-                let _ = tag_kind;
+                // Deletions name addresses as NIP-01 writes them, so their
+                // tombstones are found by the canonical spelling.
+                let (_, tag_pubkey, _) = parse_canonical_a_tag(tag_val)?;
                 if tag_pubkey.as_slice() != pubkey.as_slice() {
                     return Err(EventError::msg("can't delete other user's events"));
                 }
@@ -373,6 +374,34 @@ mod tests {
         });
         let packed = nostr_json_to_packed_event(&v, &EventLimits::default()).unwrap();
         assert_eq!(packed.view().first_d_tag().unwrap(), b"");
+    }
+
+    #[test]
+    fn deletion_a_tags_need_canonical_kinds() {
+        let pubkey = "22".repeat(32);
+        let deletion = |address: String| {
+            json!({
+                "id": "11".repeat(32),
+                "pubkey": pubkey,
+                "created_at": 1,
+                "kind": 5,
+                "content": "",
+                "tags": [["a", address]],
+                "sig": "00".repeat(64),
+            })
+        };
+        let limits = EventLimits::default();
+        for address in [format!("0:{pubkey}:"), format!("30000:{pubkey}:d")] {
+            nostr_json_to_packed_event(&deletion(address), &limits).unwrap();
+        }
+        for address in [format!("00:{pubkey}:"), format!("030000:{pubkey}:d")] {
+            let error = nostr_json_to_packed_event(&deletion(address), &limits).unwrap_err();
+            assert_eq!(error.to_string(), "a tag kind has leading zeros");
+        }
+        // Other events may reference an address however they spell it.
+        let mut reference = deletion(format!("030000:{pubkey}:d"));
+        reference["kind"] = json!(1);
+        nostr_json_to_packed_event(&reference, &limits).unwrap();
     }
 
     #[test]

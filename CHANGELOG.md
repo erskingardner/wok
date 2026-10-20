@@ -185,6 +185,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests already stored, including those migrated from strfry, gain their
   tombstones from `wok reindex`; until then `wok doctor` warns
   (`replaceable-tombstones`).
+- A deletion `a` tag whose kind has leading zeros (`030000:<pubkey>:<d>`) is
+  refused with `invalid: a tag kind has leading zeros`. It deleted the stored
+  versions of the address, but its tombstone never refused later ones.
 - A kind 22242 AUTH event sent with EVENT is refused with
   `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
   to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.

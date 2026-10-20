@@ -104,6 +104,9 @@ for each `a` tag that names an address of its own author: an addressable kind
 `<kind>:<pubkey>:`. A writer refuses an addressable or replaceable event when
 the hash of its own canonical `a` tag has an entry at or after its
 `created_at`. strfry, and Wok 0.7.0 and earlier, index addressable kinds only.
+Ingest refuses a deletion `a` tag whose kind has leading zeros. A stored one
+keeps the entry its spelling derives, which no lookup matches, and deleting by
+it removes nothing.
 
 Deletion requests that strfry or an earlier Wok release stored therefore lack
 the entries of replaceable addresses. Integrity accepts their absence, so

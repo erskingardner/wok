@@ -128,6 +128,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A kind 22242 AUTH event sent with EVENT is refused with
   `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
   to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.
+- Event ids are checked against the NIP-01 preimage, which includes U+007F
+  (DEL) verbatim. Events with DEL in a tag or content, signed by go-nostr,
+  nostr-tools or anything built on serde_json, were refused with
+  `invalid: bad event id` because Wok, like strfry, escaped it as `\u007f`.
+  Stored payloads keep that escaping. `wok import`, `wok sync` and
+  `wok router` downloads also accept the legacy id, so data from strfry and
+  earlier Wok releases still verifies.
 
 ## [0.7.0] - 2026-09-08
 

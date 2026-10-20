@@ -76,10 +76,9 @@ it is not a promise to reproduce upstream bugs.
 
 ## Compatibility-sensitive behavior retained
 
-- Canonical event serialization rejects duplicate object keys, escapes U+007F,
-  and uses the established floating-point formatting. These choices affect
-  event ID calculation and migrated stored bytes, so they cannot be casually
-  changed.
+- Canonical stored event serialization rejects duplicate object keys, escapes
+  U+007F, and uses the established floating-point formatting. These choices
+  affect migrated stored bytes, so they cannot be casually changed.
 - The initial Wok v4 database retains the v3 PackedEvent, payload, index, and
   negentropy layouts. This makes the first migration lossless, but is not a
   commitment that later Wok versions retain those internal layouts.
@@ -157,3 +156,16 @@ regression test. Differential parity alone is not a reason to retain it.
   `invalid: AUTH events must be sent with AUTH`, and is neither stored nor
   broadcast. The pinned strfry accepts it like any ephemeral event and
   delivers it to matching subscriptions, which NIP-42 forbids.
+- NIP-01 event ids are hashed over the NIP-01 preimage, which includes U+007F
+  verbatim like go-nostr, nostr-tools and serde_json. strfry's tao serializer
+  escapes it as `\u007f`, so a correctly signed event containing DEL was
+  refused with `invalid: bad event id`. Stored payloads keep tao escaping, which
+  is valid JSON for the same string. A published EVENT, AUTH or NIP-98 event
+  must use the NIP-01 id. `wok import` (with verification), `wok sync` and
+  `wok router` downloads also accept the legacy tao preimage, because strfry
+  and earlier Wok releases stored events under it. Accepting both cannot give
+  two different events one id: the preimages agree unless the event contains
+  DEL, and then the NIP-01 preimage has a raw DEL byte that a tao preimage
+  never has. Integrity checks, `wok migrate strfry` and `wok doctor` never
+  rehash ids, so migrated data is unaffected. A Wok relay refuses legacy-id
+  events that `wok sync` uploads to it, because uploads are EVENTs.

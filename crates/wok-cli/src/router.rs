@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use wok_db::{Decompressor, Env, EventToWrite};
-use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
+use wok_event::{parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView};
 use wok_query::NostrFilterGroup;
 use wok_relay::plugin::{PluginEventSifter, PluginResult};
 use wok_relay::Config;
@@ -651,7 +651,15 @@ fn flush_router_batch(env: &Env, cfg: &Config, batch: &mut Vec<Value>) -> Result
     for v in batch.drain(..) {
         let policy = cfg
             .timestamp_policy_for_kind(v.get("kind").and_then(Value::as_u64).unwrap_or(u64::MAX));
-        match parse_and_verify_event(&v, &limits, Some(&policy), true, true) {
+        // Events relayed from strfry or earlier Wok relays may carry legacy ids.
+        match parse_and_verify_event_with(
+            &v,
+            &limits,
+            Some(&policy),
+            true,
+            true,
+            IdPreimage::Nip01OrLegacy,
+        ) {
             Ok(p) => evs.push(EventToWrite::new(p.packed.into_bytes(), p.json)),
             Err(e) => tracing::warn!("router: downloaded event rejected: {e}"),
         }

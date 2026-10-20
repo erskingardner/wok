@@ -25,8 +25,8 @@ compatibility requirements.
 - New databases use Wok v5. Writable open upgrades Wok v4 atomically; read-only
   inspection does not upgrade. strfry import always requires `wok migrate strfry`.
 - Event IDs, signatures, tags, content, and stored payloads survive migration
-  unchanged. Strict parsing and tao-compatible JSON encoding belong to
-  `wok_event::json`.
+  unchanged. Strict parsing, tao-compatible stored JSON and the NIP-01 id
+  preimage belong to `wok_event::json`.
 - ID and author filters require exact 32-byte values. Advertised NIPs need
   observable behavior and conformance coverage.
 - REQ, COUNT, live delivery, and negentropy share visibility rules. AUTH can add

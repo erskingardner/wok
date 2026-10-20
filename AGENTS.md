@@ -44,7 +44,7 @@ clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicate
 - Tokio owns network I/O only. LMDB transactions, cursors, and mmap slices must never cross `.await`.
 - One application-level LMDB writer; worker pools per stage (`numThreads.*`).
 - New databases use Wok v5. strfry v3 is accepted only by `wok migrate strfry`. Never mix writers.
-- Event identity (id, sig, tags, content, stored payload) is preserved across migration. Hashing and stored JSON go through `wok_event::json` (`parse_strict` / `to_tao_string`), not stock `serde_json`.
+- Event identity (id, sig, tags, content, stored payload) is preserved across migration. Parsing and stored JSON go through `wok_event::json` (`parse_strict` / `to_tao_string`), not stock `serde_json`. Event ids use the NIP-01 preimage (`wok_event::event_id_hash`, U+007F verbatim); only paths that ingest stored events (import, sync, router) also accept the legacy tao preimage (`IdPreimage::Nip01OrLegacy`).
 - ID and author filters are exact 32-byte values. Prefix filters are rejected.
 - Advertise only NIPs with observable relay behavior and conformance coverage (`wok-relay` capabilities catalog).
 - Safe crates `forbid(unsafe_code)`. LMDB/OS FFI is isolated and documented (`wok-db` env/txn, `wok-cli` doctor/migrate, `wok-relay` rlimit).

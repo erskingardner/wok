@@ -1,9 +1,10 @@
 //! Non-ASCII event id interop. The NIP-01 id preimage is UTF-8 JSON with all
 //! non-escaped characters included verbatim, so an em-dash in `content` is
-//! hashed as raw UTF-8 bytes. These tests pin wok's id check against ids
-//! computed independently of wok's own serializer (plain serde_json like
-//! nostr client libraries, plus a Python json/hashlib vector), at the
-//! validation layer and end-to-end over every transport.
+//! hashed as raw UTF-8 bytes, and so is U+007F (DEL), which strfry's tao
+//! serializer escapes. These tests pin wok's id check against ids computed
+//! independently of wok's own serializer (plain serde_json like nostr client
+//! libraries, plus a Python json/hashlib vector), at the validation layer and
+//! end-to-end over every transport.
 
 use futures_util::{SinkExt, StreamExt};
 use secp256k1::{Keypair, SECP256K1};
@@ -118,6 +119,78 @@ fn escaped_em_dash_wire_form_passes_id_check() {
     assert!(parsed.is_ok(), "escaped em-dash event rejected: {parsed:?}");
 }
 
+#[test]
+fn del_event_signed_over_serde_json_preimage_passes_id_check() {
+    // go-nostr, nostr-tools (JSON.stringify) and serde_json write U+007F raw.
+    let ev = sign_independent("delete \u{7f} me");
+    for wire in [
+        serde_json::to_string(&json!(["EVENT", ev])).unwrap(),
+        // The same event with DEL escaped on the wire.
+        serde_json::to_string(&json!(["EVENT", ev]))
+            .unwrap()
+            .replace('\u{7f}', "\\u007f"),
+    ] {
+        let cmd = wok_relay::protocol::ClientCommand::parse(&wire).unwrap();
+        let wok_relay::protocol::ClientCommand::Event(ev) = cmd else {
+            panic!()
+        };
+        let parsed = wok_event::parse_and_verify_event(
+            &ev,
+            &wok_event::EventLimits::default(),
+            None,
+            true,
+            false,
+        );
+        let parsed = parsed.unwrap_or_else(|e| panic!("DEL event rejected: {e}"));
+        // Stored payloads keep tao escaping; only the id preimage changed.
+        assert!(parsed.json.contains("\\u007f"), "{}", parsed.json);
+    }
+}
+
+#[test]
+fn legacy_del_ids_verify_only_for_stored_events() {
+    // strfry hashed DEL as \u007f. Such ids are not NIP-01 ids, so a
+    // published EVENT carrying one is refused, but an import or sync of an
+    // event a relay already stored still verifies.
+    let mut rng = rand::thread_rng();
+    let kp = Keypair::new(SECP256K1, &mut rng);
+    let mut ev = json!({
+        "pubkey": hex::encode(kp.x_only_public_key().0.serialize()),
+        "created_at": now_secs(),
+        "kind": 1,
+        "tags": [],
+        "content": "legacy \u{7f}",
+    });
+    let legacy = serde_json::to_string(&json!([
+        0,
+        ev["pubkey"],
+        ev["created_at"],
+        ev["kind"],
+        ev["tags"],
+        ev["content"],
+    ]))
+    .unwrap()
+    .replace('\u{7f}', "\\u007f");
+    let id: [u8; 32] = Sha256::digest(legacy.as_bytes()).into();
+    ev["id"] = json!(hex::encode(id));
+    ev["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &kp).as_ref()));
+    let limits = wok_event::EventLimits::default();
+    let published = wok_event::parse_and_verify_event(&ev, &limits, None, true, false);
+    assert!(
+        published.unwrap_err().to_string().contains("bad event id"),
+        "legacy id accepted as a new EVENT"
+    );
+    assert!(wok_event::parse_and_verify_event_with(
+        &ev,
+        &limits,
+        None,
+        true,
+        false,
+        wok_event::IdPreimage::Nip01OrLegacy,
+    )
+    .is_ok());
+}
+
 #[allow(clippy::field_reassign_with_default)]
 fn test_cfg(dir: &std::path::Path, deflate: bool, unix: bool) -> Config {
     let mut cfg = Config::default();
@@ -181,6 +254,49 @@ async fn em_dash_event_accepted_over_plain_ws() {
         verdict.contains("true"),
         "em-dash event rejected over plain ws: {verdict} (id {id})"
     );
+    handle.request_shutdown();
+}
+
+async fn next_json<S>(ws: &mut S) -> Value
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(msg.to_text().unwrap()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn del_event_accepted_over_plain_ws_and_served_with_a_verifiable_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, addr) = start_ws(dir.path(), false).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .unwrap();
+    let ev = sign_independent("bell \u{7}, delete \u{7f}");
+    let id = ev["id"].as_str().unwrap().to_string();
+    ws.send(Message::Text(
+        serde_json::to_string(&json!(["EVENT", ev])).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+    let verdict = next_json(&mut ws).await;
+    assert_eq!(verdict, json!(["OK", id, true, ""]), "DEL event rejected");
+
+    ws.send(Message::Text(
+        json!(["REQ", "del", {"ids": [id]}]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let served = next_json(&mut ws).await;
+    assert_eq!(served[0], "EVENT", "{served}");
+    // A client recomputing the id from what the relay serves gets it back.
+    assert_eq!(hex::encode(nip01_id_independent(&served[2])), id);
+    assert_eq!(served[2]["content"], ev["content"]);
+    assert_eq!(next_json(&mut ws).await, json!(["EOSE", "del"]));
     handle.request_shutdown();
 }
 

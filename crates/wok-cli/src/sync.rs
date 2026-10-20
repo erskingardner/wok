@@ -82,7 +82,15 @@ fn store_downloads(
     let mut writes = Vec::with_capacity(events.len());
     for event in events.drain(..) {
         let policy = cfg.timestamp_policy_for_kind(event["kind"].as_u64().unwrap_or(u64::MAX));
-        match parse_and_verify_event(&event, &cfg.event_limits(), Some(&policy), true, true) {
+        // A peer's stored events may carry legacy strfry/Wok ids.
+        match parse_and_verify_event_with(
+            &event,
+            &cfg.event_limits(),
+            Some(&policy),
+            true,
+            true,
+            IdPreimage::Nip01OrLegacy,
+        ) {
             Ok(parsed) => writes.push(EventToWrite::new(parsed.packed.into_bytes(), parsed.json)),
             Err(error) => {
                 report.rejected += 1;

@@ -5,13 +5,14 @@
 //!
 //! - `parse_strict` rejects duplicate object keys (`tao::json::from_string`
 //!   throws `duplicate JSON object key`); serde_json silently keeps the last.
-//! - `to_tao_string` escapes U+007F as `` (tao escapes all control
+//! - `to_tao_string` escapes U+007F as `\u007f` (tao escapes all control
 //!   characters `< 0x20` *and* `0x7F`); serde_json emits `0x7F` raw.
 //! - Both sides otherwise agree: sorted object keys, no whitespace, UTF-8
 //!   passthrough, shortest-round-trip ryu float formatting.
 //!
-//! The event id hash preimage and the normalized stored JSON must match the
-//! C++ byte output exactly, so always use `to_tao_string` for those.
+//! The normalized stored JSON must match the C++ byte output exactly, so
+//! always use `to_tao_string` for it. The NIP-01 event id preimage is written
+//! by `write_nip01`, which differs only in writing U+007F verbatim.
 
 use serde_json::{Map, Value};
 
@@ -320,6 +321,25 @@ pub fn to_tao_string(v: &Value) -> String {
 }
 
 pub(crate) fn write_tao(v: &Value, out: &mut String) {
+    write_json(v, out, Escaping::Tao);
+}
+
+/// Serialize for the NIP-01 event id preimage. NIP-01 escapes `\n`, `"`,
+/// `\\`, `\r`, `\t`, `\b` and `\f`, and includes "all other characters"
+/// verbatim. Other characters below 0x20 cannot appear raw in JSON; they are
+/// written as `\u00xx`, as `JSON.stringify` and serde_json do. U+007F is
+/// verbatim, the only difference from `write_tao`.
+pub(crate) fn write_nip01(v: &Value, out: &mut String) {
+    write_json(v, out, Escaping::Nip01);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Escaping {
+    Tao,
+    Nip01,
+}
+
+fn write_json(v: &Value, out: &mut String, escaping: Escaping) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -330,14 +350,14 @@ pub(crate) fn write_tao(v: &Value, out: &mut String) {
                 out.push_str(&format_tao_f64(n.as_f64().unwrap_or_default()));
             }
         }
-        Value::String(s) => write_tao_string(s, out),
+        Value::String(s) => write_string(s, out, escaping),
         Value::Array(arr) => {
             out.push('[');
             for (i, item) in arr.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
-                write_tao(item, out);
+                write_json(item, out, escaping);
             }
             out.push(']');
         }
@@ -351,9 +371,9 @@ pub(crate) fn write_tao(v: &Value, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                write_tao_string(k, out);
+                write_string(k, out, escaping);
                 out.push(':');
-                write_tao(&map[*k], out);
+                write_json(&map[*k], out, escaping);
             }
             out.push('}');
         }
@@ -362,7 +382,8 @@ pub(crate) fn write_tao(v: &Value, out: &mut String) {
 
 /// tao::json string escaping: `"` and `\` escaped; bytes `< 0x20` and `0x7F`
 /// become `\b \f \n \r \t` or `\u00xx`; everything else passes through raw.
-fn write_tao_string(s: &str, out: &mut String) {
+/// NIP-01 escaping is the same except that `0x7F` passes through raw.
+fn write_string(s: &str, out: &mut String, escaping: Escaping) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push('"');
     for c in s.chars() {
@@ -374,7 +395,7 @@ fn write_tao_string(s: &str, out: &mut String) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || (c as u32) == 0x7F => {
+            c if (c as u32) < 0x20 || (c == '\u{7f}' && escaping == Escaping::Tao) => {
                 let b = c as u32 as usize;
                 out.push_str("\\u00");
                 out.push(HEX[(b & 0xf0) >> 4] as char);

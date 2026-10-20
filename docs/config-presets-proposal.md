@@ -7,7 +7,9 @@ has changed yet. Written on 2026-10-20 against
 This builds on the 2026-10-20 NIP compliance and client-workload audit, which
 is cited here by finding ID (C2–C7, B3, B13, W1–W10). That audit reproduced the
 client collisions on the wire. This document turns them into defaults, a
-configuration model and an implementation plan.
+configuration model and an implementation plan. The audit itself is published
+separately. Every ID cited here is defined in the appendix "Audit findings
+cited", so this document stands on its own.
 
 The owner's decisions it works from:
 - The defaults target a general public relay.
@@ -92,14 +94,15 @@ The reading for this proposal found these issues in addition to the audit's:
 | F3 | Two settings share the name `max_filters_per_req`: `relay.max_filters_per_req = 200` and `relay.filter_validation.max_filters_per_req = 3`. Kinds are also filtered in three places: the `filter_validation.allowed_kinds` query filter, the NIP-86 write kind policy, and nothing for writes in config. | `config.rs:380,409` |
 | F4 | `docs/wok.toml` writes out every default. Operators who copied it have pinned every value, so changing a default or adding a preset changes nothing for them. Dashboard saves re-serialize the complete config, which flattens comments and would erase a `preset` line. | `docs/wok.toml`, `admin.rs:438-465` |
 | F5 | The cost model ignores how many values a tag filter has and how many (author, kind) pairs a filter has. `{"authors":[2000],"kinds":[50 kinds]}` costs 5, yet it opens 100,000 cursors. Above 1,000 pairs it falls back to the Pubkey index (C6). | `filter.rs:467-508` |
-| F6 | The per-author quota nets out replacements, so a user at quota can still update a profile. It does count kind-5 deletions, though, so an author at quota cannot delete events to get back under it. | `wok-db/src/write.rs:714-727` |
+| F6 | The per-author quota checks `count - removed + 1 > quota`. `removed` includes events the write replaces and the author's own events a kind 5 deletes. So at quota, an author can still replace a profile, and a deletion that removes at least one of their events is accepted. Only a kind 5 that deletes nothing of theirs is refused, and that is correct, because exempting it would let one key store unlimited no-op deletions. No change is needed. | `wok-db/src/write.rs:640-727` |
 | F7 | `max_stored_events = 10,000,000` is a global cliff. When it is reached, every write on the relay fails. A busy public relay stores far more than that. | `writer.rs:384` |
 | F8 | The memory used by live filters is bounded only by `max_subs_per_connection × max_req_filter_size` (200 × 64 KiB = 12.8 MiB per connection). Raising the per-REQ byte cap without a per-connection budget multiplies that figure. | — |
 | F9 | `max_num_tags = 2000` rejects the kind-3 follow lists of heavy users. | `parse.rs:179` |
-| F10 | NIP-11 is out of step with the configuration: <ul><li>`created_at_lower_limit` and `max_query_cost` are advertised even when the check is off (0) or `abuse.enabled = false`;</li><li>`max_subid_length`, `restricted_writes` and `auth_required` are missing (B12).</li></ul> | `wok-ws/src/lib.rs:322-345` |
+| F10 | NIP-11 is out of step with the configuration: <ul><li>`max_query_cost` is advertised even when it is 0 (unlimited) or `abuse.enabled = false`;</li><li>`max_subid_length`, `restricted_writes` and `auth_required` are missing (B12).</li></ul> | `wok-ws/src/lib.rs:322-345` |
 | F11 | The per-author EVENT budget and the storage quota key on the event author. Marmot 445 (fresh key per event) and 1059 (random key) are never charged. | `server.rs:1847`, `write.rs:714` |
 | F12 | A filter can list at most 2,047 authors or `#p` values, because each value set is capped at 65,535 decoded bytes. This holds whatever `max_req_filter_size` is set to. | `filter.rs:50-53` |
 | F13 | `filter_validation.require_author_or_tag` requires *exactly one* author, `#p` or `#e` value. It refuses `#h` group filters, `ids` fetches and multi-author directory batches, which covers most of what a Marmot client sends. | `filter.rs:544-573` |
+| F14 | `reject_older_than_secs = 0` does not mean "off". `verify_event_timestamp` computes `earliest = now - 0 = now`, so every event in the past is rejected. Today the only way to disable the bound is a huge value: kind 62 already passes `u64::MAX`, and the end-to-end tests use `u64::MAX / 4`. Unlike `max_query_cost` and `max_stored_events`, zero is not "unlimited" here. | `wok-event/src/validate.rs:80-100` |
 
 ## 2. Inventory
 
@@ -119,7 +122,7 @@ Columns:
 | `max_num_tags` | 2,000 | Write amplification: each single-letter tag adds a tag-index entry | Kind-3, 10000 and 30000 lists of heavy users (F9) | **5,000** (measure write cost) |
 | `max_tag_val_size` | 1,024 B | Bloat from long single-letter tag values | <ul><li>One long `r`, `t` or `a` value rejects the whole event.</li><li>Values of 256–1,024 B are stored but not indexed (A2, bug).</li></ul> | Keep until A2's hashed index lands, then 4,096 |
 | `reject_newer_than_secs` | 900 | Future-dated events pinned to the top of feeds | Clocks more than 15 min fast (rare) | Keep |
-| `reject_older_than_secs` | 3 years | Nothing meaningful. Old events sort to the bottom, and storage volume is bounded by rates and quotas | Rebroadcasting old kind 0/3/10002, importing history, rebroadcasting kind 5 (C2) | **0 (off)**. If an operator sets a bound, replaceable, addressable, 5 and 62 are always exempt (§3.5) |
+| `reject_older_than_secs` | 3 years | Nothing meaningful. Old events sort to the bottom, and storage volume is bounded by rates and quotas | Rebroadcasting old kind 0/3/10002, importing history, rebroadcasting kind 5 (C2) | **Off**. Represented as 0, which needs the F14 fix in the same change. If an operator sets a bound, replaceable, addressable, 5 and 62 are always exempt (§3.5) |
 | `reject_ephemeral_older_than_secs` | 60 | Replayed ephemeral events (NIP-46) reaching live subscribers | <ul><li>AUTH signed more than 60 s earlier (B3).</li><li>Every spec-built 21059, which is backdated by up to 2 days (B3).</li></ul> | Keep 60 for generic ephemeral kinds. AUTH and 21059 get their NIP windows as constants (§3.5) |
 | `ephemeral_persistence` / `ephemeral_lifetime_secs` | `live_only` / 300 | Storage of ephemeral kinds | — | Keep |
 
@@ -128,7 +131,7 @@ Columns:
 | Setting | Now | Protects | Collides with | Public |
 |---|---|---|---|---|
 | `max_websocket_payload_size` | 2 MiB | Parse memory per message (NIP-11 `max_message_length`) | — | Keep. Validate that it is at least `max_event_size` plus envelope and at least `max_req_filter_size`. Frame buffers grow on demand, so a larger value costs memory only while large frames are actually in flight |
-| `max_req_filter_size` | 64 KiB | Parse and live-matching memory per REQ | Outbox author lists above ~978 authors (C5, W2) | **256 KiB** (about 3,900 authors), plus a new per-connection filter budget of 2 MiB (F8) |
+| `max_req_filter_size` | 64 KiB | Parse and live-matching memory per REQ | Outbox author lists above ~978 authors (C5, W2) | **256 KiB**, plus a new per-connection filter budget of 2 MiB (F8). One filter still stops at 2,047 authors (F12). 256 KiB lets a single filter reach that ceiling, and leaves room for the other filters in the same REQ |
 | `max_filters_per_req` | 200 | Fan-out per REQ | Nothing seen (NDK batches about 45) | Keep |
 | `max_pending_outbound_bytes` | 32 MiB | Memory held for a slow reader | Large backfills on slow links disconnect, which is the intended behaviour | Keep |
 | `auto_ping_seconds` | 55 | Dead TCP connections | — | Keep |
@@ -150,7 +153,7 @@ Columns:
 | `query_timeslice_budget_us` | 10,000 | Fairness between running scans | The W5 latency is structural, not caused by this knob | Keep (advanced) |
 | `abuse.max_concurrent_historical_queries` | 8 | Scan fairness per connection | A ninth concurrent scan is refused instead of waiting (F2) | Keep 8, but **queue** the excess (bounded by `max_subs_per_connection`) |
 | `abuse.max_query_cost` | 1,000 | Expensive scans, checked before a cursor opens | <ul><li>Rejects `authors[150]`, an 11-kind feed and 45-filter batches.</li><li>Lets 100k-cursor fan-outs through (F5).</li><li>Uses the wrong prefix (C4).</li></ul> | **New model, ceiling 20,000** (§3.4) |
-| `filter_validation.enabled` and its rules | off | Optional structural rules, inherited from a strfry plugin | <ul><li>Once enabled, its own `max_filters_per_req = 3` and `max_kinds_per_filter = 3` break most clients.</li><li>`require_author_or_tag` breaks Marmot and outbox clients (F13).</li></ul> | Keep off. Drop the duplicate counts (F3). Add `require_scoped_filters`, which the marmot preset uses (§3.7) |
+| `filter_validation.enabled` and its rules | off | Optional structural rules, inherited from a strfry plugin | <ul><li>Once enabled, its own `max_filters_per_req = 3` and `max_kinds_per_filter = 3` break most clients.</li><li>`require_author_or_tag` breaks Marmot and outbox clients (F13).</li></ul> | Keep off. Drop the duplicate counts (F3). Removing the `enabled` switch needs neutral defaults and a translation for old files (§3.7). Add `require_scoped_filters`, which the marmot preset uses |
 | *hard:* tag filter value | 255 B | Index key size | `#d`, `#a` and `#r` values over 255 B cannot be queried | Fix with A2 hashing (bug track) |
 | *hard:* one filter's value set | 65,535 decoded B | Memory per set | At most 2,047 authors or `#p` per filter (F12) | Keep. Document it, because it caps outbox lists before the byte cap does |
 
@@ -171,7 +174,7 @@ Columns:
 | Setting | Now | Protects | Collides with | Public |
 |---|---|---|---|---|
 | `max_stored_events` | 10,000,000 | Disk exhaustion | A busy relay reaches a cliff where every write fails (F7) | **0 (off)**. Rely on `database.min_free_disk_bytes` and `map_size`, which measure the actual resource |
-| `max_stored_events_per_pubkey` | 100,000 | One key filling the disk | <ul><li>Heavy users and bots.</li><li>At quota, kind-5 deletions are refused (F6).</li><li>Not charged for throwaway keys (F11).</li></ul> | **1,000,000**, with kind 5 exempt (62 is already exempt) |
+| `max_stored_events_per_pubkey` | 100,000 | One key filling the disk | <ul><li>Heavy users and bots.</li><li>Not charged for throwaway keys (F11).</li><li>Replacements and deletions of the author's own events keep working at quota (F6).</li></ul> | **1,000,000** |
 | `min_pow_difficulty` | 0 | Spam | Any nonzero value rejects most clients | Keep |
 | `database.min_free_disk_bytes` | 1 GiB | Full disk | — | Keep |
 | `database.map_size` | 64 GiB | LMDB map ceiling | Depends on the deployment | Keep. Document it as the real storage cap |
@@ -226,8 +229,12 @@ A complete public relay looks like this:
 preset = "public"            # optional; "public" is the default
 
 [relay]
-bind = "0.0.0.0"
-real_ip_header = "x-forwarded-for"
+bind = "127.0.0.1"                # behind a TLS reverse proxy on this host
+# Only set this when every direct connection comes from a proxy that
+# overwrites the header (production-deployment.md). On a listener that
+# clients can reach directly, a client could pick a new address per
+# connection and escape every per-address budget.
+real_ip_header = "x-real-ip"
 
 [relay.auth]
 service_url = "wss://relay.example.com"
@@ -354,10 +361,26 @@ seeks(f) = cursors the plan opens:
              Kind → |kinds|
              CreatedAt → 1
 rows(f)  = min(limit or max_filter_limit, max_filter_limit); for ids, ≤ |ids|
-cost     = Σ seeks(f) + min(Σ rows(f), max_total_events_per_req)
+REQ      = Σ seeks(f) + min(Σ rows(f), max_total_events_per_req)
            + 1,000 per search filter + rows(f) per NIP-91 & value
-COUNT    = the same formula × 2, as today
+COUNT    = 2 × (Σ seeks(f) + 1,000 per search filter)
+NEG-OPEN = Σ seeks(f) + 1,000 per search filter
 ```
+
+COUNT and NEG-OPEN do not run under the REQ row bounds:
+- **COUNT** parses its filters with `max_filter_limit_count + 1` and drops
+  `max_total_events_per_req` (`server.rs:2181`, `scan.rs:808-840`).
+- **NEG-OPEN** parses with `max_sync_events + 1` (`ingest_neg`).
+
+Pricing their rows with `max_filter_limit` would claim a bound that does not
+exist. A COUNT can scan up to a million matches, and a NEG-OPEN can scan the
+whole sync view. So the pre-scan cost for both covers only seeks, the part it
+can know. Their rows are bounded at run time:
+- COUNT by `max_filter_limit_count` and its own rate budget;
+- NEG-OPEN by `max_sync_events` and the sync memory budgets.
+
+The runtime scan budget below should cover COUNT as well. The current gate
+does not bound these rows either: today `COUNT {"kinds":[1]}` costs 200.
 
 The unit is index entries touched. In the audit's C6 table, 999 PubkeyKind
 cursors returned in about 2.4 ms on a laptop, which is roughly 2.4 µs per
@@ -378,6 +401,10 @@ The examples below use the proposed `max_filter_limit = 2000` and
 | `{}`, no limit | 1,000 ✓ | 2,001 | ✓ |
 | `{"authors":[2000],"kinds":[50 kinds]}` | 5 ✓ | 102,000 | ✗ |
 | `{"#t":["nostr"],"authors":[x]}` | 25 ✓ | 2,001 | ✓ (see below) |
+| `COUNT {"kinds":[3],"#p":[pk]}` (follower count) | 50 ✓ | 2 | ✓ (rows bounded by `max_filter_limit_count`) |
+| `COUNT {"kinds":[1]}` | 200 ✓ | 2 | ✓ (same) |
+| `COUNT {"authors":[2000],"kinds":[50 kinds]}` | 10 ✓ | 200,000 | ✗ |
+| `NEG-OPEN {"kinds":[445],"#h":[gid]}` | 25 ✓ | 1 | ✓ (rows bounded by `max_sync_events` and sync memory) |
 
 - A refusal reads `blocked: query too broad (cost 102000 > 20000); split the
   REQ or narrow authors/kinds`. NIP-01 has no "too expensive" prefix.
@@ -398,10 +425,14 @@ The examples below use the proposed `max_filter_limit = 2000` and
 
 ### 3.5 Timestamp windows
 
-- `events.reject_older_than_secs` defaults to 0, and NIP-11 then omits
-  `created_at_lower_limit`. When an operator sets a bound, it applies only to
-  regular kinds. Replaceable (0, 3, 10000–19999), addressable (30000–39999),
-  5 and 62 are always exempt, so rebroadcasts and deletions keep working.
+- `events.reject_older_than_secs` defaults to 0, meaning no lower bound, and
+  NIP-11 then omits `created_at_lower_limit`. Today 0 rejects every past
+  event (F14). The same change must teach `verify_event_timestamp` that 0
+  skips the bound, or the new default would refuse everything.
+- When an operator sets a bound, it applies only to regular kinds. The
+  exemptions follow `is_replaceable_kind` and `is_param_replaceable_kind`
+  rather than a list written here, so they track A3's fix for kind 41. Kinds
+  5 and 62 are also exempt, so rebroadcasts and deletions keep working.
 - AUTH (22242) gets a fixed window of ±600 s around the relay clock, as NIP-42
   suggests. It does not use `events.*`. Replay is already prevented by the
   per-connection challenge.
@@ -461,6 +492,15 @@ accepted_kinds = []                      # empty = every kind; NIP-86 kind polic
 - Remove `filter_validation.max_filters_per_req` and `min_filters_per_req`
   (F3). Keep `allowed_kinds` and `max_kinds_per_filter`, each disabled by its
   zero or empty value, and drop `filter_validation.enabled`.
+  - The neutral defaults change with it: `max_kinds_per_filter` goes from 3 to
+    0. Otherwise removing the switch would turn on today's three-kind cap,
+    which refuses MDK's six-kind directory query.
+  - Old files are translated, with a deprecation warning. A section with
+    `enabled = false` loads with every rule off, whatever values it pins. The
+    copied 0.7 sample has `enabled = false` and `max_kinds_per_filter = 3`.
+    A section with `enabled = true` keeps its values.
+  - An upgrade test loads the 0.7 `docs/wok.toml` and checks that the
+    effective rules are unchanged.
 - Add `filter_validation.require_scoped_filters`. Every filter must then name
   what it wants: `ids`, `authors`, or at least one tag filter, with any number
   of values. That refuses enumeration such as `{"kinds":[445]}` or
@@ -474,7 +514,11 @@ accepted_kinds = []                      # empty = every kind; NIP-86 kind polic
 - Add `relay.max_filter_bytes_per_connection = 2 MiB` (F8). It caps all live
   filters on one connection, so raising `max_req_filter_size` does not
   multiply memory.
-- `max_stored_events` defaults to 0 and leaves the zero-guard warnings (F7).
+- `max_stored_events` defaults to 0 (F7). Zero-guard warnings compare
+  against the active preset: a guard warns only when it is 0 and the preset
+  value is not. Today's test, which asserts the defaults produce no
+  warnings, keeps passing. Reloads stay quiet for the recommended setting,
+  and an operator who zeroes another guard is still warned.
 - Fold the remaining zero-means-unlimited warnings into the dashboard as
   explicit "Off" toggles.
 
@@ -748,8 +792,8 @@ Format: a label, then **If too low:** and **If too high:** lines.
   - If too high: spam and signature-verification load.
   - Per-author limits never apply to throwaway keys.
 - **Stored events per author** (`max_stored_events_per_pubkey`).
-  - If too low: active users and bots stop being able to post. Deletions
-    always work.
+  - If too low: active users and bots stop being able to post new events.
+    Updating a profile or deleting their own events still works.
   - If too high: one key can fill the disk.
 - **Concurrent historical queries** (`max_concurrent_historical_queries`).
   Extra queries wait their turn.
@@ -770,7 +814,7 @@ Format: a label, then **If too low:** and **If too high:** lines.
 | `max_subid_length` | constant 64 | always | **add** (B12) |
 | `max_event_tags` | `max_num_tags` | always | — |
 | `min_pow_difficulty` | `min_pow_difficulty` | when abuse is on | — |
-| `created_at_lower_limit` | `reject_older_than_secs` | **only when > 0** | omit when off (F10) |
+| `created_at_lower_limit` | `reject_older_than_secs` | **only when a bound is set** | omit when off (F14) |
 | `created_at_upper_limit` | `reject_newer_than_secs` | always | — |
 | `auth_required` | `read_policy != open` | always | **add** |
 | `restricted_writes` | write policy, `accepted_kinds` or PoW | always | **add** (B12) |
@@ -843,7 +887,11 @@ the reviewer sees each default next to its mechanism.
    - `wok config minimize`, the `wok doctor` check for pinned stale defaults,
      and `migrate strfry` emitting `preset`.
 3. **Timestamp windows (C2, B3).**
-   - `reject_older_than_secs = 0`, with the exempt kinds when it is set.
+   - Make 0 mean "no lower bound" in `verify_event_timestamp` (F14) in the
+     same change as the default, and add a test that a configured 0 accepts
+     a 2020 event.
+   - The exempt kinds when a bound is set, via `is_replaceable_kind` and
+     `is_param_replaceable_kind`.
    - AUTH at ±600 s, and the 21059 exemption.
    - Omit `created_at_lower_limit` when 0.
    - Regression tests reuse the audit's probes: a 2020 kind 0, an AUTH signed
@@ -852,13 +900,18 @@ the reviewer sees each default next to its mechanism.
    - `max_req_filter_size` at 256 KiB, plus `max_filter_bytes_per_connection`.
    - `max_tags_per_filter` at 8, `max_num_tags` at 5,000, `max_filter_limit`
      at 2,000 and `max_total_events_per_req` at 10,000.
-   - `max_stored_events` at 0, and the per-author quota at 1,000,000 with
-     kind 5 exempt (F6, F7).
-   - Remove the duplicate `filter_validation` keys (F3).
+   - `max_stored_events` at 0 (F7), and zero-guard warnings measured against
+     the preset.
+   - The per-author quota at 1,000,000. Deletions already net out (F6).
+   - Remove the duplicate `filter_validation` keys and the `enabled` switch,
+     with neutral defaults, the legacy translation and the 0.7-sample
+     upgrade test (F3, §3.7).
 5. **Cost model (C4, F5).**
    - `estimated_cost` takes the planner's plan, and the new ceiling is set.
    - The refusal prefix becomes `blocked:`, and NIP-11 gating follows.
-   - The table in §3.4 becomes the unit test.
+   - Separate COUNT and NEG-OPEN pricing.
+   - The table in §3.4, including its COUNT and NEG-OPEN rows, becomes the
+     unit test.
 6. **Rate keying (C3, F1, F2).**
    - The `per_connection` table, including the NEG-MSG bucket, plus
      `ipv6_prefix_len` and `authenticated_multiplier`.
@@ -916,8 +969,9 @@ ships.
 8. **Cost-refusal prefix:** `blocked:`, which tells clients that resending
    the same request won't help.
 9. **`default_limit` and `max_limit`:** one knob, `max_filter_limit = 2000`,
-   drives both. Filters without a `limit`, which are common in outbox
-   metadata fetches, are not cut.
+   drives both. A filter without a `limit` gets the same 2,000 clamp as a
+   filter that asks for more, not a smaller separate default. Outbox
+   metadata fetches without a `limit` are therefore no longer cut at 500.
 
 ## Appendix: hard-coded limits
 
@@ -933,3 +987,36 @@ These are not configuration knobs, and should stay that way. Document them in
 | AUTH identities per connection | 64 | known-differences | The first identity is the rate-limit identity |
 | Event kind | 0–65,535 | parser | — |
 | Size-class ceiling | 16 MiB | `MAX_SIZE_CLASS_BYTES` | Clamps event, frame and payload sizes |
+
+## Appendix: audit findings cited
+
+One-line definitions of the 2026-10-20 audit findings this document refers
+to. "Bug track" means the finding is being fixed outside this plan.
+
+| ID | Finding |
+|---|---|
+| A2 | Single-letter tag values of 256–1,024 B are accepted but not indexed. Long `d` tags therefore merge distinct addressable events (bug track). |
+| A3 | Kind 41 is treated as replaceable per pubkey. NIP-01 makes it a regular kind (bug track). |
+| A5 | Kind 21059 ephemeral gift wraps can be read by anyone, because the default restricted kinds are only 4 and 1059. |
+| B3 | AUTH reuses the 60 s ephemeral age window, and spec-built 21059s, which are backdated, are refused as expired. |
+| B8 | Subscription IDs reject non-ASCII and JSON-special characters, and the limit counts bytes rather than characters (bug track). |
+| B12 | NIP-11 accuracy: `software` is not a homepage URL, `max_subid_length` and `restricted_writes` are missing, and draft NIP-91 is advertised. |
+| B13 | NIP-78 kinds 78 and 30078 are not owner-restricted by default. |
+| B14 | NIP-86 is behind the current spec. For example, `listallowedkinds` returns all 65,536 kinds when no policy is set. |
+| C1 | NIP-67 EOSE completeness hints are not implemented, so truncation by `max_total_events_per_req` looks like completion. |
+| C2 | Events older than 3 years are rejected, including old profile, contact-list and relay-list rebroadcasts and old deletions. |
+| C3 | The REQ budget is per IP (20/s, burst 40), so a 60-REQ startup loses 20, and NAT or VPN users share one budget. |
+| C4 | The query-cost gate ignores `limit` and refuses ordinary client filters, using the misleading `rate-limited:` prefix. |
+| C5 | Caps that real queries hit: 64 KB of filters per REQ, three tag letters per filter, and tag-filter values over 255 B. |
+| C6 | At 1,000 or more (author, kind) pairs, the planner switches from the PubkeyKind index to the Pubkey index, and outbox metadata fetches slow down by about 60×. |
+| C7 | `restrict_writes` checks the event author rather than the AUTHed identity, so allowlisted relays refuse every Marmot 445 and 1059. |
+| W1 | Cold start or reconnect: 10–60 REQs in the first second. |
+| W2 | Outbox metadata: `authors[100–2000] × kinds[0,3,10002,10050]`. |
+| W3 | Feeds and pagination with `until`. |
+| W4 | Threads, reactions and notifications by tag. |
+| W5 | Fetch-and-close: CLOSEs queued behind heavy queries cost a scheduler slice each. |
+| W6 | Subscription replacement while scrolling or rotating. |
+| W7 | Long-lived live subscriptions (DM inbox, Marmot `445 #h`, NIP-46). |
+| W8 | Publishing. |
+| W9 | Mobile churn: handshake, AUTH challenge and per-connection deflate contexts. |
+| W10 | Marmot: live `1059 #p` and `445 #h` subscriptions, `since` backfill, routing rotation, and 445s published from fresh keys. |

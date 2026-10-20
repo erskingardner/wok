@@ -103,7 +103,7 @@ sync_idle_timeout_secs = 60
 enabled = true
 # Public relay URL used in NIP-42 challenges.
 service_url = ""
-restricted_read_kinds = [4, 1059]
+restricted_read_kinds = [4, 1059, 21059]
 restrict_read_to_involved_pubkey = true
 # When true, only NIP-86 allowlisted or role-holding pubkeys (and operator
 # admin pubkeys) may write events.

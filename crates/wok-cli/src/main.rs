@@ -9,7 +9,7 @@ use wok_db::{
     check_integrity, delete_events, event_json_owned, write_events_with_policy, Decompressor, Env,
     EnvOptions, EventToWrite,
 };
-use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
+use wok_event::{parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView, AUTH_KIND};
 use wok_negentropy::Storage;
 mod doctor;
 mod mesh;
@@ -621,19 +621,38 @@ fn cmd_import(
     Ok(())
 }
 
+/// NIP-42 forbids broadcasting kind 22242. The relay refuses it as EVENT, and
+/// imports and downloads refuse it with this reason, so no ingest path stores
+/// one.
+const AUTH_EVENT_REFUSAL: &str = "kind 22242 AUTH events are never stored";
+
 fn parse_import_line(
     line: &str,
     fried: bool,
     no_verify: bool,
     limits: &EventLimits,
 ) -> Result<EventToWrite> {
-    if fried {
+    let event = if fried {
         let (packed, json) = parse_fried(line)?;
-        return Ok(EventToWrite::new(packed, json));
+        EventToWrite::new(packed, json)
+    } else {
+        let v: serde_json::Value = wok_event::json::parse_strict(line)?;
+        // Imported lines are stored events, possibly hashed with the legacy
+        // preimage by strfry or an earlier Wok release.
+        let parsed = parse_and_verify_event_with(
+            &v,
+            limits,
+            None,
+            !no_verify,
+            false,
+            IdPreimage::Nip01OrLegacy,
+        )?;
+        EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+    };
+    if PackedEventView::new(&event.packed)?.kind() == AUTH_KIND {
+        bail!(AUTH_EVENT_REFUSAL);
     }
-    let v: serde_json::Value = wok_event::json::parse_strict(line)?;
-    let parsed = parse_and_verify_event(&v, limits, None, !no_verify, false)?;
-    Ok(EventToWrite::new(parsed.packed.into_bytes(), parsed.json))
+    Ok(event)
 }
 
 fn parse_fried(line: &str) -> Result<(Vec<u8>, String)> {
@@ -1504,6 +1523,32 @@ mod main_tests {
             wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn import_accepts_legacy_ids_from_stored_events() {
+        // strfry and earlier Wok releases hashed U+007F as \u007f. Their
+        // exports still verify on import; the NIP-01 form does too.
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let mut event = json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [],
+            "content": "del \u{7f}",
+            "pubkey": hex::encode(key.x_only_public_key().0.serialize()),
+        });
+        let limits = EventLimits::default();
+        for hash in [wok_event::legacy_event_id_hash, wok_event::event_id_hash] {
+            let id = hash(&event).unwrap();
+            event["id"] = json!(hex::encode(id));
+            event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+            let line = wok_event::json::to_tao_string(&event);
+            assert!(line.contains("\\u007f"));
+            assert!(parse_import_line(&line, false, false, &limits).is_ok());
+        }
+        event["id"] = json!("00".repeat(32));
+        let line = wok_event::json::to_tao_string(&event);
+        assert!(parse_import_line(&line, false, false, &limits).is_err());
     }
 
     #[test]

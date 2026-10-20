@@ -4,7 +4,8 @@ use tempfile::TempDir;
 use wok_db::{write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
 use wok_event::{parse_and_verify_event, EventLimits};
 use wok_query::{
-    foreach_by_filter, DbQuery, DbScan, NostrFilterGroup, QueryScheduler, SubId, Subscription,
+    foreach_by_filter, foreach_visible_by_filter, visibility::ReadVisibility, DbQuery, DbScan,
+    NostrFilterGroup, QueryScheduler, SubId, Subscription,
 };
 
 fn sign(kind: u64, content: &str, created: u64) -> (Vec<u8>, String, String) {
@@ -52,6 +53,40 @@ fn sign_with_tags(content: &str, created: u64, tags: &[&str]) -> (Vec<u8>, Strin
     ev["sig"] = json!(hex::encode(sig.as_ref()));
     let parsed = parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).unwrap();
     (parsed.packed.into_bytes(), parsed.json, hex::encode(id))
+}
+
+#[test]
+fn operator_scans_find_stored_auth_events_that_clients_never_see() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (packed, json, _) = sign(22242, "", now);
+    let mut events = vec![EventToWrite::new(packed, json)];
+    let mut txn = env.begin_rw().unwrap();
+    write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+    txn.commit().unwrap();
+
+    let txn = env.begin_ro().unwrap();
+    let filter = json!({"kinds": [22242]});
+    let mut operator = Vec::new();
+    foreach_by_filter(&txn, &filter, 500, 3, 16, |lev| operator.push(lev)).unwrap();
+    assert_eq!(operator, [events[0].lev_id]);
+    let mut client = Vec::new();
+    foreach_visible_by_filter(
+        &txn,
+        &filter,
+        500,
+        3,
+        16,
+        ReadVisibility::default(),
+        |lev| client.push(lev),
+    )
+    .unwrap();
+    assert!(client.is_empty());
 }
 
 #[test]

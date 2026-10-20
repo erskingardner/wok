@@ -98,13 +98,14 @@ it is not a promise to reproduce upstream bugs.
 
 ## Compatibility-sensitive behavior retained
 
-- Canonical event serialization rejects duplicate object keys, escapes U+007F,
-  and uses the established floating-point formatting. These choices affect
-  event ID calculation and migrated stored bytes, so they cannot be casually
-  changed.
+- Canonical stored event serialization rejects duplicate object keys, escapes
+  U+007F, and uses the established floating-point formatting. These choices
+  affect migrated stored bytes, so they cannot be casually changed.
 - The initial Wok v4 database retains the v3 PackedEvent, payload, index, and
   negentropy layouts. This makes the first migration lossless, but is not a
-  commitment that later Wok versions retain those internal layouts.
+  commitment that later Wok versions retain those internal layouts. Wok now
+  also packs single-letter tag values longer than 255 bytes, by hash, where v3
+  drops them; shorter values pack exactly as in v3.
 
 Each correction cites a pinned NIP or a Wok safety requirement and adds a
 regression test. Differential parity alone is not a reason to retain it.
@@ -161,3 +162,57 @@ regression test. Differential parity alone is not a reason to retain it.
   the same first-recipient/author policy, moderation, vanish and expiry checks.
   Multiple successfully authenticated identities remain valid on one connection
   (up to 64); the first identity remains the connection's rate-limit identity.
+- A validated EVENT is committed even when its connection closes before the
+  writer reaches it; only the OK is lost. The pinned strfry writer drops events
+  whose connection closed within the same write batch, which lost posts from
+  clients that publish and hang up at once. An EVENT still parked in an
+  ingester because the writer queue is full is dropped when its connection
+  closes, which keeps memory bounded under writer backpressure.
+- NIP-01 tag filters and addresses: single-letter tag values longer than 255
+  bytes are packed and indexed as a marker byte and their SHA-256, so `#x`
+  filters match them, an addressable event whose first `d` tag is that long
+  has its own address, and a kind 5 `a` tag that long deletes and tombstones
+  its target. An addressable event whose `a` tag would exceed
+  `events.max_tag_val_size` is refused with `invalid:`, so every stored
+  address can be named by an `a` tag. The pinned strfry drops such values: it keys that event by its
+  virtual empty `d` (or a later short `d`), so distinct addresses replace one
+  another, never matches that deletion against its target, and refuses such
+  filters. Records migrated from strfry or stored by earlier Wok releases keep
+  their packing, so these limits remain for them (see `lmdb-v3.md`).
+- NIP-01 kind ranges: kind 41 (NIP-28 channel metadata) is regular. The pinned
+  strfry treats it as replaceable per author, so metadata for a second channel
+  deleted the first channel's. Migrated kind 41 history stays stored and
+  becomes visible, and the superseded-version count is redone on the first
+  writable open (see [lmdb-v3.md](lmdb-v3.md)).
+- NIP-09: a deletion request against a deletion request has no effect. A kind
+  5 `e` tag never deletes a stored kind 5, and an earlier tombstone does not
+  block a kind 5 from being stored. The pinned strfry exempts neither, so
+  deleting a deletion removed it with its tombstone and the original event
+  could be published again.
+- NIP-59: kind 21059 ephemeral gift wraps are restricted reads by default,
+  alongside kinds 4 and 1059, and NIP-59 is advertised only while both
+  gift-wrap kinds are restricted. The previous default let any
+  unauthenticated subscriber receive wraps addressed to someone else.
+- NIP-42: kind 22242 events reach no client. One sent as EVENT is refused
+  with `invalid: AUTH events must be sent with AUTH`. `wok import` refuses
+  one, as do `wok sync` and `wok router` downloads, in either ephemeral mode.
+  `wok migrate strfry` and `wok reindex` keep stored records unchanged. Such
+  a record, or one committed by another writer, is hidden from REQ, COUNT,
+  live delivery, NIP-77 and router/sync uploads until the ephemeral purge
+  removes it. Operator tools still reach it: `wok scan` finds it and
+  `wok delete --filter '{"kinds":[22242]}'` removes it, even offline. The
+  pinned strfry treats kind 22242 like any ephemeral event: it stores it and
+  delivers it to matching subscriptions, which NIP-42 forbids.
+- NIP-01 event ids are hashed over the NIP-01 preimage, which includes U+007F
+  verbatim like go-nostr, nostr-tools and serde_json. strfry's tao serializer
+  escapes it as `\u007f`, so a correctly signed event containing DEL was
+  refused with `invalid: bad event id`. Stored payloads keep tao escaping, which
+  is valid JSON for the same string. A published EVENT, AUTH or NIP-98 event
+  must use the NIP-01 id. `wok import` (with verification), `wok sync` and
+  `wok router` downloads also accept the legacy tao preimage, because strfry
+  and earlier Wok releases stored events under it. Accepting both cannot give
+  two different events one id: the preimages agree unless the event contains
+  DEL, and then the NIP-01 preimage has a raw DEL byte that a tao preimage
+  never has. Integrity checks, `wok migrate strfry` and `wok doctor` never
+  rehash ids, so migrated data is unaffected. A Wok relay refuses legacy-id
+  events that `wok sync` uploads to it, because uploads are EVENTs.

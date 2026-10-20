@@ -11,9 +11,11 @@ use crate::txn::RwTxn;
 use crate::vanish::{is_event_vanished_rw, mark_vanished, VanishPolicy, VANISH_KIND};
 use crate::DbError;
 use lmdb_sys::{MDB_dbi, MDB_APPEND, MDB_NOOVERWRITE};
+use std::collections::HashMap;
 use wok_event::{
-    is_event_a_before_event_b, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag, sha256,
-    to_hex, PackedEventView, GIFT_WRAP_KINDS,
+    hashed_tag_value_digest, indexed_tag_value, is_event_a_before_event_b,
+    is_param_replaceable_kind, is_replaceable_kind, parse_a_tag, sha256, to_hex, PackedEventView,
+    DELETION_KIND, GIFT_WRAP_KINDS, MAX_INDEXED_TAG_VAL_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +150,41 @@ pub fn deletion_exists(txn: &RwTxn<'_>, event_id: &[u8], pubkey: &[u8]) -> Resul
     Ok(txn.get(txn.env().dbis().event_deletion, &key)?.is_some())
 }
 
+/// Original values of the `name` tags in `json` that PackedEvent holds
+/// hashed, keyed by their SHA-256. Only events with such long values parse
+/// their JSON here.
+fn hashed_tag_originals(json: &str, name: &str) -> Result<HashMap<Vec<u8>, String>, DbError> {
+    let event = wok_event::json::parse_strict(json).map_err(|e| DbError::msg(e.to_string()))?;
+    let mut originals = HashMap::new();
+    for tag in event
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_array)
+    {
+        if tag.first().and_then(serde_json::Value::as_str) != Some(name) {
+            continue;
+        }
+        let value = tag.get(1).and_then(serde_json::Value::as_str).unwrap_or("");
+        if value.len() > MAX_INDEXED_TAG_VAL_SIZE {
+            originals.insert(sha256(value.as_bytes()).to_vec(), value.to_owned());
+        }
+    }
+    Ok(originals)
+}
+
+/// The original value of a packed `name` tag value, which may be hashed.
+fn original_tag_value(json: &str, name: &str, packed_value: &[u8]) -> Result<Vec<u8>, DbError> {
+    let Some(digest) = hashed_tag_value_digest(packed_value) else {
+        return Ok(packed_value.to_vec());
+    };
+    hashed_tag_originals(json, name)?
+        .remove(digest)
+        .map(String::into_bytes)
+        .ok_or_else(|| DbError::msg(format!("event JSON lacks its hashed {name} tag")))
+}
+
 fn index_event(packed: PackedEventView<'_>) -> EventIndices {
     let index_time = packed.created_at();
     let mut idx = EventIndices {
@@ -184,7 +221,14 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
             s.extend_from_slice(packed.pubkey());
             idx.deletion.push(s);
         } else if tag_name == 'a' && packed.kind() == 5 {
-            if let Ok(val) = std::str::from_utf8(tag_val) {
+            if let Some(digest) = hashed_tag_value_digest(tag_val) {
+                // A hashed address is already sha256(a-tag). Ingest checked
+                // that it parses and names the author, but its kind is hashed
+                // too. An entry for a kind that is not addressable is harmless:
+                // an addressable event looks up the hash of its own kind.
+                idx.replace_deletion
+                    .push(make_key_string_u64(digest, packed.created_at()));
+            } else if let Ok(val) = std::str::from_utf8(tag_val) {
                 if let Ok((kind, pubkey, _d)) = parse_a_tag(val) {
                     if is_param_replaceable_kind(kind) && pubkey.as_slice() == packed.pubkey() {
                         idx.replace_deletion
@@ -540,8 +584,13 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
 
         // NIP-62 requests cannot be removed or preemptively tombstoned by a
-        // kind 5 event. Validity and duplicate checks still apply.
-        if !is_vanish_request && deletion_exists(txn, packed.id(), packed.pubkey())? {
+        // kind 5 event, and NIP-09 gives a deletion request against a
+        // deletion request no effect. Validity and duplicate checks still
+        // apply.
+        if !is_vanish_request
+            && packed.kind() != DELETION_KIND
+            && deletion_exists(txn, packed.id(), packed.pubkey())?
+        {
             *status = EventWriteStatus::Deleted;
             continue;
         }
@@ -605,12 +654,15 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                 if is_param_replaceable_kind(packed.kind()) && *status == EventWriteStatus::Pending
                 {
                     // Hash the raw d-tag bytes, like C++ (no UTF-8 round-trip).
-                    let mut a_tag = Vec::with_capacity(24 + 64 + 1 + replace.len());
+                    // A deletion hashes the whole a tag, so a hashed d needs
+                    // its original value.
+                    let d_tag = original_tag_value(json, "d", &replace)?;
+                    let mut a_tag = Vec::with_capacity(24 + 64 + 1 + d_tag.len());
                     a_tag.extend_from_slice(packed.kind().to_string().as_bytes());
                     a_tag.push(b':');
                     a_tag.extend_from_slice(to_hex(packed.pubkey()).as_bytes());
                     a_tag.push(b':');
-                    a_tag.extend_from_slice(&replace);
+                    a_tag.extend_from_slice(&d_tag);
                     let search_str = sha256(&a_tag);
                     let search_key = make_key_string_u64(&search_str, u64::MAX);
                     let mut scan_err: Option<DbError> = None;
@@ -645,6 +697,16 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
 
         if packed.kind() == 5 {
+            let mut hashed_addresses = false;
+            packed.foreach_tag(|tag_name, tag_val| {
+                hashed_addresses = tag_name == 'a' && hashed_tag_value_digest(tag_val).is_some();
+                !hashed_addresses
+            });
+            let long_addresses = if hashed_addresses {
+                hashed_tag_originals(json, "a")?
+            } else {
+                HashMap::new()
+            };
             // LMDB errors abort the write like C++; only malformed a-tags are
             // skipped (C++ catch(...)).
             let mut scan_err: Option<DbError> = None;
@@ -657,6 +719,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                         Ok(Some((lev, buf))) => match PackedEventView::new(&buf) {
                             Ok(other) => {
                                 let mut can_delete = other.kind() != VANISH_KIND
+                                    && other.kind() != DELETION_KIND
                                     && other.pubkey() == packed.pubkey();
                                 if !can_delete && GIFT_WRAP_KINDS.contains(&other.kind()) {
                                     other.foreach_tag(|on, ov| {
@@ -677,14 +740,16 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                         Err(e) => scan_err = Some(e),
                     }
                 } else if tag_name == 'a' {
-                    let parsed = std::str::from_utf8(tag_val)
-                        .ok()
-                        .and_then(|s| parse_a_tag(s).ok());
+                    let address = match hashed_tag_value_digest(tag_val) {
+                        Some(digest) => long_addresses.get(digest).map(String::as_str),
+                        None => std::str::from_utf8(tag_val).ok(),
+                    };
+                    let parsed = address.and_then(|s| parse_a_tag(s).ok());
                     if let Some((kind, pubkey, d_tag)) = parsed {
                         if is_param_replaceable_kind(kind) && pubkey.as_slice() == packed.pubkey() {
                             let mut search = Vec::new();
                             search.extend_from_slice(&pubkey);
-                            search.extend_from_slice(d_tag.as_bytes());
+                            search.extend_from_slice(&indexed_tag_value(d_tag.as_bytes()));
                             let search_key = make_key_string_u64(&search, kind);
                             if let Err(error) =
                                 foreach_replacement(txn, &search_key, |lev, other| {

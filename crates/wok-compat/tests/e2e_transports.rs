@@ -130,6 +130,69 @@ async fn ws_publish_and_subscribe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_survive_their_publisher_disconnecting_immediately() {
+    // Bots, CLI tools and backgrounded mobile apps publish and hang up
+    // without waiting for OK. A validated EVENT must be stored anyway; the
+    // writer used to drop events whose connection closed in the same batch.
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let handle = wok_relay::start(env, test_cfg(dir.path())).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    let url = format!("ws://{addr}/");
+
+    let mut publishers = Vec::new();
+    for _ in 0..8 {
+        publishers.push(tokio_tungstenite::connect_async(&url).await.unwrap().0);
+    }
+    let mut ids = Vec::new();
+    for (index, mut ws) in publishers.into_iter().enumerate() {
+        let event = sign_event(json!({
+            "created_at": now_secs(),
+            "kind": 1,
+            "tags": [],
+            "content": format!("publish and hang up {index}"),
+        }));
+        ids.push(event["id"].as_str().unwrap().to_owned());
+        ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+            .await
+            .unwrap();
+        ws.close(None).await.unwrap();
+    }
+    ids.sort();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let stored = loop {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(Message::Text(
+            json!(["REQ", "check", {"ids": ids}]).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let mut stored: Vec<String> = recv_until(&mut ws, |t| t.contains("EOSE"))
+            .await
+            .iter()
+            .filter_map(|t| {
+                let frame: serde_json::Value = serde_json::from_str(t).ok()?;
+                (frame[0] == "EVENT").then(|| frame[2]["id"].as_str().unwrap().to_owned())
+            })
+            .collect();
+        stored.sort();
+        if stored == ids || tokio::time::Instant::now() > deadline {
+            break stored;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(stored, ids, "every validated EVENT must be stored");
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_accepts_events_beyond_the_legacy_nip44_ceiling() {
     let dir = tempfile::tempdir().unwrap();
     let env = test_env(dir.path());

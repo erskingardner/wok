@@ -27,6 +27,18 @@ fn event(key: &Keypair, kind: u64, time: u64, tags: Value, content: &str) -> Val
 // Rebuild all derived indexes, then verify structural integrity. The read fix
 // must not depend on physical deletion, insertion order, or damaged indexes.
 fn snapshot(events: &[Value]) -> (TempDir, Env) {
+    let records: Vec<_> = events
+        .iter()
+        .map(|event| {
+            let parsed =
+                parse_and_verify_event(event, &EventLimits::default(), None, true, false).unwrap();
+            (parsed.packed.into_bytes(), parsed.json)
+        })
+        .collect();
+    snapshot_records(&records)
+}
+
+fn snapshot_records(records: &[(Vec<u8>, String)]) -> (TempDir, Env) {
     let source_dir = tempfile::tempdir().unwrap();
     let source = Env::open(
         source_dir.path(),
@@ -39,16 +51,13 @@ fn snapshot(events: &[Value]) -> (TempDir, Env) {
     source.ensure_initialized().unwrap();
     {
         let mut txn = source.begin_rw().unwrap();
-        for (index, event) in events.iter().enumerate() {
-            let parsed =
-                parse_and_verify_event(event, &EventLimits::default(), None, true, false).unwrap();
+        for (index, (packed, json)) in records.iter().enumerate() {
             let lev = index as u64 + 1;
-            txn.put_u64(source.dbis().event, lev, &parsed.packed.into_bytes(), 0)
-                .unwrap();
+            txn.put_u64(source.dbis().event, lev, packed, 0).unwrap();
             txn.put_u64(
                 source.dbis().event_payload,
                 lev,
-                &wok_db::encode_raw_payload(&parsed.json),
+                &wok_db::encode_raw_payload(json),
                 0,
             )
             .unwrap();
@@ -69,12 +78,9 @@ fn snapshot(events: &[Value]) -> (TempDir, Env) {
         wok_db::rebuild_primary_and_event_indices(&source.begin_ro().unwrap(), &mut txn).unwrap();
         // Keep the persistent match-all negentropy tree structurally correct too.
         let mut tree = wok_negentropy::open_rw(&mut txn, 1).unwrap();
-        for event in events {
-            tree.insert(
-                event["created_at"].as_u64().unwrap(),
-                &hex::decode(event["id"].as_str().unwrap()).unwrap(),
-            )
-            .unwrap();
+        for (packed, _) in records {
+            let packed = PackedEventView::new(packed).unwrap();
+            tree.insert(packed.created_at(), packed.id()).unwrap();
         }
         tree.backend.flush().unwrap();
         drop(tree);
@@ -125,7 +131,7 @@ fn ids(events: &[Value]) -> Vec<String> {
 #[test]
 fn all_replaceable_kinds_hide_imported_history_in_req_and_count() {
     let key = key();
-    for kind in [0, 3, 41, 10000, 10002, 19999, 30000, 30023, 30443, 39999] {
+    for kind in [0, 3, 10000, 10002, 19999, 30000, 30023, 30443, 39999] {
         let old = event(&key, kind, 100, json!([["d", "address"]]), "old");
         let newest = event(&key, kind, 300, json!([["d", "address"]]), "newest");
         let middle = event(&key, kind, 200, json!([["d", "address"]]), "middle");
@@ -167,7 +173,8 @@ fn addresses_authors_kinds_and_regular_events_remain_independent() {
             }
         }
     }
-    for kind in [1, 2, 9999, 40000, 65535] {
+    // NIP-01: 4 <= n < 45 is regular, so kind 41 channel metadata is too.
+    for kind in [1, 2, 41, 44, 9999, 40000, 65535] {
         for time in [10, 20] {
             let regular = event(&a, kind, time, json!([["d", "a"]]), "regular");
             events.push(regular.clone());
@@ -412,6 +419,213 @@ async fn websocket_history_count_and_live_updates_only_serve_current_versions() 
     }
 }
 
+async fn publish(wire: &mut Wire, event: &Value) -> Value {
+    wire.send(json!(["EVENT", event])).await.unwrap();
+    let ok = wire.recv().await.unwrap();
+    assert_eq!(ok[0], "OK", "{ok}");
+    assert_eq!(ok[1], event["id"], "{ok}");
+    ok
+}
+
+async fn history(wire: &mut Wire, filter: Value) -> Vec<Value> {
+    wire.send(json!(["REQ", "history", filter])).await.unwrap();
+    let mut stored = Vec::new();
+    loop {
+        let frame = wire.recv().await.unwrap();
+        match frame[0].as_str() {
+            Some("EVENT") => stored.push(frame[2].clone()),
+            Some("EOSE") => break,
+            _ => panic!("unexpected {frame}"),
+        }
+    }
+    wire.send(json!(["CLOSE", "history"])).await.unwrap();
+    stored
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_d_tags_keep_distinct_addresses() {
+    // Single-letter tag values over 255 bytes are indexed by hash. Without
+    // that, d="", a 300-byte d and a 301-byte d were one address, and a
+    // deletion a tag naming a long d never matched it.
+    let key = key();
+    let (dir, env) = snapshot(&[]);
+    let (handle, mut wire) = server(env, dir.path()).await;
+    let pubkey = key.x_only_public_key().0.to_string();
+    let (d300, d301) = ("z".repeat(300), "z".repeat(301));
+    let empty = event(&key, 30000, 100, json!([["d", ""]]), "empty d");
+    let long = event(&key, 30000, 200, json!([["d", &d300]]), "300");
+    let longer = event(&key, 30000, 300, json!([["d", &d301]]), "301");
+    for event in [&empty, &long, &longer] {
+        assert_eq!(publish(&mut wire, event).await[2], true);
+    }
+    assert_eq!(
+        ids(&history(&mut wire, json!({"kinds": [30000]})).await),
+        ids(&[empty.clone(), long.clone(), longer.clone()])
+    );
+    for (d, expected) in [(&d300, &long), (&d301, &longer)] {
+        let found = history(&mut wire, json!({"kinds": [30000], "#d": [d]})).await;
+        assert_eq!(
+            ids(&found),
+            ids(std::slice::from_ref(expected)),
+            "d {}",
+            d.len()
+        );
+    }
+
+    // A live #d subscription for a long value sees its replacement, which
+    // replaces only that address.
+    wire.send(json!(["REQ", "live", {"#d": [&d300]}]))
+        .await
+        .unwrap();
+    assert_eq!(wire.recv().await.unwrap()[2]["id"], long["id"]);
+    assert_eq!(wire.recv().await.unwrap()[0], "EOSE");
+    let replacement = event(&key, 30000, 250, json!([["d", &d300]]), "300 again");
+    wire.send(json!(["EVENT", replacement])).await.unwrap();
+    let mut frames = vec![wire.recv().await.unwrap(), wire.recv().await.unwrap()];
+    frames.sort_by_key(|frame| frame[0].as_str().unwrap().to_owned());
+    assert_eq!(frames[0][0], "EVENT", "{frames:?}");
+    assert_eq!(frames[0][2]["id"], replacement["id"]);
+    assert_eq!(frames[1][0], "OK", "{frames:?}");
+    assert_eq!(frames[1][2], true, "{frames:?}");
+    wire.send(json!(["CLOSE", "live"])).await.unwrap();
+    assert_eq!(
+        ids(&history(&mut wire, json!({"kinds": [30000]})).await),
+        ids(&[empty.clone(), replacement, longer.clone()])
+    );
+
+    // A deletion a tag naming the long address deletes it and nothing else,
+    // and stays matchable by #a.
+    let address = format!("30000:{pubkey}:{d300}");
+    let deletion = event(&key, 5, 400, json!([["a", &address]]), "");
+    assert_eq!(publish(&mut wire, &deletion).await[2], true);
+    assert_eq!(
+        ids(&history(&mut wire, json!({"kinds": [30000, 5]})).await),
+        ids(&[empty, longer, deletion.clone()])
+    );
+    assert_eq!(
+        ids(&history(&mut wire, json!({"#a": [&address]})).await),
+        ids(std::slice::from_ref(&deletion))
+    );
+    // An older version of the deleted address cannot come back.
+    let stale = event(&key, 30000, 350, json!([["d", &d300]]), "stale");
+    let ok = publish(&mut wire, &stale).await;
+    assert_eq!(ok[2], false, "{ok}");
+    assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+
+    // Every stored address fits the a tag that names it: `30000:`, 64 hex
+    // digits and `:` leave max_tag_val_size - 71 bytes for d.
+    let max = EventLimits::default().max_tag_val_size;
+    for len in [max - 70, max] {
+        let unnamed = event(&key, 30000, 500, json!([["d", "z".repeat(len)]]), "");
+        let ok = publish(&mut wire, &unnamed).await;
+        assert_eq!(ok[2], false, "{ok}");
+        assert!(ok[3].as_str().unwrap().starts_with("invalid:"), "{ok}");
+    }
+    let d_max = "z".repeat(max - 71);
+    let longest = event(&key, 30000, 500, json!([["d", &d_max]]), "longest");
+    assert_eq!(publish(&mut wire, &longest).await[2], true);
+    let address = format!("30000:{pubkey}:{d_max}");
+    assert_eq!(address.len(), max);
+    let deletion = event(&key, 5, 600, json!([["a", &address]]), "");
+    assert_eq!(publish(&mut wire, &deletion).await[2], true);
+    assert!(
+        history(&mut wire, json!({"kinds": [30000], "#d": [&d_max]}))
+            .await
+            .is_empty()
+    );
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn channel_metadata_for_each_channel_survives() {
+    // NIP-01 makes 4 <= n < 45 regular. NIP-28 kind 41 names its channel
+    // with an e tag, so one author's metadata for two channels is two
+    // events, not a replacement.
+    let key = key();
+    let (dir, env) = snapshot(&[]);
+    let (handle, mut wire) = server(env, dir.path()).await;
+    let channels = ["aa".repeat(32), "bb".repeat(32)];
+    let mut published = Vec::new();
+    for (time, channel) in [(100, &channels[0]), (200, &channels[1])] {
+        let metadata = event(&key, 41, time, json!([["e", channel]]), "{}");
+        assert_eq!(publish(&mut wire, &metadata).await[2], true);
+        published.push(metadata);
+    }
+    for (filter, expected) in [
+        (json!({"kinds": [41]}), published.clone()),
+        (
+            json!({"kinds": [41], "#e": [channels[0]]}),
+            vec![published[0].clone()],
+        ),
+    ] {
+        wire.send(json!(["REQ", "channels", filter])).await.unwrap();
+        let mut stored = Vec::new();
+        loop {
+            let frame = wire.recv().await.unwrap();
+            match frame[0].as_str() {
+                Some("EVENT") => stored.push(frame[2].clone()),
+                Some("EOSE") => break,
+                _ => panic!("unexpected {frame}"),
+            }
+        }
+        assert_eq!(ids(&stored), ids(&expected), "{filter}");
+    }
+    handle.request_shutdown();
+}
+
+#[test]
+fn kind41_history_packed_as_replaceable_is_regular_after_upgrade() {
+    // strfry and earlier Wok releases packed kind 41 with a virtual empty d
+    // and counted extra versions per author as superseded history under the
+    // state key "superseded-events". Both versions must now be visible, and
+    // the count is redone on the next writable open.
+    let key = key();
+    let channels = ["aa".repeat(32), "bb".repeat(32)];
+    let records: Vec<_> = [(100, &channels[0]), (200, &channels[1])]
+        .into_iter()
+        .map(|(time, channel)| {
+            let metadata = event(&key, 41, time, json!([["e", channel]]), "{}");
+            let parsed =
+                parse_and_verify_event(&metadata, &EventLimits::default(), None, true, false)
+                    .unwrap();
+            let view = parsed.packed.view();
+            let mut tags = wok_event::PackedEventTagBuilder::default();
+            tags.add('d', b"").unwrap();
+            tags.add('e', &hex::decode(channel).unwrap()).unwrap();
+            let legacy =
+                wok_event::PackedEventBuilder::build(view.id(), view.pubkey(), time, 41, 0, &tags)
+                    .unwrap();
+            (metadata, (legacy.into_bytes(), parsed.json))
+        })
+        .collect();
+    let (published, records): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+    let (_dir, env) = snapshot_records(&records);
+    let state = env.dbis().state.unwrap();
+    {
+        // What a writable open by an older release leaves behind.
+        let mut txn = env.begin_rw().unwrap();
+        txn.clear(state).unwrap();
+        txn.put(state, b"superseded-events", &1u64.to_le_bytes(), 0)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let txn = env.begin_ro().unwrap();
+    assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), None);
+    let report = wok_db::check_integrity(&txn).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    assert_eq!((report.superseded_groups, report.superseded_events), (0, 0));
+    drop(txn);
+    assert_eq!(query(&env, &[json!({})], false), ids(&published));
+
+    env.ensure_initialized().unwrap();
+    let txn = env.begin_ro().unwrap();
+    assert!(txn.get(state, b"superseded-events").unwrap().is_none());
+    assert_eq!(wok_db::state::superseded_events_ro(&txn).unwrap(), Some(0));
+    assert!(wok_db::check_integrity(&txn).unwrap().ok());
+    drop(txn);
+    assert_eq!(query(&env, &[json!({})], false), ids(&published));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn negentropy_hides_stale_ids_with_and_without_a_matching_persistent_tree() {
     let key = key();
@@ -507,7 +721,7 @@ fn write_with_quota(
 
 #[test]
 fn replacement_writer_removes_all_versions_atomically_and_uses_net_quota() {
-    for kind in [0, 3, 41, 10000, 19999, 30000, 30443, 39999] {
+    for kind in [0, 3, 10000, 19999, 30000, 30443, 39999] {
         let key = key();
         let events: Vec<_> = [300, 100, 200]
             .iter()
@@ -628,6 +842,65 @@ fn address_deletion_removes_all_eligible_versions_and_keeps_newer_versions() {
 }
 
 #[test]
+fn long_addresses_are_deleted_and_tombstoned_through_their_hashes() {
+    // A 200-byte d is packed as is but its a tag is hashed; a 300-byte d is
+    // hashed as well. Either deletion removes and tombstones the address, and
+    // removing the deletion request removes its hashed tombstone too.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    for d in ["y".repeat(200), "z".repeat(300)] {
+        let versions: Vec<_> = [100, 200]
+            .iter()
+            .map(|t| event(&key, 30443, *t, json!([["d", &d]]), "version"))
+            .collect();
+        let other = event(&key, 30443, 100, json!([["d", "short"]]), "other");
+        let mut input = versions.clone();
+        input.push(other.clone());
+        let (_dir, env) = snapshot(&input);
+        let address = format!("30443:{pubkey}:{d}");
+        assert!(address.len() > wok_event::MAX_INDEXED_TAG_VAL_SIZE);
+        let deletion = event(&key, 5, 300, json!([["a", &address]]), "delete");
+        assert_eq!(
+            write_with_quota(&env, &deletion, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+        assert_eq!(
+            stored_ids(&env),
+            ids(&[other.clone(), deletion.clone()]),
+            "d {}",
+            d.len()
+        );
+        let stale = event(&key, 30443, 250, json!([["d", &d]]), "stale");
+        assert_eq!(
+            write_with_quota(&env, &stale, 0, true),
+            wok_db::EventWriteStatus::Deleted,
+            "d {}",
+            d.len()
+        );
+        assert!(wok_db::check_integrity(&env.begin_ro().unwrap())
+            .unwrap()
+            .ok());
+
+        let id = hex::decode(deletion["id"].as_str().unwrap()).unwrap();
+        let (lev, _) = wok_db::lookup_event_by_id_ro(&env.begin_ro().unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [lev]).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event_replace_deletion).unwrap(), 0);
+        assert!(wok_db::check_integrity(&txn).unwrap().ok());
+        drop(txn);
+        let fresh = event(&key, 30443, 250, json!([["d", &d]]), "fresh");
+        assert_eq!(
+            write_with_quota(&env, &fresh, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+    }
+}
+
+#[test]
 fn integrity_reports_retained_versions_without_treating_them_as_corruption() {
     let key = key();
     let mut events = Vec::new();
@@ -647,7 +920,7 @@ fn integrity_reports_retained_versions_without_treating_them_as_corruption() {
 #[test]
 fn physical_tree_fast_path_tracks_retained_history_transactionally() {
     let key = key();
-    for kind in [0, 3, 41, 10002, 30443] {
+    for kind in [0, 3, 10002, 30443] {
         let old = event(&key, kind, 100, json!([]), "old");
         let newest = event(&key, kind, 200, json!([]), "newest");
         let (_dir, env) = snapshot(std::slice::from_ref(&old));
@@ -762,7 +1035,7 @@ fn purging_superseded_history_keeps_one_winner_per_address() {
     let mut events = Vec::new();
     let mut winners = Vec::new();
     for key in [&a, &b] {
-        for kind in [0, 3, 41, 10000, 19999] {
+        for kind in [0, 3, 10000, 19999] {
             let versions: Vec<_> = [200, 300, 100]
                 .iter()
                 .map(|t| event(key, kind, *t, json!([["d", "ignored"]]), "version"))
@@ -789,14 +1062,16 @@ fn purging_superseded_history_keeps_one_winner_per_address() {
         ties.sort_by_key(|v| v["id"].as_str().unwrap().to_owned());
         winners.push(ties[0].clone());
         events.extend(ties.into_iter().rev());
-        for time in [100, 200] {
-            let regular = event(key, 1, time, json!([["d", "x"]]), "regular");
-            winners.push(regular.clone());
-            events.push(regular);
+        for kind in [1, 41] {
+            for time in [100, 200] {
+                let regular = event(key, kind, time, json!([["d", "x"]]), "regular");
+                winners.push(regular.clone());
+                events.push(regular);
+            }
         }
     }
-    let groups = 2 * (5 + 2 + 1);
-    let superseded = 2 * (5 * 2 + 2 + 2);
+    let groups = 2 * (4 + 2 + 1);
+    let superseded = 2 * (4 * 2 + 2 + 2);
     let (_dir, env) = snapshot(&events);
     let before = wok_db::count_superseded_ro(&env.begin_ro().unwrap()).unwrap();
     assert_eq!((before.groups, before.events), (groups, superseded));

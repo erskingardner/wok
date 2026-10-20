@@ -5,10 +5,10 @@ Library modules. Public surface is re-exported from `lib.rs`.
 | File | Role |
 | --- | --- |
 | `lib.rs` | Crate root, version/kind constants, re-exports |
-| `json.rs` | tao-compatible `parse_strict` / `to_tao_string` |
+| `json.rs` | tao-compatible `parse_strict` / `to_tao_string`; NIP-01 id preimage writer |
 | `parse.rs` | Hex helpers, `ParsedEvent`, `EventLimits`, JSON → PackedEvent |
 | `validate.rs` | Size/timestamp/Schnorr checks; `parse_and_verify_event` |
-| `hash.rs` | SHA-256 event id, `verify_id`, `verify_sig` |
+| `hash.rs` | NIP-01 and legacy event ids, `verify_id`, `verify_id_allowing_legacy`, `verify_sig` |
 | `packed.rs` | PackedEvent bytes, views, tag builder, ordering |
 | `kinds.rs` | Replaceable / param-replaceable / ephemeral; `a` tags |
 | `bech32.rs` | npub encode/decode |

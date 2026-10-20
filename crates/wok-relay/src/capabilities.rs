@@ -38,7 +38,9 @@ impl CapabilityCondition {
             Self::Nip59Safe => {
                 cfg.events.ephemeral_persistence == EphemeralPersistence::LiveOnly
                     && cfg.auth_usable()
-                    && cfg.relay.auth.restricted_read_kinds.contains(&1059)
+                    && wok_event::GIFT_WRAP_KINDS
+                        .iter()
+                        .all(|kind| cfg.relay.auth.restricted_read_kinds.contains(kind))
                     && cfg.relay.auth.restrict_read_to_involved_pubkey
             }
             Self::Nip62Enabled => cfg.relay.nip62.enabled,
@@ -190,9 +192,15 @@ mod tests {
         cfg.relay.auth.service_url = "wss://relay.example.com/".into();
         assert!(supported_nips(&cfg).contains(&59));
 
-        cfg.relay.auth.restricted_read_kinds.clear();
-        assert!(!supported_nips(&cfg).contains(&59));
-        cfg.relay.auth.restricted_read_kinds.push(1059);
+        for wrap in [1059, 21059] {
+            cfg.relay
+                .auth
+                .restricted_read_kinds
+                .retain(|kind| *kind != wrap);
+            assert!(!supported_nips(&cfg).contains(&59), "kind {wrap}");
+            cfg.relay.auth.restricted_read_kinds.push(wrap);
+            assert!(supported_nips(&cfg).contains(&59));
+        }
 
         cfg.relay.auth.restrict_read_to_involved_pubkey = false;
         assert!(!supported_nips(&cfg).contains(&59));

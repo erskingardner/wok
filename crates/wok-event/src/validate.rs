@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::hash::{verify_id, verify_sig};
+use crate::hash::{verify_id, verify_id_allowing_legacy, verify_sig};
 use crate::packed::PackedEventView;
 use crate::parse::{
     from_lower_hex_array, normalize_event_json, nostr_json_to_packed_event, EventLimits,
@@ -13,6 +13,17 @@ use crate::EventError;
 
 fn json_string<'a>(v: &'a Value, err: &str) -> Result<&'a str, EventError> {
     v.as_str().ok_or_else(|| EventError::msg(err.to_string()))
+}
+
+/// Which event id preimages verification accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdPreimage {
+    /// NIP-01 only. For events published to this relay.
+    Nip01,
+    /// NIP-01, or the legacy tao preimage that strfry and earlier Wok
+    /// releases hashed (U+007F escaped). Only for events a relay has already
+    /// stored: imports, sync and router downloads.
+    Nip01OrLegacy,
 }
 
 #[derive(Debug, Clone)]
@@ -43,7 +54,18 @@ impl TimestampPolicy {
 }
 
 pub fn verify_nostr_event(packed: PackedEventView<'_>, orig: &Value) -> Result<(), EventError> {
-    verify_id(orig, packed.id())?;
+    verify_nostr_event_with(packed, orig, IdPreimage::Nip01)
+}
+
+fn verify_nostr_event_with(
+    packed: PackedEventView<'_>,
+    orig: &Value,
+    ids: IdPreimage,
+) -> Result<(), EventError> {
+    match ids {
+        IdPreimage::Nip01 => verify_id(orig, packed.id())?,
+        IdPreimage::Nip01OrLegacy => verify_id_allowing_legacy(orig, packed.id())?,
+    }
     let sig_hex = json_string(
         orig.get("sig")
             .ok_or_else(|| EventError::msg("missing sig"))?,
@@ -109,12 +131,33 @@ pub fn verify_event_timestamp(
     Ok(())
 }
 
+/// Parse and verify an event published to this relay. Its id must use the
+/// NIP-01 preimage.
 pub fn parse_and_verify_event(
     orig: &Value,
     limits: &EventLimits,
     policy: Option<&TimestampPolicy>,
     verify_msg: bool,
     verify_time: bool,
+) -> Result<ParsedEvent, EventError> {
+    parse_and_verify_event_with(
+        orig,
+        limits,
+        policy,
+        verify_msg,
+        verify_time,
+        IdPreimage::Nip01,
+    )
+}
+
+/// `parse_and_verify_event` with a choice of accepted id preimages.
+pub fn parse_and_verify_event_with(
+    orig: &Value,
+    limits: &EventLimits,
+    policy: Option<&TimestampPolicy>,
+    verify_msg: bool,
+    verify_time: bool,
+    ids: IdPreimage,
 ) -> Result<ParsedEvent, EventError> {
     if !orig.is_object() {
         return Err(EventError::msg("event is not an object"));
@@ -132,7 +175,7 @@ pub fn parse_and_verify_event(
         verify_event_timestamp(packed.view(), p)?;
     }
     if verify_msg {
-        verify_nostr_event(packed.view(), orig)?;
+        verify_nostr_event_with(packed.view(), orig, ids)?;
     }
     Ok(ParsedEvent { packed, json })
 }

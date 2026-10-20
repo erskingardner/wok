@@ -119,6 +119,7 @@ Available operator commands:
 | `relay` | WS (+ optional Unix) relay |
 | `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse` |
 | `scan`, `event <levId>`, `info`, `delete`, `compact`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |
+| `config show [--overrides]` | Effective configuration with each value's origin: default, preset, or file line (`--overrides`: only values the file changes from its preset) |
 | `doctor [--json]` | Config, storage, index, payload, negentropy, capacity, and runtime-path diagnostics |
 | `purge-superseded [--dry-run] [--json]` | Delete replaceable versions superseded at their address, keeping the version reads serve |
 | `reindex --confirm-relay-stopped [--backup <dir>]` | Stage and verify rebuilt indexes, atomically promote them, and retain the original DB |

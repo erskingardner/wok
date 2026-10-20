@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Update Rustls to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349
+  (client session secrets in `Debug` output, data sent after an ECH rejection,
+  unbounded Brotli certificate decompression, and a key-exchange downgrade).
+  As before, only the CLI's outbound clients and the benchmark harness use
+  Rustls.
 - Update Rustls to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake messages
   accepted across encryption-level boundaries). Rustls is used only by the
   CLI's outbound `wss://` and HTTPS clients (mesh, router, upload/download,
@@ -58,9 +63,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the COUNT dedup budget derived from `relay.max_filter_limit_count`. An
   operator who shortened the plugin timeout to contain a hanging plugin was
   still waiting the old duration (#54).
+- Ephemeral gift wraps (kind 21059) are restricted reads by default:
+  `relay.auth.restricted_read_kinds` now defaults to `[4, 1059, 21059]`.
+  Before, any unauthenticated subscription to kind 21059, or to everything,
+  received wraps addressed to someone else, recipient tag included, while
+  NIP-59 was advertised. NIP-59 is now advertised only while both gift-wrap
+  kinds are restricted; configs that list restricted kinds explicitly need
+  21059 added.
 
 ### Added
 
+- Configuration presets. The optional top-level key `preset` selects a named
+  set of defaults; configuration resolves as built-in defaults, then the
+  preset's overlay, then the file. `public`, the built-in defaults, is the
+  only preset and is selected when the key is absent, so no default changes.
+  Unknown preset names are rejected. `wok config show` prints the effective
+  configuration with each value's origin (default, preset, or file and line),
+  and `--overrides` prints only the keys the file changes from its preset.
+  Files written by dashboard saves and `wok migrate strfry` now include
+  `preset = "public"`.
 - `wok-bench --scenario clients` measures default limits the way clients hit
   them. Abuse controls and AUTH stay on, or the scenario runs a supplied relay
   TOML (`--relay-config`). It simulates outbox clients with about 30
@@ -106,6 +127,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were never sent a challenge. It draws on the per-address EVENT budget and
   replies `rate-limited: AUTH budget exhausted` once that runs out, so a few
   connections can no longer tie up every ingester thread with signature checks.
+- Events are stored even when the publisher disconnects right after sending
+  them. The writer dropped every EVENT whose connection closed within the same
+  write batch, so bots, CLI tools and mobile apps that publish and hang up lost
+  posts (of eight such publishers, one event was stored). Only the OK is lost
+  now. An EVENT still parked behind a full writer queue is dropped when its
+  connection closes, as before.
+- Single-letter tag values longer than 255 bytes are indexed by their SHA-256.
+  They were not indexed at all, so an addressable event whose first `d` tag
+  was that long was keyed by an empty `d` and distinct addresses replaced one
+  another (`d=""`, a 300-byte `d` and a 301-byte `d`), a kind 5 `a` tag that
+  long never deleted its target, and `#x` filters for such values were
+  refused. An addressable event is refused with `invalid:` when the `a` tag
+  naming it would exceed `events.max_tag_val_size`, so every stored address
+  can still be deleted by `a` tag. Events stored by earlier releases or
+  migrated from strfry keep their packing, so filters still cannot match
+  their long values.
+- Kind 41 (NIP-28 channel metadata) is a regular event, as NIP-01 makes every
+  kind from 4 to 44. It was replaced per author, so metadata for a second
+  channel deleted the first channel's. Migrated kind 41 history becomes
+  visible, and the superseded-version count is redone once on the next
+  writable open (state key `superseded-versions` replaces `superseded-events`).
+- A deletion request against a deletion request has no effect, as NIP-09
+  requires. Before, a kind 5 deleting an earlier kind 5 removed it with its
+  tombstone, and the originally deleted event could be published again.
+- A kind 22242 AUTH event sent with EVENT is refused with
+  `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
+  to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.
+- `wok import`, `wok sync` and `wok router` no longer store kind 22242 AUTH
+  events; import and sync count them as rejected. They stored them in either
+  ephemeral mode, and the relay then delivered them to live subscriptions. A
+  22242 already in the database, from strfry or another writer, is now hidden
+  from REQ, COUNT, live delivery and NIP-77 sync.
+- Event ids are checked against the NIP-01 preimage, which includes U+007F
+  (DEL) verbatim. Events with DEL in a tag or content, signed by go-nostr,
+  nostr-tools or anything built on serde_json, were refused with
+  `invalid: bad event id` because Wok, like strfry, escaped it as `\u007f`.
+  Stored payloads keep that escaping. `wok import`, `wok sync` and
+  `wok router` downloads also accept the legacy id, so data from strfry and
+  earlier Wok releases still verifies.
 
 ## [0.7.0] - 2026-09-08
 

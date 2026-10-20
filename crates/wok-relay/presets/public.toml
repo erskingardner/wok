@@ -1,0 +1,13 @@
+# Wok preset: public (the default)
+#
+# A general public relay that any client can read from and write to: feeds,
+# outbox lookups, DMs and gift-wrap inboxes.
+#
+# The public preset is Wok's built-in defaults, so this overlay changes
+# nothing. docs/wok.toml lists every default value, and `wok config show`
+# prints the effective configuration with the origin of each value.
+#
+# Wok resolves configuration in three layers: the built-in defaults, then the
+# selected preset's overlay, then the operator's file. Each layer replaces
+# individual keys, not whole sections. An overlay contains only the keys its
+# preset changes.

@@ -82,7 +82,19 @@ fn store_downloads(
     let mut writes = Vec::with_capacity(events.len());
     for event in events.drain(..) {
         let policy = cfg.timestamp_policy_for_kind(event["kind"].as_u64().unwrap_or(u64::MAX));
-        match parse_and_verify_event(&event, &cfg.event_limits(), Some(&policy), true, true) {
+        // A peer's stored events may carry legacy strfry/Wok ids.
+        match parse_and_verify_event_with(
+            &event,
+            &cfg.event_limits(),
+            Some(&policy),
+            true,
+            true,
+            IdPreimage::Nip01OrLegacy,
+        ) {
+            Ok(parsed) if parsed.packed.view().kind() == AUTH_KIND => {
+                report.rejected += 1;
+                tracing::warn!(error = AUTH_EVENT_REFUSAL, "sync download rejected");
+            }
             Ok(parsed) => writes.push(EventToWrite::new(parsed.packed.into_bytes(), parsed.json)),
             Err(error) => {
                 report.rejected += 1;
@@ -186,12 +198,14 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 let memory_cap = (view_budget / per_item).saturating_sub(1);
                 let cap = cfg.relay.max_sync_events.min(memory_cap);
                 let mut levs = Vec::new();
-                foreach_by_filter_scan(
+                // Offer the peer only what a client may read, like the relay.
+                wok_query::foreach_visible_by_filter(
                     &txn,
                     &filter_json,
                     cap.saturating_add(1),
                     cfg.relay.max_tags_per_filter,
                     cfg.relay.max_and_entries,
+                    wok_query::visibility::ReadVisibility::default(),
                     |lev| levs.push(lev),
                 )?;
                 if levs.len() as u64 > cap {

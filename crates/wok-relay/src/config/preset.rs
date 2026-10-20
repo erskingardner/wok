@@ -1,0 +1,79 @@
+//! Named configuration presets.
+//!
+//! A preset is a TOML overlay on the built-in defaults, selected with the
+//! top-level `preset` key. Configuration resolves in three layers: built-in
+//! defaults, then the preset's overlay, then the operator's file. Overlays
+//! ship in the binary from `crates/wok-relay/presets/` and are mirrored in
+//! `docs/presets/`.
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+
+/// A named configuration preset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Preset {
+    /// A general public relay. Its values are the built-in defaults.
+    #[default]
+    Public,
+}
+
+impl Preset {
+    /// Every preset, in the order error messages list them.
+    pub const ALL: &'static [Preset] = &[Preset::Public];
+
+    /// The name the `preset` key uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Preset::Public => "public",
+        }
+    }
+
+    /// The preset's overlay: only the keys it changes from the built-in
+    /// defaults.
+    pub fn overlay(self) -> &'static str {
+        match self {
+            Preset::Public => include_str!("../../presets/public.toml"),
+        }
+    }
+
+    /// Read the `preset` key of an operator's file. An absent key selects
+    /// the public preset.
+    pub(super) fn select(file: &toml::Value) -> Result<Self, String> {
+        match file.get("preset") {
+            None => Ok(Self::default()),
+            Some(toml::Value::String(name)) => name.parse(),
+            Some(other) => Err(format!(
+                "preset must be a string naming one of: {}; got {other}",
+                names()
+            )),
+        }
+    }
+}
+
+impl FromStr for Preset {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|preset| preset.name() == name)
+            .ok_or_else(|| format!("unknown preset {name:?}; valid presets: {}", names()))
+    }
+}
+
+impl fmt::Display for Preset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+fn names() -> String {
+    Preset::ALL
+        .iter()
+        .map(|preset| preset.name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}

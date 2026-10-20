@@ -98,7 +98,7 @@ fn rust_tree_stats(dir: &Path) -> (u64, String) {
         dir,
         EnvOptions {
             create_dir: false,
-            ..EnvOptions::default()
+            ..EnvOptions::for_tests()
         },
     )
     .unwrap();

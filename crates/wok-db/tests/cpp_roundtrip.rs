@@ -57,7 +57,7 @@ fn make_cpp_db() -> (TempDir, PathBuf) {
 fn open_cpp_created_database() {
     require_strfry!();
     let (_tmp, db) = make_cpp_db();
-    let env = Env::open(&db, EnvOptions::default()).unwrap();
+    let env = Env::open(&db, EnvOptions::for_tests()).unwrap();
     assert_eq!(env.db_version().unwrap(), 3);
     let txn = env.begin_ro().unwrap();
     let meta = txn.get_u64(env.dbis().meta, 1).unwrap().unwrap();
@@ -71,7 +71,7 @@ fn cpp_refuses_wok_owned_database() {
     require_strfry!();
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
-    let env = Env::open(&db, EnvOptions::default()).unwrap();
+    let env = Env::open(&db, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     drop(env);
 
@@ -126,7 +126,7 @@ fn sign_kind1(content: &str, created_at: u64) -> (Vec<u8>, String) {
 fn wok_owned_event_remains_readable_by_wok() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
-    let env = Env::open(&db, EnvOptions::default()).unwrap();
+    let env = Env::open(&db, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
     let (packed, json) = sign_kind1("hello wok", 1_700_000_000);
     let id_hex = hex::encode(PackedEventView::new(&packed).unwrap().id());

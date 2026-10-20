@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::kinds::{
     is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag,
 };
-use crate::packed::{PackedEvent, PackedEventBuilder, PackedEventTagBuilder};
+use crate::packed::{indexed_tag_value, PackedEvent, PackedEventBuilder, PackedEventTagBuilder};
 use crate::{EventError, MAX_INDEXED_TAG_VAL_SIZE};
 
 /// Default ceiling for normalized event JSON. This is intentionally far below
@@ -165,6 +165,7 @@ pub fn nostr_json_to_packed_event(
 
     let mut tag_builder = PackedEventTagBuilder::default();
     let mut expiration = 0u64;
+    let mut address_d_seen = !is_param_replaceable_kind(kind);
 
     if is_replaceable_kind(kind) {
         // Prepend virtual d-tag. Any later d-tags will be ignored during indexing.
@@ -202,6 +203,17 @@ pub fn nostr_json_to_packed_event(
                     tag_val.len()
                 )));
             }
+            // An address must fit the a tag that names it, `kind:pubkey:d`,
+            // under the same limit, or no event could reference or delete it.
+            if tag_name == "d" && !address_d_seen {
+                address_d_seen = true;
+                let a_tag_len = kind.to_string().len() + 1 + 64 + 1 + tag_val.len();
+                if a_tag_len > limits.max_tag_val_size {
+                    return Err(EventError::msg(format!(
+                        "d tag too large: its a tag would be {a_tag_len} bytes"
+                    )));
+                }
+            }
             if tag_name == "e" || tag_name == "p" {
                 if tag_val.len() != 64 {
                     return Err(EventError::msg(format!(
@@ -221,9 +233,12 @@ pub fn nostr_json_to_packed_event(
                 }
             }
 
-            if tag_val.len() <= MAX_INDEXED_TAG_VAL_SIZE {
-                tag_builder.add(tag_name.chars().next().unwrap(), tag_val.as_bytes())?;
-            }
+            // Long values are packed by hash, so an address with a long d or a
+            // long deletion a tag stays distinct and can be matched.
+            tag_builder.add(
+                tag_name.chars().next().unwrap(),
+                &indexed_tag_value(tag_val.as_bytes()),
+            )?;
         } else if tag_name == "expiration" && expiration == 0 {
             expiration = parse_uint64(tag_val)?;
             if expiration < 100 {
@@ -358,6 +373,88 @@ mod tests {
         });
         let packed = nostr_json_to_packed_event(&v, &EventLimits::default()).unwrap();
         assert_eq!(packed.view().first_d_tag().unwrap(), b"");
+    }
+
+    #[test]
+    fn long_tag_values_are_packed_by_hash() {
+        let event = |kind: u64, tags: Value| {
+            json!({
+                "id": "11".repeat(32),
+                "pubkey": "22".repeat(32),
+                "created_at": 1,
+                "kind": kind,
+                "content": "",
+                "tags": tags,
+                "sig": "00".repeat(64),
+            })
+        };
+        let pack = |kind: u64, tags: Value| {
+            nostr_json_to_packed_event(&event(kind, tags), &EventLimits::default()).unwrap()
+        };
+        let longest = "z".repeat(MAX_INDEXED_TAG_VAL_SIZE);
+        let long = "z".repeat(MAX_INDEXED_TAG_VAL_SIZE + 1);
+        let hashed = indexed_tag_value(long.as_bytes()).into_owned();
+        assert_eq!(hashed.len(), 33);
+
+        let packed = pack(30000, json!([["d", longest]]));
+        assert_eq!(packed.view().first_d_tag().unwrap(), longest.as_bytes());
+        // The first d is the address even when it is long, and the virtual
+        // empty d stays last.
+        for tags in [json!([["d", long]]), json!([["d", long], ["d", "short"]])] {
+            let packed = pack(30000, tags);
+            assert_eq!(packed.view().first_d_tag().unwrap(), hashed);
+            assert_eq!(packed.view().tags().last().unwrap().value, b"");
+        }
+        let packed = pack(30000, json!([["d", "short"], ["d", long]]));
+        assert_eq!(packed.view().first_d_tag().unwrap(), b"short");
+        // Replaceable kinds keep their leading virtual empty d.
+        let packed = pack(10002, json!([["d", long]]));
+        assert_eq!(packed.view().first_d_tag().unwrap(), b"");
+        let packed = pack(1, json!([["r", long], ["t", "short"], ["title", long]]));
+        let tags = packed.view().tags();
+        assert_eq!(tags.len(), 2);
+        assert_eq!((tags[0].name, &tags[0].value), ('r', &hashed));
+        assert_eq!((tags[1].name, &tags[1].value[..]), ('t', &b"short"[..]));
+
+        // An address must fit the a tag that names it: `30000:` plus 64 hex
+        // digits and `:` leave max_tag_val_size - 71 bytes for the first d.
+        let limits = EventLimits::default();
+        let fits = "z".repeat(limits.max_tag_val_size - 71);
+        let too_long = "z".repeat(limits.max_tag_val_size - 70);
+        let packed = pack(30000, json!([["d", fits]]));
+        assert_eq!(
+            packed.view().first_d_tag().unwrap(),
+            indexed_tag_value(fits.as_bytes()).into_owned()
+        );
+        for tags in [
+            json!([["d", too_long]]),
+            json!([["d", "z".repeat(limits.max_tag_val_size)]]),
+        ] {
+            assert!(nostr_json_to_packed_event(&event(30000, tags), &limits).is_err());
+        }
+        // Only the address is held to that: later d tags and other kinds are
+        // not named by an a tag.
+        pack(30000, json!([["d", "short"], ["d", too_long]]));
+        pack(1, json!([["d", too_long]]));
+        pack(10002, json!([["d", too_long]]));
+
+        let pubkey = "22".repeat(32);
+        let deletion = format!("30000:{pubkey}:{fits}");
+        assert_eq!(deletion.len(), limits.max_tag_val_size);
+        pack(5, json!([["a", deletion]]));
+        let address = format!("30000:{pubkey}:{long}");
+        let packed = pack(5, json!([["a", address]]));
+        assert_eq!(
+            packed.view().tags()[0].value,
+            indexed_tag_value(address.as_bytes()).into_owned()
+        );
+        // A long address must still name the author of the deletion.
+        let other = format!("30000:{}:{long}", "33".repeat(32));
+        assert!(nostr_json_to_packed_event(
+            &event(5, json!([["a", other]])),
+            &EventLimits::default()
+        )
+        .is_err());
     }
 
     #[test]

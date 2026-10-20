@@ -4,9 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+mod preset;
+mod provenance;
+
+pub use preset::Preset;
+pub use provenance::{ConfigEntry, ConfigExplanation, Origin};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// The preset whose overlay this configuration was resolved over.
+    #[serde(default)]
+    pub preset: Preset,
     pub admin: AdminConfig,
     pub db: PathBuf,
     pub db_maxreaders: u32,
@@ -101,6 +110,7 @@ const STRFRY_TRANSLATED_KEYS: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TomlConfig {
+    preset: Preset,
     admin: AdminConfig,
     database: DatabaseConfig,
     events: EventsConfig,
@@ -308,6 +318,7 @@ pub struct UnixConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            preset: Preset::Public,
             admin: AdminConfig {
                 enabled: false,
                 public_url: String::new(),
@@ -345,9 +356,10 @@ impl Default for Config {
                 auth: AuthConfig {
                     enabled: true,
                     service_url: String::new(),
-                    // Private messages and gift wraps fail closed until the
-                    // operator configures the relay URL required by NIP-42.
-                    restricted_read_kinds: vec![4, 1059],
+                    // Private messages and gift wraps, including NIP-59's
+                    // ephemeral kind 21059, fail closed until the operator
+                    // configures the relay URL required by NIP-42.
+                    restricted_read_kinds: vec![4, 1059, 21059],
                     restrict_read_to_involved_pubkey: true,
                     restrict_writes: false,
                 },
@@ -451,6 +463,7 @@ fn default_max_and_entries() -> usize {
 impl From<Config> for TomlConfig {
     fn from(config: Config) -> Self {
         Self {
+            preset: config.preset,
             admin: config.admin,
             database: DatabaseConfig {
                 path: config.db,
@@ -469,6 +482,7 @@ impl From<Config> for TomlConfig {
 impl From<TomlConfig> for Config {
     fn from(config: TomlConfig) -> Self {
         Self {
+            preset: config.preset,
             admin: config.admin,
             db: config.database.path,
             db_maxreaders: config.database.max_readers,
@@ -480,6 +494,70 @@ impl From<TomlConfig> for Config {
             relay: config.relay,
         }
     }
+}
+
+/// Resolves one preset's overlay text.
+type OverlayFn = fn(Preset) -> &'static str;
+
+/// The configuration layers of one TOML file before they are merged: the
+/// built-in defaults, the selected preset's overlay, and the file itself.
+struct Layers {
+    preset: Preset,
+    overlay: toml::Value,
+    file: toml::Value,
+}
+
+impl Layers {
+    fn parse(text: &str, overlay_of: OverlayFn) -> Result<Self, String> {
+        let file: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+        let preset = Preset::select(&file)?;
+        let overlay =
+            toml::from_str(overlay_of(preset)).map_err(|e| format!("preset {preset}: {e}"))?;
+        Ok(Self {
+            preset,
+            overlay,
+            file,
+        })
+    }
+
+    /// The built-in defaults with the preset's overlay: the configuration a
+    /// file containing only the `preset` key would get.
+    fn preset_value(&self) -> Result<toml::Value, String> {
+        let mut merged = toml::Value::try_from(TomlConfig::from(Config::default()))
+            .map_err(|e| e.to_string())?;
+        merge_toml(&mut merged, self.overlay.clone());
+        if let toml::Value::Table(table) = &mut merged {
+            table.insert("preset".into(), self.preset.name().into());
+        }
+        Ok(merged)
+    }
+
+    fn resolve(&self) -> Result<Config, String> {
+        let mut merged = self.preset_value()?;
+        merge_toml(&mut merged, self.file.clone());
+        let parsed: TomlConfig = merged
+            .try_into()
+            .map_err(|e: toml::de::Error| e.to_string())?;
+        validate(parsed)
+    }
+}
+
+/// Check and normalize a merged configuration.
+fn validate(mut parsed: TomlConfig) -> Result<Config, String> {
+    validate_admin_config(&mut parsed.admin)?;
+    clamp_size_class(&mut parsed);
+    parsed.relay.unix.mode = mask_socket_mode(parsed.relay.unix.mode);
+    if parsed.observability.history_interval_secs == 0 {
+        return Err("observability.history_interval_secs must be at least 1".into());
+    }
+    if parsed.observability.history_max_points > crate::metrics::MAX_HISTORY_POINTS {
+        return Err(format!(
+            "observability.history_max_points cannot exceed {}",
+            crate::metrics::MAX_HISTORY_POINTS
+        ));
+    }
+    tracing_subscriber_filter_syntax(&parsed.observability.log_filter)?;
+    Ok(parsed.into())
 }
 
 fn merge_toml(base: &mut toml::Value, supplied: toml::Value) {
@@ -556,30 +634,18 @@ impl Config {
         Self::parse_toml(&text)
     }
 
-    /// Parse Wok's native TOML format. Omitted settings inherit documented
-    /// defaults, while unknown settings are rejected.
+    /// Parse Wok's native TOML format. Settings resolve in three layers:
+    /// built-in defaults, then the overlay of the file's `preset` (public
+    /// when absent), then the file. Unknown settings and preset names are
+    /// rejected.
     pub fn parse_toml(text: &str) -> Result<Self, String> {
-        let mut merged = toml::Value::try_from(TomlConfig::from(Config::default()))
-            .map_err(|e| e.to_string())?;
-        let supplied: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
-        merge_toml(&mut merged, supplied);
-        let mut parsed: TomlConfig = merged
-            .try_into()
-            .map_err(|e: toml::de::Error| e.to_string())?;
-        validate_admin_config(&mut parsed.admin)?;
-        clamp_size_class(&mut parsed);
-        parsed.relay.unix.mode = mask_socket_mode(parsed.relay.unix.mode);
-        if parsed.observability.history_interval_secs == 0 {
-            return Err("observability.history_interval_secs must be at least 1".into());
-        }
-        if parsed.observability.history_max_points > crate::metrics::MAX_HISTORY_POINTS {
-            return Err(format!(
-                "observability.history_max_points cannot exceed {}",
-                crate::metrics::MAX_HISTORY_POINTS
-            ));
-        }
-        tracing_subscriber_filter_syntax(&parsed.observability.log_filter)?;
-        Ok(parsed.into())
+        Layers::parse(text, Preset::overlay)?.resolve()
+    }
+
+    /// Parse a native TOML file like [`Config::parse_toml`] and report each
+    /// effective value with the layer it came from.
+    pub fn explain_toml(text: &str) -> Result<ConfigExplanation, String> {
+        provenance::explain(text, Preset::overlay)
     }
 
     pub fn to_toml(&self) -> Result<String, String> {
@@ -861,12 +927,17 @@ impl Config {
     /// Describe changes to restart-safe security scopes (write-policy plugin,
     /// filter validation, abuse budgets, NIP-42 read restriction scope,
     /// NIP-62 vanish scope, negentropy enable switch) between this config and
-    /// a reload candidate. TOML loading merges the supplied file over factory
-    /// defaults, so a valid-but-incomplete file silently reverts omitted
-    /// sections — these diffs are warn-logged on reload so the reversion is
-    /// at least visible in the logs.
+    /// a reload candidate. TOML loading merges the supplied file over its
+    /// preset and the factory defaults, so a valid-but-incomplete file (or a
+    /// changed `preset`) silently changes omitted sections — these diffs are
+    /// warn-logged on reload so the change is at least visible in the logs.
     pub fn security_scope_changes(&self, new: &Config) -> Vec<String> {
         let mut changes = Vec::new();
+        // A preset only changes effective values, and each scope below
+        // compares those, so this line just names the cause.
+        if self.preset != new.preset {
+            changes.push(format!("preset changed: {} -> {}", self.preset, new.preset));
+        }
         if self.relay.write_policy_plugin != new.relay.write_policy_plugin {
             changes.push(format!(
                 "relay.write_policy_plugin changed: {:?} -> {:?}{}",
@@ -1913,8 +1984,8 @@ mod tests {
                 .any(|c| c.contains("relay.auth changed") && c.contains("DROPPED: [4]")),
             "{changes:?}"
         );
-        // Omitting [relay.auth] merges factory defaults [4, 1059]; starting
-        // from a superset the defaults would drop ([4, 44, 1059]) is the
+        // Omitting [relay.auth] merges factory defaults [4, 1059, 21059];
+        // starting from a superset the defaults would drop ([4, 44, 1059]) is the
         // issue's omit-reverts-to-defaults fail-open path.
         let superset =
             Config::parse_toml("[relay.auth]\nrestricted_read_kinds = [4, 44, 1059]\n").unwrap();
@@ -2033,7 +2104,7 @@ mod tests {
         assert!(c.relay.auth.restricted_read_kinds.is_empty());
         assert_eq!(
             Config::default().relay.auth.restricted_read_kinds,
-            vec![4, 1059]
+            vec![4, 1059, 21059]
         );
     }
 
@@ -2112,6 +2183,235 @@ mod tests {
         assert!(
             Config::parse_toml("[events]\nephemeral_persistence = \"something_else\"\n").is_err()
         );
+    }
+
+    #[test]
+    fn absent_preset_selects_public() {
+        assert_eq!(Config::default().preset, Preset::Public);
+        assert_eq!(Config::parse_toml("").unwrap().preset, Preset::Public);
+        assert_eq!(
+            Config::parse_toml("[relay]\nport = 9000\n").unwrap().preset,
+            Preset::Public
+        );
+    }
+
+    #[test]
+    fn explicit_public_preset_parses_like_an_absent_one() {
+        let file = r#"
+            [database]
+            path = "/tmp/wok-db"
+
+            [relay]
+            port = 9000
+
+            [relay.auth]
+            restricted_read_kinds = [4, 1059]
+
+            [relay.abuse]
+            event_burst = 500
+            "#;
+        let absent = Config::parse_toml(file).unwrap();
+        let explicit = Config::parse_toml(&format!("preset = \"public\"\n{file}")).unwrap();
+        assert_eq!(explicit.preset, Preset::Public);
+        assert_eq!(explicit.to_toml().unwrap(), absent.to_toml().unwrap());
+        assert_eq!(
+            Config::parse_toml("preset = \"public\"")
+                .unwrap()
+                .to_toml()
+                .unwrap(),
+            Config::default().to_toml().unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_preset_is_an_error_naming_the_valid_presets() {
+        let error = Config::parse_toml("preset = \"marmot\"\n").unwrap_err();
+        assert_eq!(error, r#"unknown preset "marmot"; valid presets: public"#);
+        let error = Config::parse_toml("preset = \"Public\"\n").unwrap_err();
+        assert!(error.contains("valid presets: public"), "{error}");
+        let error = Config::parse_toml("preset = 1\n").unwrap_err();
+        assert!(
+            error.contains("preset must be a string naming one of: public"),
+            "{error}"
+        );
+        // Section-level keys named `preset` are still unknown fields.
+        let error = Config::parse_toml("[relay]\npreset = \"public\"\n").unwrap_err();
+        assert!(error.contains("unknown field `preset`"), "{error}");
+    }
+
+    #[test]
+    fn preset_roundtrips_through_to_toml() {
+        let parsed = Config::parse_toml("preset = \"public\"\n[relay]\nport = 9000\n").unwrap();
+        let encoded = parsed.to_toml().unwrap();
+        let file: toml::Value = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            file.get("preset").and_then(toml::Value::as_str),
+            Some("public")
+        );
+        let decoded = Config::parse_toml(&encoded).unwrap();
+        assert_eq!(decoded.preset, Preset::Public);
+        assert_eq!(decoded.relay.port, 9000);
+        assert_eq!(decoded.to_toml().unwrap(), encoded);
+    }
+
+    #[test]
+    fn every_preset_overlay_parses_and_is_mirrored_in_docs() {
+        for &preset in Preset::ALL {
+            let documented = match preset {
+                Preset::Public => include_str!("../../../docs/presets/public.toml"),
+            };
+            assert_eq!(
+                preset.overlay(),
+                documented,
+                "docs/presets/{preset}.toml must match the shipped overlay"
+            );
+            let overlay: toml::Value = toml::from_str(preset.overlay()).unwrap();
+            assert!(
+                overlay.get("preset").is_none(),
+                "the {preset} overlay must not select a preset"
+            );
+            let parsed = Config::parse_toml(&format!("preset = \"{preset}\"")).unwrap();
+            assert_eq!(parsed.preset, preset);
+            assert_eq!(preset.name().parse::<Preset>(), Ok(preset));
+        }
+        // The public preset is the built-in defaults.
+        let public: toml::Value = toml::from_str(Preset::Public.overlay()).unwrap();
+        assert_eq!(public, toml::Value::Table(Default::default()));
+    }
+
+    fn test_overlay(_: Preset) -> &'static str {
+        "[relay.abuse]\nevent_burst = 300\nreq_burst = 400\n"
+    }
+
+    fn entry<'a>(explained: &'a ConfigExplanation, key: &str) -> &'a ConfigEntry {
+        explained
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .unwrap_or_else(|| panic!("no entry for {key}"))
+    }
+
+    #[test]
+    fn explanation_reports_default_preset_and_file_origins() {
+        let text = "preset = \"public\"\n\
+                    \n\
+                    [relay.abuse]\n\
+                    event_burst = 500\n\
+                    \n\
+                    [relay.info]\n\
+                    name = \"Example relay\"\n";
+        let explained = provenance::explain(text, test_overlay).unwrap();
+        assert_eq!(explained.config.relay.abuse.event_burst, 500);
+        assert_eq!(explained.config.relay.abuse.req_burst, 400);
+
+        assert_eq!(explained.entries[0].key, "preset");
+        assert_eq!(
+            *entry(&explained, "preset"),
+            ConfigEntry {
+                key: "preset".into(),
+                value: "\"public\"".into(),
+                origin: Origin::File { line: Some(1) },
+                preset_value: None,
+            }
+        );
+        assert_eq!(
+            *entry(&explained, "relay.port"),
+            ConfigEntry {
+                key: "relay.port".into(),
+                value: "7777".into(),
+                origin: Origin::Default,
+                preset_value: None,
+            }
+        );
+        assert_eq!(
+            *entry(&explained, "relay.abuse.req_burst"),
+            ConfigEntry {
+                key: "relay.abuse.req_burst".into(),
+                value: "400".into(),
+                origin: Origin::Preset(Preset::Public),
+                preset_value: None,
+            }
+        );
+        assert_eq!(
+            *entry(&explained, "relay.abuse.event_burst"),
+            ConfigEntry {
+                key: "relay.abuse.event_burst".into(),
+                value: "500".into(),
+                origin: Origin::File { line: Some(4) },
+                preset_value: Some("300".into()),
+            }
+        );
+        assert_eq!(
+            entry(&explained, "relay.info.name").origin,
+            Origin::File { line: Some(7) }
+        );
+        let overrides: Vec<&str> = explained
+            .entries
+            .iter()
+            .filter(|entry| entry.is_override())
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(overrides, ["relay.abuse.event_burst", "relay.info.name"]);
+        let mut keys: Vec<&str> = explained.entries[1..]
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        keys.dedup();
+        assert_eq!(keys.len(), explained.entries.len() - 1);
+    }
+
+    #[test]
+    fn explanation_keeps_file_origin_for_values_equal_to_the_preset() {
+        let explained =
+            provenance::explain("[relay.abuse]\nreq_burst = 400\n", test_overlay).unwrap();
+        let req_burst = entry(&explained, "relay.abuse.req_burst");
+        assert_eq!(req_burst.origin, Origin::File { line: Some(2) });
+        assert!(!req_burst.is_override());
+        assert_eq!(entry(&explained, "preset").origin, Origin::Default);
+        assert!(explained.entries.iter().all(|entry| !entry.is_override()));
+    }
+
+    #[test]
+    fn explanation_locates_dotted_inline_and_array_keys() {
+        let text = r#"relay.port = 9000
+admin = { enabled = false, auth_window_secs = 30 }
+
+[relay.auth]
+restricted_read_kinds = [
+  4,
+  1059,
+]
+
+[events]
+max_event_size = 99999999999
+"#;
+        let explained = Config::explain_toml(text).unwrap();
+        let line = |key| match entry(&explained, key).origin {
+            Origin::File { line } => line,
+            origin => panic!("{key} came from {origin:?}"),
+        };
+        assert_eq!(line("relay.port"), Some(1));
+        assert_eq!(line("admin.enabled"), Some(2));
+        assert_eq!(line("admin.auth_window_secs"), Some(2));
+        assert_eq!(line("relay.auth.restricted_read_kinds"), Some(5));
+        assert_eq!(
+            entry(&explained, "relay.auth.restricted_read_kinds").value,
+            "[4, 1059]"
+        );
+        // Normalized values are reported as the relay uses them.
+        let max_event_size = entry(&explained, "events.max_event_size");
+        assert_eq!(max_event_size.value, MAX_SIZE_CLASS_BYTES.to_string());
+        assert_eq!(max_event_size.preset_value.as_deref(), Some("1048576"));
+        // The public preset sets nothing, so every other value is a default.
+        assert_eq!(
+            entry(&explained, "admin.public_url").origin,
+            Origin::Default
+        );
+        assert!(explained
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry.origin, Origin::Preset(_))));
     }
 
     #[test]

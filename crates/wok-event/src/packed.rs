@@ -12,10 +12,45 @@
 //!
 //! Integers use native endian, identical to C++ `lmdb::to_sv<uint64_t>`.
 //! Fried import/export is documented as little-endian-only in C++.
+//!
+//! A tag value longer than [`MAX_INDEXED_TAG_VAL_SIZE`] does not fit the
+//! length byte. Wok packs [`indexed_tag_value`] instead, a marker byte and the
+//! SHA-256 of the value. strfry and earlier Wok releases dropped such tags.
 
-use crate::EventError;
+use std::borrow::Cow;
+
+use crate::{sha256, EventError, MAX_INDEXED_TAG_VAL_SIZE};
 
 pub const PACKED_HEADER_LEN: usize = 88;
+
+/// First byte of the hashed form of a long tag value. Packed values are
+/// otherwise UTF-8 text, which never contains 0xFF, or 32-byte `e`/`p` ids, so
+/// the 33-byte hashed form cannot equal a value packed as is.
+pub const HASHED_TAG_VAL_MARKER: u8 = 0xFF;
+
+const HASHED_TAG_VAL_LEN: usize = 1 + 32;
+
+/// The bytes a single-letter tag value occupies in PackedEvent, and so in tag,
+/// replacement and filter keys: the value itself up to
+/// [`MAX_INDEXED_TAG_VAL_SIZE`] bytes, otherwise [`HASHED_TAG_VAL_MARKER`]
+/// followed by the SHA-256 of the value.
+pub fn indexed_tag_value(value: &[u8]) -> Cow<'_, [u8]> {
+    if value.len() <= MAX_INDEXED_TAG_VAL_SIZE {
+        return Cow::Borrowed(value);
+    }
+    let mut hashed = Vec::with_capacity(HASHED_TAG_VAL_LEN);
+    hashed.push(HASHED_TAG_VAL_MARKER);
+    hashed.extend_from_slice(&sha256(value));
+    Cow::Owned(hashed)
+}
+
+/// The SHA-256 of the original value when `indexed` is its hashed form.
+pub fn hashed_tag_value_digest(indexed: &[u8]) -> Option<&[u8]> {
+    match indexed {
+        [HASHED_TAG_VAL_MARKER, digest @ ..] if digest.len() == 32 => Some(digest),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedEventTag {
@@ -211,6 +246,26 @@ mod tests {
         assert_eq!(t[0].name, 'e');
         assert_eq!(t[1].value, b"hello");
         assert_eq!(v.first_d_tag().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn long_values_take_a_hashed_form_no_short_value_can_have() {
+        let longest = [b'z'; MAX_INDEXED_TAG_VAL_SIZE];
+        assert_eq!(&*indexed_tag_value(&longest), &longest[..]);
+        assert_eq!(hashed_tag_value_digest(&longest), None);
+
+        let long = [b'z'; MAX_INDEXED_TAG_VAL_SIZE + 1];
+        let indexed = indexed_tag_value(&long);
+        assert_eq!(indexed.len(), HASHED_TAG_VAL_LEN);
+        assert_eq!(indexed[0], HASHED_TAG_VAL_MARKER);
+        assert_eq!(hashed_tag_value_digest(&indexed), Some(&sha256(&long)[..]));
+        assert!(std::str::from_utf8(&indexed).is_err());
+        assert_ne!(*indexed_tag_value(&[b'y'; 300]), *indexed);
+
+        let mut tags = PackedEventTagBuilder::default();
+        tags.add('d', &indexed).unwrap();
+        let packed = PackedEventBuilder::build(&[2u8; 32], &[3u8; 32], 1, 30000, 0, &tags).unwrap();
+        assert_eq!(packed.view().first_d_tag().unwrap(), &indexed[..]);
     }
 
     #[test]

@@ -15,7 +15,6 @@ pub(super) fn run_writer(
     let mut negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
     let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
     let mut event_batch = Vec::with_capacity(WRITER_BATCH_MAX);
-    let mut closed = std::collections::HashSet::new();
     let mut maintenance_cursor = Vec::new();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
     let mut events: Vec<EventToWrite<u64>> = Vec::with_capacity(256);
@@ -24,7 +23,6 @@ pub(super) fn run_writer(
         let Ok(msg) = rx.recv() else { break };
         batch.clear();
         event_batch.clear();
-        closed.clear();
         batch_vanish.clear();
         events.clear();
         batch.push(msg);
@@ -32,14 +30,6 @@ pub(super) fn run_writer(
             match rx.try_recv() {
                 Ok(more) => batch.push(more),
                 Err(_) => break,
-            }
-        }
-        // Filter out events from connections closed within this batch, like
-        // C++ RelayWriter (a per-batch set; a persistent set would leak one
-        // entry per closed connection for the life of the process).
-        for m in &batch {
-            if let WriterMsg::Close { conn_id } = m {
-                closed.insert(*conn_id);
             }
         }
         // Management mutations take priority over every event in the drained
@@ -71,18 +61,9 @@ pub(super) fn run_writer(
         // live-only event cannot be broadcast immediately before its request
         // is persisted later in that batch.
         for m in &event_batch {
-            let WriterMsg::AddEvent {
-                conn_id,
-                packed,
-                json,
-                ..
-            } = m
-            else {
+            let WriterMsg::AddEvent { packed, json, .. } = m else {
                 continue;
             };
-            if closed.contains(conn_id) {
-                continue;
-            }
             let Ok(event) = PackedEventView::new(packed) else {
                 continue;
             };
@@ -99,6 +80,10 @@ pub(super) fn run_writer(
                 .and_modify(|timestamp| *timestamp = (*timestamp).max(event.created_at()))
                 .or_insert(event.created_at());
         }
+        // A validated event is committed even when its connection closed in
+        // the same batch; only its OK goes nowhere. C++ RelayWriter drops
+        // such events, losing posts from clients that disconnect right after
+        // publishing. `Close` therefore needs no writer state.
         for m in event_batch.drain(..) {
             if let WriterMsg::AddEvent {
                 conn_id,
@@ -108,9 +93,6 @@ pub(super) fn run_writer(
                 authed,
             } = m
             {
-                if closed.contains(&conn_id) {
-                    continue;
-                }
                 let mut ok_msg = String::new();
                 let is_vanish_request =
                     PackedEventView::new(&packed).is_ok_and(|event| event.kind() == VANISH_KIND);
@@ -684,5 +666,79 @@ pub(super) fn run_maintenance(env: &Env, cfg_snap: &Config, vanish_cursor: &mut 
             }
         }
         Err(error) => tracing::error!(%error, "relay maintenance transaction aborted"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
+
+    #[test]
+    fn events_from_connections_closed_in_the_same_batch_are_committed() {
+        // A publisher that sends EVENT and disconnects at once has its EVENT
+        // and its Close drained by the writer together. The validated event
+        // must still be stored; only its OK has nowhere to go.
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let moderation = Arc::new(parking_lot::RwLock::new(
+            env.begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                .unwrap(),
+        ));
+        const PUBLISHERS: u64 = 8;
+        let (writer_tx, writer_rx) = bounded(2 * PUBLISHERS as usize);
+        for conn_id in 1..=PUBLISHERS {
+            let id = [conn_id as u8; 32];
+            let author = [0x40 + conn_id as u8; 32];
+            let packed = PackedEventBuilder::build(
+                &id,
+                &author,
+                1_700_000_000,
+                1,
+                0,
+                &PackedEventTagBuilder::default(),
+            )
+            .unwrap();
+            let json = json!({
+                "id": to_hex(&id),
+                "pubkey": to_hex(&author),
+                "created_at": 1_700_000_000u64,
+                "kind": 1,
+                "tags": [],
+                "content": "",
+                "sig": "00".repeat(64),
+            })
+            .to_string();
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id,
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: None,
+                })
+                .unwrap();
+            writer_tx.send(WriterMsg::Close { conn_id }).unwrap();
+        }
+        drop(writer_tx);
+
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config)),
+            Arc::new(ConnTable::new()),
+            Arc::new(Metrics::default()),
+            writer_rx,
+            Vec::new(),
+            moderation,
+        );
+
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event).unwrap(), PUBLISHERS as usize);
     }
 }

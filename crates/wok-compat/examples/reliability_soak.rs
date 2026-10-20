@@ -15,6 +15,13 @@ use std::{
 };
 use wire::Wire;
 
+/// NIP-09 gives a deletion request against a deletion request no effect, so
+/// every kind 5 stays stored. Notes past the retained window are deleted in
+/// one request per author every this many rounds. For the longest soak
+/// (21600 one-second rounds) that keeps at most 5760 requests and 736 notes,
+/// so the model stays below the configured 30000-event history limit.
+const DELETE_EVERY_ROUNDS: u64 = 15;
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -210,7 +217,6 @@ async fn main() -> Result<()> {
     ];
     let mut notes: VecDeque<(usize, String)> = VecDeque::new();
     let mut replacements: BTreeMap<(usize, u64), String> = BTreeMap::new();
-    let mut deletions: BTreeMap<usize, String> = BTreeMap::new();
     let start = Instant::now();
     let mut round = 0u64;
     let mut receipts = 0u64;
@@ -266,16 +272,12 @@ async fn main() -> Result<()> {
             batch.push(e);
         }
         let mut removed: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        while notes.len() > 256 {
+        while round % DELETE_EVERY_ROUNDS == 0 && notes.len() > 256 {
             let (actor, id) = notes.pop_front().unwrap();
             model.remove(&id);
             removed.entry(actor).or_default().push(id);
         }
-        for (actor, mut ids) in removed {
-            if let Some(old) = deletions.remove(&actor) {
-                model.remove(&old);
-                ids.push(old);
-            }
+        for (actor, ids) in removed {
             let mut tags = vec![json!(["t", "soak"])];
             tags.extend(ids.into_iter().map(|id| json!(["e", id])));
             let e = event(
@@ -284,9 +286,7 @@ async fn main() -> Result<()> {
                 json!(tags),
                 format!("delete {round}/{actor}"),
             );
-            let id = e["id"].as_str().unwrap().to_string();
-            deletions.insert(actor, id.clone());
-            model.insert(id, e.clone());
+            model.insert(e["id"].as_str().unwrap().to_string(), e.clone());
             batch.push(e);
         }
         publish(&mut writers, &batch, &mut ack_hist).await?;

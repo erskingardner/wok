@@ -2,8 +2,9 @@
 
 Wok uses strict TOML configuration. Copy [wok.toml](wok.toml), or start with
 the file produced by `wok migrate strfry`. Omitted settings inherit the
-defaults below; unknown keys, wrong types, invalid admin URLs, invalid log
-filters, and out-of-range history settings are rejected.
+selected [preset](#preset), whose values are the defaults below; unknown keys,
+unknown preset names, wrong types, invalid admin URLs, invalid log filters,
+and out-of-range history settings are rejected.
 
 The legacy HOCON-subset reader is used only for explicit strfry migration.
 It accepts named objects, arrays, and anonymous object blocks inside arrays
@@ -27,6 +28,42 @@ NIP-62, and local history. Database/listener/thread/socket settings are omitted
 because they require restart. Admin credentials, proxy trust, authentication
 policy, external plugin paths, and diagnostic logging switches remain
 file-only to avoid remote self-lockout or security-boundary changes.
+
+## Preset
+
+| Key | Default | Reload | Dashboard | Meaning |
+|---|---:|---|---|---|
+| `preset` | `public` | Live | No | Named set of defaults this file overlays. |
+
+Settings resolve in three layers: the built-in defaults, then the preset's
+overlay, then this file. Each layer replaces individual keys, not whole
+sections. A preset ships in the binary as a small TOML overlay containing only
+the keys it changes; [presets/](presets/) has a copy of each.
+
+| Preset | Use |
+|---|---|
+| `public` | A general public relay. Its values are the built-in defaults, so its overlay is empty. |
+
+Further presets, starting with `marmot`, are planned; see
+[#97](https://github.com/erskingardner/wok/issues/97).
+
+`wok config show` prints the effective configuration, one dotted key per line,
+with the origin of each value: `default`, `preset <name>`, or the file and
+line that set it. When the file sets a value other than the preset's, the
+preset's value follows in parentheses. `wok config show --overrides` prints
+only those keys. The output is itself valid TOML.
+
+```text
+preset = "public"                                      # wok.toml:1
+relay.abuse.event_burst = 500                          # wok.toml:11 (preset public: 100)
+relay.auth.service_url = "wss://relay.example.com"     # wok.toml:8 (preset public: "")
+relay.bind = "127.0.0.1"                               # default
+```
+
+Changing `preset` on reload is allowed. The reload log names the preset change,
+and every resulting security-scope change is warn-logged like any other
+reload. Restart settings keep their startup values. Dashboard saves keep the
+file's `preset`.
 
 ## Admin
 
@@ -68,6 +105,16 @@ All event settings reload live and are available in the dashboard.
 | `events.ephemeral_persistence` | `live_only` | `live_only` broadcasts without storage; `ttl` persists then expires. |
 | `events.max_num_tags` | `2000` | Maximum tags on one event. |
 | `events.max_tag_val_size` | `1024` | Maximum bytes in one tag value. |
+
+Single-letter tag values longer than 255 bytes are indexed by their SHA-256,
+so up to `max_tag_val_size` a `#x` filter matches them, an addressable event
+whose first `d` tag is that long keeps its own address, and a kind 5 `a` tag
+that long deletes its target. An addressable event is refused with `invalid:`
+when the `a` tag naming it (`kind:pubkey:d`) would exceed `max_tag_val_size`,
+so its first `d` is at most `max_tag_val_size` minus 71 bytes and every stored
+address can be referenced and deleted. Records stored by earlier Wok releases
+or migrated from strfry lack long values in their indexes; see
+[lmdb-v3.md](lmdb-v3.md#packedevent).
 
 The 1 MiB event ceiling accommodates bounded extended-length NIP-44 payloads,
 including kind 1059 gift wraps and kind 445 MLS group events. Wok does not
@@ -145,7 +192,7 @@ control boundary.
 |---|---:|---|
 | `relay.auth.enabled` | `true` | Enable NIP-42 authentication. |
 | `relay.auth.service_url` | empty | Public relay URL placed in and checked against AUTH challenges. |
-| `relay.auth.restricted_read_kinds` | `[4, 1059]` | Kinds hidden from unauthenticated historical reads. |
+| `relay.auth.restricted_read_kinds` | `[4, 1059, 21059]` | Kinds hidden from unauthenticated historical and live reads. |
 | `relay.auth.restrict_read_to_involved_pubkey` | `true` | Restrict authenticated reads to the author or first `p`-tag recipient. |
 | `relay.auth.restrict_writes` | `false` | Only NIP-86 allowlisted or role-holding pubkeys (and operator admins) may write. NIP-62 vanish requests are exempt. See [nip86.md](nip86.md). |
 
@@ -157,7 +204,8 @@ unusable, those reads are refused with `restricted:` and no AUTH challenge, so
 NIP-42 clients do not attempt an AUTH that cannot succeed; with
 `enabled = false` the relay refuses AUTH outright. Clearing
 `restricted_read_kinds` restores unrestricted history, but Wok stops
-advertising NIP-59.
+advertising NIP-59, which needs both gift-wrap kinds (1059 and the live-only
+ephemeral 21059) restricted.
 
 Keep `restrict_read_to_involved_pubkey` at `true` unless you understand the
 interplay: with `false`, the per-event delivery filter is skipped entirely

@@ -1755,6 +1755,20 @@ fn ingest_event(
         kind = packed.kind(),
         "validated inbound event"
     );
+    // NIP-42: relays MUST exclude kind 22242 from broadcast. One sent as an
+    // EVENT is neither stored nor delivered to any subscription.
+    if packed.kind() == AUTH_KIND {
+        conns.send(
+            conn_id,
+            RelayMessage::Ok {
+                event_id: id_hex,
+                accepted: false,
+                message: "invalid: AUTH events must be sent with AUTH".into(),
+            },
+            metrics,
+        );
+        return;
+    }
     let is_vanish_request = packed.kind() == VANISH_KIND;
     {
         let snap = moderation.read();
@@ -2514,6 +2528,7 @@ fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::
         restrictor: restrictor(cfg),
         identities,
         ephemeral_lifetime_secs: Some(cfg.events.ephemeral_lifetime_secs),
+        include_auth_events: false,
     }
 }
 
@@ -3914,7 +3929,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_registration_cleans_up_registration() {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::default()).unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();

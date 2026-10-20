@@ -19,6 +19,7 @@ LMDB environment and table access. Start at `lib.rs` for the public API.
 | `vanish.rs` | NIP-62 markers, query suppression, bounded sweep |
 | `moderation.rs` | NIP-86 records (prefix-keyed), snapshot, query suppression |
 | `purge.rs` | Count and delete superseded replacement history in bounded batches |
+| `long_tags.rs` | Detect and repack (for reindex) records whose PackedEvent lacks long single-letter tag values |
 | `integrity.rs` | Primary + every event-derived index check |
 | `state.rs` | Transactional sequence, lazy author counters, visibility generation |
 | `crash_tests.rs` | Test-only checkpoints and subprocess kill/restart coverage |

@@ -141,7 +141,12 @@ fn reindex_preserves_deleted_tail_and_rebuilds_author_counts() {
     txn.commit().unwrap();
     let target = Env::open(target_dir.path(), EnvOptions::for_tests()).unwrap();
     let mut txn = target.begin_rw().unwrap();
-    wok_db::rebuild_primary_and_event_indices(&source.begin_ro().unwrap(), &mut txn).unwrap();
+    wok_db::rebuild_primary_and_event_indices(
+        &source.begin_ro().unwrap(),
+        &mut txn,
+        wok_db::PackedEventRebuild::Copy,
+    )
+    .unwrap();
     txn.commit().unwrap();
     let mut txn = target.begin_rw().unwrap();
     assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 1);

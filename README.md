@@ -122,7 +122,7 @@ Available operator commands:
 | `config show [--overrides]` | Effective configuration with each value's origin: default, preset, or file line (`--overrides`: only values the file changes from its preset) |
 | `doctor [--json]` | Config, storage, index, payload, negentropy, capacity, and runtime-path diagnostics |
 | `purge-superseded [--dry-run] [--json]` | Delete replaceable versions superseded at their address, keeping the version reads serve |
-| `reindex --confirm-relay-stopped [--backup <dir>]` | Stage and verify rebuilt indexes, atomically promote them, and retain the original DB |
+| `reindex --confirm-relay-stopped [--backup <dir>]` | Stage and verify rebuilt indexes, repack records that dropped long tag values, atomically promote them, and retain the original DB |
 | `dict stats/train/compress/decompress` | zstd dictionary management (ZDICT training included) |
 | `negentropy list/add/build` | persistent trees; build uses bounded, restart-safe batches |
 | `router <file>` | mesh replication with hot reconfig |

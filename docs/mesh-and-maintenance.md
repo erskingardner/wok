@@ -46,6 +46,26 @@ surviving records cannot establish the lost deletion history. Use a trusted
 backup for recovery. See [storage integrity and upgrade](lmdb-v3.md#integrity)
 for lazy-initialization limits and process-kill test coverage.
 
+Reindex also repairs records that lack single-letter tag values longer than
+255 bytes. strfry and Wok 0.7.0 and earlier dropped such values from the packed
+record, so filters cannot match them and such an addressable record is keyed
+by an empty or later `d`. Integrity JSON counts the records reindex would
+repack as `legacy_long_tag_records`, and doctor emits a `long-tag-packing`
+warning while it is nonzero. Reindex packs each of them again from its payload, as Wok packs
+new events, while it builds the staged database. A record whose payload packs
+differently in any other way is copied unchanged and counted as skipped; kind
+41 history that older releases packed with a virtual `d` is the known case. The
+outcome and `reindex-manifest.json` report `repacked_long_tag_records` and
+`skipped_long_tag_records`, and the fingerprints of the original
+(`source_event_fingerprint_sha256`) and of the result
+(`event_fingerprint_sha256`), which differ once a record is repacked. A
+repaired addressable record may land beside a newer version of its address,
+which makes it superseded history for `wok purge-superseded`. A repaired
+deletion tombstones its address from then on but does not delete versions
+already stored. Nothing is lost: removing the hashed values from a repacked
+record gives its previous bytes back, and the original stays in the backup.
+See [lmdb-v3.md](lmdb-v3.md#packedevent).
+
 ## Outbound connections
 
 `wok sync`, `wok router`, `wok upload`, and `wok download`

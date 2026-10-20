@@ -1047,8 +1047,8 @@ impl DbQuery {
 }
 
 /// Records matching `filter`, for operator tools that address stored records
-/// (`wok scan`, `wok delete`, `wok dict`, `wok reindex`). Global visibility
-/// applies, but kind 22242 AUTH events, hidden from clients, are included.
+/// (`wok scan`, `wok delete`, `wok dict`). Global visibility applies, but kind
+/// 22242 AUTH events, hidden from clients, are included.
 pub fn foreach_by_filter<F>(
     txn: &RoTxn<'_>,
     filter: &serde_json::Value,

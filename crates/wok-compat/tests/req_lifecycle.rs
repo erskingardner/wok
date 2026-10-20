@@ -427,19 +427,23 @@ async fn a_refused_replacement_closes_the_old_subscription() {
         &client.frames[closed..]
     );
 
-    // One still sending its history.
+    // One still sending its history, refused twice in a row: the second
+    // refusal must wait for the teardown the first one started.
     client.clear();
     client
         .send(history_and(json!({"kinds": [20001], "#t": ["live"]})))
         .await;
+    client.send(bad.clone()).await;
     client.send(bad).await;
-    client.recv_until(|c| c.has("CLOSED", "x")).await;
+    client.recv_until(|c| c.replies("CLOSED", "x") == 2).await;
     let probe = client.publish(20001, "live", "after the refusal").await;
     client.recv_until(|c| c.got("sentinel", &probe)).await;
     client.settle(Duration::from_millis(500)).await;
     let closed = client.position(|f| is(f, "CLOSED", "x"));
     assert!(
-        !client.frames[closed + 1..].iter().any(|f| f[1] == "x"),
+        !client.frames[closed + 1..]
+            .iter()
+            .any(|f| f[1] == "x" && f[0] != "CLOSED"),
         "the old subscription outlived its refused replacement"
     );
     assert!(!client.has("EOSE", "x"));

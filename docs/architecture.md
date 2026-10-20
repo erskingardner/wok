@@ -97,15 +97,17 @@ another along the way.
      counts them (`wok_live_buffer_dropped_ephemeral_total`); one larger than
      the whole bound is dropped alone.
 5. **CLOSE, replacement, refusal, disconnect.** CLOSE queues `Remove` for the
-   monitor and, behind it, a cancel for the worker. A refused REQ that names an
-   open subscription does the same, and its CLOSED travels from the worker
-   (after the history scan stopped) to the monitor (after live matching
-   stopped), so no EVENT for the id follows it. A req worker that refuses a
-   registered REQ itself (`relay.abuse.max_concurrent_historical_queries`, or
-   a scan error) has the monitor drop it and send CLOSED, and tells the
-   ingester to stop counting it. A `HistoryDone` or CLOSED for a generation
-   that a later REQ replaced is ignored. Disconnect drops everything, pending
-   or live, on every stage.
+   monitor and, behind it, a cancel for the worker. The worker passes the
+   teardown on to the monitor once the history scan has stopped, and the
+   monitor confirms it to the ingester. A refused REQ that names an open
+   subscription, or one whose teardown is not yet confirmed, takes the same
+   path with its CLOSED, so no EVENT for the id can follow that CLOSED. A req
+   worker that refuses a registered REQ itself
+   (`relay.abuse.max_concurrent_historical_queries`, or a scan error) has the
+   monitor drop it and send CLOSED, and the ingester stops counting it on the
+   monitor's confirmation. A `HistoryDone` or CLOSED for a generation that a
+   later REQ replaced is ignored. Disconnect drops everything, pending or
+   live, on every stage.
 
 COUNT never registers with a monitor, and COUNT ids are separate from REQ ids:
 neither cancels the other.

@@ -437,23 +437,18 @@ enum ReqMsg {
         conn_id: u64,
         authed: [u8; 32],
     },
-    /// Stop a REQ's history scan, after CLOSE or a refused replacement. A
-    /// refusal's CLOSED goes on to the monitor, behind the scan's last EVENT.
+    /// Stop a REQ's history scan, after CLOSE or a refused REQ. The worker
+    /// then passes `MonitorMsg::Closed` on to the monitor, behind the scan's
+    /// last EVENT, with the CLOSED reason if the REQ was refused.
     Cancel {
         conn_id: u64,
         sub_id: SubId,
-        refused: Option<Refusal>,
+        generation: u64,
+        refused: Option<String>,
     },
     Close {
         conn_id: u64,
     },
-}
-
-/// A refused REQ that named an open subscription, and the generation the
-/// ingester gave it.
-struct Refusal {
-    generation: u64,
-    reason: String,
 }
 
 enum MonitorMsg {
@@ -474,13 +469,15 @@ enum MonitorMsg {
         generation: u64,
         snapshot: u64,
     },
-    /// Send CLOSED for this generation of a REQ, dropping it if it is still
-    /// registered, unless a later REQ already reused the id.
+    /// A teardown (CLOSE or a refused REQ) or a req worker's refusal of a
+    /// registered REQ, once the history scan has stopped. The monitor drops
+    /// the subscription unless a later REQ already reused the id, sends
+    /// CLOSED with `reason` unless so replaced, and confirms to the ingester.
     Closed {
         conn_id: u64,
         sub_id: SubId,
         generation: u64,
-        reason: String,
+        reason: Option<String>,
     },
     SetAuth {
         conn_id: u64,
@@ -533,7 +530,8 @@ struct AuthSession {
     identities: Vec<[u8; 32]>,
 }
 
-/// A REQ a req worker refused after the ingester admitted it.
+/// A req monitor's confirmation that the subscription teardown or refusal
+/// with this generation is complete: nothing more for the id can follow.
 struct SubEnded {
     conn_id: u64,
     sub_id: SubId,
@@ -546,6 +544,10 @@ struct SubEnded {
 /// REQ that names one closes it.
 struct Subscriptions {
     open: HashMap<u64, HashMap<SubId, u64>>,
+    /// Ids whose teardown is in flight, by its generation, until the monitor
+    /// confirms it. A refusal naming one still waits behind the teardown, so
+    /// its CLOSED cannot overtake an EVENT the old subscription sends.
+    closing: HashMap<u64, HashMap<SubId, u64>>,
     next_generation: u64,
     ended: Receiver<SubEnded>,
 }
@@ -554,6 +556,7 @@ impl Subscriptions {
     fn new(ended: Receiver<SubEnded>) -> Self {
         Self {
             open: HashMap::new(),
+            closing: HashMap::new(),
             next_generation: 0,
             ended,
         }
@@ -564,12 +567,18 @@ impl Subscriptions {
         self.next_generation
     }
 
-    /// Forget what the req workers refused since the last call.
+    /// Apply the monitors' confirmations since the last call: forget REQs a
+    /// req worker refused and teardowns that are complete.
     fn drain_ended(&mut self) {
         while let Ok(ended) = self.ended.try_recv() {
-            if let Some(open) = self.open.get_mut(&ended.conn_id) {
-                if open.get(&ended.sub_id) == Some(&ended.generation) {
-                    open.remove(&ended.sub_id);
+            for ids in [&mut self.open, &mut self.closing] {
+                if let Some(conn) = ids.get_mut(&ended.conn_id) {
+                    if conn.get(&ended.sub_id) == Some(&ended.generation) {
+                        conn.remove(&ended.sub_id);
+                    }
+                    if conn.is_empty() {
+                        ids.remove(&ended.conn_id);
+                    }
                 }
             }
         }
@@ -586,6 +595,24 @@ impl Subscriptions {
         self.open
             .get(&conn_id)
             .is_some_and(|open| open.contains_key(sub_id))
+    }
+
+    fn is_closing(&self, conn_id: u64, sub_id: &SubId) -> bool {
+        self.closing
+            .get(&conn_id)
+            .is_some_and(|closing| closing.contains_key(sub_id))
+    }
+
+    /// Start a teardown of `sub_id`: no longer open, closing until the
+    /// monitor confirms this generation.
+    fn start_closing(&mut self, conn_id: u64, sub_id: SubId) -> u64 {
+        self.remove(conn_id, &sub_id);
+        let generation = self.next_generation();
+        self.closing
+            .entry(conn_id)
+            .or_default()
+            .insert(sub_id, generation);
+        generation
     }
 
     fn insert(&mut self, conn_id: u64, sub_id: SubId, generation: u64) {
@@ -608,6 +635,7 @@ impl Subscriptions {
 
     fn close(&mut self, conn_id: u64) {
         self.open.remove(&conn_id);
+        self.closing.remove(&conn_id);
     }
 }
 
@@ -1016,8 +1044,9 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         .unzip();
     let (neg_txs, neg_rxs): (Vec<_>, Vec<_>) =
         (0..n_negentropy).map(|_| bounded::<NegMsg>(4096)).unzip();
-    // Req workers tell the owning ingester about REQs they refused. Bounded by
-    // the REQs in flight, which the ingester's own queues already bound.
+    // Req monitors confirm finished teardowns and refusals to the owning
+    // ingester. Bounded by the teardowns in flight, which the ingester's own
+    // queues already bound.
     let (ended_txs, ended_rxs): (Vec<_>, Vec<_>) = (0..n_ingester)
         .map(|_| crossbeam_channel::unbounded::<SubEnded>())
         .unzip();
@@ -1103,10 +1132,9 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let conns = conns.clone();
         let metrics = metrics.clone();
         let mon_txs = mon_txs.clone();
-        let ended_txs = ended_txs.clone();
         thread::Builder::new()
             .name(format!("req-worker-{i}"))
-            .spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, mon_txs, ended_txs))
+            .spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, mon_txs))
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1115,9 +1143,10 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
+        let ended_txs = ended_txs.clone();
         thread::Builder::new()
             .name(format!("req-monitor-{i}"))
-            .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx))
+            .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx, ended_txs))
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1874,7 +1903,7 @@ fn handle_client(
         ClientCommand::Close { sub_id } => {
             metrics.client_close.fetch_add(1, Ordering::Relaxed);
             match SubId::new(&sub_id) {
-                Ok(sid) => close_req(subs, dispatch, conn_id, sid, None),
+                Ok(sid) => close_req(subs, dispatch, conn_id, sid),
                 Err(e) => {
                     if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
                         return;
@@ -2417,7 +2446,7 @@ fn ingest_req(
         // sub id is known. The REQ still replaces the subscription it names.
         if !count_only {
             if let Ok(sid) = SubId::new(&sub_id) {
-                close_req(subs, dispatch, conn_id, sid, None);
+                close_req(subs, dispatch, conn_id, sid);
             }
         }
         conns.send(
@@ -2544,35 +2573,44 @@ fn admit_req(
     Ok(Subscription::new(conn_id, sid, fg, count_only))
 }
 
-/// End REQ subscription `sub_id` if it is open: its history scan and live
-/// matching stop. A `refused` REQ's CLOSED then comes from the req monitor.
-fn close_req(
+/// End REQ subscription `sub_id` (CLOSE, or a REQ that names it): its
+/// history scan and live matching stop.
+fn close_req(subs: &mut Subscriptions, dispatch: &mut Dispatch, conn_id: u64, sub_id: SubId) {
+    if subs.is_open(conn_id, &sub_id) {
+        tear_down(subs, dispatch, conn_id, sub_id, None);
+    }
+}
+
+/// Stop `sub_id`'s history scan, then its live matching. With `refused`, the
+/// req monitor sends that CLOSED once neither can send anything more.
+fn tear_down(
     subs: &mut Subscriptions,
     dispatch: &mut Dispatch,
     conn_id: u64,
     sub_id: SubId,
-    refused: Option<Refusal>,
+    refused: Option<String>,
 ) {
-    if subs.remove(conn_id, &sub_id) {
-        dispatch.subscription(
-            MonitorMsg::Remove {
-                conn_id,
-                sub_id: sub_id.clone(),
-            },
-            ReqMsg::Cancel {
-                conn_id,
-                sub_id,
-                refused,
-            },
-        );
-    }
+    let generation = subs.start_closing(conn_id, sub_id.clone());
+    dispatch.subscription(
+        MonitorMsg::Remove {
+            conn_id,
+            sub_id: sub_id.clone(),
+        },
+        ReqMsg::Cancel {
+            conn_id,
+            sub_id,
+            generation,
+            refused,
+        },
+    );
 }
 
 /// Refuse a REQ with CLOSED. NIP-01 makes a REQ replace the subscription it
 /// names, so a refused one still ends an open subscription with its id. Its
 /// CLOSED is then sent once that subscription can send nothing more: by the
 /// req worker after its history scan stops, by way of the req monitor after
-/// its live matching stops.
+/// its live matching stops. The same holds while an earlier teardown of the
+/// id is still in flight.
 fn refuse_req(
     conns: &ConnTable,
     metrics: &Metrics,
@@ -2583,15 +2621,8 @@ fn refuse_req(
     reason: String,
 ) {
     if let Ok(sid) = SubId::new(sub_id) {
-        if subs.is_open(conn_id, &sid) {
-            let generation = subs.next_generation();
-            close_req(
-                subs,
-                dispatch,
-                conn_id,
-                sid,
-                Some(Refusal { generation, reason }),
-            );
+        if subs.is_open(conn_id, &sid) || subs.is_closing(conn_id, &sid) {
+            tear_down(subs, dispatch, conn_id, sid, Some(reason));
             return;
         }
     }
@@ -2863,7 +2894,6 @@ fn run_req_worker(
     metrics: Arc<Metrics>,
     rx: Receiver<ReqMsg>,
     mon_txs: Vec<Sender<MonitorMsg>>,
-    ended_txs: Vec<Sender<SubEnded>>,
 ) {
     let initial_cfg = cfg.read();
     let mut queries = QueryScheduler::new(
@@ -2875,18 +2905,13 @@ fn run_req_worker(
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut decomp = Decompressor::new();
     // A REQ that was registered with the monitor but will send no history:
-    // the monitor drops it and sends CLOSED, and the ingester stops counting it.
+    // the monitor drops it, sends CLOSED, and tells the ingester.
     let end_req = |conn_id: u64, sub_id: SubId, generation: u64, reason: &str| {
-        let _ = route_tx(&ended_txs, conn_id).send(SubEnded {
-            conn_id,
-            sub_id: sub_id.clone(),
-            generation,
-        });
         let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::Closed {
             conn_id,
             sub_id,
             generation,
-            reason: reason.into(),
+            reason: Some(reason.into()),
         });
     };
     loop {
@@ -2906,10 +2931,12 @@ fn run_req_worker(
         queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
         queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
         queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
-        let txn = match env.begin_ro() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        // Without a read transaction a REQ or COUNT is refused rather than
+        // dropped: a registered REQ would otherwise never get EOSE or CLOSED.
+        let txn = env
+            .begin_ro()
+            .inspect_err(|error| tracing::warn!(%error, "req worker cannot read the database"))
+            .ok();
         if let Some(msg) = msg {
             match msg {
                 ReqMsg::Scan(sub) | ReqMsg::Count(sub) => {
@@ -2919,15 +2946,15 @@ fn run_req_worker(
                         sub.generation,
                         sub.count_only,
                     );
-                    let reason = match queries.add_sub(&txn, sub) {
-                        Ok(true) => None,
-                        Ok(false) => {
+                    let reason = match txn.as_ref().map(|txn| queries.add_sub(txn, sub)) {
+                        Some(Ok(true)) => None,
+                        Some(Ok(false)) => {
                             metrics
                                 .abuse_query_concurrency_rejections
                                 .fetch_add(1, Ordering::Relaxed);
                             Some("rate-limited: too many concurrent historical queries")
                         }
-                        Err(_) => Some("error: history scan could not start"),
+                        Some(Err(_)) | None => Some("error: history scan could not start"),
                     };
                     if let Some(reason) = reason {
                         if count_only {
@@ -2953,19 +2980,19 @@ fn run_req_worker(
                 ReqMsg::Cancel {
                     conn_id,
                     sub_id,
+                    generation,
                     refused,
                 } => {
                     queries.remove_sub(conn_id, &sub_id);
-                    // The monitor already dropped the subscription; it sends
-                    // the CLOSED after this scan's last EVENT.
-                    if let Some(Refusal { generation, reason }) = refused {
-                        let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::Closed {
-                            conn_id,
-                            sub_id,
-                            generation,
-                            reason,
-                        });
-                    }
+                    // The monitor already stopped live matching. Behind this
+                    // scan's last EVENT, it sends any CLOSED and tells the
+                    // ingester the teardown is complete.
+                    let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::Closed {
+                        conn_id,
+                        sub_id,
+                        generation,
+                        reason: refused,
+                    });
                 }
                 ReqMsg::Close { conn_id } => {
                     authed.remove(&conn_id);
@@ -2973,6 +3000,9 @@ fn run_req_worker(
                 }
             }
         }
+        let Some(txn) = txn else {
+            continue;
+        };
         let mut completed: Vec<Completed> = Vec::new();
         // Events are framed and delivered inside the scan callback: no
         // per-event Subscription clone, no intermediate collection, and the
@@ -3201,6 +3231,7 @@ fn run_req_monitor(
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     rx: Receiver<MonitorMsg>,
+    ended_txs: Vec<Sender<SubEnded>>,
 ) {
     // The ingester caps subscriptions per connection before registering them.
     let mut monitors = ActiveMonitors::new(usize::MAX);
@@ -3210,12 +3241,25 @@ fn run_req_monitor(
     let mut decomp = Decompressor::new();
     let mut control = Vec::new();
     let mut data = Vec::new();
-    while let Ok(msg) = rx.recv() {
+    let mut retry = false;
+    loop {
+        let first = if retry {
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(msg) => Some(msg),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(msg) => Some(msg),
+                Err(_) => break,
+            }
+        };
         // Subscription changes are applied before the events queued with
         // them, each in its own order: a REQ then also sees events published
         // just before it, CLOSE stops delivery sooner, and EOSE does not wait
         // behind the batch's fan-out.
-        for msg in std::iter::once(msg).chain(rx.try_iter()) {
+        for msg in first.into_iter().chain(rx.try_iter()) {
             match msg {
                 MonitorMsg::DbChange | MonitorMsg::Ephemeral { .. } => data.push(msg),
                 _ => control.push(msg),
@@ -3227,12 +3271,22 @@ fn run_req_monitor(
         let max_event_size = cfg_snap.events.max_event_size;
         let txn = match env.begin_ro() {
             Ok(t) => t,
-            Err(_) => {
-                control.clear();
+            Err(error) => {
+                // Subscription changes are sent once, so keep them and retry
+                // shortly; a lost one would leave a REQ without EOSE or
+                // CLOSED. One DbChange is enough: the next scan resumes from
+                // the same cursor. Live-only events are dropped.
+                tracing::warn!(%error, "req monitor cannot read the database");
+                let db_change = data.iter().any(|m| matches!(m, MonitorMsg::DbChange));
                 data.clear();
+                if db_change {
+                    data.push(MonitorMsg::DbChange);
+                }
+                retry = true;
                 continue;
             }
         };
+        retry = false;
         let latest = most_recent_levid_ro(&txn).unwrap_or(0);
         if curr_event_id > latest {
             curr_event_id = latest;
@@ -3342,18 +3396,26 @@ fn run_req_monitor(
                     generation,
                     reason,
                 } => {
-                    if let Some(sub) = monitors.subscription(conn_id, &sub_id) {
-                        // A later REQ reused the id; this CLOSED would end it.
-                        if sub.generation > generation {
-                            continue;
-                        }
+                    // A later REQ that reused the id stays, and gets no CLOSED.
+                    let replaced = monitors
+                        .subscription(conn_id, &sub_id)
+                        .is_some_and(|sub| sub.generation > generation);
+                    if !replaced {
                         monitors.remove_sub(conn_id, &sub_id);
+                        if let Some(reason) = reason {
+                            conns.send(
+                                conn_id,
+                                RelayMessage::closed_error(sub_id.as_str(), reason),
+                                &metrics,
+                            );
+                        }
                     }
-                    conns.send(
+                    // Nothing more for this generation can follow.
+                    let _ = route_tx(&ended_txs, conn_id).send(SubEnded {
                         conn_id,
-                        RelayMessage::closed_error(sub_id.as_str(), reason),
-                        &metrics,
-                    );
+                        sub_id,
+                        generation,
+                    });
                 }
                 MonitorMsg::SetAuth {
                     conn_id,
@@ -4751,6 +4813,8 @@ mod tests {
         req: Vec<Receiver<ReqMsg>>,
         mon: Receiver<MonitorMsg>,
         neg: Receiver<NegMsg>,
+        /// Stands in for the req monitors' confirmations.
+        ended: Sender<SubEnded>,
         outbound: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
         gates: [IngressGate; 2],
         ingester: thread::JoinHandle<()>,
@@ -4785,7 +4849,7 @@ mod tests {
             let (stalled_tx, stalled) = bounded(stalled);
             let (mon_tx, mon) = bounded(monitor);
             let (neg_tx, neg) = bounded(64);
-            let (_, ended) = crossbeam_channel::unbounded();
+            let (ended_tx, ended) = crossbeam_channel::unbounded();
             let (ingest, ingest_rx) = tokio::sync::mpsc::channel(64);
             let ingester = thread::spawn(move || {
                 run_ingester(
@@ -4818,6 +4882,7 @@ mod tests {
                 req: vec![healthy, stalled],
                 mon,
                 neg,
+                ended: ended_tx,
                 outbound,
                 gates,
                 ingester,
@@ -4951,6 +5016,7 @@ mod tests {
                 conn_id,
                 sub_id,
                 refused: None,
+                ..
             } => {
                 assert_eq!((conn_id, sub_id.as_str()), (1, "s0"));
             }
@@ -5026,7 +5092,7 @@ mod tests {
         assert_eq!(registered(recv_mon()), "-c");
         assert!(matches!(
             relay.recv_stalled(),
-            ReqMsg::Cancel { conn_id: 1, ref sub_id, refused: None } if sub_id.as_str() == "c"
+            ReqMsg::Cancel { conn_id: 1, ref sub_id, refused: None, .. } if sub_id.as_str() == "c"
         ));
         relay.finish();
     }
@@ -5038,6 +5104,7 @@ mod tests {
         env: Env,
         cfg: Arc<parking_lot::RwLock<Config>>,
         tx: Sender<MonitorMsg>,
+        ended: Receiver<SubEnded>,
         metrics: Arc<Metrics>,
         subject: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
         observer: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
@@ -5061,15 +5128,17 @@ mod tests {
             conns.insert(2, Outbound::new(observer_tx, 0));
             let metrics = Arc::new(Metrics::default());
             let (tx, rx) = bounded(64);
+            let (ended_tx, ended) = crossbeam_channel::unbounded();
             let cfg = Arc::new(parking_lot::RwLock::new(cfg));
             let thread = {
                 let (env, cfg, metrics) = (env.clone(), cfg.clone(), metrics.clone());
-                thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx))
+                thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx, vec![ended_tx]))
             };
             let mut harness = Self {
                 env,
                 cfg,
                 tx,
+                ended,
                 metrics,
                 subject,
                 observer,
@@ -5362,9 +5431,14 @@ mod tests {
             conn_id: 1,
             sub_id: x(),
             generation,
-            reason: "rate-limited: too many concurrent historical queries".into(),
+            reason: Some("rate-limited: too many concurrent historical queries".into()),
+        };
+        let confirmed = |h: &MonitorHarness| {
+            let ended = h.ended.try_recv().expect("no confirmation");
+            (ended.conn_id, ended.sub_id.to_string(), ended.generation)
         };
         assert!(h.apply(closed(2)).is_empty(), "REQ 3 replaced REQ 2");
+        assert_eq!(confirmed(&h), (1, "x".into(), 2));
         h.store("held for REQ 3");
         assert!(h.history_done(1, 0).is_empty());
         assert_eq!(
@@ -5375,8 +5449,101 @@ mod tests {
                 "rate-limited: too many concurrent historical queries".into()
             )]
         );
-        h.store("after CLOSED");
+        assert_eq!(confirmed(&h), (1, "x".into(), 3));
+        let (snapshot, _) = h.store("after CLOSED");
         assert!(h.history_done(3, 0).is_empty());
+
+        // A CLOSE's teardown sends nothing and is confirmed too.
+        h.register(5, json!({"kinds": [1]}), snapshot);
+        assert_eq!(h.history_done(5, snapshot), [eose_frame()]);
+        h.send(MonitorMsg::Remove {
+            conn_id: 1,
+            sub_id: x(),
+        });
+        let teardown = MonitorMsg::Closed {
+            conn_id: 1,
+            sub_id: x(),
+            generation: 6,
+            reason: None,
+        };
+        assert!(h.apply(teardown).is_empty());
+        assert_eq!(confirmed(&h), (1, "x".into(), 6));
+        h.store("after CLOSE");
+        assert!(h.frames().is_empty());
+    }
+
+    /// A refusal waits behind a teardown of its id that the monitor has not
+    /// confirmed yet (after a refused replacement or a CLOSE), instead of
+    /// being answered at once: the old subscription's last EVENT could still
+    /// follow such a CLOSED. Once confirmed, a refusal is answered directly.
+    #[test]
+    fn refusals_wait_for_a_teardown_in_flight() {
+        let mut relay = StalledWorker::start();
+        let bad = |sub_id: &str| json!(["REQ", sub_id, {"kinds": [1], "nope": true}]);
+        let next = |relay: &StalledWorker| {
+            relay.req[0]
+                .recv_timeout(Duration::from_secs(2))
+                .expect("nothing reached the req worker")
+        };
+        let cancel = |relay: &StalledWorker| match next(relay) {
+            ReqMsg::Cancel {
+                sub_id,
+                generation,
+                refused,
+                ..
+            } => (sub_id.to_string(), generation, refused.is_some()),
+            _ => panic!("expected a cancel"),
+        };
+        let confirm = |relay: &StalledWorker, sub_id: &str, generation| {
+            relay
+                .ended
+                .send(SubEnded {
+                    conn_id: 2,
+                    sub_id: SubId::new(sub_id).unwrap(),
+                    generation,
+                })
+                .unwrap();
+        };
+
+        relay.send(2, json!(["REQ", "x", {"kinds": [1]}]));
+        assert!(matches!(next(&relay), ReqMsg::Scan(_)));
+        relay.send(2, bad("x"));
+        let (_, first, refused) = cancel(&relay);
+        assert!(refused);
+        relay.send(2, bad("x"));
+        let (_, second, refused) = cancel(&relay);
+        assert!(refused && second > first);
+        // Confirming the earlier teardown is not enough.
+        confirm(&relay, "x", first);
+        relay.send(2, bad("x"));
+        let (_, third, _) = cancel(&relay);
+        assert!(
+            relay.outbound.try_recv().is_err(),
+            "a refusal was answered before the teardown finished"
+        );
+        confirm(&relay, "x", second);
+        confirm(&relay, "x", third);
+        relay.send(2, bad("x"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let closed = loop {
+            if let Ok(frame) = relay.outbound.try_recv() {
+                break frame.into_text();
+            }
+            assert!(std::time::Instant::now() < deadline, "no CLOSED");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(closed.starts_with(r#"["CLOSED","x","#), "{closed}");
+        assert!(relay.req[0].try_recv().is_err());
+
+        // CLOSE, then a refused REQ before the CLOSE is confirmed.
+        relay.send(2, json!(["REQ", "y", {"kinds": [1]}]));
+        assert!(matches!(next(&relay), ReqMsg::Scan(_)));
+        relay.send(2, json!(["CLOSE", "y"]));
+        assert!(!cancel(&relay).2, "a CLOSE carries no refusal");
+        relay.send(2, bad("y"));
+        assert!(cancel(&relay).2);
+        assert!(relay.outbound.try_recv().is_err());
+        relay.finish();
     }
 
     fn relay_env(dir: &std::path::Path) -> (Env, Config) {

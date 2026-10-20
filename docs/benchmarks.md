@@ -191,8 +191,6 @@ default limits (`clients::tests`).
 For a repeatable local setup or fresh two-VM deployment, start with the
 [Docker load lab](load-lab.md). It packages `wok-bench` with the relay, preserves
 results, and checks shutdown/integrity without fixed host addresses.
-The [September 5 local lab audit](load-lab-audit-2026-09-05.md) records larger
-campaigns, long-idle validation, generator corrections, and measurement limits.
 
 ## Two-host load generation
 
@@ -313,65 +311,25 @@ Original artifacts remain under `/opt/relay-bench/campaigns/<campaign-id>` and
 are copied to `/opt/wok-load/results/<campaign-id>` for analysis with the
 two-host campaign results.
 
-### Recorded campaigns
+See [NIP-50 search](nip50-search.md) for the search workload and exact semantics.
 
-The [post-hardening report](benchmark-security-hardening-2026-08-14.md)
-records the full 100,000-event rerun at Wok commit `fa9b061` after the
-WebSocket performance work and security-hardening series. All 96 two-host and
-same-host result rows passed. It includes the controlled change from v0.2.0,
-resource measurements, retained artifact hashes, and a Unix socket shutdown
-cleanup defect found after the transport campaign and subsequently fixed in
-commit `ca64980` without changing the measured binary or results.
-
-The [2026-08-14 WebSocket optimization report](websocket-performance-2026-08-14.md)
-records the focused profiling and same-build two-host A/B that followed the
-v0.2.0 campaign. The final zero-delay candidate improved scaled WebSocket
-publication throughput by 22–24% in two order-balanced comparisons.
-
-The [v0.2.0 report](benchmark-v0.2.0-2026-08-14.md) records the previous
-100,000-event Linux campaign: a two-host Wok/strfry relay comparison and a
-same-host Wok Unix/WebSocket transport comparison, each with three
-order-rotated repetitions. All 96 result rows passed their correctness gates.
-It includes the before/after comparison to the previous controlled Wok build,
-median throughput and latency, resources, exact corpus and binary hashes,
-limitations, retained artifacts, and next investigations.
-
-The earlier [2026-08-14 transport report](transport-benchmark-2026-08-14.md)
-is the baseline for that comparison. It records 54 correct trials against Wok
-commit `876bce55671120fc65b9a0844d2f4ae9f1d9d229`.
-
-The older `sample-bench-summary.md` and `sample-bench-results.jsonl` remain a
-historical single-run Apple Silicon example of the local process harness. Do
-not treat that sample as the current controlled VM result or combine it with
-same-host transport and two-host network measurements.
-
-See [NIP-50 search](nip50-search.md) for the search workload, exact semantics,
-and 100k/1m-event scale results.
-
-## September 5 audit corrections
+## Harness correctness checks
 
 The harness defaults to `--tcp-nodelay true` and records this setting in every
 result row. Use explicit true/false runs on the same Linux host before attributing
-older WebSocket request plateaus to the codec, LMDB, or Nagle. A Mac loopback
-A/B/B/A diagnostic did not demonstrate a consistent Nagle penalty.
+WebSocket request plateaus to the codec, LMDB, or Nagle.
 
-Historical reports used weaker correctness checks and a different client TCP
-setting. Their zero-mismatch counts do not validate receipt routing or exact
-query sets. Preserve them as historical measurements; do not compare their rates
-directly with new runs. The mixed read/write scenario now queries a fixed corpus
-author while distinct authors publish, allowing an exact historical oracle despite
-concurrent commits. The search oracle uses the generated equal-score vocabulary.
-Fanout subscribers read concurrently with publication and request no historical
-events (`limit: 0`). Both throughput and the latency fields use aggregate
+The mixed read/write scenario queries a fixed corpus author while distinct
+authors publish, allowing an exact historical oracle despite concurrent commits.
+The search oracle uses the generated equal-score vocabulary. Fanout subscribers
+read concurrently with publication and request no historical events
+(`limit: 0`). Both throughput and the latency fields use aggregate
 publication/delivery duration; the latter contain one sample per trial, not
-individual subscriber delivery percentiles. Older harness versions recorded only
-post-publication drain time in those latency fields. Each subscriber verifies
-unique IDs and exact payloads against shared expectations without retaining a
-second copy of all received events. Warm-up is excluded from measured search time.
+individual subscriber delivery percentiles. Each subscriber verifies unique IDs
+and exact payloads against shared expectations without retaining a second copy
+of all received events. Warm-up is excluded from measured search time.
 
 Storage verification accounts for the documented ephemeral difference: Wok's
 live-only default must export no ephemeral records. strfry's temporary storage
 may export a duplicate-free subset of submitted ephemeral events, each with its
 exact original payload. Both must export the exact expected persistent set.
-The first lifecycle audit control flagged this intentional difference; the oracle
-was then corrected and tested, rather than treating it as a strfry defect.

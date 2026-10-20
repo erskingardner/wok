@@ -70,7 +70,7 @@ jobs:
           archive="wok-${VERSION}-${TARGET}"
           mkdir -p "package/${archive}/docs" dist
           install -m 0755 "target/${TARGET}/release/wok" "package/${archive}/wok"
-          cp README.md CHANGELOG.md LICENSE docs/wok.toml "package/${archive}/"
+          cp README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md LICENSE docs/wok.toml "package/${archive}/"
           cp -R docs/. "package/${archive}/docs/"
           tar -C package -czf "dist/${archive}.tar.gz" "$archive"
       - uses: actions/upload-artifact@v4

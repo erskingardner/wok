@@ -54,20 +54,11 @@ EOSE, and no query may exceed its post-ranking limit. Abuse throttling is
 disabled only in the disposable benchmark relay so the measurements cover
 search execution rather than REQ admission policy.
 
-Apple Silicon macOS results from 2026-08-13, release builds, seed 1:
+Broad terms that match most of the corpus score every matching event before
+the limit applies, so they dominate the high percentiles; rare and
+intersection queries dominate the median.
 
-| corpus | queries | p50 | p90 | p99 | max | correctness |
-|---:|---:|---:|---:|---:|---:|---|
-| 100,000 | 300 | 0.38 ms | 15.60 ms | 15.82 ms | 15.9 ms | 0 mismatches |
-| 1,000,000 | 60 | 2.34 ms | 192.77 ms | 193.79 ms | 193.8 ms | 0 mismatches |
-
-The high-percentile samples are the broad queries that score every event; rare
-and intersection queries dominate the median. A separate identical-corpus
-100,000-event verified import measured 26,098 events/s for Wok with search
-indexing enabled and 18,317 events/s for pinned strfry, which has no search
-index. These are single-host observations, not universal performance claims.
-
-Reproduce the search workload with:
+Run the search workload with:
 
 ```bash
 cargo build --release -p wok-cli -p wok-bench

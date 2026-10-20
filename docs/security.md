@@ -1,5 +1,7 @@
 # Security notes
 
+To report a vulnerability, follow [SECURITY.md](../SECURITY.md).
+
 For a least-privilege systemd unit, filesystem layout, reverse-proxy boundary,
 plugin isolation guidance, and logging policy, see
 [Production deployment security](production-deployment.md).

@@ -1332,8 +1332,7 @@ fn stop_target(child: &mut Option<Child>, url: &str) {
 /// enough trials exhaust kern.posix.sem.max (docs/production-deployment.md).
 /// SIGUSR1 is the graceful shutdown signal of both Wok and strfry, but strfry
 /// exits only when a connection closes during shutdown, never when already
-/// idle. A control WebSocket held across the signal supplies that close
-/// (docs/benchmark-strfry-soak-comparison-2026-09-07.md).
+/// idle. A control WebSocket held across the signal supplies that close.
 fn stop_relay(child: &mut Child, url: &str) {
     let control = tokio_tungstenite::tungstenite::connect(url).ok();
     let signalled = Command::new("kill")

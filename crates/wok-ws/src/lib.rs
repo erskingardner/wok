@@ -245,7 +245,11 @@ async fn dispatch(
     ) {
         return not_found();
     }
+    if req.method() == hyper::Method::OPTIONS {
+        return preflight_response();
+    }
     // NIP-86 management RPC arrives as an HTTP POST to the relay URI itself.
+    // Browser management tools call it cross-origin, so it carries CORS too.
     if path == "/"
         && req.method() == hyper::Method::POST
         && req
@@ -255,7 +259,7 @@ async fn dispatch(
             .map(|value| value.starts_with(nip86::RPC_CONTENT_TYPE))
             .unwrap_or(false)
     {
-        return nip86::dispatch(req, handle, admin_state).await;
+        return with_cors(nip86::dispatch(req, handle, admin_state).await);
     }
     let host = req
         .headers()
@@ -263,12 +267,7 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let accept = req
-        .headers()
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let wants_nip11 = accepts_nip11(req.headers());
     let cfg = handle.config.read().clone();
     if path == "/metrics" {
         return text_response("text/plain; version=0.0.4", handle.metrics.render());
@@ -300,18 +299,41 @@ async fn dispatch(
         return json_response(&body);
     }
     if path == "/favicon.ico" {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "image/x-icon")
-            .header("Cache-Control", "public, max-age=31536000")
-            .header("Access-Control-Allow-Origin", "*")
-            .body(Full::new(Bytes::from_static(&[0, 0, 1, 0])))
-            .unwrap_or_else(|_| empty(StatusCode::OK));
+        return with_cors(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "image/x-icon")
+                .header("Cache-Control", "public, max-age=31536000")
+                .body(Full::new(Bytes::from_static(&[0, 0, 1, 0])))
+                .unwrap_or_else(|_| empty(StatusCode::OK)),
+        );
     }
-    if accept == "application/nostr+json" {
+    if wants_nip11 {
         return json_response(&nip11(&cfg, &handle));
     }
     html_response(&landing(&cfg, &handle.supported_nips()))
+}
+
+/// Whether the `Accept` media-range list names `application/nostr+json` with
+/// a nonzero quality. Wildcards don't count: browsers send `*/*` and get the
+/// landing page.
+fn accepts_nip11(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get_all(hyper::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|range| {
+            let mut parts = range.split(';');
+            let media_type = parts.next().unwrap_or("").trim();
+            media_type.eq_ignore_ascii_case("application/nostr+json")
+                && !parts.any(|param| {
+                    param.split_once('=').is_some_and(|(name, value)| {
+                        name.trim().eq_ignore_ascii_case("q")
+                            && value.trim().parse::<f32>() == Ok(0.0)
+                    })
+                })
+        })
 }
 
 fn maybe_npub(s: &str) -> String {
@@ -574,45 +596,64 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// NIP-11 requires CORS on the relay URI. Every public response carries
+/// these headers, NIP-86 replies included.
+const CORS_HEADERS: [(&str, &str); 3] = [
+    ("Access-Control-Allow-Origin", "*"),
+    (
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, Accept",
+    ),
+    ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+];
+
+fn with_cors(mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+    for (name, value) in CORS_HEADERS {
+        response
+            .headers_mut()
+            .insert(name, hyper::header::HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// Answer a CORS preflight. The headers already say what is allowed.
+fn preflight_response() -> Response<Full<Bytes>> {
+    with_cors(empty(StatusCode::NO_CONTENT))
+}
+
+fn public_response(status: StatusCode, content_type: &str, body: Bytes) -> Response<Full<Bytes>> {
+    with_cors(
+        Response::builder()
+            .status(status)
+            .header("Content-Type", content_type)
+            .header("Server", "wok")
+            .body(Full::new(body))
+            .unwrap_or_else(|_| empty(status)),
+    )
+}
+
 fn json_response(v: &serde_json::Value) -> Response<Full<Bytes>> {
-    let body = v.to_string();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/json")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Server", "wok")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| empty(StatusCode::OK))
+    public_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(v.to_string()),
+    )
 }
 
 fn text_response(ct: &str, body: String) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", ct)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Server", "wok")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| empty(StatusCode::OK))
+    public_response(StatusCode::OK, ct, Bytes::from(body))
 }
 
 fn text_status_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header("Content-Type", "text/plain; charset=utf-8")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Server", "wok")
-        .body(Full::new(Bytes::copy_from_slice(body.as_bytes())))
-        .unwrap_or_else(|_| empty(status))
+    public_response(
+        status,
+        "text/plain; charset=utf-8",
+        Bytes::copy_from_slice(body.as_bytes()),
+    )
 }
 
 fn html_response(body: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/html")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Server", "wok")
-        .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap_or_else(|_| empty(StatusCode::OK))
+    public_response(StatusCode::OK, "text/html", Bytes::from(body.to_string()))
 }
 
 fn not_found() -> Response<Full<Bytes>> {
@@ -934,6 +975,61 @@ mod landing_tests {
 
         assert!(server.nodelay().unwrap());
         drop(client);
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+
+    fn accept(values: &[&str]) -> bool {
+        let mut headers = hyper::HeaderMap::new();
+        for value in values {
+            headers.append(
+                hyper::header::ACCEPT,
+                hyper::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        accepts_nip11(&headers)
+    }
+
+    #[test]
+    fn accept_is_parsed_as_a_media_range_list() {
+        assert!(accept(&["application/nostr+json"]));
+        assert!(accept(&["application/nostr+json, application/json;q=0.9"]));
+        assert!(accept(&["application/json;q=0.9 , Application/Nostr+JSON"]));
+        assert!(accept(&["application/nostr+json; charset=utf-8; q=0.5"]));
+        assert!(accept(&["text/html", "application/nostr+json"]));
+        assert!(!accept(&[]));
+        assert!(!accept(&["application/json"]));
+        assert!(!accept(&["*/*"]));
+        assert!(!accept(&["application/*"]));
+        assert!(!accept(&["text/html,application/xhtml+xml,*/*;q=0.8"]));
+        assert!(!accept(&["application/nostr+json;q=0"]));
+        assert!(!accept(&["application/nostr+json; q=0.000"]));
+        assert!(!accept(&["application/nostr+jsonx"]));
+    }
+
+    #[test]
+    fn public_responses_carry_every_cors_header() {
+        for response in [
+            json_response(&serde_json::json!({})),
+            text_status_response(StatusCode::NOT_FOUND, "not found"),
+            html_response("<p>"),
+            preflight_response(),
+        ] {
+            let headers = response.headers();
+            assert_eq!(headers["access-control-allow-origin"], "*");
+            assert_eq!(
+                headers["access-control-allow-headers"],
+                "Content-Type, Authorization, Accept"
+            );
+            assert_eq!(
+                headers["access-control-allow-methods"],
+                "GET, POST, OPTIONS"
+            );
+        }
+        assert_eq!(preflight_response().status(), StatusCode::NO_CONTENT);
     }
 }
 

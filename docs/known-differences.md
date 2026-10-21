@@ -208,3 +208,9 @@ regression test. Differential parity alone is not a reason to retain it.
   `/admin`, `/metrics` and the nodeinfo routes. The pinned strfry upgrades
   and serves NIP-11 on every path, so one relay answers under many URLs. A
   reverse proxy that serves the relay under a path prefix must strip it.
+- NIP-11 CORS: relay responses send `Access-Control-Allow-Origin`,
+  `-Allow-Headers` and `-Allow-Methods`, and `OPTIONS /` is a 204 preflight
+  reply. NIP-11 is chosen when `Accept` lists `application/nostr+json` among
+  other media ranges with a nonzero `q`. The pinned strfry sends only
+  `Access-Control-Allow-Origin`, answers OPTIONS with the landing page, and
+  serves NIP-11 only when `Accept` is exactly `application/nostr+json`.

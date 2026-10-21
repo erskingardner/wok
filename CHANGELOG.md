@@ -223,6 +223,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes. Before, every path upgraded and served NIP-11, so one relay
   answered under any number of URLs. A reverse proxy that serves the relay
   under a path prefix must now strip the prefix.
+- Relay HTTP responses send `Access-Control-Allow-Headers` (`Content-Type,
+  Authorization, Accept`) and `Access-Control-Allow-Methods` (`GET, POST,
+  OPTIONS`) as well as `Access-Control-Allow-Origin`, as NIP-11 requires, and
+  `OPTIONS /` answers a CORS preflight with 204 instead of the landing page.
+  NIP-86 replies carry them too, so browser management tools can call the
+  API. The admin dashboard API stays same-origin.
+- NIP-11 is served whenever the `Accept` header lists
+  `application/nostr+json`, for example
+  `application/nostr+json, application/json;q=0.9`. Only that exact header
+  value was recognized, and anything else got the landing page.
 
 ## [0.7.0] - 2026-09-08
 

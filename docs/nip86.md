@@ -21,7 +21,9 @@ Request and response bodies follow the pinned spec:
 ```
 
 Method-level failures return HTTP 200 with an `error` field. Authentication
-failures return 401. Signed authorization events are single-use within
+failures return 401. Every reply carries the NIP-11 CORS headers, and
+`OPTIONS /` answers the preflight with 204, so browser management tools can
+call the API from another origin. Signed authorization events are single-use within
 `admin.auth_window_secs`; clients must include a unique tag (for example a
 random `nonce`) so same-second calls do not collide in the replay cache. An
 event is claimed as soon as it is accepted, so a concurrent request reusing it

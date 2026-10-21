@@ -1137,6 +1137,87 @@ async fn relay_is_served_on_a_single_endpoint() {
     handle.request_shutdown();
 }
 
+fn assert_cors(response: &str) {
+    let headers = response
+        .split("\r\n\r\n")
+        .next()
+        .unwrap()
+        .to_ascii_lowercase();
+    for header in [
+        "access-control-allow-origin: *",
+        "access-control-allow-headers: content-type, authorization, accept",
+        "access-control-allow-methods: get, post, options",
+    ] {
+        assert!(headers.contains(header), "missing {header:?}: {response}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip11_and_nip86_accept_cors_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(admin_key.x_only_public_key().0.serialize())];
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // NIP-11: relays MUST accept CORS requests. A browser NIP-86 tool sends
+    // this preflight before its POST.
+    let preflight = raw_http(
+        addr,
+        &format!("OPTIONS / HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://manager.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization, content-type\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(preflight.starts_with("HTTP/1.1 204"), "{preflight}");
+    assert!(!preflight.contains("<html"), "{preflight}");
+    assert_cors(&preflight);
+
+    // Accept is a media-range list, not one exact string.
+    let nip11 = raw_http(
+        addr,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept: application/nostr+json, application/json;q=0.9\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(nip11.starts_with("HTTP/1.1 200"), "{nip11}");
+    assert!(nip11.contains("\"supported_nips\""), "{nip11}");
+    assert_cors(&nip11);
+    let page = raw_http(
+        addr,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept: text/html,*/*;q=0.8\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(page.contains("<html"), "{page}");
+    assert_cors(&page);
+
+    // NIP-86 replies carry the headers too, refusals included.
+    let body = json!({"method": "supportedmethods", "params": []}).to_string();
+    let unauthorized = raw_http(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/nostr+json+rpc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert!(unauthorized.starts_with("HTTP/1.1 401"), "{unauthorized}");
+    assert_cors(&unauthorized);
+    let authorized = raw_http(addr, &nip86_request(addr, &admin_key, &body)).await;
+    assert!(authorized.starts_with("HTTP/1.1 200"), "{authorized}");
+    assert!(authorized.contains("banpubkey"), "{authorized}");
+    assert_cors(&authorized);
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip98_admin_http_route_authenticates_and_rejects_replay() {
     let dir = tempfile::tempdir().unwrap();

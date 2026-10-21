@@ -543,6 +543,99 @@ async fn long_d_tags_keep_distinct_addresses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tag_deletions_remove_and_tombstone_replaceable_events() {
+    // NIP-01 names a replaceable event `<kind>:<pubkey>:`, with an empty d,
+    // and NIP-09 deletes its versions up to the request's created_at.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    for kind in [0, 10002] {
+        let versions: Vec<_> = [100, 200]
+            .iter()
+            .map(|t| event(&key, kind, *t, json!([]), "version"))
+            .collect();
+        // Imported history keeps both versions stored.
+        let (dir, env) = snapshot(&versions);
+        let (handle, mut wire) = server(env, dir.path()).await;
+        let filter = json!({"kinds": [kind], "authors": [&pubkey]});
+        assert_eq!(
+            ids(&history(&mut wire, filter.clone()).await),
+            ids(&versions[1..])
+        );
+        let address = format!("{kind}:{pubkey}:");
+        let deletion = event(&key, 5, 300, json!([["a", &address]]), "");
+        assert_eq!(publish(&mut wire, &deletion).await[2], true);
+        // The older version would be the winner had it survived.
+        assert!(
+            history(&mut wire, filter.clone()).await.is_empty(),
+            "kind {kind}"
+        );
+        // Neither a deleted version nor another one up to the request's
+        // created_at can come back.
+        let at_deletion = event(&key, kind, 300, json!([]), "at deletion");
+        for stale in versions.iter().chain([&at_deletion]) {
+            let ok = publish(&mut wire, stale).await;
+            assert_eq!(ok[2], false, "kind {kind}: {ok}");
+            assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+        }
+        let newer = event(&key, kind, 301, json!([]), "newer");
+        assert_eq!(publish(&mut wire, &newer).await[2], true);
+        assert_eq!(
+            ids(&history(&mut wire, filter).await),
+            ids(std::slice::from_ref(&newer))
+        );
+        handle.request_shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deletion_a_tags_spelling_kinds_with_leading_zeros_are_refused() {
+    // `030000:<pubkey>:x` deleted the stored versions of `30000:<pubkey>:x`,
+    // but its tombstone, the hash of that spelling, never refused later ones.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    let addressable = event(&key, 30000, 100, json!([["d", "x"]]), "addressable");
+    let replaceable = event(&key, 10002, 100, json!([]), "replaceable");
+    let (dir, env) = snapshot(&[addressable.clone(), replaceable.clone()]);
+    let (handle, mut wire) = server(env, dir.path()).await;
+    let filter = json!({"kinds": [10002, 30000]});
+    let stored = ids(&[addressable, replaceable]);
+    for address in [
+        format!("030000:{pubkey}:x"),
+        format!("010002:{pubkey}:"),
+        format!("00:{pubkey}:"),
+    ] {
+        let deletion = event(&key, 5, 200, json!([["a", &address]]), "");
+        let ok = publish(&mut wire, &deletion).await;
+        assert_eq!(ok[2], false, "{ok}");
+        assert_eq!(ok[3], "invalid: a tag kind has leading zeros", "{ok}");
+    }
+    assert_eq!(ids(&history(&mut wire, filter.clone()).await), stored);
+
+    // The canonical spellings delete both, and refuse older versions.
+    let deletion = event(
+        &key,
+        5,
+        200,
+        json!([
+            ["a", format!("30000:{pubkey}:x")],
+            ["a", format!("10002:{pubkey}:")]
+        ]),
+        "",
+    );
+    assert_eq!(publish(&mut wire, &deletion).await[2], true);
+    assert!(history(&mut wire, filter).await.is_empty());
+    for stale in [
+        event(&key, 30000, 150, json!([["d", "x"]]), "stale"),
+        event(&key, 10002, 150, json!([]), "stale"),
+    ] {
+        let ok = publish(&mut wire, &stale).await;
+        assert_eq!(ok[2], false, "{ok}");
+        assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+    }
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn channel_metadata_for_each_channel_survives() {
     // NIP-01 makes 4 <= n < 45 regular. NIP-28 kind 41 names its channel
     // with an e tag, so one author's metadata for two channels is two
@@ -907,6 +1000,213 @@ fn long_addresses_are_deleted_and_tombstoned_through_their_hashes() {
 }
 
 #[test]
+fn replaceable_address_deletion_removes_eligible_versions_and_keeps_newer_versions() {
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    for kind in [0, 3, 10000, 19999] {
+        let versions: Vec<_> = [300, 100, 200]
+            .iter()
+            .map(|t| event(&key, kind, *t, json!([]), "version"))
+            .collect();
+        // Neither another author's version nor the addressable `30000:pk:`
+        // shares the address.
+        let other_author = event(&self::key(), kind, 100, json!([]), "other author");
+        let addressable = event(&key, 30000, 100, json!([]), "addressable");
+        let mut input = versions.clone();
+        input.extend([other_author.clone(), addressable.clone()]);
+        let (_dir, env) = snapshot(&input);
+        let deletion = event(
+            &key,
+            5,
+            250,
+            json!([["a", format!("{kind}:{pubkey}:")]]),
+            "delete",
+        );
+        assert_eq!(
+            write_with_quota(&env, &deletion, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+        assert_eq!(
+            stored_ids(&env),
+            ids(&[
+                versions[0].clone(),
+                other_author,
+                addressable,
+                deletion.clone()
+            ]),
+            "kind {kind}"
+        );
+        assert_eq!(
+            env.begin_ro()
+                .unwrap()
+                .entries(env.dbis().event_replace_deletion)
+                .unwrap(),
+            1
+        );
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
+        assert_eq!(report.legacy_untombstoned_deletions, 0);
+        wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap();
+
+        // Once the newer version is gone too, the tombstone refuses older ones.
+        let (_dir, env) = snapshot(&versions[1..]);
+        assert_eq!(
+            write_with_quota(&env, &deletion, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+        assert_eq!(stored_ids(&env), ids(std::slice::from_ref(&deletion)));
+        for time in [150, 250] {
+            let stale = event(&key, kind, time, json!([]), "stale");
+            assert_eq!(
+                write_with_quota(&env, &stale, 0, true),
+                wok_db::EventWriteStatus::Deleted,
+                "kind {kind} at {time}"
+            );
+        }
+        let newer = event(&key, kind, 251, json!([]), "newer");
+        assert_eq!(
+            write_with_quota(&env, &newer, 0, true),
+            wok_db::EventWriteStatus::Written
+        );
+
+        // Removing the request removes its tombstone.
+        let id = hex::decode(deletion["id"].as_str().unwrap()).unwrap();
+        let (lev, _) = wok_db::lookup_event_by_id_ro(&env.begin_ro().unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [lev]).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event_replace_deletion).unwrap(), 0);
+        assert!(wok_db::check_integrity(&txn).unwrap().ok());
+    }
+
+    // A replaceable event's address has an empty d; `10002:pk:x` names nothing.
+    let version = event(&key, 10002, 100, json!([["d", "x"]]), "version");
+    let (_dir, env) = snapshot(std::slice::from_ref(&version));
+    let deletion = event(
+        &key,
+        5,
+        200,
+        json!([["a", format!("10002:{pubkey}:x")]]),
+        "",
+    );
+    assert_eq!(
+        write_with_quota(&env, &deletion, 0, true),
+        wok_db::EventWriteStatus::Written
+    );
+    assert_eq!(stored_ids(&env), ids(&[version, deletion]));
+    let txn = env.begin_ro().unwrap();
+    assert_eq!(txn.entries(env.dbis().event_replace_deletion).unwrap(), 0);
+}
+
+#[test]
+fn deletions_stored_without_tombstones_are_applied_by_reindex() {
+    // strfry and earlier Wok releases did not tombstone `<kind>:<pubkey>:`,
+    // and tombstoned a padded kind by its spelling, so the versions such a
+    // request names were never deleted or came back. Integrity accepts the
+    // missing tombstones and counts the requests; reindex applies them.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    let replaceable = event(&key, 10002, 100, json!([]), "never deleted");
+    let newer = event(&key, 10002, 300, json!([]), "newer");
+    let came_back = event(&key, 30000, 150, json!([["d", "x"]]), "came back");
+    let deletion = event(
+        &key,
+        5,
+        200,
+        json!([
+            ["a", format!("10002:{pubkey}:")],
+            ["a", format!("030000:{pubkey}:x")]
+        ]),
+        "",
+    );
+    let (_dir, env) = snapshot_records(&[
+        packing(&replaceable),
+        packing(&newer),
+        packing(&came_back),
+        stored_packing(&deletion),
+    ]);
+    {
+        let mut txn = env.begin_rw().unwrap();
+        for address in [format!("10002:{pubkey}:"), format!("30000:{pubkey}:x")] {
+            let key =
+                wok_db::keys::make_key_string_u64(&wok_event::sha256(address.as_bytes()), 200);
+            let lev = 4u64.to_ne_bytes();
+            assert!(txn
+                .del(env.dbis().event_replace_deletion, &key, Some(&lev))
+                .unwrap());
+        }
+        txn.commit().unwrap();
+    }
+    let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    assert_eq!(report.legacy_untombstoned_deletions, 1);
+    assert_eq!(report.expected_index_entries, report.actual_index_entries);
+
+    let (_repaired_dir, repaired, stats) = reindex(&env);
+    assert_eq!(stats.deleted_versions, BTreeSet::from([1, 3]));
+    assert_eq!(stored_ids(&repaired), ids(&[newer, deletion]));
+    let report = wok_db::check_integrity(&repaired.begin_ro().unwrap()).unwrap();
+    assert!(report.ok(), "{:?}", report.issues);
+    assert_eq!(report.legacy_untombstoned_deletions, 0);
+    // The padded spelling's own entry, and both canonical ones.
+    let txn = repaired.begin_ro().unwrap();
+    assert_eq!(
+        txn.entries(repaired.dbis().event_replace_deletion).unwrap(),
+        3
+    );
+    drop(txn);
+    let stale = event(&key, 30000, 180, json!([["d", "x"]]), "stale");
+    assert_eq!(
+        write_with_quota(&env, &stale, 0, false),
+        wok_db::EventWriteStatus::Written
+    );
+    assert_eq!(
+        write_with_quota(&repaired, &stale, 0, false),
+        wok_db::EventWriteStatus::Deleted
+    );
+}
+
+#[test]
+fn stored_deletions_spelling_kinds_with_leading_zeros_act_on_the_canonical_address() {
+    // Ingest refuses such requests now; strfry and earlier releases stored
+    // them. Written directly, one deletes what the canonical spelling names
+    // and refuses older versions of it.
+    let key = key();
+    let pubkey = key.x_only_public_key().0.to_string();
+    for (kind, address) in [
+        (30000, format!("030000:{pubkey}:")),
+        (10002, format!("010002:{pubkey}:")),
+    ] {
+        let version = event(&key, kind, 100, json!([]), "version");
+        let (_dir, env) = snapshot(std::slice::from_ref(&version));
+        let deletion = event(&key, 5, 200, json!([["a", &address]]), "");
+        assert!(
+            parse_and_verify_event(&deletion, &EventLimits::default(), None, true, false).is_err()
+        );
+        let (packed, json) = stored_packing(&deletion);
+        let mut events = [wok_db::EventToWrite::new(packed, json)];
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false)
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(events[0].status, wok_db::EventWriteStatus::Written);
+        assert_eq!(stored_ids(&env), ids(&[deletion]), "{address}");
+        let stale = event(&key, kind, 150, json!([]), "stale");
+        assert_eq!(
+            write_with_quota(&env, &stale, 0, false),
+            wok_db::EventWriteStatus::Deleted,
+            "{address}"
+        );
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
+        assert_eq!(report.legacy_untombstoned_deletions, 0);
+    }
+}
+
+#[test]
 fn integrity_reports_retained_versions_without_treating_them_as_corruption() {
     let key = key();
     let mut events = Vec::new();
@@ -1144,10 +1444,18 @@ fn packing(event: &Value) -> (Vec<u8>, String) {
     (parsed.packed.into_bytes(), parsed.json)
 }
 
+/// Pack `event` as a stored record, without ingest's checks: strfry and
+/// earlier releases stored deletions whose `a` tags pad the kind.
+fn stored_packing(event: &Value) -> (Vec<u8>, String) {
+    let packed = wok_event::nostr_json_to_packed_event(event, &EventLimits::default()).unwrap();
+    let json = wok_event::normalize_event_json(event).unwrap();
+    (packed.into_bytes(), json)
+}
+
 /// What strfry and earlier Wok releases stored: every single-letter tag value
 /// longer than 255 bytes dropped.
 fn legacy_packing(event: &Value) -> (Vec<u8>, String) {
-    let (packed, json) = packing(event);
+    let (packed, json) = stored_packing(event);
     let view = PackedEventView::new(&packed).unwrap();
     let mut tags = wok_event::PackedEventTagBuilder::default();
     for tag in view.tags() {
@@ -1458,8 +1766,9 @@ fn reindex_restores_long_tag_values_to_legacy_records() {
 
 #[test]
 fn reindex_deletes_under_long_addresses_spelled_with_a_padded_kind() {
-    // `a` tags accept a kind with leading zeros. The write path deletes the
-    // versions such a tag names, and reindex must too, not fail.
+    // Ingest refuses an `a` tag whose kind has leading zeros, but strfry and
+    // earlier releases stored such requests, with the long tag dropped or
+    // hashed. Reindex must apply them like the write path did, not fail.
     let key = key();
     let pubkey = key.x_only_public_key().0.to_string();
     let d = "x".repeat(300);
@@ -1471,20 +1780,17 @@ fn reindex_deletes_under_long_addresses_spelled_with_a_padded_kind() {
         json!([["a", format!("030000:{pubkey}:{d}")]]),
         "",
     );
+    assert!(parse_and_verify_event(&deletion, &EventLimits::default(), None, true, false).is_err());
 
-    let (_dir, env) = snapshot(std::slice::from_ref(&version));
-    assert_eq!(
-        write_with_quota(&env, &deletion, 0, true),
-        wok_db::EventWriteStatus::Written
-    );
-    assert_eq!(stored_ids(&env), ids(std::slice::from_ref(&deletion)));
-
-    let (_dir, env) = snapshot_records(&[legacy_packing(&version), legacy_packing(&deletion)]);
-    let (_repaired_dir, repaired, stats) = reindex(&env);
-    assert_eq!(stats.deleted_versions, BTreeSet::from([1]));
-    assert_eq!(stored_ids(&repaired), ids(&[deletion]));
-    let report = wok_db::check_integrity(&repaired.begin_ro().unwrap()).unwrap();
-    assert!(report.ok(), "{:?}", report.issues);
+    for stored_deletion in [legacy_packing(&deletion), stored_packing(&deletion)] {
+        let (_dir, env) = snapshot_records(&[legacy_packing(&version), stored_deletion]);
+        let (_repaired_dir, repaired, stats) = reindex(&env);
+        assert_eq!(stats.deleted_versions, BTreeSet::from([1]));
+        assert_eq!(stats.skipped_long_tag_records, 0);
+        assert_eq!(stored_ids(&repaired), ids(std::slice::from_ref(&deletion)));
+        let report = wok_db::check_integrity(&repaired.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
+    }
 }
 
 /// Rebuild `source` as `wok reindex` does, repacking long tag values.

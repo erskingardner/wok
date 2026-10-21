@@ -23,8 +23,9 @@ pub struct ReindexOutcome {
     pub negentropy_items: u64,
     pub repacked_long_tag_records: u64,
     pub skipped_long_tag_records: u64,
-    /// Versions deleted because a repaired deletion request's long `a` tag
-    /// names their address. The backup keeps them.
+    /// Versions deleted because a repaired `a` tag of a deletion request
+    /// names their address: one longer than 255 bytes, a replaceable event's,
+    /// or one whose kind has leading zeros. The backup keeps them.
     pub deleted_under_repaired_deletions: u64,
     /// Fingerprint of the original database, which is kept as the backup.
     pub source_event_fingerprint_sha256: String,

@@ -326,6 +326,18 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
                             integrity.legacy_long_tag_records,
                         ),
                     );
+                    report.add(
+                        "deletion-tombstones",
+                        if integrity.legacy_untombstoned_deletions == 0 {
+                            CheckStatus::Pass
+                        } else {
+                            CheckStatus::Warn
+                        },
+                        format!(
+                            "{} deletion requests lack the tombstone of an address their `a` tag names (a replaceable event, or a kind with leading zeros; stored by strfry or an earlier Wok), so the versions they name were not deleted or can be published again; `wok reindex --confirm-relay-stopped` deletes them and adds the tombstones",
+                            integrity.legacy_untombstoned_deletions,
+                        ),
+                    );
                     report.integrity = Some(integrity);
                 }
                 Err(error) => report.add("integrity", CheckStatus::Fail, error.to_string()),

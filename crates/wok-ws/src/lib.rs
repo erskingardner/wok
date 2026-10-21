@@ -822,21 +822,22 @@ async fn handle_ws<S>(
         deflate.map(|d| InflateCtx::new(d.client_takeover)),
     );
     let mut encoder = WsEncoder::new(deflate.map(|d| DeflateCtx::new(d.server_takeover)));
-    let mut deflate_idle = tokio::time::interval(deflate_idle_check);
+    // Both intervals first tick one period from now. Awaiting an immediate
+    // first tick instead holds a new connection until the timer's next
+    // millisecond before it reads anything.
+    let mut deflate_idle = tokio::time::interval_at(
+        tokio::time::Instant::now() + deflate_idle_check,
+        deflate_idle_check,
+    );
     deflate_idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    if deflate.is_some() {
-        deflate_idle.tick().await; // first tick is immediate; skip it
-    }
     let mut incoming_events = Vec::with_capacity(4);
-    let mut ping = tokio::time::interval(std::time::Duration::from_secs(auto_ping.max(1)));
+    let ping_every = std::time::Duration::from_secs(auto_ping.max(1));
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + ping_every, ping_every);
     // Delay (not the Burst default): after the select is stalled elsewhere
     // for two or more intervals, Burst would fire back-to-back ticks — send
     // a ping, then immediately close for a pong the peer never got a window
     // to send. Delay guarantees one full interval per outstanding ping.
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    if auto_ping > 0 {
-        ping.tick().await; // first tick is immediate; skip it
-    }
     // Liveness: a ping unanswered when the next ping interval elapses means
     // the peer is gone (or deliberately silent) — close the connection.
     let mut awaiting_pong = false;

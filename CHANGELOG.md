@@ -151,7 +151,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffer shrinks back to 1 KiB between messages. Outbound frames already
   queued go out in one write instead of one write each. Outbound compression
   uses level 1, as strfry does, instead of 6: well under half the CPU for a
-  few percent more bytes.
+  few percent more bytes. A new connection no longer waits for a timer tick
+  (up to a millisecond, twice with deflate) before it reads its first
+  message, which roughly doubles reconnect throughput.
 - A bound set with `events.reject_older_than_secs` applies to regular kinds
   only. Replaceable (0, 3, 10000–19999) and addressable (30000–39999) events
   and deletions (5) are now accepted whatever their age, like vanish requests

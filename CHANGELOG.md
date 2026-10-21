@@ -128,6 +128,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The relay could crash with a segmentation fault while shutting down. LMDB
+  clears a thread's reader slot from a thread-local destructor as the thread
+  exits, and the database was closed by whichever relay thread exited last,
+  so it could unmap the slot under another thread's destructor. The three
+  req monitors exit together, which made this reachable: about one in a
+  thousand runs of a test that starts and stops six relays crashed on Linux.
+  The database now closes only after every relay thread has exited.
 - An `authors` and `kinds` filter naming 1000 or more (author, kind) pairs no
   longer reads every event those authors wrote when its kinds are replaceable
   or addressable, as in an outbox fetch of kinds 0, 3 and 10002 for a long

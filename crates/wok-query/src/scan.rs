@@ -235,6 +235,8 @@ struct TieRun {
     sent_through: Option<[u8; 32]>,
     pass: Option<TiePass>,
     more: bool,
+    /// Once sent: the next of `cursors` to refill, a batch per step.
+    refill_next: Option<usize>,
 }
 
 struct TiePass {
@@ -824,10 +826,10 @@ impl DbScan {
                 continue;
             } else if self.front_run.is_empty() {
                 if let Some(mut run) = self.tie_run.take() {
-                    if run.pass.is_none() && !run.more {
-                        self.finish_tie_run(txn, &run)?;
-                    } else {
+                    if run.pass.is_some() || run.more {
                         self.advance_tie_pass(txn, filter, &mut run)?;
+                        self.tie_run = Some(run);
+                    } else if !self.finish_tie_run(txn, &mut run)? {
                         self.tie_run = Some(run);
                     }
                 } else if self.event_queue.is_empty() {
@@ -872,10 +874,17 @@ impl DbScan {
             self.refill_scan_depth,
             &mut more,
         )?;
+        self.queue_more(more);
+        Ok(())
+    }
+
+    fn queue_more(&mut self, more: VecDeque<CandidateEvent>) {
+        if more.is_empty() {
+            return;
+        }
         let mut merged: Vec<_> = self.event_queue.drain(..).chain(more).collect();
         merged.sort_by(cmp_cand);
         self.event_queue = merged.into();
-        Ok(())
     }
 
     /// Count a candidate out of the queue, keeping one queued for each
@@ -917,6 +926,7 @@ impl DbScan {
             sent_through: None,
             pass: None,
             more: true,
+            refill_next: None,
         });
         Ok(())
     }
@@ -1020,22 +1030,48 @@ impl DbScan {
     }
 
     /// Move the run's cursors past its `created_at` and refill those left
-    /// with nothing queued.
-    fn finish_tie_run(&mut self, txn: &RoTxn<'_>, run: &TieRun) -> Result<(), wok_db::DbError> {
-        for &si in &run.cursors {
-            let cursor = &mut self.cursors[si];
-            if cursor.may_hold(run.created) {
-                // A reverse scan from the key's lowest duplicate goes on below it.
-                cursor.resume_key = make_key_string_u64(&cursor.search, run.created);
-                cursor.resume_val = 0;
+    /// with nothing queued, about [`TIE_CHUNK`] entries and one queue merge
+    /// per step. Returns true once every cursor is refilled; nothing leaves
+    /// the queue before then, as each active cursor needs a queued entry.
+    fn finish_tie_run(
+        &mut self,
+        txn: &RoTxn<'_>,
+        run: &mut TieRun,
+    ) -> Result<bool, wok_db::DbError> {
+        let next = match run.refill_next {
+            Some(next) => next,
+            None => {
+                for &si in &run.cursors {
+                    let cursor = &mut self.cursors[si];
+                    if cursor.may_hold(run.created) {
+                        // A reverse scan from the key's lowest duplicate goes on below it.
+                        cursor.resume_key = make_key_string_u64(&cursor.search, run.created);
+                        cursor.resume_val = 0;
+                    }
+                }
+                0
             }
-        }
-        for &si in &run.cursors {
+        };
+        let mut more = VecDeque::new();
+        let mut index = next;
+        while index < run.cursors.len() && more.len() < TIE_CHUNK {
+            let si = run.cursors[index];
+            index += 1;
             if self.cursors[si].outstanding == 0 && self.cursors[si].active() {
-                self.refill(txn, si)?;
+                self.approx_work += self.cursors[si].collect(
+                    txn,
+                    self.index_dbi,
+                    si as u64,
+                    self.since,
+                    self.until,
+                    self.refill_scan_depth,
+                    &mut more,
+                )?;
             }
         }
-        Ok(())
+        self.queue_more(more);
+        run.refill_next = Some(index);
+        Ok(index == run.cursors.len())
     }
 }
 
@@ -1412,8 +1448,9 @@ mod tests {
         ids
     }
 
-    /// Scan one step per call. Returns the ids sent, the most candidates held
-    /// after any step, and the most work done by one step.
+    /// Scan one step per call. Returns the distinct ids sent, in order, the
+    /// most candidates held after any step, and the most work done by one
+    /// step.
     fn scan_in_steps(
         env: &Env,
         filter: serde_json::Value,
@@ -1426,6 +1463,9 @@ mod tests {
             .remove(0);
         let mut scan = DbScan::new(&f, &txn);
         let mut sent = Vec::new();
+        // An event under several of a filter's tag values is sent once per
+        // cursor; `DbQuery` drops the repeats.
+        let mut seen = HashSet::new();
         let (mut held, mut step_work) = (0, 0);
         loop {
             let before = scan.approx_work;
@@ -1436,7 +1476,11 @@ mod tests {
                     &f,
                     |lev| {
                         let raw = txn.get_u64(txn.env().dbis().event, lev).unwrap().unwrap();
-                        sent.push(PackedEventView::new(raw).unwrap().id().try_into().unwrap());
+                        let id: [u8; 32] =
+                            PackedEventView::new(raw).unwrap().id().try_into().unwrap();
+                        if seen.insert(id) {
+                            sent.push(id);
+                        }
                         sent.len() == want
                     },
                     |_| {
@@ -1481,6 +1525,60 @@ mod tests {
         assert_eq!(sent[..run], ids[..]);
         assert_eq!(sent.len(), run + 1);
         assert!(held <= MAX_TIE_SELECTION + 50, "held {held}");
+        assert!(work <= chunk_work, "one step did {work}");
+    }
+
+    /// Kind 1 events from one author, each with every tag in `tags`, at
+    /// `created_ats`. Returns (created_at, id) of each.
+    fn tagged_events(env: &Env, created_ats: &[u64], tags: &[String]) -> Vec<(u64, [u8; 32])> {
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let pubkey = hex::encode(key.x_only_public_key().0.serialize());
+        let tag_list: Vec<_> = tags.iter().map(|value| json!(["t", value])).collect();
+        let mut events = Vec::new();
+        let mut out = Vec::new();
+        for (i, &created_at) in created_ats.iter().enumerate() {
+            let mut ev = json!({
+                "created_at": created_at,
+                "kind": 1,
+                "tags": tag_list,
+                "content": format!("tagged {i}"),
+                "pubkey": pubkey,
+            });
+            let id = wok_event::event_id_hash(&ev).unwrap();
+            ev["id"] = json!(hex::encode(id));
+            let sig = SECP256K1.sign_schnorr_no_aux_rand(&id, &key);
+            ev["sig"] = json!(hex::encode(sig.as_ref()));
+            let packed =
+                wok_event::nostr_json_to_packed_event(&ev, &wok_event::EventLimits::default())
+                    .unwrap();
+            events.push(EventToWrite::new(packed.into_bytes(), ev.to_string()));
+            out.push((created_at, id));
+        }
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        out
+    }
+
+    #[test]
+    fn refilling_many_cursors_after_a_tie_stays_inside_the_time_slice() {
+        // Every one of 200 OR alternatives holds the same six tied events, so
+        // each cursor's first read sits wholly in the run and needs a refill
+        // of older history once the run is sent.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let tags: Vec<_> = (0..200).map(|i| format!("v{i}")).collect();
+        let created_ats: Vec<u64> = std::iter::repeat_n(1_700_000_000, 6)
+            .chain((1..=50).map(|i| 1_700_000_000 - i))
+            .collect();
+        let mut expected = tagged_events(&env, &created_ats, &tags);
+        expected.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let expected: Vec<_> = expected.into_iter().map(|(_, id)| id).collect();
+
+        let (sent, _, work) = scan_in_steps(&env, json!({"#t": tags, "limit": 500}), 56);
+        assert_eq!(sent, expected);
+        let chunk_work = 10 * TIE_CHUNK as u64 + 1000;
         assert!(work <= chunk_work, "one step did {work}");
     }
 }

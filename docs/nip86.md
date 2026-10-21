@@ -35,7 +35,10 @@ event to retry.
 ## Supported methods
 
 `supportedmethods` returns the implemented list. Unknown methods return an
-`unsupported method` error.
+`unsupported method` error. The pinned NIP-86 also defines `unbanevent`,
+`unallowevent`, `listallowedevents`, `listdisallowedkinds` and the NIP-43
+invite methods `listclaims`, `createclaim` and `deleteclaim`, which Wok does
+not implement.
 
 | Group | Methods |
 | --- | --- |

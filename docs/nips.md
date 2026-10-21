@@ -1,6 +1,6 @@
 # Supported NIPs
 
-Conformance suite pins nostr-protocol/nips at `656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab`.
+Conformance suite pins nostr-protocol/nips at `0b5532c0355ab27f447e071a93c09cf3a2b4aad5`.
 
 Only NIPs for which Wok implements observable **relay behavior** and has
 conformance coverage are advertised in NIP-11. The authoritative typed catalog
@@ -36,6 +36,9 @@ requires; it is not treated as an absent field. Such a filter is skipped and
 the request's other filters still apply. A REQ whose filters all have an empty
 list gets EOSE and stays open, a COUNT reports 0, and a NEG-OPEN reconciles
 against no events. Filter-validation limits still count the skipped filters.
+
+A filter with `limit: 0` returns no stored events. The subscription still gets
+EOSE once its other filters have sent theirs, and stays open for new events.
 
 Stored events are sent newest first, and events with the same `created_at`
 lowest id first, as NIP-01 orders them. That order also decides which tied

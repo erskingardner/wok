@@ -461,3 +461,71 @@ fn created_at_ties_put_the_lowest_id_first_on_every_plan() {
         }
     }
 }
+
+/// NIP-01 `limit: 0` returns no stored event, so no plan opens a cursor, and
+/// `until: 0` is a bound like any other: each cursor stops at its first newer
+/// entry instead of walking the index and discarding every entry.
+#[test]
+fn limit_zero_and_until_zero_read_no_history() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut rng = rand::thread_rng();
+    let key = Keypair::new(SECP256K1, &mut rng);
+    let author = hex::encode(key.x_only_public_key().0.serialize());
+    let mut events: Vec<_> = (0..200)
+        .map(|i| {
+            let (packed, json) = sign_note(&key, 1_700_000_000 + i, &["x"], &format!("n{i}"));
+            EventToWrite::new(packed, json)
+        })
+        .collect();
+    let mut write = env.begin_rw().unwrap();
+    write_events(&mut write, &mut NoopNegentropy, &mut events, false).unwrap();
+    write.commit().unwrap();
+
+    let txn = env.begin_ro().unwrap();
+    let id = hex::encode(
+        wok_event::PackedEventView::new(
+            txn.get_u64(txn.env().dbis().event, events[0].lev_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+        .id(),
+    );
+    let parse = |filter: &serde_json::Value| {
+        NostrFilterGroup::from_value(filter, 500, 3, 16)
+            .unwrap()
+            .filters
+            .remove(0)
+    };
+    for filter in [
+        json!({"limit": 0}),
+        json!({"kinds": [1], "limit": 0}),
+        json!({"authors": [author], "limit": 0}),
+        json!({"authors": [author], "kinds": [1], "limit": 0}),
+        json!({"authors": [author], "#t": ["x"], "limit": 0}),
+        json!({"ids": [id], "limit": 0}),
+    ] {
+        let f = parse(&filter);
+        let mut scan = DbScan::new(&f, &txn);
+        assert_eq!(scan.cursor_count(), 0, "{filter}");
+        assert!(scan
+            .scan(&txn, &f, |_| panic!("{filter}"), |_| false)
+            .unwrap());
+    }
+    for filter in [
+        json!({"until": 0}),
+        json!({"kinds": [1], "until": 0}),
+        json!({"authors": [author], "until": 0}),
+        json!({"authors": [author], "kinds": [1], "until": 0}),
+        json!({"#t": ["x"], "until": 0}),
+    ] {
+        let f = parse(&filter);
+        let mut scan = DbScan::new(&f, &txn);
+        assert!(scan
+            .scan(&txn, &f, |_| panic!("{filter}"), |_| false)
+            .unwrap());
+        assert!(scan.approx_work < 10, "{filter}: {}", scan.approx_work);
+    }
+}

@@ -128,6 +128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A filter with `until: 0` no longer reads its whole index to return nothing,
+  and a filter with `limit: 0` reads no index at all.
 - Stored events with the same `created_at` are now sent lowest id first, as
   NIP-01 specifies, and a `limit` that cuts such a tie keeps the lowest ids.
   Before, ties followed local insertion order, newest first.

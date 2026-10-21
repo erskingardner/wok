@@ -15,7 +15,8 @@ The count scan uses constant additional memory. New winning writes remove every
 older record at their address transactionally; stale, duplicate, tombstoned, or
 quota-rejected writes leave existing records intact. Address-based deletions
 remove all matching versions at or before the deletion timestamp. Reindex and
-migration continue to preserve physical history.
+migration continue to preserve physical history, except that reindex deletes
+the versions that a deletion it repairs names (below).
 
 ```console
 wok --config /etc/wok.toml purge-superseded --dry-run
@@ -60,10 +61,21 @@ outcome and `reindex-manifest.json` report `repacked_long_tag_records` and
 (`source_event_fingerprint_sha256`) and of the result
 (`event_fingerprint_sha256`), which differ once a record is repacked. A
 repaired addressable record may land beside a newer version of its address,
-which makes it superseded history for `wok purge-superseded`. A repaired
-deletion tombstones its address from then on but does not delete versions
-already stored. Nothing is lost: removing the hashed values from a repacked
-record gives its previous bytes back, and the original stays in the backup.
+which makes it superseded history for `wok purge-superseded`.
+
+A deletion request whose `a` tag is longer than 255 bytes tombstones its
+address once repaired, and reindex then deletes the versions it names, as the
+relay does when such a request arrives: every version of that address by the
+request's author with a `created_at` at or before the request's. Newer
+versions and the request itself stay. The same applies when the request was
+stored with its tag but the versions were keyed by another address until
+the repack. Deletion requests whose `a` tags are 255 bytes or shorter are not
+applied again. The outcome and manifest count the deleted versions as
+`deleted_under_repaired_deletions`, and the original database in the backup
+still holds them. Verification accounts for them explicitly: the result must
+match the original's fingerprint without exactly those versions. Nothing else
+changes: removing the hashed values from a repacked record gives its previous
+bytes back.
 See [lmdb-v3.md](lmdb-v3.md#packedevent).
 
 Reindex also tombstones replaceable events that deletion requests stored by

@@ -88,13 +88,17 @@ superseded-version count and negentropy trees are derived from the new packing
 like everything else reindex builds. A legacy addressable record can join a
 newer version at its real address, where reads hide it as superseded history,
 and a version it hid at the empty `d` becomes visible again. A legacy deletion
-gains its tombstone, so older versions of its address are refused from then on;
-versions already stored are not deleted. Nothing repacks implicitly. Finding
+gains its tombstone, so older versions of its address are refused from then on,
+and reindex deletes the versions already stored at or before it, as the writer
+does when such a request arrives. It applies the long `a` tags of every stored
+deletion request this way, so a request stored with its tag also deletes the
+legacy versions that were keyed by another address until the repack. The
+backup keeps the deleted versions. Nothing repacks implicitly. Finding
 legacy records means decoding every payload, which at writable open would make
 the first start after an upgrade scan the whole database, and migration keeps
 strfry records byte for byte. Repacking changes the record's PackedEvent bytes,
 and so `event_fingerprint`, but removing the hashed values gives the previous
-bytes back, so the repair loses nothing.
+bytes back, so the repack itself loses nothing.
 
 ## Event__replaceDeletion
 
@@ -140,14 +144,19 @@ config, plugin, and socket-path problems.
 event/negentropy indexes or author counters. It copies authoritative Meta, filter, dictionary,
 PackedEvent, and EventPayload records into a sibling staging database,
 repacking PackedEvent records that dropped long tag values (see
-[PackedEvent](#packedevent)), derives all indexes again (negentropy trees hold
-every stored record their filter matches), verifies the integrity
+[PackedEvent](#packedevent)), derives all indexes again, deletes the versions
+that repaired deletions name, builds negentropy trees (which hold every stored
+record their filter matches), verifies the integrity
 report and the event fingerprint, then renames the original to a retained
 backup and atomically promotes the staged directory. When it repacks records,
 the fingerprint it verifies leaves out hashed tag values, which are the only
-bytes a repack adds; otherwise the full fingerprint must be unchanged. The
-manifest records the fingerprints of the original and of the result, and how
-many records were repacked and skipped. It preserves a valid sequence and discards author counters for lazy
+bytes a repack adds; otherwise the full fingerprint must be unchanged. When it
+deletes versions, it compares against the original's fingerprint without
+exactly those records, each of which must be stored. The manifest records the
+fingerprints of the original and of the result, how many records were
+repacked and skipped, and how many versions were deleted
+(`deleted_under_repaired_deletions`). It preserves a valid sequence, including
+when it deletes the newest record, and discards author counters for lazy
 reconstruction from the rebuilt indexes. It refuses primary, payload, or
 metadata corruption, including a malformed or regressed sequence; the highest
 surviving event cannot establish the sequence of a previously deleted tail.

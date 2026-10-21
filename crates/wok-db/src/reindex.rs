@@ -2,10 +2,12 @@
 //! event secondary index from PackedEvent again.
 
 use crate::long_tags::{long_tag_packing, LongTagPacking};
-use crate::write::event_index_entries;
+use crate::write::{delete_event_basic, event_index_entries, long_address_deletions};
 use crate::{index_event_search, payload::Decompressor, search::initialize_search_index_state};
 use crate::{DbError, RoTxn, RwTxn};
 use std::borrow::Cow;
+use std::collections::BTreeSet;
+use wok_event::{hashed_tag_value_digest, PackedEventView, DELETION_KIND};
 
 /// What a rebuild does with each PackedEvent record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,11 +16,14 @@ pub enum PackedEventRebuild {
     Copy,
     /// Pack records that lack single-letter tag values longer than 255 bytes
     /// again from their payloads, as [`crate::long_tags`] allows, and copy
-    /// the others unchanged.
+    /// the others unchanged. Then delete the stored versions named by
+    /// deletion requests' `a` tags longer than 255 bytes, as the write path
+    /// does when a request arrives.
     RepackLongTags,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the rebuilt database holds, and what the rebuild changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReindexStats {
     pub events: u64,
     pub payloads: u64,
@@ -28,6 +33,11 @@ pub struct ReindexStats {
     /// Records lacking long tag values that were copied unchanged, because
     /// packing their payload again changes more than those values.
     pub skipped_long_tag_records: u64,
+    /// Local IDs of the stored versions deleted because a deletion request's
+    /// `a` tag longer than 255 bytes names their address. Before the repack,
+    /// the request had no tombstone or the version was keyed by another
+    /// address, so the write path had not deleted them.
+    pub deleted_versions: BTreeSet<u64>,
 }
 
 fn copy_table(
@@ -124,6 +134,7 @@ pub fn rebuild_primary_and_event_indices(
     let mut index_entries = 0u64;
     let mut repacked_long_tag_records = 0u64;
     let mut skipped_long_tag_records = 0u64;
+    let mut long_address_requests = Vec::new();
     let mut error = None;
     let mut decompressor = Decompressor::new();
     source.foreach_full(source_dbis.event, &[], &[], false, |key, packed_bytes| {
@@ -131,19 +142,8 @@ pub fn rebuild_primary_and_event_indices(
             error = Some(DbError::msg("Event key is not 8 bytes"));
             return false;
         };
-        let payload = match source.get_u64(source_dbis.event_payload, lev_id) {
-            Ok(Some(payload)) => payload.to_vec(),
-            Ok(None) => {
-                error = Some(DbError::msg(format!("event {lev_id} has no payload")));
-                return false;
-            }
-            Err(err) => {
-                error = Some(err);
-                return false;
-            }
-        };
-        let json = match decompressor.decode(source, &payload, 16 * 1024 * 1024) {
-            Ok(json) => json.to_owned(),
+        let json = match payload_json(source, &mut decompressor, lev_id) {
+            Ok(json) => json,
             Err(err) => {
                 error = Some(err);
                 return false;
@@ -167,13 +167,16 @@ pub fn rebuild_primary_and_event_indices(
                 }
             },
         };
-        let packed = match wok_event::PackedEventView::new(&packed_bytes) {
+        let packed = match PackedEventView::new(&packed_bytes) {
             Ok(packed) => packed,
             Err(err) => {
                 error = Some(DbError::msg(format!("levId {lev_id}: {err}")));
                 return false;
             }
         };
+        if packing == PackedEventRebuild::RepackLongTags && names_long_address(packed) {
+            long_address_requests.push(lev_id);
+        }
         if let Err(err) = target.put(target_dbis.event, key, &packed_bytes, 0) {
             error = Some(err);
             return false;
@@ -204,13 +207,98 @@ pub fn rebuild_primary_and_event_indices(
         meta.db_version = wok_event::WOK_DB_VERSION;
         target.put_u64(target_dbis.meta, 1, &crate::encode_meta(&meta), 0)?;
     }
+    // The sequence is set, so deleting the newest record cannot lower it.
+    let deleted_versions = delete_versions_under_long_addresses(
+        source,
+        target,
+        &mut decompressor,
+        &long_address_requests,
+    )?;
     crate::state::superseded_events(target)?;
     initialize_search_index_state(target, last_lev_id)?;
+    let deleted = deleted_versions.lev_ids.len() as u64;
     Ok(ReindexStats {
-        events,
-        payloads,
-        index_entries,
+        events: events - deleted,
+        payloads: payloads - deleted,
+        index_entries: index_entries - deleted_versions.index_entries,
         repacked_long_tag_records,
         skipped_long_tag_records,
+        deleted_versions: deleted_versions.lev_ids,
+    })
+}
+
+fn payload_json(
+    source: &RoTxn<'_>,
+    decompressor: &mut Decompressor,
+    lev_id: u64,
+) -> Result<String, DbError> {
+    let payload = source
+        .get_u64(source.env().dbis().event_payload, lev_id)?
+        .ok_or_else(|| DbError::msg(format!("event {lev_id} has no payload")))?;
+    Ok(decompressor
+        .decode(source, payload, 16 * 1024 * 1024)?
+        .to_owned())
+}
+
+/// Whether `packed` is a deletion request with an `a` tag longer than 255
+/// bytes, which PackedEvent holds hashed.
+fn names_long_address(packed: PackedEventView<'_>) -> bool {
+    let mut long = false;
+    if packed.kind() == DELETION_KIND {
+        packed.foreach_tag(|name, value| {
+            long = name == 'a' && hashed_tag_value_digest(value).is_some();
+            !long
+        });
+    }
+    long
+}
+
+struct DeletedVersions {
+    lev_ids: BTreeSet<u64>,
+    index_entries: u64,
+}
+
+/// Apply the long `a` tags of the stored deletion requests `requests` to the
+/// rebuilt `target`, with the write path's deletion semantics: each stored
+/// version of an address a request's author published, up to the request's
+/// `created_at`, is deleted. strfry and earlier Wok releases dropped those
+/// tags and keyed a version with a long first `d` by another address, so
+/// such versions survived the requests that name them. A request whose
+/// shorter `a` tags were never applied is a different gap, and stays as it is.
+fn delete_versions_under_long_addresses(
+    source: &RoTxn<'_>,
+    target: &mut RwTxn<'_>,
+    decompressor: &mut Decompressor,
+    requests: &[u64],
+) -> Result<DeletedVersions, DbError> {
+    let dbis = target.env().dbis();
+    let stored = |target: &RwTxn<'_>, lev_id: u64| {
+        target
+            .get_u64(dbis.event, lev_id)?
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| DbError::msg(format!("levId {lev_id} is not stored")))
+    };
+    let mut lev_ids = BTreeSet::new();
+    for &lev_id in requests {
+        let request = stored(target, lev_id)?;
+        let json = payload_json(source, decompressor, lev_id)?;
+        lev_ids.extend(long_address_deletions(
+            target,
+            PackedEventView::new(&request)?,
+            &json,
+        )?);
+    }
+    let mut index_entries = 0u64;
+    for &lev_id in &lev_ids {
+        let version = stored(target, lev_id)?;
+        index_entries +=
+            event_index_entries(dbis, lev_id, PackedEventView::new(&version)?).len() as u64;
+        if !delete_event_basic(target, lev_id)? {
+            return Err(DbError::msg(format!("event {lev_id} has no payload")));
+        }
+    }
+    Ok(DeletedVersions {
+        lev_ids,
+        index_entries,
     })
 }

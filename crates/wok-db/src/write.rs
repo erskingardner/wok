@@ -539,6 +539,37 @@ fn push_address_deletions(
     })
 }
 
+/// Stored versions that the `a` tags longer than [`MAX_INDEXED_TAG_VAL_SIZE`]
+/// of the stored deletion request `packed` delete, as [`write_events`] deletes
+/// them when the request arrives. Its shorter `a` tags are not applied.
+pub(crate) fn long_address_deletions(
+    txn: &RwTxn<'_>,
+    packed: PackedEventView<'_>,
+    json: &str,
+) -> Result<Vec<u64>, DbError> {
+    let mut lev_ids = Vec::new();
+    if packed.kind() != DELETION_KIND {
+        return Ok(lev_ids);
+    }
+    let long_addresses = hashed_tag_originals(json, "a")?;
+    let mut scan_err = None;
+    packed.foreach_tag(|tag_name, tag_val| {
+        if tag_name == 'a' && hashed_tag_value_digest(tag_val).is_some() {
+            if let Err(error) =
+                push_address_deletions(txn, packed, tag_val, &long_addresses, &mut lev_ids)
+            {
+                scan_err = Some(error);
+                return false;
+            }
+        }
+        true
+    });
+    match scan_err {
+        Some(error) => Err(error),
+        None => Ok(lev_ids),
+    }
+}
+
 fn foreach_replacement(
     txn: &RwTxn<'_>,
     key: &[u8],

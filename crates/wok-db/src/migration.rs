@@ -8,6 +8,7 @@ use lmdb_sys::{
     MDB_RDONLY,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::path::Path;
 use std::ptr;
@@ -57,22 +58,43 @@ pub fn snapshot_lmdb_readonly(
 /// Hash the complete logical event records without decompressing or
 /// reserializing them. Length framing makes the digest unambiguous.
 pub fn event_fingerprint(env: &Env) -> Result<EventFingerprint, DbError> {
-    fingerprint(env, false)
+    fingerprint(env, false, &BTreeSet::new())
 }
 
 /// [`event_fingerprint`] over PackedEvent records without their hashed tag
 /// values, which reindex adds to records that dropped long values. It stays
 /// the same across such a repack.
 pub fn event_fingerprint_without_hashed_tag_values(env: &Env) -> Result<EventFingerprint, DbError> {
-    fingerprint(env, true)
+    fingerprint(env, true, &BTreeSet::new())
 }
 
-fn fingerprint(env: &Env, without_hashed_tag_values: bool) -> Result<EventFingerprint, DbError> {
+/// [`event_fingerprint`], or with `without_hashed_tag_values`
+/// [`event_fingerprint_without_hashed_tag_values`], of the records other than
+/// the local IDs in `excluded`: what a database holding only the others hashes
+/// to. Every excluded record must be stored.
+pub fn event_fingerprint_excluding(
+    env: &Env,
+    excluded: &BTreeSet<u64>,
+    without_hashed_tag_values: bool,
+) -> Result<EventFingerprint, DbError> {
+    fingerprint(env, without_hashed_tag_values, excluded)
+}
+
+fn fingerprint(
+    env: &Env,
+    without_hashed_tag_values: bool,
+    excluded: &BTreeSet<u64>,
+) -> Result<EventFingerprint, DbError> {
     let txn = env.begin_ro()?;
     let mut hasher = Sha256::new();
     let mut count = 0u64;
+    let mut skipped = 0usize;
     let mut error = None;
     foreach_event_from(&txn, 0, |lev_id, packed| {
+        if excluded.contains(&lev_id) {
+            skipped += 1;
+            return true;
+        }
         match txn.get_u64(env.dbis().event_payload, lev_id) {
             Ok(Some(payload)) => {
                 let packed = if without_hashed_tag_values {
@@ -102,6 +124,13 @@ fn fingerprint(env: &Env, without_hashed_tag_values: bool) -> Result<EventFinger
     })?;
     if let Some(error) = error {
         return Err(error);
+    }
+    if skipped != excluded.len() {
+        return Err(DbError::msg(format!(
+            "{} of the {} records excluded from the fingerprint are not stored",
+            excluded.len() - skipped,
+            excluded.len()
+        )));
     }
     Ok(EventFingerprint {
         count,

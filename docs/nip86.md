@@ -38,7 +38,9 @@ event to retry.
 `unsupported method` error. The pinned NIP-86 also defines `unbanevent`,
 `unallowevent`, `listallowedevents`, `listdisallowedkinds` and the NIP-43
 invite methods `listclaims`, `createclaim` and `deleteclaim`, which Wok does
-not implement.
+not implement. It also says `banpubkey` should remove the pubkey from the
+allow list and `allowpubkey` should remove it from the ban list. Wok keeps the
+two pubkey lists independent: each method writes only its own record.
 
 | Group | Methods |
 | --- | --- |

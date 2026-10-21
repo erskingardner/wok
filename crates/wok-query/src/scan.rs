@@ -80,7 +80,7 @@ fn plans_pubkey_kind(f: &NostrFilter) -> bool {
 
 fn cmp_cand(a: &CandidateEvent, b: &CandidateEvent) -> std::cmp::Ordering {
     // Newer first. Equal created_at is ordered by id later, when the run
-    // reaches the front (`DbScan::gather_front_run`); levId keeps this total.
+    // reaches the front (`TieRun`); levId keeps this total.
     b.created()
         .cmp(&a.created())
         .then_with(|| b.lev_id().cmp(&a.lev_id()))
@@ -214,15 +214,35 @@ impl ScanCursor {
     }
 }
 
-/// The newest `created_at` run while the cursors that can still yield it are
-/// drained.
-struct PendingRun {
+/// Most candidates of one `created_at` a scan holds at once to put the lowest
+/// ids first: about 160 KiB, well within a NEG-OPEN round's reservation.
+const MAX_TIE_SELECTION: usize = 4096;
+/// Index entries a tie pass reads per step, so a long run still pauses.
+const TIE_CHUNK: usize = 256;
+
+/// Events with the newest `created_at`, sent lowest id first as NIP-01
+/// orders ties, which also decides what a `limit` keeps. No index orders by
+/// id, and the run can be any length, so it is not held whole: each pass
+/// reads the run's index entries again, a chunk per step, and keeps the
+/// lowest ids above those already sent. Another pass runs only if one
+/// dropped a candidate.
+struct TieRun {
     created: u64,
-    members: Vec<CandidateEvent>,
-    /// Cursors that may still yield `created`.
+    /// Cursors with entries at `created`: those with queued candidates in the
+    /// run. Any other cursor's unread entries are older than its queued ones.
     cursors: Vec<usize>,
-    /// Older candidates those cursors yielded, queued once the run is complete.
-    older: Vec<CandidateEvent>,
+    /// Ids up to this one were sent by earlier passes.
+    sent_through: Option<[u8; 32]>,
+    pass: Option<TiePass>,
+    more: bool,
+}
+
+struct TiePass {
+    /// The cursor being read and the next duplicate (levId) in its key.
+    cursor: usize,
+    next_lev: u64,
+    best: BinaryHeap<([u8; 32], u64)>,
+    dropped: bool,
 }
 
 pub struct DbScan {
@@ -231,9 +251,10 @@ pub struct DbScan {
     pub desc: &'static str,
     cursors: Vec<ScanCursor>,
     event_queue: VecDeque<CandidateEvent>,
-    /// The newest candidates, all with one `created_at`, in id order.
+    /// Candidates to send next, all with one `created_at`, in id order.
     front_run: VecDeque<CandidateEvent>,
-    pending_run: Option<PendingRun>,
+    tie_run: Option<TieRun>,
+    tie_capacity: usize,
     initial_scan_depth: u64,
     refill_scan_depth: u64,
     next_init_index: usize,
@@ -754,7 +775,10 @@ impl DbScan {
             cursors,
             event_queue: VecDeque::new(),
             front_run: VecDeque::new(),
-            pending_run: None,
+            tie_run: None,
+            tie_capacity: usize::try_from(f.limit)
+                .unwrap_or(usize::MAX)
+                .clamp(1, MAX_TIE_SELECTION),
             initial_scan_depth: initial,
             refill_scan_depth: 10 * initial,
             next_init_index: 0,
@@ -799,10 +823,18 @@ impl DbScan {
                 }
                 continue;
             } else if self.front_run.is_empty() {
-                if self.pending_run.is_none() && self.event_queue.is_empty() {
+                if let Some(mut run) = self.tie_run.take() {
+                    if run.pass.is_none() && !run.more {
+                        self.finish_tie_run(txn, &run)?;
+                    } else {
+                        self.advance_tie_pass(txn, filter, &mut run)?;
+                        self.tie_run = Some(run);
+                    }
+                } else if self.event_queue.is_empty() {
                     return Ok(true);
+                } else {
+                    self.take_front(txn)?;
                 }
-                self.gather_front_run(txn)?;
                 continue;
             }
 
@@ -826,11 +858,6 @@ impl DbScan {
             if do_send && handle_event(lev_id) {
                 return Ok(true);
             }
-            let si = ev.scan_index() as usize;
-            self.cursors[si].outstanding -= 1;
-            if self.cursors[si].outstanding == 0 {
-                self.refill(txn, si)?;
-            }
         }
     }
 
@@ -851,96 +878,163 @@ impl DbScan {
         Ok(())
     }
 
-    /// Gather the newest `created_at` run into `front_run`, lowest id first,
-    /// as NIP-01 orders ties; that also decides which events a `limit` keeps.
-    /// No index orders by id, so every cursor that can still yield that
-    /// `created_at` is drained first, one chunk per call so a long run can
-    /// pause. Only a cursor whose queued candidates are all in the run can
-    /// (each active cursor has one queued, and the run is the newest).
-    fn gather_front_run(&mut self, txn: &RoTxn<'_>) -> Result<(), wok_db::DbError> {
-        let mut run = match self.pending_run.take() {
-            Some(run) => run,
-            None => {
-                let created = self.event_queue[0].created();
-                let len = self
-                    .event_queue
-                    .iter()
-                    .take_while(|c| c.created() == created)
-                    .count();
-                // Most runs are one event whose cursor has moved past it.
-                let first = self.event_queue[0].scan_index() as usize;
-                if len == 1 && !self.cursors[first].may_hold(created) {
-                    self.front_run.extend(self.event_queue.pop_front());
-                    return Ok(());
-                }
-                let members: Vec<_> = self.event_queue.drain(..len).collect();
-                let mut cursors: Vec<_> = members
-                    .iter()
-                    .map(|c| c.scan_index() as usize)
-                    .filter(|&si| self.cursors[si].may_hold(created))
-                    .collect();
-                cursors.sort_unstable();
-                cursors.dedup();
-                PendingRun {
-                    created,
-                    members,
-                    cursors,
-                    older: Vec::new(),
-                }
-            }
-        };
-        if let Some(&si) = run.cursors.last() {
-            let mut more = VecDeque::new();
-            self.approx_work += self.cursors[si].collect(
-                txn,
+    /// Count a candidate out of the queue, keeping one queued for each
+    /// active cursor so the queue front stays the newest unsent entry.
+    fn consumed(&mut self, txn: &RoTxn<'_>, si: usize) -> Result<(), wok_db::DbError> {
+        self.cursors[si].outstanding -= 1;
+        if self.cursors[si].outstanding == 0 && self.cursors[si].active() {
+            self.refill(txn, si)?;
+        }
+        Ok(())
+    }
+
+    /// Move the newest candidate to `front_run`, or start a [`TieRun`] when
+    /// others may share its `created_at`.
+    fn take_front(&mut self, txn: &RoTxn<'_>) -> Result<(), wok_db::DbError> {
+        let created = self.event_queue[0].created();
+        let len = self
+            .event_queue
+            .iter()
+            .take_while(|c| c.created() == created)
+            .count();
+        let first = self.event_queue[0].scan_index() as usize;
+        // Most runs are one event whose cursor has moved past it.
+        if len == 1 && !self.cursors[first].may_hold(created) {
+            self.front_run.extend(self.event_queue.pop_front());
+            return self.consumed(txn, first);
+        }
+        let mut cursors = Vec::with_capacity(len);
+        for candidate in self.event_queue.drain(..len) {
+            let si = candidate.scan_index() as usize;
+            self.cursors[si].outstanding -= 1;
+            cursors.push(si);
+        }
+        cursors.sort_unstable();
+        cursors.dedup();
+        self.tie_run = Some(TieRun {
+            created,
+            cursors,
+            sent_through: None,
+            pass: None,
+            more: true,
+        });
+        Ok(())
+    }
+
+    /// Read up to [`TIE_CHUNK`] of the run's index entries, starting a pass
+    /// if none is under way. A finished pass fills `front_run`.
+    fn advance_tie_pass(
+        &mut self,
+        txn: &RoTxn<'_>,
+        filter: &NostrFilter,
+        run: &mut TieRun,
+    ) -> Result<(), wok_db::DbError> {
+        let pass = run.pass.get_or_insert_with(|| TiePass {
+            cursor: 0,
+            next_lev: u64::MAX,
+            best: BinaryHeap::new(),
+            dropped: false,
+        });
+        let event_dbi = txn.env().dbis().event;
+        let mut levs = Vec::with_capacity(TIE_CHUNK);
+        while levs.len() < TIE_CHUNK && pass.cursor < run.cursors.len() {
+            // Every index key is the cursor's prefix and then `created_at`.
+            let key =
+                make_key_string_u64(&self.cursors[run.cursors[pass.cursor]].search, run.created);
+            let mut resume = None;
+            let mut error = None;
+            txn.foreach_full(
                 self.index_dbi,
-                si as u64,
-                self.since,
-                self.until,
-                self.refill_scan_depth,
-                &mut more,
+                &key,
+                &pass.next_lev.to_ne_bytes(),
+                true,
+                |k, v| {
+                    if k != key.as_slice() {
+                        return false;
+                    }
+                    match u64_from_ne_checked(v) {
+                        Ok(lev) if levs.len() == TIE_CHUNK => {
+                            resume = Some(lev);
+                            false
+                        }
+                        Ok(lev) => {
+                            levs.push(lev);
+                            true
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                            false
+                        }
+                    }
+                },
             )?;
-            let same = more
-                .iter()
-                .take_while(|c| c.created() == run.created)
-                .count();
-            run.members.extend(more.drain(..same));
-            run.older.extend(more);
-            if !self.cursors[si].may_hold(run.created) {
-                run.cursors.pop();
+            if let Some(e) = error {
+                return Err(e);
             }
-            if !run.cursors.is_empty() {
-                self.pending_run = Some(run);
-                return Ok(());
-            }
-        }
-        if !run.older.is_empty() {
-            let mut merged: Vec<_> = self.event_queue.drain(..).chain(run.older).collect();
-            merged.sort_by(cmp_cand);
-            self.event_queue = merged.into();
-        }
-        let mut members = run.members;
-        if members.len() > 1 {
-            let event_dbi = txn.env().dbis().event;
-            let mut keyed = Vec::with_capacity(members.len());
-            for candidate in members {
-                self.approx_work += 10;
-                // A missing record sorts last; the scan drops it anyway.
-                let mut id = [0xFF; 32];
-                if let Some(view) = txn
-                    .get_u64(event_dbi, candidate.lev_id())?
-                    .and_then(|raw| PackedEventView::new(raw).ok())
-                {
-                    id.copy_from_slice(view.id());
+            match resume {
+                Some(lev) => pass.next_lev = lev,
+                None => {
+                    pass.cursor += 1;
+                    pass.next_lev = u64::MAX;
                 }
-                keyed.push((id, candidate));
             }
-            keyed.sort_by(|(a_id, a), (b_id, b)| {
-                a_id.cmp(b_id).then_with(|| a.lev_id().cmp(&b.lev_id()))
-            });
-            members = keyed.into_iter().map(|(_, candidate)| candidate).collect();
         }
-        self.front_run = members.into();
+        for lev in levs {
+            self.approx_work += 10;
+            let Some(view) = txn
+                .get_u64(event_dbi, lev)?
+                .and_then(|raw| PackedEventView::new(raw).ok())
+            else {
+                continue;
+            };
+            if !self.index_only && !filter.does_match(view) {
+                continue;
+            }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(view.id());
+            if run.sent_through.is_some_and(|sent| id <= sent) {
+                continue;
+            }
+            pass.best.push((id, lev));
+            if pass.best.len() > self.tie_capacity {
+                pass.best.pop();
+                pass.dropped = true;
+            }
+        }
+        if pass.cursor < run.cursors.len() {
+            return Ok(());
+        }
+        let pass = run.pass.take().expect("pass under way");
+        run.more = pass.dropped;
+        let mut members = pass.best.into_sorted_vec();
+        // A tag filter's alternatives can index one event twice.
+        members.dedup();
+        if let Some((id, _)) = members.last() {
+            run.sent_through = Some(*id);
+        }
+        self.front_run = members
+            .into_iter()
+            .map(|(_, lev)| CandidateEvent::new(lev, run.created, 0))
+            .collect();
+        Ok(())
+    }
+
+    /// Move the run's cursors past its `created_at` and refill those left
+    /// with nothing queued.
+    fn finish_tie_run(&mut self, txn: &RoTxn<'_>, run: &TieRun) -> Result<(), wok_db::DbError> {
+        for &si in &run.cursors {
+            let cursor = &mut self.cursors[si];
+            if cursor.may_hold(run.created) {
+                // A reverse scan from the key's lowest duplicate goes on below it.
+                cursor.resume_key = make_key_string_u64(&cursor.search, run.created);
+                cursor.resume_val = 0;
+            }
+        }
+        for &si in &run.cursors {
+            if self.cursors[si].outstanding == 0 && self.cursors[si].active() {
+                self.refill(txn, si)?;
+            }
+        }
         Ok(())
     }
 }
@@ -1266,4 +1360,127 @@ where
     q.process(txn, |_, lev| cb(lev), u64::MAX)
         .map_err(|e| crate::subid::QueryError::msg(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secp256k1::{Keypair, SECP256K1};
+    use serde_json::json;
+    use wok_db::{write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
+
+    /// `count` kind 1 events from one author, all at one `created_at`, plus
+    /// one older event. Returns their ids, lowest first.
+    fn same_second_run(env: &Env, count: usize) -> Vec<[u8; 32]> {
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let pubkey = hex::encode(key.x_only_public_key().0.serialize());
+        let mut events = Vec::new();
+        for i in 0..=count {
+            let created_at = if i == count {
+                1_699_999_999
+            } else {
+                1_700_000_000
+            };
+            let mut ev = json!({
+                "created_at": created_at,
+                "kind": 1,
+                "tags": [],
+                "content": format!("tie {i}"),
+                "pubkey": pubkey,
+            });
+            let id = wok_event::event_id_hash(&ev).unwrap();
+            ev["id"] = json!(hex::encode(id));
+            let sig = SECP256K1.sign_schnorr_no_aux_rand(&id, &key);
+            ev["sig"] = json!(hex::encode(sig.as_ref()));
+            let packed =
+                wok_event::nostr_json_to_packed_event(&ev, &wok_event::EventLimits::default())
+                    .unwrap();
+            events.push(EventToWrite::new(packed.into_bytes(), ev.to_string()));
+        }
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        let mut ids: Vec<[u8; 32]> = events
+            .iter()
+            .filter_map(|event| txn.get_u64(txn.env().dbis().event, event.lev_id).ok()?)
+            .filter_map(|raw| PackedEventView::new(raw).ok())
+            .filter(|view| view.created_at() == 1_700_000_000)
+            .map(|view| view.id().try_into().unwrap())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Scan one step per call. Returns the ids sent, the most candidates held
+    /// after any step, and the most work done by one step.
+    fn scan_in_steps(
+        env: &Env,
+        filter: serde_json::Value,
+        want: usize,
+    ) -> (Vec<[u8; 32]>, usize, u64) {
+        let txn = env.begin_ro().unwrap();
+        let f = crate::NostrFilterGroup::from_value(&filter, u64::MAX, 3, 16)
+            .unwrap()
+            .filters
+            .remove(0);
+        let mut scan = DbScan::new(&f, &txn);
+        let mut sent = Vec::new();
+        let (mut held, mut step_work) = (0, 0);
+        loop {
+            let before = scan.approx_work;
+            let mut step = false;
+            let done = scan
+                .scan(
+                    &txn,
+                    &f,
+                    |lev| {
+                        let raw = txn.get_u64(txn.env().dbis().event, lev).unwrap().unwrap();
+                        sent.push(PackedEventView::new(raw).unwrap().id().try_into().unwrap());
+                        sent.len() == want
+                    },
+                    |_| {
+                        step = !step;
+                        !step
+                    },
+                )
+                .unwrap();
+            step_work = step_work.max(scan.approx_work - before);
+            let tie = scan.tie_run.as_ref().and_then(|run| run.pass.as_ref());
+            held = held.max(
+                scan.event_queue.len()
+                    + scan.front_run.len()
+                    + tie.map_or(0, |pass| pass.best.len()),
+            );
+            if done {
+                return (sent, held, step_work);
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_same_second_run_is_selected_in_bounded_resumable_steps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let run = 4500;
+        let ids = same_second_run(&env, run);
+        assert_eq!(ids.len(), run);
+        let chunk_work = 10 * TIE_CHUNK as u64 + 1000;
+
+        // A tiny limit holds only what it can send.
+        let (sent, held, work) = scan_in_steps(&env, json!({"kinds": [1], "limit": 1}), 1);
+        assert_eq!(sent, ids[..1]);
+        assert!(held <= 50, "held {held}");
+        assert!(work <= chunk_work, "one step did {work}");
+
+        // NEG-OPEN and COUNT limits are their caps: the run is sent whole, in
+        // id order, a bounded selection at a time.
+        let (sent, held, work) =
+            scan_in_steps(&env, json!({"kinds": [1], "limit": 1_000_001}), run + 1);
+        assert_eq!(sent[..run], ids[..]);
+        assert_eq!(sent.len(), run + 1);
+        assert!(held <= MAX_TIE_SELECTION + 50, "held {held}");
+        assert!(work <= chunk_work, "one step did {work}");
+    }
 }

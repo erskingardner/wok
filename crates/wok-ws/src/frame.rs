@@ -71,92 +71,209 @@ pub enum WsEvent {
     Close(Vec<u8>),
 }
 
-/// RFC 7692 inflater for one connection. Context is kept across messages
-/// when `sliding` (strfry's `compression.slidingWindow`, default true).
+/// The farthest back a client's compressor may refer: RFC 7692 windows are
+/// at most 2^15 bytes, and the server never asks for less.
+const WINDOW: usize = 1 << 15;
+
+/// RFC 7692 inflater for one connection. With `takeover` the client may refer
+/// back into earlier messages, so their history is kept between messages.
+///
+/// The decompressor (about 40 KiB) is created by the first compressed message
+/// rather than at upgrade, and [`InflateCtx::release_idle`] drops it again
+/// once the client has gone quiet. A client using context takeover may still
+/// refer back up to 32 KiB into what it sent before, so while takeover is on
+/// the most recent output is copied aside and replayed into the next
+/// decompressor, as one stored block, before the client's next message.
 pub struct InflateCtx {
-    sliding: bool,
-    inner: flate2::Decompress,
+    takeover: bool,
+    inner: Option<flate2::Decompress>,
+    /// The last `WINDOW` bytes of output when `takeover`, oldest first from
+    /// `head` once full.
+    history: Vec<u8>,
+    head: usize,
+    used: bool,
 }
 
 impl InflateCtx {
-    pub fn new(sliding: bool) -> Self {
+    pub fn new(takeover: bool) -> Self {
         Self {
-            sliding,
-            inner: flate2::Decompress::new(false),
+            takeover,
+            inner: None,
+            history: Vec::new(),
+            head: 0,
+            used: false,
         }
     }
 
     /// Inflate one message payload after re-appending the sync-flush marker.
     pub fn decompress(&mut self, payload: &[u8], max_out: usize) -> Result<Vec<u8>, WsError> {
-        if !self.sliding {
-            self.inner.reset(false);
-        }
+        self.used = true;
+        let inner = match &mut self.inner {
+            Some(inner) => {
+                if !self.takeover {
+                    inner.reset(false);
+                }
+                inner
+            }
+            None => {
+                let mut inner = flate2::Decompress::new(false);
+                if !self.history.is_empty() {
+                    let len = self.history.len() as u16;
+                    let mut block = Vec::with_capacity(self.history.len() + 5);
+                    // BFINAL 0, BTYPE 00 (stored), padded to a byte; LEN, NLEN.
+                    block.push(0);
+                    block.extend_from_slice(&len.to_le_bytes());
+                    block.extend_from_slice(&(!len).to_le_bytes());
+                    block.extend_from_slice(&self.history[self.head..]);
+                    block.extend_from_slice(&self.history[..self.head]);
+                    let mut replayed = Vec::with_capacity(self.history.len() + 64);
+                    inflate_into(&mut inner, &block, &mut replayed, WINDOW)?;
+                    if replayed.len() != self.history.len() {
+                        return Err(WsError::Inflate("history replay".into()));
+                    }
+                }
+                self.inner.insert(inner)
+            }
+        };
         let mut input = Vec::with_capacity(payload.len() + 4);
         input.extend_from_slice(payload);
         input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
         let mut out = Vec::with_capacity(payload.len().saturating_mul(3).clamp(64, 1 << 20));
-        let start_in = self.inner.total_in();
-        loop {
-            // Keep spare output capacity so "no progress" reliably means done.
-            if out.capacity() - out.len() < 64 {
-                out.reserve(32 * 1024);
-            }
-            let consumed = (self.inner.total_in() - start_in) as usize;
-            let in_before = self.inner.total_in();
-            let out_before = self.inner.total_out();
-            self.inner
-                .decompress_vec(&input[consumed..], &mut out, flate2::FlushDecompress::Sync)
-                .map_err(|e| WsError::Inflate(e.to_string()))?;
-            if out.len() > max_out {
-                return Err(WsError::MessageTooLarge);
-            }
-            let progressed =
-                self.inner.total_in() != in_before || self.inner.total_out() != out_before;
-            if !progressed {
-                break;
-            }
+        inflate_into(inner, &input, &mut out, max_out)?;
+        if self.takeover {
+            self.remember(&out);
         }
         Ok(out)
     }
+
+    /// Append to the history ring, which grows to at most `WINDOW` bytes.
+    fn remember(&mut self, mut data: &[u8]) {
+        if data.len() >= WINDOW {
+            data = &data[data.len() - WINDOW..];
+            self.history.clear();
+            self.head = 0;
+        }
+        let fill = (WINDOW - self.history.len()).min(data.len());
+        if fill > 0 {
+            if self.history.len() + fill > self.history.capacity() {
+                let want = (self.history.len() + fill)
+                    .max(self.history.capacity() * 2)
+                    .min(WINDOW);
+                self.history.reserve_exact(want - self.history.len());
+            }
+            self.history.extend_from_slice(&data[..fill]);
+            data = &data[fill..];
+        }
+        while !data.is_empty() {
+            let n = (WINDOW - self.head).min(data.len());
+            self.history[self.head..self.head + n].copy_from_slice(&data[..n]);
+            self.head = (self.head + n) % WINDOW;
+            data = &data[n..];
+        }
+    }
+
+    /// Drop the decompressor if no message used it since the previous call,
+    /// keeping only the history a client using takeover may refer back to.
+    pub fn release_idle(&mut self) {
+        if !std::mem::take(&mut self.used) && self.inner.take().is_some() {
+            self.history.rotate_left(self.head);
+            self.head = 0;
+            self.history.shrink_to_fit();
+        }
+    }
+
+    /// Whether the decompressor is currently allocated.
+    pub fn is_allocated(&self) -> bool {
+        self.inner.is_some()
+    }
 }
 
-/// RFC 7692 deflater for one connection.
+/// Inflate all of `input` into `out`, failing once it passes `max_out`.
+fn inflate_into(
+    inner: &mut flate2::Decompress,
+    input: &[u8],
+    out: &mut Vec<u8>,
+    max_out: usize,
+) -> Result<(), WsError> {
+    let start_in = inner.total_in();
+    loop {
+        // Keep spare output capacity so "no progress" reliably means done.
+        if out.capacity() - out.len() < 64 {
+            out.reserve(32 * 1024);
+        }
+        let consumed = (inner.total_in() - start_in) as usize;
+        let in_before = inner.total_in();
+        let out_before = inner.total_out();
+        inner
+            .decompress_vec(&input[consumed..], out, flate2::FlushDecompress::Sync)
+            .map_err(|e| WsError::Inflate(e.to_string()))?;
+        if out.len() > max_out {
+            return Err(WsError::MessageTooLarge);
+        }
+        let progressed = inner.total_in() != in_before || inner.total_out() != out_before;
+        if !progressed {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// RFC 7692 deflater for one connection. With `takeover` (strfry's
+/// `compression.slidingWindow`, default true) each message is compressed
+/// against the history of the previous ones.
+///
+/// The compressor (about 300 KiB with miniz_oxide) is created by the first
+/// message rather than at upgrade, and [`DeflateCtx::release_idle`] drops it
+/// again once the connection has gone quiet. Dropping it is always safe:
+/// takeover lets the server refer back into earlier messages but never
+/// obliges it to, and the client keeps its own window either way, so the
+/// next message simply starts from an empty history.
 pub struct DeflateCtx {
-    sliding: bool,
-    inner: flate2::Compress,
+    takeover: bool,
+    inner: Option<flate2::Compress>,
+    used: bool,
 }
 
 impl DeflateCtx {
-    pub fn new(sliding: bool) -> Self {
+    pub fn new(takeover: bool) -> Self {
         Self {
-            sliding,
-            inner: flate2::Compress::new(flate2::Compression::default(), false),
+            takeover,
+            inner: None,
+            used: false,
         }
     }
 
     /// Compress with Z_SYNC_FLUSH and strip the trailing `00 00 ff ff`.
     pub fn compress(&mut self, msg: &[u8]) -> Result<Vec<u8>, WsError> {
-        if !self.sliding {
-            self.inner.reset();
-        }
+        self.used = true;
+        let inner = match &mut self.inner {
+            Some(inner) => {
+                if !self.takeover {
+                    inner.reset();
+                }
+                inner
+            }
+            None => self
+                .inner
+                .insert(flate2::Compress::new(flate2::Compression::default(), false)),
+        };
         let mut out = Vec::with_capacity(msg.len() / 2 + 64);
-        let start_in = self.inner.total_in();
+        let start_in = inner.total_in();
         loop {
             if out.capacity() - out.len() < 64 {
                 out.reserve(32 * 1024);
             }
-            let consumed = (self.inner.total_in() - start_in) as usize;
-            let in_before = self.inner.total_in();
-            let out_before = self.inner.total_out();
-            self.inner
+            let consumed = (inner.total_in() - start_in) as usize;
+            let in_before = inner.total_in();
+            let out_before = inner.total_out();
+            inner
                 .compress_vec(&msg[consumed..], &mut out, flate2::FlushCompress::Sync)
                 .map_err(|e| WsError::Deflate(e.to_string()))?;
-            let all_consumed = (self.inner.total_in() - start_in) as usize == msg.len();
+            let all_consumed = (inner.total_in() - start_in) as usize == msg.len();
             if all_consumed && out.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
                 break;
             }
-            let progressed =
-                self.inner.total_in() != in_before || self.inner.total_out() != out_before;
+            let progressed = inner.total_in() != in_before || inner.total_out() != out_before;
             if !progressed && all_consumed {
                 break;
             }
@@ -166,6 +283,18 @@ impl DeflateCtx {
         }
         out.truncate(out.len() - 4);
         Ok(out)
+    }
+
+    /// Drop the compressor if no message used it since the previous call.
+    pub fn release_idle(&mut self) {
+        if !std::mem::take(&mut self.used) {
+            self.inner = None;
+        }
+    }
+
+    /// Whether the compressor is currently allocated.
+    pub fn is_allocated(&self) -> bool {
+        self.inner.is_some()
     }
 }
 
@@ -203,6 +332,13 @@ impl WsParser {
             frag: Vec::new(),
             inflater,
             role,
+        }
+    }
+
+    /// Drop an idle inflater (see [`InflateCtx::release_idle`]).
+    pub fn release_idle(&mut self) {
+        if let Some(inflater) = &mut self.inflater {
+            inflater.release_idle();
         }
     }
 
@@ -473,6 +609,13 @@ impl WsEncoder {
         Ok(out)
     }
 
+    /// Drop an idle compressor (see [`DeflateCtx::release_idle`]).
+    pub fn release_idle(&mut self) {
+        if let Some(deflater) = &mut self.deflater {
+            deflater.release_idle();
+        }
+    }
+
     pub fn encode_control(&self, opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(payload.len() + 14);
         self.encode_frame(true, false, opcode, payload, &mut out);
@@ -652,6 +795,124 @@ mod tests {
         let c2 = d.compress(b"hello hello hello hello deflate me").unwrap();
         let back2 = d2.decompress(&c2, 1 << 20).unwrap();
         assert_eq!(back2, b"hello hello hello hello deflate me");
+    }
+
+    /// Deterministic incompressible bytes, so only back-references to
+    /// earlier messages can shrink them.
+    fn noise(seed: u32, len: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deflater_is_created_on_use_and_released_when_idle() {
+        let msg = b"[\"EOSE\",\"a-subscription-id\"]";
+        let mut server = DeflateCtx::new(true);
+        let mut client = InflateCtx::new(true);
+        assert!(!server.is_allocated());
+        let fresh = server.compress(msg).unwrap();
+        assert!(server.is_allocated());
+        let with_history = server.compress(msg).unwrap();
+        assert!(with_history.len() < fresh.len(), "second copy refers back");
+        assert_eq!(client.decompress(&fresh, 1 << 20).unwrap(), msg);
+        assert_eq!(client.decompress(&with_history, 1 << 20).unwrap(), msg);
+
+        server.release_idle(); // used since the last check: kept
+        assert!(server.is_allocated());
+        server.release_idle();
+        assert!(!server.is_allocated());
+        // A fresh compressor's output is valid in the client's ongoing
+        // stream: takeover permits references back, it never requires them.
+        let after = server.compress(msg).unwrap();
+        assert_eq!(after, fresh);
+        assert_eq!(client.decompress(&after, 1 << 20).unwrap(), msg);
+    }
+
+    #[test]
+    fn inflater_replays_client_history_after_release() {
+        let msg = br#"["REQ","feed",{"kinds":[1,6,7],"limit":100}]"#;
+        let mut client = DeflateCtx::new(true);
+        let mut server = InflateCtx::new(true);
+        assert!(!server.is_allocated());
+        let first = client.compress(msg).unwrap();
+        assert_eq!(server.decompress(&first, 1 << 20).unwrap(), msg);
+        assert!(server.is_allocated());
+        server.release_idle();
+        server.release_idle();
+        assert!(!server.is_allocated());
+        assert_eq!(server.history, msg);
+
+        // The client still holds its context: the repeat is a back-reference
+        // into the previous message, which only the replayed history resolves.
+        let repeat = client.compress(msg).unwrap();
+        assert!(repeat.len() < 12, "expected a back-reference: {repeat:?}");
+        assert_eq!(server.decompress(&repeat, 1 << 20).unwrap(), msg);
+    }
+
+    #[test]
+    fn inflater_history_wraps_at_the_window() {
+        let msgs: Vec<Vec<u8>> = (1..=5).map(|seed| noise(seed, 12_000)).collect();
+        let mut client = DeflateCtx::new(true);
+        let mut server = InflateCtx::new(true);
+        for msg in &msgs {
+            let wire = client.compress(msg).unwrap();
+            assert_eq!(&server.decompress(&wire, 1 << 20).unwrap(), msg);
+        }
+        assert_eq!(server.history.len(), WINDOW);
+        server.release_idle();
+        server.release_idle();
+        // msgs[3] now starts 24,000 bytes back, across the ring's wrap point.
+        for msg in [&msgs[3], &msgs[4]] {
+            let wire = client.compress(msg).unwrap();
+            assert!(wire.len() < 1_000, "expected back-references");
+            assert_eq!(&server.decompress(&wire, 1 << 20).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn inflater_history_is_the_latest_window() {
+        let mut server = InflateCtx::new(true);
+        let mut all = Vec::new();
+        for (i, len) in [1, 100, 5_000, 40_000, 3, 32_767, 2, 32_768, 7_001]
+            .into_iter()
+            .enumerate()
+        {
+            let chunk = noise(i as u32 + 1, len);
+            server.remember(&chunk);
+            all.extend_from_slice(&chunk);
+            let tail = &all[all.len().saturating_sub(WINDOW)..];
+            let ring = [
+                &server.history[server.head..],
+                &server.history[..server.head],
+            ]
+            .concat();
+            assert_eq!(ring, tail, "after chunk {i}");
+            assert!(server.history.capacity() <= WINDOW);
+        }
+    }
+
+    #[test]
+    fn inflater_without_takeover_keeps_no_history() {
+        let msg = br#"["CLOSE","feed"]"#;
+        let mut client = DeflateCtx::new(false);
+        let mut server = InflateCtx::new(false);
+        for _ in 0..3 {
+            let wire = client.compress(msg).unwrap();
+            assert_eq!(server.decompress(&wire, 1 << 20).unwrap(), msg);
+        }
+        assert!(server.history.is_empty());
+        server.release_idle();
+        server.release_idle();
+        assert!(!server.is_allocated());
+        let wire = client.compress(msg).unwrap();
+        assert_eq!(server.decompress(&wire, 1 << 20).unwrap(), msg);
     }
 
     #[test]

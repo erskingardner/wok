@@ -1,4 +1,4 @@
-//! permessage-deflate as negotiated for a whole connection.
+//! Per-connection transport costs: idle release of permessage-deflate state.
 
 #![allow(clippy::field_reassign_with_default)]
 use super::*;
@@ -84,6 +84,50 @@ impl Client {
     }
 }
 
+/// A quiet connection drops its compressor and inflater, and both directions
+/// keep context takeover across the gap: the client, which kept its own
+/// window, decodes the fresh compressor's output, and the relay decodes the
+/// client's back-references into messages sent before it went quiet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_deflate_state_is_released_without_breaking_takeover() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = relay(dir.path());
+    let (io, stream) = tokio::io::duplex(1 << 16);
+    let check = Duration::from_millis(100);
+    let task = tokio::spawn(handle_ws(
+        stream,
+        handle.clone(),
+        "127.0.0.1:9000".parse().unwrap(),
+        1 << 20,
+        Some(Deflate {
+            server_takeover: true,
+            client_takeover: true,
+        }),
+        check,
+    ));
+    let mut client = Client::new(io, true);
+
+    let fresh = client.fetch("q").await;
+    let with_history = client.fetch("q").await;
+    assert!(
+        with_history < fresh,
+        "the repeat EOSE should refer back: {with_history} vs {fresh}"
+    );
+    // Two whole checks without traffic release everything.
+    tokio::time::sleep(check * 3).await;
+    // The REQ is a back-reference into the client's earlier REQs; the EOSE
+    // comes from a fresh compressor.
+    assert_eq!(client.fetch("q").await, fresh);
+    assert_eq!(client.fetch("q").await, with_history);
+
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    handle.request_shutdown();
+}
+
 /// compression.slidingWindow = false governs only the relay's compressor. A
 /// client that was not asked for client_no_context_takeover may still refer
 /// back into its earlier messages, so the inflater must keep their history.
@@ -101,6 +145,7 @@ async fn inflater_follows_the_client_takeover_not_the_sliding_window() {
             server_takeover: false,
             client_takeover: true,
         }),
+        DEFLATE_IDLE_CHECK,
     ));
     // The relay's compressor resets per message, so the client inflater may
     // keep context or not; the client's compressor keeps it.

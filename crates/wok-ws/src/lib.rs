@@ -26,6 +26,7 @@ use sha1::Digest as _;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use wok_relay::{
     supported_nips, Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource,
@@ -415,6 +416,11 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
 
 const PROTOCOL_NEG: u64 = 1;
 
+/// How often a permessage-deflate connection drops compression state it has
+/// not used since the previous check, so a quiet connection gives it back
+/// after one to two intervals (see `frame::DeflateCtx`).
+const DEFLATE_IDLE_CHECK: Duration = Duration::from_secs(30);
+
 fn nip_description(nip: u64) -> Option<&'static str> {
     match nip {
         1 => Some("Defines the core event format, filters, and client-relay message flow."),
@@ -738,7 +744,7 @@ async fn upgrade_ws(
         match hyper::upgrade::on(&mut req).await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
-                handle_ws(io, handle, peer, max, deflate).await;
+                handle_ws(io, handle, peer, max, deflate, DEFLATE_IDLE_CHECK).await;
             }
             Err(e) => tracing::warn!("ws upgrade failed: {e}"),
         }
@@ -781,6 +787,7 @@ async fn handle_ws<S>(
     peer: SocketAddr,
     max_message: usize,
     deflate: Option<Deflate>,
+    deflate_idle_check: Duration,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -805,6 +812,11 @@ async fn handle_ws<S>(
         deflate.map(|d| InflateCtx::new(d.client_takeover)),
     );
     let mut encoder = WsEncoder::new(deflate.map(|d| DeflateCtx::new(d.server_takeover)));
+    let mut deflate_idle = tokio::time::interval(deflate_idle_check);
+    deflate_idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    if deflate.is_some() {
+        deflate_idle.tick().await; // first tick is immediate; skip it
+    }
     let mut incoming_events = Vec::with_capacity(4);
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(auto_ping.max(1)));
     // Delay (not the Burst default): after the select is stalled elsewhere
@@ -846,6 +858,10 @@ async fn handle_ws<S>(
                     // write can't eat the peer's pong window.
                     ping.reset();
                     awaiting_pong = true;
+                }
+                _ = deflate_idle.tick(), if deflate.is_some() => {
+                    encoder.release_idle();
+                    parser.release_idle();
                 }
                 _ = connection.ingress_resumed(), if !held.is_empty() => {
                     connection.hand_over(&mut held).await;
@@ -1211,7 +1227,7 @@ mod stalled_write_tests {
         let stream = StalledStream::new(Duration::from_secs(3));
         let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let start = Instant::now();
-        handle_ws(stream, handle, peer, 1 << 20, None).await;
+        handle_ws(stream, handle, peer, 1 << 20, None, DEFLATE_IDLE_CHECK).await;
         let elapsed = start.elapsed();
 
         // Timeline: first ping tick at t=2s, its write stalls until t=5s.

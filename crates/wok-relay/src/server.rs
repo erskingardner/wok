@@ -2887,6 +2887,41 @@ fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::
     }
 }
 
+/// A read transaction for the req worker and monitor. Tests can make the
+/// next few fail for one database (`fault::fail_reads`).
+fn begin_read(env: &Env) -> Result<wok_db::RoTxn<'_>, wok_db::DbError> {
+    #[cfg(test)]
+    if fault::read_fails(env.path()) {
+        return Err(wok_db::DbError::msg("injected read failure"));
+    }
+    env.begin_ro()
+}
+
+/// Read failures injected per database path, so parallel tests stay apart.
+#[cfg(test)]
+mod fault {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static READS: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    /// Fail the next `count` reads from the database at `path`.
+    pub(super) fn fail_reads(path: &Path, count: usize) {
+        let mut reads = READS.lock().unwrap();
+        reads.retain(|(p, _)| p != path);
+        reads.push((path.to_path_buf(), count));
+    }
+
+    pub(super) fn read_fails(path: &Path) -> bool {
+        let mut reads = READS.lock().unwrap();
+        let Some(slot) = reads.iter_mut().find(|(p, n)| p == path && *n != 0) else {
+            return false;
+        };
+        slot.1 -= 1;
+        true
+    }
+}
+
 fn run_req_worker(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -2933,8 +2968,7 @@ fn run_req_worker(
         queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
         // Without a read transaction a REQ or COUNT is refused rather than
         // dropped: a registered REQ would otherwise never get EOSE or CLOSED.
-        let txn = env
-            .begin_ro()
+        let txn = begin_read(&env)
             .inspect_err(|error| tracing::warn!(%error, "req worker cannot read the database"))
             .ok();
         if let Some(msg) = msg {
@@ -3269,7 +3303,7 @@ fn run_req_monitor(
         let r = restrictor(&cfg_snap);
         let global_visibility = read_visibility(&cfg_snap, vec![]);
         let max_event_size = cfg_snap.events.max_event_size;
-        let txn = match env.begin_ro() {
+        let txn = match begin_read(&env) {
             Ok(t) => t,
             Err(error) => {
                 // Subscription changes are sent once, so keep them and retry
@@ -5414,6 +5448,101 @@ mod tests {
         h.store("restricted while held");
         h.cfg.write().relay.auth.restricted_read_kinds = vec![1, 20001];
         assert_eq!(h.history_done(2, 0), [eose_frame()]);
+    }
+
+    /// A monitor that cannot open a read transaction keeps the subscription
+    /// changes and database change it was handed, which nobody resends, and
+    /// applies them once reads work again.
+    #[test]
+    fn monitor_keeps_subscription_changes_through_read_failures() {
+        let mut h = MonitorHarness::start(0);
+        let (snapshot, _) = h.store("before the REQ");
+        h.register(1, json!({"kinds": [1]}), snapshot);
+        let (_, held) = h.store("held");
+        let event_id = |frame: Value| frame[2]["id"].as_str().unwrap().to_string();
+
+        fault::fail_reads(h.env.path(), 3);
+        h.send(MonitorMsg::HistoryDone {
+            conn_id: 1,
+            sub_id: SubId::new("x").unwrap(),
+            generation: 1,
+            snapshot,
+        });
+        let eose = MonitorHarness::next(&mut h.subject);
+        assert_eq!(
+            (eose[0].as_str(), eose[1].as_str()),
+            (Some("EOSE"), Some("x"))
+        );
+        assert_eq!(event_id(MonitorHarness::next(&mut h.subject)), held);
+
+        fault::fail_reads(h.env.path(), 3);
+        let (_, live) = h.write("committed while reads fail");
+        h.send(MonitorMsg::DbChange);
+        assert_eq!(event_id(MonitorHarness::next(&mut h.subject)), live);
+    }
+
+    /// A req worker that cannot open a read transaction refuses the REQ or
+    /// COUNT it was handed instead of dropping it, so the client still gets
+    /// CLOSED (a registered REQ by way of the monitor), and keeps working.
+    #[test]
+    fn req_worker_refuses_what_it_cannot_start_when_reads_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (req_tx, req_rx) = bounded(8);
+        let (mon_tx, mon_rx) = bounded(8);
+        let worker = {
+            let env = env.clone();
+            let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+            let metrics = Arc::new(Metrics::default());
+            thread::spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, vec![mon_tx]))
+        };
+        let sub = |generation, count_only| {
+            let group = NostrFilterGroup::from_value(&json!({"kinds": [1]}), 500, 3, 16).unwrap();
+            let mut sub = Subscription::new(1, SubId::new("x").unwrap(), group, count_only);
+            sub.generation = generation;
+            if !count_only {
+                sub.latest_event_id = 0;
+            }
+            sub
+        };
+        let monitor = || mon_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        fault::fail_reads(env.path(), 1);
+        req_tx.send(ReqMsg::Scan(sub(7, false))).unwrap();
+        match monitor() {
+            MonitorMsg::Closed {
+                generation: 7,
+                reason: Some(reason),
+                ..
+            } => assert!(reason.starts_with("error: "), "{reason}"),
+            _ => panic!("expected the REQ to be closed"),
+        }
+        req_tx.send(ReqMsg::Scan(sub(8, false))).unwrap();
+        assert!(matches!(
+            monitor(),
+            MonitorMsg::HistoryDone { generation: 8, .. }
+        ));
+
+        fault::fail_reads(env.path(), 1);
+        req_tx.send(ReqMsg::Count(sub(9, true))).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let closed = loop {
+            if let Ok(frame) = outbound.try_recv() {
+                break frame.into_text();
+            }
+            assert!(std::time::Instant::now() < deadline, "no CLOSED");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(closed.starts_with(r#"["CLOSED","x","error: "#), "{closed}");
+        drop(req_tx);
+        worker.join().unwrap();
     }
 
     /// A refusal's CLOSED ends only the generation it was for: a later REQ

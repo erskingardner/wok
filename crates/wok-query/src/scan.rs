@@ -1272,14 +1272,24 @@ impl DbQuery {
             return Ok(true);
         }
 
+        // One clock for the whole slice, unlike C++ DBQuery's per filter: a
+        // REQ's filters share its budget rather than each getting one.
+        let start = std::time::Instant::now();
+        let elapsed_us = || u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
         while self.filter_group_index < self.sub.filter_group.filters.len() {
-            // C++ DBQuery resets the timeslice clock per filter.
-            let start = std::time::Instant::now();
             let f = self.sub.filter_group.filters[self.filter_group_index].clone();
             let mut scanner = match self.scanner.take() {
                 Some(scanner) => scanner,
-                None if f.search.is_some() => QueryScanner::Search(SearchScan::new(&f, txn)?),
-                None => QueryScanner::Chronological(DbScan::new(&f, txn)),
+                None => {
+                    // A new scanner counts its work from 0, so the next
+                    // check comes as soon after its start as after a resume.
+                    self.last_work_checked = 0;
+                    if f.search.is_some() {
+                        QueryScanner::Search(SearchScan::new(&f, txn)?)
+                    } else {
+                        QueryScanner::Chronological(DbScan::new(&f, txn))
+                    }
+                }
             };
             let latest = self.sub.latest_event_id;
             let mut sent_full = std::mem::take(&mut self.sent_events_full);
@@ -1333,7 +1343,7 @@ impl DbQuery {
                     scanner.scan(txn, &f, &mut handle, |approx_work| {
                         if approx_work > last_work + 2000 {
                             last_work = approx_work;
-                            start.elapsed().as_micros() as u64 > time_budget_us
+                            elapsed_us() >= time_budget_us
                         } else {
                             false
                         }
@@ -1343,7 +1353,7 @@ impl DbQuery {
                     txn,
                     &f,
                     latest,
-                    time_budget_us,
+                    time_budget_us.saturating_sub(elapsed_us()),
                     &self.visibility,
                     &mut handle,
                 )?,
@@ -1406,6 +1416,13 @@ impl DbQuery {
             self.scanner = None;
             self.filter_group_index += 1;
             self.sent_events_curr.clear();
+            // A filter that finished between work checks may have spent the
+            // slice; the next one starts in the next slice.
+            if self.filter_group_index < self.sub.filter_group.filters.len()
+                && elapsed_us() >= time_budget_us
+            {
+                return Ok(false);
+            }
         }
         Ok(true)
     }

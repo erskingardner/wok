@@ -72,7 +72,9 @@ subscriber delivery completeness), `ws_publish_scaled` (configurable
 connection count), `idle_connections` (open-and-hold connection capacity),
 `duplicate_import`, `cold_start`, and Wok-only
 `nip50_search` (rare, intersected, and full-corpus ranked searches with
-result/limit verification). Use `--scenario <name>` to isolate one scenario.
+result/limit verification). Wok-only `clients`, `author_kinds`,
+`monitor_index` and `live_subscriptions` have their own sections below. Use
+`--scenario <name>` to isolate one scenario.
 
 ## Client-realistic scenario (`clients`)
 
@@ -185,6 +187,216 @@ stored part is bounded by `limit`.
 
 CI runs a small version as a unit test against an in-process relay with
 default limits (`clients::tests`).
+
+## Author × kind sweep (`author_kinds`)
+
+Wok-only `--scenario author_kinds` measures time to EOSE of historical
+`authors` × `kinds` REQs as the author list grows. Those are the outbox-model
+fetches of profiles, contact lists and relay lists, and home feeds. The corpus
+is large enough for the cost of each query plan to show. With
+`--wok-baseline` every query shape also runs against a second wok binary on
+the same database files, so a change can be compared before and after.
+
+The dataset has `--authors` authors and `--events` events:
+
+- Every author has one kind 0, 3, 10002 and 10050 event.
+- The rest is kind 1, 7 and 6 history, in the ratio 60:30:10. History sizes
+  follow a Zipf law over author rank, with exponent 0.8.
+- Timestamps spread over two years before a fixed anchor, and events are
+  imported in timestamp order, so authors interleave as they do on a relay.
+- Mentions, reactions, reposts and follow lists name popular authors more
+  often.
+
+The dataset is generated and imported once for each combination of events,
+authors and seed. It is kept under `--dataset-dir`, and later runs and both
+binaries reuse its database. Delete the directory to rebuild it.
+
+The query shapes:
+
+- `authors` with kinds `[0,3,10002]` or `[0,3,10002,10050]` and no limit, so
+  the relay's `max_filter_limit` applies. Also kinds `[1]` with limit 50 and
+  `[1,6,7]` with limit 100.
+- Each of those for 50, 100, 300, 333, 334, 500, 1,000 and 2,000 authors.
+  Author lists sample authors in proportion to their activity, and each list
+  extends the smaller ones. So 333 and 334 differ by one author, at strfry's
+  1,000-pair bound for the PubkeyKind index.
+- Guards that use other plans: `authors` with limit 100, `#p` with kinds,
+  kinds alone, and 100 ids.
+
+The relays run the harness's usual configuration, except that
+`relay.max_req_filter_size` is raised to 1 MiB. The default of 64 KiB refuses a
+REQ that names about 970 authors or more.
+
+Each shape and binary starts a relay on a fresh copy-on-write clone of the
+dataset database (`cp -c` on macOS, `cp --reflink=auto` elsewhere). The first
+query after the relay starts is the cold run. Warm runs follow, stopping
+after `--warm-runs` runs or `--shape-secs` seconds, with at least three. The
+binaries alternate which runs first. On a filesystem that cannot clone, the
+copy leaves the file's pages cached, so the cold run is not cold.
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--events` | 1,000,000 | Events in the dataset |
+| `--authors` | 5,000 | Authors in the dataset |
+| `--dataset-dir` | `bench-results/datasets` | Where datasets are kept for reuse |
+| `--wok-baseline` | none | Second wok binary to measure on the same dataset |
+| `--warm-runs` | 15 | Warm runs per shape, after the cold run |
+| `--shape-secs` | 30 | Stop a shape's warm runs after this long (at least three run) |
+
+Both binaries must be named `wok`. For example, to compare a change against
+master, build master in a separate worktree:
+
+```bash
+git worktree add ../wok-master master
+(cd ../wok-master && cargo build --release -p wok-cli)
+cargo build --release -p wok-cli -p wok-bench
+./target/release/wok-bench --scenario author_kinds --events 5000000 \
+  --wok ./target/release/wok --wok-baseline ../wok-master/target/release/wok \
+  --out bench-results/author_kinds
+```
+
+`summary.md` has one row per shape and author count:
+
+- `author events`: the events those authors hold, which is what reading the
+  Pubkey index for them costs;
+- `events`: the events returned;
+- cold, p50, p95 and max time to EOSE for each binary, in milliseconds, and
+  the p50 speedup;
+- `same results`: whether the SHA-256 of the sorted returned ids matches.
+  Any difference is a mismatch and fails the trial.
+
+`results.jsonl` holds every row in the trial's `author_kinds` field.
+
+## Live subscriptions (`monitor_index`, `live_subscriptions`)
+
+Two Wok-only scenarios measure the live-subscription monitor under the load
+real clients put on it: many subscriptions with distinct author lists, REQ
+replacement and CLOSE churn, and reconnect storms. Both build the same
+workload from `--seed`:
+
+- `--live-conns` connections hold `--live-subs-per-conn` subscriptions each.
+  Of every ten, six are home feeds (`authors` × kinds 1 and 6) with a distinct
+  list of `--live-min-authors` to `--live-max-authors` authors. The others are
+  a `#p` mentions subscription, a `#p` zap-receipt subscription and two `#e`
+  thread subscriptions.
+- Authors come from a pool of `--live-authors`, ranked by popularity. Follow
+  lists, posts and mentions pick them by a Zipf law (exponent 0.8), so popular
+  authors are in most lists, as on a public relay.
+- Events: 50% notes (some replies or mentions), 30% reactions, 5% reposts, 10%
+  zap receipts, and 5% kind 3 contact lists with 300 to 1,000 `p` tags. No
+  subscription wants a contact list, but matching still looks at every tag.
+
+### `monitor_index`
+
+This scenario runs `wok_query::ActiveMonitors`, the req monitor's index, in
+process. It starts no relay, so it measures the index compiled into this
+`wok-bench` build, not the `--wok` binary. Every time is CPU on one monitor
+thread with every subscription on it, as with `relay.numThreads.reqMonitor = 1`.
+Subscriptions register the way the monitor registers them, pending until
+their history is sent. The steps:
+
+- **REQ (subscribe):** register every subscription.
+- **match event:** match `--live-events` events, as the monitor does for each
+  stored event. Kind 3 lists get their own row.
+- **churn:** `2 × --live-conns` cycles. Each replaces a random feed with a
+  new list of `--live-max-authors` (a REQ with the same id), CLOSEs it, then
+  REQs the original again.
+- **storm:** close every connection, then register all its subscriptions
+  again.
+
+The first 500 events matched, and the first 500 of the up to 1,000 matched
+after the storm, are checked against an independent matcher; any difference
+fails the trial.
+
+The table gives count, mean, p50, p99, max and total time per step. The
+trial's latency columns hold the per-event match time in **µs**, not ms.
+Throughput is events matched per second of monitor CPU.
+
+To compare two versions of the monitor, build `wok-bench` from each and run
+both on the same host:
+
+```bash
+git worktree add ../wok-master master
+(cd ../wok-master && cargo build --release -p wok-cli -p wok-bench)
+cargo build --release -p wok-cli -p wok-bench
+../wok-master/target/release/wok-bench --scenario monitor_index \
+  --out bench-results/monitor-master --seed 1
+./target/release/wok-bench --scenario monitor_index \
+  --out bench-results/monitor-branch --seed 1
+```
+
+### `live_subscriptions`
+
+This scenario runs the workload against a relay (`--wok`). It first
+publishes 2,000 root notes for the thread subscriptions to follow, then
+opens every connection and waits for each EOSE. One publisher then sends
+`--live-rate` events per second, waiting for each OK, through four phases:
+
+| Phase | What happens |
+|---|---|
+| Steady | Ingest only, for `--live-phase-secs` |
+| Churn | `--live-churners` extra connections each keep feeds of `--live-max-authors` open and cycle through them: replace one (REQ with the same id), CLOSE it, REQ it again. Each REQ waits for its EOSE. Together they aim for `--live-churn-rate` REQs per second |
+| Storm | Every stable connection drops at once, reconnects and sends its REQs again. The phase ends when every connection has all its EOSEs |
+| Recovered | Ingest only, for `--live-phase-secs` |
+
+Before the storm and at the end the publisher pauses until every stable
+connection has received what it is owed, so no checked delivery is in flight
+when connections drop. A relay that falls behind makes these waits longer;
+the report gives their total.
+
+Every delivery to a stable connection of an event published outside the
+storm is checked against the independent matcher: each event exactly once on
+every subscription that matches it. Missing or unexpected deliveries fail the
+trial, and so does any refused publication other than a kind 3 contact list
+(which can lose to a newer list from the same author in the same second). Events published during the storm are not checked, because a
+subscription that is reconnecting may miss them.
+
+The table has one row per phase:
+
+- events published and deliveries received, to the stable connections and the
+  churners' feeds;
+- fan-out latency, from just before the EVENT is sent to its receipt, as p50,
+  p90, p99 and max;
+- relay CPU seconds for the whole process. On Linux, monitor CPU is the sum of
+  the `req-monitor-*` threads. Other systems do not name threads, so it reads
+  `n/a`.
+
+Below the table come:
+
+- time from connect to the last EOSE, for the first subscription and for the
+  storm, per connection;
+- the churn rate the churners reached;
+- churn REQ-to-EOSE latency. The monitor sends EOSE after it has applied every
+  subscription change queued before it, so a backlog of CLOSEs and
+  replacements shows here.
+
+The trial's latency columns hold steady-phase fan-out in ms, and throughput is
+steady-phase deliveries per second. Compare two relay binaries with the same
+`wok-bench` and `--seed`:
+
+```bash
+./target/release/wok-bench --scenario live_subscriptions --seed 1 \
+  --wok ../wok-master/target/release/wok --out bench-results/live-master
+./target/release/wok-bench --scenario live_subscriptions --seed 1 \
+  --wok ./target/release/wok --out bench-results/live-branch
+```
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--live-authors` | 20,000 | Author pool |
+| `--live-conns` | 1,000 | Stable connections |
+| `--live-subs-per-conn` | 10 | Subscriptions per connection (at most 100) |
+| `--live-min-authors` | 50 | Smallest feed author list |
+| `--live-max-authors` | 500 | Largest feed author list, and the size of churn REQs |
+| `--live-events` | 20,000 | Events `monitor_index` matches before its churn |
+| `--live-rate` | 50 | Publications per second in `live_subscriptions` |
+| `--live-phase-secs` | 10 | Length of the steady, churn and recovered phases |
+| `--live-churners` | 50 | Churning connections |
+| `--live-churn-rate` | 200 | REQs per second, all churners together |
+
+Feeds of 500 authors fit the default `relay.max_req_filter_size` of 64 KiB.
+CI runs small versions of both scenarios as unit tests (`live::tests`). The
+`live_subscriptions` test uses an in-process relay.
 
 ## Portable Docker lab
 

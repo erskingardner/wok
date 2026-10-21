@@ -31,6 +31,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 wok-event = { path = "../wok-event" }
 wok-negentropy = { path = "../wok-negentropy" }
+wok-query = { path = "../wok-query" }
 wok-relay = { path = "../wok-relay" }
 wok-unix = { path = "../wok-unix" }
 wok-ws = { path = "../wok-ws" }

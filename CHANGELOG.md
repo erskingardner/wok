@@ -153,6 +153,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EOSE stays newest-first. Before, stored events committed during the scan came
   before EOSE, as in strfry. A client that sends CLOSE at EOSE no longer gets
   them.
+- The req monitor's live-subscription index is cheaper under churn. CLOSE,
+  REQ replacement and disconnects now take time in proportion to the
+  subscription's own filter keys. Before, they scanned every subscription that
+  shared those keys, so a 500-author feed over popular authors was slow to
+  remove and reconnect storms grew quadratically. Matching an event no longer
+  allocates per tag or per candidate, and it skips filters that cannot take
+  the event's kind.
 - Frames for different connections are queued under per-connection locks
   instead of one relay-wide lock, so live fan-out to many connections no
   longer serializes on it.
@@ -213,6 +220,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   req monitors exit together, which made this reachable: about one in a
   thousand runs of a test that starts and stops six relays crashed on Linux.
   The database now closes only after every relay thread has exited.
+- An `authors` and `kinds` filter naming 1000 or more (author, kind) pairs no
+  longer reads every event those authors wrote when its kinds are replaceable
+  or addressable, as in an outbox fetch of kinds 0, 3 and 10002 for a long
+  follow list. The same applies when it names one kind, or when its limit
+  covers the extra index seeks, as for COUNT and NEG-OPEN. Such a fetch for 334
+  authors took 70 ms or more instead of 2 ms on a 200,000-event database.
+- A filter with `until: 0` no longer reads its whole index to return nothing,
+  and a filter with `limit: 0` reads no index at all.
+- A filter with an empty `ids`, `authors`, `kinds` or `#x` list now matches no
+  event, as NIP-01 requires. Before, the whole REQ, COUNT or NEG-OPEN was
+  refused with `must not be empty`, so the request lost its other valid filters
+  and a client with an empty follow list got an error. The subscription now
+  gets EOSE and stays open for its other filters.
 - `wok reindex` rebuilt negentropy trees from what relay reads serve, so a
   database with superseded versions (retained by a strfry migration, or created
   when reindex repacks a long address next to a newer version) came out with

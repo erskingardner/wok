@@ -344,6 +344,36 @@ fn nip40_expiration_too_small_rejected() {
     assert!(wok_event::nostr_json_to_packed_event(&ev, &EventLimits::default()).is_err());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip40_expired_ephemeral_events_are_refused_and_not_broadcast() {
+    // "Relays SHOULD drop any events that are published to them if they are
+    // expired." Live-only ephemeral events are never stored, so the only
+    // place to drop one is at publication.
+    let relay = Relay::new(|_| {});
+    let mut subscriber = relay.connect().await;
+    subscriber
+        .subscribe("ephemeral", json!({"kinds": [20001]}))
+        .await;
+    let mut publisher = relay.connect().await;
+    let ephemeral = |expiration: u64| {
+        sign_event(json!({
+            "created_at": now(),
+            "kind": 20001,
+            "tags": [["expiration", expiration.to_string()]],
+            "content": "",
+        }))
+    };
+    let expired = ephemeral(now() - 1);
+    let reply = publisher.publish(&expired).await;
+    assert_eq!(reply[2], false, "{reply}");
+    assert_eq!(reply[3], "invalid: event expired", "{reply}");
+    assert_eq!(subscriber.try_recv().await, None);
+
+    let live = ephemeral(now() + 60);
+    assert_eq!(publisher.publish(&live).await[2], true);
+    assert_eq!(subscriber.recv().await, json!(["EVENT", "ephemeral", live]));
+}
+
 #[test]
 fn nip70_protected_tag_constant() {
     assert_eq!(wok_event::PROTECTED_TAG, '-');

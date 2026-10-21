@@ -124,6 +124,16 @@ pub fn nostr_json_to_packed_event(
     v: &Value,
     limits: &EventLimits,
 ) -> Result<PackedEvent, EventError> {
+    pack_event(v, limits).map(|(packed, _)| packed)
+}
+
+/// [`nostr_json_to_packed_event`], also returning the NIP-40 expiration tag's
+/// value (0 when there is none). An ephemeral event packs the ephemeral
+/// marker in its place, so ingest checks expiry against this value.
+pub(crate) fn pack_event(
+    v: &Value,
+    limits: &EventLimits,
+) -> Result<(PackedEvent, u64), EventError> {
     if !v.is_object() {
         return Err(EventError::msg("event is not an object"));
     }
@@ -256,11 +266,20 @@ pub fn nostr_json_to_packed_event(
         tag_builder.add('d', b"")?;
     }
 
-    if is_ephemeral_kind(kind) {
-        expiration = 1;
-    }
-
-    PackedEventBuilder::build(&id, &pubkey, created_at, kind, expiration, &tag_builder)
+    let packed_expiration = if is_ephemeral_kind(kind) {
+        1
+    } else {
+        expiration
+    };
+    let packed = PackedEventBuilder::build(
+        &id,
+        &pubkey,
+        created_at,
+        kind,
+        packed_expiration,
+        &tag_builder,
+    )?;
+    Ok((packed, expiration))
 }
 
 /// Matches C++ `parseUint64`: every character must be an ASCII digit and the

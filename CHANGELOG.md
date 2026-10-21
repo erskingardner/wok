@@ -230,6 +230,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one. Messages that already start with a standard prefix are unchanged. A
   `shadowReject` with an unprefixed `msg` now sends an empty reason, like an
   accepted event.
+- An ephemeral event published with an `expiration` tag in the past is refused
+  with `invalid: event expired`, as NIP-40 asks. It was accepted and sent to
+  matching live subscriptions, because the ephemeral marker replaced the
+  expiration before it was checked.
 
 ## [0.7.0] - 2026-09-08
 

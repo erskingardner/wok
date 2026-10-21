@@ -125,6 +125,10 @@ regression test. Differential parity alone is not a reason to retain it.
   an accepted event. The pinned strfry sends the plugin's `msg` verbatim, so a
   plugin could produce `false` OKs with an empty or unprefixed reason, which
   NIP-01 forbids.
+- NIP-40: an ephemeral event whose `expiration` tag has passed is refused with
+  `invalid: event expired` and reaches no subscriber. The pinned strfry packs
+  the ephemeral marker in place of the expiration before checking it, so it
+  accepted and broadcast such events.
 - NIP-77 network payload hex rejects `0x` prefixes and half bytes.
 - NIP-01 IDs, pubkeys, signatures, and standard `e`/`p` values require the
   specified lowercase hex form.

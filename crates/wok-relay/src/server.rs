@@ -4393,6 +4393,41 @@ mod tests {
         (env, cfg)
     }
 
+    /// Starts and stops relays from several threads at once. A relay thread
+    /// that read from LMDB clears its reader slot, in the lock-file mapping,
+    /// from a thread-local destructor after its closure returns. When the
+    /// last relay thread to exit closed the environment, it could unmap that
+    /// slot under another thread's destructor and crash the process
+    /// (SIGSEGV, about once in a few thousand teardowns on Linux). A crash is
+    /// the failure, so this is a stress run:
+    ///
+    /// `cargo test -p wok-relay --lib relay_teardown_stress -- --ignored`
+    #[test]
+    #[ignore = "stress run; the failure is a crash"]
+    fn relay_teardown_stress() {
+        let runs: Vec<_> = (0..8)
+            .map(|_| {
+                thread::spawn(|| {
+                    for _ in 0..500 {
+                        let dir = tempfile::tempdir().unwrap();
+                        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+                        env.ensure_initialized().unwrap();
+                        let mut cfg = Config::default();
+                        cfg.db = dir.path().to_path_buf();
+                        cfg.relay.auth.enabled = false;
+                        let handle = start(env, cfg).unwrap();
+                        // The req monitors read once db-watch reports in.
+                        thread::sleep(Duration::from_millis(2));
+                        handle.shutdown_and_join(Duration::from_secs(10)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for run in runs {
+            run.join().unwrap();
+        }
+    }
+
     // An Env the relay never releases is never `mdb_env_close`d; on macOS
     // its two POSIX semaphores then outlive the process and, once
     // kern.posix.sem.max is exhausted, every Env::open fails with ENOSPC.

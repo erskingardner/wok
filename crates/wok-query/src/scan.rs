@@ -117,14 +117,14 @@ impl ScanCursor {
                 let Ok((prefix, created)) = parsed else {
                     return true;
                 };
-                if since != 0 && created < since {
+                if created < since {
                     self.resume_key = make_key_string_u64(prefix, 0);
                     self.resume_val = 0;
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
-                if until != 0 && until != u64::MAX && created > until {
+                if created > until {
                     self.resume_key = make_key_string_u64(prefix, until);
                     self.resume_val = u64::MAX;
                     finished_naturally = false;
@@ -518,7 +518,10 @@ impl DbScan {
         // this probe to 64 postings and eight seeks per alternative; avoid a
         // statistics table or a database-sized planning pass. Uncertain/error
         // cases retain the established plan.
-        if f.ids.is_none() && f.authors.is_some() && (!f.tags.is_empty() || !f.and_tags.is_empty())
+        if !default.cursors.is_empty()
+            && f.ids.is_none()
+            && f.authors.is_some()
+            && (!f.tags.is_empty() || !f.and_tags.is_empty())
         {
             let mut author_filter = f.clone();
             author_filter.tags.clear();
@@ -584,7 +587,10 @@ impl DbScan {
             (dbis.event_created_at, "CreatedAt")
         };
 
-        if let Some(ids) = &f.ids {
+        if f.limit == 0 || f.never_match {
+            // No stored event can be returned (NIP-01 `limit: 0`), so no
+            // index is read.
+        } else if let Some(ids) = &f.ids {
             for i in 0..ids.size() {
                 let search = ids.at(i).to_vec();
                 let mut resume = search.clone();

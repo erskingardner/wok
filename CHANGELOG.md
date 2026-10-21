@@ -203,6 +203,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   req monitors exit together, which made this reachable: about one in a
   thousand runs of a test that starts and stops six relays crashed on Linux.
   The database now closes only after every relay thread has exited.
+- A filter with `until: 0` no longer reads its whole index to return nothing,
+  and a filter with `limit: 0` reads no index at all.
 - A filter with an empty `ids`, `authors`, `kinds` or `#x` list now matches no
   event, as NIP-01 requires. Before, the whole REQ, COUNT or NEG-OPEN was
   refused with `must not be empty`, so the request lost its other valid filters

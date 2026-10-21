@@ -39,6 +39,45 @@ impl CandidateEvent {
     }
 }
 
+/// Most (author, kind) cursors a PubkeyKind plan opens past strfry's 1000:
+/// about 4 MiB of cursor state, enough for every author a filter can name
+/// (2047 fit its 65535 bytes) across eight kinds.
+const MAX_PUBKEY_KIND_CURSORS: usize = 16_384;
+
+/// Whether an `authors` and `kinds` filter seeks each (author, kind) pair in
+/// the PubkeyKind index instead of reading every event the authors wrote from
+/// the Pubkey index and checking its kind.
+fn plans_pubkey_kind(f: &NostrFilter) -> bool {
+    let (Some(authors), Some(kinds)) = (&f.authors, &f.kinds) else {
+        return false;
+    };
+    let pairs = authors.size().saturating_mul(kinds.size());
+    // strfry's bound (DBQuery.h).
+    if pairs < 1000 {
+        return true;
+    }
+    if pairs > MAX_PUBKEY_KIND_CURSORS {
+        return false;
+    }
+    // A replaceable kind holds one live version per author and an addressable
+    // kind one per address, so every seek reads few entries, all of them
+    // matches, while the Pubkey index would read the authors' whole history.
+    if kinds.iter().all(|kind| {
+        wok_event::is_replaceable_kind(kind) || wok_event::is_param_replaceable_kind(kind)
+    }) {
+        return true;
+    }
+    // Otherwise the Pubkey plan wins only when `limit` stops it early on kinds
+    // most of the authors' events have, and it reads each candidate's event
+    // to check the kind. While the seeks this plan adds stay within `limit`,
+    // it costs at most about twice as much even then, and far less when few
+    // events match or the limit is not reached. That holds for one kind and
+    // for COUNT and NEG-OPEN, whose limits are their caps. Sparse kinds under
+    // a small limit still read the authors' history: telling them apart
+    // needs statistics.
+    pairs - authors.size() <= usize::try_from(f.limit).unwrap_or(usize::MAX)
+}
+
 fn cmp_cand(a: &CandidateEvent, b: &CandidateEvent) -> std::cmp::Ordering {
     // Newer first. Equal created_at is ordered by id later, when the run
     // reaches the front (`DbScan::gather_front_run`); levId keeps this total.
@@ -593,10 +632,7 @@ impl DbScan {
             (dbis.event_id, "ID")
         } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
             (dbis.event_tag, "Tag")
-        } else if f.authors.is_some()
-            && f.kinds.is_some()
-            && f.authors.as_ref().unwrap().size() * f.kinds.as_ref().unwrap().size() < 1000
-        {
+        } else if plans_pubkey_kind(f) {
             (dbis.event_pubkey_kind, "PubkeyKind")
         } else if f.authors.is_some() {
             if f.kinds.is_some() {
@@ -655,10 +691,7 @@ impl DbScan {
                     outstanding: 0,
                 });
             }
-        } else if f.authors.is_some()
-            && f.kinds.is_some()
-            && f.authors.as_ref().unwrap().size() * f.kinds.as_ref().unwrap().size() < 1000
-        {
+        } else if plans_pubkey_kind(f) {
             let authors = f.authors.as_ref().unwrap();
             let kinds = f.kinds.as_ref().unwrap();
             for i in 0..authors.size() {

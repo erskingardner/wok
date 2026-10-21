@@ -679,6 +679,26 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
+/// Connect to a relay that is still starting. A loaded host, or the OS
+/// checking a newly built binary on its first launch, can take longer than
+/// one `connect_retry` round; a relay that exits fails at once.
+async fn connect_starting(url: &str, child: &mut std::process::Child) -> Result<ClientConnection> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match connect_retry(url).await {
+            Ok(socket) => return Ok(socket),
+            Err(e) => {
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!("relay exited with {status} before accepting connections");
+                }
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
 fn measure(
     rt: &tokio::runtime::Runtime,
     opts: &Options,
@@ -693,7 +713,7 @@ fn measure(
     let mut child = spawn_relay(bin, scratch.path(), port)?;
     let url = format!("ws://127.0.0.1:{port}");
     let measured = rt.block_on(async {
-        let mut socket = connect_retry(&url).await?;
+        let mut socket = connect_starting(&url, &mut child).await?;
         let cold = time_to_eose(&mut socket, "cold", &shape.filter).await?;
         let mut warm = Vec::new();
         let started = Instant::now();

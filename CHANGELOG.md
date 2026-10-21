@@ -165,6 +165,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sends no EOSE itself and never waits for the monitor. Gone with it is the
   5-second wait that could end in a "live subscription monitor unavailable"
   NOTICE and an EOSE for a subscription that never went live.
+- The relay could crash with a segmentation fault while shutting down. LMDB
+  clears a thread's reader slot from a thread-local destructor as the thread
+  exits, and the database was closed by whichever relay thread exited last,
+  so it could unmap the slot under another thread's destructor. The three
+  req monitors exit together, which made this reachable: about one in a
+  thousand runs of a test that starts and stops six relays crashed on Linux.
+  The database now closes only after every relay thread has exited.
 - `wok reindex` rebuilt negentropy trees from what relay reads serve, so a
   database with superseded versions (retained by a strfry migration, or created
   when reindex repacks a long address next to a newer version) came out with

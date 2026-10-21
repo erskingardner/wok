@@ -486,11 +486,37 @@ impl RelayThreads {
     }
 }
 
+impl RelayThreads {
+    /// Stop and join the threads, waiting up to `timeout`. Threads still
+    /// running then are handed to a `relay-join` thread together with the
+    /// environment guard, which it releases only after joining them, so the
+    /// environment is never closed while one of them is exiting. If that
+    /// thread cannot start, the environment stays open.
+    fn release(&mut self, timeout: Duration) {
+        let Err(e) = self.stop_and_join(timeout) else {
+            return;
+        };
+        tracing::warn!("{e}; their LMDB environment stays open until they exit");
+        let running = std::mem::take(&mut *self.running.lock());
+        let guard = Arc::new(Mutex::new(self.env.lock().take()));
+        let held = guard.clone();
+        let joiner = thread::Builder::new()
+            .name("relay-join".into())
+            .spawn(move || {
+                for h in running.ingesters.into_iter().chain(running.workers) {
+                    let _ = h.join();
+                }
+                drop(held.lock().take());
+            });
+        if joiner.is_err() {
+            std::mem::forget(guard);
+        }
+    }
+}
+
 impl Drop for RelayThreads {
     fn drop(&mut self) {
-        if let Err(e) = self.stop_and_join(DROP_JOIN_TIMEOUT) {
-            tracing::warn!("{e}; their LMDB environment stays open");
-        }
+        self.release(DROP_JOIN_TIMEOUT);
     }
 }
 
@@ -5212,6 +5238,171 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         assert!(relay.req[1].try_recv().is_err(), "nothing runs after Close");
         relay.finish();
+    }
+
+    fn relay_env(dir: &std::path::Path) -> (Env, Config) {
+        let env = Env::open(dir, EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.to_path_buf();
+        cfg.relay.auth.enabled = false;
+        (env, cfg)
+    }
+
+    /// A relay thread still running when the last handle's join times out
+    /// must not end up closing the environment itself when it finally exits:
+    /// the guard goes to a joiner that drops it only after joining it.
+    #[test]
+    fn a_timed_out_join_keeps_the_environment_open_until_threads_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let alive = Arc::downgrade(&env.inner);
+        let (release_tx, release_rx) = bounded::<()>(1);
+        let outlived = Arc::new(AtomicBool::new(false));
+        // A relay thread that reads, then exits only when told to: after the
+        // join deadline.
+        let straggler = {
+            let env = env.clone();
+            let (alive, outlived) = (alive.clone(), outlived.clone());
+            thread::spawn(move || {
+                drop(env.begin_ro().unwrap());
+                release_rx.recv().unwrap();
+                drop(env);
+                outlived.store(alive.upgrade().is_some(), Ordering::Relaxed);
+            })
+        };
+        // Room for both releases' `Stop`.
+        let (writer_tx, _writer_rx) = bounded(2);
+        let mut threads = RelayThreads {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            ingest: Vec::new(),
+            writer_tx,
+            running: Mutex::new(RunningThreads {
+                ingesters: Vec::new(),
+                workers: vec![straggler],
+            }),
+            env: Mutex::new(Some(env)),
+        };
+        threads.release(Duration::from_millis(20));
+        drop(threads);
+        assert!(alive.upgrade().is_some());
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "environment never closed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            outlived.load(Ordering::Relaxed),
+            "the exiting relay thread held the environment's last reference"
+        );
+    }
+
+    /// Starts and stops relays from several threads at once. A relay thread
+    /// that read from LMDB clears its reader slot, in the lock-file mapping,
+    /// from a thread-local destructor after its closure returns. When the
+    /// last relay thread to exit closed the environment, it could unmap that
+    /// slot under another thread's destructor and crash the process
+    /// (SIGSEGV, about once in a few thousand teardowns on Linux). A crash is
+    /// the failure, so this is a stress run:
+    ///
+    /// `cargo test -p wok-relay --lib relay_teardown_stress -- --ignored`
+    #[test]
+    #[ignore = "stress run; the failure is a crash"]
+    fn relay_teardown_stress() {
+        let runs: Vec<_> = (0..8)
+            .map(|_| {
+                thread::spawn(|| {
+                    for _ in 0..500 {
+                        let dir = tempfile::tempdir().unwrap();
+                        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+                        env.ensure_initialized().unwrap();
+                        let mut cfg = Config::default();
+                        cfg.db = dir.path().to_path_buf();
+                        cfg.relay.auth.enabled = false;
+                        let handle = start(env, cfg).unwrap();
+                        // The req monitors read once db-watch reports in.
+                        thread::sleep(Duration::from_millis(2));
+                        handle.shutdown_and_join(Duration::from_secs(10)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for run in runs {
+            run.join().unwrap();
+        }
+    }
+
+    // An Env the relay never releases is never `mdb_env_close`d; on macOS
+    // its two POSIX semaphores then outlive the process and, once
+    // kern.posix.sem.max is exhausted, every Env::open fails with ENOSPC.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_join_releases_env_while_handles_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, cfg) = relay_env(dir.path());
+        let env_alive = Arc::downgrade(&env.inner);
+        let handle = start(env, cfg).unwrap();
+        // A transport's clone and an open connection outlive the join.
+        let transport = handle.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = transport.next_conn_id();
+        transport.register(conn, Outbound::new(tx, 0)).await;
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "before-join"
+        }));
+        transport
+            .client_message(
+                conn,
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                json!(["EVENT", event]).to_string(),
+            )
+            .await;
+        assert!(recv_outbound(&mut rx).await.contains("true"));
+
+        let joiner = handle.clone();
+        tokio::task::spawn_blocking(move || joiner.shutdown_and_join(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(handle.is_shutdown());
+        {
+            let running = handle.threads.running.lock();
+            assert!(running.ingesters.is_empty() && running.workers.is_empty());
+        }
+        assert_eq!(env_alive.strong_count(), 0, "relay threads still hold Env");
+        // Idempotent, and the stopped writer answers instead of hanging.
+        handle.shutdown_and_join(Duration::from_secs(1)).unwrap();
+        assert!(transport
+            .manage(ManagementCmd::AllowKind { kind: 1 })
+            .await
+            .is_err());
+
+        // The closed environment reopens with the committed event intact.
+        let reopened = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        let txn = reopened.begin_ro().unwrap();
+        assert_eq!(most_recent_levid_ro(&txn).unwrap(), 1);
+    }
+
+    #[test]
+    fn dropping_last_handle_joins_relay_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, cfg) = relay_env(dir.path());
+        let env_alive = Arc::downgrade(&env.inner);
+        let handle = start(env, cfg).unwrap();
+        let clone = handle.clone();
+        drop(handle);
+        assert!(
+            env_alive.strong_count() > 0,
+            "a live handle keeps the relay up"
+        );
+        // No request_shutdown: the last drop alone must stop the threads.
+        drop(clone);
+        assert_eq!(env_alive.strong_count(), 0, "relay threads still hold Env");
     }
 
     /// A REQ's registration is queued for the req monitor when the REQ is

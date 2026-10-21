@@ -365,3 +365,40 @@ run. Results swing widely near the monitors' saturation point: raise
 at least three times, alternating, and compare medians. A run that panics with
 "load ran out" lasted longer than its load, so its later lines were measured
 without it; discard them.
+
+## REQ path latency for client traffic shapes
+
+`crates/wok-compat/tests/req_path_latency.rs` holds three ignored tests that
+time the REQ path the way clients use it. Like `eose_latency.rs`, they drive an
+in-process relay through the public `RelayHandle` API, so the same file runs
+unchanged against older revisions. The relay has default limits, with abuse
+controls and AUTH off. Its corpus of kind-1 events is written straight to
+LMDB before it starts.
+
+```bash
+cargo test --release -p wok-compat --test req_path_latency -- \
+  --ignored --nocapture --test-threads 1
+```
+
+- `close_then_req` repeats `ROUNDS` (100) times: open `CLOSE_SUBS` (50) live
+  subscriptions, CLOSE them all, then send one `{"kinds":[1],"limit":5}`. It
+  times that REQ to its EOSE.
+- `req_bursts` has `CONNS` (100) connections each send a burst of small REQs
+  at once, `ROUNDS` (5) times: 30, then 60, or only `BURST` when it is set.
+  Each sample runs from its connection's first REQ to one EOSE.
+- `fanout_many_connections` opens `CONNS` (2000) connections with `SUBS` (5)
+  live subscriptions each that match every published event. It publishes
+  `RATE` (200) events a second for `SECS` (10) seconds and times each
+  delivered frame from publication to receipt. Sequential REQ → EOSE probes
+  run alongside.
+
+Both `close_then_req` and `req_bursts` run their probes twice: first idle,
+then while every req worker is busy. For the busy run, `HEAVY` (2) connections
+per req worker send NIP-50 searches one after another. Each search matches the
+whole corpus of `CORPUS` (200,000) events. The `heavy searches` line gives how
+many searches finished meanwhile, so a change that helps the probes at the
+searches' expense shows there.
+
+Each line gives the sample count and p50/p90/p99/max in milliseconds. Read
+the heavy lines against the idle ones from the same run. Run each revision at
+least three times, alternating, and compare medians.

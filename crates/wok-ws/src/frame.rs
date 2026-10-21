@@ -604,18 +604,30 @@ impl WsEncoder {
         kind: MessageKind,
         payload: &[u8],
     ) -> Result<Vec<u8>, WsError> {
+        let mut out = Vec::with_capacity(payload.len() + 14);
+        self.encode_message_into(kind, payload, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`WsEncoder::encode_message`], appending the frame to `out`.
+    pub fn encode_message_into(
+        &mut self,
+        kind: MessageKind,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), WsError> {
         let opcode = match kind {
             MessageKind::Text => OP_TEXT,
             MessageKind::Binary => OP_BINARY,
         };
-        let mut out = Vec::with_capacity(payload.len() + 14);
         if let Some(d) = &mut self.deflater {
             let compressed = d.compress(payload)?;
-            self.encode_frame(true, true, opcode, &compressed, &mut out);
+            self.encode_frame(true, true, opcode, &compressed, out);
         } else {
-            self.encode_frame(true, false, opcode, payload, &mut out);
+            out.reserve(payload.len() + 14);
+            self.encode_frame(true, false, opcode, payload, out);
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Drop an idle compressor (see [`DeflateCtx::release_idle`]).

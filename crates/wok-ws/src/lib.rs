@@ -421,6 +421,12 @@ const PROTOCOL_NEG: u64 = 1;
 /// after one to two intervals (see `frame::DeflateCtx`).
 const DEFLATE_IDLE_CHECK: Duration = Duration::from_secs(30);
 
+/// Outbound frames queued behind a write are encoded into the next write until
+/// it reaches this size, so a history burst costs a few syscalls rather than
+/// one per event. A frame that finds the queue empty is written alone, so
+/// coalescing never delays the first frame of a response.
+const COALESCE_BYTES: usize = 16 * 1024;
+
 fn nip_description(nip: u64) -> Option<&'static str> {
     match nip {
         1 => Some("Defines the core event format, filters, and client-relay message flow."),
@@ -841,6 +847,8 @@ async fn handle_ws<S>(
     // with messages read meanwhile queued behind it; reading stops only while
     // those have taken it past its limit, and starts again if ingress pauses.
     let mut held = HeldMessages::new(max_message);
+    // Frames were still queued after the last write: coalesce the next one.
+    let mut backlog = false;
     let io = async {
         'outer: loop {
             let draining = connection.draining(&held);
@@ -911,21 +919,29 @@ async fn handle_ws<S>(
                     }
                 }
                 out = rx.recv() => {
-                    match out {
+                    let Some(frame) = out else { break };
+                    // Frames are encoded and dropped (releasing their pending
+                    // bytes) before the write, which holds at most about
+                    // COALESCE_BYTES more than a single frame would.
+                    let limit = if backlog { COALESCE_BYTES } else { 0 };
+                    let mut bytes = Vec::new();
+                    let mut next = Some(frame);
+                    while let Some(frame) = next.take() {
                         // Its subscription was replaced or closed while it
                         // waited: the client no longer wants it.
-                        Some(frame) if frame.is_stale() => {}
-                        Some(frame) => {
-                            let bytes = match encoder.encode_message(MessageKind::Text, frame.text.as_bytes()) {
-                                Ok(b) => b,
-                                Err(_) => break,
-                            };
-                            if write_bytes(&mut wr, &bytes).await.is_err() {
-                                break;
-                            }
+                        if !frame.is_stale()
+                            && encoder.encode_message_into(MessageKind::Text, frame.text.as_bytes(), &mut bytes).is_err()
+                        {
+                            break 'outer;
                         }
-                        None => break,
+                        if bytes.len() < limit {
+                            next = rx.try_recv().ok();
+                        }
                     }
+                    if !bytes.is_empty() && write_bytes(&mut wr, &bytes).await.is_err() {
+                        break;
+                    }
+                    backlog = !rx.is_empty();
                 }
             }
         }

@@ -13,4 +13,4 @@ Plain HTTP serves NIP-11 (`Accept: application/nostr+json`), the landing page, `
 
 Nagle is disabled (`TCP_NODELAY`) on accepted streams. Outbound is bounded by pending bytes, not message count. Mesh *client* links in the CLI still use tungstenite and do not speak deflate.
 
-Per-connection costs are kept low for many idle connections: compression state is created on first use and dropped after 30–60 s without traffic (the inflater keeps the client's 32 KiB history for context takeover).
+Per-connection costs are kept low for many idle connections: compression state is created on first use and dropped after 30–60 s without traffic (the inflater keeps the client's 32 KiB history for context takeover), and outbound frames already queued are coalesced into one write of up to about 16 KiB.

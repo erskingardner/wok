@@ -18,16 +18,29 @@ pub fn is_event_superseded_ro(
     if !addressable && !is_replaceable_kind(event.kind()) {
         return Ok(false);
     }
-    let mut address = event.pubkey().to_vec();
+    // The address (pubkey, then the first `d` tag of an addressable event)
+    // and kind, as `make_key_string_u64` lays them out. A packed tag value
+    // is at most 255 bytes, so the key is built on the stack.
+    let mut buf = [0u8; 32 + 255 + 8];
+    buf[..32].copy_from_slice(event.pubkey());
+    let mut len = 32;
     if addressable {
-        address.extend_from_slice(&event.first_d_tag().unwrap_or_default());
+        event.foreach_tag(|name, value| {
+            if name != 'd' {
+                return true;
+            }
+            buf[32..32 + value.len()].copy_from_slice(value);
+            len += value.len();
+            false
+        });
     }
-    let key = make_key_string_u64(&address, event.kind());
+    buf[len..len + 8].copy_from_slice(&event.kind().to_ne_bytes());
+    let key = &buf[..len + 8];
     let mut superseded = false;
     let mut error = None;
     txn.foreach_full(
         txn.env().dbis().event_replace,
-        &key,
+        key,
         &u64::MAX.to_ne_bytes(),
         true,
         |candidate_key, value| {

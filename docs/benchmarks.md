@@ -785,6 +785,32 @@ can wait behind it. Set `EVENTS` large enough that one filter takes longer
 than a slice to see each filter's checks; set `ARRIVAL_US` past the run's
 length to time the many-filter REQ alone.
 
+## Read visibility cost per event
+
+`crates/wok-query/tests/visibility_cost.rs` holds an ignored test that times
+history scans in process, so read visibility is a large share of what it
+measures. It uses only public `wok-query` API, so the same file runs unchanged
+against older revisions.
+
+```bash
+cargo test --release -p wok-query --test visibility_cost -- --ignored --nocapture
+```
+
+The database holds `NOTES` (200000) kind-1 notes by `AUTHORS` (1000)
+authors, and a kind 0 and kind 3 event for each author. Three queries run
+`RUNS` (21) times each:
+
+- `{"kinds":[1],"limit":2000}`;
+- every author with kinds `[0,3]`, which are replaceable, so each event also
+  gets a replacement check;
+- a COUNT of every note.
+
+They run four times, as policy records are added: none, then 1,000 banned
+pubkeys and 1,000 banned event ids, then a kind policy without kind 7, then
+1,000 NIP-62 vanish markers. None of the records hides an event the queries
+match, so each row times only the checks. Each row prints the events sent,
+the median time and the time per event.
+
 ## REQ path latency for client traffic shapes
 
 `crates/wok-compat/tests/req_path_latency.rs` holds three ignored tests that

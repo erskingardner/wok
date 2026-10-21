@@ -970,13 +970,14 @@ async fn router_db_change(
             ephemeral_lifetime_secs: Some(cfg.events.ephemeral_lifetime_secs),
             ..Default::default()
         };
+        let snapshot = wok_query::visibility::ReadSnapshot::for_stored(&txn);
         wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
             latest = lev;
             let packed = match PackedEventView::new(packed_bytes) {
                 Ok(p) => p,
                 Err(_) => return true,
             };
-            match visibility.globally_visible(&txn, packed) {
+            match visibility.globally_visible(&snapshot, packed) {
                 Ok(true) => {}
                 Ok(false) => return true,
                 Err(error) => {

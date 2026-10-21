@@ -150,6 +150,56 @@ impl ReadRestrictor {
     }
 }
 
+/// A read transaction as visibility checks see it. The clock is read once,
+/// and which policy tables can hide an event is found once, so checking each
+/// event looks up only what is there. Build one per scan slice, live batch or
+/// sync pass. A table whose state cannot be read is checked for every event,
+/// as if it held records.
+pub struct ReadSnapshot<'t> {
+    txn: &'t wok_db::RoTxn<'t>,
+    now: u64,
+    /// The NIP-62 vanish table may hold a marker.
+    vanish: bool,
+    moderation: wok_db::ModerationView<'t>,
+    /// A replaceable or addressable event checked may lose replacement.
+    superseded: bool,
+}
+
+impl<'t> ReadSnapshot<'t> {
+    /// For any event, stored in `txn` or not.
+    pub fn new(txn: &'t wok_db::RoTxn<'t>) -> Self {
+        let dbis = txn.env().dbis();
+        Self {
+            txn,
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            vanish: dbis
+                .vanish_pubkey
+                .is_some_and(|dbi| txn.entries(dbi).map_or(true, |entries| entries != 0)),
+            moderation: wok_db::ModerationView::new(txn),
+            superseded: true,
+        }
+    }
+
+    /// For events read from `txn`, and live-only events, which are never
+    /// replaceable. When `txn` holds no superseded version, no stored event
+    /// loses NIP-01 replacement, so that lookup is skipped. A replaceable
+    /// event not stored in `txn`, such as a copy of one since replaced, could
+    /// still lose to one that is: check it with [`new`](Self::new).
+    pub fn for_stored(txn: &'t wok_db::RoTxn<'t>) -> Self {
+        Self {
+            superseded: !matches!(wok_db::state::superseded_events_ro(txn), Ok(Some(0))),
+            ..Self::new(txn)
+        }
+    }
+
+    pub fn txn(&self) -> &'t wok_db::RoTxn<'t> {
+        self.txn
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadVisibility {
     pub restrictor: ReadRestrictor,
@@ -163,7 +213,7 @@ pub struct ReadVisibility {
 impl ReadVisibility {
     pub fn allows(
         &self,
-        txn: &wok_db::RoTxn<'_>,
+        snapshot: &ReadSnapshot<'_>,
         event: PackedEventView<'_>,
     ) -> Result<bool, wok_db::DbError> {
         if !self
@@ -172,7 +222,7 @@ impl ReadVisibility {
         {
             return Ok(false);
         }
-        self.globally_visible(txn, event)
+        self.globally_visible(snapshot, event)
     }
 
     /// [`allows`](Self::allows), also setting `restricted` when the event is
@@ -182,7 +232,7 @@ impl ReadVisibility {
     /// events cost no more than `allows`.
     pub fn allows_noting_restricted(
         &self,
-        txn: &wok_db::RoTxn<'_>,
+        snapshot: &ReadSnapshot<'_>,
         event: PackedEventView<'_>,
         restricted: &mut bool,
     ) -> Result<bool, wok_db::DbError> {
@@ -190,9 +240,9 @@ impl ReadVisibility {
             .restrictor
             .should_send_to_identities(event, &self.identities)
         {
-            return self.globally_visible(txn, event);
+            return self.globally_visible(snapshot, event);
         }
-        if !*restricted && self.globally_visible(txn, event)? {
+        if !*restricted && self.globally_visible(snapshot, event)? {
             *restricted = true;
         }
         Ok(false)
@@ -200,7 +250,7 @@ impl ReadVisibility {
 
     pub fn globally_visible(
         &self,
-        txn: &wok_db::RoTxn<'_>,
+        snapshot: &ReadSnapshot<'_>,
         event: PackedEventView<'_>,
     ) -> Result<bool, wok_db::DbError> {
         // NIP-42: relays MUST exclude kind 22242 from broadcast. Wok's ingest
@@ -211,10 +261,7 @@ impl ReadVisibility {
         if event.kind() == wok_event::AUTH_KIND && !self.include_auth_events {
             return Ok(false);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = snapshot.now;
         // NIP-59 backdates gift wraps, so a kind 21059 may be published up to
         // GIFT_WRAP_BACKDATE_SECS after its created_at. Its lifetime counts
         // from that latest publication time; from created_at, a backdated
@@ -234,9 +281,12 @@ impl ReadVisibility {
         {
             return Ok(false);
         }
-        Ok(!wok_db::is_event_vanished_ro(txn, event)?
-            && !wok_db::is_event_moderated_ro(txn, event)?
-            && !wok_db::is_event_superseded_ro(txn, event)?)
+        let txn = snapshot.txn;
+        Ok(
+            !(snapshot.vanish && wok_db::is_event_vanished_ro(txn, event)?)
+                && !snapshot.moderation.hides(event)?
+                && !(snapshot.superseded && wok_db::is_event_superseded_ro(txn, event)?),
+        )
     }
 }
 
@@ -288,6 +338,7 @@ mod tests {
         let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let txn = env.begin_ro().unwrap();
+        let snapshot = ReadSnapshot::new(&txn);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -302,7 +353,7 @@ mod tests {
         for (kind, visible) in [(22241, true), (22242, false), (22243, true)] {
             let ev = PackedEventBuilder::build(&[1u8; 32], &author, now, kind, 1, &tags).unwrap();
             assert_eq!(
-                visibility.allows(&txn, ev.view()).unwrap(),
+                visibility.allows(&snapshot, ev.view()).unwrap(),
                 visible,
                 "kind {kind}"
             );
@@ -312,7 +363,7 @@ mod tests {
             ..visibility
         };
         let auth = PackedEventBuilder::build(&[1u8; 32], &author, now, 22242, 1, &tags).unwrap();
-        assert!(operator.allows(&txn, auth.view()).unwrap());
+        assert!(operator.allows(&snapshot, auth.view()).unwrap());
     }
 
     #[test]
@@ -321,6 +372,7 @@ mod tests {
         let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let txn = env.begin_ro().unwrap();
+        let snapshot = ReadSnapshot::new(&txn);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -341,7 +393,7 @@ mod tests {
             let ev = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], created_at, kind, 1, &tags)
                 .unwrap();
             assert_eq!(
-                visibility.globally_visible(&txn, ev.view()).unwrap(),
+                visibility.globally_visible(&snapshot, ev.view()).unwrap(),
                 visible,
                 "kind {kind} dated {} s ago",
                 now - created_at

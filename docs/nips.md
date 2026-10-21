@@ -40,6 +40,10 @@ against no events. Filter-validation limits still count the skipped filters.
 A filter with `limit: 0` returns no stored events. The subscription still gets
 EOSE once its other filters have sent theirs, and stays open for new events.
 
+Stored events are sent newest first. Events with the same `created_at` are
+sent in local arrival order, not lowest id first as NIP-01 suggests; see
+[known differences](known-differences.md).
+
 NIP-01 replacement is enforced when reading, even if a lossless migration
 retained multiple versions. Kinds 0, 3 (contact lists), and 10000–19999 select
 the newest event per author and kind; kinds 30000–39999 additionally use the

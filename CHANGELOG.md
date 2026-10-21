@@ -147,6 +147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- With `relay.compression_sliding_window = false`, the relay reset its
+  inflater before every client message although it had not asked the client
+  to stop context takeover, so a client compressing against its earlier
+  messages, as browsers do, was disconnected on its second compressed
+  message. The setting now applies only to the relay's own compressor.
 - Ephemeral events published while a REQ's history was being sent were lost.
   The live filter was installed only after the history, and live-only events
   are never stored, so nothing could catch them up: NIP-46 replies and

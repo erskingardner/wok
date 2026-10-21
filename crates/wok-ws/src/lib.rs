@@ -694,7 +694,7 @@ async fn upgrade_ws(
         _ => return empty(StatusCode::BAD_REQUEST),
     }
     // permessage-deflate negotiation mirroring uWS as strfry configures it:
-    // respond with plain `permessage-deflate` (context takeover per
+    // respond with plain `permessage-deflate` (our context takeover per
     // compression.slidingWindow), echoing client_no_context_takeover.
     let (compression_on, sliding) = {
         let cfg = handle.config.read();
@@ -704,6 +704,7 @@ async fn upgrade_ws(
         )
     };
     let mut ext_response: Option<String> = None;
+    let mut deflate = None;
     if compression_on {
         if let Some(offer) = req
             .headers()
@@ -717,24 +718,27 @@ async fn upgrade_ws(
                 .unwrap_or(false)
             {
                 let mut resp = "permessage-deflate".to_string();
-                if offer
+                let client_no_takeover = offer
                     .split(';')
                     .skip(1)
-                    .any(|t| t.trim().eq_ignore_ascii_case("client_no_context_takeover"))
-                {
+                    .any(|t| t.trim().eq_ignore_ascii_case("client_no_context_takeover"));
+                if client_no_takeover {
                     resp.push_str("; client_no_context_takeover");
                 }
                 ext_response = Some(resp);
+                deflate = Some(Deflate {
+                    server_takeover: sliding,
+                    client_takeover: !client_no_takeover,
+                });
             }
         }
     }
     let max = handle.config.read().relay.max_websocket_payload_size;
-    let deflate = ext_response.is_some();
     tokio::spawn(async move {
         match hyper::upgrade::on(&mut req).await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
-                handle_ws(io, handle, peer, max, sliding, deflate).await;
+                handle_ws(io, handle, peer, max, deflate).await;
             }
             Err(e) => tracing::warn!("ws upgrade failed: {e}"),
         }
@@ -761,13 +765,22 @@ fn ws_accept_key(key: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, h.finalize())
 }
 
+/// What a WebSocket upgrade negotiated for permessage-deflate.
+#[derive(Clone, Copy)]
+struct Deflate {
+    /// Our compressor keeps history between messages (slidingWindow).
+    server_takeover: bool,
+    /// The client did not agree to client_no_context_takeover, so its
+    /// compressor may refer back into earlier messages.
+    client_takeover: bool,
+}
+
 async fn handle_ws<S>(
     stream: S,
     handle: Arc<RelayHandle>,
     peer: SocketAddr,
     max_message: usize,
-    sliding: bool,
-    deflate: bool,
+    deflate: Option<Deflate>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -789,17 +802,9 @@ async fn handle_ws<S>(
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut parser = WsParser::new(
         max_message,
-        if deflate {
-            Some(InflateCtx::new(sliding))
-        } else {
-            None
-        },
+        deflate.map(|d| InflateCtx::new(d.client_takeover)),
     );
-    let mut encoder = WsEncoder::new(if deflate {
-        Some(DeflateCtx::new(sliding))
-    } else {
-        None
-    });
+    let mut encoder = WsEncoder::new(deflate.map(|d| DeflateCtx::new(d.server_takeover)));
     let mut incoming_events = Vec::with_capacity(4);
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(auto_ping.max(1)));
     // Delay (not the Burst default): after the select is stalled elsewhere
@@ -917,6 +922,10 @@ async fn handle_ws<S>(
 #[cfg(test)]
 #[path = "review_regressions.rs"]
 mod review_regressions;
+
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod transport_tests;
 
 #[cfg(test)]
 mod landing_tests {
@@ -1202,7 +1211,7 @@ mod stalled_write_tests {
         let stream = StalledStream::new(Duration::from_secs(3));
         let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let start = Instant::now();
-        handle_ws(stream, handle, peer, 1 << 20, false, false).await;
+        handle_ws(stream, handle, peer, 1 << 20, None).await;
         let elapsed = start.elapsed();
 
         // Timeline: first ping tick at t=2s, its write stalls until t=5s.

@@ -186,21 +186,26 @@ impl Client {
         ids.iter().all(|id| self.got(sub_id, id))
     }
 
-    /// Receive until `done` holds.
+    /// Receive until `done` holds. Like a transport, skip frames whose
+    /// subscription was replaced or closed while they were queued.
     async fn recv_until(&mut self, done: impl Fn(&Self) -> bool) {
         while !done(self) {
             let frame = tokio::time::timeout(Duration::from_secs(20), self.rx.recv())
                 .await
                 .expect("relay went quiet")
                 .expect("connection closed");
-            self.record(serde_json::from_str(&frame.into_text()).unwrap());
+            if !frame.is_stale() {
+                self.record(serde_json::from_str(&frame.into_text()).unwrap());
+            }
         }
     }
 
     /// Receive whatever else arrives within `quiet`.
     async fn settle(&mut self, quiet: Duration) {
         while let Ok(Some(frame)) = tokio::time::timeout(quiet, self.rx.recv()).await {
-            self.record(serde_json::from_str(&frame.into_text()).unwrap());
+            if !frame.is_stale() {
+                self.record(serde_json::from_str(&frame.into_text()).unwrap());
+            }
         }
     }
 
@@ -394,6 +399,76 @@ async fn replacing_a_subscription_stops_the_old_filter_at_once() {
     assert_eq!(old_after_swap, 1, "only the pre-swap old event may arrive");
     assert_eq!(seen.len(), 1 + HISTORY + new.len());
     assert!(seen.values().all(|n| *n == 1));
+}
+
+/// REQ `abc` with filter A is live while A's events keep arriving; then REQ
+/// `abc` with filter B. Once the relay has the second REQ, the client sees
+/// nothing that matches only A: B's stored events, then EOSE, then B's live
+/// events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacing_a_live_subscription_switches_filters_cleanly() {
+    let relay = Relay::new(false, |_| {});
+    let mut client = relay.client().await;
+    let mut stored_b = Vec::new();
+    for i in 0..5 {
+        stored_b.push(client.publish(1, "b", &format!("stored b {i}")).await);
+    }
+    client.recv_until(|c| c.accepted == stored_b.len()).await;
+    client
+        .send(json!(["REQ", "abc", {"kinds": [1, 20001], "#t": ["a"]}]))
+        .await;
+    client.recv_until(|c| c.has("EOSE", "abc")).await;
+
+    // Another connection keeps A busy across the switch.
+    let flood = relay.client().await;
+    let publishing = tokio::spawn(async move {
+        for i in 0..1_000 {
+            flood.publish(20001, "a", &format!("a {i}")).await;
+        }
+        flood
+    });
+    client.recv_until(|c| c.delivered("abc").len() >= 20).await;
+    // Stop reading for a while: A's matches pile up in the outbound queue, as
+    // on a slow link, and are still there when the filter changes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client
+        .send(json!(["REQ", "abc", {"kinds": [1, 20001], "#t": ["b"]}]))
+        .await;
+    let mut live_b = Vec::new();
+    for i in 0..5 {
+        live_b.push(client.publish(20001, "b", &format!("live b {i}")).await);
+    }
+    // Let the relay take the second REQ before reading anything sent since:
+    // what A's subscription still had queued is stale by then.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let switched = client.frames.len();
+    let _flood = publishing.await.unwrap();
+    client
+        .recv_until(|c| c.replies("EOSE", "abc") == 2 && c.got_all("abc", &live_b))
+        .await;
+    client.settle(Duration::from_millis(300)).await;
+
+    let after: Vec<&Value> = client.frames[switched..]
+        .iter()
+        .filter(|f| f[1] == "abc")
+        .collect();
+    let tag = |f: &Value| f[2]["tags"][0][1].as_str().unwrap_or_default().to_string();
+    assert!(
+        after.iter().all(|f| f[0] != "EVENT" || tag(f) == "b"),
+        "an event only A matches arrived after the switch"
+    );
+    let eose = after
+        .iter()
+        .position(|f| f[0] == "EOSE")
+        .expect("EOSE for B");
+    let id = |f: &Value| f[2]["id"].as_str().unwrap().to_string();
+    let before: Vec<String> = after[..eose].iter().map(|f| id(f)).collect();
+    let since: Vec<String> = after[eose + 1..].iter().map(|f| id(f)).collect();
+    assert_eq!(before.len(), stored_b.len());
+    assert!(stored_b.iter().all(|e| before.contains(e)), "B's history");
+    assert!(live_b.iter().all(|e| since.contains(e)), "B's live events");
+    assert_eq!(since.len(), live_b.len());
 }
 
 /// A refused REQ still replaces the subscription it names (NIP-01): the old

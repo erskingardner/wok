@@ -516,7 +516,7 @@ async fn long_d_tags_keep_distinct_addresses() {
     let stale = event(&key, 30000, 350, json!([["d", &d300]]), "stale");
     let ok = publish(&mut wire, &stale).await;
     assert_eq!(ok[2], false, "{ok}");
-    assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+    assert_eq!(ok[3], "blocked: user requested deletion", "{ok}");
 
     // Every stored address fits the a tag that names it: `30000:`, 64 hex
     // digits and `:` leave max_tag_val_size - 71 bytes for d.
@@ -575,7 +575,7 @@ async fn a_tag_deletions_remove_and_tombstone_replaceable_events() {
         for stale in versions.iter().chain([&at_deletion]) {
             let ok = publish(&mut wire, stale).await;
             assert_eq!(ok[2], false, "kind {kind}: {ok}");
-            assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+            assert_eq!(ok[3], "blocked: user requested deletion", "{ok}");
         }
         let newer = event(&key, kind, 301, json!([]), "newer");
         assert_eq!(publish(&mut wire, &newer).await[2], true);
@@ -630,7 +630,7 @@ async fn deletion_a_tags_spelling_kinds_with_leading_zeros_are_refused() {
     ] {
         let ok = publish(&mut wire, &stale).await;
         assert_eq!(ok[2], false, "{ok}");
-        assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+        assert_eq!(ok[3], "blocked: user requested deletion", "{ok}");
     }
     handle.request_shutdown();
 }

@@ -982,6 +982,44 @@ async fn superseded_transfers_are_reported_without_failing_sync() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_ephemeral_events_are_reported_without_failing_sync() {
+    // A ttl-mode relay keeps an ephemeral record, which packs the ephemeral
+    // marker, until its purge, even after its NIP-40 expiration. Relays drop
+    // expired events, so neither direction transfers it, and that is not a
+    // failure.
+    let ttl = "[events]\nephemeral_persistence=\"ttl\"\n[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n";
+    let expired = sign(
+        json!({
+            "kind": 20001,
+            "created_at": now() - 5,
+            "tags": [["expiration", (now() - 1).to_string()]],
+            "content": "expired",
+        }),
+        &key(),
+    );
+    for direction in ["up", "down"] {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let lc = config(local.path(), ttl);
+        let rc = config(remote.path(), ttl);
+        let holder = if direction == "up" { &lc } else { &rc };
+        import(holder, std::slice::from_ref(&expired));
+        let server = serve(&rc).await;
+        let output = sync(&lc, &server.url, &["--dir", direction, "--json"]);
+        let report = summary(&output);
+        assert!(output.status.success(), "{direction}: {report}");
+        assert_eq!(report["rejected"], 0, "{direction}: {report}");
+        assert_eq!(report["upload_rejected"], 0, "{direction}: {report}");
+        let counter = if direction == "up" {
+            "upload_expired"
+        } else {
+            "expired"
+        };
+        assert_eq!(report[counter], 1, "{direction}: {report}");
+    }
+}
+
 #[test]
 fn filtered_sync_view_respects_the_configured_event_budget() {
     let dir = tempfile::tempdir().unwrap();

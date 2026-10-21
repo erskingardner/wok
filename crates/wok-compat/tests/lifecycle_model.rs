@@ -530,7 +530,10 @@ async fn generated_privacy_lifecycle_matches_model_over_both_transports() {
                             }
                         } else {
                             model.banned_ids.remove(&id);
-                            ManagementCmd::AllowEvent { id: bytes }
+                            ManagementCmd::AllowEvent {
+                                id: bytes,
+                                reason: "model".into(),
+                            }
                         };
                         fixture.handle.manage(cmd).await.unwrap();
                     }

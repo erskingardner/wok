@@ -1,6 +1,8 @@
 # NIP-86 Relay Management API
 
-Wok implements the pinned NIP-86 draft: JSON-RPC-like management requests over
+Wok implements the NIP-86 draft at nips
+[`62d5fed`](https://github.com/nostr-protocol/nips/blob/62d5fed/86.md), newer
+than the conformance pin: JSON-RPC-like management requests over
 HTTP POST to the relay URI with `Content-Type: application/nostr+json+rpc`,
 authorized by a NIP-98 event (kind 27235, empty content) whose `payload` tag
 is required and whose `u` tag names the relay URL. The endpoint shares the
@@ -9,7 +11,7 @@ only when `admin.enabled` is set, and the signed `u` tag is compared against
 `admin.public_url` after normalizing the scheme (`http(s)` and `ws(s)` forms
 are accepted) and any trailing slash.
 
-Request and response bodies follow the pinned spec:
+Request and response bodies follow the spec:
 
 ```json
 { "method": "banpubkey", "params": ["<pubkey-hex>", "<optional reason>"] }
@@ -21,7 +23,9 @@ Request and response bodies follow the pinned spec:
 ```
 
 Method-level failures return HTTP 200 with an `error` field. Authentication
-failures return 401. Signed authorization events are single-use within
+failures return 401. Every reply carries the NIP-11 CORS headers, and
+`OPTIONS /` answers the preflight with 204, so browser management tools can
+call the API from another origin. Signed authorization events are single-use within
 `admin.auth_window_secs`; clients must include a unique tag (for example a
 random `nonce`) so same-second calls do not collide in the replay cache. An
 event is claimed as soon as it is accepted, so a concurrent request reusing it
@@ -34,24 +38,24 @@ event to retry.
 
 ## Supported methods
 
-`supportedmethods` returns the implemented list. Unknown methods return an
-`unsupported method` error. The pinned NIP-86 also defines `unbanevent`,
-`unallowevent`, `listallowedevents`, `listdisallowedkinds` and the NIP-43
-invite methods `listclaims`, `createclaim` and `deleteclaim`, which Wok does
-not implement. It also says `banpubkey` should remove the pubkey from the
-allow list and `allowpubkey` should remove it from the ban list. Wok keeps the
-two pubkey lists independent: each method writes only its own record.
+`supportedmethods` returns the methods the caller may call at its
+[management level](#management-levels). Unknown methods return an
+`unsupported method` error.
 
 | Group | Methods |
 | --- | --- |
 | Pubkey bans | `banpubkey`, `unbanpubkey`, `listbannedpubkeys` |
 | Write allowlist | `allowpubkey`, `unallowpubkey`, `listallowedpubkeys` |
-| Event bans | `banevent`, `allowevent`, `listbannedevents` |
+| Event bans | `banevent`, `unbanevent`, `listbannedevents` |
+| Event allow list | `allowevent`, `unallowevent`, `listallowedevents` |
 | Moderation queue | `listeventsneedingmoderation` |
 | IP blocks | `blockip`, `unblockip`, `listblockedips` |
 | Relay info | `changerelayname`, `changerelaydescription`, `changerelayicon` |
-| Kind policy | `allowkind`, `disallowkind`, `listallowedkinds` |
+| Kind policy | `allowkind`, `disallowkind`, `listallowedkinds`, `listdisallowedkinds` |
 | Roles | `createrole`, `editrole`, `deleterole`, `assignrole`, `unassignrole` |
+
+The NIP-43 invite-code methods (`listclaims`, `createclaim`, `deleteclaim`)
+are not implemented, because Wok does not implement NIP-43.
 
 ## Management levels
 
@@ -60,9 +64,9 @@ Every call is made by a NIP-98 signer at one of two levels:
 - **Admin** — `admin.pubkeys` from the config, or any pubkey holding the
   built-in `admin` role. Admins may call every method.
 - **Moderator** — pubkeys holding the built-in `moderator` role. Moderators
-  may call the ban, allowlist, queue, and IP-block methods plus
-  `supportedmethods`; relay-info, kind-policy, and role methods return a
-  `requires the admin role` error.
+  may call the ban, allow-list, queue, and IP-block methods plus
+  `supportedmethods`, which lists only those. Relay-info, kind-policy, and
+  role methods return a `requires the admin role` error.
 
 `assignrole` / `unassignrole` manage these grants without restarting the
 relay or editing the config file.
@@ -73,9 +77,17 @@ Bans are **suppressive, not destructive**. A banned pubkey or event id is
 rejected on future writes (`OK false "restricted: ..."`) and hidden from
 historical REQ results, live delivery (including monitor catch-up and
 queued DB changes), and COUNT, but the stored records remain in the
-database, so `unbanpubkey` / `allowevent` restore them exactly. Negentropy
+database, so `unbanpubkey` / `unbanevent` restore them exactly. Negentropy
 sync between relays is unaffected by bans, so operators can still mirror a
 banned corpus between their own relays.
+
+A pubkey or event is on at most one of its ban list and allow list:
+`banpubkey` / `banevent` remove it from the allow list, and `allowpubkey` /
+`allowevent` lift its ban. `unbanpubkey` / `unbanevent` and
+`unallowpubkey` / `unallowevent` remove it from one list without adding it
+to the other. Earlier releases could leave a pubkey on both lists; the ban
+wins until the next `banpubkey` or `allowpubkey` for it, and `unbanpubkey`
+alone leaves it allowlisted.
 
 `allowpubkey` only has an effect when `relay.auth.restrict_writes = true`:
 then writes are accepted only from allowlisted pubkeys, pubkeys holding any
@@ -87,7 +99,12 @@ NIP-62 vanish requests (kind 62) are exempt from pubkey bans and the write
 allowlist: NIP-62 requires relays that restrict who can post to honor them
 regardless of the user's status. A banned author's vanish request is stored
 and erases their events, but stays hidden from reads while the ban stands.
-Event-id bans and the kind allowlist still apply to vanish requests.
+Event-id bans and the kind policy still apply to vanish requests.
+
+The event allow list records an operator's approval. `allowevent` lifts any
+ban on the event and takes it out of the moderation queue. An allowed event
+is still hidden while its author is banned or its kind disallowed, and a
+later report queues it again.
 
 Blocked IPs are refused at connection admission for both WebSocket upgrades
 and plain HTTP — **including the management endpoint itself**. Blocking the
@@ -101,7 +118,8 @@ Stored NIP-56 reports (kind 1984) feed `listeventsneedingmoderation`: each
 `e` tag target (up to 64 per report) is recorded with a reason derived from
 the reporting pubkey and content. Queue entries are recorded in the same
 LMDB transaction as the report itself. `banevent` and `allowevent` both
-remove the target from the queue.
+remove the target from the queue; `unbanevent` and `unallowevent` leave it
+alone.
 
 ## Roles
 
@@ -129,10 +147,13 @@ error.
 
 ## Kind policy
 
-`allowkind` / `disallowkind` / `listallowedkinds` maintain a dedicated kind
-policy in the moderation table (a 65536-bit map), not the query-filter
-validation config. With no stored policy every kind is allowed and
-`listallowedkinds` reports the full 0–65535 range. A disallowed kind is:
+`allowkind` / `disallowkind` maintain a dedicated kind policy in the
+moderation table (a 65536-bit map), not the query-filter validation config.
+Every kind is allowed until `disallowkind` disallows it, and `allowkind`
+allows it again. `listdisallowedkinds` lists the disallowed kinds.
+`listallowedkinds` lists the kinds named by `allowkind` since their last
+`disallowkind`, not every allowed kind; with no policy both lists are empty.
+`allowkind` therefore never restricts other kinds. A disallowed kind is:
 
 - rejected on write admission (`OK false "restricted: kind N is not allowed
   by this relay"`), and

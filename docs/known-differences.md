@@ -20,7 +20,7 @@ it is not a promise to reproduce upstream bugs.
 - Wok offers an optional Unix socket transport. Write-policy plugins see
   `sourceType: "unix"` for those connections.
 - `wok event <levId>` prints one event by local event ID.
-- NIP-11 reports Wok's repository as the software implementation.
+- NIP-11 `software` is Wok's homepage, `https://github.com/erskingardner/wok`.
 - Wok implements NIP-50 ranked content search using a Wok-owned derived LMDB
   index. The pinned strfry revision has no NIP-50 implementation.
 - Wok returns mergeable NIP-45 HyperLogLog sketches for canonical
@@ -69,7 +69,8 @@ it is not a promise to reproduce upstream bugs.
 - Mesh client connections do not currently offer permessage-deflate. Wok's
   WebSocket server does negotiate it.
 - `wok sync` classifies a peer's negative upload ACK as superseded only when
-  its reason starts with `replaced:` (the prefix used by Wok). A foreign peer
+  its reason starts with `blocked: have a newer version` (Wok's reason) or
+  `replaced:` (what strfry and earlier Wok releases send). A foreign peer
   using different wording is counted as `upload_rejected`, and the run exits
   nonzero even if replacement semantics explain the difference. Arbitrary
   human-readable rejection text is not treated as evidence of supersession.
@@ -110,7 +111,29 @@ regression test. Differential parity alone is not a reason to retain it.
   produces a NOTICE.
 - OK reasons for storage failures use `error:` instead of `Write error:`, and
   AUTH failures that already carry a NIP-01 prefix are not wrapped in a second
-  `error:`.
+  `error:`. Events refused because free disk space is below
+  `database.min_free_disk_bytes` also get `error:`.
+- OK reasons for refused events use NIP-01's standardized prefixes. An event
+  older than the stored version of its replaceable or addressable event gets
+  `blocked: have a newer version`, and one that a deletion or vanish request
+  covers gets `blocked: user requested deletion`. The pinned strfry replies
+  `replaced: have newer event` and `deleted: user requested deletion`, whose
+  prefixes NIP-01 does not define.
+- A write-policy plugin's rejection message is sent as is only when it starts
+  with a standard NIP-01 prefix. Any other message is sent as
+  `blocked: <msg>`, and an empty one as `blocked: rejected by write policy`. A
+  `shadowReject` message without a prefix is replaced by the empty reason of
+  an accepted event. The pinned strfry sends the plugin's `msg` verbatim, so a
+  plugin could produce `false` OKs with an empty or unprefixed reason, which
+  NIP-01 forbids.
+- NIP-40: an ephemeral event whose `expiration` tag has passed is refused with
+  `invalid: event expired` and reaches no subscriber. The pinned strfry packs
+  the ephemeral marker in place of the expiration before checking it, so it
+  accepted and broadcast such events. `wok sync` and `wok router` downloads
+  drop them too. In `ttl` mode a stored ephemeral event
+  stays readable until the ephemeral purge even once its expiration passes,
+  so `wok sync` counts one it does not transfer, in either direction, as
+  `expired` or `upload_expired` instead of failing.
 - NIP-77 network payload hex rejects `0x` prefixes and half bytes.
 - NIP-01 history order: events with the same `created_at` are sent lowest id
   first, so a `limit` that cuts a tie keeps the lowest ids. The pinned strfry
@@ -206,3 +229,14 @@ regression test. Differential parity alone is not a reason to retain it.
   never has. Integrity checks, `wok migrate strfry` and `wok doctor` never
   rehash ids, so migrated data is unaffected. A Wok relay refuses legacy-id
   events that `wok sync` uploads to it, because uploads are EVENTs.
+- NIP-01 single endpoint: only `/` accepts WebSocket upgrades and serves
+  NIP-11, NIP-86 and the landing page. Other paths return 404, apart from
+  `/admin`, `/metrics` and the nodeinfo routes. The pinned strfry upgrades
+  and serves NIP-11 on every path, so one relay answers under many URLs. A
+  reverse proxy that serves the relay under a path prefix must strip it.
+- NIP-11 CORS: relay responses send `Access-Control-Allow-Origin`,
+  `-Allow-Headers` and `-Allow-Methods`, and `OPTIONS /` is a 204 preflight
+  reply. NIP-11 is chosen when `Accept` lists `application/nostr+json` among
+  other media ranges with a nonzero `q`. The pinned strfry sends only
+  `Access-Control-Allow-Origin`, answers OPTIONS with the landing page, and
+  serves NIP-11 only when `Accept` is exactly `application/nostr+json`.

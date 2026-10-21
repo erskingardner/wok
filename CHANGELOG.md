@@ -119,6 +119,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps them, and verification compares the result with the original's
   fingerprint without them.
 
+- NIP-86 `unbanevent`, `unallowevent`, `listallowedevents` and
+  `listdisallowedkinds`, from the current NIP-86 draft. `allowevent` also
+  puts the event on an allow list, with its optional reason, which
+  `listallowedevents` returns; the allow list records the approval and
+  changes no visibility. The NIP-43 claim methods are not implemented.
+
 ### Removed
 
 - Dated benchmark, soak, lab and audit reports, the definition-of-done report
@@ -240,6 +246,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Stored payloads keep that escaping. `wok import`, `wok sync` and
   `wok router` downloads also accept the legacy id, so data from strfry and
   earlier Wok releases still verifies.
+- NIP-86 ban and allow lists replace each other, as NIP-86 asks:
+  `banpubkey` and `banevent` take the pubkey or event off the allow list,
+  and `allowpubkey` and `allowevent` lift its ban. A pubkey could be on both
+  lists, and the ban won. A pubkey that an earlier release left on both lists
+  stays there, with the ban still winning, until the next `banpubkey` or
+  `allowpubkey` for it; `unbanpubkey` alone leaves it allowlisted.
+- NIP-86 `supportedmethods` lists only the methods the caller may call, so
+  moderators no longer see the admin-only ones.
+- NIP-86 `listallowedkinds` lists the kinds named by `allowkind` since their
+  last `disallowkind`. It listed every allowed kind: all 65,536 with no kind
+  policy, and 65,535 after one `disallowkind`. `listdisallowedkinds` lists
+  the disallowed kinds. Which kinds are accepted does not change.
+- The relay is served on a single endpoint, as NIP-01 requires. Only `/`
+  accepts WebSocket upgrades and serves NIP-11, NIP-86 and the landing page;
+  other paths return 404, apart from `/admin`, `/metrics` and the nodeinfo
+  routes. Before, every path upgraded and served NIP-11, so one relay
+  answered under any number of URLs. A reverse proxy that serves the relay
+  under a path prefix must now strip the prefix.
+- Relay HTTP responses send `Access-Control-Allow-Headers` (`Content-Type,
+  Authorization, Accept`) and `Access-Control-Allow-Methods` (`GET, POST,
+  OPTIONS`) as well as `Access-Control-Allow-Origin`, as NIP-11 requires, and
+  `OPTIONS /` answers a CORS preflight with 204 instead of the landing page.
+  NIP-86 replies carry them too, so browser management tools can call the
+  API. The admin dashboard API stays same-origin.
+- NIP-11 is served whenever the `Accept` header lists
+  `application/nostr+json`, for example
+  `application/nostr+json, application/json;q=0.9`. Only that exact header
+  value was recognized, and anything else got the landing page. Both
+  documents at `/` now send `Vary: Accept`, so caches keep them apart.
+- NIP-11 `software` is the homepage URL `https://github.com/erskingardner/wok`,
+  as NIP-11 requires. It was the git remote
+  `git+https://github.com/erskingardner/wok.git`.
+- Refused events get OK reasons with NIP-01's standard prefixes. An event
+  older than the stored version of its replaceable or addressable event gets
+  `blocked: have a newer version` (was `replaced: have newer event`), and a
+  deleted one `blocked: user requested deletion` (was `deleted:`). `wok sync`
+  counts an upload refused with either the new or the old superseded reason as
+  `upload_superseded`, so peers running strfry or earlier Wok releases are
+  still recognized.
+- A write-policy plugin that rejects an event with an empty or unprefixed
+  `msg` no longer produces an OK reason without a NIP-01 prefix: the client
+  gets `blocked: <msg>`, or `blocked: rejected by write policy` for an empty
+  one. Messages that already start with a standard prefix are unchanged. A
+  `shadowReject` with an unprefixed `msg` now sends an empty reason, like an
+  accepted event.
+- An ephemeral event published with an `expiration` tag in the past is refused
+  with `invalid: event expired`, as NIP-40 asks. It was accepted and sent to
+  matching live subscriptions, because the ephemeral marker replaced the
+  expiration before it was checked. `wok sync` and `wok router` downloads drop
+  such events too. `wok sync` neither uploads nor fails on one that a `ttl`-mode
+  database still holds; its summary counts them as `expired` and
+  `upload_expired`.
+- Events refused because free disk space is below
+  `database.min_free_disk_bytes` get `error: disk reserve requires N free
+  bytes` instead of `blocked:`. A low disk is the relay's own failure, not a
+  policy decision about the event or its author.
 
 ## [0.7.0] - 2026-09-08
 

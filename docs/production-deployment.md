@@ -40,7 +40,9 @@ host, bind to an explicitly firewalled private address. Set
 `relay.real_ip_header` only when every direct connection is from a trusted
 proxy that overwrites that header. Configure `relay.auth.service_url` and
 `admin.public_url` with the exact external HTTPS origins before enabling those
-features.
+features. Wok serves the relay only at `/`, NIP-01's single endpoint, so a
+proxy that publishes it under a path prefix must strip the prefix before
+forwarding.
 
 Validate and start the service:
 
@@ -127,6 +129,12 @@ formats or needs additional network/filesystem access, place the policy engine
 behind a separately sandboxed local service and keep the relay-side plugin as
 a minimal protocol adapter. Extend the unit's sandbox only for the exact path
 or address family that adapter requires.
+
+A `reject` record's `msg` becomes the OK reason the client sees. Start it with
+a NIP-01 prefix such as `blocked:` or `rate-limited:`. Wok sends any other
+message as `blocked: <msg>`, and an empty one as
+`blocked: rejected by write policy`. A `shadowReject` keeps its `msg` only when
+it is prefixed; otherwise the client gets the empty reason of an accepted event.
 
 ## Logs and user content
 

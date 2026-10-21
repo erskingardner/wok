@@ -8,6 +8,7 @@
 //! plugin must not wedge the single LMDB writer) and the 8192-byte response
 //! line cap, like C++'s `StreamReader::setMaxRecordSize`.
 
+use crate::protocol::has_reason_prefix;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -90,8 +91,16 @@ impl PluginEventSifter {
                 *ok_msg = msg;
                 match action.as_str() {
                     "accept" => PluginResult::Accept,
-                    "reject" => PluginResult::Reject,
-                    "shadowReject" => PluginResult::ShadowReject,
+                    "reject" => {
+                        *ok_msg = rejection_reason(std::mem::take(ok_msg));
+                        PluginResult::Reject
+                    }
+                    "shadowReject" => {
+                        if !has_reason_prefix(ok_msg) {
+                            ok_msg.clear();
+                        }
+                        PluginResult::ShadowReject
+                    }
                     other => {
                         tracing::error!(action = ?other, "write policy plugin returned unknown action");
                         *ok_msg = "error: internal error".into();
@@ -282,6 +291,18 @@ impl Drop for Running {
     }
 }
 
+/// NIP-01 requires a false OK's reason to start with a standard prefix.
+/// strfry sends a plugin's `msg` verbatim, even when it is empty.
+fn rejection_reason(msg: String) -> String {
+    if has_reason_prefix(&msg) {
+        msg
+    } else if msg.is_empty() {
+        "blocked: rejected by write policy".into()
+    } else {
+        format!("blocked: {msg}")
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -419,5 +440,62 @@ mod tests {
         );
         assert_eq!(res, PluginResult::Reject);
         assert_eq!(msg, "error: internal error");
+    }
+
+    /// NIP-01: a false OK's reason starts with a standard prefix, and a true
+    /// OK's reason is empty or prefixed. The plugin's `msg` is sent as is
+    /// only when it already has one.
+    #[test]
+    fn plugin_messages_get_a_standard_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("verdict.pl");
+        // Kind 1 is rejected and kind 2 shadow-rejected, with the event's
+        // content as the message.
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/perl
+use strict; use warnings;
+$| = 1;
+while (my $line = <STDIN>) {
+    my ($id) = $line =~ /"id":"([0-9a-f]+)"/;
+    my ($kind) = $line =~ /"kind":(\d+)/;
+    my ($msg) = $line =~ /"content":"([^"]*)"/;
+    my $action = $kind == 1 ? "reject" : "shadowReject";
+    print qq({"id":"$id","action":"$action","msg":"$msg"}\n);
+}
+"#,
+        )
+        .unwrap();
+        let cmd = format!("perl {}", script.display());
+        let mut sifter = PluginEventSifter::new(3);
+        for (kind, content, result, sent) in [
+            (
+                1,
+                "",
+                PluginResult::Reject,
+                "blocked: rejected by write policy",
+            ),
+            (1, "spam", PluginResult::Reject, "blocked: spam"),
+            (1, "spam: no", PluginResult::Reject, "blocked: spam: no"),
+            (
+                1,
+                "rate-limited: slow down",
+                PluginResult::Reject,
+                "rate-limited: slow down",
+            ),
+            (2, "", PluginResult::ShadowReject, ""),
+            (2, "thanks", PluginResult::ShadowReject, ""),
+            (
+                2,
+                "duplicate: have it",
+                PluginResult::ShadowReject,
+                "duplicate: have it",
+            ),
+        ] {
+            let ev = json!({"id": "abcd", "kind": kind, "content": content});
+            let mut msg = String::new();
+            let res = sifter.accept_event(&cmd, &ev, "IP4", "127.0.0.1", None, &mut msg);
+            assert_eq!((res, msg.as_str()), (result, sent), "{content:?}");
+        }
     }
 }

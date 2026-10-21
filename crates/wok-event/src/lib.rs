@@ -29,8 +29,9 @@ pub use packed::{
     HASHED_TAG_VAL_MARKER, PACKED_HEADER_LEN,
 };
 pub use parse::{
-    from_hex, from_hex_exact, from_hex_strict, from_lower_hex_exact, normalize_event_json,
-    nostr_json_to_packed_event, to_hex, EventLimits, ParsedEvent, DEFAULT_MAX_EVENT_SIZE,
+    expiration_tag, from_hex, from_hex_exact, from_hex_strict, from_lower_hex_exact,
+    normalize_event_json, nostr_json_to_packed_event, to_hex, EventLimits, ParsedEvent,
+    DEFAULT_MAX_EVENT_SIZE,
 };
 pub use validate::{
     parse_and_verify_event, parse_and_verify_event_with, require_canonical_addresses,

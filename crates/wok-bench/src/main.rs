@@ -2703,6 +2703,29 @@ fn log_tail(path: &Path) -> String {
     lines[lines.len().saturating_sub(5)..].join(" | ")
 }
 
+/// The kind-1 events a relay serves after importing `corpus`: deletions
+/// applied as `retained_events` models them, each id once, and none past a
+/// NIP-40 expiration.
+fn served_notes(corpus: &[Value], now: u64) -> Vec<Value> {
+    let expired = |event: &Value| {
+        event["tags"].as_array().is_some_and(|tags| {
+            tags.iter().any(|tag| {
+                tag[0] == "expiration"
+                    && tag[1]
+                        .as_str()
+                        .and_then(|at| at.parse::<u64>().ok())
+                        .is_some_and(|at| at <= now)
+            })
+        })
+    };
+    let mut seen = std::collections::HashSet::new();
+    retained_events(corpus)
+        .into_iter()
+        .filter(|event| event["kind"] == 1 && !expired(event))
+        .filter(|event| seen.insert(event["id"].as_str().unwrap_or_default().to_owned()))
+        .collect()
+}
+
 /// Per-connection transport costs with and without deflate (see
 /// transport.rs). Fan-out publications are fresh notes, newer than the corpus.
 fn transport_trial(
@@ -2721,20 +2744,25 @@ fn transport_trial(
         fanout_events: args.fanout_events,
         churn_connections: args.churn_connections,
     };
+    // The spawned relay keeps its default filter limit, which would quietly
+    // shorten larger bursts.
+    let max_limit = wok_relay::Config::default().relay.max_filter_limit;
+    anyhow::ensure!(
+        args.burst_events <= max_limit,
+        "--burst-events {} is above the relay's max_filter_limit ({max_limit})",
+        args.burst_events
+    );
     let corpus = read_event_values(corpus_path)?;
     let newest = corpus
         .iter()
         .filter_map(|event| event["created_at"].as_u64())
         .max()
         .unwrap_or_default();
-    let kind1: Vec<Value> = corpus
-        .into_iter()
-        .filter(|event| event["kind"] == 1)
-        .collect();
+    let now = unix_timestamp()?;
+    let kind1 = served_notes(&corpus, now);
     // Every fan-out note takes one second after the corpus (or now), so no
     // history fetch returns them, however many there are, and the relay's
     // created_at window still accepts them.
-    let now = unix_timestamp()?;
     let fanout_at = now.max(newest + 1);
     let window = wok_relay::Config::default().events.reject_newer_than_secs;
     anyhow::ensure!(
@@ -3271,6 +3299,50 @@ mod tests {
                     .as_array()
                     .is_some_and(|tags| tags.iter().any(|tag| tag[0] == "e"))
         }));
+    }
+
+    #[test]
+    fn ws_transport_expects_only_notes_the_relay_serves() {
+        let now = 1_800_000_000;
+        let mut events = generate_values(EventWorkload {
+            count: 1000,
+            seed: 11,
+            base_timestamp: now,
+            mix: EventMix::Lifecycle,
+        })
+        .unwrap();
+        let deleted: Vec<String> = events
+            .iter()
+            .filter(|event| event["kind"] == 5)
+            .flat_map(|event| event["tags"].as_array().cloned().unwrap_or_default())
+            .filter(|tag| tag[0] == "e")
+            .filter_map(|tag| tag[1].as_str().map(str::to_owned))
+            .collect();
+        let kept = events
+            .iter()
+            .find(|event| {
+                event["kind"] == 1 && !deleted.iter().any(|id| event["id"] == id.as_str())
+            })
+            .cloned()
+            .unwrap();
+        events.push(kept.clone());
+        let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+        let expired = clients::signed(
+            &key,
+            now - 10,
+            1,
+            vec![json!(["expiration", (now - 5).to_string()])],
+            "expired".into(),
+        );
+        events.push(expired.clone());
+
+        let served = served_notes(&events, now);
+        let ids: Vec<&str> = served.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(!deleted.is_empty());
+        assert!(served.iter().all(|event| event["kind"] == 1));
+        assert!(deleted.iter().all(|id| !ids.contains(&id.as_str())));
+        assert_eq!(ids.iter().filter(|&&id| kept["id"] == id).count(), 1);
+        assert!(!ids.contains(&expired["id"].as_str().unwrap()));
     }
 
     #[test]

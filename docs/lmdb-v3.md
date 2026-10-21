@@ -88,13 +88,46 @@ superseded-version count and negentropy trees are derived from the new packing
 like everything else reindex builds. A legacy addressable record can join a
 newer version at its real address, where reads hide it as superseded history,
 and a version it hid at the empty `d` becomes visible again. A legacy deletion
-gains its tombstone, so older versions of its address are refused from then on;
-versions already stored are not deleted. Nothing repacks implicitly. Finding
+gains its tombstone, so older versions of its address are refused from then on,
+and reindex deletes the versions already stored at or before it, as the writer
+does when such a request arrives. It applies the long `a` tags of every stored
+deletion request this way, so a request stored with its tag also deletes the
+legacy versions that were keyed by another address until the repack, and also
+the `a` tags that name a replaceable address or pad the kind with leading
+zeros (see [Event__replaceDeletion](#eventreplacedeletion)). The
+backup keeps the deleted versions. Nothing repacks implicitly. Finding
 legacy records means decoding every payload, which at writable open would make
 the first start after an upgrade scan the whole database, and migration keeps
 strfry records byte for byte. Repacking changes the record's PackedEvent bytes,
 and so `event_fingerprint`, but removing the hashed values gives the previous
-bytes back, so the repair loses nothing.
+bytes back, so the repack itself loses nothing.
+
+## Event__replaceDeletion
+
+A kind 5 record keys `Event__replaceDeletion` by `sha256(a tag) || created_at`
+for each `a` tag that names an address of its own author: an addressable kind
+(30000–39999), or a replaceable kind (0, 3, 10000–19999) with an empty `d`,
+`<kind>:<pubkey>:`. A writer refuses an addressable or replaceable event when
+the hash of its own canonical `a` tag has an entry at or after its
+`created_at`. strfry, and Wok 0.7.0 and earlier, index addressable kinds only,
+by the hash of the tag as written. Ingest now refuses a deletion `a` tag whose
+kind has leading zeros. For one stored before, the entry of its spelling is
+derived as those releases did, and so is the entry of the canonical spelling,
+so the request refuses what it deletes. An `a` tag longer than 255 bytes is the
+exception: PackedEvent holds only the hash of its spelling, so its entry
+matches nothing.
+
+Deletion requests that strfry or an earlier Wok release stored therefore lack
+the entries of replaceable addresses and of canonical spellings, and the
+versions they name were never deleted or could be published again. Integrity
+accepts the missing entries, so migration and older databases still verify, and
+counts such records as `legacy_untombstoned_deletions`; `wok doctor` warns
+while any remain. `wok reindex` derives the entries and deletes the versions
+those requests name up to their `created_at`, as it does for long `a` tags (see
+[PackedEvent](#packedevent)). An earlier Wok release opening a database written by this one does not
+derive those entries, so its integrity check reports them as unexpected, and
+if it deletes such a deletion request the entry stays behind; `wok integrity`
+reports it and `wok reindex` removes it.
 
 ## EventPayload
 
@@ -118,14 +151,19 @@ config, plugin, and socket-path problems.
 event/negentropy indexes or author counters. It copies authoritative Meta, filter, dictionary,
 PackedEvent, and EventPayload records into a sibling staging database,
 repacking PackedEvent records that dropped long tag values (see
-[PackedEvent](#packedevent)), derives all indexes again (negentropy trees hold
-every stored record their filter matches), verifies the integrity
+[PackedEvent](#packedevent)), derives all indexes again, deletes the versions
+that repaired deletions name, builds negentropy trees (which hold every stored
+record their filter matches), verifies the integrity
 report and the event fingerprint, then renames the original to a retained
 backup and atomically promotes the staged directory. When it repacks records,
 the fingerprint it verifies leaves out hashed tag values, which are the only
-bytes a repack adds; otherwise the full fingerprint must be unchanged. The
-manifest records the fingerprints of the original and of the result, and how
-many records were repacked and skipped. It preserves a valid sequence and discards author counters for lazy
+bytes a repack adds; otherwise the full fingerprint must be unchanged. When it
+deletes versions, it compares against the original's fingerprint without
+exactly those records, each of which must be stored. The manifest records the
+fingerprints of the original and of the result, how many records were
+repacked and skipped, and how many versions were deleted
+(`deleted_under_repaired_deletions`). It preserves a valid sequence, including
+when it deletes the newest record, and discards author counters for lazy
 reconstruction from the rebuilt indexes. It refuses primary, payload, or
 metadata corruption, including a malformed or regressed sequence; the highest
 surviving event cannot establish the sequence of a previously deleted tail.

@@ -24,16 +24,30 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
     let config = dir.path().join("strfry.conf");
     std::fs::write(&config, format!("db = {:?}\nrelay {{ nofiles = 0 }}\n", db)).unwrap();
     let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
-    let mut events = Vec::new();
-    for i in 0..12 {
-        let mut e = json!({"pubkey":hex::encode(key.x_only_public_key().0.serialize()),"kind":if i % 3 == 0 { 1 } else { 1059 },"created_at":1_800_000_000+i,"tags":[["t","migration"],["p", if i % 2 == 0 { "01".repeat(32) } else { "02".repeat(32) }]],"content":format!("migration {i}: café 🦀 \\ \" \u{7f}")});
+    let pubkey = hex::encode(key.x_only_public_key().0.serialize());
+    let sign = |mut e: serde_json::Value| {
+        e["pubkey"] = json!(pubkey);
         let id = wok_event::event_id_hash(&e).unwrap();
         e["id"] = json!(hex::encode(id));
         e["sig"] = json!(hex::encode(
             secp256k1::SECP256K1.sign_schnorr(&id, &key).as_ref()
         ));
-        events.push(e);
+        e
+    };
+    let mut events = Vec::new();
+    for i in 0..12 {
+        events.push(sign(json!({"kind":if i % 3 == 0 { 1 } else { 1059 },"created_at":1_800_000_000+i,"tags":[["t","migration"],["p", if i % 2 == 0 { "01".repeat(32) } else { "02".repeat(32) }]],"content":format!("migration {i}: café 🦀 \\ \" \u{7f}")})));
     }
+    // strfry tombstones no replaceable event an `a` tag names, and a kind
+    // spelled with leading zeros tombstones that spelling. Wok's integrity
+    // accepts the canonical tombstones they lack.
+    events.push(sign(
+        json!({"kind":10002,"created_at":1_800_000_100,"tags":[],"content":"relays"}),
+    ));
+    events.push(sign(json!({"kind":5,"created_at":1_800_000_200,"tags":[
+        ["a", format!("10002:{pubkey}:")],
+        ["a", format!("030000:{pubkey}:x")]
+    ],"content":""})));
     let mut cpp = Command::new(&reference)
         .arg("--config")
         .arg(&config)
@@ -73,6 +87,12 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&result.stdout)
+            .contains("1 deletion requests name replaceable events or kinds with leading zeros"),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
     assert_eq!(
         Sha256::digest(std::fs::read(db.join("data.mdb")).unwrap()),
         data_before
@@ -106,6 +126,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
     let report = wok_db::check_integrity(&txn).unwrap();
     assert!(report.ok(), "{report:?}");
     assert_eq!(report.events, events.len() as u64);
+    assert_eq!(report.legacy_untombstoned_deletions, 1);
     let mut decompressor = wok_db::Decompressor::new();
     let mut actual = std::collections::BTreeMap::new();
     txn.foreach_full(target.dbis().event, &[], &[], false, |key, _| {

@@ -226,8 +226,11 @@ pub fn nostr_json_to_packed_event(
                 }
                 continue;
             } else if tag_name == "a" && kind == 5 {
-                let (tag_kind, tag_pubkey, _d) = parse_a_tag(tag_val)?;
-                let _ = tag_kind;
+                // Ingest also requires the canonical kind spelling
+                // (`parse_and_verify_event`). Packing accepts the leading
+                // zeros strfry and earlier releases stored, so reindex can
+                // pack such a record again.
+                let (_, tag_pubkey, _) = parse_a_tag(tag_val)?;
                 if tag_pubkey.as_slice() != pubkey.as_slice() {
                     return Err(EventError::msg("can't delete other user's events"));
                 }

@@ -114,6 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprint as `source_event_fingerprint_sha256`. Integrity reports
   `legacy_long_tag_records`, doctor warns while it is nonzero, and the
   migration manifest records it. Migration still copies records unchanged.
+- `wok reindex` applies the deletions its long-tag repair restores. Each
+  stored deletion request with an `a` tag longer than 255 bytes deletes the
+  versions of the address it names, by its author, up to its `created_at`, as
+  the relay does when such a request arrives (NIP-09). strfry and earlier
+  releases left those versions stored and visible. The request and newer
+  versions stay. The outcome and manifest count the deleted versions as
+  `deleted_under_repaired_deletions`, the original database in the backup
+  keeps them, and verification compares the result with the original's
+  fingerprint without them.
 
 ### Changed
 
@@ -215,6 +224,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A deletion request against a deletion request has no effect, as NIP-09
   requires. Before, a kind 5 deleting an earlier kind 5 removed it with its
   tombstone, and the originally deleted event could be published again.
+- A deletion's `a` tag naming a replaceable event, `<kind>:<pubkey>:` for
+  kinds 0, 3 and 10000–19999, deletes that author's versions up to the
+  request's `created_at` and refuses such versions published later, as NIP-09
+  asks and as for addressable events. Such deletions did nothing. Deletion
+  requests already stored, including those migrated from strfry, take effect
+  when `wok reindex` applies them; until then `wok doctor` warns
+  (`deletion-tombstones`).
+- A deletion `a` tag whose kind has leading zeros (`030000:<pubkey>:<d>`) is
+  refused with `invalid: a tag kind has leading zeros`, as are such lines in
+  `wok import` (fried included) and such events in `wok sync` and `wok router`
+  downloads. It deleted the stored versions of the address, but its tombstone
+  never refused later ones. Such
+  requests stored by strfry or earlier releases still name the canonical
+  address: `wok reindex` deletes the versions that came back and tombstones
+  the canonical spelling, except for an `a` tag longer than 255 bytes.
 - A kind 22242 AUTH event sent with EVENT is refused with
   `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
   to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.

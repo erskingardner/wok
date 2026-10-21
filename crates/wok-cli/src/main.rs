@@ -9,7 +9,9 @@ use wok_db::{
     check_integrity, delete_events, event_json_owned, write_events_with_policy, Decompressor, Env,
     EnvOptions, EventToWrite,
 };
-use wok_event::{parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView, AUTH_KIND};
+use wok_event::{
+    parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView, AUTH_KIND, DELETION_KIND,
+};
 use wok_negentropy::Storage;
 mod config_show;
 mod doctor;
@@ -577,6 +579,12 @@ fn cmd_reindex(
                 outcome.skipped_long_tag_records
             );
         }
+        if outcome.deleted_under_repaired_deletions != 0 {
+            cli_println!(
+                "Deleted {} versions under repaired deletion requests; the backup keeps them.",
+                outcome.deleted_under_repaired_deletions
+            );
+        }
         cli_println!("Database: {}", outcome.database.display());
         cli_println!("Original backup: {}", outcome.backup.display());
         cli_println!("Fingerprint: {}", outcome.event_fingerprint_sha256);
@@ -686,8 +694,13 @@ fn parse_import_line(
         )?;
         EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
     };
-    if PackedEventView::new(&event.packed)?.kind() == AUTH_KIND {
+    let kind = PackedEventView::new(&event.packed)?.kind();
+    if kind == AUTH_KIND {
         bail!(AUTH_EVENT_REFUSAL);
+    }
+    // parse_and_verify_event_with already refused a JSON line's padded kinds.
+    if fried && kind == DELETION_KIND {
+        wok_event::require_canonical_addresses(&wok_event::json::parse_strict(&event.json)?)?;
     }
     Ok(event)
 }
@@ -1589,6 +1602,52 @@ mod main_tests {
         event["id"] = json!("00".repeat(32));
         let line = wok_event::json::to_tao_string(&event);
         assert!(parse_import_line(&line, false, false, &limits).is_err());
+    }
+
+    #[test]
+    fn import_refuses_deletion_a_tags_that_pad_the_kind() {
+        // However a line arrives: JSON, verified or not, or fried, whose
+        // packed record is taken as it is.
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let pubkey = hex::encode(key.x_only_public_key().0.serialize());
+        let limits = EventLimits::default();
+        for (address, accepted) in [
+            (format!("30000:{pubkey}:x"), true),
+            (format!("030000:{pubkey}:x"), false),
+        ] {
+            let mut event = json!({
+                "created_at": 1_700_000_000u64,
+                "kind": 5,
+                "tags": [["a", address]],
+                "content": "",
+                "pubkey": pubkey,
+            });
+            let id = wok_event::event_id_hash(&event).unwrap();
+            event["id"] = json!(hex::encode(id));
+            event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+            let line = wok_event::json::to_tao_string(&event);
+            let packed = wok_event::nostr_json_to_packed_event(&event, &limits).unwrap();
+            let fried = format!(
+                "{},\"fried\":\"{}\"}}",
+                &line[..line.len() - 1],
+                hex::encode(packed.as_bytes())
+            );
+            for (line, fried, no_verify) in [
+                (&line, false, false),
+                (&line, false, true),
+                (&fried, true, false),
+            ] {
+                let result = parse_import_line(line, fried, no_verify, &limits);
+                let context = format!("{address} fried={fried} no_verify={no_verify}");
+                match result {
+                    Ok(_) => assert!(accepted, "{context}"),
+                    Err(error) => {
+                        assert!(!accepted, "{context}: {error:#}");
+                        assert!(format!("{error:#}").contains("leading zeros"), "{error:#}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

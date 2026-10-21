@@ -19,7 +19,10 @@ pub use error::EventError;
 pub use hash::{
     event_id_hash, legacy_event_id_hash, sha256, verify_id, verify_id_allowing_legacy, verify_sig,
 };
-pub use kinds::{is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag};
+pub use kinds::{
+    is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag,
+    parse_canonical_a_tag,
+};
 pub use packed::{
     hashed_tag_value_digest, indexed_tag_value, is_event_a_before_event_b, PackedEvent,
     PackedEventBuilder, PackedEventTag, PackedEventTagBuilder, PackedEventView,
@@ -30,8 +33,9 @@ pub use parse::{
     nostr_json_to_packed_event, to_hex, EventLimits, ParsedEvent, DEFAULT_MAX_EVENT_SIZE,
 };
 pub use validate::{
-    parse_and_verify_event, parse_and_verify_event_with, verify_event_json_size,
-    verify_event_timestamp, verify_nostr_event, IdPreimage, TimestampPolicy,
+    parse_and_verify_event, parse_and_verify_event_with, require_canonical_addresses,
+    verify_event_json_size, verify_event_timestamp, verify_nostr_event, IdPreimage,
+    TimestampPolicy,
 };
 
 pub const MAX_SUBID_SIZE: usize = 64;

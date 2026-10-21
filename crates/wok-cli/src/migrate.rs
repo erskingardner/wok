@@ -332,6 +332,12 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
             target_integrity.legacy_long_tag_records,
         );
     }
+    if target_integrity.legacy_untombstoned_deletions != 0 {
+        println!(
+            "{} deletion requests name replaceable events or kinds with leading zeros, which strfry did not tombstone; `wok reindex --confirm-relay-stopped` deletes the versions they name and adds the tombstones.",
+            target_integrity.legacy_untombstoned_deletions,
+        );
+    }
     println!("Wok config: {}", final_config.display());
     println!("Manifest: {}", output.join(MANIFEST_NAME).display());
     println!("Source files were not modified.");

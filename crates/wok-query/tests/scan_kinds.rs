@@ -417,3 +417,181 @@ fn count_and_req_ids_are_separate_namespaces() {
     scheduler.remove_sub(1, &SubId::new("x").unwrap());
     assert_eq!(run(&mut scheduler), vec![(true, 3)]);
 }
+
+fn sign_note(kp: &Keypair, created: u64, tags: &[&str], content: &str) -> (Vec<u8>, String) {
+    let (xonly, _) = kp.x_only_public_key();
+    let mut ev = json!({
+        "created_at": created,
+        "kind": 1,
+        "tags": tags.iter().map(|value| json!(["t", value])).collect::<Vec<_>>(),
+        "content": content,
+        "pubkey": hex::encode(xonly.serialize()),
+    });
+    let id = wok_event::event_id_hash(&ev).unwrap();
+    ev["id"] = json!(hex::encode(id));
+    let sig = SECP256K1.sign_schnorr(&id, kp);
+    ev["sig"] = json!(hex::encode(sig.as_ref()));
+    let parsed = parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).unwrap();
+    (parsed.packed.into_bytes(), parsed.json)
+}
+
+/// NIP-01 `limit: 0` returns no stored event, so no plan opens a cursor, and
+/// `until: 0` is a bound like any other: each cursor stops at its first newer
+/// entry instead of walking the index and discarding every entry.
+#[test]
+fn limit_zero_and_until_zero_read_no_history() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut rng = rand::thread_rng();
+    let key = Keypair::new(SECP256K1, &mut rng);
+    let author = hex::encode(key.x_only_public_key().0.serialize());
+    let mut events: Vec<_> = (0..200)
+        .map(|i| {
+            let (packed, json) = sign_note(&key, 1_700_000_000 + i, &["x"], &format!("n{i}"));
+            EventToWrite::new(packed, json)
+        })
+        .collect();
+    let mut write = env.begin_rw().unwrap();
+    write_events(&mut write, &mut NoopNegentropy, &mut events, false).unwrap();
+    write.commit().unwrap();
+
+    let txn = env.begin_ro().unwrap();
+    let id = hex::encode(
+        wok_event::PackedEventView::new(
+            txn.get_u64(txn.env().dbis().event, events[0].lev_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+        .id(),
+    );
+    let parse = |filter: &serde_json::Value| {
+        NostrFilterGroup::from_value(filter, 500, 3, 16)
+            .unwrap()
+            .filters
+            .remove(0)
+    };
+    for filter in [
+        json!({"limit": 0}),
+        json!({"kinds": [1], "limit": 0}),
+        json!({"authors": [author], "limit": 0}),
+        json!({"authors": [author], "kinds": [1], "limit": 0}),
+        json!({"authors": [author], "#t": ["x"], "limit": 0}),
+        json!({"ids": [id], "limit": 0}),
+    ] {
+        let f = parse(&filter);
+        let mut scan = DbScan::new(&f, &txn);
+        assert_eq!(scan.cursor_count(), 0, "{filter}");
+        assert!(scan
+            .scan(&txn, &f, |_| panic!("{filter}"), |_| false)
+            .unwrap());
+    }
+    for filter in [
+        json!({"until": 0}),
+        json!({"kinds": [1], "until": 0}),
+        json!({"authors": [author], "until": 0}),
+        json!({"authors": [author], "kinds": [1], "until": 0}),
+        json!({"#t": ["x"], "until": 0}),
+    ] {
+        let f = parse(&filter);
+        let mut scan = DbScan::new(&f, &txn);
+        assert!(scan
+            .scan(&txn, &f, |_| panic!("{filter}"), |_| false)
+            .unwrap());
+        assert!(scan.approx_work < 10, "{filter}: {}", scan.approx_work);
+    }
+}
+
+/// An outbox fetch (kinds 0, 3 and 10002 for a follow list) seeks each
+/// (author, kind) pair however many authors it names: those kinds hold few
+/// versions per pair, while the Pubkey index would read every event the
+/// authors wrote. Other kinds keep strfry's 1000-pair bound unless the seeks
+/// that adds over one per author fit the limit.
+#[test]
+fn author_kind_plans_seek_past_a_thousand_pairs_when_seeks_read_less() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let txn = env.begin_ro().unwrap();
+    let authors = |n: usize| (0..n).map(|i| format!("{i:064x}")).collect::<Vec<_>>();
+    let plan = |n: usize, kinds: serde_json::Value, limit: u64| {
+        let filter = json!({"authors": authors(n), "kinds": kinds, "limit": limit});
+        let group = NostrFilterGroup::from_value(&filter, u64::MAX, 3, 16).unwrap();
+        let scan = DbScan::new(&group.filters[0], &txn);
+        (scan.desc, scan.cursor_count())
+    };
+    let outbox = json!([0, 3, 10002]);
+    assert_eq!(plan(333, outbox.clone(), 500), ("PubkeyKind", 999));
+    assert_eq!(plan(334, outbox.clone(), 500), ("PubkeyKind", 1002));
+    assert_eq!(plan(2047, outbox, 500), ("PubkeyKind", 6141));
+    assert_eq!(
+        plan(2047, json!([0, 3, 10002, 30023]), 1),
+        ("PubkeyKind", 8188)
+    );
+    // Past the cap of cursor state, every kind falls back.
+    let many: Vec<_> = (10000..10009).collect();
+    assert_eq!(plan(2047, json!(many), u64::MAX), ("Pubkey", 2047));
+
+    assert_eq!(plan(333, json!([1, 6, 7]), 500), ("PubkeyKind", 999));
+    assert_eq!(plan(334, json!([1, 6, 7]), 500), ("Pubkey", 334));
+    assert_eq!(plan(334, json!([0, 1, 3]), 500), ("Pubkey", 334));
+    // One kind adds no seeks over the Pubkey plan.
+    assert_eq!(plan(2047, json!([1]), 1), ("PubkeyKind", 2047));
+    // A limit (COUNT and NEG-OPEN use their caps) pays for the extra seeks.
+    assert_eq!(plan(1000, json!([1, 6, 7]), 2000), ("PubkeyKind", 3000));
+    assert_eq!(plan(1000, json!([1, 6, 7]), 1999), ("Pubkey", 1000));
+    assert_eq!(
+        plan(2047, json!([7, 9735]), 1_000_001),
+        ("PubkeyKind", 4094)
+    );
+}
+
+#[test]
+fn outbox_fetch_past_a_thousand_pairs_returns_the_newest_versions() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut rng = rand::thread_rng();
+    let keys: Vec<_> = (0..400)
+        .map(|_| Keypair::new(SECP256K1, &mut rng))
+        .collect();
+    let mut events = Vec::new();
+    for (a, key) in keys.iter().enumerate() {
+        let a = a as u64;
+        for (i, kind) in [0, 3, 10002].into_iter().enumerate() {
+            // An older version each replaceable event supersedes.
+            let (packed, json, _) = sign_with_key(key, kind, "old", 1_600_000_000 + a);
+            events.push(EventToWrite::new(packed, json));
+            let created = 1_700_000_000 + a * 10 + i as u64;
+            let (packed, json, _) = sign_with_key(key, kind, "new", created);
+            events.push(EventToWrite::new(packed, json));
+        }
+        let (packed, json, _) = sign_with_key(key, 1, "note", 1_800_000_000 + a);
+        events.push(EventToWrite::new(packed, json));
+    }
+    let mut write = env.begin_rw().unwrap();
+    write_events(&mut write, &mut NoopNegentropy, &mut events, false).unwrap();
+    write.commit().unwrap();
+
+    let txn = env.begin_ro().unwrap();
+    let authors: Vec<_> = keys
+        .iter()
+        .map(|kp| hex::encode(kp.x_only_public_key().0.serialize()))
+        .collect();
+    let created = |lev: u64| {
+        let raw = txn.get_u64(txn.env().dbis().event, lev).unwrap().unwrap();
+        wok_event::PackedEventView::new(raw).unwrap().created_at()
+    };
+    for limit in [500, 1200] {
+        let filter = json!({"authors": authors, "kinds": [0, 3, 10002], "limit": limit});
+        let mut got = Vec::new();
+        foreach_by_filter(&txn, &filter, 2000, 3, 16, |lev| got.push(created(lev))).unwrap();
+        let want: Vec<_> = (0..400u64)
+            .rev()
+            .flat_map(|a| (0..3).rev().map(move |i| 1_700_000_000 + a * 10 + i))
+            .take(limit)
+            .collect();
+        assert_eq!(got, want, "limit {limit}");
+    }
+}

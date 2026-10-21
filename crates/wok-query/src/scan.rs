@@ -39,6 +39,45 @@ impl CandidateEvent {
     }
 }
 
+/// Most (author, kind) cursors a PubkeyKind plan opens past strfry's 1000:
+/// about 4 MiB of cursor state, enough for every author a filter can name
+/// (2047 fit its 65535 bytes) across eight kinds.
+const MAX_PUBKEY_KIND_CURSORS: usize = 16_384;
+
+/// Whether an `authors` and `kinds` filter seeks each (author, kind) pair in
+/// the PubkeyKind index instead of reading every event the authors wrote from
+/// the Pubkey index and checking its kind.
+fn plans_pubkey_kind(f: &NostrFilter) -> bool {
+    let (Some(authors), Some(kinds)) = (&f.authors, &f.kinds) else {
+        return false;
+    };
+    let pairs = authors.size().saturating_mul(kinds.size());
+    // strfry's bound (DBQuery.h).
+    if pairs < 1000 {
+        return true;
+    }
+    if pairs > MAX_PUBKEY_KIND_CURSORS {
+        return false;
+    }
+    // A replaceable kind holds one live version per author and an addressable
+    // kind one per address, so every seek reads few entries, all of them
+    // matches, while the Pubkey index would read the authors' whole history.
+    if kinds.iter().all(|kind| {
+        wok_event::is_replaceable_kind(kind) || wok_event::is_param_replaceable_kind(kind)
+    }) {
+        return true;
+    }
+    // Otherwise the Pubkey plan wins only when `limit` stops it early on kinds
+    // most of the authors' events have, and it reads each candidate's event
+    // to check the kind. While the seeks this plan adds stay within `limit`,
+    // it costs at most about twice as much even then, and far less when few
+    // events match or the limit is not reached. That holds for one kind and
+    // for COUNT and NEG-OPEN, whose limits are their caps. Sparse kinds under
+    // a small limit still read the authors' history: telling them apart
+    // needs statistics.
+    pairs - authors.size() <= usize::try_from(f.limit).unwrap_or(usize::MAX)
+}
+
 fn cmp_cand(a: &CandidateEvent, b: &CandidateEvent) -> std::cmp::Ordering {
     // Newer first; if equal created, higher levId first (matches C++ sort predicate).
     b.created()
@@ -117,14 +156,14 @@ impl ScanCursor {
                 let Ok((prefix, created)) = parsed else {
                     return true;
                 };
-                if since != 0 && created < since {
+                if created < since {
                     self.resume_key = make_key_string_u64(prefix, 0);
                     self.resume_val = 0;
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
-                if until != 0 && until != u64::MAX && created > until {
+                if created > until {
                     self.resume_key = make_key_string_u64(prefix, until);
                     self.resume_val = u64::MAX;
                     finished_naturally = false;
@@ -518,7 +557,10 @@ impl DbScan {
         // this probe to 64 postings and eight seeks per alternative; avoid a
         // statistics table or a database-sized planning pass. Uncertain/error
         // cases retain the established plan.
-        if f.ids.is_none() && f.authors.is_some() && (!f.tags.is_empty() || !f.and_tags.is_empty())
+        if !default.cursors.is_empty()
+            && f.ids.is_none()
+            && f.authors.is_some()
+            && (!f.tags.is_empty() || !f.and_tags.is_empty())
         {
             let mut author_filter = f.clone();
             author_filter.tags.clear();
@@ -568,10 +610,7 @@ impl DbScan {
             (dbis.event_id, "ID")
         } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
             (dbis.event_tag, "Tag")
-        } else if f.authors.is_some()
-            && f.kinds.is_some()
-            && f.authors.as_ref().unwrap().size() * f.kinds.as_ref().unwrap().size() < 1000
-        {
+        } else if plans_pubkey_kind(f) {
             (dbis.event_pubkey_kind, "PubkeyKind")
         } else if f.authors.is_some() {
             if f.kinds.is_some() {
@@ -584,7 +623,10 @@ impl DbScan {
             (dbis.event_created_at, "CreatedAt")
         };
 
-        if let Some(ids) = &f.ids {
+        if f.limit == 0 || f.never_match {
+            // No stored event can be returned (NIP-01 `limit: 0`), so no
+            // index is read.
+        } else if let Some(ids) = &f.ids {
             for i in 0..ids.size() {
                 let search = ids.at(i).to_vec();
                 let mut resume = search.clone();
@@ -627,10 +669,7 @@ impl DbScan {
                     outstanding: 0,
                 });
             }
-        } else if f.authors.is_some()
-            && f.kinds.is_some()
-            && f.authors.as_ref().unwrap().size() * f.kinds.as_ref().unwrap().size() < 1000
-        {
+        } else if plans_pubkey_kind(f) {
             let authors = f.authors.as_ref().unwrap();
             let kinds = f.kinds.as_ref().unwrap();
             for i in 0..authors.size() {
@@ -807,7 +846,12 @@ impl DbQuery {
     /// completes the query with limited: true.
     pub fn new(sub: Subscription, max_total_events: u64, count_dedup_budget: u64) -> Self {
         let max_total_events = if sub.count_only { 0 } else { max_total_events };
-        let hll = if sub.count_only && sub.filter_group.filters.len() == 1 {
+        // A sketch is for a COUNT that sent one filter, even if others were
+        // dropped as never matching.
+        let hll = if sub.count_only
+            && sub.filter_group.filters.len() == 1
+            && sub.filter_group.never_matching == 0
+        {
             HyperLogLog::for_filter(&sub.filter_group.filters[0])
         } else {
             None

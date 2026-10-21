@@ -25,10 +25,19 @@ pub enum IdPreimage {
     Nip01OrLegacy,
 }
 
+/// NIP-42 suggests relays accept AUTH events whose `created_at` is within
+/// about ten minutes of their clock, in either direction.
+pub const AUTH_TIMESTAMP_WINDOW_SECS: u64 = 600;
+
+/// How long before publication a kind 21059 ephemeral gift wrap may be dated.
+/// NIP-59 backdates wraps by up to two days; the third day is slack.
+pub const GIFT_WRAP_BACKDATE_SECS: u64 = 3 * 86_400;
+
 #[derive(Debug, Clone)]
 pub struct TimestampPolicy {
     pub now_secs: u64,
     pub reject_newer_than_secs: u64,
+    /// Oldest a non-ephemeral event may be; 0 means no lower bound.
     pub reject_older_than_secs: u64,
     pub reject_ephemeral_older_than_secs: u64,
 }
@@ -99,11 +108,14 @@ pub fn verify_event_timestamp(
     let ts = packed.created_at();
     let is_ephemeral = packed.expiration() == 1;
 
-    let mut earliest = now.saturating_sub(if is_ephemeral {
+    let max_age = if is_ephemeral {
         policy.reject_ephemeral_older_than_secs
+    } else if policy.reject_older_than_secs == 0 {
+        u64::MAX
     } else {
         policy.reject_older_than_secs
-    });
+    };
+    let mut earliest = now.saturating_sub(max_age);
     let mut latest = now.saturating_add(policy.reject_newer_than_secs);
 
     // Match C++ overflow handling.
@@ -332,6 +344,32 @@ mod tests {
         assert!(verify_event_timestamp(packed.view(), &policy).is_ok());
         let packed = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 95, 1, 90, &tags).unwrap();
         assert!(verify_event_timestamp(packed.view(), &policy).is_err());
+    }
+
+    #[test]
+    fn zero_means_no_lower_bound_for_non_ephemeral_events() {
+        let tags = PackedEventTagBuilder::default();
+        let now = 1_700_000_000;
+        let policy = TimestampPolicy {
+            now_secs: now,
+            reject_newer_than_secs: 900,
+            reject_older_than_secs: 0,
+            reject_ephemeral_older_than_secs: 60,
+        };
+        for created_at in [0, 1_577_836_800, now] {
+            let packed =
+                PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], created_at, 0, 0, &tags).unwrap();
+            verify_event_timestamp(packed.view(), &policy).unwrap();
+        }
+        let packed =
+            PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], now + 901, 0, 0, &tags).unwrap();
+        let err = verify_event_timestamp(packed.view(), &policy).unwrap_err();
+        assert_eq!(err.to_string(), "created_at too late");
+        // The ephemeral window has its own bound.
+        let packed =
+            PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], now - 61, 20_001, 1, &tags).unwrap();
+        let err = verify_event_timestamp(packed.view(), &policy).unwrap_err();
+        assert_eq!(err.to_string(), "ephemeral event expired");
     }
 
     #[test]

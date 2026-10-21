@@ -36,8 +36,8 @@ use wok_db::{
     EventWriteStatus, ModerationSnapshot, MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
 };
 use wok_event::{
-    parse_and_verify_event, to_hex, PackedEventView, TimestampPolicy, AUTH_CHALLENGE_LEN,
-    AUTH_KIND, GIFT_WRAP_KINDS, PROTECTED_TAG, REPOST_KINDS,
+    parse_and_verify_event, to_hex, PackedEventView, AUTH_CHALLENGE_LEN, AUTH_KIND,
+    GIFT_WRAP_KINDS, PROTECTED_TAG, REPOST_KINDS,
 };
 use wok_negentropy::{DeferredSink, NegentropyFilterCache};
 mod negentropy;
@@ -2472,13 +2472,12 @@ fn ingest_auth_inner(
     let asess = auth
         .get_mut(&conn_id)
         .ok_or("no auth status available for connection")?;
-    let policy = TimestampPolicy::from_now(
-        cfg.events.reject_newer_than_secs,
-        cfg.events.reject_older_than_secs,
-        cfg.events.reject_ephemeral_older_than_secs,
-    );
+    // NIP-42's window of about ten minutes, not `[events]`: the challenge
+    // already prevents replay. An AUTH event that fails validation is
+    // `invalid:`, as it would be if sent as EVENT.
+    let policy = cfg.timestamp_policy_for_kind(AUTH_KIND);
     let parsed = parse_and_verify_event(event_json, &cfg.event_limits(), Some(&policy), true, true)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("invalid: {e}"))?;
     let packed = parsed.packed.view();
     if packed.kind() != AUTH_KIND {
         return Err("wrong event kind, expected 22242".into());

@@ -108,6 +108,15 @@ it is not a promise to reproduce upstream bugs.
   also packs single-letter tag values longer than 255 bytes, by hash, where v3
   drops them; shorter values pack exactly as in v3. Migration keeps v3 records
   byte for byte; `wok reindex` repacks them.
+- History order: stored events with the same `created_at` are sent in local
+  arrival order, newest arrival first, as in the pinned strfry. NIP-01 says
+  the lowest id should come first, and that order also decides which tied
+  events a `limit` keeps.
+  - No index orders by id. Selecting the lowest ids within the scanner's
+    memory, time-slice and resumability bounds proved complex, so this is
+    deferred.
+  - The options are a capped re-sort of only the tie that a `limit` cuts, or
+    an index key that holds the id, in a future storage version.
 
 Each correction cites a pinned NIP or a Wok safety requirement and adds a
 regression test. Differential parity alone is not a reason to retain it.
@@ -237,6 +246,25 @@ regression test. Differential parity alone is not a reason to retain it.
   alongside kinds 4 and 1059, and NIP-59 is advertised only while both
   gift-wrap kinds are restricted. The previous default let any
   unauthenticated subscriber receive wraps addressed to someone else.
+- `created_at` has no lower bound by default, and
+  `events.reject_older_than_secs = 0` means none. The pinned strfry defaults
+  to three years (`rejectEventsOlderThanSeconds = 94608000`) and treats 0 as
+  "now", refusing every event dated in the past. A bound an operator sets
+  applies to regular kinds only: replaceable and addressable events,
+  deletions (5) and vanish requests (62) are accepted whatever their age.
+  NIP-11 omits `created_at_lower_limit` while there is no bound.
+- NIP-42: AUTH is accepted within 600 seconds of the relay clock in either
+  direction, whatever `[events]` says. The pinned strfry checks AUTH like any
+  ephemeral event, within `rejectEphemeralEventsOlderThanSeconds` (60), so a
+  client whose clock ran a minute slow could not authenticate. An AUTH event
+  that fails validation is refused with `invalid:`, where strfry uses
+  `error:`.
+- NIP-59: kind 21059 gift wraps may be dated up to three days in the past,
+  whatever `reject_ephemeral_older_than_secs` says, because NIP-59
+  backdates wraps by up to two days. The pinned strfry refused every such
+  wrap older than 60 seconds. In `ttl` mode a wrap older than
+  `ephemeral_lifetime_secs` reaches live subscribers, but the next purge
+  removes it, so history does not serve it.
 - NIP-42: kind 22242 events reach no client. One sent as EVENT is refused
   with `invalid: AUTH events must be sent with AUTH`. `wok import` refuses
   one, as do `wok sync` and `wok router` downloads, in either ephemeral mode.

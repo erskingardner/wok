@@ -2,7 +2,7 @@
 
 Cross-crate test crate: NIP conformance, transport e2e, plugins, and optional C++ differentials. Not a runtime dependency of the relay.
 
-NIPs pin used by the conformance suite: `656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab` (`nips_commit()` in `src/lib.rs`). C++ diffs need `STRFRY_BIN` (default `/Users/jeff/code/strfry/strfry`).
+NIPs pin used by the conformance suite: `0b5532c0355ab27f447e071a93c09cf3a2b4aad5` (`nips_commit()` in `src/lib.rs`). C++ diffs need `STRFRY_BIN` (default `/Users/jeff/code/strfry/strfry`).
 
 ## Layout
 

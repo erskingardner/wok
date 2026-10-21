@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+mod author_kinds;
 mod clients;
 mod transport;
 
@@ -151,6 +152,23 @@ struct Args {
     /// last memory sample (0 skips it).
     #[arg(long, default_value_t = 0)]
     transport_idle_secs: u64,
+    /// Second wok binary that --scenario author_kinds measures on the same
+    /// dataset, for a before/after comparison (for example a build of master).
+    #[arg(long)]
+    wok_baseline: Option<PathBuf>,
+    /// Authors in the --scenario author_kinds dataset.
+    #[arg(long, default_value_t = 5_000)]
+    authors: usize,
+    /// Directory that keeps --scenario author_kinds datasets, so later runs
+    /// and other binaries reuse the same database files.
+    #[arg(long, default_value = "bench-results/datasets")]
+    dataset_dir: PathBuf,
+    /// Warm runs per --scenario author_kinds query shape, after one cold run.
+    #[arg(long, default_value_t = 15)]
+    warm_runs: usize,
+    /// Seconds after which a shape stops its warm runs (it keeps at least 3).
+    #[arg(long, default_value_t = 30)]
+    shape_secs: u64,
 }
 
 impl Args {
@@ -196,6 +214,7 @@ struct Trial {
     clients: Option<clients::ClientsReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport: Option<transport::TransportReport>,
+    author_kinds: Option<author_kinds::Report>,
 }
 
 #[derive(Serialize)]
@@ -326,6 +345,7 @@ fn main() -> Result<()> {
         "cold_start",
         "clients",
         "ws_transport",
+        "author_kinds",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -389,7 +409,15 @@ fn main() -> Result<()> {
     } else {
         20_000
     };
-    let (corpus_path, event_count) = if let Some(path) = &args.corpus {
+    let (corpus_path, event_count) = if args.scenario.as_deref() == Some("author_kinds") {
+        anyhow::ensure!(
+            args.corpus.is_none() && !args.has_external_target(),
+            "--scenario author_kinds generates its own dataset and starts its own relays"
+        );
+        let opts = author_kinds_options(&args)?;
+        author_kinds::ensure_dataset(&opts)?;
+        (author_kinds::Dataset::corpus_path(&opts), opts.events)
+    } else if let Some(path) = &args.corpus {
         let path = std::fs::canonicalize(path)
             .with_context(|| format!("open corpus {}", path.display()))?;
         let count = count_jsonl_events(&path)?;
@@ -453,7 +481,10 @@ fn main() -> Result<()> {
         for scenario in &scenarios {
             let mut relays: Vec<&str> = if args.has_external_target() {
                 vec![args.target_label.as_str()]
-            } else if matches!(*scenario, "nip50_search" | "clients" | "ws_transport") {
+            } else if matches!(
+                *scenario,
+                "nip50_search" | "clients" | "ws_transport" | "author_kinds"
+            ) {
                 vec!["wok"]
             } else {
                 RELAYS.to_vec()
@@ -527,6 +558,7 @@ fn run_trial(
     let mut throughput = 0.0f64;
     let mut clients_report = None;
     let mut transport_report = None;
+    let mut author_kinds_report = None;
 
     let bin = if args.has_external_target() {
         None
@@ -852,6 +884,21 @@ fn run_trial(
                 }
             }
         }
+        "author_kinds" => match author_kinds::run(rt, &author_kinds_options(args)?) {
+            Ok(report) => {
+                mismatches += report.mismatches.len() as u64;
+                notes = format!(
+                    "{} measurements; time to EOSE per shape in the author_kinds table",
+                    report.rows.len()
+                );
+                author_kinds_report = Some(report);
+            }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e:#}");
+            }
+        },
         _ => {
             notes = "unrecognized scenario".into();
             ok = false;
@@ -861,6 +908,7 @@ fn run_trial(
     Ok(Trial {
         clients: clients_report,
         transport: transport_report,
+        author_kinds: author_kinds_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -900,6 +948,7 @@ fn failed_trial(
     Trial {
         clients: None,
         transport: None,
+        author_kinds: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -2464,6 +2513,31 @@ fn cold_start_trial(
     Ok(ms)
 }
 
+fn author_kinds_options(args: &Args) -> Result<author_kinds::Options> {
+    // `write_conf` writes Wok TOML only for a binary named `wok`.
+    let canonical = |path: &Path| {
+        anyhow::ensure!(
+            path.file_name().and_then(|name| name.to_str()) == Some("wok"),
+            "{} must be named wok",
+            path.display()
+        );
+        std::fs::canonicalize(path).with_context(|| format!("wok binary {}", path.display()))
+    };
+    Ok(author_kinds::Options {
+        wok: canonical(&args.wok)?,
+        baseline: args.wok_baseline.as_deref().map(canonical).transpose()?,
+        // The importer runs in the database directory, so a relative path
+        // would resolve under it.
+        dataset_dir: std::path::absolute(&args.dataset_dir)
+            .with_context(|| format!("dataset directory {}", args.dataset_dir.display()))?,
+        authors: args.authors,
+        events: args.events.unwrap_or(1_000_000),
+        seed: args.seed,
+        warm_runs: args.warm_runs.max(1),
+        shape_secs: args.shape_secs,
+    })
+}
+
 fn clients_options(args: &Args) -> clients::ClientsOptions {
     clients::ClientsOptions {
         outbox_clients: args.clients,
@@ -2710,6 +2784,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.transport {
             s.push_str(&transport::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.author_kinds {
+            s.push_str(&author_kinds::render_markdown(report));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -2749,6 +2826,19 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             args.churn_connections,
             args.events.unwrap_or_default(),
         ));
+    }
+    if args.scenario.as_deref() == Some("author_kinds") {
+        selection.push_str(&format!(
+            " --events {} --authors {} --warm-runs {} --shape-secs {} --dataset-dir \"{}\"",
+            args.events.unwrap_or_default(),
+            args.authors,
+            args.warm_runs,
+            args.shape_secs,
+            args.dataset_dir.display(),
+        ));
+        if let Some(path) = &args.wok_baseline {
+            selection.push_str(&format!(" --wok-baseline \"{}\"", path.display()));
+        }
     }
     let target = if let Some(path) = &args.target_unix {
         format!(
@@ -3008,6 +3098,24 @@ mod tests {
                     .as_array()
                     .is_some_and(|tags| tags.iter().any(|tag| tag[0] == "e"))
         }));
+    }
+
+    #[test]
+    fn author_kinds_datasets_resolve_to_an_absolute_directory() {
+        let bin = TempDir::new().unwrap();
+        let wok = bin.path().join("wok");
+        std::fs::write(&wok, b"").unwrap();
+        let args = Args::try_parse_from([
+            "wok-bench".as_ref(),
+            "--scenario".as_ref(),
+            "author_kinds".as_ref(),
+            "--wok".as_ref(),
+            wok.as_os_str(),
+        ])
+        .unwrap();
+        let opts = author_kinds_options(&args).unwrap();
+        assert!(opts.dataset_dir.is_absolute());
+        assert!(opts.dataset_dir.ends_with("bench-results/datasets"));
     }
 
     #[test]

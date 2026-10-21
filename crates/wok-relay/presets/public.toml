@@ -11,3 +11,12 @@
 # selected preset's overlay, then the operator's file. Each layer replaces
 # individual keys, not whole sections. An overlay contains only the keys its
 # preset changes.
+#
+# Defaults chosen for real client traffic rather than inherited from strfry
+# (https://github.com/erskingardner/wok/issues/97):
+#
+# - [events] reject_older_than_secs = 0: no lower bound on created_at (was
+#   three years). Old profiles, lists and deletions can be rebroadcast, and a
+#   bound set in the operator's file never applies to replaceable,
+#   addressable, deletion or vanish events. AUTH and kind 21059 gift wraps
+#   use the windows NIP-42 and NIP-59 call for.

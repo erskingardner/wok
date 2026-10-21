@@ -89,15 +89,17 @@ fn public_tree_allowed(
     cfg: &Config,
 ) -> Result<bool, wok_db::DbError> {
     let db = txn.env().dbis();
-    if !wok_query::visibility::physical_tree_is_globally_visible(txn, &sub.filter_group.filters[0])?
-    {
+    // A filter that never matches leaves no filter; its memory view is empty.
+    let Some(filter) = sub.filter_group.filters.first() else {
+        return Ok(false);
+    };
+    if !wok_query::visibility::physical_tree_is_globally_visible(txn, filter)? {
         return Ok(false);
     }
     let policy = restrictor(cfg);
     if !policy.restrict_to_involved {
         return Ok(true);
     }
-    let filter = &sub.filter_group.filters[0];
     for kind in &policy.restricted_kinds {
         if filter
             .kinds
@@ -260,9 +262,10 @@ pub(super) fn run_negentropy(
                     for f in &mut sub.filter_group.filters {
                         f.limit = f.limit.min(cap);
                     }
-                    let limit = sub.filter_group.filters[0].limit;
+                    let first = sub.filter_group.filters.first();
+                    let limit = first.map_or(0, |f| f.limit);
                     let per_item = wok_negentropy::memory_view_item_bytes(
-                        sub.filter_group.filters[0].search.is_some(),
+                        first.is_some_and(|f| f.search.is_some()),
                     );
                     let bytes = if tree_id.is_some() {
                         ROUND_BYTES

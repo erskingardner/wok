@@ -374,7 +374,6 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "max_event_tags": cfg.events.max_num_tags,
             "max_tags_per_filter": cfg.relay.max_tags_per_filter,
             "max_and_entries": cfg.relay.max_and_entries,
-            "created_at_lower_limit": cfg.events.reject_older_than_secs,
             "created_at_upper_limit": cfg.events.reject_newer_than_secs,
             "default_limit": cfg.relay.max_filter_limit,
             "min_pow_difficulty": min_pow_difficulty,
@@ -382,6 +381,11 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "max_concurrent_historical_queries": cfg.relay.abuse.max_concurrent_historical_queries,
         }
     });
+    // NIP-11 has no value for "no lower bound", so the field is omitted.
+    if cfg.events.reject_older_than_secs != 0 {
+        v["limitation"]["created_at_lower_limit"] =
+            serde_json::json!(cfg.events.reject_older_than_secs);
+    }
     let info = &cfg.relay.info;
     if !info.name.is_empty() {
         v["name"] = serde_json::json!(info.name);

@@ -1,6 +1,6 @@
 # Supported NIPs
 
-Conformance suite pins nostr-protocol/nips at `656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab`.
+Conformance suite pins nostr-protocol/nips at `0b5532c0355ab27f447e071a93c09cf3a2b4aad5`.
 
 Only NIPs for which Wok implements observable **relay behavior** and has
 conformance coverage are advertised in NIP-11. The authoritative typed catalog
@@ -30,6 +30,19 @@ capabilities.
 
 ID and author filter values must be exactly 64 lowercase hexadecimal
 characters, as required by current NIP-01. Prefix filters are rejected.
+
+An empty `ids`, `authors`, `kinds` or `#x` list matches no event, as NIP-01
+requires; it is not treated as an absent field. Such a filter is skipped and
+the request's other filters still apply. A REQ whose filters all have an empty
+list gets EOSE and stays open, a COUNT reports 0, and a NEG-OPEN reconciles
+against no events. Filter-validation limits still count the skipped filters.
+
+A filter with `limit: 0` returns no stored events. The subscription still gets
+EOSE once its other filters have sent theirs, and stays open for new events.
+
+Stored events are sent newest first. Events with the same `created_at` are
+sent in local arrival order, not lowest id first as NIP-01 suggests; see
+[known differences](known-differences.md).
 
 NIP-01 replacement is enforced when reading, even if a lossless migration
 retained multiple versions. Kinds 0, 3 (contact lists), and 10000–19999 select
@@ -101,8 +114,8 @@ deleted with kind 5. See `relay.nip62` in the sample configuration.
 
 NIP-86 management calls are JSON-RPC-like POSTs to the relay URI authorized
 by NIP-98 events from operator admins or role-holding moderators. They follow
-NIP-86 at nips `62d5fed`, newer than the pin, without its NIP-43 claim
-methods. Bans suppress rather than delete; allowlists gate writes only when
+NIP-86 at nips `62d5fed`, which is unchanged at the pin, without its NIP-43
+claim methods. Bans suppress rather than delete; allowlists gate writes only when
 `relay.auth.restrict_writes` is set; kind-1984 reports feed the moderation
 queue. See [NIP-86 management](nip86.md) for levels, role semantics, and the
 method table.

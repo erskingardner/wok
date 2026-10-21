@@ -299,7 +299,10 @@ mod tests {
         assert!(report.ok(), "{:#?}", report.issues);
         let tag_kind = report.tag_kind_index.unwrap();
         assert!(!tag_kind.complete);
-        assert_eq!((tag_kind.expected_entries, tag_kind.missing_entries), (2, 0));
+        assert_eq!(
+            (tag_kind.expected_entries, tag_kind.missing_entries),
+            (2, 0)
+        );
     }
 
     #[test]

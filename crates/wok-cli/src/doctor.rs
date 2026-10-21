@@ -386,13 +386,20 @@ fn check_tag_kind_index(tag_kind: Option<&TagKindIndexReport>, report: &mut Doct
             return;
         }
     }
+    let counted =
+        |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut status = CheckStatus::Pass;
     let mut details = Vec::new();
     if tag_kind.missing_entries != 0 || tag_kind.unexpected_entries != 0 {
         status = CheckStatus::Fail;
+        let (missing, unexpected) = (tag_kind.missing_entries, tag_kind.unexpected_entries);
         details.push(format!(
-            "{} entries are missing and {} do not match their event; {REINDEX} rebuilds the index",
-            tag_kind.missing_entries, tag_kind.unexpected_entries
+            "{missing} missing and {unexpected} mismatched {}; {REINDEX} rebuilds the index",
+            if missing + unexpected == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
         ));
     }
     if !tag_kind.complete {
@@ -409,14 +416,14 @@ fn check_tag_kind_index(tag_kind: Option<&TagKindIndexReport>, report: &mut Doct
             status = CheckStatus::Warn;
         }
         details.push(format!(
-            "{} entries name events that an earlier Wok release deleted; reads skip them, and {REINDEX} rebuilds the index without them",
-            tag_kind.stale_entries
+            "{} events that an earlier Wok release deleted; reads skip them, and {REINDEX} rebuilds the index without them",
+            counted(tag_kind.stale_entries, "entry names", "entries name")
         ));
     }
     if details.is_empty() {
         details.push(format!(
-            "{} entries index every stored event",
-            tag_kind.actual_entries
+            "{} every stored event",
+            counted(tag_kind.actual_entries, "entry indexes", "entries index")
         ));
     }
     report.add(NAME, status, details.join("; "));
@@ -741,14 +748,9 @@ mod tests {
             let id = wok_event::event_id_hash(&event).unwrap();
             event["id"] = json!(hex::encode(id));
             event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &keypair).as_ref()));
-            let parsed = wok_event::parse_and_verify_event(
-                &event,
-                &Default::default(),
-                None,
-                true,
-                false,
-            )
-            .unwrap();
+            let parsed =
+                wok_event::parse_and_verify_event(&event, &Default::default(), None, true, false)
+                    .unwrap();
             events.push(wok_db::EventToWrite::new(
                 parsed.packed.into_bytes(),
                 parsed.json,
@@ -791,7 +793,7 @@ mod tests {
         assert!(
             tag_kind
                 .detail
-                .starts_with("1 entries name events that an earlier Wok release deleted"),
+                .starts_with("1 entry names events that an earlier Wok release deleted"),
             "{}",
             tag_kind.detail
         );
@@ -811,7 +813,7 @@ mod tests {
         assert!(
             tag_kind
                 .detail
-                .starts_with("1 entries are missing and 0 do not match their event"),
+                .starts_with("1 missing and 0 mismatched entry"),
             "{}",
             tag_kind.detail
         );

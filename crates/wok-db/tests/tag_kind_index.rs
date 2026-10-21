@@ -28,8 +28,8 @@ fn signed(key: &Keypair, kind: u64, created_at: u64, tags: Value) -> ([u8; 32], 
     let id = wok_event::event_id_hash(&event).unwrap();
     event["id"] = json!(hex::encode(id));
     event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, key).as_ref()));
-    let parsed = wok_event::parse_and_verify_event(&event, &Default::default(), None, true, false)
-        .unwrap();
+    let parsed =
+        wok_event::parse_and_verify_event(&event, &Default::default(), None, true, false).unwrap();
     (
         id,
         EventToWrite::new(parsed.packed.into_bytes(), parsed.json),
@@ -151,7 +151,12 @@ fn every_write_and_deletion_path_keeps_the_index_equal_to_the_tag_index() {
         &alice,
         1,
         1_000,
-        json!([["t", "nostr"], ["t", "rust"], ["p", &bob_hex], ["r", &long_url]]),
+        json!([
+            ["t", "nostr"],
+            ["t", "rust"],
+            ["p", &bob_hex],
+            ["r", &long_url]
+        ]),
     );
     let (_, reaction) = signed(
         &bob,
@@ -163,16 +168,15 @@ fn every_write_and_deletion_path_keeps_the_index_equal_to_the_tag_index() {
         &bob,
         9735,
         1_002,
-        json!([["e", hex::encode(note_id)], ["p", &alice_hex], ["P", &bob_hex]]),
+        json!([
+            ["e", hex::encode(note_id)],
+            ["p", &alice_hex],
+            ["P", &bob_hex]
+        ]),
     );
     let (gift_id, gift) = signed(&sender, 1059, 1_003, json!([["p", &alice_hex]]));
     let (_, profile) = signed(&alice, 0, 1_004, json!([]));
-    let (_, article) = signed(
-        &alice,
-        30023,
-        1_005,
-        json!([["d", "post"], ["t", "nostr"]]),
-    );
+    let (_, article) = signed(&alice, 30023, 1_005, json!([["d", "post"], ["t", "nostr"]]));
     let (_, expiring) = signed(
         &alice,
         1,
@@ -274,12 +278,15 @@ fn drifted_database(dir: &TempDir) -> (Env, Postings) {
     let mut txn = env.begin_rw().unwrap();
     // An earlier release deleting an event leaves its entries.
     for key in tag_kind_keys(&deleted.packed) {
-        txn.put(dbi, &key, &deleted.lev_id.to_ne_bytes(), 0).unwrap();
+        txn.put(dbi, &key, &deleted.lev_id.to_ne_bytes(), 0)
+            .unwrap();
     }
     // An entry a stored event lacks.
     let missing = &events[2];
     let key = &tag_kind_keys(&missing.packed)[0];
-    assert!(txn.del(dbi, key, Some(&missing.lev_id.to_ne_bytes())).unwrap());
+    assert!(txn
+        .del(dbi, key, Some(&missing.lev_id.to_ne_bytes()))
+        .unwrap());
     // An entry a stored event does not derive: the right tag, another kind.
     let view = PackedEventView::new(&events[3].packed).unwrap();
     let unexpected = tag_kind_key(b't', b"t3", 30023, view.created_at());

@@ -13,7 +13,7 @@ quirk. It also provides an additional Unix-domain socket transport.
 [![ci](https://github.com/erskingardner/wok/actions/workflows/ci.yml/badge.svg)](https://github.com/erskingardner/wok/actions/workflows/ci.yml)
 
 - Reference C++ commit: `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`
-- NIPs pin used by the conformance suite: `656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab`
+- NIPs pin used by the conformance suite: `0b5532c0355ab27f447e071a93c09cf3a2b4aad5`
 
 ## Highlights
 

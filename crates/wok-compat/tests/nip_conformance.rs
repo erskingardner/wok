@@ -1,4 +1,4 @@
-//! Independently grounded NIP tests. NIPs pin: 656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab
+//! Independently grounded NIP tests. NIPs pin: 0b5532c0355ab27f447e071a93c09cf3a2b4aad5
 
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
@@ -306,6 +306,53 @@ async fn nip01_empty_filter_lists_match_nothing() {
         assert_eq!((have.len(), need.len()), (0, needed), "{filter}");
         conn.send(json!(["NEG-CLOSE", "neg"])).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip01_limit_zero_sends_eose_and_stays_live() {
+    // "When `limit` is zero, the relay MUST NOT return stored events for that
+    // filter. After the initial queries for all filters are complete, the
+    // relay MUST send `EOSE` and MUST keep the subscription active for newly
+    // received matching events."
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    let note = |content: &str| {
+        sign_event(json!({
+            "created_at": now(),
+            "kind": 1,
+            "tags": [],
+            "content": content,
+        }))
+    };
+    let stored = note("stored");
+    assert_eq!(conn.publish(&stored).await[2], true);
+
+    conn.subscribe("live", json!({"kinds": [1], "limit": 0}))
+        .await;
+    // Only the filter with `limit: 0` returns no stored events.
+    conn.send(json!([
+        "REQ",
+        "mixed",
+        {"kinds": [1], "limit": 0},
+        {"ids": [stored["id"]]}
+    ]))
+    .await;
+    assert_eq!(conn.recv().await, json!(["EVENT", "mixed", stored]));
+    assert_eq!(conn.recv().await, json!(["EOSE", "mixed"]));
+
+    let live = note("live");
+    let mut publisher = relay.connect().await;
+    assert_eq!(publisher.publish(&live).await[2], true);
+    let mut delivered = vec![conn.recv().await, conn.recv().await];
+    delivered.sort_by_key(|frame| frame[1].as_str().unwrap().to_owned());
+    assert_eq!(
+        delivered,
+        [
+            json!(["EVENT", "live", live]),
+            json!(["EVENT", "mixed", live])
+        ]
+    );
+    assert_eq!(conn.try_recv().await, None);
 }
 
 #[test]

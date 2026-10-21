@@ -23,6 +23,7 @@ pub mod purge;
 pub mod reindex;
 pub mod schema;
 pub mod search;
+pub mod tag_kind;
 pub mod txn;
 pub mod vanish;
 pub mod write;
@@ -34,7 +35,7 @@ pub use fbs::{
     encode_compression_dictionary, encode_meta, encode_negentropy_filter, CompressionDictionaryRec,
     Meta, NegentropyFilterRec,
 };
-pub use integrity::{check_integrity, IntegrityIssue, IntegrityReport};
+pub use integrity::{check_integrity, IntegrityIssue, IntegrityReport, TagKindIndexReport};
 pub use long_tags::{
     lacks_long_tag_values, long_tag_packing, without_hashed_tag_values, LongTagPacking,
 };
@@ -72,6 +73,9 @@ pub use search::{
     parse_search_query, remove_event_search, search_bigram_posting_exists, search_posting_count,
     search_posting_exists, search_postings, search_term_set, SearchQuery, SearchTermSet,
     MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TERMS,
+};
+pub use tag_kind::{
+    tag_kind_index_state_ro, tag_kind_key, TagKindIndexState, TAG_KIND_SCHEMA_VERSION,
 };
 pub use txn::{RoTxn, RwTxn};
 pub use vanish::{

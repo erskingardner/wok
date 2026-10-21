@@ -73,6 +73,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A `(tag, kind, created_at)` index, the LMDB table `wok_Event__tagKind`, for
+  filters that combine one single-letter tag with `kinds`: DM inboxes
+  (`{"#p":[me],"kinds":[1059]}`), zaps, reactions to a note, `#a` filters.
+  Queries do not use it yet. The writer keeps an entry for every
+  single-letter tag of every event it stores, so the database grows by about
+  14% once every event is indexed, and imports and writes take about 18%
+  longer (measured at 5M events). A new database is complete from the start;
+  `wok reindex --confirm-relay-stopped` builds the index for an existing one.
+  The database version stays 5, and earlier releases ignore the table: events
+  they insert are left for the index to catch up on, and the entries of
+  events they delete stay behind until a reindex. `wok integrity` reports the
+  table under `tag_kind_index`, and `wok doctor` adds a `tag-kind-index`
+  check: those leftover entries and an incomplete index are warnings, and
+  entries missing below the index's progress marker are a failure.
 - `relay.max_filter_bytes_per_connection` (default 2097152, 2 MiB) bounds the
   filter bytes of the REQ subscriptions open on one connection. Live filters
   stay in memory until closed, so without it a larger

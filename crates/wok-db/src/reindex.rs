@@ -2,6 +2,7 @@
 //! event secondary index from PackedEvent again.
 
 use crate::long_tags::{long_tag_packing, LongTagPacking};
+use crate::tag_kind::{initialize_tag_kind_index_state, put_tag_kind_entries, tag_kind_keys};
 use crate::write::{
     delete_event_basic, event_index_entries, is_repaired_address, repaired_address_deletions,
 };
@@ -99,6 +100,9 @@ pub fn rebuild_primary_and_event_indices(
     if let Some(vanish_pubkey) = target_dbis.vanish_pubkey {
         dbis_to_clear.push(vanish_pubkey);
     }
+    if let Some(event_tag_kind) = target_dbis.event_tag_kind {
+        dbis_to_clear.push(event_tag_kind);
+    }
     for dbi in dbis_to_clear {
         target.clear(dbi)?;
     }
@@ -194,6 +198,10 @@ pub fn rebuild_primary_and_event_indices(
                 }
             }
         }
+        if let Err(err) = put_tag_kind_entries(target, lev_id, &tag_kind_keys(packed)) {
+            error = Some(err);
+            return false;
+        }
         if let Err(err) = index_event_search(target, lev_id, &json) {
             error = Some(err);
             return false;
@@ -205,7 +213,8 @@ pub fn rebuild_primary_and_event_indices(
     if let Some(error) = error {
         return Err(error);
     }
-    target.event_sequence = Some(target.event_sequence.unwrap_or(0).max(last_lev_id));
+    let sequence = target.event_sequence.unwrap_or(0).max(last_lev_id);
+    target.event_sequence = Some(sequence);
     if let Some(raw) = target.get_u64(target_dbis.meta, 1)? {
         let mut meta = crate::decode_meta(raw)?;
         meta.db_version = wok_event::WOK_DB_VERSION;
@@ -220,6 +229,8 @@ pub fn rebuild_primary_and_event_indices(
     )?;
     crate::state::superseded_events(target)?;
     initialize_search_index_state(target, last_lev_id)?;
+    // Every stored event is indexed, and the deleted tail needs no entries.
+    initialize_tag_kind_index_state(target, sequence)?;
     let deleted = deleted_versions.lev_ids.len() as u64;
     Ok(ReindexStats {
         events: events - deleted,

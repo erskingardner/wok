@@ -120,7 +120,12 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
     let (negentropy_trees, negentropy_items) = rebuild_negentropy(&target)?;
 
     let target_integrity = check_integrity(&target.begin_ro()?)?;
-    if !target_integrity.ok() {
+    if !target_integrity.ok()
+        || target_integrity
+            .tag_kind_index
+            .as_ref()
+            .is_some_and(|tag_kind| !tag_kind.complete || tag_kind.stale_entries != 0)
+    {
         bail!("staged database failed integrity verification: {target_integrity:#?}");
     }
     // Repacking only adds hashed tag values to records that dropped them, and
@@ -240,6 +245,7 @@ fn ensure_reindexable(report: &wok_db::IntegrityReport) -> Result<()> {
         "event_replace_deletion",
         "event_kind",
         "event_expiration",
+        "event_tag_kind",
         "negentropy",
     ];
     if report
@@ -703,6 +709,63 @@ mod tests {
         )
         .unwrap();
         assert!(!check_integrity(&original.begin_ro().unwrap()).unwrap().ok());
+    }
+
+    #[test]
+    fn rebuilds_a_tag_kind_index_with_stale_and_missing_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("db");
+        let backup = root.path().join("backup");
+        let env = Env::open(&database, EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut events: Vec<_> = ["one", "two", "three"]
+            .into_iter()
+            .map(|content| {
+                let (packed, json) = signed(json!([["t", "reindex"]]), content);
+                EventToWrite::new(packed, json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let key = wok_db::tag_kind_key(b't', b"reindex", 1, 1_700_000_000);
+        let lev = |i: usize| events[i].lev_id.to_ne_bytes();
+        let dbi = env.dbis().event_tag_kind.unwrap();
+        // An earlier release deleted the first event and left its entry, and
+        // the second lost its own.
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut NoopNegentropy, [events[0].lev_id]).unwrap();
+        txn.put(dbi, &key, &lev(0), 0).unwrap();
+        assert!(txn.del(dbi, &key, Some(&lev(1))).unwrap());
+        txn.commit().unwrap();
+        let report = check_integrity(&env.begin_ro().unwrap()).unwrap();
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert_eq!((tag_kind.stale_entries, tag_kind.missing_entries), (1, 1));
+        drop(env);
+
+        let cfg = Config {
+            db: database.clone(),
+            ..Config::default()
+        };
+        run(&cfg, Some(&backup), true).unwrap();
+        let repaired = open_existing(&database);
+        let txn = repaired.begin_ro().unwrap();
+        let report = check_integrity(&txn).unwrap();
+        assert!(report.ok(), "{:#?}", report.issues);
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert!(tag_kind.complete);
+        assert_eq!(tag_kind.stale_entries, 0);
+        assert_eq!((tag_kind.expected_entries, tag_kind.actual_entries), (2, 2));
+        for (i, stored) in [(1, true), (2, true), (0, false)] {
+            let mut cursor = txn.cursor(dbi).unwrap();
+            assert_eq!(
+                cursor
+                    .get(Some(&key), Some(&lev(i)), lmdb_sys::MDB_GET_BOTH)
+                    .unwrap()
+                    .is_some(),
+                stored
+            );
+        }
     }
 
     #[test]

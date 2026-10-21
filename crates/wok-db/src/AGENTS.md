@@ -8,7 +8,7 @@ LMDB environment and table access. Start at `lib.rs` for the public API.
 | `env.rs` | `Env` / `EnvOptions`; LMDB FFI isolated here |
 | `txn.rs` | `RoTxn` / `RwTxn` and cursors; mmap lifetime tied to txn |
 | `error.rs` | `DbError` |
-| `schema.rs` | DBI names and open flags (`rasgueadb_*`, plus Wok search/vanish/moderation) |
+| `schema.rs` | DBI names and open flags (`rasgueadb_*`, plus Wok search/tag-kind/vanish/moderation) |
 | `keys.rs` | Key encode/decode re-exports |
 | `comparators.rs` | C++-compatible composite key comparators |
 | `fbs.rs` | FlatBuffers for Meta, NegentropyFilter, CompressionDictionary |
@@ -16,6 +16,7 @@ LMDB environment and table access. Start at `lib.rs` for the public API.
 | `lookup.rs` | Read helpers on Ro/Rw txns (id, created_at, negentropy filters) |
 | `write.rs` | Insert/delete/replace matching strfry `events.cpp` |
 | `search.rs` | NIP-50 term/bigram postings |
+| `tag_kind.rs` | `(tag, kind, created_at)` postings, schema and indexed-through markers |
 | `vanish.rs` | NIP-62 markers, query suppression, bounded sweep |
 | `moderation.rs` | NIP-86 records (prefix-keyed), snapshot, query suppression |
 | `purge.rs` | Count and delete superseded replacement history in bounded batches |

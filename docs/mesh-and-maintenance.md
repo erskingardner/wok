@@ -47,6 +47,20 @@ surviving records cannot establish the lost deletion history. Use a trusted
 backup for recovery. See [storage integrity and upgrade](lmdb-v3.md#integrity)
 for lazy-initialization limits and process-kill test coverage.
 
+The `(tag, kind, created_at)` index, `wok_Event__tagKind`, records how far it
+covers the stored events. Integrity JSON reports it as `tag_kind_index`:
+`schema`, `indexed_through` and `high_water` (the greatest local ID
+allocated), `complete`, and its expected, actual, missing, unexpected and
+stale entries. Doctor's `tag-kind-index` check passes when the index is
+complete and every entry matches its event. It warns while the index is
+incomplete (a database from before the index, or events an earlier Wok
+release inserted), and when stale entries remain: entries an earlier release
+left behind when it deleted their events. Readers skip those. It fails on
+missing entries, which a query using the index would miss, and on entries
+their event does not derive. Reindex rebuilds the table from every stored
+event, so the result is complete and holds no stale entries, and verifies
+that before promoting it. See [lmdb-v3.md](lmdb-v3.md#wok_event__tagkind).
+
 Reindex also repairs records that lack single-letter tag values longer than
 255 bytes. strfry and Wok 0.7.0 and earlier dropped such values from the packed
 record, so filters cannot match them and such an addressable record is keyed

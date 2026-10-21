@@ -59,6 +59,28 @@ and deletions, including while quotas are disabled. Enabling a quota may therefo
 require a one-time author-index scan for an author without a cached count; no
 database upgrade or startup-wide scan is required.
 
+## Indexes
+
+Events are stored in `Event` (PackedEvent) and `EventPayload` (JSON), keyed
+by a local ID that the writer allocates and never reuses. Every other event
+table is derived from them, written and removed in the transaction that
+inserts or deletes the event, and rebuilt by `wok reindex`: strfry's indexes
+by id, pubkey, kind, pubkey and kind, single-letter tag, `created_at`,
+expiration, replacement address and deletion, then Wok's NIP-50 search
+postings and `(tag, kind, created_at)` postings. Layouts are in
+[lmdb-v3.md](lmdb-v3.md).
+
+The `(tag, kind, created_at)` table, `wok_Event__tagKind`, holds the tag
+index again with each event's kind before its time. A filter with one tag and
+`kinds`, such as a DM inbox `{"#p":[me],"kinds":[1059]}`, can then read only
+events of those kinds; through the tag index it reads the value's history and
+the primary record of each entry to check its kind, which for a popular
+pubkey means thousands of records per query. Queries do not use the table
+yet. It costs one entry per single-letter tag, about 14% more disk. A marker
+records which events it covers, so a database that predates it, or events an
+earlier release inserted, are known to be missing; entries an earlier
+release left when it deleted their events name events no longer stored.
+
 ## REQ lifecycle
 
 A REQ is live before its history is read. When the REQ is admitted, the

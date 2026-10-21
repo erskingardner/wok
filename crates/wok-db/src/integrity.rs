@@ -4,6 +4,10 @@
 use crate::fbs::{decode_compression_dictionary, decode_meta, decode_negentropy_filter};
 use crate::payload::{parse_payload, Decompressor, PayloadView};
 use crate::search::{is_search_marker, search_index_entries, search_term_from_key};
+use crate::tag_kind::{
+    is_tag_kind_marker, tag_kind_index_state_ro, tag_kind_keys, TagKindIndexState,
+    TAG_KIND_SCHEMA_VERSION,
+};
 use crate::txn::RoTxn;
 use crate::write::{event_index_entries, EventIndexEntry};
 use crate::DbError;
@@ -54,7 +58,63 @@ pub struct IntegrityReport {
     pub author_counts_checked: u64,
     pub author_count_errors: u64,
     pub lookup_errors: u64,
+    /// The `(tag, kind, created_at)` index, when the database has the table.
+    pub tag_kind_index: Option<TagKindIndexReport>,
     pub issues: Vec<IntegrityIssue>,
+}
+
+/// What integrity found in `wok_Event__tagKind`. It is checked apart from the
+/// other indexes, whose entries every event must have: here only the events
+/// at or below the table's marker must have theirs.
+#[derive(Debug, Clone, Serialize)]
+pub struct TagKindIndexReport {
+    #[serde(flatten)]
+    pub state: TagKindIndexState,
+    /// Every stored event has its entries, so queries may rely on the index.
+    pub complete: bool,
+    /// Entries derived from the events at or below `indexed_through`.
+    pub expected_entries: u64,
+    /// Postings stored, markers excluded.
+    pub actual_entries: u64,
+    /// Entries that an event at or below `indexed_through` lacks. Queries
+    /// relying on the index would miss the event.
+    pub missing_entries: u64,
+    /// Entries naming a stored event that does not derive them, or
+    /// malformed. Neither the writer nor an earlier release writes these.
+    pub unexpected_entries: u64,
+    /// Entries naming an event that is no longer stored: an earlier Wok
+    /// release deleted it. Advisory: readers skip them, and `wok reindex`
+    /// rebuilds the table without them.
+    pub stale_entries: u64,
+}
+
+impl TagKindIndexReport {
+    fn new(state: TagKindIndexState) -> Self {
+        Self {
+            state,
+            complete: state.complete(),
+            expected_entries: 0,
+            actual_entries: 0,
+            missing_entries: 0,
+            unexpected_entries: 0,
+            stale_entries: 0,
+        }
+    }
+
+    /// Whether this release can derive the stored postings: its own layout,
+    /// or a table not initialized yet that only its writer filled.
+    fn verifiable(&self) -> bool {
+        matches!(self.state.schema, None | Some(TAG_KIND_SCHEMA_VERSION))
+    }
+
+    /// The greatest local id whose event must have its entries.
+    fn expected_through(&self) -> u64 {
+        if self.state.schema == Some(TAG_KIND_SCHEMA_VERSION) {
+            self.state.indexed_through
+        } else {
+            0
+        }
+    }
 }
 
 impl IntegrityReport {
@@ -69,6 +129,9 @@ impl IntegrityReport {
             && self.metadata_errors == 0
             && self.author_count_errors == 0
             && self.lookup_errors == 0
+            && self.tag_kind_index.as_ref().is_none_or(|tag_kind| {
+                tag_kind.missing_entries == 0 && tag_kind.unexpected_entries == 0
+            })
     }
 
     fn issue(&mut self, category: &'static str, table: &'static str, detail: String) {
@@ -361,6 +424,71 @@ fn check_payload(txn: &RoTxn<'_>, lev_id: u64, raw: &[u8], report: &mut Integrit
     }
 }
 
+/// Check every `wok_Event__tagKind` posting against the event it names.
+fn check_tag_kind_postings(
+    txn: &RoTxn<'_>,
+    dbi: MDB_dbi,
+    tag_kind: &mut TagKindIndexReport,
+    report: &mut IntegrityReport,
+) -> Result<(), DbError> {
+    const TABLE: &str = "event_tag_kind";
+    let verifiable = tag_kind.verifiable();
+    txn.foreach_full(dbi, &[], &[], false, |key, value| {
+        if is_tag_kind_marker(key) {
+            if read_u64(value).is_none() {
+                report.malformed_records += 1;
+                report.issue(
+                    "malformed-value",
+                    TABLE,
+                    format!("marker value has {} bytes, expected 8", value.len()),
+                );
+            }
+            return true;
+        }
+        tag_kind.actual_entries += 1;
+        if !verifiable {
+            return true;
+        }
+        // The shortest posting is a tag name and the two integers.
+        let lev_id = match read_u64(value) {
+            Some(lev_id) if key.len() > 16 => lev_id,
+            _ => {
+                report.malformed_records += 1;
+                tag_kind.unexpected_entries += 1;
+                report.issue(
+                    "malformed-record",
+                    TABLE,
+                    format!("key has {} bytes, value {}", key.len(), value.len()),
+                );
+                return true;
+            }
+        };
+        match txn.get_u64(txn.env().dbis().event, lev_id) {
+            Ok(Some(raw)) => match PackedEventView::new(raw) {
+                Ok(packed) if tag_kind_keys(packed).iter().any(|expected| expected == key) => {}
+                Ok(_) => {
+                    tag_kind.unexpected_entries += 1;
+                    report.issue("unexpected-index", TABLE, format!("levId {lev_id}"));
+                }
+                Err(_) => {
+                    tag_kind.unexpected_entries += 1;
+                    report.issue("unverifiable-index", TABLE, format!("levId {lev_id}"));
+                }
+            },
+            Ok(None) => {
+                tag_kind.stale_entries += 1;
+                report.issue("stale-index", TABLE, format!("levId {lev_id}"));
+            }
+            Err(error) => {
+                report.lookup_errors += 1;
+                report.issue("lookup", TABLE, error.to_string());
+            }
+        }
+        true
+    })?;
+    Ok(())
+}
+
 fn index_specs(txn: &RoTxn<'_>) -> [(&'static str, MDB_dbi); 10] {
     let dbis = txn.env().dbis();
     [
@@ -383,6 +511,10 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
     let mut search_decompressor = Decompressor::new();
     let mut authors = HashMap::<[u8; 32], u64>::new();
     let mut largest_id = 0;
+    let mut tag_kind = tag_kind_index_state_ro(txn)?.map(TagKindIndexReport::new);
+    let tag_kind_through = tag_kind
+        .as_ref()
+        .map_or(0, TagKindIndexReport::expected_through);
 
     check_metadata_tables(txn, &mut report)?;
 
@@ -443,6 +575,31 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
         }
         if lacks_legacy_entries {
             report.legacy_untombstoned_deletions += 1;
+        }
+        if let (Some(dbi), Some(tag_kind)) = (dbis.event_tag_kind, tag_kind.as_mut()) {
+            if lev_id <= tag_kind_through {
+                for key in tag_kind_keys(packed) {
+                    let entry = EventIndexEntry {
+                        name: "event_tag_kind",
+                        dbi,
+                        key,
+                        value: lev_id.to_ne_bytes().to_vec(),
+                        legacy_optional: false,
+                    };
+                    tag_kind.expected_entries += 1;
+                    match entry_exists(txn, &entry) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tag_kind.missing_entries += 1;
+                            report.issue("missing-index", entry.name, format!("levId {lev_id}"));
+                        }
+                        Err(error) => {
+                            report.lookup_errors += 1;
+                            report.issue("lookup", entry.name, error.to_string());
+                        }
+                    }
+                }
+            }
         }
         if let Some(search_dbi) = dbis.event_search {
             let payload = match txn.get_u64(dbis.event_payload, lev_id) {
@@ -657,6 +814,11 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
             true
         })?;
     }
+
+    if let (Some(dbi), Some(tag_kind)) = (dbis.event_tag_kind, tag_kind.as_mut()) {
+        check_tag_kind_postings(txn, dbi, tag_kind, &mut report)?;
+    }
+    report.tag_kind_index = tag_kind;
 
     // The advisory count includes only validated replacement entries. A broken
     // index cannot establish drift in the separately maintained physical count.

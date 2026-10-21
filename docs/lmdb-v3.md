@@ -129,6 +129,46 @@ derive those entries, so its integrity check reports them as unexpected, and
 if it deletes such a deletion request the entry stays behind; `wok integrity`
 reports it and `wok reindex` removes it.
 
+## wok_Event__tagKind
+
+A Wok table, not part of strfry v3, that keys every single-letter tag by the
+event's kind as well:
+
+| DBI | flags | comparator | key | value |
+|---|---|---|---|---|
+| `wok_Event__tagKind` | DUPSORT, INTEGERDUP, DUPFIXED | StringUint64Uint64 | tagName\|\|tagVal \|\| kind \|\| created_at | levId |
+
+`tagVal` is the packed value, as in `Event__tag`: the raw 32 bytes of an `e`
+or `p` id, the hashed form of a value longer than 255 bytes, and nothing for
+a value a legacy record dropped. The virtual `d` of replaceable and
+addressable kinds has its entry too. The writer puts and deletes an event's
+entries in the transaction that inserts or deletes the event, on every path:
+replacement, NIP-09 deletion, NIP-40 expiry, the NIP-62 sweep,
+`wok purge-superseded`, `wok delete` and the deletions reindex applies.
+
+Two markers share the table. Their keys are shorter than the 16 bytes of a
+posting's integers, so the comparator sorts them before every posting, and
+their values are native-endian u64s:
+
+- `\0schema` is the key layout, 1 in this release. A writable open that finds
+  no layout or another one empties the table and sets both markers again,
+  `\0through` to 0.
+- `\0through` is a local ID: every event at or below it has its entries.
+  The index is complete when it is at least the sequence high-water mark (the
+  stored `sequence`, or the newest local ID where none is stored). A write
+  that inserts events moves it past them only when it already covered every
+  earlier ID, so a gap of unindexed events stops it.
+
+A new database is complete from its first open. One written before this
+table existed, or migrated from strfry, gets an empty table at marker 0 on
+its first writable open, and `wok reindex` builds it complete. The database
+version is unchanged. An earlier Wok release does not open the table: the
+events it inserts take IDs above the marker, which stops there until they
+are indexed, and the events it deletes leave their entries. Local IDs are
+never reused, so a leftover entry names an event that is no longer stored;
+readers must check the event exists, `wok integrity` counts these entries as
+stale, and `wok reindex` drops them.
+
 ## EventPayload
 
 - `0x00` + UTF-8 JSON (compact, keys `content,created_at,id,kind,pubkey,sig,tags`)
@@ -138,7 +178,12 @@ reports it and `wok reindex` removes it.
 
 `wok integrity` verifies metadata and payload envelopes and compares every
 expected event-derived secondary-index entry with the actual indexes in both
-directions. It also validates `wok_State` encodings, compares each stored author
+directions. For `wok_Event__tagKind` it expects entries only of the events at
+or below `\0through`, and reports under `tag_kind_index` the markers, whether
+the index is complete, and entries missing, stale (the event is no longer
+stored) or unexpected (the stored event does not derive them, or a malformed
+record). Missing and unexpected entries fail the check; stale entries do not.
+It also validates `wok_State` encodings, compares each stored author
 count against primary events (not the derived author index), and checks that a
 stored sequence is at least the greatest surviving local ID. Author-count
 verification uses temporary memory proportional to the number of distinct
@@ -151,7 +196,8 @@ config, plugin, and socket-path problems.
 event/negentropy indexes or author counters. It copies authoritative Meta, filter, dictionary,
 PackedEvent, and EventPayload records into a sibling staging database,
 repacking PackedEvent records that dropped long tag values (see
-[PackedEvent](#packedevent)), derives all indexes again, deletes the versions
+[PackedEvent](#packedevent)), derives all indexes again, `wok_Event__tagKind`
+included and marked complete, deletes the versions
 that repaired deletions name, builds negentropy trees (which hold every stored
 record their filter matches), verifies the integrity
 report and the event fingerprint, then renames the original to a retained

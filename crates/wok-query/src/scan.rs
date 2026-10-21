@@ -807,7 +807,12 @@ impl DbQuery {
     /// completes the query with limited: true.
     pub fn new(sub: Subscription, max_total_events: u64, count_dedup_budget: u64) -> Self {
         let max_total_events = if sub.count_only { 0 } else { max_total_events };
-        let hll = if sub.count_only && sub.filter_group.filters.len() == 1 {
+        // A sketch is for a COUNT that sent one filter, even if others were
+        // dropped as never matching.
+        let hll = if sub.count_only
+            && sub.filter_group.filters.len() == 1
+            && sub.filter_group.never_matching == 0
+        {
             HyperLogLog::for_filter(&sub.filter_group.filters[0])
         } else {
             None

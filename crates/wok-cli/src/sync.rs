@@ -148,6 +148,9 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
         cfg.relay.max_and_entries,
     )?;
     if filter_group.filters.is_empty() {
+        if filter_group.never_matching > 0 {
+            bail!("filter will never match");
+        }
         bail!("sync requires at least one filter");
     }
     let env = open_env(cfg)?;

@@ -87,6 +87,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table under `tag_kind_index`, and `wok doctor` adds a `tag-kind-index`
   check: those leftover entries and an incomplete index are warnings, and
   entries missing below the index's progress marker are a failure.
+- `relay.max_filter_bytes_per_connection` (default 2097152, 2 MiB) bounds the
+  filter bytes of the REQ subscriptions open on one connection. Live filters
+  stay in memory until closed, so without it a larger
+  `relay.max_req_filter_size` multiplied the memory one connection can hold
+  (200 subscriptions of 256 KiB is 50 MiB). A REQ over the budget gets
+  `CLOSED` with `blocked: this connection's filters exceed <budget> bytes`.
+  Reusing an open subscription ID is charged only for the difference, and
+  COUNT is not charged. Zero is unlimited and is warned about on reload. The
+  setting reloads live and is in the dashboard.
 - NIP-67 EOSE completeness hints, advertised in NIP-11. EOSE gains a third
   element when Wok knows the answer: `finish` when every stored match the
   connection may read was sent, `more` when a filter's `limit`, the
@@ -178,6 +187,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebroadcast again. Files that pin the old value, as copies of the 0.7
   `docs/wok.toml` do, keep the bound, but it now spares the kinds listed
   under Changed.
+- `public`: `relay.max_req_filter_size` is `262144`, 256 KiB of filters per
+  REQ or COUNT (was 65536). An outbox client's REQ for a follow list of
+  2,000 authors is accepted; 64 KiB refused one of about 970 authors or
+  more. One filter still lists at most 2,047 authors. Files that pin 65536,
+  as copies of the 0.7 `docs/wok.toml` do, keep the old cap, and `wok
+  doctor` flags them.
+- `public`: result sizes, all advertised in NIP-11 `limitation`. Files that
+  pin the old values, as copies of the 0.7 `docs/wok.toml` do, keep them,
+  and `wok doctor` flags them.
+  - `relay.max_filter_limit` is `2000` (was 500), and so are `max_limit` and
+    `default_limit`. MDK's directory batches (`limit` 1,200) and outbox
+    metadata fetches without a `limit` are no longer cut at 500.
+  - `relay.max_total_events_per_req` is `10000` (was 2000), so a merged
+    batch of filters is no longer cut at 2,000 events in all.
+  - `relay.max_tags_per_filter` is `8` (was 3), so NIP-22 comment queries on
+    `#E`, `#K`, `#P` and `#k`, and other filters with four or more tag
+    letters, are accepted.
+  - `events.max_num_tags` is `5000` (was 2000), NIP-11 `max_event_tags`, so
+    heavy users' follow and mute lists are accepted.
 
 ### Changed
 
@@ -241,6 +269,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A REQ with many filters could hold a req worker well past its time slice
+  (`relay.query_timeslice_budget_us`), and every query behind it waited.
+  Each filter restarted the slice's clock, and a filter that followed a long
+  one did not check the clock until it had done as much work. A REQ's filters
+  now share one slice, and each checks the clock from its start. A 30-filter
+  REQ that once ran 100 ms without yielding now yields every 10 ms.
 - With `relay.compression_sliding_window = false`, the relay reset its
   inflater before every client message although it had not asked the client
   to stop context takeover, so a client compressing against its earlier

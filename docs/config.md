@@ -131,7 +131,7 @@ All event settings reload live and are available in the dashboard.
 | `events.reject_ephemeral_older_than_secs` | `60` | Maximum age for ephemeral events at publication. |
 | `events.ephemeral_lifetime_secs` | `300` | Retention window when ephemeral persistence is `ttl`. |
 | `events.ephemeral_persistence` | `live_only` | `live_only` broadcasts without storage; `ttl` persists then expires. |
-| `events.max_num_tags` | `2000` | Maximum tags on one event. |
+| `events.max_num_tags` | `5000` | Maximum tags on one event; NIP-11 `max_event_tags`. See [Tags per event](#tags-per-event). |
 | `events.max_tag_val_size` | `1024` | Maximum bytes in one tag value. |
 
 Single-letter tag values longer than 255 bytes are indexed by their SHA-256,
@@ -151,6 +151,20 @@ decrypt or identify NIP-44 content, so this remains a global event limit and is
 measured after Base64 encoding, JSON escaping, and event metadata are present.
 The NIP-44 theoretical maximum is not a relay allocation target. Existing
 operator files that explicitly retain `65536` continue enforcing 64 KiB.
+
+### Tags per event
+
+`max_num_tags` is 5,000 in the public preset, and NIP-11 advertises it as
+`max_event_tags`.
+
+- **If too low:** heavy users can't save their follow lists (kind 3) or
+  mute and other lists (kinds 10000 and 30000). At 2,000, the default
+  through 0.7, a follow list of more than 2,000 accounts was refused.
+- **If too high:** every single-letter tag is an index entry, so one event
+  adds thousands of index writes, and replacing a list removes as many.
+  Parsing, verification, the writer's index work and disk use all grow with
+  the tag count. The EVENT budgets bound how often one address or author can
+  pay that.
 
 ### Timestamp windows
 
@@ -209,18 +223,19 @@ interface or protect the path at the reverse proxy.
 | `relay.nofiles` | `524288` | Restart | Requested process file-descriptor limit. |
 | `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-IP budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. |
 | `relay.max_websocket_payload_size` | `2097152` | Restart | Maximum reassembled WebSocket payload bytes. |
-| `relay.max_req_filter_size` | `65536` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. |
+| `relay.max_req_filter_size` | `262144` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. See [Filter size](#filter-size). |
+| `relay.max_filter_bytes_per_connection` | `2097152` | Live | Yes | Maximum combined compact-JSON filter bytes of the REQ subscriptions open on one connection; zero is unlimited. See [Filter size](#filter-size). |
 | `relay.max_filters_per_req` | `200` | Live | Yes | Unconditional maximum filter objects in one REQ or COUNT. |
 | `relay.auto_ping_seconds` | `55` | Restart | WebSocket ping interval; zero disables automatic pings. A ping unanswered for a full interval closes the connection. |
 | `relay.enable_tcp_keepalive` | `false` | Restart | Enable TCP keepalive on accepted sockets. |
 | `relay.handshake_timeout_secs` | `10` | Live (new connections) | No | Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it. |
 | `relay.frame_read_timeout_secs` | `30` | Live (new connections) | No | Maximum idle gap between socket reads while a partial WebSocket frame or unfinished fragmented message is buffered (slow-trickle guard); zero disables it. |
 | `relay.query_timeslice_budget_us` | `10000` | Live | Yes | Query CPU budget before cooperative yielding. |
-| `relay.max_filter_limit` | `500` | Live | Yes | Maximum normal REQ filter limit. |
-| `relay.max_tags_per_filter` | `3` | Live | Yes | Maximum distinct tag names across `#` and NIP-91 `&` query keys in one filter. |
+| `relay.max_filter_limit` | `2000` | Live | Yes | Maximum events one REQ filter returns, and the limit of a filter without one; NIP-11 `max_limit` and `default_limit`. See [Result size](#result-size). |
+| `relay.max_tags_per_filter` | `8` | Live | Yes | Maximum distinct tag names across `#` and NIP-91 `&` query keys in one filter. See [Result size](#result-size). |
 | `relay.max_and_entries` | `16` | Live | Yes | Maximum distinct values across all NIP-91 `&` query keys in one filter; zero disables NIP-91 and removes it from NIP-11. |
 | `relay.max_filter_limit_count` | `1000000` | Live | Yes | Maximum COUNT filter limit. |
-| `relay.max_total_events_per_req` | `2000` | Live | Yes | Deduplicated historical events across a REQ; zero is unlimited. |
+| `relay.max_total_events_per_req` | `10000` | Live | Yes | Deduplicated historical events across a REQ; zero is unlimited. See [Result size](#result-size). |
 | `relay.max_subs_per_connection` | `200` | Live | Yes | Simultaneous subscriptions per connection, counting those still sending history. A REQ over it gets `CLOSED`; reusing an open id is always allowed. |
 | `relay.max_live_buffer_bytes` | `262144` | Live (new subscriptions) | No | Live matches held for one subscription while its history is sent, before EOSE. Past it, stored events are re-read from the database after the history, and the oldest ephemeral events are dropped (`wok_live_buffer_dropped_ephemeral_total`). Zero is unlimited. |
 | `relay.max_pending_outbound_bytes` | `33554432` | Live (new connections) | Yes | Pending output budget before slow-client disconnect. |
@@ -242,6 +257,67 @@ interface or protect the path at the reverse proxy.
 | `relay.sync_memory_per_connection` | `268435456` | Live | Yes | Bytes reserved for sync sessions on one connection (256 MiB); zero rejects new sessions. |
 | `relay.sync_memory_total` | `1073741824` | Live | Yes | Shared sync reservation ceiling across workers (1 GiB); zero rejects new sessions. |
 | `relay.sync_idle_timeout_secs` | `60` | Live | Yes | Maximum idle wait for the next sync message; active construction has no fixed lifetime. Zero expires sessions immediately. |
+
+### Result size
+
+Three settings bound what one REQ returns or asks the relay to check. NIP-11
+advertises all three.
+
+- **Events per filter** (`max_filter_limit`, 2,000; `max_limit` and
+  `default_limit`). A filter's `limit` is clamped to it, and a filter without
+  a `limit` gets it too.
+  - If too low: results are cut, and clients make extra round trips. At 500,
+    the default through 0.7, MDK's directory batches (`limit` 1,200) and
+    outbox metadata fetches without a `limit` lost events.
+  - If too high: more output per request. The outbound queue still bounds
+    memory.
+- **Events per request** (`max_total_events_per_req`, 10,000).
+  - If too low: merged batches of filters are cut. At 2,000, the default
+    through 0.7, five filters of 500 lost a fifth of their events.
+  - If too high: one request can queue many megabytes for a slow client,
+    who is then disconnected (`max_pending_outbound_bytes`).
+- **Tag letters per filter** (`max_tags_per_filter`, 8).
+  - If too low: comment, community and marketplace queries are refused. At
+    3, the default through 0.7, a NIP-22 query on `#E`, `#K`, `#P` and `#k`
+    was refused.
+  - If too high: small extra checks per candidate event.
+
+A history cut by either limit never gets the NIP-67 `finish` hint, and
+usually gets `more` (see [nips.md](nips.md)), so a client can page with
+`until` for the rest.
+
+### Filter size
+
+Two settings bound the filters a client sends, both in compact JSON bytes.
+`max_req_filter_size` bounds the filters of one REQ or COUNT.
+`max_filter_bytes_per_connection` bounds the filters of every REQ
+subscription open on one connection, because live filters stay in memory
+until they are closed.
+
+- **Filters per request** (`max_req_filter_size`, 256 KiB).
+  - If too low: outbox clients can't fetch a large follow list in one
+    request. At 64 KiB, the default through 0.7, a REQ naming about 970
+    authors or more was refused.
+  - If too high: more memory per subscription. The connection budget caps
+    the total.
+- **Filters per connection** (`max_filter_bytes_per_connection`, 2 MiB).
+  - If too low: clients that keep several subscriptions over a long follow
+    list open, such as a home feed and a profile feed, have new ones refused.
+  - If too high: one connection can hold more filter memory, up to
+    `max_subs_per_connection` times `max_req_filter_size` (50 MiB at the
+    defaults) with the budget off.
+
+A REQ that would take the connection over its budget is refused with
+`CLOSED` and `blocked: this connection's filters exceed <budget> bytes`.
+Closing a subscription frees its bytes. A REQ that reuses an open
+subscription ID is charged only for the difference, so after a reload lowers
+the budget, a subscription can still be replaced by filters no larger than
+its own. COUNT holds no live filter and is not charged.
+
+One filter also stops at 65,535 decoded bytes per value list, whatever these
+settings are: at most 2,047 `authors`, `ids`, `#e` or `#p` values. 256 KiB
+lets one filter reach that ceiling and leaves room for the other filters in
+the same REQ.
 
 ## Authentication and private reads
 

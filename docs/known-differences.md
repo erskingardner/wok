@@ -184,6 +184,11 @@ regression test. Differential parity alone is not a reason to retain it.
 - COUNT and REQ ids are separate. In pinned strfry a COUNT that reuses an
   in-flight REQ's id cancels the REQ's history scan, which then never sends
   EOSE. CLOSE ends only the REQ.
+- A REQ's filters share one time slice (`relay.query_timeslice_budget_us`).
+  Pinned strfry's `DBQuery` restarts the clock for each filter, and carries
+  the work count of its last check over to the next filter, which then does
+  as much work before it checks again. A REQ of many filters could hold a req
+  worker for many slices.
 - NIP-77 network payload hex rejects `0x` prefixes and half bytes.
 - NIP-01 IDs, pubkeys, signatures, and standard `e`/`p` values require the
   specified lowercase hex form.

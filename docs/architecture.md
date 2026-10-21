@@ -114,15 +114,18 @@ So, per id, no frame of a replaced or closed generation follows the change,
 and a CLOSED is the last frame of its generation, however the producers
 interleave. The subscription cap (`relay.max_subs_per_connection`) is the
 number of open REQ ids in the gate, which counts subscriptions still sending
-history as well as live ones; a REQ reusing an open id always fits.
+history as well as live ones; a REQ reusing an open id always fits. The gate
+also keeps each open id's serialized filter bytes, and their sum is what the
+connection's filter budget (`relay.max_filter_bytes_per_connection`) bounds;
+a REQ reusing an open id is charged only for the difference.
 
 ### Stages
 
 1. **Admission, on the ingester.** Before any worker sees the REQ, the ingester
-   checks parsing and filter limits, query cost, AUTH and the cap. A refusal is
-   `CLOSED`. NIP-01 makes a REQ replace the subscription it names, so a refused
-   one still ends it. An admitted REQ gets its generation and history snapshot,
-   and the gate opens for it.
+   checks parsing and filter limits, query cost, AUTH, the cap and the filter
+   budget. A refusal is `CLOSED`. NIP-01 makes a REQ replace the subscription
+   it names, so a refused one still ends it. An admitted REQ gets its
+   generation and history snapshot, and the gate opens for it.
 2. **Registration, on the req monitor.** The ingester queues `Register` on the
    connection's req monitor's control queue, then the history scan for its req
    worker, so the scan's `HistoryDone` can never reach the monitor first. The
@@ -142,7 +145,9 @@ history as well as live ones; a REQ reusing an open id always fits.
      and applies it in order under one read transaction. Cancels, AUTH and
      disconnects take no query time. Each new REQ or COUNT gets its first
      time slice (`relay.query_timeslice_budget_us`) as it is taken, so a
-     small one is answered before the messages behind it.
+     small one is answered before the messages behind it. A slice covers
+     all of a query's filters: one that ends after the budget is spent
+     leaves the next filter to the next slice.
    - The running query that has waited longest gets a slice ahead of the
      next new query once the new queries' first slices since its last slice
      have taken as long as that slice did, and at the end of a pass when no

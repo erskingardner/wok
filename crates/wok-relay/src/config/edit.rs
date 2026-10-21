@@ -232,7 +232,7 @@ event_burst = 100
 req_burst = 40
 
 [events]
-max_num_tags = 5000
+max_num_tags = 8000
 "#;
 
     const MINIMIZED: &str = r#"# Example relay.
@@ -243,7 +243,7 @@ admin = { auth_window_secs = 30 }
 real_ip_header = "x-real-ip"
 
 [events]
-max_num_tags = 5000
+max_num_tags = 8000
 "#;
 
     #[test]
@@ -288,6 +288,15 @@ max_num_tags = 5000
             minimized.text,
             "[events]\n\
              reject_older_than_secs = 94608000\n\
+             max_num_tags = 2000\n\
+             \n\
+             [relay]\n\
+             # Maximum combined compact-JSON bytes across all filters in one REQ/COUNT.\n\
+             max_req_filter_size = 65536\n\
+             max_filter_limit = 500\n\
+             max_tags_per_filter = 3\n\
+             # Zero means unlimited.\n\
+             max_total_events_per_req = 2000\n\
              \n\
              [relay.auth]\n\
              restricted_read_kinds = [4, 1059]\n"

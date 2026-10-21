@@ -31,7 +31,7 @@ pub use packed::{
 pub use parse::{
     expiration_tag, from_hex, from_hex_exact, from_hex_strict, from_lower_hex_exact,
     normalize_event_json, nostr_json_to_packed_event, to_hex, EventLimits, ParsedEvent,
-    DEFAULT_MAX_EVENT_SIZE,
+    DEFAULT_MAX_EVENT_SIZE, DEFAULT_MAX_NUM_TAGS,
 };
 pub use validate::{
     parse_and_verify_event, parse_and_verify_event_with, require_canonical_addresses,

@@ -17,6 +17,11 @@ const PAST_DEFAULTS: &[(&str, &str, &str)] = &[
     ("relay.unix.max_frame_bytes", "131072", "0.4.0"),
     ("events.reject_older_than_secs", "94608000", "0.7.0"),
     ("relay.auth.restricted_read_kinds", "[4, 1059]", "0.7.0"),
+    ("relay.max_req_filter_size", "65536", "0.7.0"),
+    ("events.max_num_tags", "2000", "0.7.0"),
+    ("relay.max_filter_limit", "500", "0.7.0"),
+    ("relay.max_tags_per_filter", "3", "0.7.0"),
+    ("relay.max_total_events_per_req", "2000", "0.7.0"),
 ];
 
 /// A key the operator's file pins to a built-in default that a later release
@@ -118,7 +123,7 @@ mod tests {
             "a default changed since 0.7.0: add its 0.7.0 value to PAST_DEFAULTS"
         );
         assert_eq!(
-            stale[0],
+            stale[1],
             StaleDefault {
                 key: "events.reject_older_than_secs".into(),
                 value: "94608000".into(),
@@ -135,7 +140,7 @@ mod tests {
             "[events]\n\
              reject_older_than_secs = 31536000\n\
              max_event_size = 65536\n\
-             max_num_tags = 2000\n",
+             max_num_tags = 5000\n",
         )
         .unwrap();
         let stale = explained.stale_defaults();

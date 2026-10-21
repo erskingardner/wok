@@ -1055,15 +1055,16 @@ async fn nip11_http_document() {
         client["supported_nips"],
         json!([1, 9, 11, 13, 40, 45, 50, 62, 67, 70, 77, 91])
     );
-    assert_eq!(client["limitation"]["max_event_tags"], 2000);
+    assert_eq!(client["limitation"]["max_event_tags"], 5000);
     assert_eq!(client["limitation"]["max_message_length"], 2_097_152);
     assert_eq!(client["limitation"]["created_at_lower_limit"], 86_400);
     assert_eq!(client["limitation"]["created_at_upper_limit"], 900);
-    assert_eq!(client["limitation"]["default_limit"], 500);
-    assert_eq!(client["limitation"]["max_total_events_per_req"], 2000);
+    assert_eq!(client["limitation"]["max_limit"], 2000);
+    assert_eq!(client["limitation"]["default_limit"], 2000);
+    assert_eq!(client["limitation"]["max_total_events_per_req"], 10_000);
     assert_eq!(client["limitation"]["min_pow_difficulty"], 20);
     assert_eq!(client["limitation"]["max_query_cost"], 1000);
-    assert_eq!(client["limitation"]["max_tags_per_filter"], 3);
+    assert_eq!(client["limitation"]["max_tags_per_filter"], 8);
     assert_eq!(client["limitation"]["max_and_entries"], 16);
     // NIP-11: `software` MUST be a URL to the project's homepage.
     assert_eq!(client["software"], "https://github.com/erskingardner/wok");

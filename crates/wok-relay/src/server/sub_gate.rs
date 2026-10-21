@@ -11,6 +11,9 @@
 //! the connection is queued under. So no frame of a replaced or closed
 //! generation follows the change, and a CLOSED is the last frame of its
 //! generation, whatever order the producers run in.
+//!
+//! The gate also keeps each open id's serialized filter bytes, so the
+//! connection's filter budget is released however the id closes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,41 +34,62 @@ pub(crate) type Current = Arc<AtomicU64>;
 
 #[derive(Default)]
 pub(crate) struct SubGate {
-    req: HashMap<SubId, Current>,
-    count: HashMap<SubId, Current>,
+    req: Ids,
+    count: Ids,
+}
+
+/// One namespace's open ids, each with its current generation and the
+/// serialized bytes of its filters.
+#[derive(Default)]
+struct Ids {
+    open: HashMap<SubId, (Current, usize)>,
+    /// The sum of the open ids' filter bytes.
+    filter_bytes: usize,
 }
 
 impl SubGate {
-    fn ids(&self, ns: Ns) -> &HashMap<SubId, Current> {
+    fn ids(&self, ns: Ns) -> &Ids {
         match ns {
             Ns::Req => &self.req,
             Ns::Count => &self.count,
         }
     }
 
-    fn ids_mut(&mut self, ns: Ns) -> &mut HashMap<SubId, Current> {
+    fn ids_mut(&mut self, ns: Ns) -> &mut Ids {
         match ns {
             Ns::Req => &mut self.req,
             Ns::Count => &mut self.count,
         }
     }
 
-    /// A REQ or COUNT took the id at `generation` (never zero): only its
-    /// frames pass from now on. Returns the generation it replaced.
-    pub(crate) fn open(&mut self, ns: Ns, sub_id: &SubId, generation: u64) -> Option<u64> {
+    /// A REQ or COUNT took the id at `generation` (never zero), with filters
+    /// of `filter_bytes` serialized bytes: only its frames pass from now on.
+    /// Returns the generation it replaced.
+    pub(crate) fn open(
+        &mut self,
+        ns: Ns,
+        sub_id: &SubId,
+        generation: u64,
+        filter_bytes: usize,
+    ) -> Option<u64> {
         debug_assert_ne!(generation, 0);
         let ids = self.ids_mut(ns);
-        if let Some(current) = ids.get(sub_id) {
+        ids.filter_bytes += filter_bytes;
+        if let Some((current, bytes)) = ids.open.get_mut(sub_id) {
+            ids.filter_bytes -= std::mem::replace(bytes, filter_bytes);
             return Some(current.swap(generation, Ordering::Relaxed));
         }
-        ids.insert(sub_id.clone(), Arc::new(AtomicU64::new(generation)));
+        let current = Arc::new(AtomicU64::new(generation));
+        ids.open.insert(sub_id.clone(), (current, filter_bytes));
         None
     }
 
     /// Nothing for the id passes until it is opened again. Returns the
     /// generation that was current.
     pub(crate) fn close(&mut self, ns: Ns, sub_id: &SubId) -> Option<u64> {
-        let current = self.ids_mut(ns).remove(sub_id)?;
+        let ids = self.ids_mut(ns);
+        let (current, bytes) = ids.open.remove(sub_id)?;
+        ids.filter_bytes -= bytes;
         Some(current.swap(0, Ordering::Relaxed))
     }
 
@@ -73,16 +97,26 @@ impl SubGate {
     /// tag it with.
     pub(crate) fn admit(&self, ns: Ns, sub_id: &SubId, generation: u64) -> Option<&Current> {
         self.ids(ns)
+            .open
             .get(sub_id)
+            .map(|(current, _)| current)
             .filter(|current| current.load(Ordering::Relaxed) == generation)
     }
 
     pub(crate) fn len(&self, ns: Ns) -> usize {
-        self.ids(ns).len()
+        self.ids(ns).open.len()
     }
 
     pub(crate) fn is_open(&self, ns: Ns, sub_id: &SubId) -> bool {
-        self.ids(ns).contains_key(sub_id)
+        self.ids(ns).open.contains_key(sub_id)
+    }
+
+    /// The filter bytes held by every open id in `ns`, and by `sub_id` alone
+    /// (zero when it is not open).
+    pub(crate) fn filter_bytes(&self, ns: Ns, sub_id: &SubId) -> (usize, usize) {
+        let ids = self.ids(ns);
+        let own = ids.open.get(sub_id).map_or(0, |&(_, bytes)| bytes);
+        (ids.filter_bytes, own)
     }
 }
 
@@ -102,8 +136,9 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum Op {
-        /// An admitted REQ or COUNT, replacing whatever had the id.
-        Open { ns: Ns, id: u8 },
+        /// An admitted REQ or COUNT with filters of `bytes`, replacing
+        /// whatever had the id.
+        Open { ns: Ns, id: u8, bytes: u8 },
         /// A refused REQ or COUNT: the id closes and its CLOSED is queued.
         Refuse { ns: Ns, id: u8 },
         /// CLOSE (REQ ids only).
@@ -120,7 +155,7 @@ mod tests {
     fn op() -> impl Strategy<Value = Op> {
         let id = 0u8..3;
         prop_oneof![
-            (ns(), id.clone()).prop_map(|(ns, id)| Op::Open { ns, id }),
+            (ns(), id.clone(), any::<u8>()).prop_map(|(ns, id, bytes)| Op::Open { ns, id, bytes }),
             (ns(), id.clone()).prop_map(|(ns, id)| Op::Refuse { ns, id }),
             id.clone().prop_map(|id| Op::Close { id }),
             (
@@ -141,7 +176,8 @@ mod tests {
         /// Whatever order client operations and producers interleave in,
         /// per id: only the current generation's frames are queued, none of a
         /// generation the gate moved past, generations never go backwards,
-        /// and a CLOSED is the last frame of its generation.
+        /// and a CLOSED is the last frame of its generation. Each namespace
+        /// holds the filter bytes of exactly its open ids.
         #[test]
         fn frames_never_outlive_their_generation(ops in prop::collection::vec(op(), 1..300)) {
             let mut gate = SubGate::default();
@@ -150,16 +186,18 @@ mod tests {
             let mut handed: HashMap<(Ns, u8), Vec<u64>> = HashMap::new();
             // What the gate should hold, kept independently of it.
             let mut model: HashMap<(Ns, u8), u64> = HashMap::new();
+            let mut model_bytes: HashMap<(Ns, u8), usize> = HashMap::new();
             // Generations the gate has moved past (replaced, closed, ended).
             let mut over: HashSet<(Ns, u8, u64)> = HashSet::new();
             // Frames queued, in order; a CLOSED of no generation is 0.
             let mut queued: Vec<(Ns, u8, u64, Kind)> = Vec::new();
             for op in ops {
                 match op {
-                    Op::Open { ns, id } => {
+                    Op::Open { ns, id, bytes } => {
                         next += 1;
-                        let replaced = gate.open(ns, &sid(id), next);
+                        let replaced = gate.open(ns, &sid(id), next, usize::from(bytes));
                         prop_assert_eq!(replaced, model.insert((ns, id), next));
+                        model_bytes.insert((ns, id), usize::from(bytes));
                         if let Some(old) = replaced {
                             over.insert((ns, id, old));
                         }
@@ -168,6 +206,7 @@ mod tests {
                     Op::Refuse { ns, id } => {
                         let closed = gate.close(ns, &sid(id));
                         prop_assert_eq!(closed, model.remove(&(ns, id)));
+                        model_bytes.remove(&(ns, id));
                         if let Some(g) = closed {
                             over.insert((ns, id, g));
                         }
@@ -176,6 +215,7 @@ mod tests {
                     Op::Close { id } => {
                         let closed = gate.close(Ns::Req, &sid(id));
                         prop_assert_eq!(closed, model.remove(&(Ns::Req, id)));
+                        model_bytes.remove(&(Ns::Req, id));
                         if let Some(g) = closed {
                             over.insert((Ns::Req, id, g));
                         }
@@ -193,6 +233,7 @@ mod tests {
                             if matches!(kind, Kind::Last) {
                                 gate.close(ns, &sid(id));
                                 model.remove(&(ns, id));
+                                model_bytes.remove(&(ns, id));
                                 over.insert((ns, id, g));
                             }
                         }
@@ -205,6 +246,17 @@ mod tests {
                     gate.len(Ns::Req) + gate.len(Ns::Count),
                     model.len()
                 );
+                for ns in [Ns::Req, Ns::Count] {
+                    let held: usize = model_bytes
+                        .iter()
+                        .filter(|((n, _), _)| *n == ns)
+                        .map(|(_, bytes)| bytes)
+                        .sum();
+                    for id in 0..3 {
+                        let own = model_bytes.get(&(ns, id)).copied().unwrap_or(0);
+                        prop_assert_eq!(gate.filter_bytes(ns, &sid(id)), (held, own));
+                    }
+                }
             }
             let mut newest: HashMap<(Ns, u8), u64> = HashMap::new();
             for (i, &(ns, id, g, kind)) in queued.iter().enumerate() {
@@ -231,17 +283,17 @@ mod tests {
     fn queued_frames_see_their_generation_end() {
         let mut gate = SubGate::default();
         let x = SubId::new("x").unwrap();
-        gate.open(Ns::Req, &x, 1);
+        gate.open(Ns::Req, &x, 1, 0);
         let cell = gate.admit(Ns::Req, &x, 1).unwrap().clone();
         assert_eq!(cell.load(Ordering::Relaxed), 1);
-        gate.open(Ns::Req, &x, 2);
+        gate.open(Ns::Req, &x, 2, 0);
         assert_eq!(cell.load(Ordering::Relaxed), 2);
         assert!(gate.admit(Ns::Req, &x, 1).is_none());
         gate.close(Ns::Req, &x);
         assert_eq!(cell.load(Ordering::Relaxed), 0);
         assert!(!gate.is_open(Ns::Req, &x));
         // The COUNT namespace is separate.
-        gate.open(Ns::Count, &x, 3);
+        gate.open(Ns::Count, &x, 3, 0);
         assert!(gate.admit(Ns::Req, &x, 3).is_none());
         assert!(gate.admit(Ns::Count, &x, 3).is_some());
     }

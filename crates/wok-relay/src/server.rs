@@ -272,10 +272,13 @@ impl ConnTable {
         self.deliver(id, json, metrics);
     }
 
-    /// The ingester admitted a REQ or COUNT: from now on only frames of
-    /// `generation` pass for the id.
-    fn open_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId, generation: u64) {
-        self.with(conn_id, |_, state| state.subs.open(ns, sub_id, generation));
+    /// The ingester admitted a REQ or COUNT with filters of `filter_bytes`
+    /// serialized bytes: from now on only frames of `generation` pass for
+    /// the id.
+    fn open_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId, generation: u64, filter_bytes: usize) {
+        self.with(conn_id, |_, state| {
+            state.subs.open(ns, sub_id, generation, filter_bytes)
+        });
     }
 
     /// CLOSE, or a REQ that names the id and fails before refusal (no CLOSED
@@ -316,6 +319,13 @@ impl ConnTable {
     fn is_open(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> bool {
         self.with(conn_id, |_, state| state.subs.is_open(ns, sub_id))
             .unwrap_or(false)
+    }
+
+    /// The filter bytes held by every open id in `ns` on a connection, and
+    /// by `sub_id` alone.
+    fn filter_bytes(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> (usize, usize) {
+        self.with(conn_id, |_, state| state.subs.filter_bytes(ns, sub_id))
+            .unwrap_or((0, 0))
     }
 
     /// Queue a frame of one generation of a subscription, if that generation
@@ -2724,8 +2734,8 @@ fn ingest_req(
     let admitted = admit_req(
         cfg, conns, metrics, auth, conn_id, &sub_id, filters, count_only,
     );
-    let mut sub = match admitted {
-        Ok(sub) => sub,
+    let (mut sub, filter_bytes) = match admitted {
+        Ok(admitted) => admitted,
         Err(reason) => {
             refuse_req(conns, metrics, dispatch, conn_id, ns, &sub_id, reason);
             return;
@@ -2733,7 +2743,13 @@ fn ingest_req(
     };
     sub.generation = generations.next();
     if count_only {
-        conns.open_sub(conn_id, Ns::Count, &sub.sub_id, sub.generation);
+        conns.open_sub(
+            conn_id,
+            Ns::Count,
+            &sub.sub_id,
+            sub.generation,
+            filter_bytes,
+        );
         dispatch.req(ReqMsg::Count(sub));
         return;
     }
@@ -2754,12 +2770,13 @@ fn ingest_req(
         sub.auth_challenged = true;
     }
     // From here on only this generation's frames reach the client for the id.
-    conns.open_sub(conn_id, Ns::Req, &sub.sub_id, sub.generation);
+    conns.open_sub(conn_id, Ns::Req, &sub.sub_id, sub.generation, filter_bytes);
     dispatch.subscription(MonitorMsg::Register(sub.clone()), ReqMsg::Scan(sub));
 }
 
-/// Every check a REQ or COUNT passes before any worker sees it. `Err` is the
-/// CLOSED reason.
+/// Every check a REQ or COUNT passes before any worker sees it, returning
+/// the subscription and its serialized filter bytes. `Err` is the CLOSED
+/// reason.
 #[allow(clippy::too_many_arguments)]
 fn admit_req(
     cfg: &Config,
@@ -2770,7 +2787,7 @@ fn admit_req(
     sub_id: &str,
     filters: Vec<Value>,
     count_only: bool,
-) -> Result<Subscription, String> {
+) -> Result<(Subscription, usize), String> {
     // C++ RelayIngester: once the sub id is known, errors are a NIP-01
     // CLOSED with an `error:` machine-readable prefix.
     let bad_req = |e: String| format!("error: bad req: {e}");
@@ -2846,7 +2863,24 @@ fn admit_req(
     {
         return Err("blocked: too many concurrent REQs".into());
     }
-    Ok(Subscription::new(conn_id, sid, fg, count_only))
+    // Live filters stay in memory until closed, so their bytes are budgeted
+    // per connection. Like the subscription cap, a lowered budget still lets
+    // an open id be replaced by filters no larger than its own.
+    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
+    if !count_only && filter_budget != 0 {
+        let (held, replaced) = conns.filter_bytes(conn_id, Ns::Req, &sid);
+        if serialized_filter_bytes > replaced
+            && held - replaced + serialized_filter_bytes > filter_budget
+        {
+            return Err(format!(
+                "blocked: this connection's filters exceed {filter_budget} bytes"
+            ));
+        }
+    }
+    Ok((
+        Subscription::new(conn_id, sid, fg, count_only),
+        serialized_filter_bytes,
+    ))
 }
 
 /// End the subscription or COUNT `sub_id` names, if open: its frames stop at
@@ -4891,6 +4925,191 @@ mod tests {
         handle.request_shutdown();
     }
 
+    /// An outbox client's metadata fetch for a follow list of `authors`.
+    fn follow_list_req(sub: &str, authors: usize) -> String {
+        let authors: Vec<String> = (0..authors).map(|i| format!("{i:064x}")).collect();
+        json!(["REQ", sub, {"authors": authors, "kinds": [0, 3, 10002, 10050]}]).to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_limits_accept_a_two_thousand_author_req() {
+        // Audit C5: the 64 KiB default refused follow lists of about 970
+        // authors or more.
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        let (conn, mut rx) = live_conn(&handle).await;
+        let req = follow_list_req("follows", 2_000);
+        assert!(req.len() > 128 * 1024, "{} bytes", req.len());
+        handle.client_message(conn, local_source(), req).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(reply.starts_with(r#"["EOSE","follows""#), "{reply}");
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filter_bytes_are_budgeted_per_connection() {
+        // F8: room for two follow-list subscriptions, not three.
+        let budget = 2 * follow_list_req("a", 1_000).len();
+        let (_dir, handle) = live_reload_relay(|cfg, _| {
+            cfg.relay.max_filter_bytes_per_connection = budget;
+        });
+        let (conn, mut rx) = live_conn(&handle).await;
+        let req = |sub: &str| follow_list_req(sub, 1_000);
+        let refusal =
+            format!(r#"["CLOSED","c","blocked: this connection's filters exceed {budget} bytes"]"#);
+        for sub in ["a", "b"] {
+            handle.client_message(conn, local_source(), req(sub)).await;
+            assert!(recv_outbound(&mut rx).await.contains("EOSE"));
+        }
+        handle.client_message(conn, local_source(), req("c")).await;
+        assert_eq!(recv_outbound(&mut rx).await, refusal);
+        // Replacing an open subscription reuses its bytes, and a COUNT holds
+        // nothing once answered.
+        handle.client_message(conn, local_source(), req("a")).await;
+        assert!(recv_outbound(&mut rx).await.contains("EOSE"));
+        let count = json!(["COUNT", "n", {"kinds": [1]}]).to_string();
+        handle.client_message(conn, local_source(), count).await;
+        assert!(recv_outbound(&mut rx).await.starts_with(r#"["COUNT","n""#));
+        // A closed subscription frees its bytes.
+        let close = json!(["CLOSE", "b"]).to_string();
+        handle.client_message(conn, local_source(), close).await;
+        handle.client_message(conn, local_source(), req("c")).await;
+        assert!(recv_outbound(&mut rx).await.contains("EOSE"));
+
+        // Over a lowered budget an open id can still be replaced by filters no
+        // larger than its own; anything that grows the total is refused.
+        handle.config.write().relay.max_filter_bytes_per_connection = budget / 2;
+        handle.client_message(conn, local_source(), req("a")).await;
+        assert!(recv_outbound(&mut rx).await.contains("EOSE"));
+        handle
+            .client_message(conn, local_source(), follow_list_req("c", 1_001))
+            .await;
+        let frames = drain_outbound(&mut rx).await;
+        assert_eq!(
+            frames,
+            [format!(
+                r#"["CLOSED","c","blocked: this connection's filters exceed {} bytes"]"#,
+                budget / 2
+            )]
+        );
+        // Zero is unlimited.
+        handle.config.write().relay.max_filter_bytes_per_connection = 0;
+        for sub in ["b", "c", "d"] {
+            handle.client_message(conn, local_source(), req(sub)).await;
+            assert!(recv_outbound(&mut rx).await.contains("EOSE"));
+        }
+        handle.request_shutdown();
+    }
+
+    /// A relay with default limits over `count` stored notes of each
+    /// `(kind, count)`, written straight to the database.
+    fn relay_with_notes(kinds: &[(u64, u64)]) -> (tempfile::TempDir, RelayHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut events: Vec<EventToWrite> = kinds
+            .iter()
+            .flat_map(|&(kind, count)| (0..count).map(move |i| (kind, i)))
+            .map(|(kind, i)| {
+                let mut id = [0xCCu8; 32];
+                id[..8].copy_from_slice(&kind.to_be_bytes());
+                id[8..16].copy_from_slice(&i.to_be_bytes());
+                let event = json!({
+                    "id": hex::encode(id), "pubkey": "11".repeat(32),
+                    "created_at": 1_700_000_000 + i, "kind": kind, "tags": [],
+                    "content": "note", "sig": "00".repeat(64),
+                });
+                let parsed = wok_event::parse_and_verify_event(
+                    &event,
+                    &wok_event::EventLimits::default(),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+                EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        let handle = start(env, cfg).unwrap();
+        (dir, handle)
+    }
+
+    /// The EVENTs a REQ sends before its EOSE.
+    async fn history_len(
+        handle: &RelayHandle,
+        conn: u64,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+        req: Value,
+    ) -> usize {
+        handle
+            .client_message(conn, local_source(), req.to_string())
+            .await;
+        let mut events = 0;
+        loop {
+            let frame = recv_outbound(rx).await;
+            if frame.starts_with(r#"["EVENT""#) {
+                events += 1;
+            } else {
+                assert!(frame.starts_with(r#"["EOSE""#), "{frame}");
+                return events;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_limits_return_directory_batches_and_merged_reqs_whole() {
+        let (_dir, handle) =
+            relay_with_notes(&[(1, 2_100), (6, 500), (7, 500), (16, 500), (1111, 500)]);
+        let (conn, mut rx) = live_conn(&handle).await;
+        // MDK's directory batch: 200 authors x 6 kinds. The 500 clamp cut it.
+        let batch = json!(["REQ", "dir", {"kinds": [1], "limit": 1_200}]);
+        assert_eq!(history_len(&handle, conn, &mut rx, batch).await, 1_200);
+        // A filter without a limit gets the same 2,000 clamp (#97 decision 9).
+        let unlimited = json!(["REQ", "all", {"kinds": [1]}]);
+        assert_eq!(history_len(&handle, conn, &mut rx, unlimited).await, 2_000);
+        // A merged batch whose filters each fit is no longer cut at 2,000 in
+        // all (audit C1).
+        let merged = json!(["REQ", "merged",
+            {"kinds": [1], "limit": 500}, {"kinds": [6]}, {"kinds": [7]},
+            {"kinds": [16]}, {"kinds": [1111]}]);
+        assert_eq!(history_len(&handle, conn, &mut rx, merged).await, 2_500);
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_limits_accept_long_lists_and_four_tag_letters() {
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        let (conn, mut rx) = live_conn(&handle).await;
+        // A heavy user's follow list (audit F9): 2,000 tags used to be the cap.
+        let follows: Vec<Value> = (0..4_000u32)
+            .map(|i| json!(["p", format!("{i:064x}")]))
+            .collect();
+        let contacts = sign_event(json!({
+            "created_at": now_secs(), "kind": 3, "tags": follows, "content": "",
+        }));
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", contacts]).to_string())
+            .await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["OK""#) && reply.contains("true"),
+            "{reply}"
+        );
+        // NIP-22 comments on an event of kind 1, by root and kind: four tag
+        // letters, where three used to be the cap.
+        let comments = json!(["REQ", "comments", {
+            "kinds": [1111], "#E": ["ab".repeat(32)], "#K": ["1"],
+            "#P": ["cd".repeat(32)], "#k": ["1"],
+        }]);
+        assert_eq!(history_len(&handle, conn, &mut rx, comments).await, 0);
+        handle.request_shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_reload_applies_the_count_dedup_budget() {
         // The REQ worker sized its COUNT dedup budget from the startup
@@ -5895,7 +6114,7 @@ mod tests {
                 _dir: dir,
             };
             let all = SubId::new("all").unwrap();
-            harness.conns.open_sub(2, Ns::Req, &all, 1);
+            harness.conns.open_sub(2, Ns::Req, &all, 1, 0);
             harness.send(MonitorMsg::Register(Self::sub(2, "all", json!({}), 1, 0)));
             harness.send(MonitorMsg::HistoryDone {
                 conn_id: 2,
@@ -5926,7 +6145,7 @@ mod tests {
 
         fn register(&self, generation: u64, filter: Value, snapshot: u64) {
             let x = SubId::new("x").unwrap();
-            self.conns.open_sub(1, Ns::Req, &x, generation);
+            self.conns.open_sub(1, Ns::Req, &x, generation, 0);
             self.send(MonitorMsg::Register(Self::sub(
                 1, "x", filter, generation, snapshot,
             )));
@@ -6335,7 +6554,7 @@ mod tests {
         let monitor = || mon_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
         fault::fail_reads(env.path(), 1);
-        conns.open_sub(1, Ns::Req, &x, 7);
+        conns.open_sub(1, Ns::Req, &x, 7, 0);
         req_tx.send(ReqMsg::Scan(sub(7, false))).unwrap();
         assert!(matches!(
             monitor(),
@@ -6344,7 +6563,7 @@ mod tests {
         let reply = closed(&mut outbound);
         assert!(reply.starts_with(r#"["CLOSED","x","error: "#), "{reply}");
         assert!(!conns.is_open(1, Ns::Req, &x));
-        conns.open_sub(1, Ns::Req, &x, 8);
+        conns.open_sub(1, Ns::Req, &x, 8, 0);
         req_tx.send(ReqMsg::Scan(sub(8, false))).unwrap();
         assert!(matches!(
             monitor(),
@@ -6352,7 +6571,7 @@ mod tests {
         ));
 
         fault::fail_reads(env.path(), 1);
-        conns.open_sub(1, Ns::Count, &x, 9);
+        conns.open_sub(1, Ns::Count, &x, 9, 0);
         req_tx.send(ReqMsg::Count(sub(9, true))).unwrap();
         let reply = closed(&mut outbound);
         assert!(reply.starts_with(r#"["CLOSED","x","error: "#), "{reply}");
@@ -6451,7 +6670,7 @@ mod tests {
             conns.insert(1, Outbound::new(out_tx, 0));
             // The ingester has opened the gate for the replacement.
             let ns = if count { Ns::Count } else { Ns::Req };
-            conns.open_sub(1, ns, &SubId::new("x").unwrap(), 2);
+            conns.open_sub(1, ns, &SubId::new("x").unwrap(), 2, 0);
             let (req_tx, req_rx) = bounded(8);
             let (mon_tx, mon_rx) = bounded(8);
             trace::record(env.path());
@@ -6617,7 +6836,7 @@ mod tests {
         let conns = Arc::new(ConnTable::new());
         let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
         conns.insert(1, Outbound::new(out_tx, 0));
-        conns.open_sub(1, Ns::Count, &SubId::new("d").unwrap(), 5);
+        conns.open_sub(1, Ns::Count, &SubId::new("d").unwrap(), 5, 0);
         let (req_tx, req_rx) = bounded(REQ_PASS_MAX);
         let (mon_tx, mon_rx) = unbounded();
         let all = json!({"kinds": [1], "limit": 50_000});
@@ -6831,7 +7050,7 @@ mod tests {
             let over = match rng.gen_range(0..4) {
                 0 | 1 => {
                     next += 1;
-                    conns.open_sub(1, Ns::Req, &sid(id), next);
+                    conns.open_sub(1, Ns::Req, &sid(id), next, 0);
                     newest[id].store(next, Ordering::Relaxed);
                     next - 1
                 }
@@ -7011,7 +7230,7 @@ mod tests {
             thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx, data_rx))
         };
         let all = SubId::new("all").unwrap();
-        conns.open_sub(2, Ns::Req, &all, 1);
+        conns.open_sub(2, Ns::Req, &all, 1, 0);
         tx.send(MonitorMsg::Register(MonitorHarness::sub(
             2,
             "all",

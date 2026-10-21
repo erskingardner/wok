@@ -224,7 +224,7 @@ cargo build --release -p wok-cli -p wok-bench
 |---|---:|---|
 | `--connections` | 1,000 | Sockets held open in the memory phase |
 | `--transport-idle-secs` | 0 | Silence before the last memory sample (0 skips it). Wok releases compression state after 30–60 s without traffic, so use at least 65 to see it |
-| `--burst-events` | 500 | Events per burst, at most the relay's default `max_filter_limit` (500); fewer if fewer kind-1 events are stored |
+| `--burst-events` | 500 | Events per burst, at most the relay's default `max_filter_limit` (2,000); fewer if fewer kind-1 events are stored |
 | `--bursts` | 40 | Bursts per mode |
 | `--fanout-subscribers` | 32 | Live subscribers |
 | `--fanout-events` | 200 | Notes published per mode |
@@ -301,8 +301,10 @@ The query shapes:
   kinds alone, and 100 ids.
 
 The relays run the harness's usual configuration, except that
-`relay.max_req_filter_size` is raised to 1 MiB. The default of 64 KiB refuses a
-REQ that names about 970 authors or more.
+`relay.max_req_filter_size` is raised to 1 MiB. The default is 256 KiB, which
+fits 2,000 authors; the 64 KiB default of Wok 0.7 and earlier, which a
+`--wok-baseline` build may have, refuses a REQ that names about 970 authors or
+more.
 
 Each shape and binary starts a relay on a fresh copy-on-write clone of the
 dataset database (`cp -c` on macOS, `cp --reflink=auto` elsewhere). The first
@@ -569,7 +571,11 @@ steady-phase deliveries per second. Compare two relay binaries with the same
 | `--live-churners` | 50 | Churning connections |
 | `--live-churn-rate` | 200 | REQs per second, all churners together |
 
-Feeds of 500 authors fit the default `relay.max_req_filter_size` of 64 KiB.
+Feeds of 500 authors fit the default `relay.max_req_filter_size` of 256 KiB.
+A connection's subscriptions must also fit
+`relay.max_filter_bytes_per_connection` (2 MiB), about 31,000 authors in all:
+ten feeds always do, but with `--live-subs-per-conn` near 100 and the default
+author range, raise it or some subscriptions are refused.
 CI runs small versions of both scenarios as unit tests (`live::tests`). The
 `live_subscriptions` test uses an in-process relay.
 
@@ -752,6 +758,32 @@ run. Results swing widely near the monitors' saturation point: raise
 at least three times, alternating, and compare medians. A run that panics with
 "load ran out" lasted longer than its load, so its later lines were measured
 without it; discard them.
+
+## Time slices of many-filter REQs
+
+`crates/wok-query/tests/timeslice.rs` holds an ignored test that times the
+slices of one REQ with many filters, in process, through a `QueryScheduler`
+as a req worker runs it. It uses only public `wok-query` API, so the same file
+runs unchanged against older revisions.
+
+```bash
+cargo test --release -p wok-query --test timeslice -- --ignored --nocapture
+```
+
+- `EVENTS` (20000) stored kind-1 notes each mention `FILTERS` (30) accounts.
+  The REQ has one filter per account, `{"kinds":[7],"#p":[<account>],
+  "limit":500}`, so each filter reads every note and finds no match.
+- It runs in slices of `BUDGET_US` (10000). A small REQ,
+  `{"kinds":[1],"limit":5}`, arrives every `ARRIVAL_US` (2000) and runs
+  before the many-filter REQ's next slice, as a new query does on a req
+  worker.
+
+Each of three rounds prints the many-filter REQ's time to its end, then
+sample counts and p50/p90/p99/max for its slice lengths and for each small
+REQ's time from arrival to its end. The longest slice is how long a query
+can wait behind it. Set `EVENTS` large enough that one filter takes longer
+than a slice to see each filter's checks; set `ARRIVAL_US` past the run's
+length to time the many-filter REQ alone.
 
 ## REQ path latency for client traffic shapes
 

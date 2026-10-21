@@ -21,3 +21,16 @@
 #   bound set in the operator's file never applies to replaceable,
 #   addressable, deletion or vanish events. AUTH and kind 21059 gift wraps
 #   use the windows NIP-42 and NIP-59 call for.
+# - [relay] max_req_filter_size = 262144: 256 KiB of filters per REQ (was
+#   64 KiB), so an outbox client can fetch a 2,000-account follow list in one
+#   request. max_filter_bytes_per_connection = 2097152 caps the filters of all
+#   the subscriptions open on one connection, so the larger REQ cap does not
+#   multiply live filter memory.
+# - [events] max_num_tags = 5000 (was 2000): heavy users' follow, mute and
+#   other lists fit.
+# - [relay] max_filter_limit = 2000 (was 500), NIP-11 max_limit and
+#   default_limit: directory batches and metadata fetches without a limit
+#   are no longer cut at 500. max_total_events_per_req = 10000 (was 2000):
+#   merged batches of filters are no longer cut at 2,000 in all.
+#   max_tags_per_filter = 8 (was 3): comment, community and marketplace
+#   queries that combine four or more tag letters are accepted.

@@ -597,8 +597,9 @@ pub(crate) struct Received {
     pub sha256: String,
 }
 
-/// Room for a 2,000-author filter: the default `relay.max_req_filter_size`
-/// (64 KiB) refuses a REQ naming about 970 authors or more.
+/// Room for a 2,000-author filter on a baseline build too: the
+/// `relay.max_req_filter_size` default of Wok 0.7 and earlier (64 KiB) refuses
+/// a REQ naming about 970 authors or more.
 const RELAY_OVERRIDES: &[(&str, &str)] = &[("[relay]", "max_req_filter_size = 1048576")];
 
 /// Start a relay with the harness's usual file, plus each `(section, line)`

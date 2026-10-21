@@ -233,6 +233,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `application/nostr+json`, for example
   `application/nostr+json, application/json;q=0.9`. Only that exact header
   value was recognized, and anything else got the landing page.
+- NIP-11 `software` is the homepage URL `https://github.com/erskingardner/wok`,
+  as NIP-11 requires. It was the git remote
+  `git+https://github.com/erskingardner/wok.git`.
 
 ## [0.7.0] - 2026-09-08
 

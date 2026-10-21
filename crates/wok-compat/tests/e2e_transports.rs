@@ -1061,10 +1061,8 @@ async fn nip11_http_document() {
     assert_eq!(client["limitation"]["max_query_cost"], 1000);
     assert_eq!(client["limitation"]["max_tags_per_filter"], 3);
     assert_eq!(client["limitation"]["max_and_entries"], 16);
-    assert_eq!(
-        client["software"],
-        "git+https://github.com/erskingardner/wok.git"
-    );
+    // NIP-11: `software` MUST be a URL to the project's homepage.
+    assert_eq!(client["software"], "https://github.com/erskingardner/wok");
     // npub is converted to hex like C++.
     assert_eq!(
         client["pubkey"],

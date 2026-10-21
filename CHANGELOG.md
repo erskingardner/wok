@@ -73,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wok-bench --scenario ws_transport` measures what WebSocket connections
+  cost the relay, with and without permessage-deflate: RSS per open, warm and
+  idle connection, history bursts, live fan-out, reconnect churn, and the
+  deflate codec at each level.
 - Configuration presets. The optional top-level key `preset` selects a named
   set of defaults; configuration resolves as built-in defaults, then the
   preset's overlay, then the file. `public`, the built-in defaults, is the

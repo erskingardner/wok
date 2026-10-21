@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod clients;
+mod transport;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -137,6 +138,19 @@ struct Args {
     /// Fail --scenario clients when any request is refused.
     #[arg(long)]
     expect_no_refusals: bool,
+    /// Events per history burst in --scenario ws_transport.
+    #[arg(long, default_value_t = 500)]
+    burst_events: u64,
+    /// History bursts per deflate mode in --scenario ws_transport.
+    #[arg(long, default_value_t = 40)]
+    bursts: usize,
+    /// Connect, fetch, close cycles per deflate mode in --scenario ws_transport.
+    #[arg(long, default_value_t = 1_000)]
+    churn_connections: usize,
+    /// Seconds --scenario ws_transport holds its connections silent before a
+    /// last memory sample (0 skips it).
+    #[arg(long, default_value_t = 0)]
+    transport_idle_secs: u64,
 }
 
 impl Args {
@@ -180,6 +194,8 @@ struct Trial {
     client_tcp_nodelay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     clients: Option<clients::ClientsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<transport::TransportReport>,
 }
 
 #[derive(Serialize)]
@@ -309,6 +325,7 @@ fn main() -> Result<()> {
         "duplicate_import",
         "cold_start",
         "clients",
+        "ws_transport",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -436,7 +453,7 @@ fn main() -> Result<()> {
         for scenario in &scenarios {
             let mut relays: Vec<&str> = if args.has_external_target() {
                 vec![args.target_label.as_str()]
-            } else if matches!(*scenario, "nip50_search" | "clients") {
+            } else if matches!(*scenario, "nip50_search" | "clients" | "ws_transport") {
                 vec!["wok"]
             } else {
                 RELAYS.to_vec()
@@ -509,6 +526,7 @@ fn run_trial(
     let mut notes = String::new();
     let mut throughput = 0.0f64;
     let mut clients_report = None;
+    let mut transport_report = None;
 
     let bin = if args.has_external_target() {
         None
@@ -818,6 +836,22 @@ fn run_trial(
                 }
             }
         }
+        "ws_transport" => {
+            let bin = local_bin()?;
+            match transport_trial(rt, args, bin, dir.path(), corpus_path) {
+                Ok((nts, report)) => {
+                    notes = nts;
+                    ok = report.ok();
+                    errors += report.errors();
+                    transport_report = Some(report);
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e}");
+                }
+            }
+        }
         _ => {
             notes = "unrecognized scenario".into();
             ok = false;
@@ -826,6 +860,7 @@ fn run_trial(
 
     Ok(Trial {
         clients: clients_report,
+        transport: transport_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -864,6 +899,7 @@ fn failed_trial(
 ) -> Trial {
     Trial {
         clients: None,
+        transport: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -2465,6 +2501,67 @@ fn log_tail(path: &Path) -> String {
     lines[lines.len().saturating_sub(5)..].join(" | ")
 }
 
+/// Per-connection transport costs with and without deflate (see
+/// transport.rs). Fan-out publications are fresh notes, newer than the corpus.
+fn transport_trial(
+    rt: &tokio::runtime::Runtime,
+    args: &Args,
+    bin: &Path,
+    dbdir: &Path,
+    corpus_path: &Path,
+) -> Result<(String, transport::TransportReport)> {
+    let opts = transport::TransportOptions {
+        connections: args.connections,
+        idle_secs: args.transport_idle_secs,
+        burst_events: args.burst_events,
+        bursts: args.bursts,
+        fanout_subscribers: args.fanout_subscribers,
+        fanout_events: args.fanout_events,
+        churn_connections: args.churn_connections,
+    };
+    let corpus = read_event_values(corpus_path)?;
+    let newest = corpus
+        .iter()
+        .filter_map(|event| event["created_at"].as_u64())
+        .max()
+        .unwrap_or_default();
+    let kind1_events = corpus.iter().filter(|event| event["kind"] == 1).count() as u64;
+    // Generated events take the seconds just before the base timestamp.
+    let count = args.fanout_events * 2;
+    let fanout = generate_values(EventWorkload {
+        count,
+        seed: args.seed ^ 0x7472_616e_7370_6f72,
+        base_timestamp: unix_timestamp()?.max(newest + count + 1),
+        mix: EventMix::Kind1,
+    })?;
+    let report = transport::run(
+        rt,
+        transport::RunInput {
+            bin,
+            dbdir,
+            corpus: corpus_path,
+            kind1_events,
+            newest,
+            fanout,
+            opts,
+        },
+    )?;
+    let summary: Vec<String> = report
+        .modes
+        .iter()
+        .map(|mode| {
+            format!(
+                "deflate {}: {:.0} KB/conn warm, burst {:.2} ms / {:.1} CPU ms",
+                if mode.offer_deflate { "on" } else { "off" },
+                mode.warm_kb_per_conn,
+                mode.burst_p50_ms,
+                mode.burst_cpu_ms,
+            )
+        })
+        .collect();
+    Ok((summary.join("; "), report))
+}
+
 /// Client-realistic load with abuse controls and AUTH on (see clients.rs).
 /// The relay gets the background corpus plus the scenario's own corpus, both
 /// imported with the trial's config before it starts.
@@ -2610,6 +2707,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.clients {
             s.push_str(&clients::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.transport {
+            s.push_str(&transport::render_markdown(report, &t.relay, t.repetition));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -2636,6 +2736,19 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if args.expect_no_refusals {
             selection.push_str(" --expect-no-refusals");
         }
+    }
+    if args.scenario.as_deref() == Some("ws_transport") {
+        selection.push_str(&format!(
+            " --connections {} --transport-idle-secs {} --burst-events {} --bursts {} --fanout-subscribers {} --fanout-events {} --churn-connections {} --events {}",
+            args.connections,
+            args.transport_idle_secs,
+            args.burst_events,
+            args.bursts,
+            args.fanout_subscribers,
+            args.fanout_events,
+            args.churn_connections,
+            args.events.unwrap_or_default(),
+        ));
     }
     let target = if let Some(path) = &args.target_unix {
         format!(

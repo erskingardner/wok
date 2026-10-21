@@ -73,7 +73,7 @@ pub enum WsEvent {
 
 /// Outbound compression level. Level 1 is what uWS uses for strfry. On Nostr
 /// events it costs well under half the CPU of zlib's default level 6, for a
-/// few percent more bytes.
+/// few percent more bytes (wok-bench `--scenario ws_transport` measures both).
 pub const DEFAULT_LEVEL: u32 = 1;
 
 /// The farthest back a client's compressor may refer: RFC 7692 windows are

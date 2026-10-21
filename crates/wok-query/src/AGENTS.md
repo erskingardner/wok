@@ -4,7 +4,7 @@
 | --- | --- |
 | `lib.rs` | Re-exports |
 | `filter.rs` | `NostrFilter` / `NostrFilterGroup`, `dumb_match`, validator |
-| `scan.rs` | Resumable `DbScan` / `DbQuery` (C++ `DBQuery.h`) |
+| `scan.rs` | Resumable `DbScan` / `DbQuery` (C++ `DBQuery.h`); NIP-67 `Completeness` |
 | `scheduler.rs` | Per-connection query scheduling; REQ and COUNT ids are separate |
 | `monitor.rs` | Live inverted index (`ActiveMonitors`) over subscription slots, O(keys) add/remove; pending or live by generation |
 | `pending.rs` | `PendingBuffer`: live matches held while a REQ's history is sent |

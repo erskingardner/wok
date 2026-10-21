@@ -218,6 +218,9 @@ pub struct DbScan {
     pub approx_work: u64,
     since: u64,
     until: u64,
+    /// The cursor of the candidate a handler stopped the scan on, which a
+    /// resumed scan settles before taking the next one.
+    unsettled: Option<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -257,6 +260,11 @@ struct SearchScan {
     max_hits: usize,
     emit_index: usize,
     approx_work: u64,
+    /// A hit ranked below `max_hits`: a match the reader may see that this
+    /// filter does not send.
+    overflow: Option<u64>,
+    /// A match was hidden by the restricted-read rule alone.
+    restricted: bool,
 }
 
 struct SearchGroupScan {
@@ -372,6 +380,8 @@ impl SearchScan {
             max_hits: usize::try_from(filter.limit).unwrap_or(usize::MAX),
             emit_index: 0,
             approx_work: 0,
+            overflow: None,
+            restricted: false,
         })
     }
 
@@ -467,7 +477,7 @@ impl SearchScan {
             if !filter.does_match_without_search(packed) {
                 return true;
             }
-            match visibility.allows(txn, packed) {
+            match visibility.allows_noting_restricted(txn, packed, &mut self.restricted) {
                 Ok(true) => {}
                 Ok(false) => return true,
                 Err(err) => {
@@ -496,7 +506,7 @@ impl SearchScan {
                     id,
                 }));
                 if self.top_hits.len() > self.max_hits {
-                    self.top_hits.pop();
+                    self.overflow = self.top_hits.pop().map(|Reverse(hit)| hit.lev_id);
                 }
             }
 
@@ -536,6 +546,23 @@ impl SearchScan {
             }
         }
         Ok(true)
+    }
+
+    /// What a finished search left that is not in `sent`: a ranked hit the
+    /// handler stopped before, else one ranked below the limit.
+    fn remaining(&self, sent: &HashSet<u64>) -> Peek {
+        if let Some(hit) = self.ranked_hits[self.emit_index..]
+            .iter()
+            .find(|hit| !sent.contains(&hit.lev_id))
+        {
+            return Peek::Found(hit.lev_id);
+        }
+        match self.overflow {
+            None => Peek::Exhausted,
+            Some(lev_id) if !sent.contains(&lev_id) => Peek::Found(lev_id),
+            // Another filter sent it; whether more ranked below is unknown.
+            Some(_) => Peek::Unknown,
+        }
     }
 }
 
@@ -737,6 +764,7 @@ impl DbScan {
             approx_work: 0,
             since: f.since,
             until: f.until,
+            unsettled: None,
         }
     }
 
@@ -751,6 +779,9 @@ impl DbScan {
         H: FnMut(u64) -> bool,
         P: FnMut(u64) -> bool,
     {
+        if let Some(si) = self.unsettled.take() {
+            self.settle(txn, si)?;
+        }
         loop {
             self.approx_work += 1;
             if do_pause(self.approx_work) {
@@ -795,28 +826,76 @@ impl DbScan {
                     }
                 }
             }
+            let si = ev.scan_index() as usize;
             if do_send && handle_event(lev_id) {
+                self.unsettled = Some(si);
                 return Ok(true);
             }
-            let si = ev.scan_index() as usize;
-            self.cursors[si].outstanding -= 1;
-            if self.cursors[si].outstanding == 0 {
-                let mut more = VecDeque::new();
-                self.approx_work += self.cursors[si].collect(
-                    txn,
-                    self.index_dbi,
-                    ev.scan_index(),
-                    self.since,
-                    self.until,
-                    self.refill_scan_depth,
-                    &mut more,
-                )?;
-                let mut merged: Vec<_> = self.event_queue.drain(..).chain(more).collect();
-                merged.sort_by(cmp_cand);
-                self.event_queue = merged.into();
-            }
+            self.settle(txn, si)?;
         }
     }
+
+    /// One of cursor `si`'s candidates was taken. Once the queue holds none
+    /// of its candidates, its next entries are read and merged in, so the
+    /// queue's head stays the newest entry left in any cursor.
+    fn settle(&mut self, txn: &RoTxn<'_>, si: usize) -> Result<(), wok_db::DbError> {
+        self.cursors[si].outstanding -= 1;
+        if self.cursors[si].outstanding == 0 {
+            let mut more = VecDeque::new();
+            self.approx_work += self.cursors[si].collect(
+                txn,
+                self.index_dbi,
+                si as u64,
+                self.since,
+                self.until,
+                self.refill_scan_depth,
+                &mut more,
+            )?;
+            let mut merged: Vec<_> = self.event_queue.drain(..).chain(more).collect();
+            merged.sort_by(cmp_cand);
+            self.event_queue = merged.into();
+        }
+        Ok(())
+    }
+}
+
+/// Most work the NIP-67 peeks of one REQ do, looking past where cut filters
+/// stopped for one more match, in `DbScan::approx_work` units: a refill of
+/// one cursor and about a hundred event reads. The peek that spends the last
+/// of it may overrun it by one cursor refill; later ones do no work. A peek
+/// that runs out has learned nothing, and the REQ's EOSE carries neither
+/// `finish` nor `more`.
+const PEEK_WORK: u64 = 2048;
+/// Most candidates those peeks check the read policy of.
+const PEEK_CANDIDATES: u32 = 64;
+
+/// What a NIP-67 peek found past the matches a filter sent.
+enum Peek {
+    /// A match the reader may see that was not sent.
+    Found(u64),
+    /// No such match is left.
+    Exhausted,
+    /// The peek ran out of budget first, or cannot tell.
+    Unknown,
+}
+
+/// What a REQ's peeks may still spend.
+struct PeekBudget {
+    work: u64,
+    candidates: u32,
+}
+
+/// NIP-67: what a REQ's finished history scan knows about the stored matches
+/// it did not send, up to its snapshot. A field is set only when it holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Completeness {
+    /// Every stored match the reader may see was sent.
+    pub finish: bool,
+    /// A stored match the reader may see was not sent.
+    pub more: bool,
+    /// A stored match was hidden by the restricted-read rule alone, which
+    /// authenticating as an involved pubkey lifts.
+    pub restricted: bool,
 }
 
 pub struct DbQuery {
@@ -834,6 +913,21 @@ pub struct DbQuery {
     hll: Option<HyperLogLog>,
     count_dedup_budget: u64,
     count_dedup_limited: bool,
+    /// Whether to work out [`Completeness`], peeking past cut filters.
+    completeness: bool,
+    /// Matches peeks found past cut filters, unsent when found.
+    witnesses: Vec<u64>,
+    /// A filter may have matches left that no peek could find.
+    unknown: bool,
+    restricted: bool,
+    peek_budget: PeekBudget,
+    /// The read policy changed between time slices, after an AUTH, a reload
+    /// or a moderation, vanish or deletion commit, so earlier slices hid or
+    /// sent by another.
+    visibility_changed: bool,
+    /// The database's visibility generation the first slice read under.
+    policy_generation: Option<u64>,
+    started: bool,
 }
 
 impl DbQuery {
@@ -885,7 +979,33 @@ impl DbQuery {
             hll,
             count_dedup_budget,
             count_dedup_limited: false,
+            completeness: false,
+            witnesses: Vec::new(),
+            unknown: false,
+            restricted: false,
+            peek_budget: PeekBudget {
+                work: PEEK_WORK,
+                candidates: PEEK_CANDIDATES,
+            },
+            visibility_changed: false,
+            policy_generation: None,
+            started: false,
         }
+    }
+
+    /// Work out [`Completeness`] for a REQ's history (NIP-67). It costs a
+    /// bounded peek past each filter cut by its limit or the request-wide
+    /// ceiling, so COUNT and sync scans leave it off.
+    pub fn track_completeness(&mut self) {
+        self.completeness = !self.sub.count_only;
+    }
+
+    /// The read policy for the next time slice.
+    pub fn set_visibility(&mut self, visibility: ReadVisibility) {
+        if self.started && visibility != self.visibility {
+            self.visibility_changed = true;
+        }
+        self.visibility = visibility;
     }
 
     pub fn sent_count(&self) -> u64 {
@@ -902,21 +1022,142 @@ impl DbQuery {
         self.count_dedup_limited
     }
 
+    /// What the finished scan knows about the matches it did not send; all
+    /// false unless [`track_completeness`](Self::track_completeness) was
+    /// called. `finish` needs every filter to have run out of matches or a
+    /// peek past its cut to find none; `more` needs a match a peek found to
+    /// be still unsent at the end, as a later filter may have sent it.
+    pub fn completeness(&self) -> Completeness {
+        if !self.completeness || self.visibility_changed {
+            return Completeness::default();
+        }
+        let more = self
+            .witnesses
+            .iter()
+            .any(|lev_id| !self.sent_events_full.contains(lev_id));
+        Completeness {
+            finish: !self.unknown && self.witnesses.is_empty(),
+            more,
+            restricted: self.restricted,
+        }
+    }
+
+    /// An event the scan counted as sent did not reach the reader (its
+    /// payload could not be read or decoded), so `finish` would be wrong.
+    pub fn mark_incomplete(&mut self) {
+        self.unknown = true;
+    }
+
+    fn note(&mut self, peek: Peek) {
+        match peek {
+            Peek::Found(lev_id) => self.witnesses.push(lev_id),
+            Peek::Exhausted => {}
+            Peek::Unknown => self.unknown = true,
+        }
+    }
+
     fn visible_event_pubkey(
         txn: &RoTxn<'_>,
         lev_id: u64,
         visibility: &ReadVisibility,
+        restricted: &mut bool,
     ) -> Result<Option<[u8; 32]>, wok_db::DbError> {
         let Some(raw) = txn.get_u64(txn.env().dbis().event, lev_id)? else {
             return Ok(None);
         };
         let packed = PackedEventView::new(raw)?;
-        if !visibility.allows(txn, packed)? {
+        if !visibility.allows_noting_restricted(txn, packed, restricted)? {
             return Ok(None);
         }
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(packed.pubkey());
         Ok(Some(pubkey))
+    }
+
+    /// Resume `scanner` past where it stopped, looking for a match the
+    /// reader may see that is not in `sent`, within `budget`.
+    #[allow(clippy::too_many_arguments)]
+    fn peek(
+        scanner: &mut DbScan,
+        txn: &RoTxn<'_>,
+        filter: &NostrFilter,
+        latest: u64,
+        sent: &HashSet<u64>,
+        visibility: &ReadVisibility,
+        restricted: &mut bool,
+        budget: &mut PeekBudget,
+    ) -> Result<Peek, wok_db::DbError> {
+        // Resuming would settle the stopped cursor, a refill, for nothing.
+        if budget.work == 0 || budget.candidates == 0 {
+            return Ok(Peek::Unknown);
+        }
+        let (start, work) = (scanner.approx_work, budget.work);
+        let mut found = None;
+        let mut out_of_candidates = false;
+        let mut error = None;
+        let candidates = &mut budget.candidates;
+        let complete = scanner.scan(
+            txn,
+            filter,
+            |lev_id| {
+                if lev_id > latest || sent.contains(&lev_id) {
+                    return false;
+                }
+                if *candidates == 0 {
+                    out_of_candidates = true;
+                    return true;
+                }
+                *candidates -= 1;
+                match Self::visible_event_pubkey(txn, lev_id, visibility, restricted) {
+                    Ok(Some(_)) => {
+                        found = Some(lev_id);
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(e) => {
+                        error = Some(e);
+                        true
+                    }
+                }
+            },
+            |approx_work| approx_work - start > work,
+        )?;
+        budget.work = work.saturating_sub(scanner.approx_work - start);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(match found {
+            Some(lev_id) => Peek::Found(lev_id),
+            None if complete && !out_of_candidates => Peek::Exhausted,
+            None => Peek::Unknown,
+        })
+    }
+
+    /// After the request-wide ceiling cut the scan, look in the filters it
+    /// never reached for a match the reader may see that was not sent.
+    fn peek_unscanned(&mut self, txn: &RoTxn<'_>) -> Result<Peek, wok_db::DbError> {
+        let latest = self.sub.latest_event_id;
+        for f in &self.sub.filter_group.filters[self.filter_group_index + 1..] {
+            // A limit of 0 asks for no stored events, and a search ranks all
+            // of its hits before it can say anything.
+            if f.limit == 0 || f.search.is_some() {
+                return Ok(Peek::Unknown);
+            }
+            let peek = Self::peek(
+                &mut DbScan::new(f, txn),
+                txn,
+                f,
+                latest,
+                &self.sent_events_full,
+                &self.visibility,
+                &mut self.restricted,
+                &mut self.peek_budget,
+            )?;
+            if !matches!(peek, Peek::Exhausted) {
+                return Ok(peek);
+            }
+        }
+        Ok(Peek::Exhausted)
     }
 
     /// Returns true when the scan is complete.
@@ -929,6 +1170,16 @@ impl DbQuery {
     where
         F: FnMut(&Subscription, u64),
     {
+        if self.completeness {
+            // Moderation, vanish and deletion commits change what a slice
+            // may send without changing `visibility`.
+            let generation = wok_db::state::policy_generation(txn).ok();
+            if generation.is_none() || (self.started && generation != self.policy_generation) {
+                self.visibility_changed = true;
+            }
+            self.policy_generation = generation;
+        }
+        self.started = true;
         if self.all_filters_search {
             let mut group = match self.search_group.take() {
                 Some(group) => group,
@@ -938,6 +1189,9 @@ impl DbQuery {
             let mut hits = Vec::new();
             let mut visibility_error = None;
             let mut dedup_budget_hit = false;
+            let mut restricted = self.restricted;
+            // The first hit the request-wide ceiling kept out.
+            let mut unsent = None;
             let count_dedup_budget = self.count_dedup_budget;
             let complete = group.process(
                 txn,
@@ -946,7 +1200,12 @@ impl DbQuery {
                 time_budget_us,
                 &self.visibility,
                 |lev_id| {
-                    let pubkey = match Self::visible_event_pubkey(txn, lev_id, &self.visibility) {
+                    let pubkey = match Self::visible_event_pubkey(
+                        txn,
+                        lev_id,
+                        &self.visibility,
+                        &mut restricted,
+                    ) {
                         Ok(Some(pubkey)) => pubkey,
                         Ok(None) => return,
                         Err(error) => {
@@ -959,10 +1218,12 @@ impl DbQuery {
                         dedup_budget_hit = true;
                         return;
                     }
-                    if (self.max_total_events == 0 || (sent.len() as u64) < self.max_total_events)
-                        && sent.insert(lev_id)
-                    {
-                        hits.push((lev_id, pubkey));
+                    if self.max_total_events == 0 || (sent.len() as u64) < self.max_total_events {
+                        if sent.insert(lev_id) {
+                            hits.push((lev_id, pubkey));
+                        }
+                    } else if !sent.contains(&lev_id) {
+                        unsent.get_or_insert(lev_id);
                     }
                 },
             )?;
@@ -970,6 +1231,7 @@ impl DbQuery {
                 return Err(error);
             }
             self.sent_events_full = sent;
+            self.restricted = restricted;
             for (lev_id, pubkey) in hits {
                 if let Some(hll) = &mut self.hll {
                     hll.add_pubkey(&pubkey);
@@ -980,15 +1242,34 @@ impl DbQuery {
                 self.count_dedup_limited = true;
                 return Ok(true);
             }
-            if self.max_total_events != 0
-                && self.sent_events_full.len() as u64 >= self.max_total_events
-            {
-                return Ok(true);
-            }
-            if !complete {
+            let capped = self.max_total_events != 0
+                && self.sent_events_full.len() as u64 >= self.max_total_events;
+            if !complete && !capped {
                 self.search_group = Some(group);
+                return Ok(false);
             }
-            return Ok(complete);
+            if self.completeness {
+                if !complete {
+                    self.unknown = true;
+                }
+                if let Some(lev_id) = unsent {
+                    self.witnesses.push(lev_id);
+                }
+                let peeks: Vec<_> = group
+                    .scans
+                    .iter()
+                    .zip(&self.sub.filter_group.filters)
+                    .map(|(scan, filter)| match filter.limit {
+                        0 => Peek::Unknown,
+                        _ => scan.remaining(&self.sent_events_full),
+                    })
+                    .collect();
+                for peek in peeks {
+                    self.note(peek);
+                }
+                self.restricted |= group.scans.iter().any(|scan| scan.restricted);
+            }
+            return Ok(true);
         }
 
         while self.filter_group_index < self.sub.filter_group.filters.len() {
@@ -1007,6 +1288,10 @@ impl DbQuery {
             let mut hits: Vec<(u64, [u8; 32])> = Vec::new();
             let mut visibility_error = None;
             let mut dedup_budget_hit = false;
+            let mut restricted = self.restricted;
+            // The scan stopped at this filter's limit or the request-wide
+            // ceiling rather than running out of matches.
+            let mut cut = false;
             let count_dedup_budget = self.count_dedup_budget;
             let mut handle = |lev_id| {
                 if f.limit == 0 {
@@ -1015,7 +1300,12 @@ impl DbQuery {
                 if lev_id > latest {
                     return false;
                 }
-                let pubkey = match Self::visible_event_pubkey(txn, lev_id, &self.visibility) {
+                let pubkey = match Self::visible_event_pubkey(
+                    txn,
+                    lev_id,
+                    &self.visibility,
+                    &mut restricted,
+                ) {
                     Ok(Some(pubkey)) => pubkey,
                     Ok(None) => return false,
                     Err(error) => {
@@ -1033,9 +1323,10 @@ impl DbQuery {
                     hits.push((lev_id, pubkey));
                 }
                 sent_curr.insert(lev_id);
-                sent_curr.len() as u64 >= f.limit
+                cut = sent_curr.len() as u64 >= f.limit
                     || (self.max_total_events != 0
-                        && sent_full.len() as u64 >= self.max_total_events)
+                        && sent_full.len() as u64 >= self.max_total_events);
+                cut
             };
             let complete = match &mut scanner {
                 QueryScanner::Chronological(scanner) => {
@@ -1060,9 +1351,29 @@ impl DbQuery {
             if let Some(error) = visibility_error {
                 return Err(error);
             }
+            if let QueryScanner::Search(scanner) = &scanner {
+                restricted |= scanner.restricted;
+            }
+            let peek = match &mut scanner {
+                _ if !self.completeness || !complete || dedup_budget_hit => None,
+                _ if f.limit == 0 => Some(Peek::Unknown),
+                QueryScanner::Chronological(scanner) if cut => Some(Self::peek(
+                    scanner,
+                    txn,
+                    &f,
+                    latest,
+                    &sent_full,
+                    &self.visibility,
+                    &mut restricted,
+                    &mut self.peek_budget,
+                )?),
+                QueryScanner::Chronological(_) => Some(Peek::Exhausted),
+                QueryScanner::Search(scanner) => Some(scanner.remaining(&sent_full)),
+            };
             self.sent_events_full = sent_full;
             self.sent_events_curr = sent_curr;
             self.last_work_checked = last_work;
+            self.restricted = restricted;
             for (lev, pubkey) in hits {
                 if let Some(hll) = &mut self.hll {
                     hll.add_pubkey(&pubkey);
@@ -1073,9 +1384,19 @@ impl DbQuery {
                 self.count_dedup_limited = true;
                 return Ok(true);
             }
+            let exhausted = matches!(peek, Some(Peek::Exhausted));
+            if let Some(peek) = peek {
+                self.note(peek);
+            }
             if self.max_total_events != 0
                 && self.sent_events_full.len() as u64 >= self.max_total_events
             {
+                // Nothing more is sent, so whatever the filters not reached
+                // hold, and this one does not, decides between the hints.
+                if self.completeness && exhausted {
+                    let peek = self.peek_unscanned(txn)?;
+                    self.note(peek);
+                }
                 return Ok(true);
             }
             if !complete {

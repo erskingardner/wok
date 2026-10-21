@@ -756,6 +756,9 @@ async fn reconnect_rejects_old_auth_proof_and_drops_previous_identities() {
             .send(json!(["REQ","private",{"kinds":[4]}]))
             .await
             .unwrap();
-        assert_eq!(fresh.response().await, json!(["EOSE", "private"]));
+        assert_eq!(
+            fresh.response().await,
+            json!(["EOSE", "private", ["finish"]])
+        );
     }
 }

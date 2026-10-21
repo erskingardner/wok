@@ -26,6 +26,9 @@ it is not a promise to reproduce upstream bugs.
 - Wok returns mergeable NIP-45 HyperLogLog sketches for canonical
   single-target COUNT filters, including address and hashed-string offsets;
   this is not present in the pinned strfry revision.
+- EOSE carries NIP-67 completeness hints (`finish`, `more`, `auth`) when Wok
+  knows them; see [nips.md](nips.md). The pinned strfry revision sends a
+  two-element EOSE.
 - Wok serves the NIP-86 management API (ban/allow/block/role methods backed
   by a Wok-owned LMDB moderation table) and NIP-56 report queueing. The
   pinned strfry revision delegates all such decisions to write-policy
@@ -117,6 +120,10 @@ it is not a promise to reproduce upstream bugs.
     deferred.
   - The options are a capped re-sort of only the tie that a `limit` cuts, or
     an index key that holds the id, in a future storage version.
+  - For the same reason, a response is not extended to every event of the
+    boundary `created_at`, as NIP-67 says a relay SHOULD. Its `finish` hint is
+    sent only when no match is left, so it is never sent for a `limit` cut
+    inside a same-second run.
 
 Each correction cites a pinned NIP or a Wok safety requirement and adds a
 regression test. Differential parity alone is not a reason to retain it.

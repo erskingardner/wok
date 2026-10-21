@@ -420,10 +420,10 @@ pub(super) fn run_negentropy(
             |sub, lev, _| {
                 let key = (sub.conn_id, sub.sub_id.to_string());
                 let Some(session) = sessions.get_mut(&key) else {
-                    return;
+                    return true;
                 };
                 let View::Memory { items, .. } = &mut session.view else {
-                    return;
+                    return true;
                 };
                 let inserted = (|| {
                     let raw = txn
@@ -446,9 +446,11 @@ pub(super) fn run_negentropy(
                 })();
                 if inserted.is_err() {
                     failed.push(key);
+                    return false;
                 }
+                true
             },
-            |sub, total, _, _| done.push((sub.clone(), total)),
+            |sub, total, _, _, _| done.push((sub.clone(), total)),
         );
         if scan.is_err() {
             for (conn, sid) in sessions.keys() {

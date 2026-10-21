@@ -73,6 +73,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- NIP-67 EOSE completeness hints, advertised in NIP-11. EOSE gains a third
+  element when Wok knows the answer: `finish` when every stored match the
+  connection may read was sent, `more` when a filter's `limit`, the
+  `relay.max_filter_limit` clamp or `relay.max_total_events_per_req` left at
+  least one, and `auth` when the restricted-read rule hid stored matches from
+  an unauthenticated connection while AUTH is usable. A REQ admitted after a
+  reload made AUTH usable now gets the connection's challenge first, as the
+  hint requires. Each filter a limit cuts costs a bounded peek for one more
+  match; when the peek cannot tell, EOSE has no `finish` or `more`. Clients
+  that index EOSE by position are unaffected; a client that requires exactly
+  two elements must accept three.
 - `wok-bench --scenario ws_transport` measures what WebSocket connections
   cost the relay, with and without permessage-deflate: RSS per open, warm and
   idle connection, history bursts, live fan-out, reconnect churn, and the

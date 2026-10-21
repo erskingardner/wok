@@ -700,7 +700,8 @@ impl Conn {
     async fn subscribe(&mut self, sid: &str, filter: &Value) -> Result<Vec<Vec<u8>>> {
         self.send(&json!(["REQ", sid, filter]).to_string()).await?;
         let event_prefix = format!("[\"EVENT\",\"{sid}\",");
-        let eose = format!("[\"EOSE\",\"{sid}\"]");
+        // Then `]`, or NIP-67 hints.
+        let eose = format!("[\"EOSE\",\"{sid}\"");
         let mut events = Vec::new();
         self.first_event = None;
         // One deadline for the whole exchange: pings would keep resetting a
@@ -711,7 +712,9 @@ impl Conn {
                 if msg.starts_with(event_prefix.as_bytes()) {
                     self.first_event.get_or_insert_with(Instant::now);
                     events.push(msg);
-                } else if msg == eose.as_bytes() {
+                } else if msg.starts_with(eose.as_bytes())
+                    && matches!(msg.get(eose.len()), Some(b']' | b','))
+                {
                     return Ok(());
                 } else if msg.starts_with(b"[\"CLOSED\"") || msg.starts_with(b"[\"NOTICE\"") {
                     anyhow::bail!("{}", String::from_utf8_lossy(&msg));

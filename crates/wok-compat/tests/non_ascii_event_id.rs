@@ -296,7 +296,7 @@ async fn del_event_accepted_over_plain_ws_and_served_with_a_verifiable_id() {
     // A client recomputing the id from what the relay serves gets it back.
     assert_eq!(hex::encode(nip01_id_independent(&served[2])), id);
     assert_eq!(served[2]["content"], ev["content"]);
-    assert_eq!(next_json(&mut ws).await, json!(["EOSE", "del"]));
+    assert_eq!(next_json(&mut ws).await, json!(["EOSE", "del", ["finish"]]));
     handle.request_shutdown();
 }
 

@@ -1,4 +1,4 @@
-use crate::scan::DbQuery;
+use crate::scan::{Completeness, DbQuery};
 use crate::subid::{SubId, Subscription};
 use std::collections::{HashMap, VecDeque};
 use wok_db::{most_recent_levid_ro, RoTxn};
@@ -31,6 +31,7 @@ pub struct QueryScheduler {
     max_subs_per_connection: usize,
     max_total_events_per_req: u64,
     count_dedup_budget: u64,
+    completeness: bool,
 }
 
 impl QueryScheduler {
@@ -48,6 +49,7 @@ impl QueryScheduler {
             max_subs_per_connection,
             max_total_events_per_req,
             count_dedup_budget,
+            completeness: false,
         }
     }
 
@@ -71,7 +73,10 @@ impl QueryScheduler {
         if conn.len() >= self.max_subs_per_connection {
             return Ok(false);
         }
-        let q = DbQuery::new(sub, self.max_total_events_per_req, self.count_dedup_budget);
+        let mut q = DbQuery::new(sub, self.max_total_events_per_req, self.count_dedup_budget);
+        if self.completeness {
+            q.track_completeness();
+        }
         // Reuse slots of finished/dead queries instead of growing forever.
         let idx = match self.free.pop() {
             Some(i) => {
@@ -148,8 +153,8 @@ impl QueryScheduler {
         on_complete: C,
     ) -> Result<(), QueryFailure>
     where
-        F: FnMut(&Subscription, u64, Option<&[u8]>),
-        C: FnMut(&Subscription, u64, Option<String>, bool),
+        F: FnMut(&Subscription, u64, Option<&[u8]>) -> bool,
+        C: FnMut(&Subscription, u64, Option<String>, bool, Completeness),
     {
         self.process_visible(
             txn,
@@ -160,6 +165,9 @@ impl QueryScheduler {
         )
     }
 
+    /// Give the first running query a time slice. `on_event` gets each event
+    /// it sends and says whether the event reached the subscriber; a REQ that
+    /// lost one cannot report NIP-67 `finish`.
     pub fn process_visible<F, C, V>(
         &mut self,
         txn: &RoTxn<'_>,
@@ -170,8 +178,8 @@ impl QueryScheduler {
     ) -> Result<(), QueryFailure>
     where
         V: Fn(&Subscription) -> crate::visibility::ReadVisibility,
-        F: FnMut(&Subscription, u64, Option<&[u8]>),
-        C: FnMut(&Subscription, u64, Option<String>, bool),
+        F: FnMut(&Subscription, u64, Option<&[u8]>) -> bool,
+        C: FnMut(&Subscription, u64, Option<String>, bool, Completeness),
     {
         let Some(idx) = self.running.pop_front() else {
             return Ok(());
@@ -190,8 +198,9 @@ impl QueryScheduler {
         let ensure_exists = self.ensure_exists;
         let result = {
             let q = self.queries[idx].as_mut().unwrap();
-            q.visibility = visibility(&q.sub);
-            q.process(
+            q.set_visibility(visibility(&q.sub));
+            let mut undelivered = false;
+            let result = q.process(
                 txn,
                 |sub, lev| {
                     let payload = if ensure_exists {
@@ -202,12 +211,19 @@ impl QueryScheduler {
                         None
                     };
                     if ensure_exists && payload.is_none() {
+                        undelivered = true;
                         return;
                     }
-                    on_event(sub, lev, payload);
+                    if !on_event(sub, lev, payload) {
+                        undelivered = true;
+                    }
                 },
                 time_budget_us,
-            )
+            );
+            if undelivered {
+                q.mark_incomplete();
+            }
+            result
         };
         let complete = match result {
             Ok(complete) => complete,
@@ -226,7 +242,13 @@ impl QueryScheduler {
             let q = self.queries[idx].take().unwrap();
             self.free.push(idx);
             self.remove_query(q.sub.conn_id, &q.sub.sub_id, q.sub.count_only);
-            on_complete(&q.sub, q.sent_count(), q.hll_hex(), q.count_dedup_limited());
+            on_complete(
+                &q.sub,
+                q.sent_count(),
+                q.hll_hex(),
+                q.count_dedup_limited(),
+                q.completeness(),
+            );
         } else {
             self.running.push_back(idx);
         }
@@ -254,5 +276,11 @@ impl QueryScheduler {
     /// Applies to queries added afterwards; see [`DbQuery::new`].
     pub fn set_count_dedup_budget(&mut self, budget: u64) {
         self.count_dedup_budget = budget;
+    }
+
+    /// Work out NIP-67 [`Completeness`] for the REQs added afterwards; see
+    /// [`DbQuery::track_completeness`].
+    pub fn set_completeness(&mut self, track: bool) {
+        self.completeness = track;
     }
 }

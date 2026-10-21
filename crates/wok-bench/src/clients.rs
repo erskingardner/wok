@@ -1751,7 +1751,8 @@ impl Session {
                 let sid = text(&frame, 1).unwrap_or_default();
                 self.on_event(at, &sid, event);
             }
-            Some("EOSE") if frame.len() == 2 => {
+            // A third element carries NIP-67 hints.
+            Some("EOSE") if matches!(frame.len(), 2 | 3) => {
                 self.on_eose(at, &text(&frame, 1).unwrap_or_default())
             }
             Some("CLOSED") if frame.len() == 3 => {

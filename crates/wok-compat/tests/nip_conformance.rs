@@ -114,7 +114,8 @@ impl Conn {
     async fn subscribe(&mut self, sub_id: &str, filter: Value) {
         self.send(json!(["REQ", sub_id, filter])).await;
         let eose = self.recv().await;
-        assert_eq!(eose, json!(["EOSE", sub_id]));
+        // Whatever NIP-67 hints follow.
+        assert!(eose[0] == "EOSE" && eose[1] == sub_id, "{eose}");
     }
 
     /// Publish and return the OK reply.
@@ -124,6 +125,23 @@ impl Conn {
         assert_eq!(reply[0], "OK", "{reply}");
         assert_eq!(reply[1], event["id"], "{reply}");
         reply
+    }
+
+    /// What a REQ sends up to its EOSE: the EVENTs' events, the other frames
+    /// (AUTH), and the EOSE.
+    async fn backfill(&mut self, sub_id: &str, filters: Value) -> (Vec<Value>, Vec<Value>, Value) {
+        let mut req = vec![json!("REQ"), json!(sub_id)];
+        req.extend(filters.as_array().unwrap().iter().cloned());
+        self.send(Value::Array(req)).await;
+        let (mut events, mut other) = (Vec::new(), Vec::new());
+        loop {
+            let frame = self.recv().await;
+            match frame[0].as_str() {
+                Some("EVENT") => events.push(frame[2].clone()),
+                Some("EOSE") => return (events, other, frame),
+                _ => other.push(frame),
+            }
+        }
     }
 
     /// Stored events matching `filter`, up to EOSE.
@@ -267,12 +285,12 @@ async fn nip01_empty_filter_lists_match_nothing() {
     let mut req = vec![json!("REQ"), json!("empty")];
     req.extend(empty.iter().cloned());
     conn.send(Value::Array(req)).await;
-    assert_eq!(conn.recv().await, json!(["EOSE", "empty"]));
+    assert_eq!(conn.recv().await, json!(["EOSE", "empty", ["finish"]]));
     // The REQ's other filters still apply.
     conn.send(json!(["REQ", "mixed", {"kinds": []}, {"kinds": [1]}]))
         .await;
     assert_eq!(conn.recv().await, json!(["EVENT", "mixed", stored]));
-    assert_eq!(conn.recv().await, json!(["EOSE", "mixed"]));
+    assert_eq!(conn.recv().await, json!(["EOSE", "mixed", ["finish"]]));
 
     let live = signed("live");
     let mut publisher = relay.connect().await;
@@ -364,6 +382,7 @@ fn nip01_unknown_filter_field_rejected() {
 fn nip01_eose_encoding() {
     let s = RelayMessage::Eose {
         sub_id: "abc".into(),
+        hints: wok_relay::EoseHints::default(),
     }
     .to_json();
     assert_eq!(s, r#"["EOSE","abc"]"#);
@@ -729,7 +748,7 @@ fn nip50_search_filter_and_extensions() {
 fn nip11_software_not_strfry_when_unconfigured() {
     let cfg = wok_relay::Config::default();
     let nips = wok_relay::supported_nips(&cfg);
-    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 62, 70, 77, 91]);
+    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91]);
     assert!(!nips.contains(&2), "client-side NIP-02 is not advertised");
     assert!(!nips.contains(&4), "client-side NIP-04 is not advertised");
     assert!(!nips.contains(&28), "client-side NIP-28 is not advertised");
@@ -853,6 +872,213 @@ async fn nip59_ephemeral_gift_wraps_reach_only_their_recipient() {
     assert_eq!(inbox.try_recv().await, None);
 }
 
+/// Kind-`kind` events, a second apart, the newest now.
+async fn publish_notes(conn: &mut Conn, kind: u64, count: u64) -> Vec<Value> {
+    let mut events = Vec::new();
+    for i in (0..count).rev() {
+        let event = sign_event(json!({
+            "created_at": now() - i,
+            "kind": kind,
+            "tags": [],
+            "content": format!("{kind}/{i}"),
+        }));
+        assert_eq!(conn.publish(&event).await[2], true);
+        events.push(event);
+    }
+    events
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip67_finish_once_every_stored_match_was_sent() {
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    publish_notes(&mut conn, 1, 3).await;
+
+    let (events, _, eose) = conn.backfill("all", json!([{"kinds": [1]}])).await;
+    assert_eq!(events.len(), 3);
+    assert_eq!(eose, json!(["EOSE", "all", ["finish"]]));
+    // Exactly `limit` matches: the limit cut nothing.
+    let (events, _, eose) = conn
+        .backfill("three", json!([{"kinds": [1], "limit": 3}]))
+        .await;
+    assert_eq!(events.len(), 3);
+    assert_eq!(eose, json!(["EOSE", "three", ["finish"]]));
+    // Filters with an empty list match nothing, so nothing is left.
+    let (events, _, eose) = conn
+        .backfill("empty", json!([{"kinds": []}, {"#p": []}]))
+        .await;
+    assert!(events.is_empty());
+    assert_eq!(eose, json!(["EOSE", "empty", ["finish"]]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip67_more_when_a_limit_or_the_request_ceiling_leaves_matches() {
+    let relay = Relay::new(|cfg| {
+        cfg.relay.max_filter_limit = 4;
+        cfg.relay.max_total_events_per_req = 5;
+    });
+    let mut conn = relay.connect().await;
+    let notes = publish_notes(&mut conn, 1, 3).await;
+    publish_notes(&mut conn, 7, 3).await;
+
+    // The client's limit.
+    let (events, _, eose) = conn
+        .backfill("limit", json!([{"kinds": [1], "limit": 2}]))
+        .await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(eose, json!(["EOSE", "limit", ["more"]]));
+    // The relay's clamp of it, `relay.max_filter_limit`.
+    let (events, _, eose) = conn.backfill("clamp", json!([{"kinds": [1, 7]}])).await;
+    assert_eq!(events.len(), 4);
+    assert_eq!(eose, json!(["EOSE", "clamp", ["more"]]));
+    // `relay.max_total_events_per_req` across filters.
+    let (events, _, eose) = conn
+        .backfill("ceiling", json!([{"kinds": [1]}, {"kinds": [7]}]))
+        .await;
+    assert_eq!(events.len(), 5);
+    assert_eq!(eose, json!(["EOSE", "ceiling", ["more"]]));
+    // The ceiling reached by exactly the matches there are.
+    let since = notes[1]["created_at"].clone();
+    let (events, _, eose) = conn
+        .backfill(
+            "exact",
+            json!([{"kinds": [7]}, {"kinds": [1], "since": since}]),
+        )
+        .await;
+    assert_eq!(events.len(), 5);
+    assert_eq!(eose, json!(["EOSE", "exact", ["finish"]]));
+    // `limit: 0` asks for no stored events: no hints.
+    let (events, _, eose) = conn
+        .backfill("zero", json!([{"kinds": [1], "limit": 0}]))
+        .await;
+    assert!(events.is_empty());
+    assert_eq!(eose, json!(["EOSE", "zero"]));
+}
+
+/// A note and a kind 4 to `recipient`, by different authors.
+async fn publish_note_and_dm(relay: &Relay, recipient: &Keypair) -> (Value, Value) {
+    let mut publisher = relay.connect().await;
+    let note = sign_event(json!({"created_at": now(), "kind": 1, "tags": [], "content": "hi"}));
+    let dm = sign_event(json!({
+        "created_at": now() - 1,
+        "kind": 4,
+        "tags": [["p", pubkey_hex(recipient)]],
+        "content": "ciphertext",
+    }));
+    if relay.handle.config.read().auth_usable() {
+        assert_eq!(publisher.recv().await[0], "AUTH");
+    }
+    for event in [&note, &dm] {
+        assert_eq!(publisher.publish(event).await[2], true);
+    }
+    (note, dm)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip67_auth_follows_a_challenge_until_authenticated_as_the_recipient() {
+    let relay = auth_relay();
+    let recipient = key();
+    let (note, dm) = publish_note_and_dm(&relay, &recipient).await;
+
+    let mut reader = relay.connect().await;
+    // NIP-67: the challenge comes before an EOSE with `auth`.
+    let challenge = reader.recv().await;
+    assert_eq!(challenge[0], "AUTH", "{challenge}");
+    let (events, other, eose) = reader.backfill("mixed", json!([{"kinds": [1, 4]}])).await;
+    assert_eq!((events, other), (vec![note.clone()], vec![]));
+    assert_eq!(eose, json!(["EOSE", "mixed", ["auth", "finish"]]));
+    // What a REQ that cannot match a restricted kind leaves hidden is nothing.
+    let (_, _, eose) = reader.backfill("public", json!([{"kinds": [1]}])).await;
+    assert_eq!(eose, json!(["EOSE", "public", ["finish"]]));
+
+    let auth = sign_event_with_key(
+        json!({
+            "created_at": now(),
+            "kind": 22242,
+            "tags": [["relay", AUTH_RELAY], ["challenge", challenge[1]]],
+            "content": "",
+        }),
+        &recipient,
+    );
+    reader.send(json!(["AUTH", auth])).await;
+    assert_eq!(reader.recv().await[2], true);
+    let (events, _, eose) = reader.backfill("mixed", json!([{"kinds": [1, 4]}])).await;
+    assert_eq!(events, [note, dm]);
+    assert_eq!(eose, json!(["EOSE", "mixed", ["finish"]]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip67_auth_waits_for_usable_auth_and_its_challenge() {
+    let relay = Relay::new(|_| {});
+    let recipient = key();
+    let (note, _) = publish_note_and_dm(&relay, &recipient).await;
+
+    // AUTH is unusable: no challenge on connect, and no `auth` hint.
+    let mut reader = relay.connect().await;
+    let (events, other, eose) = reader.backfill("mixed", json!([{"kinds": [1, 4]}])).await;
+    assert_eq!((events, other), (vec![note.clone()], vec![]));
+    assert_eq!(eose, json!(["EOSE", "mixed", ["finish"]]));
+
+    // Once a reload makes it usable, the connection gets its challenge ahead
+    // of the EOSE that names `auth`.
+    relay.handle.config.write().relay.auth.service_url = AUTH_RELAY.into();
+    let (events, other, eose) = reader.backfill("mixed", json!([{"kinds": [1, 4]}])).await;
+    assert_eq!(events, [note]);
+    assert_eq!(other.len(), 1, "{other:?}");
+    assert_eq!(other[0][0], "AUTH", "{other:?}");
+    assert_eq!(eose, json!(["EOSE", "mixed", ["auth", "finish"]]));
+}
+
+/// Store `event` straight to LMDB with its payload compressed, as a relay
+/// with a trained dictionary and a larger `events.max_event_size` would have.
+fn store_compressed(env: &wok_db::Env, event: &Value) {
+    let parsed = parse_and_verify_event(event, &EventLimits::default(), None, true, false).unwrap();
+    let json = parsed.json.clone();
+    let mut txn = env.begin_rw().unwrap();
+    let mut events = vec![wok_db::EventToWrite::new(
+        parsed.packed.into_bytes(),
+        parsed.json,
+    )];
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+    let dict = br#"{"content":"xxxxxxxxxxxxxxxx","kind":1,"tags":[]}"#.repeat(32);
+    let dict_id = wok_db::insert_compression_dictionary(&mut txn, &dict).unwrap();
+    let compressed = zstd::bulk::Compressor::with_dictionary(3, &dict)
+        .unwrap()
+        .compress(json.as_bytes())
+        .unwrap();
+    let payload = wok_db::encode_zstd_payload(u32::try_from(dict_id).unwrap(), &compressed);
+    let event_payload = txn.env().dbis().event_payload;
+    txn.put_u64(event_payload, events[0].lev_id, &payload, 0)
+        .unwrap();
+    txn.commit().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip67_no_finish_when_a_stored_event_could_not_be_sent() {
+    // A compressed payload larger than a lowered `events.max_event_size`
+    // cannot be decoded, so the relay skips the event. EOSE must not then
+    // say that every stored match was sent.
+    let relay = Relay::new(|cfg| cfg.events.max_event_size = 65_536);
+    let large = sign_event(json!({
+        "created_at": now() - 10,
+        "kind": 1,
+        "tags": [],
+        "content": "x".repeat(70_000),
+    }));
+    store_compressed(&relay.env, &large);
+    let mut conn = relay.connect().await;
+    let small = publish_notes(&mut conn, 1, 1).await;
+
+    let (events, _, eose) = conn.backfill("s", json!([{"kinds": [1]}])).await;
+    assert_eq!(events, small);
+    assert_eq!(eose, json!(["EOSE", "s"]));
+    // Without the large event, the same REQ is finished.
+    let (_, _, eose) = conn
+        .backfill("t", json!([{"kinds": [1], "since": now() - 5}]))
+        .await;
+    assert_eq!(eose, json!(["EOSE", "t", ["finish"]]));
+}
+
 #[test]
 fn nip62_is_enabled_by_default_and_can_be_disabled() {
     let mut cfg = wok_relay::Config::default();
@@ -895,7 +1121,7 @@ fn nip91_and_tags_take_precedence_over_compatibility_or_tags() {
 #[test]
 fn advertised_nips_are_subset_of_tested() {
     // NIP-86 coverage lives in e2e_transports.rs (management API e2e tests).
-    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 70, 77, 86, 91];
+    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 67, 70, 77, 86, 91];
     assert_eq!(
         wok_relay::RELAY_CAPABILITY_CATALOG
             .iter()

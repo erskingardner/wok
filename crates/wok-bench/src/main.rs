@@ -1732,8 +1732,9 @@ async fn read_history(socket: &mut ClientConnection, sid: &str) -> Result<Vec<Va
                     events.push(reply[2].clone());
                 }
                 Some("EOSE") => {
+                    // A third element carries NIP-67 hints.
                     anyhow::ensure!(
-                        reply.as_array().is_some_and(|a| a.len() == 2),
+                        reply.as_array().is_some_and(|a| matches!(a.len(), 2 | 3)),
                         "invalid EOSE"
                     );
                     return Ok(events);

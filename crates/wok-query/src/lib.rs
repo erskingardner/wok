@@ -14,7 +14,7 @@ pub use filter::{
 pub use hll::{offset_for_filter as nip45_hll_offset, HyperLogLog};
 pub use monitor::{ActiveMonitors, Recipient};
 pub use pending::{HeldEvent, PendingBuffer, PendingEvent};
-pub use scan::{foreach_by_filter, foreach_visible_by_filter, DbQuery, DbScan};
+pub use scan::{foreach_by_filter, foreach_visible_by_filter, Completeness, DbQuery, DbScan};
 pub use scheduler::{QueryFailure, QueryScheduler};
 pub use subid::{QueryError, SubId, Subscription};
 

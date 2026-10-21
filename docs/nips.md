@@ -114,8 +114,8 @@ deleted with kind 5. See `relay.nip62` in the sample configuration.
 
 NIP-86 management calls are JSON-RPC-like POSTs to the relay URI authorized
 by NIP-98 events from operator admins or role-holding moderators. They follow
-NIP-86 at nips `62d5fed`, newer than the pin, without its NIP-43 claim
-methods. Bans suppress rather than delete; allowlists gate writes only when
+NIP-86 at nips `62d5fed`, which is unchanged at the pin, without its NIP-43
+claim methods. Bans suppress rather than delete; allowlists gate writes only when
 `relay.auth.restrict_writes` is set; kind-1984 reports feed the moderation
 queue. See [NIP-86 management](nip86.md) for levels, role semantics, and the
 method table.

@@ -1,8 +1,8 @@
 # NIP-86 Relay Management API
 
 Wok implements the NIP-86 draft at nips
-[`62d5fed`](https://github.com/nostr-protocol/nips/blob/62d5fed/86.md), newer
-than the conformance pin: JSON-RPC-like management requests over
+[`62d5fed`](https://github.com/nostr-protocol/nips/blob/62d5fed/86.md), which
+is unchanged at the conformance pin: JSON-RPC-like management requests over
 HTTP POST to the relay URI with `Content-Type: application/nostr+json+rpc`,
 authorized by a NIP-98 event (kind 27235, empty content) whose `payload` tag
 is required and whose `u` tag names the relay URL. The endpoint shares the

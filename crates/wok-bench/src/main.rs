@@ -2488,7 +2488,10 @@ fn author_kinds_options(args: &Args) -> Result<author_kinds::Options> {
     Ok(author_kinds::Options {
         wok: canonical(&args.wok)?,
         baseline: args.wok_baseline.as_deref().map(canonical).transpose()?,
-        dataset_dir: args.dataset_dir.clone(),
+        // The importer runs in the database directory, so a relative path
+        // would resolve under it.
+        dataset_dir: std::path::absolute(&args.dataset_dir)
+            .with_context(|| format!("dataset directory {}", args.dataset_dir.display()))?,
         authors: args.authors,
         events: args.events.unwrap_or(1_000_000),
         seed: args.seed,
@@ -2980,6 +2983,24 @@ mod tests {
                     .as_array()
                     .is_some_and(|tags| tags.iter().any(|tag| tag[0] == "e"))
         }));
+    }
+
+    #[test]
+    fn author_kinds_datasets_resolve_to_an_absolute_directory() {
+        let bin = TempDir::new().unwrap();
+        let wok = bin.path().join("wok");
+        std::fs::write(&wok, b"").unwrap();
+        let args = Args::try_parse_from([
+            "wok-bench".as_ref(),
+            "--scenario".as_ref(),
+            "author_kinds".as_ref(),
+            "--wok".as_ref(),
+            wok.as_os_str(),
+        ])
+        .unwrap();
+        let opts = author_kinds_options(&args).unwrap();
+        assert!(opts.dataset_dir.is_absolute());
+        assert!(opts.dataset_dir.ends_with("bench-results/datasets"));
     }
 
     #[test]

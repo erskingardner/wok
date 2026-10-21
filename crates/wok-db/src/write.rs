@@ -471,6 +471,71 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
     Ok(lev_id)
 }
 
+/// Push to `lev_ids` each stored version that the `a` tag value `tag_val` of
+/// the deletion request `deletion` deletes: every version of the addressable
+/// event it names, when the request's author published it, up to the
+/// request's `created_at`. `long_addresses` maps each hashed value to its
+/// original. Other addresses delete nothing.
+fn push_address_deletions(
+    txn: &RwTxn<'_>,
+    deletion: PackedEventView<'_>,
+    tag_val: &[u8],
+    long_addresses: &HashMap<Vec<u8>, String>,
+    lev_ids: &mut Vec<u64>,
+) -> Result<(), DbError> {
+    let address = match hashed_tag_value_digest(tag_val) {
+        Some(digest) => long_addresses.get(digest).map(String::as_str),
+        None => std::str::from_utf8(tag_val).ok(),
+    };
+    let Some((kind, pubkey, d_tag)) = address.and_then(|s| parse_a_tag(s).ok()) else {
+        return Ok(());
+    };
+    if !is_param_replaceable_kind(kind) || pubkey.as_slice() != deletion.pubkey() {
+        return Ok(());
+    }
+    let mut search = Vec::new();
+    search.extend_from_slice(&pubkey);
+    search.extend_from_slice(&indexed_tag_value(d_tag.as_bytes()));
+    let search_key = make_key_string_u64(&search, kind);
+    foreach_replacement(txn, &search_key, |lev, other| {
+        if other.created_at() <= deletion.created_at() {
+            lev_ids.push(lev);
+        }
+        true
+    })
+}
+
+/// Stored versions that the `a` tags longer than [`MAX_INDEXED_TAG_VAL_SIZE`]
+/// of the stored deletion request `packed` delete, as [`write_events`] deletes
+/// them when the request arrives. Its shorter `a` tags are not applied.
+pub(crate) fn long_address_deletions(
+    txn: &RwTxn<'_>,
+    packed: PackedEventView<'_>,
+    json: &str,
+) -> Result<Vec<u64>, DbError> {
+    let mut lev_ids = Vec::new();
+    if packed.kind() != DELETION_KIND {
+        return Ok(lev_ids);
+    }
+    let long_addresses = hashed_tag_originals(json, "a")?;
+    let mut scan_err = None;
+    packed.foreach_tag(|tag_name, tag_val| {
+        if tag_name == 'a' && hashed_tag_value_digest(tag_val).is_some() {
+            if let Err(error) =
+                push_address_deletions(txn, packed, tag_val, &long_addresses, &mut lev_ids)
+            {
+                scan_err = Some(error);
+                return false;
+            }
+        }
+        true
+    });
+    match scan_err {
+        Some(error) => Err(error),
+        None => Ok(lev_ids),
+    }
+}
+
 fn foreach_replacement(
     txn: &RwTxn<'_>,
     key: &[u8],
@@ -740,29 +805,15 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                         Err(e) => scan_err = Some(e),
                     }
                 } else if tag_name == 'a' {
-                    let address = match hashed_tag_value_digest(tag_val) {
-                        Some(digest) => long_addresses.get(digest).map(String::as_str),
-                        None => std::str::from_utf8(tag_val).ok(),
-                    };
-                    let parsed = address.and_then(|s| parse_a_tag(s).ok());
-                    if let Some((kind, pubkey, d_tag)) = parsed {
-                        if is_param_replaceable_kind(kind) && pubkey.as_slice() == packed.pubkey() {
-                            let mut search = Vec::new();
-                            search.extend_from_slice(&pubkey);
-                            search.extend_from_slice(&indexed_tag_value(d_tag.as_bytes()));
-                            let search_key = make_key_string_u64(&search, kind);
-                            if let Err(error) =
-                                foreach_replacement(txn, &search_key, |lev, other| {
-                                    if other.created_at() <= packed.created_at() {
-                                        lev_ids_to_delete.push(lev);
-                                    }
-                                    true
-                                })
-                            {
-                                scan_err = Some(error);
-                                return false;
-                            }
-                        }
+                    if let Err(error) = push_address_deletions(
+                        txn,
+                        packed,
+                        tag_val,
+                        &long_addresses,
+                        &mut lev_ids_to_delete,
+                    ) {
+                        scan_err = Some(error);
+                        return false;
                     }
                 }
                 scan_err.is_none()

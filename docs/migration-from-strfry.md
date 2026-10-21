@@ -86,8 +86,9 @@ strfry drops single-letter tag values longer than 255 bytes from its packed
 records, and migration keeps those records byte for byte. The manifest's
 `legacy_long_tag_records` counts them, and migration prints the count when it
 is nonzero. `wok reindex` packs them again so filters match those values and
-long addresses are their own; see
-[lmdb-v3.md](lmdb-v3.md#packedevent).
+long addresses are their own. A deletion whose long `a` tag strfry dropped then
+deletes the versions it names up to its `created_at`, which strfry left stored;
+see [lmdb-v3.md](lmdb-v3.md#packedevent).
 
 ## Config review
 

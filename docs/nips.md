@@ -47,7 +47,9 @@ the same transaction, including negentropy and author-quota accounting. An
 incoming stale event is rejected against the global winner, independent of
 local insertion order. For addressable events, NIP-09 `a`-tag deletions remove
 every matching version at or before the deletion timestamp, preserving newer
-versions.
+versions. Databases from strfry or earlier releases can still hold versions
+under a deletion whose `a` tag is longer than 255 bytes; `wok reindex` deletes
+them.
 
 Persistent negentropy trees represent physical storage. A transactional count
 of retained superseded versions keeps clean databases on the persistent-tree

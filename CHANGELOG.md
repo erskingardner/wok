@@ -109,6 +109,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprint as `source_event_fingerprint_sha256`. Integrity reports
   `legacy_long_tag_records`, doctor warns while it is nonzero, and the
   migration manifest records it. Migration still copies records unchanged.
+- `wok reindex` applies the deletions its long-tag repair restores. Each
+  stored deletion request with an `a` tag longer than 255 bytes deletes the
+  versions of the address it names, by its author, up to its `created_at`, as
+  the relay does when such a request arrives (NIP-09). strfry and earlier
+  releases left those versions stored and visible. The request and newer
+  versions stay. The outcome and manifest count the deleted versions as
+  `deleted_under_repaired_deletions`, the original database in the backup
+  keeps them, and verification compares the result with the original's
+  fingerprint without them.
 
 ### Removed
 

@@ -1,4 +1,4 @@
-//! Independently grounded NIP tests. NIPs pin: 656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab
+//! Independently grounded NIP tests. NIPs pin: 0b5532c0355ab27f447e071a93c09cf3a2b4aad5
 
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
@@ -235,8 +235,124 @@ fn nip01_filter_ids_and_kinds_use_event_field_grammar() {
     )
     .is_err());
     assert!(NostrFilterGroup::from_value(&json!({"kinds":[65536]}), 500, 3, 16).is_err());
-    assert!(NostrFilterGroup::from_value(&json!({"ids":[]}), 500, 3, 16).is_err());
     assert!(NostrFilterGroup::from_value(&json!({"#1":["value"]}), 500, 3, 16).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip01_empty_filter_lists_match_nothing() {
+    // "If any of these lists is empty, no event can satisfy that condition,
+    // so the filter MUST NOT match any events. An empty list MUST NOT be
+    // treated as if the attribute were absent."
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    let p = "11".repeat(32);
+    let signed = |content: &str| {
+        sign_event(json!({
+            "created_at": now(),
+            "kind": 1,
+            "tags": [["p", p]],
+            "content": content,
+        }))
+    };
+    let stored = signed("stored");
+    assert_eq!(conn.publish(&stored).await[2], true);
+
+    // The subscription gets EOSE and stays open, not CLOSED.
+    let empty = [
+        json!({"ids": []}),
+        json!({"authors": []}),
+        json!({"kinds": []}),
+        json!({"#p": []}),
+    ];
+    let mut req = vec![json!("REQ"), json!("empty")];
+    req.extend(empty.iter().cloned());
+    conn.send(Value::Array(req)).await;
+    assert_eq!(conn.recv().await, json!(["EOSE", "empty"]));
+    // The REQ's other filters still apply.
+    conn.send(json!(["REQ", "mixed", {"kinds": []}, {"kinds": [1]}]))
+        .await;
+    assert_eq!(conn.recv().await, json!(["EVENT", "mixed", stored]));
+    assert_eq!(conn.recv().await, json!(["EOSE", "mixed"]));
+
+    let live = signed("live");
+    let mut publisher = relay.connect().await;
+    assert_eq!(publisher.publish(&live).await[2], true);
+    assert_eq!(conn.recv().await, json!(["EVENT", "mixed", live]));
+    assert_eq!(conn.try_recv().await, None);
+
+    for filter in &empty {
+        conn.send(json!(["COUNT", "count", filter])).await;
+        assert_eq!(conn.recv().await, json!(["COUNT", "count", {"count": 0}]));
+    }
+    conn.send(json!(["COUNT", "count", {"kinds": []}, {"kinds": [1]}]))
+        .await;
+    assert_eq!(conn.recv().await, json!(["COUNT", "count", {"count": 2}]));
+
+    // NIP-77 reconciles against no events, not against the whole database.
+    for (filter, needed) in [(json!({"kinds": []}), 0), (json!({"kinds": [1]}), 2)] {
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+        let init = client.initiate().unwrap();
+        conn.send(json!(["NEG-OPEN", "neg", filter, hex::encode(init)]))
+            .await;
+        let reply = conn.recv().await;
+        assert_eq!(reply[0], "NEG-MSG", "{filter}: {reply}");
+        let reply = hex::decode(reply[2].as_str().unwrap()).unwrap();
+        let (mut have, mut need) = (Vec::new(), Vec::new());
+        client
+            .reconcile_with_ids(&reply, &mut have, &mut need)
+            .unwrap();
+        assert_eq!((have.len(), need.len()), (0, needed), "{filter}");
+        conn.send(json!(["NEG-CLOSE", "neg"])).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip01_limit_zero_sends_eose_and_stays_live() {
+    // "When `limit` is zero, the relay MUST NOT return stored events for that
+    // filter. After the initial queries for all filters are complete, the
+    // relay MUST send `EOSE` and MUST keep the subscription active for newly
+    // received matching events."
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    let note = |content: &str| {
+        sign_event(json!({
+            "created_at": now(),
+            "kind": 1,
+            "tags": [],
+            "content": content,
+        }))
+    };
+    let stored = note("stored");
+    assert_eq!(conn.publish(&stored).await[2], true);
+
+    conn.subscribe("live", json!({"kinds": [1], "limit": 0}))
+        .await;
+    // Only the filter with `limit: 0` returns no stored events.
+    conn.send(json!([
+        "REQ",
+        "mixed",
+        {"kinds": [1], "limit": 0},
+        {"ids": [stored["id"]]}
+    ]))
+    .await;
+    assert_eq!(conn.recv().await, json!(["EVENT", "mixed", stored]));
+    assert_eq!(conn.recv().await, json!(["EOSE", "mixed"]));
+
+    let live = note("live");
+    let mut publisher = relay.connect().await;
+    assert_eq!(publisher.publish(&live).await[2], true);
+    let mut delivered = vec![conn.recv().await, conn.recv().await];
+    delivered.sort_by_key(|frame| frame[1].as_str().unwrap().to_owned());
+    assert_eq!(
+        delivered,
+        [
+            json!(["EVENT", "live", live]),
+            json!(["EVENT", "mixed", live])
+        ]
+    );
+    assert_eq!(conn.try_recv().await, None);
 }
 
 #[test]

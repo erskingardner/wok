@@ -73,5 +73,5 @@ pub fn strfry_export(db: &std::path::Path) -> String {
 }
 
 pub fn nips_commit() -> &'static str {
-    "656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab"
+    "0b5532c0355ab27f447e071a93c09cf3a2b4aad5"
 }

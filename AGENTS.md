@@ -73,7 +73,7 @@ cargo test -p wok-compat --test cpp_export --test cpp_negentropy
 - This directory's crate map: `crates/AGENTS.md`
 - Architecture: `docs/architecture.md` and `docs/AGENTS.md`
 - Compatibility: `docs/compatibility-policy.md`, `docs/known-differences.md`
-- NIPs: `docs/nips.md` (pin: `656cecc7c0a815b6a2b218d3b5d6f078b3f4dbab`)
+- NIPs: `docs/nips.md` (pin: `0b5532c0355ab27f447e071a93c09cf3a2b4aad5`)
 - Config sample: `docs/wok.toml`
 - Non-goals: `docs/architecture.md`
 - Contributor workflow and PR expectations: `CONTRIBUTING.md`; vulnerability reporting: `SECURITY.md`

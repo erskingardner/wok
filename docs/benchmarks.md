@@ -242,9 +242,9 @@ and a codec table. `results.jsonl` holds the same values in each trial's
   differs between platforms and allocators, and macOS may compress idle pages
   out of RSS, so read the idle column with care.
 - **KB/conn 2nd wave**: what each connection of the second wave adds to RSS
-  while the first wave is idle. Memory the idle connections gave back is
-  reused here even when the allocator kept it from the OS, so this column
-  shows what an idle connection still holds.
+  while the first wave is idle. An allocator that keeps freed memory instead
+  of returning it to the OS hides a release from the idle column; a second
+  wave that reuses that memory shows it here.
 - **burst first EVENT / EOSE**: time from sending the REQ to its first EVENT
   and to its EOSE. **wire KB** is what the client read per burst, so the
   `offered` row shows the compression ratio.

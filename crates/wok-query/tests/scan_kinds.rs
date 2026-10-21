@@ -369,3 +369,51 @@ fn nip91_and_tag_seeds_a_single_cursor() {
         2
     );
 }
+
+/// A COUNT and a REQ with the same id are separate requests: scheduling one
+/// must not cancel the other, and CLOSE (`remove_sub`) stops only the REQ.
+#[test]
+fn count_and_req_ids_are_separate_namespaces() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut events = Vec::new();
+    for i in 0..3u64 {
+        let (packed, json, _) = sign(1, &format!("ns-{i}"), 1_700_000_000 + i);
+        events.push(EventToWrite::new(packed, json));
+    }
+    let mut write = env.begin_rw().unwrap();
+    write_events(&mut write, &mut NoopNegentropy, &mut events, false).unwrap();
+    write.commit().unwrap();
+
+    let txn = env.begin_ro().unwrap();
+    let sub = |count_only| {
+        let group = NostrFilterGroup::from_value(&json!({"kinds":[1]}), 500, 3, 16).unwrap();
+        Subscription::new(1, SubId::new("x").unwrap(), group, count_only)
+    };
+    let run = |scheduler: &mut QueryScheduler| {
+        let mut completed = Vec::new();
+        while scheduler.has_running() {
+            scheduler
+                .process(
+                    &txn,
+                    10_000,
+                    |_, _, _| {},
+                    |sub, total, _, _| completed.push((sub.count_only, total)),
+                )
+                .unwrap();
+        }
+        completed.sort();
+        completed
+    };
+
+    let mut scheduler = QueryScheduler::new(8, 2_000, 0);
+    assert!(scheduler.add_sub(&txn, sub(false)).unwrap());
+    assert!(scheduler.add_sub(&txn, sub(true)).unwrap());
+    assert_eq!(run(&mut scheduler), vec![(false, 3), (true, 3)]);
+
+    assert!(scheduler.add_sub(&txn, sub(false)).unwrap());
+    assert!(scheduler.add_sub(&txn, sub(true)).unwrap());
+    scheduler.remove_sub(1, &SubId::new("x").unwrap());
+    assert_eq!(run(&mut scheduler), vec![(true, 3)]);
+}

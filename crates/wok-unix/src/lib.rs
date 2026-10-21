@@ -255,6 +255,11 @@ async fn handle_conn(
     };
     let writer = async {
         while let Some(frame) = rx.recv().await {
+            // Its subscription was replaced or closed while it waited: the
+            // client no longer wants it.
+            if frame.is_stale() {
+                continue;
+            }
             // Keep the frame alive until the complete write releases its bytes.
             wr.write_all(&(frame.text.len() as u32).to_be_bytes())
                 .await?;

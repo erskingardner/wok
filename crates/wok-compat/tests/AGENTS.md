@@ -6,6 +6,8 @@
 | `lifecycle_model.rs` | Generated real-transport privacy/lifecycle model and in-flight revocation |
 | `support/wire.rs` | Shared framed Unix / WebSocket test and soak client |
 | `e2e_transports.rs` | WebSocket + Unix end-to-end |
+| `req_lifecycle.rs` | Live-before-history REQs: no loss, exactly once, replacement, cap, COUNT ids |
+| `eose_latency.rs` | Ignored benchmark: REQ→EOSE latency under monitor fan-out |
 | `ws_deflate.rs` | permessage-deflate negotiation/frames |
 | `ws_timeouts.rs` | Handshake/frame-read/pong liveness timeouts |
 | `negentropy_e2e.rs` | NEG-* sessions against a live relay |

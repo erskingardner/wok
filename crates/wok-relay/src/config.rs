@@ -207,6 +207,10 @@ pub struct RelayConfig {
     pub max_filter_limit_count: u64,
     pub max_total_events_per_req: u64,
     pub max_subs_per_connection: usize,
+    /// Per-subscription bytes of live matches held while its history is
+    /// sent; zero is unbounded. See `wok_query::PendingBuffer`.
+    #[serde(default = "default_max_live_buffer_bytes")]
+    pub max_live_buffer_bytes: usize,
     pub max_pending_outbound_bytes: usize,
     pub write_policy_plugin: String,
     pub write_policy_timeout_secs: u64,
@@ -388,6 +392,7 @@ impl Default for Config {
                 max_filter_limit_count: 1_000_000,
                 max_total_events_per_req: 2_000,
                 max_subs_per_connection: 200,
+                max_live_buffer_bytes: default_max_live_buffer_bytes(),
                 max_pending_outbound_bytes: 33_554_432,
                 write_policy_plugin: String::new(),
                 write_policy_timeout_secs: 10,
@@ -458,6 +463,10 @@ impl Default for Config {
 
 fn default_max_and_entries() -> usize {
     wok_query::DEFAULT_MAX_AND_ENTRIES
+}
+
+fn default_max_live_buffer_bytes() -> usize {
+    262_144
 }
 
 impl From<Config> for TomlConfig {

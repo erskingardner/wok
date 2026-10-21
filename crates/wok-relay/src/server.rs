@@ -8,6 +8,8 @@
 
 mod writer;
 use writer::*;
+mod sub_gate;
+use sub_gate::{Current, Ns, SubGate};
 
 use crate::abuse::{leading_zero_bits, AbuseController, Admission, BudgetKind};
 use crate::config::{Config, EphemeralPersistence};
@@ -18,7 +20,7 @@ use crate::protocol::{has_reason_prefix, ClientCommand, ParseFailure, RelayMessa
 use crate::restrict::ReadRestrictor;
 use crate::source::TransportSource;
 use crate::supported_nips;
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 use rand::Rng;
 use serde_json::{json, Value};
@@ -41,7 +43,8 @@ use wok_negentropy::{DeferredSink, NegentropyFilterCache};
 mod negentropy;
 use negentropy::run_negentropy;
 use wok_query::{
-    ActiveMonitors, FilterValidator, NostrFilterGroup, QueryScheduler, SubId, Subscription,
+    ActiveMonitors, FilterValidator, HeldEvent, NostrFilterGroup, PendingBuffer, PendingEvent,
+    QueryScheduler, SubId, Subscription,
 };
 
 const AUTH_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -61,11 +64,23 @@ pub struct OutboundFrame {
     pub text: String,
     len: u64,
     pending: Arc<AtomicU64>,
+    /// For a subscription's EVENT or EOSE: its id's current generation, and
+    /// the generation the frame belongs to.
+    generation: Option<(Current, u64)>,
 }
 
 impl OutboundFrame {
     pub fn into_text(mut self) -> String {
         std::mem::take(&mut self.text)
+    }
+
+    /// True once the subscription generation this frame belongs to was
+    /// replaced or closed while it waited in the queue. A transport skips it:
+    /// the client no longer wants it.
+    pub fn is_stale(&self) -> bool {
+        self.generation
+            .as_ref()
+            .is_some_and(|(current, generation)| current.load(Ordering::Relaxed) != *generation)
     }
 }
 
@@ -98,7 +113,11 @@ impl Outbound {
         }
     }
 
-    fn try_send(&self, msg: String) -> Result<(), OutboundSendError> {
+    fn try_send(
+        &self,
+        msg: String,
+        generation: Option<(Current, u64)>,
+    ) -> Result<(), OutboundSendError> {
         let len = msg.len() as u64;
         let prev = self.pending.fetch_add(len, Ordering::Relaxed);
         if self.limit != 0 && prev.saturating_add(len) > self.limit as u64 {
@@ -111,6 +130,7 @@ impl Outbound {
                 len: msg.len() as u64,
                 text: msg,
                 pending: self.pending.clone(),
+                generation,
             })
             .map_err(|_| OutboundSendError::Closed)
     }
@@ -132,8 +152,18 @@ enum OutboundSendError {
     Closed,
 }
 
+/// A connection's outbound queue and the gate in front of it.
+struct ConnEntry {
+    out: Outbound,
+    subs: SubGate,
+}
+
+/// Every frame for every connection is queued here, under one lock. That lock
+/// also guards each connection's subscription gate (see `sub_gate`), so a
+/// subscription frame is checked against its generation and queued in one
+/// step, ordered against the ingester's REQ, COUNT, CLOSE and refusals.
 struct ConnTable {
-    map: Mutex<HashMap<u64, Outbound>>,
+    map: Mutex<HashMap<u64, ConnEntry>>,
 }
 
 impl ConnTable {
@@ -143,29 +173,48 @@ impl ConnTable {
         }
     }
     fn insert(&self, id: u64, out: Outbound) {
-        self.map.lock().insert(id, out);
+        self.map.lock().insert(
+            id,
+            ConnEntry {
+                out,
+                subs: SubGate::default(),
+            },
+        );
     }
     fn remove(&self, id: u64) {
         self.map.lock().remove(&id);
     }
-    /// Deliver a pre-built frame, terminating the connection if it is over
-    /// its pending-bytes budget (C++ slow-client termination).
-    fn deliver(&self, conn_id: u64, payload: String, metrics: &Metrics) {
-        let mut map = self.map.lock();
-        if let Some(out) = map.get(&conn_id) {
-            if let Err(error) = out.try_send(payload) {
+
+    /// Queue a frame, terminating the connection if it is over its
+    /// pending-bytes budget (C++ slow-client termination).
+    fn push(
+        map: &mut HashMap<u64, ConnEntry>,
+        conn_id: u64,
+        payload: String,
+        generation: Option<(Current, u64)>,
+        metrics: &Metrics,
+    ) {
+        let Some(entry) = map.get(&conn_id) else {
+            return;
+        };
+        if let Err(error) = entry.out.try_send(payload, generation) {
+            if error == OutboundSendError::OverByteLimit {
+                metrics
+                    .slow_client_terminations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(entry) = map.remove(&conn_id) {
                 if error == OutboundSendError::OverByteLimit {
-                    metrics
-                        .slow_client_terminations
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some(out) = map.remove(&conn_id) {
-                    if error == OutboundSendError::OverByteLimit {
-                        out.kill();
-                    }
+                    entry.out.kill();
                 }
             }
         }
+    }
+
+    /// Deliver a frame that belongs to no subscription (OK, NOTICE, AUTH,
+    /// NEG-*), or a CLOSED for an id the relay never held.
+    fn deliver(&self, conn_id: u64, payload: String, metrics: &Metrics) {
+        Self::push(&mut self.map.lock(), conn_id, payload, None, metrics);
     }
 
     fn send(&self, id: u64, msg: RelayMessage, metrics: &Metrics) {
@@ -174,29 +223,149 @@ impl ConnTable {
         self.deliver(id, json, metrics);
     }
 
-    /// Build the EVENT frame once (pre-sized) and deliver.
-    fn send_event(&self, conn_id: u64, sub_id: &str, ev_json: &str, metrics: &Metrics) {
-        metrics.relay_event.fetch_add(1, Ordering::Relaxed);
-        let mut payload = String::with_capacity(sub_id.len() + ev_json.len() + 12);
+    /// The ingester admitted a REQ or COUNT: from now on only frames of
+    /// `generation` pass for the id.
+    fn open_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId, generation: u64) {
+        if let Some(entry) = self.map.lock().get_mut(&conn_id) {
+            entry.subs.open(ns, sub_id, generation);
+        }
+    }
+
+    /// CLOSE, or a REQ that names the id and fails before refusal (no CLOSED
+    /// owed). Returns the generation it closed, for the workers' cleanup.
+    fn close_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> Option<u64> {
+        self.map.lock().get_mut(&conn_id)?.subs.close(ns, sub_id)
+    }
+
+    /// Refuse a REQ or COUNT: close its id and queue the CLOSED in one step,
+    /// so nothing for the id can follow it. Returns the generation it closed.
+    fn refuse(
+        &self,
+        conn_id: u64,
+        ns: Ns,
+        sub_id: &str,
+        reason: String,
+        metrics: &Metrics,
+    ) -> Option<u64> {
+        let msg = RelayMessage::closed_error(sub_id, reason);
+        bump_relay_metrics(&msg, metrics);
+        let json = msg.to_json();
+        let mut map = self.map.lock();
+        let closed = match (map.get_mut(&conn_id), SubId::new(sub_id)) {
+            (Some(entry), Ok(sub_id)) => entry.subs.close(ns, &sub_id),
+            _ => None,
+        };
+        Self::push(&mut map, conn_id, json, None, metrics);
+        closed
+    }
+
+    /// Open REQ subscriptions (pending or live) or COUNTs on a connection.
+    fn open_count(&self, conn_id: u64, ns: Ns) -> usize {
+        self.map
+            .lock()
+            .get(&conn_id)
+            .map_or(0, |entry| entry.subs.len(ns))
+    }
+
+    fn is_open(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> bool {
+        self.map
+            .lock()
+            .get(&conn_id)
+            .is_some_and(|entry| entry.subs.is_open(ns, sub_id))
+    }
+
+    /// Queue a frame of one generation of a subscription, if that generation
+    /// is still current.
+    fn push_sub(
+        &self,
+        conn_id: u64,
+        ns: Ns,
+        sub_id: &SubId,
+        generation: u64,
+        payload: String,
+        metrics: &Metrics,
+    ) -> bool {
+        let mut map = self.map.lock();
+        let Some(current) = map
+            .get(&conn_id)
+            .and_then(|entry| entry.subs.admit(ns, sub_id, generation))
+            .cloned()
+        else {
+            return false;
+        };
+        Self::push(
+            &mut map,
+            conn_id,
+            payload,
+            Some((current, generation)),
+            metrics,
+        );
+        true
+    }
+
+    /// A subscription frame that the generation goes on after (EOSE).
+    fn send_sub(
+        &self,
+        conn_id: u64,
+        sub_id: &SubId,
+        generation: u64,
+        msg: RelayMessage,
+        metrics: &Metrics,
+    ) {
+        let json = msg.to_json();
+        if self.push_sub(conn_id, Ns::Req, sub_id, generation, json, metrics) {
+            bump_relay_metrics(&msg, metrics);
+        }
+    }
+
+    /// A generation's last frame (a CLOSED from a worker, a COUNT result):
+    /// queued if the generation is current, which then ends.
+    fn send_last(
+        &self,
+        conn_id: u64,
+        ns: Ns,
+        sub_id: &SubId,
+        generation: u64,
+        msg: RelayMessage,
+        metrics: &Metrics,
+    ) {
+        let json = msg.to_json();
+        let mut map = self.map.lock();
+        let Some(entry) = map.get_mut(&conn_id) else {
+            return;
+        };
+        if entry.subs.admit(ns, sub_id, generation).is_none() {
+            return;
+        }
+        entry.subs.close(ns, sub_id);
+        bump_relay_metrics(&msg, metrics);
+        Self::push(&mut map, conn_id, json, None, metrics);
+    }
+
+    /// Build the EVENT frame once (pre-sized) and queue it.
+    fn send_event(
+        &self,
+        conn_id: u64,
+        sub_id: &SubId,
+        generation: u64,
+        ev_json: &str,
+        metrics: &Metrics,
+    ) {
+        let sub = sub_id.as_str();
+        let mut payload = String::with_capacity(sub.len() + ev_json.len() + 12);
         payload.push_str("[\"EVENT\",\"");
-        payload.push_str(sub_id);
+        payload.push_str(sub);
         payload.push_str("\",");
         payload.push_str(ev_json);
         payload.push(']');
-        self.deliver(conn_id, payload, metrics);
+        if self.push_sub(conn_id, Ns::Req, sub_id, generation, payload, metrics) {
+            metrics.relay_event.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    fn send_event_batch(&self, recipients: &[(u64, SubId)], ev_json: &str, metrics: &Metrics) {
-        for (conn, sub) in recipients {
-            metrics.relay_event.fetch_add(1, Ordering::Relaxed);
-            let sub = sub.as_str();
-            let mut payload = String::with_capacity(sub.len() + ev_json.len() + 12);
-            payload.push_str("[\"EVENT\",\"");
-            payload.push_str(sub);
-            payload.push_str("\",");
-            payload.push_str(ev_json);
-            payload.push(']');
-            self.deliver(*conn, payload, metrics);
+    fn send_event_batch(&self, recipients: &[(u64, SubId, u64)], ev_json: &str, metrics: &Metrics) {
+        for (conn, sub, generation) in recipients {
+            self.send_event(*conn, sub, *generation, ev_json, metrics);
         }
     }
 }
@@ -452,33 +621,71 @@ pub struct ManagementMsg {
 }
 
 enum ReqMsg {
-    NewSub(Subscription),
-    SetAuth { conn_id: u64, authed: [u8; 32] },
-    RemoveSub { conn_id: u64, sub_id: SubId },
-    Close { conn_id: u64 },
+    /// Send a REQ's history up to the snapshot fixed at admission. Its
+    /// `MonitorMsg::Register` is already queued on the req monitor, so the
+    /// scan's `HistoryDone` cannot reach the monitor first.
+    Scan(Subscription),
+    /// Answer a COUNT. COUNT ids are separate from REQ ids.
+    Count(Subscription),
+    SetAuth {
+        conn_id: u64,
+        authed: [u8; 32],
+    },
+    /// Stop this generation's REQ history scan or COUNT, after CLOSE, a
+    /// refusal or a replacement the client no longer waits for. Cleanup only:
+    /// the subscription gate already drops anything it would still send.
+    Cancel {
+        conn_id: u64,
+        sub_id: SubId,
+        generation: u64,
+        count_only: bool,
+    },
+    Close {
+        conn_id: u64,
+    },
 }
 
+/// Subscription changes for a req monitor, on its control queue. The queue
+/// is unbounded so a REQ's registration is queued the moment it is admitted
+/// and never waits behind live traffic. Each turn the monitor takes what is in
+/// its data queue, then what is in this one, and applies these first: so any
+/// event sent after a registration is matched against it, however full the
+/// data queue was. Every message here is paired with work the bounded req
+/// worker queues pace, so the queue grows only while a monitor turn runs.
 enum MonitorMsg {
-    NewSub {
-        sub: Subscription,
-        ready: Sender<()>,
+    /// An admitted REQ. The monitor matches it at once but holds matches back
+    /// until `HistoryDone`. It replaces any subscription with the same id.
+    Register(Subscription),
+    /// Stop matching this generation of the subscription, if it is the one
+    /// registered: after CLOSE, a refusal, or a REQ the worker could not
+    /// start. Cleanup only, like `ReqMsg::Cancel`.
+    Remove {
+        conn_id: u64,
+        sub_id: SubId,
+        generation: u64,
+    },
+    /// The req worker sent this generation's history, up to the snapshot
+    /// `snapshot`. The monitor sends EOSE and what it held back, then
+    /// delivers live.
+    HistoryDone {
+        conn_id: u64,
+        sub_id: SubId,
+        generation: u64,
+        snapshot: u64,
     },
     SetAuth {
         conn_id: u64,
         authed: [u8; 32],
     },
-    RemoveSub {
-        conn_id: u64,
-        sub_id: SubId,
-    },
     Close {
         conn_id: u64,
     },
+}
+
+/// What a req monitor matches, on its bounded data queue.
+enum MonitorData {
     DbChange,
-    Ephemeral {
-        packed: Vec<u8>,
-        json: String,
-    },
+    Ephemeral { packed: Vec<u8>, json: String },
 }
 
 enum NegMsg {
@@ -805,8 +1012,8 @@ impl RelayHandle {
     /// stalled worker would. For transport tests.
     #[doc(hidden)]
     pub fn set_ingress_paused(&self, conn_id: u64, paused: bool) {
-        if let Some(out) = self.conns.map.lock().get(&conn_id) {
-            out.gate.send_replace(!paused);
+        if let Some(entry) = self.conns.map.lock().get(&conn_id) {
+            entry.out.gate.send_replace(!paused);
         }
     }
 
@@ -919,7 +1126,10 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let (req_txs, req_rxs): (Vec<_>, Vec<_>) =
         (0..n_req_worker).map(|_| bounded::<ReqMsg>(4096)).unzip();
     let (mon_txs, mon_rxs): (Vec<_>, Vec<_>) = (0..n_req_monitor)
-        .map(|_| bounded::<MonitorMsg>(4096))
+        .map(|_| unbounded::<MonitorMsg>())
+        .unzip();
+    let (mon_data_txs, mon_data_rxs): (Vec<_>, Vec<_>) = (0..n_req_monitor)
+        .map(|_| bounded::<MonitorData>(4096))
         .unzip();
     let (neg_txs, neg_rxs): (Vec<_>, Vec<_>) =
         (0..n_negentropy).map(|_| bounded::<NegMsg>(4096)).unzip();
@@ -962,6 +1172,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let metrics = metrics.clone();
         let writer_tx = writer_tx.clone();
         let req_txs = req_txs.clone();
+        let mon_txs = mon_txs.clone();
         let neg_txs = neg_txs.clone();
         let abuse = abuse.clone();
         let moderation = moderation.clone();
@@ -970,7 +1181,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
             .spawn(move || {
                 run_ingester(
                     env, cfg, conns, metrics, abuse, moderation, ingest_rx, writer_tx, req_txs,
-                    neg_txs,
+                    mon_txs, neg_txs,
                 )
             })
             .map(ingester)
@@ -991,10 +1202,20 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
-        let mon_txs = mon_txs.clone();
+        let mon_data_txs = mon_data_txs.clone();
         thread::Builder::new()
             .name("writer".into())
-            .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_txs, moderation))
+            .spawn(move || {
+                run_writer(
+                    env,
+                    cfg,
+                    conns,
+                    metrics,
+                    writer_rx,
+                    mon_data_txs,
+                    moderation,
+                )
+            })
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1010,14 +1231,14 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
-    for (i, mon_rx) in mon_rxs.into_iter().enumerate() {
+    for (i, (mon_rx, data_rx)) in mon_rxs.into_iter().zip(mon_data_rxs).enumerate() {
         let env = env.clone();
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
         thread::Builder::new()
             .name(format!("req-monitor-{i}"))
-            .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx))
+            .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx, data_rx))
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1048,7 +1269,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let shutdown = shutdown.clone();
         thread::Builder::new()
             .name("db-watch".into())
-            .spawn(move || run_db_watch(env, mon_txs, shutdown))
+            .spawn(move || run_db_watch(env, mon_data_txs, shutdown))
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1079,15 +1300,15 @@ fn run_metrics_history(
 }
 
 /// Broadcast a database-change notification to every req-monitor thread.
-fn broadcast_db_change(mon_txs: &[Sender<MonitorMsg>]) {
+fn broadcast_db_change(mon_txs: &[Sender<MonitorData>]) {
     for tx in mon_txs {
-        let _ = tx.send(MonitorMsg::DbChange);
+        let _ = tx.send(MonitorData::DbChange);
     }
 }
 
-fn broadcast_ephemeral(mon_txs: &[Sender<MonitorMsg>], packed: &[u8], json: &str) {
+fn broadcast_ephemeral(mon_txs: &[Sender<MonitorData>], packed: &[u8], json: &str) {
     for tx in mon_txs {
-        let _ = tx.send(MonitorMsg::Ephemeral {
+        let _ = tx.send(MonitorData::Ephemeral {
             packed: packed.to_vec(),
             json: json.to_string(),
         });
@@ -1098,7 +1319,7 @@ fn broadcast_ephemeral(mon_txs: &[Sender<MonitorMsg>], packed: &[u8], json: &str
 /// and poke the req-monitor. strfry must never write a Wok database. Like
 /// RelayReqMonitor's hoytech::file_change_monitor (100ms debounce). Polling
 /// is used for portability; semantics match.
-fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorMsg>>, shutdown: Arc<AtomicBool>) {
+fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorData>>, shutdown: Arc<AtomicBool>) {
     let path = env.path().join("data.mdb");
     // Reconcile once after establishing the baseline so a commit that lands
     // before this thread is first scheduled cannot be absorbed as baseline.
@@ -1181,15 +1402,19 @@ fn route_tx<T>(txs: &[Sender<T>], conn_id: u64) -> &Sender<T> {
 /// until the backlog drains, which keeps per-worker (and so per-connection)
 /// order. Parked messages, protocol CLOSE and NEG-CLOSE included, are only
 /// dropped when their connection closes: see `Lane::close`.
-struct Lane<T> {
+///
+/// A message can carry a follow-up `F` for another worker. The follow-up is
+/// released, into the caller's `released`, only once the message itself is in
+/// this worker's queue.
+struct Lane<T, F = ()> {
     tx: Sender<T>,
-    parked: VecDeque<T>,
+    parked: VecDeque<(T, Option<F>)>,
     /// Open connections with something already in the worker queue, and so
     /// possibly state on the worker that their `Close` must clear.
     delivered: HashSet<u64>,
 }
 
-impl<T: Routed> Lane<T> {
+impl<T: Routed, F> Lane<T, F> {
     fn new(tx: Sender<T>) -> Self {
         Self {
             tx,
@@ -1198,43 +1423,45 @@ impl<T: Routed> Lane<T> {
         }
     }
 
-    fn send(&mut self, msg: T, gates: &mut Gates) {
-        if self.flush(gates) {
+    fn send_then(&mut self, msg: T, then: Option<F>, gates: &mut Gates, released: &mut Vec<F>) {
+        if self.flush(gates, released) {
             let (conn_id, close) = (msg.conn_id(), msg.is_close());
             match self.tx.try_send(msg) {
                 Ok(()) => {
                     if !close {
                         self.delivered.insert(conn_id);
                     }
+                    released.extend(then);
                 }
                 Err(TrySendError::Disconnected(_)) => {}
-                Err(TrySendError::Full(msg)) => self.park(msg, gates),
+                Err(TrySendError::Full(msg)) => self.park(msg, then, gates),
             }
         } else {
-            self.park(msg, gates);
+            self.park(msg, then, gates);
         }
     }
 
-    fn park(&mut self, msg: T, gates: &mut Gates) {
+    fn park(&mut self, msg: T, then: Option<F>, gates: &mut Gates) {
         gates.park(msg.conn_id());
-        self.parked.push_back(msg);
+        self.parked.push_back((msg, then));
     }
 
     /// Move parked messages into the worker queue while it has room. True when
     /// nothing is left parked.
-    fn flush(&mut self, gates: &mut Gates) -> bool {
-        while let Some(msg) = self.parked.pop_front() {
+    fn flush(&mut self, gates: &mut Gates, released: &mut Vec<F>) -> bool {
+        while let Some((msg, then)) = self.parked.pop_front() {
             let (conn_id, close) = (msg.conn_id(), msg.is_close());
             match self.tx.try_send(msg) {
                 Ok(()) => {
                     if !close {
                         self.delivered.insert(conn_id);
                     }
+                    released.extend(then);
                     gates.unpark(conn_id);
                 }
                 Err(TrySendError::Disconnected(_)) => gates.unpark(conn_id),
                 Err(TrySendError::Full(msg)) => {
-                    self.parked.push_front(msg);
+                    self.parked.push_front((msg, then));
                     return false;
                 }
             }
@@ -1243,12 +1470,12 @@ impl<T: Routed> Lane<T> {
     }
 
     /// Connection teardown. What is parked for the connection is dropped,
-    /// and the worker gets `close` only if it was handed something before.
-    /// A closed connection therefore leaves at most one message behind, and
-    /// none at all if a stalled worker never saw it, however many connections
-    /// come and go while the worker is stuck.
-    fn close(&mut self, conn_id: u64, close: T, gates: &mut Gates) {
-        self.parked.retain(|msg| {
+    /// follow-ups included, and the worker gets `close` only if it was handed
+    /// something before. A closed connection therefore leaves at most one
+    /// message behind, and none at all if a stalled worker never saw it,
+    /// however many connections come and go while the worker is stuck.
+    fn close(&mut self, conn_id: u64, close: T, gates: &mut Gates, released: &mut Vec<F>) {
+        self.parked.retain(|(msg, _)| {
             let keep = msg.conn_id() != conn_id;
             if !keep {
                 gates.unpark(conn_id);
@@ -1256,15 +1483,25 @@ impl<T: Routed> Lane<T> {
             keep
         });
         if self.delivered.remove(&conn_id) {
-            self.send(close, gates);
+            self.send_then(close, None, gates, released);
         }
     }
 
     /// Hand over the backlog at shutdown, when there is nothing left to stall.
     fn flush_blocking(&mut self) {
-        for msg in self.parked.drain(..) {
+        for (msg, _) in self.parked.drain(..) {
             let _ = self.tx.send(msg);
         }
+    }
+}
+
+impl<T: Routed> Lane<T> {
+    fn send(&mut self, msg: T, gates: &mut Gates) {
+        self.send_then(msg, None, gates, &mut Vec::new());
+    }
+
+    fn flush_all(&mut self, gates: &mut Gates) -> bool {
+        self.flush(gates, &mut Vec::new())
     }
 }
 
@@ -1278,9 +1515,25 @@ trait Routed {
 impl Routed for ReqMsg {
     fn conn_id(&self) -> u64 {
         match self {
-            Self::NewSub(sub) => sub.conn_id,
+            Self::Scan(sub) | Self::Count(sub) => sub.conn_id,
             Self::SetAuth { conn_id, .. }
-            | Self::RemoveSub { conn_id, .. }
+            | Self::Cancel { conn_id, .. }
+            | Self::Close { conn_id } => *conn_id,
+        }
+    }
+
+    fn is_close(&self) -> bool {
+        matches!(self, Self::Close { .. })
+    }
+}
+
+impl Routed for MonitorMsg {
+    fn conn_id(&self) -> u64 {
+        match self {
+            Self::Register(sub) => sub.conn_id,
+            Self::Remove { conn_id, .. }
+            | Self::HistoryDone { conn_id, .. }
+            | Self::SetAuth { conn_id, .. }
             | Self::Close { conn_id } => *conn_id,
         }
     }
@@ -1361,17 +1614,32 @@ impl Gates {
 struct Dispatch {
     writer: Lane<WriterMsg>,
     req: Vec<Lane<ReqMsg>>,
+    /// A REQ's or CLOSE's message for the req worker follows its monitor
+    /// message: a REQ's history never finishes before the monitor's control
+    /// queue holds its registration, and both see a connection's REQs and
+    /// CLOSEs in the same order. That queue is unbounded, so nothing parks
+    /// here and the follow-up goes at once.
+    mon: Vec<Lane<MonitorMsg, ReqMsg>>,
     neg: Vec<Lane<NegMsg>>,
     gates: Gates,
+    /// Follow-ups whose monitor message went through, for the req lanes.
+    released: Vec<ReqMsg>,
 }
 
 impl Dispatch {
-    fn new(writer: Sender<WriterMsg>, req: Vec<Sender<ReqMsg>>, neg: Vec<Sender<NegMsg>>) -> Self {
+    fn new(
+        writer: Sender<WriterMsg>,
+        req: Vec<Sender<ReqMsg>>,
+        mon: Vec<Sender<MonitorMsg>>,
+        neg: Vec<Sender<NegMsg>>,
+    ) -> Self {
         Self {
             writer: Lane::new(writer),
             req: req.into_iter().map(Lane::new).collect(),
+            mon: mon.into_iter().map(Lane::new).collect(),
             neg: neg.into_iter().map(Lane::new).collect(),
             gates: Gates::default(),
+            released: Vec::new(),
         }
     }
 
@@ -1388,6 +1656,35 @@ impl Dispatch {
         self.req[msg.conn_id() as usize % n].send(msg, &mut self.gates);
     }
 
+    fn monitor(&mut self, msg: MonitorMsg) {
+        self.monitor_then(msg, None);
+    }
+
+    /// A REQ or CLOSE: `msg` for the req monitor, then `then` for the req
+    /// worker once `msg` is queued.
+    fn subscription(&mut self, msg: MonitorMsg, then: ReqMsg) {
+        self.monitor_then(msg, Some(then));
+    }
+
+    fn monitor_then(&mut self, msg: MonitorMsg, then: Option<ReqMsg>) {
+        let n = self.mon.len();
+        self.mon[msg.conn_id() as usize % n].send_then(
+            msg,
+            then,
+            &mut self.gates,
+            &mut self.released,
+        );
+        self.release();
+    }
+
+    fn release(&mut self) {
+        let mut released = std::mem::take(&mut self.released);
+        for msg in released.drain(..) {
+            self.req(msg);
+        }
+        self.released = released;
+    }
+
     fn neg(&mut self, msg: NegMsg) {
         let n = self.neg.len();
         self.neg[msg.conn_id() as usize % n].send(msg, &mut self.gates);
@@ -1399,22 +1696,48 @@ impl Dispatch {
     /// drops events from a connection that closes in the same batch.
     fn close(&mut self, conn_id: u64) {
         self.gates.open.remove(&conn_id);
+        let n = self.mon.len();
+        self.mon[conn_id as usize % n].close(
+            conn_id,
+            MonitorMsg::Close { conn_id },
+            &mut self.gates,
+            &mut self.released,
+        );
+        self.release();
         let n = self.req.len();
-        self.req[conn_id as usize % n].close(conn_id, ReqMsg::Close { conn_id }, &mut self.gates);
+        self.req[conn_id as usize % n].close(
+            conn_id,
+            ReqMsg::Close { conn_id },
+            &mut self.gates,
+            &mut Vec::new(),
+        );
         let n = self.neg.len();
-        self.neg[conn_id as usize % n].close(conn_id, NegMsg::Close { conn_id }, &mut self.gates);
-        self.writer
-            .close(conn_id, WriterMsg::Close { conn_id }, &mut self.gates);
+        self.neg[conn_id as usize % n].close(
+            conn_id,
+            NegMsg::Close { conn_id },
+            &mut self.gates,
+            &mut Vec::new(),
+        );
+        self.writer.close(
+            conn_id,
+            WriterMsg::Close { conn_id },
+            &mut self.gates,
+            &mut Vec::new(),
+        );
     }
 
     /// True when nothing is parked on any worker.
     fn flush(&mut self) -> bool {
-        let mut done = self.writer.flush(&mut self.gates);
+        let mut done = self.writer.flush_all(&mut self.gates);
+        for lane in &mut self.mon {
+            done &= lane.flush(&mut self.gates, &mut self.released);
+        }
+        self.release();
         for lane in &mut self.req {
-            done &= lane.flush(&mut self.gates);
+            done &= lane.flush_all(&mut self.gates);
         }
         for lane in &mut self.neg {
-            done &= lane.flush(&mut self.gates);
+            done &= lane.flush_all(&mut self.gates);
         }
         done
     }
@@ -1428,6 +1751,9 @@ impl Dispatch {
         for lane in self.req.iter().filter(|lane| !lane.parked.is_empty()) {
             select.send(&lane.tx);
         }
+        for lane in self.mon.iter().filter(|lane| !lane.parked.is_empty()) {
+            select.send(&lane.tx);
+        }
         for lane in self.neg.iter().filter(|lane| !lane.parked.is_empty()) {
             select.send(&lane.tx);
         }
@@ -1435,8 +1761,8 @@ impl Dispatch {
     }
 
     /// On exit, parked events still reach the writer ahead of its `Stop`.
-    /// Parked queries and sync messages are dropped: their workers are
-    /// stopping, and a stalled one must not hold up the join.
+    /// Parked queries, subscriptions and sync messages are dropped: their
+    /// workers are stopping, and a stalled one must not hold up the join.
     fn flush_blocking(&mut self) {
         self.writer.flush_blocking();
     }
@@ -1453,10 +1779,12 @@ fn run_ingester(
     mut rx: tokio::sync::mpsc::Receiver<IngestMsg>,
     writer_tx: Sender<WriterMsg>,
     req_txs: Vec<Sender<ReqMsg>>,
+    mon_txs: Vec<Sender<MonitorMsg>>,
     neg_txs: Vec<Sender<NegMsg>>,
 ) {
     let mut auth: HashMap<u64, AuthSession> = HashMap::new();
-    let mut dispatch = Dispatch::new(writer_tx, req_txs, neg_txs);
+    let mut generations = Generations::default();
+    let mut dispatch = Dispatch::new(writer_tx, req_txs, mon_txs, neg_txs);
     loop {
         // blocking_recv is only used here, on a dedicated OS thread outside
         // any Tokio runtime, so no async executor is stalled. While messages
@@ -1516,6 +1844,7 @@ fn run_ingester(
                     &abuse,
                     &moderation,
                     &mut auth,
+                    &mut generations,
                     conn_id,
                     source,
                     &payload,
@@ -1536,6 +1865,7 @@ fn handle_client(
     abuse: &AbuseController,
     moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
+    generations: &mut Generations,
     conn_id: u64,
     source: TransportSource,
     payload: &str,
@@ -1620,15 +1950,29 @@ fn handle_client(
                 metrics
                     .abuse_req_rate_rejections
                     .fetch_add(1, Ordering::Relaxed);
-                conns.send(
-                    conn_id,
-                    RelayMessage::closed_error(&sub_id, "rate-limited: REQ budget exhausted"),
+                refuse_req(
+                    conns,
                     metrics,
+                    dispatch,
+                    conn_id,
+                    Ns::Req,
+                    &sub_id,
+                    "rate-limited: REQ budget exhausted".into(),
                 );
                 return;
             }
             ingest_req(
-                cfg, conns, metrics, auth, conn_id, sub_id, filters, false, dispatch,
+                env,
+                cfg,
+                conns,
+                metrics,
+                auth,
+                generations,
+                conn_id,
+                sub_id,
+                filters,
+                false,
+                dispatch,
             );
         }
         ClientCommand::Count { sub_id, filters } => {
@@ -1642,26 +1986,35 @@ fn handle_client(
                 metrics
                     .abuse_count_rate_rejections
                     .fetch_add(1, Ordering::Relaxed);
-                conns.send(
-                    conn_id,
-                    RelayMessage::closed_error(&sub_id, "rate-limited: COUNT budget exhausted"),
+                refuse_req(
+                    conns,
                     metrics,
+                    dispatch,
+                    conn_id,
+                    Ns::Count,
+                    &sub_id,
+                    "rate-limited: COUNT budget exhausted".into(),
                 );
                 return;
             }
             ingest_req(
-                cfg, conns, metrics, auth, conn_id, sub_id, filters, true, dispatch,
+                env,
+                cfg,
+                conns,
+                metrics,
+                auth,
+                generations,
+                conn_id,
+                sub_id,
+                filters,
+                true,
+                dispatch,
             );
         }
         ClientCommand::Close { sub_id } => {
             metrics.client_close.fetch_add(1, Ordering::Relaxed);
             match SubId::new(&sub_id) {
-                Ok(sid) => {
-                    dispatch.req(ReqMsg::RemoveSub {
-                        conn_id,
-                        sub_id: sid,
-                    });
-                }
+                Ok(sid) => close_req(conns, dispatch, conn_id, Ns::Req, sid),
                 Err(e) => {
                     if !admit_invalid(cfg, conns, metrics, abuse, &source, conn_id) {
                         return;
@@ -2172,6 +2525,10 @@ fn ingest_auth_inner(
         conn_id,
         authed: pk,
     });
+    dispatch.monitor(MonitorMsg::SetAuth {
+        conn_id,
+        authed: pk,
+    });
     dispatch.neg(NegMsg::SetAuth {
         conn_id,
         authed: pk,
@@ -2181,30 +2538,40 @@ fn ingest_auth_inner(
     Ok(id)
 }
 
+/// Generations for one ingester's REQs and COUNTs, increasing in the order
+/// it handles them, and so per connection too (a connection stays on one
+/// ingester). Never zero.
+#[derive(Default)]
+struct Generations(u64);
+
+impl Generations {
+    fn next(&mut self) -> u64 {
+        self.0 += 1;
+        self.0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ingest_req(
+    env: &Env,
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
     auth: &mut HashMap<u64, AuthSession>,
+    generations: &mut Generations,
     conn_id: u64,
     sub_id: String,
     filters: Vec<Value>,
     count_only: bool,
     dispatch: &mut Dispatch,
 ) {
-    // C++ RelayIngester: errors raised before the sub id is known go out as
-    // NOTICE "ERROR: bad req: ..."; everything after is a NIP-01 CLOSED with
-    // an `error:` machine-readable prefix. The sub id is known here,
-    // except for the "arr too small" case which C++ raises first.
-    let fail_closed = |e: String| {
-        conns.send(
-            conn_id,
-            RelayMessage::closed_error(&sub_id, format!("error: bad req: {e}")),
-            metrics,
-        );
-    };
+    let ns = if count_only { Ns::Count } else { Ns::Req };
     if filters.is_empty() {
+        // C++ RelayIngester raises "arr too small" as a NOTICE, before the
+        // sub id is known. The request still replaces the one it names.
+        if let Ok(sid) = SubId::new(&sub_id) {
+            close_req(conns, dispatch, conn_id, ns, sid);
+        }
         conns.send(
             conn_id,
             RelayMessage::notice_error("bad req: arr too small"),
@@ -2212,26 +2579,69 @@ fn ingest_req(
         );
         return;
     }
+    let admitted = admit_req(
+        cfg, conns, metrics, auth, conn_id, &sub_id, filters, count_only,
+    );
+    let mut sub = match admitted {
+        Ok(sub) => sub,
+        Err(reason) => {
+            refuse_req(conns, metrics, dispatch, conn_id, ns, &sub_id, reason);
+            return;
+        }
+    };
+    sub.generation = generations.next();
+    if count_only {
+        conns.open_sub(conn_id, Ns::Count, &sub.sub_id, sub.generation);
+        dispatch.req(ReqMsg::Count(sub));
+        return;
+    }
+    // The history sends what is stored now, the monitor everything stored or
+    // published after. Each event is the job of exactly one of them, whatever
+    // the history's limits keep out.
+    let Ok(snapshot) = env.begin_ro().and_then(|txn| most_recent_levid_ro(&txn)) else {
+        let reason = "error: could not read the database".to_string();
+        refuse_req(conns, metrics, dispatch, conn_id, ns, &sub_id, reason);
+        return;
+    };
+    sub.latest_event_id = snapshot;
+    // From here on only this generation's frames reach the client for the id.
+    conns.open_sub(conn_id, Ns::Req, &sub.sub_id, sub.generation);
+    dispatch.subscription(MonitorMsg::Register(sub.clone()), ReqMsg::Scan(sub));
+}
+
+/// Every check a REQ or COUNT passes before any worker sees it. `Err` is the
+/// CLOSED reason.
+#[allow(clippy::too_many_arguments)]
+fn admit_req(
+    cfg: &Config,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    auth: &mut HashMap<u64, AuthSession>,
+    conn_id: u64,
+    sub_id: &str,
+    filters: Vec<Value>,
+    count_only: bool,
+) -> Result<Subscription, String> {
+    // C++ RelayIngester: once the sub id is known, errors are a NIP-01
+    // CLOSED with an `error:` machine-readable prefix.
+    let bad_req = |e: String| format!("error: bad req: {e}");
     if filters.len() > cfg.relay.max_filters_per_req {
         // Preserve strfry's wire error for its legacy filter-count ceiling.
-        fail_closed("arr too big".into());
-        return;
+        return Err(bad_req("arr too big".into()));
     }
     let serialized_filter_bytes = filters.iter().fold(0usize, |total, filter| {
         total.saturating_add(filter.to_string().len())
     });
     if serialized_filter_bytes > cfg.relay.max_req_filter_size {
-        fail_closed(format!(
+        return Err(bad_req(format!(
             "filters exceed {} serialized bytes",
             cfg.relay.max_req_filter_size
-        ));
-        return;
+        )));
     }
     let max_limit = if count_only {
         let m = cfg.relay.max_filter_limit_count + 1;
         if m == 1 {
-            fail_closed("COUNT disabled".into());
-            return;
+            return Err(bad_req("COUNT disabled".into()));
         }
         m
     } else {
@@ -2239,21 +2649,15 @@ fn ingest_req(
     };
     let mut arr = vec![json!("REQ"), json!(sub_id)];
     arr.extend(filters);
-    let fg = match NostrFilterGroup::from_req(
+    let fg = NostrFilterGroup::from_req(
         &arr,
         max_limit,
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
-    ) {
-        Ok(fg) => fg,
-        Err(e) => {
-            fail_closed(e.to_string());
-            return;
-        }
-    };
+    )
+    .map_err(|e| bad_req(e.to_string()))?;
     if let Err(e) = filter_validator(cfg).validate(&fg) {
-        fail_closed(format!("filter validation failed: {e}"));
-        return;
+        return Err(bad_req(format!("filter validation failed: {e}")));
     }
     let query_cost = fg.estimated_cost(count_only);
     if cfg.relay.abuse.enabled
@@ -2263,18 +2667,10 @@ fn ingest_req(
         metrics
             .abuse_query_cost_rejections
             .fetch_add(1, Ordering::Relaxed);
-        conns.send(
-            conn_id,
-            RelayMessage::closed_error(
-                &sub_id,
-                format!(
-                    "rate-limited: estimated query cost {query_cost} exceeds {}",
-                    cfg.relay.abuse.max_query_cost
-                ),
-            ),
-            metrics,
-        );
-        return;
+        return Err(format!(
+            "rate-limited: estimated query cost {query_cost} exceeds {}",
+            cfg.relay.abuse.max_query_cost
+        ));
     }
 
     let authed = auth.get(&conn_id).and_then(|a| a.authed);
@@ -2290,23 +2686,68 @@ fn ingest_req(
         r.is_filter_group_fully_restricted(&fg) && authed.is_none()
     };
     if requires_auth {
-        let reason = read_gate_refusal(cfg, conns, metrics, auth, conn_id);
-        conns.send(
-            conn_id,
-            RelayMessage::closed_error(&sub_id, reason),
-            metrics,
-        );
-        return;
+        return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
-    let sid = match SubId::new(&sub_id) {
-        Ok(s) => s,
-        Err(e) => {
-            fail_closed(e.to_string());
-            return;
-        }
+    let sid = SubId::new(sub_id).map_err(|e| bad_req(e.to_string()))?;
+    // Pending and live subscriptions both count. Over a lowered cap an open
+    // id can still be replaced; new ids wait until the count drops.
+    if !count_only
+        && !conns.is_open(conn_id, Ns::Req, &sid)
+        && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
+    {
+        return Err("blocked: too many concurrent REQs".into());
+    }
+    Ok(Subscription::new(conn_id, sid, fg, count_only))
+}
+
+/// End the subscription or COUNT `sub_id` names, if open: its frames stop at
+/// the gate at once, and its worker and monitor stop working on it.
+fn close_req(conns: &ConnTable, dispatch: &mut Dispatch, conn_id: u64, ns: Ns, sub_id: SubId) {
+    if let Some(generation) = conns.close_sub(conn_id, ns, &sub_id) {
+        stop_sub(dispatch, conn_id, ns, sub_id, generation);
+    }
+}
+
+/// Tell the workers a generation is over. Cleanup only: the gate already
+/// drops whatever they still send for it.
+fn stop_sub(dispatch: &mut Dispatch, conn_id: u64, ns: Ns, sub_id: SubId, generation: u64) {
+    let cancel = |sub_id| ReqMsg::Cancel {
+        conn_id,
+        sub_id,
+        generation,
+        count_only: ns == Ns::Count,
     };
-    let sub = Subscription::new(conn_id, sid, fg, count_only);
-    dispatch.req(ReqMsg::NewSub(sub));
+    match ns {
+        Ns::Req => dispatch.subscription(
+            MonitorMsg::Remove {
+                conn_id,
+                sub_id: sub_id.clone(),
+                generation,
+            },
+            cancel(sub_id),
+        ),
+        Ns::Count => dispatch.req(cancel(sub_id)),
+    }
+}
+
+/// Refuse a REQ or COUNT with CLOSED. NIP-01 makes a REQ replace the
+/// subscription it names, so a refused one still ends one with its id: the
+/// gate closes the id and queues the CLOSED in one step, so nothing for the id
+/// can follow it.
+fn refuse_req(
+    conns: &ConnTable,
+    metrics: &Metrics,
+    dispatch: &mut Dispatch,
+    conn_id: u64,
+    ns: Ns,
+    sub_id: &str,
+    reason: String,
+) {
+    if let Some(generation) = conns.refuse(conn_id, ns, sub_id, reason, metrics) {
+        if let Ok(sid) = SubId::new(sub_id) {
+            stop_sub(dispatch, conn_id, ns, sid, generation);
+        }
+    }
 }
 
 /// Reason for a read refused by the restricted-kind gate. NIP-42's
@@ -2567,6 +3008,55 @@ fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::
     }
 }
 
+/// A read transaction for the req worker and monitor. Tests can make the
+/// next few fail for one database (`fault::fail_reads`).
+fn begin_read(env: &Env) -> Result<wok_db::RoTxn<'_>, wok_db::DbError> {
+    #[cfg(test)]
+    if fault::read_fails(env.path()) {
+        return Err(wok_db::DbError::msg("injected read failure"));
+    }
+    env.begin_ro()
+}
+
+/// Read failures injected per database path, so parallel tests stay apart.
+#[cfg(test)]
+mod fault {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// Per database: reads to let through, then reads to fail.
+    static READS: Mutex<Vec<(PathBuf, usize, usize)>> = Mutex::new(Vec::new());
+
+    /// Fail the next `count` reads from the database at `path`.
+    pub(super) fn fail_reads(path: &Path, count: usize) {
+        fail_reads_after(path, 0, count);
+    }
+
+    /// Let `skip` reads from the database at `path` through, then fail
+    /// `count`.
+    pub(super) fn fail_reads_after(path: &Path, skip: usize, count: usize) {
+        let mut reads = READS.lock().unwrap();
+        reads.retain(|(p, ..)| p != path);
+        reads.push((path.to_path_buf(), skip, count));
+    }
+
+    pub(super) fn read_fails(path: &Path) -> bool {
+        let mut reads = READS.lock().unwrap();
+        let Some((_, skip, count)) = reads.iter_mut().find(|(p, ..)| p == path) else {
+            return false;
+        };
+        if *skip != 0 {
+            *skip -= 1;
+            return false;
+        }
+        if *count == 0 {
+            return false;
+        }
+        *count -= 1;
+        true
+    }
+}
+
 fn run_req_worker(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -2584,6 +3074,21 @@ fn run_req_worker(
     drop(initial_cfg);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut decomp = Decompressor::new();
+    // A REQ or COUNT that will send no (more) history: its CLOSED goes through
+    // the gate as the generation's last frame, and a REQ's registration with
+    // the monitor is dropped.
+    let refuse = |conn_id: u64, sub_id: SubId, generation: u64, count_only: bool, reason: &str| {
+        let ns = if count_only { Ns::Count } else { Ns::Req };
+        let closed = RelayMessage::closed_error(sub_id.as_str(), reason);
+        conns.send_last(conn_id, ns, &sub_id, generation, closed, &metrics);
+        if !count_only {
+            let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::Remove {
+                conn_id,
+                sub_id,
+                generation,
+            });
+        }
+    };
     loop {
         let msg = if queries.has_running() {
             match rx.try_recv() {
@@ -2601,27 +3106,40 @@ fn run_req_worker(
         queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
         queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
         queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
-        let txn = match env.begin_ro() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        // Without a read transaction a REQ or COUNT is refused rather than
+        // dropped: a registered REQ would otherwise never get EOSE or CLOSED.
+        let txn = begin_read(&env)
+            .inspect_err(|error| tracing::warn!(%error, "req worker cannot read the database"))
+            .ok();
         if let Some(msg) = msg {
             match msg {
-                ReqMsg::NewSub(sub) => {
-                    let conn = sub.conn_id;
-                    let sub_id = sub.sub_id.to_string();
-                    if !queries.add_sub(&txn, sub).unwrap_or(false) {
-                        metrics
-                            .abuse_query_concurrency_rejections
-                            .fetch_add(1, Ordering::Relaxed);
-                        conns.send(
-                            conn,
-                            RelayMessage::closed_error(
-                                &sub_id,
-                                "rate-limited: too many concurrent historical queries",
-                            ),
-                            &metrics,
-                        );
+                ReqMsg::Scan(sub) | ReqMsg::Count(sub) => {
+                    let (conn, sub_id, generation, count_only) = (
+                        sub.conn_id,
+                        sub.sub_id.clone(),
+                        sub.generation,
+                        sub.count_only,
+                    );
+                    let reason = match &txn {
+                        Some(txn) => match queries.add_sub(txn, sub) {
+                            Ok(true) => None,
+                            Ok(false) => {
+                                metrics
+                                    .abuse_query_concurrency_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
+                                Some("rate-limited: too many concurrent historical queries")
+                            }
+                            Err(_) => Some("error: history scan could not start"),
+                        },
+                        None => {
+                            // The query this one replaces ends with it, as
+                            // `add_sub` would have ended it.
+                            queries.remove_query(conn, &sub_id, count_only);
+                            Some("error: history scan could not start")
+                        }
+                    };
+                    if let Some(reason) = reason {
+                        refuse(conn, sub_id, generation, count_only, reason);
                     }
                 }
                 ReqMsg::SetAuth {
@@ -2632,28 +3150,29 @@ fn run_req_worker(
                     if !identities.contains(&pk) {
                         identities.push(pk);
                     }
-                    let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::SetAuth {
-                        conn_id,
-                        authed: pk,
-                    });
                 }
-                ReqMsg::RemoveSub { conn_id, sub_id } => {
-                    queries.remove_sub(conn_id, &sub_id);
-                    let _ =
-                        route_tx(&mon_txs, conn_id).send(MonitorMsg::RemoveSub { conn_id, sub_id });
+                ReqMsg::Cancel {
+                    conn_id,
+                    sub_id,
+                    generation,
+                    count_only,
+                } => {
+                    queries.remove_generation(conn_id, &sub_id, count_only, generation);
                 }
                 ReqMsg::Close { conn_id } => {
                     authed.remove(&conn_id);
                     queries.close_conn(conn_id);
-                    let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::Close { conn_id });
                 }
             }
         }
-        let mut completed: Vec<(Subscription, u64, Option<String>, bool)> = Vec::new();
+        let Some(txn) = txn else {
+            continue;
+        };
+        let mut completed: Vec<Completed> = Vec::new();
         // Events are framed and delivered inside the scan callback: no
         // per-event Subscription clone, no intermediate collection, and the
         // payload JSON is copied exactly once (into the frame).
-        let _ = queries.process_visible(
+        let scanned = queries.process_visible(
             &txn,
             cfg_snap.relay.query_timeslice_budget_us,
             |sub| {
@@ -2668,66 +3187,210 @@ fn run_req_worker(
                 }
                 if let Some(raw) = payload {
                     if let Ok(json) = decomp.decode(&txn, raw, cfg_snap.events.max_event_size) {
-                        conns.send_event(sub.conn_id, sub.sub_id.as_str(), json, &metrics);
+                        conns.send_event(sub.conn_id, &sub.sub_id, sub.generation, json, &metrics);
                     }
                 }
             },
             |sub, total, hll, dedup_limited| {
-                completed.push((sub.clone(), total, hll, dedup_limited));
+                completed.push(Completed {
+                    conn_id: sub.conn_id,
+                    sub_id: sub.sub_id.clone(),
+                    generation: sub.generation,
+                    count_only: sub.count_only,
+                    snapshot: sub.latest_event_id,
+                    total,
+                    hll,
+                    dedup_limited,
+                });
             },
         );
         drop(txn);
-        for (sub, total, hll, dedup_limited) in completed {
+        if let Err(failure) = scanned {
+            tracing::warn!(
+                conn_id = failure.sub.conn_id,
+                sub_id = %failure.sub.sub_id,
+                error = %failure.error,
+                "historical query failed"
+            );
+            let sub = failure.sub;
+            refuse(
+                sub.conn_id,
+                sub.sub_id,
+                sub.generation,
+                sub.count_only,
+                "error: history scan failed",
+            );
+        }
+        for done in completed {
             tracing::debug!(
-                conn_id = sub.conn_id,
-                sub_id = %sub.sub_id,
-                count_only = sub.count_only,
-                matched_events = total,
-                hll = hll.is_some(),
+                conn_id = done.conn_id,
+                sub_id = %done.sub_id,
+                count_only = done.count_only,
+                matched_events = done.total,
+                hll = done.hll.is_some(),
                 "historical query completed"
             );
-            if sub.count_only {
-                let mut count = total;
-                let mut limited = dedup_limited;
+            if done.count_only {
+                let mut count = done.total;
+                let mut limited = done.dedup_limited;
                 if count > cfg_snap.relay.max_filter_limit_count {
                     count = cfg_snap.relay.max_filter_limit_count;
                     limited = true;
                 }
-                conns.send(
-                    sub.conn_id,
-                    RelayMessage::Count {
-                        sub_id: sub.sub_id.to_string(),
-                        count,
-                        limited,
-                        hll: if limited { None } else { hll },
-                    },
+                let reply = RelayMessage::Count {
+                    sub_id: done.sub_id.to_string(),
+                    count,
+                    limited,
+                    hll: if limited { None } else { done.hll },
+                };
+                conns.send_last(
+                    done.conn_id,
+                    Ns::Count,
+                    &done.sub_id,
+                    done.generation,
+                    reply,
                     &metrics,
                 );
             } else {
-                let (ready_tx, ready_rx) = bounded(1);
-                let installed = route_tx(&mon_txs, sub.conn_id)
-                    .send(MonitorMsg::NewSub {
-                        sub: sub.clone(),
-                        ready: ready_tx,
-                    })
-                    .is_ok()
-                    && ready_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-                if !installed {
-                    conns.send(
-                        sub.conn_id,
-                        RelayMessage::notice_error("live subscription monitor unavailable"),
-                        &metrics,
-                    );
-                }
-                conns.send(
-                    sub.conn_id,
-                    RelayMessage::Eose {
-                        sub_id: sub.sub_id.to_string(),
-                    },
-                    &metrics,
-                );
+                // The monitor sends EOSE and goes live. No reply is awaited,
+                // so a busy monitor never holds up other queries here.
+                let _ = route_tx(&mon_txs, done.conn_id).send(MonitorMsg::HistoryDone {
+                    conn_id: done.conn_id,
+                    sub_id: done.sub_id,
+                    generation: done.generation,
+                    snapshot: done.snapshot,
+                });
             }
         }
+    }
+}
+
+/// A history scan the req worker finished.
+struct Completed {
+    conn_id: u64,
+    sub_id: SubId,
+    generation: u64,
+    count_only: bool,
+    /// Newest local event id the scan could return.
+    snapshot: u64,
+    total: u64,
+    hll: Option<String>,
+    dedup_limited: bool,
+}
+
+/// Matches a req monitor sends live: connection, subscription and the
+/// generation the match was for.
+type LiveRecipients = Vec<(u64, SubId, u64)>;
+
+/// Route `recipients` of a stored event: live subscriptions whose connection
+/// may read it are returned for delivery. Pending ones buffer its id either
+/// way: the connection may AUTH before EOSE, and what the buffer holds is
+/// checked against the read policy when it is sent.
+fn route_stored_match(
+    monitors: &mut ActiveMonitors,
+    recipients: Vec<wok_query::Recipient>,
+    readable: impl Fn(u64) -> bool,
+    lev_id: u64,
+    metrics: &Metrics,
+) -> LiveRecipients {
+    let mut live = Vec::new();
+    for recipient in recipients {
+        if recipient.pending {
+            if let Some(buffer) = monitors.pending_mut(recipient.conn_id, &recipient.sub_id) {
+                if buffer.push_stored(lev_id) {
+                    metrics
+                        .live_buffer_overflows
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else if readable(recipient.conn_id) {
+            live.push((recipient.conn_id, recipient.sub_id, recipient.generation));
+        }
+    }
+    live
+}
+
+/// Send `sub` the stored events in `from..=to` it may read, as live events.
+#[allow(clippy::too_many_arguments)]
+fn send_stored_range(
+    txn: &wok_db::RoTxn<'_>,
+    decomp: &mut Decompressor,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    max_event_size: usize,
+    sub: &Subscription,
+    visibility: &crate::restrict::ReadVisibility,
+    from: u64,
+    to: u64,
+) {
+    let requires_content = sub.filter_group.requires_content();
+    let _ = wok_db::foreach_event_from(txn, from, |lev, packed_bytes| {
+        if lev > to {
+            return false;
+        }
+        let Ok(packed) = PackedEventView::new(packed_bytes) else {
+            return true;
+        };
+        if !visibility.allows(txn, packed).unwrap_or(false)
+            || (!requires_content && !sub.filter_group.does_match(packed))
+        {
+            return true;
+        }
+        let Some(raw) = txn
+            .get_u64(txn.env().dbis().event_payload, lev)
+            .ok()
+            .flatten()
+        else {
+            return true;
+        };
+        let Ok(json) = decomp.decode(txn, raw, max_event_size) else {
+            return true;
+        };
+        if requires_content {
+            let search_terms = wok_db::event_search_terms(json).unwrap_or_default();
+            if !sub
+                .filter_group
+                .does_match_with_search_terms(packed, Some(&search_terms))
+            {
+                return true;
+            }
+        }
+        conns.send_event(sub.conn_id, &sub.sub_id, sub.generation, json, metrics);
+        true
+    });
+}
+
+/// Send one buffered stored event, if it still exists and is still readable.
+#[allow(clippy::too_many_arguments)]
+fn send_buffered_stored(
+    txn: &wok_db::RoTxn<'_>,
+    decomp: &mut Decompressor,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    max_event_size: usize,
+    conn_id: u64,
+    sub_id: &SubId,
+    generation: u64,
+    visibility: &crate::restrict::ReadVisibility,
+    lev_id: u64,
+) {
+    let dbis = txn.env().dbis();
+    let Some(packed) = txn
+        .get_u64(dbis.event, lev_id)
+        .ok()
+        .flatten()
+        .and_then(|raw| PackedEventView::new(raw).ok())
+    else {
+        return;
+    };
+    if !visibility.allows(txn, packed).unwrap_or(false) {
+        return;
+    }
+    let Some(raw) = txn.get_u64(dbis.event_payload, lev_id).ok().flatten() else {
+        return;
+    };
+    if let Ok(json) = decomp.decode(txn, raw, max_event_size) {
+        conns.send_event(conn_id, sub_id, generation, json, metrics);
     }
 }
 
@@ -2737,76 +3400,191 @@ fn run_req_monitor(
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     rx: Receiver<MonitorMsg>,
+    data_rx: Receiver<MonitorData>,
 ) {
-    let mut monitors = ActiveMonitors::new(cfg.read().relay.max_subs_per_connection);
+    // The ingester caps subscriptions per connection before registering them.
+    let mut monitors = ActiveMonitors::new(usize::MAX);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
+    // Newest local event id already matched against every subscription.
     let mut curr_event_id = u64::MAX;
     let mut decomp = Decompressor::new();
-    while let Ok(msg) = rx.recv() {
-        let mut batch = vec![msg];
-        while let Ok(more) = rx.try_recv() {
-            batch.push(more);
+    let (mut rx, mut data_rx) = (rx, data_rx);
+    let (mut control_open, mut data_open) = (true, true);
+    let mut control = Vec::new();
+    let mut data = Vec::new();
+    let mut retry = false;
+    loop {
+        // After a failed read, retry shortly with what was kept.
+        let retry_timer = if retry {
+            crossbeam_channel::after(Duration::from_millis(10))
+        } else {
+            crossbeam_channel::never()
+        };
+        crossbeam_channel::select! {
+            recv(rx) -> msg => match msg {
+                Ok(msg) => control.push(msg),
+                Err(_) => control_open = false,
+            },
+            recv(data_rx) -> msg => match msg {
+                Ok(msg) => data.push(msg),
+                Err(_) => data_open = false,
+            },
+            recv(retry_timer) -> _ => {}
+        }
+        // A closed queue never wakes the monitor again; it stops once both are.
+        if !control_open {
+            rx = crossbeam_channel::never();
+        }
+        if !data_open {
+            data_rx = crossbeam_channel::never();
+        }
+        if !control_open && !data_open {
+            break;
+        }
+        // Data first, then control. Every subscription change sent before a
+        // data message taken here is then in `control`, and changes are
+        // applied first: a REQ sees every event sent after its registration
+        // and some sent just before, CLOSE stops delivery sooner, and EOSE
+        // does not wait behind the batch's fan-out.
+        data.extend(data_rx.try_iter());
+        control.extend(rx.try_iter());
+        if control.is_empty() && data.is_empty() {
+            retry = false;
+            continue;
         }
         let cfg_snap = cfg.read();
-        monitors.set_max_subs(cfg_snap.relay.max_subs_per_connection);
         let r = restrictor(&cfg_snap);
         let global_visibility = read_visibility(&cfg_snap, vec![]);
-        let txn = match env.begin_ro() {
+        let max_event_size = cfg_snap.events.max_event_size;
+        let txn = match begin_read(&env) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(error) => {
+                // Subscription changes are sent once, so keep them and retry
+                // shortly; a lost one would leave a REQ without EOSE or
+                // CLOSED. One DbChange is enough: the next scan resumes from
+                // the same cursor. Live-only events are dropped.
+                tracing::warn!(%error, "req monitor cannot read the database");
+                let db_change = data.iter().any(|m| matches!(m, MonitorData::DbChange));
+                data.clear();
+                if db_change {
+                    data.push(MonitorData::DbChange);
+                }
+                retry = true;
+                continue;
+            }
         };
+        retry = false;
         let latest = most_recent_levid_ro(&txn).unwrap_or(0);
         if curr_event_id > latest {
             curr_event_id = latest;
         }
-        for msg in batch {
+        let identities = |authed: &HashMap<u64, Vec<[u8; 32]>>, conn_id: u64| {
+            authed.get(&conn_id).cloned().unwrap_or_default()
+        };
+        for msg in control.drain(..) {
             match msg {
-                MonitorMsg::NewSub { mut sub, ready } => {
-                    let conn = sub.conn_id;
-                    let pk = authed.get(&conn).map(|a| a.as_slice()).unwrap_or(&[]);
-                    let start = sub.latest_event_id.saturating_add(1);
-                    let requires_content = sub.filter_group.requires_content();
-                    let visibility = read_visibility(&cfg_snap, pk.to_vec());
-                    let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
-                        if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if !visibility.allows(&txn, packed).unwrap_or(false)
-                                || (!requires_content && !sub.filter_group.does_match(packed))
-                            {
-                                return true;
-                            }
-                            if let Some(raw) = txn
-                                .get_u64(txn.env().dbis().event_payload, lev)
-                                .ok()
-                                .flatten()
-                            {
-                                if let Ok(json) =
-                                    decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
-                                {
-                                    if requires_content {
-                                        let search_terms =
-                                            wok_db::event_search_terms(json).unwrap_or_default();
-                                        if !sub.filter_group.does_match_with_search_terms(
-                                            packed,
-                                            Some(&search_terms),
-                                        ) {
-                                            return true;
-                                        }
-                                    }
-                                    conns.send_event(conn, sub.sub_id.as_str(), json, &metrics);
+                MonitorMsg::Register(mut sub) => {
+                    // Stored events after the REQ's history snapshot are the
+                    // monitor's. Those it already matched are re-read when the
+                    // history is done; everything it matches from here on is
+                    // held until then.
+                    let live_from = curr_event_id.max(sub.latest_event_id);
+                    sub.latest_event_id = live_from;
+                    let buffer =
+                        PendingBuffer::new(live_from, cfg_snap.relay.max_live_buffer_bytes);
+                    monitors.add_pending(sub, buffer);
+                }
+                MonitorMsg::Remove {
+                    conn_id,
+                    sub_id,
+                    generation,
+                } => {
+                    // A later REQ may already have taken the id.
+                    if monitors
+                        .subscription(conn_id, &sub_id)
+                        .is_some_and(|sub| sub.generation == generation)
+                    {
+                        monitors.remove_sub(conn_id, &sub_id);
+                    }
+                }
+                MonitorMsg::HistoryDone {
+                    conn_id,
+                    sub_id,
+                    generation,
+                    snapshot,
+                } => {
+                    // Closed or replaced since: its history was for nothing.
+                    if monitors.pending_generation(conn_id, &sub_id) != Some(generation) {
+                        continue;
+                    }
+                    let buffer = monitors.pending_mut(conn_id, &sub_id).unwrap();
+                    // Stored events after the history snapshot that the buffer
+                    // lacks are re-read: all of them once it overflowed, else
+                    // those this monitor matched before it saw the
+                    // registration. The buffer holds only later ones.
+                    let reread_to = if buffer.stored_overflowed() {
+                        curr_event_id
+                    } else {
+                        buffer.live_from()
+                    };
+                    let delivered = snapshot.max(reread_to);
+                    let buffer = monitors
+                        .finish_pending(conn_id, &sub_id, generation, delivered)
+                        .unwrap();
+                    // NIP-01: EOSE ends stored events; what arrived while the
+                    // history was sent is "newly received" and follows it.
+                    let eose = RelayMessage::Eose {
+                        sub_id: sub_id.to_string(),
+                    };
+                    conns.send_sub(conn_id, &sub_id, generation, eose, &metrics);
+                    let visibility = read_visibility(&cfg_snap, identities(&authed, conn_id));
+                    if reread_to > snapshot {
+                        let sub = monitors.subscription(conn_id, &sub_id).unwrap();
+                        send_stored_range(
+                            &txn,
+                            &mut decomp,
+                            &conns,
+                            &metrics,
+                            max_event_size,
+                            sub,
+                            &visibility,
+                            snapshot.saturating_add(1),
+                            reread_to,
+                        );
+                    }
+                    // Held events were matched against the policy of their
+                    // time; send only what this connection may still read.
+                    for event in buffer.into_events() {
+                        match event {
+                            PendingEvent::Stored(lev) => send_buffered_stored(
+                                &txn,
+                                &mut decomp,
+                                &conns,
+                                &metrics,
+                                max_event_size,
+                                conn_id,
+                                &sub_id,
+                                generation,
+                                &visibility,
+                                lev,
+                            ),
+                            PendingEvent::Ephemeral(event) => {
+                                let readable =
+                                    PackedEventView::new(&event.packed).is_ok_and(|packed| {
+                                        visibility.allows(&txn, packed).unwrap_or(false)
+                                    });
+                                if readable {
+                                    conns.send_event(
+                                        conn_id,
+                                        &sub_id,
+                                        generation,
+                                        &event.json,
+                                        &metrics,
+                                    );
                                 }
                             }
                         }
-                        true
-                    });
-                    sub.latest_event_id = latest;
-                    if !monitors.add_sub(sub, latest) {
-                        conns.send(
-                            conn,
-                            RelayMessage::notice_error("too many concurrent REQs"),
-                            &metrics,
-                        );
                     }
-                    let _ = ready.send(());
                 }
                 MonitorMsg::SetAuth {
                     conn_id,
@@ -2817,97 +3595,124 @@ fn run_req_monitor(
                         identities.push(pk);
                     }
                 }
-                MonitorMsg::RemoveSub { conn_id, sub_id } => {
-                    monitors.remove_sub(conn_id, &sub_id);
-                }
                 MonitorMsg::Close { conn_id } => {
                     authed.remove(&conn_id);
                     monitors.close_conn(conn_id);
                 }
-                MonitorMsg::DbChange => {
+            }
+        }
+        for msg in data.drain(..) {
+            match msg {
+                MonitorData::DbChange => {
                     let start = curr_event_id.saturating_add(1);
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
-                        if let Ok(packed) = PackedEventView::new(packed_bytes) {
-                            if !global_visibility
-                                .globally_visible(&txn, packed)
-                                .unwrap_or(false)
-                            {
-                                return true;
-                            }
-                            let packed_recipients = if monitors.event_requires_content(packed) {
-                                None
-                            } else {
-                                let recipients = monitors.process(lev, packed, None);
-                                if recipients.is_empty() {
-                                    return true;
-                                }
-                                Some(recipients)
-                            };
-                            if let Some(raw) = txn
-                                .get_u64(txn.env().dbis().event_payload, lev)
+                        let Ok(packed) = PackedEventView::new(packed_bytes) else {
+                            return true;
+                        };
+                        if !global_visibility
+                            .globally_visible(&txn, packed)
+                            .unwrap_or(false)
+                        {
+                            return true;
+                        }
+                        let payload = || {
+                            txn.get_u64(txn.env().dbis().event_payload, lev)
                                 .ok()
                                 .flatten()
-                            {
-                                if let Ok(json) =
-                                    decomp.decode(&txn, raw, cfg_snap.events.max_event_size)
-                                {
-                                    let recips = if let Some(recipients) = packed_recipients {
-                                        recipients
-                                    } else {
-                                        let search_terms =
-                                            wok_db::event_search_terms(json).unwrap_or_default();
-                                        monitors.process(lev, packed, Some(&search_terms))
-                                    };
-                                    if recips.is_empty() {
-                                        return true;
-                                    }
-                                    let filtered: Vec<(u64, SubId)> = recips
-                                        .into_iter()
-                                        .filter(|recip| {
-                                            let pk = authed
-                                                .get(&recip.conn_id)
-                                                .map(|a| a.as_slice())
-                                                .unwrap_or(&[]);
-                                            r.should_send_to_identities(packed, pk)
-                                        })
-                                        .map(|recip| (recip.conn_id, recip.sub_id))
-                                        .collect();
-                                    conns.send_event_batch(&filtered, json, &metrics);
-                                }
+                        };
+                        let recipients = if monitors.event_requires_content(packed) {
+                            let Some(raw) = payload() else {
+                                return true;
+                            };
+                            let Ok(json) = decomp.decode(&txn, raw, max_event_size) else {
+                                return true;
+                            };
+                            let search_terms = wok_db::event_search_terms(json).unwrap_or_default();
+                            monitors.process(lev, packed, Some(&search_terms))
+                        } else {
+                            monitors.process(lev, packed, None)
+                        };
+                        if recipients.is_empty() {
+                            return true;
+                        }
+                        let readable = |conn_id| {
+                            let pk = authed.get(&conn_id).map(|a| a.as_slice()).unwrap_or(&[]);
+                            r.should_send_to_identities(packed, pk)
+                        };
+                        let live =
+                            route_stored_match(&mut monitors, recipients, readable, lev, &metrics);
+                        if live.is_empty() {
+                            return true;
+                        }
+                        if let Some(raw) = payload() {
+                            if let Ok(json) = decomp.decode(&txn, raw, max_event_size) {
+                                conns.send_event_batch(&live, json, &metrics);
                             }
                         }
                         true
                     });
                     curr_event_id = latest;
                 }
-                MonitorMsg::Ephemeral { packed, json } => {
-                    if let Ok(packed) = PackedEventView::new(&packed) {
+                MonitorData::Ephemeral { packed, json } => {
+                    let (live, pending) = {
+                        let Ok(event) = PackedEventView::new(&packed) else {
+                            continue;
+                        };
                         // Live-only events skip the database, but not the
                         // moderation policy: id/author/kind checks all apply.
                         if !global_visibility
-                            .globally_visible(&txn, packed)
+                            .globally_visible(&txn, event)
                             .unwrap_or(false)
                         {
                             continue;
                         }
-                        let search_terms = if monitors.event_requires_content(packed) {
+                        let search_terms = if monitors.event_requires_content(event) {
                             Some(wok_db::event_search_terms(&json).unwrap_or_default())
                         } else {
                             None
                         };
-                        let recipients = monitors.process_ephemeral(packed, search_terms.as_ref());
-                        let filtered: Vec<(u64, SubId)> = recipients
-                            .into_iter()
-                            .filter(|recipient| {
-                                let pk = authed
-                                    .get(&recipient.conn_id)
-                                    .map(|authed| authed.as_slice())
-                                    .unwrap_or(&[]);
-                                r.should_send_to_identities(packed, pk)
-                            })
-                            .map(|recipient| (recipient.conn_id, recipient.sub_id))
-                            .collect();
-                        conns.send_event_batch(&filtered, &json, &metrics);
+                        let recipients = monitors.process_ephemeral(event, search_terms.as_ref());
+                        let mut live = Vec::new();
+                        let mut pending = Vec::new();
+                        for recipient in recipients {
+                            // Held whatever the connection may read now, as
+                            // stored matches are: checked when sent.
+                            if recipient.pending {
+                                pending.push((recipient.conn_id, recipient.sub_id));
+                                continue;
+                            }
+                            let pk = authed
+                                .get(&recipient.conn_id)
+                                .map(|authed| authed.as_slice())
+                                .unwrap_or(&[]);
+                            if r.should_send_to_identities(event, pk) {
+                                live.push((
+                                    recipient.conn_id,
+                                    recipient.sub_id,
+                                    recipient.generation,
+                                ));
+                            }
+                        }
+                        (live, pending)
+                    };
+                    conns.send_event_batch(&live, &json, &metrics);
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    // One copy shared by every pending subscription it matches.
+                    let held = Arc::new(HeldEvent { packed, json });
+                    for (conn_id, sub_id) in pending {
+                        if let Some(buffer) = monitors.pending_mut(conn_id, &sub_id) {
+                            let (dropped, overflowed) = buffer.push_ephemeral(held.clone());
+                            metrics
+                                .live_buffer_dropped_ephemeral
+                                .fetch_add(dropped, Ordering::Relaxed);
+                            if overflowed {
+                                metrics
+                                    .live_buffer_overflows
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
             }
@@ -3229,17 +4034,17 @@ mod tests {
         let out = Outbound::new(tx, 100);
         let killed = out.killed();
 
-        assert_eq!(out.try_send("x".repeat(60)), Ok(()));
-        assert_eq!(out.try_send("y".repeat(30)), Ok(()));
+        assert_eq!(out.try_send("x".repeat(60), None), Ok(()));
+        assert_eq!(out.try_send("y".repeat(30), None), Ok(()));
         // 60 + 30 + 20 > 100: over budget, rejected.
         assert_eq!(
-            out.try_send("z".repeat(20)),
+            out.try_send("z".repeat(20), None),
             Err(OutboundSendError::OverByteLimit)
         );
 
         // Draining one frame releases its bytes.
         drop(rx.recv().await.unwrap());
-        assert_eq!(out.try_send("z".repeat(20)), Ok(()));
+        assert_eq!(out.try_send("z".repeat(20), None), Ok(()));
 
         // Kill notification reaches the transport.
         out.kill();
@@ -3251,14 +4056,14 @@ mod tests {
         let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let out2 = Outbound::new(tx2, 0);
         for _ in 0..8 {
-            assert_eq!(out2.try_send("q".repeat(1000)), Ok(()));
+            assert_eq!(out2.try_send("q".repeat(1000), None), Ok(()));
         }
 
         // The byte budget, not an incidental message count, bounds bursts.
         let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let out3 = Outbound::new(tx3, 10_000);
         for _ in 0..500 {
-            assert_eq!(out3.try_send("event".into()), Ok(()));
+            assert_eq!(out3.try_send("event".into(), None), Ok(()));
         }
         let mut received = 0;
         while rx3.try_recv().is_ok() {
@@ -4178,12 +4983,17 @@ mod tests {
     /// An ingester whose worker queues the test drains itself. Connection 1
     /// routes to `req[1]`, a two-slot queue nobody reads until the test says
     /// so: a REQ worker stuck in a long scan. Connection 2 routes to `req[0]`.
+    /// Both share one req monitor, whose control queue the test reads.
     struct StalledWorker {
         ingest: tokio::sync::mpsc::Sender<IngestMsg>,
         writer: Receiver<WriterMsg>,
         req: Vec<Receiver<ReqMsg>>,
+        mon: Receiver<MonitorMsg>,
         neg: Receiver<NegMsg>,
+        /// Connection 2's frames.
         outbound: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+        _outbound_1: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+        conns: Arc<ConnTable>,
         gates: [IngressGate; 2],
         ingester: thread::JoinHandle<()>,
         _dir: tempfile::TempDir,
@@ -4191,6 +5001,11 @@ mod tests {
 
     impl StalledWorker {
         fn start() -> Self {
+            Self::with_capacity(2)
+        }
+
+        /// `stalled` slots in connection 1's req worker queue.
+        fn with_capacity(stalled: usize) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let env = Env::open(dir.path(), small_map_env_options()).unwrap();
             env.ensure_initialized().unwrap();
@@ -4206,24 +5021,31 @@ mod tests {
             let conns = Arc::new(ConnTable::new());
             let (out_tx, outbound) = tokio::sync::mpsc::unbounded_channel();
             conns.insert(2, Outbound::new(out_tx, 0));
+            let (out_tx_1, _outbound_1) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx_1, 0));
             let (writer_tx, writer) = bounded(64);
             let (healthy_tx, healthy) = bounded(64);
-            let (stalled_tx, stalled) = bounded(2);
+            let (stalled_tx, stalled) = bounded(stalled);
+            let (mon_tx, mon) = unbounded();
             let (neg_tx, neg) = bounded(64);
             let (ingest, ingest_rx) = tokio::sync::mpsc::channel(64);
-            let ingester = thread::spawn(move || {
-                run_ingester(
-                    env,
-                    Arc::new(parking_lot::RwLock::new(config)),
-                    conns,
-                    Arc::new(Metrics::default()),
-                    Arc::new(AbuseController::default()),
-                    moderation,
-                    ingest_rx,
-                    writer_tx,
-                    vec![healthy_tx, stalled_tx],
-                    vec![neg_tx],
-                )
+            let ingester = thread::spawn({
+                let conns = conns.clone();
+                move || {
+                    run_ingester(
+                        env,
+                        Arc::new(parking_lot::RwLock::new(config)),
+                        conns,
+                        Arc::new(Metrics::default()),
+                        Arc::new(AbuseController::default()),
+                        moderation,
+                        ingest_rx,
+                        writer_tx,
+                        vec![healthy_tx, stalled_tx],
+                        vec![mon_tx],
+                        vec![neg_tx],
+                    )
+                }
             });
             let gates = [(); 2].map(|_| Arc::new(tokio::sync::watch::Sender::new(true)));
             for (conn_id, gate) in [1, 2].into_iter().zip(&gates) {
@@ -4238,8 +5060,11 @@ mod tests {
                 ingest,
                 writer,
                 req: vec![healthy, stalled],
+                mon,
                 neg,
                 outbound,
+                _outbound_1,
+                conns,
                 gates,
                 ingester,
                 _dir: dir,
@@ -4275,7 +5100,7 @@ mod tests {
         fn assert_other_connection_progresses(&mut self, sub_id: &str) {
             self.send(2, json!(["REQ", sub_id, {"kinds": [1]}]));
             match self.req[0].recv_timeout(Duration::from_secs(2)) {
-                Ok(ReqMsg::NewSub(sub)) => {
+                Ok(ReqMsg::Scan(sub)) => {
                     assert_eq!((sub.conn_id, sub.sub_id.as_str()), (2, sub_id));
                 }
                 _ => panic!("connection 2's REQ did not reach its worker"),
@@ -4349,7 +5174,7 @@ mod tests {
 
     fn assert_new_sub(msg: ReqMsg, sub_id: &str) {
         match msg {
-            ReqMsg::NewSub(sub) => assert_eq!((sub.conn_id, sub.sub_id.as_str()), (1, sub_id)),
+            ReqMsg::Scan(sub) => assert_eq!((sub.conn_id, sub.sub_id.as_str()), (1, sub_id)),
             _ => panic!("expected REQ {sub_id} for connection 1"),
         }
     }
@@ -4368,7 +5193,12 @@ mod tests {
             assert_new_sub(relay.recv_stalled(), &format!("s{i}"));
         }
         match relay.recv_stalled() {
-            ReqMsg::RemoveSub { conn_id, sub_id } => {
+            ReqMsg::Cancel {
+                conn_id,
+                sub_id,
+                count_only: false,
+                ..
+            } => {
                 assert_eq!((conn_id, sub_id.as_str()), (1, "s0"));
             }
             _ => panic!("expected the parked CLOSE"),
@@ -4573,5 +5403,741 @@ mod tests {
         // No request_shutdown: the last drop alone must stop the threads.
         drop(clone);
         assert_eq!(env_alive.strong_count(), 0, "relay threads still hold Env");
+    }
+
+    /// A REQ's registration is queued for the req monitor when the REQ is
+    /// admitted, however far behind the monitor is, and its history scan only
+    /// after that. So an event published after the REQ cannot reach the
+    /// monitor ahead of the registration, and the scan's snapshot cannot miss
+    /// events the monitor matched first. Nothing reads the monitor here.
+    #[test]
+    fn registrations_never_wait_for_the_monitor() {
+        let relay = StalledWorker::with_capacity(64);
+        for i in 0..100 {
+            relay.send(1, json!(["REQ", format!("s{i}"), {"kinds": [1]}]));
+        }
+        relay.send(1, json!(["CLOSE", "s99"]));
+        for i in 0..100 {
+            assert_new_sub(relay.recv_stalled(), &format!("s{i}"));
+            assert!(
+                relay.mon.len() > i,
+                "REQ s{i} was scanned before it was registered"
+            );
+        }
+        assert!(matches!(
+            relay.recv_stalled(),
+            ReqMsg::Cancel { conn_id: 1, ref sub_id, count_only: false, .. } if sub_id.as_str() == "s99"
+        ));
+        let registered: Vec<String> = relay
+            .mon
+            .try_iter()
+            .map(|msg| match msg {
+                MonitorMsg::Register(sub) => sub.sub_id.to_string(),
+                MonitorMsg::Remove { sub_id, .. } => format!("-{sub_id}"),
+                _ => panic!("unexpected monitor message"),
+            })
+            .collect();
+        let expected: Vec<String> = (0..100)
+            .map(|i| format!("s{i}"))
+            .chain(["-s99".to_string()])
+            .collect();
+        assert_eq!(registered, expected);
+        relay.finish();
+    }
+
+    /// One req monitor thread, driven directly. Connection 1 is the subject.
+    /// Connection 2 holds a live match-all subscription: its EVENT for an
+    /// event shows the monitor has matched that event. Registering opens the
+    /// subscription gate as the ingester would.
+    struct MonitorHarness {
+        env: Env,
+        cfg: Arc<parking_lot::RwLock<Config>>,
+        tx: Sender<MonitorMsg>,
+        data: Sender<MonitorData>,
+        conns: Arc<ConnTable>,
+        metrics: Arc<Metrics>,
+        subject: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+        observer: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+        thread: Option<thread::JoinHandle<()>>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl MonitorHarness {
+        fn start(live_buffer_bytes: usize) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut cfg = Config::default();
+            cfg.db = dir.path().to_path_buf();
+            cfg.relay.auth.enabled = false;
+            cfg.relay.max_live_buffer_bytes = live_buffer_bytes;
+            let conns = Arc::new(ConnTable::new());
+            let (subject_tx, subject) = tokio::sync::mpsc::unbounded_channel();
+            let (observer_tx, observer) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(subject_tx, 0));
+            conns.insert(2, Outbound::new(observer_tx, 0));
+            let metrics = Arc::new(Metrics::default());
+            let (tx, rx) = unbounded();
+            let (data, data_rx) = bounded(64);
+            let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+            let thread = {
+                let (env, cfg, conns, metrics) =
+                    (env.clone(), cfg.clone(), conns.clone(), metrics.clone());
+                thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx, data_rx))
+            };
+            let mut harness = Self {
+                env,
+                cfg,
+                tx,
+                data,
+                conns,
+                metrics,
+                subject,
+                observer,
+                thread: Some(thread),
+                _dir: dir,
+            };
+            let all = SubId::new("all").unwrap();
+            harness.conns.open_sub(2, Ns::Req, &all, 1);
+            harness.send(MonitorMsg::Register(Self::sub(2, "all", json!({}), 1, 0)));
+            harness.send(MonitorMsg::HistoryDone {
+                conn_id: 2,
+                sub_id: SubId::new("all").unwrap(),
+                generation: 1,
+                snapshot: 0,
+            });
+            let eose = Self::next(&mut harness.observer);
+            assert_eq!(eose[0], "EOSE", "{eose}");
+            harness
+        }
+
+        /// A REQ as the ingester admits it, with its history snapshot.
+        fn sub(
+            conn_id: u64,
+            sub_id: &str,
+            filter: Value,
+            generation: u64,
+            snapshot: u64,
+        ) -> Subscription {
+            let group = NostrFilterGroup::from_value(&filter, 500, 3, 16).unwrap();
+            let mut sub = Subscription::new(conn_id, SubId::new(sub_id).unwrap(), group, false);
+            sub.generation = generation;
+            sub.latest_event_id = snapshot;
+            sub
+        }
+
+        fn register(&self, generation: u64, filter: Value, snapshot: u64) {
+            let x = SubId::new("x").unwrap();
+            self.conns.open_sub(1, Ns::Req, &x, generation);
+            self.send(MonitorMsg::Register(Self::sub(
+                1, "x", filter, generation, snapshot,
+            )));
+        }
+
+        fn send(&self, msg: MonitorMsg) {
+            self.tx.send(msg).unwrap();
+        }
+
+        fn feed(&self, msg: MonitorData) {
+            self.data.send(msg).unwrap();
+        }
+
+        fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>) -> Value {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(frame) = rx.try_recv() {
+                    return serde_json::from_str(&frame.into_text()).unwrap();
+                }
+                assert!(std::time::Instant::now() < deadline, "no frame");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn parse(kind: u64, content: &str) -> wok_event::ParsedEvent {
+            Self::parse_at(kind, content, now_secs())
+        }
+
+        fn parse_at(kind: u64, content: &str, created_at: u64) -> wok_event::ParsedEvent {
+            Self::parse_tagged(kind, content, created_at, json!([]))
+        }
+
+        fn parse_tagged(
+            kind: u64,
+            content: &str,
+            created_at: u64,
+            tags: Value,
+        ) -> wok_event::ParsedEvent {
+            let event = sign_event(json!({
+                "created_at": created_at, "kind": kind, "tags": tags, "content": content,
+            }));
+            wok_event::parse_and_verify_event(
+                &event,
+                &wok_event::EventLimits::default(),
+                None,
+                true,
+                false,
+            )
+            .unwrap()
+        }
+
+        /// Wait until the observer has the event, and so the monitor matched it.
+        fn observe(&mut self, id: &str) {
+            let event = Self::next(&mut self.observer);
+            assert_eq!(event[2]["id"], id, "{event}");
+        }
+
+        /// Store a kind-1 event without telling the monitor. Returns its
+        /// local event id and event id.
+        fn write(&self, content: &str) -> (u64, String) {
+            self.write_event(Self::parse(1, content))
+        }
+
+        fn write_event(&self, parsed: wok_event::ParsedEvent) -> (u64, String) {
+            let id = to_hex(parsed.packed.view().id());
+            let mut txn = self.env.begin_rw().unwrap();
+            let mut events = vec![EventToWrite::new(parsed.packed.into_bytes(), parsed.json)];
+            wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false)
+                .unwrap();
+            txn.commit().unwrap();
+            let lev = most_recent_levid_ro(&self.env.begin_ro().unwrap()).unwrap();
+            (lev, id)
+        }
+
+        /// Store a kind-1 event, tell the monitor and wait until it matched it.
+        fn store(&mut self, content: &str) -> (u64, String) {
+            let (lev, id) = self.write(content);
+            self.feed(MonitorData::DbChange);
+            self.observe(&id);
+            (lev, id)
+        }
+
+        fn ephemeral(&mut self, content: &str) -> String {
+            self.ephemeral_at(content, now_secs())
+        }
+
+        fn ephemeral_at(&mut self, content: &str, created_at: u64) -> String {
+            let parsed = Self::parse_at(20_001, content, created_at);
+            let id = to_hex(parsed.packed.view().id());
+            self.feed(MonitorData::Ephemeral {
+                packed: parsed.packed.into_bytes(),
+                json: parsed.json,
+            });
+            self.observe(&id);
+            id
+        }
+
+        /// The subject's frames so far, as `[type, sub id, event id]`.
+        fn frames(&mut self) -> Vec<(String, String, String)> {
+            let mut frames = Vec::new();
+            while let Ok(frame) = self.subject.try_recv() {
+                let v: Value = serde_json::from_str(&frame.into_text()).unwrap();
+                let detail = match v[0].as_str().unwrap() {
+                    "EVENT" => v[2]["id"].as_str().unwrap().to_string(),
+                    "CLOSED" => v[2].as_str().unwrap().to_string(),
+                    _ => String::new(),
+                };
+                frames.push((
+                    v[0].as_str().unwrap().into(),
+                    v[1].as_str().unwrap().into(),
+                    detail,
+                ));
+            }
+            frames
+        }
+
+        /// Send `msg` and return the subject's frames once the monitor has
+        /// handled it.
+        fn apply(&mut self, msg: MonitorMsg) -> Vec<(String, String, String)> {
+            self.send(msg);
+            self.sync();
+            self.frames()
+        }
+
+        /// Wait until the monitor has handled everything sent so far: the
+        /// observer sees a later sentinel event.
+        fn sync(&mut self) {
+            let sentinel = Self::parse(20_002, "sentinel");
+            let id = to_hex(sentinel.packed.view().id());
+            self.feed(MonitorData::Ephemeral {
+                packed: sentinel.packed.into_bytes(),
+                json: sentinel.json,
+            });
+            self.observe(&id);
+        }
+
+        fn history_done(
+            &mut self,
+            generation: u64,
+            snapshot: u64,
+        ) -> Vec<(String, String, String)> {
+            self.apply(MonitorMsg::HistoryDone {
+                conn_id: 1,
+                sub_id: SubId::new("x").unwrap(),
+                generation,
+                snapshot,
+            })
+        }
+    }
+
+    impl Drop for MonitorHarness {
+        fn drop(&mut self) {
+            let (tx, _) = unbounded();
+            drop(std::mem::replace(&mut self.tx, tx));
+            let (data, _) = bounded(1);
+            drop(std::mem::replace(&mut self.data, data));
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    fn event_frame(id: &str) -> (String, String, String) {
+        ("EVENT".into(), "x".into(), id.into())
+    }
+
+    fn eose_frame() -> (String, String, String) {
+        ("EOSE".into(), "x".into(), String::new())
+    }
+
+    /// Matches that arrive while the history is sent are held, then follow
+    /// EOSE in arrival order. History from a stale generation sends nothing.
+    #[test]
+    fn monitor_sends_held_matches_after_eose_in_arrival_order() {
+        let mut h = MonitorHarness::start(0);
+        let (snapshot, _) = h.store("before the REQ");
+        h.register(7, json!({"kinds": [1, 20001]}), snapshot);
+        let (_, stored) = h.store("after the REQ");
+        let ephemeral = h.ephemeral("live only");
+        let (_, later) = h.store("later");
+        assert!(h.frames().is_empty(), "nothing goes out before EOSE");
+
+        assert!(h.history_done(6, snapshot).is_empty(), "stale generation");
+        assert_eq!(
+            h.history_done(7, snapshot),
+            [
+                eose_frame(),
+                event_frame(&stored),
+                event_frame(&ephemeral),
+                event_frame(&later)
+            ]
+        );
+        let (_, live) = h.store("live");
+        assert_eq!(h.frames(), [event_frame(&live)]);
+        assert!(h.history_done(7, snapshot).is_empty(), "already live");
+    }
+
+    /// A monitor that matched commits past the history snapshot before it saw
+    /// the registration re-reads them from the database.
+    #[test]
+    fn monitor_rereads_events_it_matched_before_the_registration() {
+        let mut h = MonitorHarness::start(0);
+        let (snapshot, _) = h.store("in the history");
+        let (_, gap) = h.store("committed after the snapshot");
+        h.register(1, json!({"kinds": [1]}), snapshot);
+        let (_, held) = h.store("held");
+        assert_eq!(
+            h.history_done(1, snapshot),
+            [eose_frame(), event_frame(&gap), event_frame(&held)]
+        );
+    }
+
+    /// Stored events up to the snapshot are the history's, even when the
+    /// monitor matches them only after the registration: it leaves them alone.
+    #[test]
+    fn monitor_leaves_events_up_to_the_snapshot_to_the_history() {
+        let mut h = MonitorHarness::start(0);
+        let (snapshot, history) = h.write("stored before the REQ, matched after it");
+        h.register(1, json!({"kinds": [1]}), snapshot);
+        h.feed(MonitorData::DbChange);
+        h.observe(&history);
+        let (_, live) = h.store("after the REQ");
+        assert_eq!(
+            h.history_done(1, snapshot),
+            [eose_frame(), event_frame(&live)]
+        );
+    }
+
+    /// Past the buffer bound, stored matches are re-read from the database
+    /// after the history and ephemeral ones are dropped and counted.
+    #[test]
+    fn monitor_overflow_rereads_stored_and_drops_ephemeral() {
+        let mut h = MonitorHarness::start(2 * wok_query::pending::STORED_ENTRY_BYTES);
+        h.register(1, json!({"kinds": [1, 20001]}), 0);
+        let ids: Vec<String> = (0..3).map(|i| h.store(&format!("stored {i}")).1).collect();
+        assert_eq!(h.metrics.live_buffer_overflows.load(Ordering::Relaxed), 1);
+        h.ephemeral("too big for the buffer");
+        assert_eq!(
+            h.metrics
+                .live_buffer_dropped_ephemeral
+                .load(Ordering::Relaxed),
+            1
+        );
+        let mut expected = vec![eose_frame()];
+        expected.extend(ids.iter().map(|id| event_frame(id)));
+        assert_eq!(h.history_done(1, 0), expected);
+    }
+
+    /// Held events are checked against the read policy again when they are
+    /// sent: one that expired or became restricted while the history was
+    /// sent is dropped.
+    #[test]
+    fn monitor_rechecks_held_events_against_the_current_policy() {
+        let mut h = MonitorHarness::start(0);
+        h.register(1, json!({"kinds": [1, 20001]}), 0);
+        h.ephemeral_at("expires while held", now_secs() - 10);
+        let (_, stored) = h.store("stored");
+        h.cfg.write().events.ephemeral_lifetime_secs = 5;
+        assert_eq!(h.history_done(1, 0), [eose_frame(), event_frame(&stored)]);
+
+        h.register(2, json!({"kinds": [1, 20001]}), 0);
+        h.ephemeral("restricted while held");
+        h.store("restricted while held");
+        h.cfg.write().relay.auth.restricted_read_kinds = vec![1, 20001];
+        assert_eq!(h.history_done(2, 0), [eose_frame()]);
+    }
+
+    /// A pending subscription holds matches its connection may not read yet,
+    /// stored and live-only: the connection may AUTH before EOSE, and what
+    /// was held is checked against the read policy when it is sent.
+    #[test]
+    fn monitor_holds_matches_until_the_connection_may_read_them() {
+        let mut h = MonitorHarness::start(0);
+        let pk = [7; 32];
+        let p = json!([["p", hex::encode(pk)]]);
+        h.register(1, json!({"#p": [hex::encode(pk)]}), 0);
+        let (_, wrap) = h.write_event(MonitorHarness::parse_tagged(
+            1059,
+            "gift wrap",
+            now_secs(),
+            p.clone(),
+        ));
+        h.feed(MonitorData::DbChange);
+        let ephemeral = MonitorHarness::parse_tagged(21059, "ephemeral wrap", now_secs(), p);
+        let ephemeral_id = to_hex(ephemeral.packed.view().id());
+        h.feed(MonitorData::Ephemeral {
+            packed: ephemeral.packed.into_bytes(),
+            json: ephemeral.json,
+        });
+        // Both are matched before the connection authenticates.
+        h.sync();
+        assert!(h
+            .apply(MonitorMsg::SetAuth {
+                conn_id: 1,
+                authed: pk,
+            })
+            .is_empty());
+        assert_eq!(
+            h.history_done(1, 0),
+            [eose_frame(), event_frame(&wrap), event_frame(&ephemeral_id)]
+        );
+    }
+
+    /// A monitor that cannot open a read transaction keeps the subscription
+    /// changes and database change it was handed, which nobody resends, and
+    /// applies them once reads work again.
+    #[test]
+    fn monitor_keeps_subscription_changes_through_read_failures() {
+        let mut h = MonitorHarness::start(0);
+        let (snapshot, _) = h.store("before the REQ");
+        h.register(1, json!({"kinds": [1]}), snapshot);
+        let (_, held) = h.store("held");
+        let event_id = |frame: Value| frame[2]["id"].as_str().unwrap().to_string();
+
+        fault::fail_reads(h.env.path(), 3);
+        h.send(MonitorMsg::HistoryDone {
+            conn_id: 1,
+            sub_id: SubId::new("x").unwrap(),
+            generation: 1,
+            snapshot,
+        });
+        let eose = MonitorHarness::next(&mut h.subject);
+        assert_eq!(
+            (eose[0].as_str(), eose[1].as_str()),
+            (Some("EOSE"), Some("x"))
+        );
+        assert_eq!(event_id(MonitorHarness::next(&mut h.subject)), held);
+
+        fault::fail_reads(h.env.path(), 3);
+        let (_, live) = h.write("committed while reads fail");
+        h.feed(MonitorData::DbChange);
+        assert_eq!(event_id(MonitorHarness::next(&mut h.subject)), live);
+    }
+
+    /// `Remove` drops only the generation it names: cleanup of an older REQ
+    /// that reaches the monitor after a newer REQ took the id leaves the newer
+    /// one running.
+    #[test]
+    fn monitor_removes_only_the_named_generation() {
+        let mut h = MonitorHarness::start(0);
+        let filter = json!({"kinds": [1]});
+        let remove = |generation| MonitorMsg::Remove {
+            conn_id: 1,
+            sub_id: SubId::new("x").unwrap(),
+            generation,
+        };
+        h.register(1, filter.clone(), 0);
+        assert_eq!(h.history_done(1, 0), [eose_frame()]);
+        let (snapshot, _) = h.store("before the replacement");
+        assert_eq!(h.frames().len(), 1);
+        h.register(3, filter, snapshot);
+        assert!(h.apply(remove(1)).is_empty());
+        assert_eq!(h.history_done(3, snapshot), [eose_frame()]);
+        let (_, live) = h.store("live for REQ 3");
+        assert_eq!(h.frames(), [event_frame(&live)]);
+        assert!(h.apply(remove(3)).is_empty());
+        h.store("after removal");
+        assert!(h.frames().is_empty());
+    }
+
+    /// A req worker that cannot open a read transaction refuses the REQ or
+    /// COUNT it was handed instead of dropping it, so the client still gets
+    /// CLOSED (and the monitor drops a REQ's registration), and keeps working.
+    #[test]
+    fn req_worker_refuses_what_it_cannot_start_when_reads_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (req_tx, req_rx) = bounded(8);
+        let (mon_tx, mon_rx) = bounded(8);
+        let worker = {
+            let env = env.clone();
+            let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+            let metrics = Arc::new(Metrics::default());
+            let conns = conns.clone();
+            thread::spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, vec![mon_tx]))
+        };
+        let x = SubId::new("x").unwrap();
+        let closed = |outbound: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(frame) = outbound.try_recv() {
+                    break frame.into_text();
+                }
+                assert!(std::time::Instant::now() < deadline, "no CLOSED");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let sub = |generation, count_only| {
+            let group = NostrFilterGroup::from_value(&json!({"kinds": [1]}), 500, 3, 16).unwrap();
+            let mut sub = Subscription::new(1, SubId::new("x").unwrap(), group, count_only);
+            sub.generation = generation;
+            if !count_only {
+                sub.latest_event_id = 0;
+            }
+            sub
+        };
+        let monitor = || mon_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        fault::fail_reads(env.path(), 1);
+        conns.open_sub(1, Ns::Req, &x, 7);
+        req_tx.send(ReqMsg::Scan(sub(7, false))).unwrap();
+        assert!(matches!(
+            monitor(),
+            MonitorMsg::Remove { generation: 7, .. }
+        ));
+        let reply = closed(&mut outbound);
+        assert!(reply.starts_with(r#"["CLOSED","x","error: "#), "{reply}");
+        assert!(!conns.is_open(1, Ns::Req, &x));
+        conns.open_sub(1, Ns::Req, &x, 8);
+        req_tx.send(ReqMsg::Scan(sub(8, false))).unwrap();
+        assert!(matches!(
+            monitor(),
+            MonitorMsg::HistoryDone { generation: 8, .. }
+        ));
+
+        fault::fail_reads(env.path(), 1);
+        conns.open_sub(1, Ns::Count, &x, 9);
+        req_tx.send(ReqMsg::Count(sub(9, true))).unwrap();
+        let reply = closed(&mut outbound);
+        assert!(reply.starts_with(r#"["CLOSED","x","error: "#), "{reply}");
+        drop(req_tx);
+        worker.join().unwrap();
+    }
+
+    /// When a req worker cannot open a read for a REQ or COUNT that replaces
+    /// one it is still running, the old query ends with the refusal rather
+    /// than scanning on for nothing: the gate already drops what it sends.
+    #[test]
+    fn a_replacement_refused_on_a_failed_read_ends_the_old_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        // Enough history that the first query spans many time slices.
+        let mut events: Vec<EventToWrite> = (0..20_000u64)
+            .map(|i| {
+                let mut id = [0xBBu8; 32];
+                id[..8].copy_from_slice(&i.to_be_bytes());
+                let event = json!({
+                    "id": hex::encode(id), "pubkey": "11".repeat(32),
+                    "created_at": 1_700_000_000 + i, "kind": 1, "tags": [],
+                    "content": "history", "sig": "00".repeat(64),
+                });
+                let parsed = wok_event::parse_and_verify_event(
+                    &event,
+                    &wok_event::EventLimits::default(),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+                EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let snapshot = most_recent_levid_ro(&env.begin_ro().unwrap()).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        cfg.relay.query_timeslice_budget_us = 1;
+        cfg.relay.max_filter_limit = 50_000;
+        cfg.relay.max_total_events_per_req = 0;
+        let sub = |generation, count_only| {
+            let group = NostrFilterGroup::from_value(
+                &json!({"kinds": [1], "limit": 50_000}),
+                50_000,
+                3,
+                16,
+            )
+            .unwrap();
+            let mut sub = Subscription::new(1, SubId::new("x").unwrap(), group, count_only);
+            sub.generation = generation;
+            if !count_only {
+                sub.latest_event_id = snapshot;
+            }
+            sub
+        };
+
+        for (first, replacement) in [
+            (ReqMsg::Scan(sub(1, false)), ReqMsg::Scan(sub(2, false))),
+            (ReqMsg::Count(sub(1, true)), ReqMsg::Count(sub(2, true))),
+        ] {
+            let count = matches!(first, ReqMsg::Count(_));
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            // The ingester has opened the gate for the replacement.
+            let ns = if count { Ns::Count } else { Ns::Req };
+            conns.open_sub(1, ns, &SubId::new("x").unwrap(), 2);
+            let (req_tx, req_rx) = bounded(8);
+            let (mon_tx, mon_rx) = bounded(8);
+            // Both are queued before the worker starts: the first pass reads
+            // and starts the first query, the second pass cannot read.
+            req_tx.send(first).unwrap();
+            req_tx.send(replacement).unwrap();
+            fault::fail_reads_after(env.path(), 1, 1);
+            let worker = {
+                let env = env.clone();
+                let cfg = Arc::new(parking_lot::RwLock::new(cfg.clone()));
+                let metrics = Arc::new(Metrics::default());
+                thread::spawn(move || {
+                    run_req_worker(env, cfg, conns, metrics, req_rx, vec![mon_tx])
+                })
+            };
+            let recv_frame =
+                |outbound: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>| {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    loop {
+                        if let Ok(frame) = outbound.try_recv() {
+                            break frame.into_text();
+                        }
+                        assert!(std::time::Instant::now() < deadline, "no frame");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                };
+            let closed = recv_frame(&mut outbound);
+            assert!(closed.starts_with(r#"["CLOSED","x","error: "#), "{closed}");
+            if !count {
+                assert!(matches!(
+                    mon_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    MonitorMsg::Remove { generation: 2, .. }
+                ));
+            }
+            thread::sleep(Duration::from_millis(300));
+            assert!(outbound.try_recv().is_err(), "a frame followed CLOSED");
+            // A replaced REQ that kept scanning would report its history done.
+            assert!(
+                mon_rx.try_recv().is_err(),
+                "the replaced query kept running"
+            );
+            drop(req_tx);
+            worker.join().unwrap();
+        }
+    }
+
+    /// A refused REQ ends the subscription it names at once: the gate closes
+    /// the id and queues the CLOSED in one step, so nothing the old
+    /// subscription's worker or monitor sends afterwards reaches the client,
+    /// and the workers are only told to clean up. A later REQ with the id is
+    /// unaffected by the old generation's late frames.
+    #[test]
+    fn a_refusal_ends_the_named_subscription_at_once() {
+        let mut relay = StalledWorker::start();
+        let metrics = Metrics::default();
+        let x = SubId::new("x").unwrap();
+        let next = |relay: &StalledWorker| {
+            relay.req[0]
+                .recv_timeout(Duration::from_secs(2))
+                .expect("nothing reached the req worker")
+        };
+        let frame = |relay: &mut StalledWorker| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(frame) = relay.outbound.try_recv() {
+                    break frame.into_text();
+                }
+                assert!(std::time::Instant::now() < deadline, "no frame");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        relay.send(2, json!(["REQ", "x", {"kinds": [1]}]));
+        let ReqMsg::Scan(first) = next(&relay) else {
+            panic!("expected the scan");
+        };
+        relay
+            .conns
+            .send_event(2, &x, first.generation, "{\"a\":1}", &metrics);
+        assert!(frame(&mut relay).starts_with(r#"["EVENT","x""#));
+
+        relay.send(2, json!(["REQ", "x", {"kinds": [1], "nope": true}]));
+        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","error: "#));
+        assert!(matches!(
+            next(&relay),
+            ReqMsg::Cancel { generation, count_only: false, .. } if generation == first.generation
+        ));
+        // The old scan and live match are too late now.
+        relay
+            .conns
+            .send_event(2, &x, first.generation, "{\"a\":2}", &metrics);
+        let eose = RelayMessage::Eose { sub_id: "x".into() };
+        relay
+            .conns
+            .send_sub(2, &x, first.generation, eose, &metrics);
+        // A refusal again, with nothing open: answered as directly.
+        relay.send(2, json!(["REQ", "x", {"kinds": [1], "nope": true}]));
+        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","error: "#));
+
+        relay.send(2, json!(["REQ", "x", {"kinds": [1]}]));
+        let ReqMsg::Scan(second) = next(&relay) else {
+            panic!("expected the scan");
+        };
+        relay
+            .conns
+            .send_event(2, &x, first.generation, "{\"a\":3}", &metrics);
+        relay
+            .conns
+            .send_event(2, &x, second.generation, "{\"b\":1}", &metrics);
+        assert_eq!(frame(&mut relay), r#"["EVENT","x",{"b":1}]"#);
+        assert!(relay.outbound.try_recv().is_err());
+        relay.finish();
     }
 }

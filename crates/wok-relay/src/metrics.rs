@@ -76,6 +76,11 @@ pub struct Metrics {
     pub authenticated_connections: AtomicU64,
     pub written_events_total: AtomicU64,
     pub ephemeral_events_total: AtomicU64,
+    /// Subscriptions whose stored matches outgrew the live buffer during
+    /// their history scan and were re-read from the database.
+    pub live_buffer_overflows: AtomicU64,
+    /// Ephemeral matches dropped from a full live buffer.
+    pub live_buffer_dropped_ephemeral: AtomicU64,
     pub dup_events_total: AtomicU64,
     pub rejected_events_total: AtomicU64,
     pub auth_challenges_sent_total: AtomicU64,
@@ -171,6 +176,10 @@ impl Metrics {
                 "wok_written_events_total {}\n",
                 "# TYPE wok_ephemeral_events_total counter\n",
                 "wok_ephemeral_events_total {}\n",
+                "# TYPE wok_live_buffer_overflows_total counter\n",
+                "wok_live_buffer_overflows_total {}\n",
+                "# TYPE wok_live_buffer_dropped_ephemeral_total counter\n",
+                "wok_live_buffer_dropped_ephemeral_total {}\n",
                 "# TYPE wok_dup_events_total counter\n",
                 "wok_dup_events_total {}\n",
                 "# TYPE wok_rejected_events_total counter\n",
@@ -217,6 +226,8 @@ impl Metrics {
             g(&self.authenticated_connections),
             g(&self.written_events_total),
             g(&self.ephemeral_events_total),
+            g(&self.live_buffer_overflows),
+            g(&self.live_buffer_dropped_ephemeral),
             g(&self.dup_events_total),
             g(&self.rejected_events_total),
             g(&self.auth_challenges_sent_total),

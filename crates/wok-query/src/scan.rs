@@ -244,6 +244,9 @@ struct TiePass {
     cursor: usize,
     next_lev: u64,
     best: BinaryHeap<([u8; 32], u64)>,
+    /// The levIds in `best`: a tag filter's alternatives can index one event
+    /// many times, and each copy must not take a place of its own.
+    in_best: HashSet<u64>,
     dropped: bool,
 }
 
@@ -943,6 +946,7 @@ impl DbScan {
             cursor: 0,
             next_lev: u64::MAX,
             best: BinaryHeap::new(),
+            in_best: HashSet::new(),
             dropped: false,
         });
         let event_dbi = txn.env().dbis().event;
@@ -990,6 +994,9 @@ impl DbScan {
             }
         }
         for lev in levs {
+            if pass.in_best.contains(&lev) {
+                continue;
+            }
             self.approx_work += 10;
             let Some(view) = txn
                 .get_u64(event_dbi, lev)?
@@ -1006,8 +1013,11 @@ impl DbScan {
                 continue;
             }
             pass.best.push((id, lev));
+            pass.in_best.insert(lev);
             if pass.best.len() > self.tie_capacity {
-                pass.best.pop();
+                if let Some((_, evicted)) = pass.best.pop() {
+                    pass.in_best.remove(&evicted);
+                }
                 pass.dropped = true;
             }
         }
@@ -1016,9 +1026,7 @@ impl DbScan {
         }
         let pass = run.pass.take().expect("pass under way");
         run.more = pass.dropped;
-        let mut members = pass.best.into_sorted_vec();
-        // A tag filter's alternatives can index one event twice.
-        members.dedup();
+        let members = pass.best.into_sorted_vec();
         if let Some((id, _)) = members.last() {
             run.sent_through = Some(*id);
         }
@@ -1449,13 +1457,13 @@ mod tests {
     }
 
     /// Scan one step per call. Returns the distinct ids sent, in order, the
-    /// most candidates held after any step, and the most work done by one
-    /// step.
+    /// most candidates held after any step, the most work done by one step,
+    /// and the work done in all.
     fn scan_in_steps(
         env: &Env,
         filter: serde_json::Value,
         want: usize,
-    ) -> (Vec<[u8; 32]>, usize, u64) {
+    ) -> (Vec<[u8; 32]>, usize, u64, u64) {
         let txn = env.begin_ro().unwrap();
         let f = crate::NostrFilterGroup::from_value(&filter, u64::MAX, 3, 16)
             .unwrap()
@@ -1497,7 +1505,7 @@ mod tests {
                     + tie.map_or(0, |pass| pass.best.len()),
             );
             if done {
-                return (sent, held, step_work);
+                return (sent, held, step_work, scan.approx_work);
             }
         }
     }
@@ -1513,14 +1521,14 @@ mod tests {
         let chunk_work = 10 * TIE_CHUNK as u64 + 1000;
 
         // A tiny limit holds only what it can send.
-        let (sent, held, work) = scan_in_steps(&env, json!({"kinds": [1], "limit": 1}), 1);
+        let (sent, held, work, _) = scan_in_steps(&env, json!({"kinds": [1], "limit": 1}), 1);
         assert_eq!(sent, ids[..1]);
         assert!(held <= 50, "held {held}");
         assert!(work <= chunk_work, "one step did {work}");
 
         // NEG-OPEN and COUNT limits are their caps: the run is sent whole, in
         // id order, a bounded selection at a time.
-        let (sent, held, work) =
+        let (sent, held, work, _) =
             scan_in_steps(&env, json!({"kinds": [1], "limit": 1_000_001}), run + 1);
         assert_eq!(sent[..run], ids[..]);
         assert_eq!(sent.len(), run + 1);
@@ -1576,9 +1584,30 @@ mod tests {
         expected.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         let expected: Vec<_> = expected.into_iter().map(|(_, id)| id).collect();
 
-        let (sent, _, work) = scan_in_steps(&env, json!({"#t": tags, "limit": 500}), 56);
+        let (sent, _, work, _) = scan_in_steps(&env, json!({"#t": tags, "limit": 500}), 56);
         assert_eq!(sent, expected);
         let chunk_work = 10 * TIE_CHUNK as u64 + 1000;
         assert!(work <= chunk_work, "one step did {work}");
+    }
+
+    #[test]
+    fn events_under_many_tie_tags_take_one_place_each() {
+        // 100 tied events under the same 50 OR alternatives: 5,000 postings
+        // of 100 events. Counting copies, a 20-place selection would hold
+        // the lowest id 20 times and need a pass of the whole run per event.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let tags: Vec<_> = (0..50).map(|i| format!("v{i}")).collect();
+        let mut ids: Vec<_> = tagged_events(&env, &[1_700_000_000; 100], &tags)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        ids.sort();
+
+        let (sent, _, _, total) = scan_in_steps(&env, json!({"#t": tags, "limit": 20}), 20);
+        assert_eq!(sent, ids[..20]);
+        // One pass reads each posting once, plus the first read of each cursor.
+        assert!(total <= 2 * 10 * 5_000, "the query did {total}");
     }
 }

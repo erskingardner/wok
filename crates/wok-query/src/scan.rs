@@ -993,6 +993,9 @@ impl DbScan {
                 }
             }
         }
+        // Each index entry read counts, as in `collect`, even when its event
+        // is not read: the scheduler checks its time budget on this work.
+        self.approx_work += levs.len() as u64;
         for lev in levs {
             if pass.in_best.contains(&lev) {
                 continue;
@@ -1609,5 +1612,55 @@ mod tests {
         assert_eq!(sent, ids[..20]);
         // One pass reads each posting once, plus the first read of each cursor.
         assert!(total <= 2 * 10 * 5_000, "the query did {total}");
+    }
+
+    #[test]
+    fn repeated_tie_postings_still_reach_the_time_budget_check() {
+        // 40 tied events under the same 600 OR alternatives: once the first
+        // cursor selects them all, the other 23,960 postings are repeats.
+        // With no time budget, `DbQuery` pauses at each check of its work,
+        // so the repeats must count toward it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let tags: Vec<_> = (0..600).map(|i| format!("v{i}")).collect();
+        let mut ids: Vec<_> = tagged_events(&env, &[1_700_000_000; 40], &tags)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        ids.sort();
+
+        let txn = env.begin_ro().unwrap();
+        let group =
+            crate::NostrFilterGroup::from_value(&json!({"#t": tags, "limit": 500}), 500, 3, 16)
+                .unwrap();
+        let mut query = DbQuery::new(
+            Subscription::new(1, crate::SubId::new("tie").unwrap(), group, false),
+            0,
+            0,
+        );
+        let mut sent = Vec::new();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            let done = query
+                .process(
+                    &txn,
+                    |_, lev| {
+                        let raw = txn.get_u64(txn.env().dbis().event, lev).unwrap().unwrap();
+                        let id: [u8; 32] =
+                            PackedEventView::new(raw).unwrap().id().try_into().unwrap();
+                        sent.push(id);
+                    },
+                    0,
+                )
+                .unwrap();
+            if done {
+                break;
+            }
+        }
+        assert_eq!(sent, ids);
+        // About one pause per 2,000 postings read.
+        assert!(calls >= 10, "{calls} calls");
     }
 }

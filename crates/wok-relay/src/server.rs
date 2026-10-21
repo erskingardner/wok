@@ -3256,8 +3256,10 @@ struct Completed {
 /// generation the match was for.
 type LiveRecipients = Vec<(u64, SubId, u64)>;
 
-/// Route `recipients` of a stored event that `identities` may read: live
-/// subscriptions are returned for delivery, pending ones buffer its id.
+/// Route `recipients` of a stored event: live subscriptions whose connection
+/// may read it are returned for delivery. Pending ones buffer its id either
+/// way: the connection may AUTH before EOSE, and what the buffer holds is
+/// checked against the read policy when it is sent.
 fn route_stored_match(
     monitors: &mut ActiveMonitors,
     recipients: Vec<wok_query::Recipient>,
@@ -3267,17 +3269,16 @@ fn route_stored_match(
 ) -> LiveRecipients {
     let mut live = Vec::new();
     for recipient in recipients {
-        if !readable(recipient.conn_id) {
-            continue;
-        }
-        if !recipient.pending {
-            live.push((recipient.conn_id, recipient.sub_id, recipient.generation));
-        } else if let Some(buffer) = monitors.pending_mut(recipient.conn_id, &recipient.sub_id) {
-            if buffer.push_stored(lev_id) {
-                metrics
-                    .live_buffer_overflows
-                    .fetch_add(1, Ordering::Relaxed);
+        if recipient.pending {
+            if let Some(buffer) = monitors.pending_mut(recipient.conn_id, &recipient.sub_id) {
+                if buffer.push_stored(lev_id) {
+                    metrics
+                        .live_buffer_overflows
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
+        } else if readable(recipient.conn_id) {
+            live.push((recipient.conn_id, recipient.sub_id, recipient.generation));
         }
     }
     live
@@ -3648,16 +3649,17 @@ fn run_req_monitor(
                         let mut live = Vec::new();
                         let mut pending = Vec::new();
                         for recipient in recipients {
+                            // Held whatever the connection may read now, as
+                            // stored matches are: checked when sent.
+                            if recipient.pending {
+                                pending.push((recipient.conn_id, recipient.sub_id));
+                                continue;
+                            }
                             let pk = authed
                                 .get(&recipient.conn_id)
                                 .map(|authed| authed.as_slice())
                                 .unwrap_or(&[]);
-                            if !r.should_send_to_identities(event, pk) {
-                                continue;
-                            }
-                            if recipient.pending {
-                                pending.push((recipient.conn_id, recipient.sub_id));
-                            } else {
+                            if r.should_send_to_identities(event, pk) {
                                 live.push((
                                     recipient.conn_id,
                                     recipient.sub_id,
@@ -5365,8 +5367,17 @@ mod tests {
         }
 
         fn parse_at(kind: u64, content: &str, created_at: u64) -> wok_event::ParsedEvent {
+            Self::parse_tagged(kind, content, created_at, json!([]))
+        }
+
+        fn parse_tagged(
+            kind: u64,
+            content: &str,
+            created_at: u64,
+            tags: Value,
+        ) -> wok_event::ParsedEvent {
             let event = sign_event(json!({
-                "created_at": created_at, "kind": kind, "tags": [], "content": content,
+                "created_at": created_at, "kind": kind, "tags": tags, "content": content,
             }));
             wok_event::parse_and_verify_event(
                 &event,
@@ -5387,7 +5398,10 @@ mod tests {
         /// Store a kind-1 event without telling the monitor. Returns its
         /// local event id and event id.
         fn write(&self, content: &str) -> (u64, String) {
-            let parsed = Self::parse(1, content);
+            self.write_event(Self::parse(1, content))
+        }
+
+        fn write_event(&self, parsed: wok_event::ParsedEvent) -> (u64, String) {
             let id = to_hex(parsed.packed.view().id());
             let mut txn = self.env.begin_rw().unwrap();
             let mut events = vec![EventToWrite::new(parsed.packed.into_bytes(), parsed.json)];
@@ -5589,6 +5603,42 @@ mod tests {
         h.store("restricted while held");
         h.cfg.write().relay.auth.restricted_read_kinds = vec![1, 20001];
         assert_eq!(h.history_done(2, 0), [eose_frame()]);
+    }
+
+    /// A pending subscription holds matches its connection may not read yet,
+    /// stored and live-only: the connection may AUTH before EOSE, and what
+    /// was held is checked against the read policy when it is sent.
+    #[test]
+    fn monitor_holds_matches_until_the_connection_may_read_them() {
+        let mut h = MonitorHarness::start(0);
+        let pk = [7; 32];
+        let p = json!([["p", hex::encode(pk)]]);
+        h.register(1, json!({"#p": [hex::encode(pk)]}), 0);
+        let (_, wrap) = h.write_event(MonitorHarness::parse_tagged(
+            1059,
+            "gift wrap",
+            now_secs(),
+            p.clone(),
+        ));
+        h.feed(MonitorData::DbChange);
+        let ephemeral = MonitorHarness::parse_tagged(21059, "ephemeral wrap", now_secs(), p);
+        let ephemeral_id = to_hex(ephemeral.packed.view().id());
+        h.feed(MonitorData::Ephemeral {
+            packed: ephemeral.packed.into_bytes(),
+            json: ephemeral.json,
+        });
+        // Both are matched before the connection authenticates.
+        h.sync();
+        assert!(h
+            .apply(MonitorMsg::SetAuth {
+                conn_id: 1,
+                authed: pk,
+            })
+            .is_empty());
+        assert_eq!(
+            h.history_done(1, 0),
+            [eose_frame(), event_frame(&wrap), event_frame(&ephemeral_id)]
+        );
     }
 
     /// A monitor that cannot open a read transaction keeps the subscription

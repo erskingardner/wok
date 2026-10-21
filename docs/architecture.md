@@ -109,7 +109,8 @@ history as well as live ones; a REQ reusing an open id always fits.
    subscription with that id and matches the new one against every later
    event, as for a live subscription. Matches are held in a per-subscription
    buffer instead of being sent: stored events by local event id, live-only
-   events in full.
+   events in full. They are held whether or not the connection may read them
+   yet, since it may AUTH before EOSE.
 3. **History, on the req worker.** The worker scans up to the snapshot, then
    posts `HistoryDone{generation, snapshot}` to the monitor and moves on. It
    never waits for a reply. A REQ or COUNT it cannot start (a read failure,

@@ -131,11 +131,12 @@ pub fn verify_event_timestamp(
     Ok(())
 }
 
-/// Refuse a deletion whose `a` tag spells its kind with leading zeros. Wok
-/// tombstones an address by the hash of the tag, and looks it up by the
-/// canonical spelling. Packing accepts such tags, which strfry and earlier
-/// releases stored.
-fn require_canonical_addresses(orig: &Value) -> Result<(), EventError> {
+/// Refuse a deletion, the event JSON `orig`, whose `a` tag spells its kind
+/// with leading zeros. Wok tombstones an address by the hash of the tag, and
+/// looks it up by the canonical spelling. Packing accepts such tags, which
+/// strfry and earlier releases stored; every path that stores new events
+/// must call this, as [`parse_and_verify_event_with`] does.
+pub fn require_canonical_addresses(orig: &Value) -> Result<(), EventError> {
     let tags = orig
         .get("tags")
         .and_then(Value::as_array)

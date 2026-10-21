@@ -195,8 +195,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when `wok reindex` applies them; until then `wok doctor` warns
   (`deletion-tombstones`).
 - A deletion `a` tag whose kind has leading zeros (`030000:<pubkey>:<d>`) is
-  refused with `invalid: a tag kind has leading zeros`. It deleted the stored
-  versions of the address, but its tombstone never refused later ones. Such
+  refused with `invalid: a tag kind has leading zeros`, as are such lines in
+  `wok import` (fried included) and such events in `wok sync` and `wok router`
+  downloads. It deleted the stored versions of the address, but its tombstone
+  never refused later ones. Such
   requests stored by strfry or earlier releases still name the canonical
   address: `wok reindex` deletes the versions that came back and tombstones
   the canonical spelling, except for an `a` tag longer than 255 bytes.

@@ -206,9 +206,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     letters, are accepted.
   - `events.max_num_tags` is `5000` (was 2000), NIP-11 `max_event_tags`, so
     heavy users' follow and mute lists are accepted.
+- `public`: storage quotas. Files that pin the old values, as copies of the
+  0.7 `docs/wok.toml` do, keep them, and `wok doctor` flags them.
+  - `relay.abuse.max_stored_events` is `0`, no global event cap (was
+    10000000). At the cap every write on the relay failed, and a busy public
+    relay stores far more. `database.map_size` and
+    `database.min_free_disk_bytes` bound storage.
+  - `relay.abuse.max_stored_events_per_pubkey` is `1000000` (was 100000),
+    so active users and bots keep posting.
 
 ### Changed
 
+- Reload warns about a guard set to zero (unlimited) only when the file's
+  preset does not set it to zero too. Before, every zero warned, so the
+  public preset's `relay.abuse.max_stored_events = 0` would have been warned
+  about on every reload.
 - Dashboard saves and the NIP-86 relay-info methods edit `wok.toml` in place.
   They change only the settings whose value changed, remove a setting set
   back to its preset's value, and keep comments and layout. Before, a save

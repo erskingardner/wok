@@ -416,8 +416,8 @@ All abuse settings reload live and are dashboard-editable.
 | `relay.abuse.invalid_burst` | `20` | Per-address malformed-message bucket capacity. |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Historical scans per connection; zero rejects new scans. |
 | `relay.abuse.max_query_cost` | `1000` | Conservative pre-scan filter cost ceiling; zero is unlimited. |
-| `relay.abuse.max_stored_events` | `10000000` | Global durable event ceiling; the entire write transaction aborts before exceeding it. |
-| `relay.abuse.max_stored_events_per_pubkey` | `100000` | Hard author storage quota; zero is unlimited. |
+| `relay.abuse.max_stored_events` | `0` | Global durable event ceiling; the entire write transaction aborts before exceeding it. Zero, the public preset's value, is unlimited. See [Storage](#storage). |
+| `relay.abuse.max_stored_events_per_pubkey` | `1000000` | Hard author storage quota; zero is unlimited. See [Storage](#storage). |
 | `relay.abuse.min_pow_difficulty` | `0` | Required NIP-13 leading-zero bits; zero disables it. |
 
 A zero rate or burst disables that individual token bucket. Unix-socket
@@ -426,6 +426,36 @@ every per-IP token bucket — connection, EVENT, REQ, and COUNT. Per-author
 publication, storage quotas, query-cost gates, and proof-of-work policies
 still apply to them. Keep the socket on a trusted host with tight
 `mode`/`auth_uids`/`auth_gids`.
+
+On reload, the relay logs a warning for each guard the file sets to zero
+(unlimited) while its preset does not. A guard that the preset itself turns
+off, such as `max_stored_events` in the public preset, is not warned about.
+
+### Storage
+
+The relay's storage is bounded by the resources it uses:
+`database.map_size` caps the LMDB map, and `database.min_free_disk_bytes`
+refuses writes before the filesystem fills. The event-count settings sit on
+top of those.
+
+- **Stored events globally** (`max_stored_events`, off in the public
+  preset).
+  - If too low: once it is reached, every write on the relay fails. A busy
+    public relay stores far more than 10,000,000 events, the default
+    through 0.7.
+  - When off, `map_size` and `min_free_disk_bytes` bound storage.
+- **Stored events per author** (`max_stored_events_per_pubkey`, 1,000,000).
+  - If too low: active users and bots can no longer post new events. At
+    quota, an author can still replace their own replaceable and addressable
+    events and delete their own events. Only a deletion that removes none of
+    their events is refused, since it would add an event and free none.
+  - If too high: one key can fill the disk.
+  - The quota is charged to the event's author, so throwaway keys such as
+    Marmot's kind 445 and gift-wrap 1059 authors never reach it.
+
+A write over a quota is refused with `OK false`: `blocked: author storage
+quota exceeded`, or `error: global storage quota of <n> events exceeded` for
+the whole batch.
 
 ## Unix socket
 

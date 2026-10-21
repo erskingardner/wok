@@ -34,3 +34,8 @@
 #   merged batches of filters are no longer cut at 2,000 in all.
 #   max_tags_per_filter = 8 (was 3): comment, community and marketplace
 #   queries that combine four or more tag letters are accepted.
+# - [relay.abuse] max_stored_events = 0 (was 10000000): no global event
+#   cap, whose cliff failed every write on a busy relay. database.map_size
+#   and database.min_free_disk_bytes bound storage.
+#   max_stored_events_per_pubkey = 1000000 (was 100000): active users and
+#   bots keep posting.

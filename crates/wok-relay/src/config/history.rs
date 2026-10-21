@@ -22,6 +22,12 @@ const PAST_DEFAULTS: &[(&str, &str, &str)] = &[
     ("relay.max_filter_limit", "500", "0.7.0"),
     ("relay.max_tags_per_filter", "3", "0.7.0"),
     ("relay.max_total_events_per_req", "2000", "0.7.0"),
+    ("relay.abuse.max_stored_events", "10000000", "0.7.0"),
+    (
+        "relay.abuse.max_stored_events_per_pubkey",
+        "100000",
+        "0.7.0",
+    ),
 ];
 
 /// A key the operator's file pins to a built-in default that a later release

@@ -224,6 +224,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts an upload refused with either the new or the old superseded reason as
   `upload_superseded`, so peers running strfry or earlier Wok releases are
   still recognized.
+- A write-policy plugin that rejects an event with an empty or unprefixed
+  `msg` no longer produces an OK reason without a NIP-01 prefix: the client
+  gets `blocked: <msg>`, or `blocked: rejected by write policy` for an empty
+  one. Messages that already start with a standard prefix are unchanged. A
+  `shadowReject` with an unprefixed `msg` now sends an empty reason, like an
+  accepted event.
 
 ## [0.7.0] - 2026-09-08
 

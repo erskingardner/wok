@@ -118,6 +118,13 @@ regression test. Differential parity alone is not a reason to retain it.
   covers gets `blocked: user requested deletion`. The pinned strfry replies
   `replaced: have newer event` and `deleted: user requested deletion`, whose
   prefixes NIP-01 does not define.
+- A write-policy plugin's rejection message is sent as is only when it starts
+  with a standard NIP-01 prefix. Any other message is sent as
+  `blocked: <msg>`, and an empty one as `blocked: rejected by write policy`. A
+  `shadowReject` message without a prefix is replaced by the empty reason of
+  an accepted event. The pinned strfry sends the plugin's `msg` verbatim, so a
+  plugin could produce `false` OKs with an empty or unprefixed reason, which
+  NIP-01 forbids.
 - NIP-77 network payload hex rejects `0x` prefixes and half bytes.
 - NIP-01 IDs, pubkeys, signatures, and standard `e`/`p` values require the
   specified lowercase hex form.

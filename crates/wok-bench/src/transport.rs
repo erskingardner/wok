@@ -26,11 +26,12 @@ use crate::clients::ws_handshake;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Child;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wok_ws::frame::{
@@ -44,6 +45,9 @@ const BATCH: usize = 64;
 const CHURN_WORKERS: usize = 16;
 /// Events in each warm and churn fetch.
 const SMALL_FETCH: u64 = 10;
+/// Longest a REQ may wait for its EOSE, or a publication for its OK, before
+/// the trial fails instead of hanging.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Frames per codec group, and the levels swept.
 const CODEC_FRAMES: usize = 2_000;
 const CODEC_LEVELS: [u32; 6] = [1, 2, 3, 4, 5, 6];
@@ -125,9 +129,9 @@ pub struct RunInput<'a> {
     pub bin: &'a Path,
     pub dbdir: &'a Path,
     pub corpus: &'a Path,
-    /// Kind-1 events in the corpus, and its newest `created_at`. Fetches stop
+    /// The corpus's kind-1 events, and its newest `created_at`. Fetches stop
     /// there, so both modes fetch the same events whatever fan-out stored.
-    pub kind1_events: u64,
+    pub kind1: Vec<Value>,
     pub newest: u64,
     /// Fan-out notes for both modes, all newer than the corpus.
     pub fanout: Vec<Value>,
@@ -141,9 +145,10 @@ pub fn run(rt: &tokio::runtime::Runtime, input: RunInput<'_>) -> Result<Transpor
         "import of {} failed",
         input.corpus.display()
     );
+    let oracle = Arc::new(Oracle::new(input.kind1));
     let mut report = TransportReport {
         options: Some(input.opts.clone()),
-        kind1_events: input.kind1_events,
+        kind1_events: oracle.created.len() as u64,
         codec: codec_sweep(input.corpus)?,
         ..TransportReport::default()
     };
@@ -163,7 +168,7 @@ pub fn run(rt: &tokio::runtime::Runtime, input: RunInput<'_>) -> Result<Transpor
                 addr,
                 offer_deflate,
                 &input.opts,
-                (input.kind1_events, input.newest),
+                (&oracle, input.newest),
                 fanout,
             ))
         });
@@ -269,7 +274,7 @@ async fn run_mode(
     addr: SocketAddr,
     deflate: bool,
     opts: &TransportOptions,
-    (kind1_events, newest): (u64, u64),
+    (oracle, newest): (&Arc<Oracle>, u64),
     fanout: &[Value],
 ) -> Result<ModeReport> {
     let mut report = ModeReport {
@@ -277,12 +282,13 @@ async fn run_mode(
         ..ModeReport::default()
     };
     let small = json!({"kinds": [1], "until": newest, "limit": SMALL_FETCH});
-    let expect_small = SMALL_FETCH.min(kind1_events) as usize;
+    let small_limit = SMALL_FETCH as usize;
     // Warm the relay (threads, LMDB pages, allocator) before the baseline.
     {
         let mut conn = Conn::open(addr, deflate).await?;
         for i in 0..3 {
-            conn.fetch(&format!("warm-{i}"), &small).await?;
+            let events = conn.fetch(&format!("warm-{i}"), &small).await?;
+            oracle.check(&events, small_limit, true)?;
         }
         conn.close().await;
     }
@@ -305,7 +311,7 @@ async fn run_mode(
     };
     settle().await;
     report.cold_kb_per_conn = per_conn(&ProcSample::read(pid)?, base.rss_kb, report.opened);
-    let mut warmed = warm_all(conns, &small, expect_small, &mut report.errors).await?;
+    let mut warmed = warm_all(conns, &small, oracle, &mut report.errors).await?;
     settle().await;
     report.warm_kb_per_conn = per_conn(&ProcSample::read(pid)?, base.rss_kb, report.opened);
     if opts.idle_secs > 0 {
@@ -332,7 +338,7 @@ async fn run_mode(
         // memory an idle connection gave back is reused here even when the
         // allocator kept it from the OS (and so from the idle sample).
         let wave = open_all(addr, deflate, opts.connections, &mut report.errors).await?;
-        let wave = warm_all(wave, &small, expect_small, &mut report.errors).await?;
+        let wave = warm_all(wave, &small, oracle, &mut report.errors).await?;
         settle().await;
         report.second_wave_kb_per_conn =
             Some(per_conn(&ProcSample::read(pid)?, idle.rss_kb, wave.len()));
@@ -347,11 +353,12 @@ async fn run_mode(
 
     // Bursts on one connection.
     let burst = json!({"kinds": [1], "until": newest, "limit": opts.burst_events});
-    let expect_burst = opts.burst_events.min(kind1_events) as usize;
-    report.burst_events = expect_burst as u64;
+    let burst_limit = opts.burst_events as usize;
+    report.burst_events = burst_limit.min(oracle.created.len()) as u64;
     let mut conn = Conn::open(addr, deflate).await?;
     for i in 0..3 {
-        conn.fetch(&format!("bw{i}"), &burst).await?;
+        let events = conn.fetch(&format!("bw{i}"), &burst).await?;
+        oracle.check(&events, burst_limit, true)?;
     }
     let mut times = Vec::with_capacity(opts.bursts);
     let mut firsts = Vec::with_capacity(opts.bursts);
@@ -359,15 +366,14 @@ async fn run_mode(
     let before = ProcSample::read(pid)?;
     for i in 0..opts.bursts {
         let started = Instant::now();
-        let got = conn.fetch(&format!("b{i}"), &burst).await?;
+        let events = conn.fetch(&format!("b{i}"), &burst).await?;
         times.push(started.elapsed().as_secs_f64() * 1000.0);
         if let Some(first) = conn.first_event {
             firsts.push((first - started).as_secs_f64() * 1000.0);
         }
-        if got != expect_burst {
-            report
-                .errors
-                .push(format!("burst returned {got} of {expect_burst} events"));
+        // Checked in full, outside the timed exchange.
+        if let Err(e) = oracle.check(&events, burst_limit, true) {
+            report.errors.push(format!("burst: {e}"));
         }
     }
     let after = ProcSample::read(pid)?;
@@ -382,7 +388,7 @@ async fn run_mode(
     conn.close().await;
 
     fanout_phase(pid, addr, deflate, opts, fanout, &mut report).await?;
-    churn_phase(pid, addr, deflate, opts, &small, expect_small, &mut report).await?;
+    churn_phase(pid, addr, deflate, opts, &small, oracle, &mut report).await?;
     Ok(report)
 }
 
@@ -420,9 +426,10 @@ async fn open_all(
 async fn warm_all(
     conns: Vec<Conn>,
     filter: &Value,
-    expect: usize,
+    oracle: &Oracle,
     errors: &mut Vec<String>,
 ) -> Result<Vec<Conn>> {
+    let limit = filter["limit"].as_u64().unwrap_or_default() as usize;
     let mut warmed = Vec::with_capacity(conns.len());
     let mut pending = conns.into_iter();
     loop {
@@ -439,10 +446,8 @@ async fn warm_all(
         }
         while let Some(joined) = batch.join_next().await {
             let (conn, got) = joined?;
-            match got {
-                Ok(n) if n == expect => {}
-                Ok(n) => errors.push(format!("warm fetch returned {n} of {expect} events")),
-                Err(e) => errors.push(format!("warm fetch: {e}")),
+            if let Err(e) = got.and_then(|events| oracle.check(&events, limit, false)) {
+                errors.push(format!("warm fetch: {e}"));
             }
             warmed.push(conn);
         }
@@ -464,7 +469,8 @@ async fn fanout_phase(
     let mut subscribers = Vec::with_capacity(opts.fanout_subscribers);
     for _ in 0..opts.fanout_subscribers {
         let mut conn = Conn::open(addr, deflate).await?;
-        conn.subscribe("live", &live).await?;
+        let history = conn.subscribe("live", &live).await?;
+        anyhow::ensure!(history.is_empty(), "a limit 0 REQ returned history");
         subscribers.push(conn);
     }
     let expected = events.len();
@@ -472,15 +478,18 @@ async fn fanout_phase(
         .iter()
         .map(|event| event["id"].as_str().unwrap_or_default().to_owned())
         .collect();
+    let published: Arc<HashMap<String, Value>> =
+        Arc::new(ids.iter().cloned().zip(events.iter().cloned()).collect());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut readers = tokio::task::JoinSet::new();
     for mut conn in subscribers {
+        let published = published.clone();
         readers.spawn(async move {
             let before = conn.wire_in;
-            let mut got = 0usize;
-            while got < expected {
+            let mut bodies = Vec::with_capacity(expected);
+            while bodies.len() < expected {
                 match tokio::time::timeout_at(deadline, conn.next_text()).await {
-                    Ok(Ok(msg)) if msg.starts_with(b"[\"EVENT\",\"live\",") => got += 1,
+                    Ok(Ok(msg)) if msg.starts_with(b"[\"EVENT\",\"live\",") => bodies.push(msg),
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => return Err(e),
                     Err(_) => break,
@@ -488,7 +497,18 @@ async fn fanout_phase(
             }
             let wire = conn.wire_in - before;
             conn.close().await;
-            Ok((got, wire))
+            // Every publication exactly once, as published.
+            let mut seen = HashSet::with_capacity(expected);
+            for body in &bodies {
+                let event = event_of(body)?;
+                let id = event["id"].as_str().unwrap_or_default().to_owned();
+                let sent = published
+                    .get(&id)
+                    .with_context(|| format!("unexpected live event {id}"))?;
+                anyhow::ensure!(same_event(&event, sent), "live event {id} differs");
+                anyhow::ensure!(seen.insert(id.clone()), "live event {id} delivered twice");
+            }
+            Ok((bodies.len(), wire))
         });
     }
     // The publisher never negotiates deflate, so only subscribers differ.
@@ -497,13 +517,17 @@ async fn fanout_phase(
     let before = ProcSample::read(pid)?;
     for (event, id) in events.iter().zip(&ids) {
         publisher.send(&json!(["EVENT", event]).to_string()).await?;
-        let ok = loop {
-            let msg = publisher.next_text().await?;
-            let value: Value = serde_json::from_slice(&msg).unwrap_or(Value::Null);
-            if value[0] == "OK" && value[1] == id.as_str() {
-                break value[2] == true;
+        let ok = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+            loop {
+                let msg = publisher.next_text().await?;
+                let value: Value = serde_json::from_slice(&msg).unwrap_or(Value::Null);
+                if value[0] == "OK" && value[1] == id.as_str() {
+                    return Ok::<_, anyhow::Error>(value[2] == true);
+                }
             }
-        };
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("no OK for fan-out publication {id}"))??;
         if !ok {
             report
                 .errors
@@ -543,7 +567,7 @@ async fn churn_phase(
     deflate: bool,
     opts: &TransportOptions,
     filter: &Value,
-    expect: usize,
+    oracle: &Arc<Oracle>,
     report: &mut ModeReport,
 ) -> Result<()> {
     if opts.churn_connections == 0 {
@@ -557,16 +581,17 @@ async fn churn_phase(
     for _ in 0..CHURN_WORKERS {
         let next = next.clone();
         let filter = filter.clone();
+        let oracle = oracle.clone();
+        let limit = filter["limit"].as_u64().unwrap_or_default() as usize;
         workers.spawn(async move {
             let mut errors = Vec::new();
             let mut cycles = 0u64;
             while next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < total {
                 let cycle = async {
                     let mut conn = Conn::open(addr, deflate).await?;
-                    let got = conn.fetch("c", &filter).await?;
+                    let events = conn.fetch("c", &filter).await?;
                     conn.close().await;
-                    anyhow::ensure!(got == expect, "churn fetch returned {got} of {expect}");
-                    Ok(())
+                    oracle.check(&events, limit, false)
                 };
                 match cycle.await {
                     Ok(()) => cycles += 1,
@@ -671,28 +696,35 @@ impl Conn {
         }
     }
 
-    /// REQ, then count this subscription's EVENTs until its EOSE.
-    async fn subscribe(&mut self, sid: &str, filter: &Value) -> Result<usize> {
+    /// REQ, then this subscription's EVENT messages until its EOSE.
+    async fn subscribe(&mut self, sid: &str, filter: &Value) -> Result<Vec<Vec<u8>>> {
         self.send(&json!(["REQ", sid, filter]).to_string()).await?;
         let event_prefix = format!("[\"EVENT\",\"{sid}\",");
         let eose = format!("[\"EOSE\",\"{sid}\"]");
-        let mut events = 0;
+        let mut events = Vec::new();
         self.first_event = None;
-        loop {
-            let msg = self.next_text().await?;
-            if msg.starts_with(event_prefix.as_bytes()) {
-                self.first_event.get_or_insert_with(Instant::now);
-                events += 1;
-            } else if msg == eose.as_bytes() {
-                return Ok(events);
-            } else if msg.starts_with(b"[\"CLOSED\"") || msg.starts_with(b"[\"NOTICE\"") {
-                anyhow::bail!("{}", String::from_utf8_lossy(&msg));
+        // One deadline for the whole exchange: pings would keep resetting a
+        // per-read timeout.
+        tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+            loop {
+                let msg = self.next_text().await?;
+                if msg.starts_with(event_prefix.as_bytes()) {
+                    self.first_event.get_or_insert_with(Instant::now);
+                    events.push(msg);
+                } else if msg == eose.as_bytes() {
+                    return Ok(());
+                } else if msg.starts_with(b"[\"CLOSED\"") || msg.starts_with(b"[\"NOTICE\"") {
+                    anyhow::bail!("{}", String::from_utf8_lossy(&msg));
+                }
             }
-        }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("no EOSE for {sid} within {EXCHANGE_TIMEOUT:?}"))??;
+        Ok(events)
     }
 
     /// REQ → EOSE → CLOSE.
-    async fn fetch(&mut self, sid: &str, filter: &Value) -> Result<usize> {
+    async fn fetch(&mut self, sid: &str, filter: &Value) -> Result<Vec<Vec<u8>>> {
         let events = self.subscribe(sid, filter).await?;
         self.send(&json!(["CLOSE", sid]).to_string()).await?;
         Ok(events)
@@ -703,6 +735,109 @@ impl Conn {
         let _ = self.stream.write_all(&frame).await;
         let _ = self.stream.shutdown().await;
     }
+}
+
+/// The corpus's kind-1 events: what every history fetch must return.
+struct Oracle {
+    events: HashMap<String, Value>,
+    /// Every event's `created_at`, newest first.
+    created: Vec<u64>,
+}
+
+impl Oracle {
+    fn new(kind1: Vec<Value>) -> Self {
+        let mut created: Vec<u64> = kind1
+            .iter()
+            .filter_map(|event| event["created_at"].as_u64())
+            .collect();
+        created.sort_unstable_by(|a, b| b.cmp(a));
+        let events = kind1
+            .into_iter()
+            .filter_map(|event| Some((event["id"].as_str()?.to_owned(), event)))
+            .collect();
+        Self { events, created }
+    }
+
+    /// Check one `{"kinds":[1],"until":newest,"limit":limit}` result: as many
+    /// distinct corpus events as the limit allows, every one strictly newer
+    /// than the oldest it may hold, and none older (events sharing that
+    /// timestamp may go either way). `full` also compares each event with the
+    /// corpus; otherwise only its id is read, which keeps the client cheap
+    /// while it churns connections.
+    fn check(&self, events: &[Vec<u8>], limit: usize, full: bool) -> Result<()> {
+        let want = limit.min(self.created.len());
+        anyhow::ensure!(
+            events.len() == want,
+            "fetch returned {} of {want} events",
+            events.len()
+        );
+        let Some(&cut) = want.checked_sub(1).and_then(|last| self.created.get(last)) else {
+            return Ok(());
+        };
+        let mut seen = HashSet::with_capacity(want);
+        let mut newer = 0;
+        for body in events {
+            let (id, event) = if full {
+                let event = event_of(body)?;
+                (
+                    event["id"].as_str().unwrap_or_default().to_owned(),
+                    Some(event),
+                )
+            } else {
+                let id = event_id(body).context("EVENT without an id")?;
+                (id.to_owned(), None)
+            };
+            let stored = self
+                .events
+                .get(&id)
+                .with_context(|| format!("unexpected event {id}"))?;
+            if let Some(event) = event {
+                anyhow::ensure!(
+                    same_event(&event, stored),
+                    "event {id} differs from the corpus"
+                );
+            }
+            let created = stored["created_at"].as_u64().unwrap_or_default();
+            anyhow::ensure!(created >= cut, "event {id} is older than the newest {want}");
+            newer += usize::from(created > cut);
+            anyhow::ensure!(seen.insert(id.clone()), "event {id} returned twice");
+        }
+        let expected_newer = self.created.iter().take_while(|&&c| c > cut).count();
+        anyhow::ensure!(
+            newer == expected_newer,
+            "fetch skipped {} newer events",
+            expected_newer - newer.min(expected_newer)
+        );
+        Ok(())
+    }
+}
+
+/// The event of an `["EVENT", sid, event]` message.
+fn event_of(body: &[u8]) -> Result<Value> {
+    let mut message: Value = serde_json::from_slice(body).context("EVENT is not JSON")?;
+    Ok(message[2].take())
+}
+
+/// The id in an `["EVENT", sid, event]` message, found without parsing it:
+/// `"id":"` can only be a key, as quotes inside strings are escaped.
+fn event_id(body: &[u8]) -> Option<&str> {
+    let at = body.windows(6).position(|w| w == b"\"id\":\"")? + 6;
+    std::str::from_utf8(body.get(at..at + 64)?).ok()
+}
+
+/// Same NIP-01 fields.
+fn same_event(a: &Value, b: &Value) -> bool {
+    [
+        "id",
+        "pubkey",
+        "created_at",
+        "kind",
+        "tags",
+        "content",
+        "sig",
+    ]
+    .iter()
+    .all(|field| a[field] == b[field])
 }
 
 /// Relay process counters read from outside the process.

@@ -2599,22 +2599,43 @@ fn transport_trial(
         .filter_map(|event| event["created_at"].as_u64())
         .max()
         .unwrap_or_default();
-    let kind1_events = corpus.iter().filter(|event| event["kind"] == 1).count() as u64;
-    // Generated events take the seconds just before the base timestamp.
-    let count = args.fanout_events * 2;
-    let fanout = generate_values(EventWorkload {
-        count,
-        seed: args.seed ^ 0x7472_616e_7370_6f72,
-        base_timestamp: unix_timestamp()?.max(newest + count + 1),
-        mix: EventMix::Kind1,
-    })?;
+    let kind1: Vec<Value> = corpus
+        .into_iter()
+        .filter(|event| event["kind"] == 1)
+        .collect();
+    // Every fan-out note takes one second after the corpus (or now), so no
+    // history fetch returns them, however many there are, and the relay's
+    // created_at window still accepts them.
+    let now = unix_timestamp()?;
+    let fanout_at = now.max(newest + 1);
+    let window = wok_relay::Config::default().events.reject_newer_than_secs;
+    anyhow::ensure!(
+        window == 0 || fanout_at < now + window,
+        "the corpus is dated too far in the future for live publications"
+    );
+    let key = {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed ^ 0x7472_616e_7370_6f72);
+        secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rng)
+    };
+    let fanout = (0..args.fanout_events * 2)
+        .map(|n| {
+            clients::signed(
+                &key,
+                fanout_at,
+                1,
+                Vec::new(),
+                format!("ws_transport fan-out note {n}"),
+            )
+        })
+        .collect();
     let report = transport::run(
         rt,
         transport::RunInput {
             bin,
             dbdir,
             corpus: corpus_path,
-            kind1_events,
+            kind1,
             newest,
             fanout,
             opts,

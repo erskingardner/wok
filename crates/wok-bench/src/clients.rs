@@ -133,7 +133,13 @@ fn pubkey_hex(keys: &Keypair) -> String {
     hex::encode(keys.x_only_public_key().0.serialize())
 }
 
-fn signed(keys: &Keypair, created_at: u64, kind: u64, tags: Vec<Value>, content: String) -> Value {
+pub(crate) fn signed(
+    keys: &Keypair,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Value>,
+    content: String,
+) -> Value {
     let mut event = json!({
         "created_at": created_at,
         "kind": kind,

@@ -153,6 +153,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EOSE stays newest-first. Before, stored events committed during the scan came
   before EOSE, as in strfry. A client that sends CLOSE at EOSE no longer gets
   them.
+- The req monitor's live-subscription index is cheaper under churn. CLOSE,
+  REQ replacement and disconnects now take time in proportion to the
+  subscription's own filter keys. Before, they scanned every subscription that
+  shared those keys, so a 500-author feed over popular authors was slow to
+  remove and reconnect storms grew quadratically. Matching an event no longer
+  allocates per tag or per candidate, and it skips filters that cannot take
+  the event's kind.
 
 ### Removed
 

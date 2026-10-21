@@ -121,12 +121,13 @@ history as well as live ones; a REQ reusing an open id always fits.
      disconnects take no query time. Each new REQ or COUNT gets its first
      time slice (`relay.query_timeslice_budget_us`) as it is taken, so a
      small one is answered before the messages behind it.
-   - The pass ends with one slice for the running query that has waited
-     longest. When more messages are already waiting, they go first, until
-     the work done since the running queries' last slice has taken as long as
-     that slice did. So the running queries keep about half the worker
-     however many REQs come, and a REQ queued during a pass does not wait for
-     another slice of them.
+   - The running query that has waited longest gets a slice ahead of the
+     next new query once the new queries' first slices since its last slice
+     have taken as long as that slice did, and at the end of a pass when no
+     more messages are waiting. So new queries go first, a REQ queued during
+     a pass does not wait for another slice of a long scan, and however many
+     REQs come, small or costly, the running queries keep about half the
+     worker.
 4. **Going live, on the req monitor.** For the current generation only, the
    monitor sends EOSE, then the held matches in arrival order, then delivers
    live. NIP-01 defines EOSE as the boundary to "events newly received in

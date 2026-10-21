@@ -3206,11 +3206,7 @@ mod trace {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    /// Marks the end of a pass in a log.
-    pub(super) const PASS_END: &str = "|";
-
-    /// The sub id of each query given a slice and how long the slice took,
-    /// with `PASS_END` after each pass.
+    /// The sub id of each query given a slice, and how long the slice took.
     type Log = Vec<(String, Duration)>;
 
     /// Per traced database.
@@ -3222,21 +3218,11 @@ mod trace {
         logs.push((path.to_path_buf(), Vec::new()));
     }
 
-    fn push(path: &Path, entry: String, took: Duration) {
-        let mut logs = LOGS.lock().unwrap();
-        if let Some((_, log)) = logs.iter_mut().find(|(p, _)| p == path) {
-            log.push((entry, took));
-        }
-    }
-
     pub(super) fn slice(path: &Path, sub_id: Option<String>, took: Duration) {
-        if let Some(sub_id) = sub_id {
-            push(path, sub_id, took);
+        let mut logs = LOGS.lock().unwrap();
+        if let (Some((_, log)), Some(sub_id)) = (logs.iter_mut().find(|(p, _)| p == path), sub_id) {
+            log.push((sub_id, took));
         }
-    }
-
-    pub(super) fn pass_end(path: &Path) {
-        push(path, PASS_END.to_string(), Duration::ZERO);
     }
 
     pub(super) fn log(path: &Path) -> Log {
@@ -3249,24 +3235,20 @@ mod trace {
 
     /// The sub ids given slices, in order.
     pub(super) fn slices(path: &Path) -> Vec<String> {
-        log(path)
-            .into_iter()
-            .map(|(entry, _)| entry)
-            .filter(|entry| entry != PASS_END)
-            .collect()
+        log(path).into_iter().map(|(sub_id, _)| sub_id).collect()
     }
 }
 
-/// Most messages a req worker takes from its queue in one pass. A REQ or COUNT
-/// gets its first time slice as soon as the pass takes it, so this bounds how
-/// long a pass runs before the queries already running get their turn.
+/// Most messages a req worker takes from its queue in one pass, which bounds
+/// how long its read transaction stays open.
 const REQ_PASS_MAX: usize = 64;
 
 /// How a req worker splits its time between the queries already running and
-/// the messages waiting for it. The running queries get the end of a pass when
-/// nothing is waiting, or once the work done since their last slice has taken
-/// as long as that slice did. So messages that are waiting go first, and
-/// however busy the queue, the running queries keep about half the worker.
+/// the new REQs and COUNTs waiting for it. The running queries get a slice
+/// when nothing is waiting, or once the new queries' first slices since their
+/// last slice have taken as long as that slice did. It is checked before each
+/// first slice and at the end of each pass, so new queries go first, and
+/// however many keep coming, the running queries keep about half the worker.
 struct RunningShare {
     /// When the running queries' last slice ended, or they started waiting.
     since: std::time::Instant,
@@ -3290,6 +3272,13 @@ impl RunningShare {
         self.took = ended.saturating_duration_since(started);
         self.since = ended;
     }
+
+    /// Give the running queries their slice, timing it.
+    fn slice(&mut self, slice: impl FnOnce()) {
+        let started = std::time::Instant::now();
+        slice();
+        self.ran(started, std::time::Instant::now());
+    }
 }
 
 /// A req worker pass takes every message already queued (up to `REQ_PASS_MAX`)
@@ -3298,9 +3287,9 @@ impl RunningShare {
 /// its first slice at once, so a small one is answered within the pass, before
 /// the messages behind it. strfry's ReqWorker drains its inbox the same way.
 ///
-/// Then the running query that has waited longest gets a slice, unless more
-/// messages are already waiting and have not yet had their share (see
-/// `RunningShare`).
+/// The running query that has waited longest gets a slice ahead of a new
+/// query whenever its share is due, and at the end of the pass unless more
+/// messages are waiting and it is not (see `RunningShare`).
 fn run_req_worker(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -3371,21 +3360,44 @@ fn run_req_worker(
                         sub.count_only,
                     );
                     let reason = match &txn {
-                        Some(txn) => match queries.add_sub(txn, sub) {
-                            Ok(true) => {
-                                // The new query is first in the run queue.
+                        Some(txn) => {
+                            if queries.has_running() && share.due(true, std::time::Instant::now()) {
                                 let cfg_snap = cfg.read();
-                                worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp);
-                                None
+                                share.slice(|| {
+                                    worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp)
+                                });
                             }
-                            Ok(false) => {
-                                metrics
-                                    .abuse_query_concurrency_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
-                                Some("rate-limited: too many concurrent historical queries")
+                            // With nothing running, this slice starts the share.
+                            let idle = !queries.has_running();
+                            match queries.add_sub(txn, sub) {
+                                Ok(true) => {
+                                    // The new query is first in the run queue.
+                                    let cfg_snap = cfg.read();
+                                    let mut first = || {
+                                        worker.slice(
+                                            &mut queries,
+                                            txn,
+                                            &cfg_snap,
+                                            &authed,
+                                            &mut decomp,
+                                        )
+                                    };
+                                    if idle {
+                                        share.slice(first);
+                                    } else {
+                                        first();
+                                    }
+                                    None
+                                }
+                                Ok(false) => {
+                                    metrics
+                                        .abuse_query_concurrency_rejections
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    Some("rate-limited: too many concurrent historical queries")
+                                }
+                                Err(_) => Some("error: history scan could not start"),
                             }
-                            Err(_) => Some("error: history scan could not start"),
-                        },
+                        }
                         None => {
                             // The query this one replaces ends with it, as
                             // `add_sub` would have ended it.
@@ -3421,14 +3433,11 @@ fn run_req_worker(
             }
         }
         if let Some(txn) = &txn {
-            let now = std::time::Instant::now();
-            if open && queries.has_running() && share.due(!rx.is_empty(), now) {
+            let waiting = !rx.is_empty();
+            if open && queries.has_running() && share.due(waiting, std::time::Instant::now()) {
                 let cfg_snap = cfg.read();
-                worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp);
-                share.ran(now, std::time::Instant::now());
+                share.slice(|| worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp));
             }
-            #[cfg(test)]
-            trace::pass_end(env.path());
         }
     }
 }
@@ -6617,67 +6626,96 @@ mod tests {
     }
 
     /// New REQs are started in the order they came, and however many keep
-    /// coming, a running scan gets its share: work that ran between two of its
-    /// slices, before the last pass in between, took less than its previous
-    /// slice did.
+    /// coming, small or costly, the running queries keep their share of the
+    /// worker: between two of their slices, the new queries' first slices
+    /// before the last one took less than the earlier of the two.
     #[test]
-    fn a_stream_of_new_queries_cannot_starve_a_running_scan() {
-        let (dir, env, snapshot) = long_history();
-        let conns = Arc::new(ConnTable::new());
-        let (out_tx, _outbound) = tokio::sync::mpsc::unbounded_channel();
-        conns.insert(1, Outbound::new(out_tx, 0));
-        // More small queries than one slice of the scan takes.
-        let small = 20 * REQ_PASS_MAX;
-        let (req_tx, req_rx) = bounded(small + 1);
-        let (mon_tx, mon_rx) = unbounded();
-        let all = json!({"kinds": [1], "limit": 50_000});
-        req_tx
-            .send(ReqMsg::Scan(queued_sub("long", all, 1, false, snapshot)))
-            .unwrap();
-        let newest = json!({"kinds": [1], "limit": 1});
-        let ids: Vec<String> = (0..small).map(|i| format!("s{i}")).collect();
-        for (i, id) in ids.iter().enumerate() {
-            let sub = queued_sub(id, newest.clone(), 2 + i as u64, false, snapshot);
-            req_tx.send(ReqMsg::Scan(sub)).unwrap();
-        }
-        let worker = traced_worker(&env, slow_scan_config(dir.path()), &conns, req_rx, mon_tx);
-
-        let mut done: Vec<String> = (0..=small).map(|_| history_done_for(&mon_rx)).collect();
-        let long_done = done.iter().position(|id| id == "long").unwrap();
-        done.remove(long_done);
-        assert_eq!(done, ids);
-        let slices = trace::slices(env.path());
-        let started: Vec<&String> = slices.iter().filter(|id| *id != "long").collect();
-        assert_eq!(started, ids.iter().collect::<Vec<_>>());
-        let last_small = slices.iter().rposition(|id| id != "long").unwrap();
-        assert!(
-            slices[1..last_small].iter().any(|id| id == "long"),
-            "the scan waited for every new query"
-        );
-
-        // Between two of the long scan's slices, every pass but the last
-        // ended without one: what ran until then had not had its share yet.
-        let log = trace::log(env.path());
-        let mut previous: Option<Duration> = None;
-        let (mut others, mut owed) = (Duration::ZERO, Duration::ZERO);
-        for (entry, took) in &log {
-            if entry == "long" {
-                if let Some(previous) = previous {
-                    assert!(
-                        owed.is_zero() || owed < previous,
-                        "{owed:?} of other work ran before a {previous:?} slice came round"
-                    );
-                }
-                previous = Some(*took);
-                (others, owed) = (Duration::ZERO, Duration::ZERO);
-            } else if entry == trace::PASS_END {
-                owed = others;
-            } else {
-                others += *took;
+    fn a_stream_of_new_queries_cannot_starve_running_ones() {
+        // More small queries than one slice of the scan takes, then queries
+        // whose first slices each cost as much as one of its slices.
+        for (arrivals, filter) in [
+            (20 * REQ_PASS_MAX, json!({"kinds": [1], "limit": 1})),
+            (2 * REQ_PASS_MAX, json!({"kinds": [1], "limit": 5_000})),
+        ] {
+            let (dir, env, snapshot) = long_history();
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, _outbound) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let (req_tx, req_rx) = bounded(arrivals + 1);
+            let (mon_tx, mon_rx) = unbounded();
+            let all = json!({"kinds": [1], "limit": 50_000});
+            req_tx
+                .send(ReqMsg::Scan(queued_sub("long", all, 1, false, snapshot)))
+                .unwrap();
+            let ids: Vec<String> = (0..arrivals).map(|i| format!("s{i}")).collect();
+            for (i, id) in ids.iter().enumerate() {
+                let sub = queued_sub(id, filter.clone(), 2 + i as u64, false, snapshot);
+                req_tx.send(ReqMsg::Scan(sub)).unwrap();
             }
+            let mut cfg = slow_scan_config(dir.path());
+            cfg.relay.abuse.max_concurrent_historical_queries = arrivals + 1;
+            let worker = traced_worker(&env, cfg, &conns, req_rx, mon_tx);
+            for _ in 0..=arrivals {
+                history_done_for(&mon_rx);
+            }
+            drop(req_tx);
+            worker.join().unwrap();
+
+            let log = trace::log(env.path());
+            let mut first_seen = HashSet::new();
+            let starts: Vec<&String> = log
+                .iter()
+                .map(|(id, _)| id)
+                .filter(|id| first_seen.insert(*id))
+                .collect();
+            assert_eq!(starts[0], "long");
+            assert_eq!(&starts[1..], ids.iter().collect::<Vec<_>>());
+            // A query runs from its first slice to its last one.
+            let last: HashMap<&String, usize> = log
+                .iter()
+                .enumerate()
+                .map(|(at, (id, _))| (id, at))
+                .collect();
+            let mut started = HashSet::new();
+            let mut previous: Option<Duration> = None;
+            let mut first_slices: Vec<Duration> = Vec::new();
+            let mut running_slices = 0;
+            for (at, (id, took)) in log.iter().enumerate() {
+                if started.insert(id) {
+                    first_slices.push(*took);
+                } else {
+                    running_slices += 1;
+                    if let Some(previous) = previous {
+                        let owed: Duration = first_slices.iter().rev().skip(1).copied().sum();
+                        assert!(
+                            owed.is_zero() || owed < previous,
+                            "{owed:?} of new queries ran before running ones, \
+                             whose last slice took {previous:?}"
+                        );
+                    }
+                    previous = Some(*took);
+                    first_slices.clear();
+                }
+                // Nothing left running: no share is owed until something is.
+                if !started.iter().any(|id| last[*id] > at) {
+                    previous = None;
+                    first_slices.clear();
+                }
+            }
+            let last_start = log
+                .iter()
+                .rposition(|(id, _)| *id == ids[arrivals - 1])
+                .unwrap();
+            assert!(
+                log[..last_start]
+                    .iter()
+                    .filter(|(id, _)| *id == "long")
+                    .count()
+                    > 1,
+                "the scan waited for every new query"
+            );
+            assert!(running_slices > 2, "{running_slices} running slices");
         }
-        drop(req_tx);
-        worker.join().unwrap();
     }
 
     /// Running queries get the end of a pass when nothing is waiting, or

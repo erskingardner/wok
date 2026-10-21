@@ -61,10 +61,12 @@ impl QueryScheduler {
         txn: &RoTxn<'_>,
         mut sub: Subscription,
     ) -> Result<bool, wok_db::DbError> {
+        // Replace first: a query that fails to start still ends the one with
+        // its id, rather than leaving it running after the refusal.
+        self.remove_query(sub.conn_id, &sub.sub_id, sub.count_only);
         if sub.latest_event_id == u64::MAX {
             sub.latest_event_id = most_recent_levid_ro(txn)?;
         }
-        self.remove_query(sub.conn_id, &sub.sub_id, sub.count_only);
         let conn = self.conns.entry(sub.conn_id).or_default();
         if conn.len() >= self.max_subs_per_connection {
             return Ok(false);
@@ -92,7 +94,8 @@ impl QueryScheduler {
         self.remove_query(conn_id, sub_id, false);
     }
 
-    fn remove_query(&mut self, conn_id: u64, sub_id: &SubId, count_only: bool) {
+    /// Drop the REQ (`count_only` false) or COUNT query with this id.
+    pub fn remove_query(&mut self, conn_id: u64, sub_id: &SubId, count_only: bool) {
         if let Some(map) = self.conns.get_mut(&conn_id) {
             if let Some(idx) = map.remove(&(sub_id.clone(), count_only)) {
                 if self.queries[idx].take().is_some() {

@@ -2903,21 +2903,35 @@ mod fault {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    static READS: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+    /// Per database: reads to let through, then reads to fail.
+    static READS: Mutex<Vec<(PathBuf, usize, usize)>> = Mutex::new(Vec::new());
 
     /// Fail the next `count` reads from the database at `path`.
     pub(super) fn fail_reads(path: &Path, count: usize) {
+        fail_reads_after(path, 0, count);
+    }
+
+    /// Let `skip` reads from the database at `path` through, then fail
+    /// `count`.
+    pub(super) fn fail_reads_after(path: &Path, skip: usize, count: usize) {
         let mut reads = READS.lock().unwrap();
-        reads.retain(|(p, _)| p != path);
-        reads.push((path.to_path_buf(), count));
+        reads.retain(|(p, ..)| p != path);
+        reads.push((path.to_path_buf(), skip, count));
     }
 
     pub(super) fn read_fails(path: &Path) -> bool {
         let mut reads = READS.lock().unwrap();
-        let Some(slot) = reads.iter_mut().find(|(p, n)| p == path && *n != 0) else {
+        let Some((_, skip, count)) = reads.iter_mut().find(|(p, ..)| p == path) else {
             return false;
         };
-        slot.1 -= 1;
+        if *skip != 0 {
+            *skip -= 1;
+            return false;
+        }
+        if *count == 0 {
+            return false;
+        }
+        *count -= 1;
         true
     }
 }
@@ -2980,15 +2994,23 @@ fn run_req_worker(
                         sub.generation,
                         sub.count_only,
                     );
-                    let reason = match txn.as_ref().map(|txn| queries.add_sub(txn, sub)) {
-                        Some(Ok(true)) => None,
-                        Some(Ok(false)) => {
-                            metrics
-                                .abuse_query_concurrency_rejections
-                                .fetch_add(1, Ordering::Relaxed);
-                            Some("rate-limited: too many concurrent historical queries")
+                    let reason = match &txn {
+                        Some(txn) => match queries.add_sub(txn, sub) {
+                            Ok(true) => None,
+                            Ok(false) => {
+                                metrics
+                                    .abuse_query_concurrency_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
+                                Some("rate-limited: too many concurrent historical queries")
+                            }
+                            Err(_) => Some("error: history scan could not start"),
+                        },
+                        None => {
+                            // The query this one replaces ends with it, as
+                            // `add_sub` would have ended it.
+                            queries.remove_query(conn, &sub_id, count_only);
+                            Some("error: history scan could not start")
                         }
-                        Some(Err(_)) | None => Some("error: history scan could not start"),
                     };
                     if let Some(reason) = reason {
                         if count_only {
@@ -3272,6 +3294,11 @@ fn run_req_monitor(
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     // Newest local event id already matched against every subscription.
     let mut curr_event_id = u64::MAX;
+    // Newest REQ registered for each id, kept after its subscription is
+    // removed until a teardown at least as new is confirmed: a delayed
+    // refusal of an older REQ must not send CLOSED while a newer one's
+    // history scan may still be running.
+    let mut newest: HashMap<u64, HashMap<SubId, u64>> = HashMap::new();
     let mut decomp = Decompressor::new();
     let mut control = Vec::new();
     let mut data = Vec::new();
@@ -3337,6 +3364,12 @@ fn run_req_monitor(
                     // held until then.
                     let live_from = curr_event_id.max(sub.latest_event_id);
                     sub.latest_event_id = live_from;
+                    let generation = newest
+                        .entry(sub.conn_id)
+                        .or_default()
+                        .entry(sub.sub_id.clone())
+                        .or_default();
+                    *generation = (*generation).max(sub.generation);
                     let buffer =
                         PendingBuffer::new(live_from, cfg_snap.relay.max_live_buffer_bytes);
                     monitors.add_pending(sub, buffer);
@@ -3430,11 +3463,19 @@ fn run_req_monitor(
                     generation,
                     reason,
                 } => {
-                    // A later REQ that reused the id stays, and gets no CLOSED.
-                    let replaced = monitors
-                        .subscription(conn_id, &sub_id)
-                        .is_some_and(|sub| sub.generation > generation);
+                    // A later REQ that reused the id stays, and gets no CLOSED,
+                    // even if it has itself been removed since.
+                    let replaced = newest
+                        .get(&conn_id)
+                        .and_then(|ids| ids.get(&sub_id))
+                        .is_some_and(|&g| g > generation);
                     if !replaced {
+                        if let Some(ids) = newest.get_mut(&conn_id) {
+                            ids.remove(&sub_id);
+                            if ids.is_empty() {
+                                newest.remove(&conn_id);
+                            }
+                        }
                         monitors.remove_sub(conn_id, &sub_id);
                         if let Some(reason) = reason {
                             conns.send(
@@ -3462,6 +3503,7 @@ fn run_req_monitor(
                 }
                 MonitorMsg::Close { conn_id } => {
                     authed.remove(&conn_id);
+                    newest.remove(&conn_id);
                     monitors.close_conn(conn_id);
                 }
                 MonitorMsg::DbChange => {
@@ -5450,6 +5492,38 @@ mod tests {
         assert_eq!(h.history_done(2, 0), [eose_frame()]);
     }
 
+    /// A refusal of an older REQ that reaches the monitor late sends no
+    /// CLOSED once a newer REQ took the id, even when that newer one has been
+    /// removed since: its history scan may still be running. Only the
+    /// teardown of the newest REQ sends CLOSED.
+    #[test]
+    fn monitor_ignores_a_late_refusal_after_a_newer_req() {
+        let mut h = MonitorHarness::start(0);
+        let filter = json!({"kinds": [1]});
+        let remove = || MonitorMsg::Remove {
+            conn_id: 1,
+            sub_id: SubId::new("x").unwrap(),
+        };
+        let closed = |generation| MonitorMsg::Closed {
+            conn_id: 1,
+            sub_id: SubId::new("x").unwrap(),
+            generation,
+            reason: Some("error: bad req".into()),
+        };
+        h.register(1, filter.clone(), 0);
+        assert_eq!(h.history_done(1, 0), [eose_frame()]);
+        // REQ 2 refused, REQ 3 accepted, then refusal 4; the req worker has
+        // not yet passed on the teardown of 2.
+        h.send(remove());
+        h.register(3, filter, 0);
+        h.send(remove());
+        assert!(h.apply(closed(2)).is_empty(), "REQ 3 may still be scanning");
+        assert_eq!(
+            h.apply(closed(4)),
+            [("CLOSED".into(), "x".into(), "error: bad req".into())]
+        );
+    }
+
     /// A monitor that cannot open a read transaction keeps the subscription
     /// changes and database change it was handed, which nobody resends, and
     /// applies them once reads work again.
@@ -5543,6 +5617,124 @@ mod tests {
         assert!(closed.starts_with(r#"["CLOSED","x","error: "#), "{closed}");
         drop(req_tx);
         worker.join().unwrap();
+    }
+
+    /// When a req worker cannot open a read for a REQ or COUNT that replaces
+    /// one it is still running, the old query ends with the refusal: nothing
+    /// for the id follows its CLOSED.
+    #[test]
+    fn a_replacement_refused_on_a_failed_read_ends_the_old_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        // Enough history that the first query spans many time slices.
+        let mut events: Vec<EventToWrite> = (0..20_000u64)
+            .map(|i| {
+                let mut id = [0xBBu8; 32];
+                id[..8].copy_from_slice(&i.to_be_bytes());
+                let event = json!({
+                    "id": hex::encode(id), "pubkey": "11".repeat(32),
+                    "created_at": 1_700_000_000 + i, "kind": 1, "tags": [],
+                    "content": "history", "sig": "00".repeat(64),
+                });
+                let parsed = wok_event::parse_and_verify_event(
+                    &event,
+                    &wok_event::EventLimits::default(),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+                EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let snapshot = most_recent_levid_ro(&env.begin_ro().unwrap()).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        cfg.relay.query_timeslice_budget_us = 1;
+        cfg.relay.max_filter_limit = 50_000;
+        cfg.relay.max_total_events_per_req = 0;
+        let sub = |generation, count_only| {
+            let group = NostrFilterGroup::from_value(
+                &json!({"kinds": [1], "limit": 50_000}),
+                50_000,
+                3,
+                16,
+            )
+            .unwrap();
+            let mut sub = Subscription::new(1, SubId::new("x").unwrap(), group, count_only);
+            sub.generation = generation;
+            if !count_only {
+                sub.latest_event_id = snapshot;
+            }
+            sub
+        };
+
+        for (first, replacement) in [
+            (ReqMsg::Scan(sub(1, false)), ReqMsg::Scan(sub(2, false))),
+            (ReqMsg::Count(sub(1, true)), ReqMsg::Count(sub(2, true))),
+        ] {
+            let count = matches!(first, ReqMsg::Count(_));
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let (req_tx, req_rx) = bounded(8);
+            let (mon_tx, mon_rx) = bounded(8);
+            // Both are queued before the worker starts: the first pass reads
+            // and starts the first query, the second pass cannot read.
+            req_tx.send(first).unwrap();
+            req_tx.send(replacement).unwrap();
+            fault::fail_reads_after(env.path(), 1, 1);
+            let worker = {
+                let env = env.clone();
+                let cfg = Arc::new(parking_lot::RwLock::new(cfg.clone()));
+                let metrics = Arc::new(Metrics::default());
+                thread::spawn(move || {
+                    run_req_worker(env, cfg, conns, metrics, req_rx, vec![mon_tx])
+                })
+            };
+            let recv_frame =
+                |outbound: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>| {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    loop {
+                        if let Ok(frame) = outbound.try_recv() {
+                            break frame.into_text();
+                        }
+                        assert!(std::time::Instant::now() < deadline, "no frame");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                };
+            if count {
+                // A COUNT's CLOSED goes straight out; the old COUNT sends
+                // nothing before it finishes.
+                let closed = recv_frame(&mut outbound);
+                assert!(closed.starts_with(r#"["CLOSED","x","error: "#), "{closed}");
+            } else {
+                match mon_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    MonitorMsg::Closed {
+                        generation: 2,
+                        reason: Some(_),
+                        ..
+                    } => {}
+                    _ => panic!("expected the replacement to be closed"),
+                }
+                // Everything the first query sent precedes that refusal.
+                while outbound.try_recv().is_ok() {}
+            }
+            thread::sleep(Duration::from_millis(300));
+            assert!(
+                outbound.try_recv().is_err(),
+                "the replaced query kept sending after CLOSED"
+            );
+            assert!(mon_rx.try_recv().is_err(), "the replaced query finished");
+            drop(req_tx);
+            worker.join().unwrap();
+        }
     }
 
     /// A refusal's CLOSED ends only the generation it was for: a later REQ

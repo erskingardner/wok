@@ -5000,11 +5000,15 @@ mod tests {
         handle.request_shutdown();
     }
 
-    /// A relay with default limits over `count` stored notes of each
-    /// `(kind, count)`, written straight to the database.
-    fn relay_with_notes(kinds: &[(u64, u64)]) -> (tempfile::TempDir, RelayHandle) {
+    /// A relay with default limits over `count` stored notes by `author`
+    /// of each `(kind, count)`, written straight to the database.
+    fn relay_with_notes(author: &str, kinds: &[(u64, u64)]) -> (tempfile::TempDir, RelayHandle) {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        let options = EnvOptions {
+            map_size: 1 << 30,
+            ..EnvOptions::default()
+        };
+        let env = Env::open(dir.path(), options).unwrap();
         env.ensure_initialized().unwrap();
         let mut events: Vec<EventToWrite> = kinds
             .iter()
@@ -5014,7 +5018,7 @@ mod tests {
                 id[..8].copy_from_slice(&kind.to_be_bytes());
                 id[8..16].copy_from_slice(&i.to_be_bytes());
                 let event = json!({
-                    "id": hex::encode(id), "pubkey": "11".repeat(32),
+                    "id": hex::encode(id), "pubkey": author,
                     "created_at": 1_700_000_000 + i, "kind": kind, "tags": [],
                     "content": "note", "sig": "00".repeat(64),
                 });
@@ -5063,8 +5067,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn default_limits_return_directory_batches_and_merged_reqs_whole() {
-        let (_dir, handle) =
-            relay_with_notes(&[(1, 2_100), (6, 500), (7, 500), (16, 500), (1111, 500)]);
+        let (_dir, handle) = relay_with_notes(
+            &"11".repeat(32),
+            &[(1, 2_100), (6, 500), (7, 500), (16, 500), (1111, 500)],
+        );
         let (conn, mut rx) = live_conn(&handle).await;
         // MDK's directory batch: 200 authors x 6 kinds. The 500 clamp cut it.
         let batch = json!(["REQ", "dir", {"kinds": [1], "limit": 1_200}]);
@@ -5078,6 +5084,29 @@ mod tests {
             {"kinds": [1], "limit": 500}, {"kinds": [6]}, {"kinds": [7]},
             {"kinds": [16]}, {"kinds": [1111]}]);
         assert_eq!(history_len(&handle, conn, &mut rx, merged).await, 2_500);
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_limits_let_an_author_store_past_a_hundred_thousand_events() {
+        // A bot or heavy user at the 0.7 per-author quota got
+        // `blocked: author storage quota exceeded` for every new event.
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let author = hex::encode(key.x_only_public_key().0.serialize());
+        let (_dir, handle) = relay_with_notes(&author, &[(1, 100_000)]);
+        let (conn, mut rx) = live_conn(&handle).await;
+        let note = sign_event_with_key(
+            json!({"created_at": now_secs(), "kind": 1, "tags": [], "content": "one more"}),
+            &key,
+        );
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", note]).to_string())
+            .await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["OK""#) && reply.contains("true"),
+            "{reply}"
+        );
         handle.request_shutdown();
     }
 

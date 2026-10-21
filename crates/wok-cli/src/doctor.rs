@@ -673,12 +673,12 @@ mod tests {
              `wok config minimize` removes it."
         );
 
-        // The complete 0.7.0 sample pins seven replaced defaults.
+        // The complete 0.7.0 sample pins nine replaced defaults.
         let check = config_defaults_check(include_str!(
             "../../wok-relay/src/config/testdata/wok-0.7.0.toml"
         ));
         assert_eq!(check.status, CheckStatus::Warn);
-        assert!(check.detail.starts_with("7 keys pin"), "{}", check.detail);
+        assert!(check.detail.starts_with("9 keys pin"), "{}", check.detail);
         assert!(check
             .detail
             .contains("relay.auth.restricted_read_kinds = [4, 1059] (line 101,"));

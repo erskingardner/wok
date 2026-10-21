@@ -449,8 +449,8 @@ impl Default for Config {
                     invalid_burst: 20,
                     max_concurrent_historical_queries: 8,
                     max_query_cost: 1_000,
-                    max_stored_events: 10_000_000,
-                    max_stored_events_per_pubkey: 100_000,
+                    max_stored_events: 0,
+                    max_stored_events_per_pubkey: 1_000_000,
                     min_pow_difficulty: 0,
                 },
                 unix: UnixConfig {
@@ -1141,69 +1141,122 @@ impl Config {
         changes
     }
 
+    /// The configuration this config's preset gives: the built-in defaults
+    /// with the preset's overlay, before any file.
+    pub fn preset_defaults(&self) -> Config {
+        Config::parse_toml(&format!("preset = \"{}\"\n", self.preset))
+            .expect("every built-in preset parses")
+    }
+
     /// Warnings for every zero-valued guard that silently means "unlimited"
     /// (all editable live through the dashboard). Surfaced on reload so a
-    /// single zero can't silently disarm a guard.
+    /// single zero can't silently disarm a guard. A guard that the preset
+    /// itself turns off, such as `relay.abuse.max_stored_events` in the
+    /// public preset, is not warned about.
     pub fn zero_guard_warnings(&self) -> Vec<String> {
-        let a = &self.relay.abuse;
+        let preset = self.preset_defaults();
+        // Zero here, but not in the preset.
+        let zeroed = |value: u64, preset: u64| value == 0 && preset != 0;
+        let (a, p) = (&self.relay.abuse, &preset.relay.abuse);
         let mut warnings = Vec::new();
         if a.enabled {
-            for (name, rate, burst) in [
+            for (name, rate, burst, preset_rate, preset_burst) in [
                 (
                     "connection",
                     a.connection_rate_per_second,
                     a.connection_burst,
+                    p.connection_rate_per_second,
+                    p.connection_burst,
                 ),
-                ("event", a.event_rate_per_second, a.event_burst),
+                (
+                    "event",
+                    a.event_rate_per_second,
+                    a.event_burst,
+                    p.event_rate_per_second,
+                    p.event_burst,
+                ),
                 (
                     "pubkey_event",
                     a.pubkey_event_rate_per_second,
                     a.pubkey_event_burst,
+                    p.pubkey_event_rate_per_second,
+                    p.pubkey_event_burst,
                 ),
-                ("req", a.req_rate_per_second, a.req_burst),
-                ("count", a.count_rate_per_second, a.count_burst),
-                ("invalid", a.invalid_rate_per_second, a.invalid_burst),
+                (
+                    "req",
+                    a.req_rate_per_second,
+                    a.req_burst,
+                    p.req_rate_per_second,
+                    p.req_burst,
+                ),
+                (
+                    "count",
+                    a.count_rate_per_second,
+                    a.count_burst,
+                    p.count_rate_per_second,
+                    p.count_burst,
+                ),
+                (
+                    "invalid",
+                    a.invalid_rate_per_second,
+                    a.invalid_burst,
+                    p.invalid_rate_per_second,
+                    p.invalid_burst,
+                ),
             ] {
-                if rate == 0 || burst == 0 {
+                if zeroed(rate.into(), preset_rate.into())
+                    || zeroed(burst.into(), preset_burst.into())
+                {
                     warnings.push(format!(
                         "relay.abuse {name} budget is zero — that token bucket is disabled (unlimited)"
                     ));
                 }
             }
-            if a.max_query_cost == 0 {
+            if zeroed(a.max_query_cost, p.max_query_cost) {
                 warnings.push("relay.abuse.max_query_cost is zero — unlimited".to_string());
             }
-            if a.max_stored_events == 0 {
+            if zeroed(a.max_stored_events, p.max_stored_events) {
                 warnings.push("relay.abuse.max_stored_events is zero — unlimited".to_string());
             }
-            if a.max_stored_events_per_pubkey == 0 {
+            if zeroed(
+                a.max_stored_events_per_pubkey,
+                p.max_stored_events_per_pubkey,
+            ) {
                 warnings.push(
                     "relay.abuse.max_stored_events_per_pubkey is zero — unlimited".to_string(),
                 );
             }
         }
-        if self.relay.max_total_events_per_req == 0 {
+        let r = &self.relay;
+        let pr = &preset.relay;
+        if zeroed(r.max_total_events_per_req, pr.max_total_events_per_req) {
             warnings.push("relay.max_total_events_per_req is zero — unlimited".to_string());
         }
-        if self.relay.max_filter_bytes_per_connection == 0 {
+        if zeroed(
+            r.max_filter_bytes_per_connection as u64,
+            pr.max_filter_bytes_per_connection as u64,
+        ) {
             warnings.push(
                 "relay.max_filter_bytes_per_connection is zero — live filter memory per connection is unlimited"
                     .to_string(),
             );
         }
-        if self.relay.max_pending_outbound_bytes == 0 {
+        if zeroed(
+            r.max_pending_outbound_bytes as u64,
+            pr.max_pending_outbound_bytes as u64,
+        ) {
             warnings.push(
                 "relay.max_pending_outbound_bytes is zero — slow-client queue is unlimited"
                     .to_string(),
             );
         }
-        if self.relay.handshake_timeout_secs == 0 {
+        if zeroed(r.handshake_timeout_secs, pr.handshake_timeout_secs) {
             warnings.push(
                 "relay.handshake_timeout_secs is zero — pre-upgrade header read deadline disabled"
                     .to_string(),
             );
         }
-        if self.relay.frame_read_timeout_secs == 0 {
+        if zeroed(r.frame_read_timeout_secs, pr.frame_read_timeout_secs) {
             warnings.push(
                 "relay.frame_read_timeout_secs is zero — partial-frame trickle guard disabled"
                     .to_string(),
@@ -2099,8 +2152,14 @@ mod tests {
 
     #[test]
     fn zero_guard_warnings_cover_each_unlimited_zero() {
-        // Defaults are all non-zero: no warnings.
+        // The defaults warn about nothing, though the public preset turns
+        // the global storage cap off.
+        assert_eq!(Config::default().relay.abuse.max_stored_events, 0);
         assert!(Config::default().zero_guard_warnings().is_empty());
+        // So does a file that repeats that 0. A guard is warned about only
+        // where the file zeroes one its preset keeps.
+        let cfg = Config::parse_toml("[relay.abuse]\nmax_stored_events = 0\n").unwrap();
+        assert!(cfg.zero_guard_warnings().is_empty());
         for field in [
             "connection_rate_per_second",
             "connection_burst",
@@ -2115,7 +2174,6 @@ mod tests {
             "invalid_rate_per_second",
             "invalid_burst",
             "max_query_cost",
-            "max_stored_events",
             "max_stored_events_per_pubkey",
         ] {
             let cfg = Config::parse_toml(&format!("[relay.abuse]\n{field} = 0\n")).unwrap();

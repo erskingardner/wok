@@ -155,66 +155,114 @@ enum OutboundSendError {
 /// A connection's outbound queue and the gate in front of it.
 struct ConnEntry {
     out: Outbound,
-    subs: SubGate,
+    /// Held while a frame is queued for the connection, together with the
+    /// gate check that admits it.
+    state: Mutex<ConnState>,
 }
 
-/// Every frame for every connection is queued here, under one lock. That lock
-/// also guards each connection's subscription gate (see `sub_gate`), so a
-/// subscription frame is checked against its generation and queued in one
-/// step, ordered against the ingester's REQ, COUNT, CLOSE and refusals.
+struct ConnState {
+    subs: SubGate,
+    /// The connection was removed, or terminated for a failed send: nothing
+    /// more is queued for it, even by a producer that found it just before.
+    gone: bool,
+}
+
+impl ConnState {
+    /// Queue a frame, terminating the connection if it is over its
+    /// pending-bytes budget (C++ slow-client termination).
+    fn push(
+        &mut self,
+        out: &Outbound,
+        payload: String,
+        generation: Option<(Current, u64)>,
+        metrics: &Metrics,
+    ) {
+        if let Err(error) = out.try_send(payload, generation) {
+            if error == OutboundSendError::OverByteLimit {
+                metrics
+                    .slow_client_terminations
+                    .fetch_add(1, Ordering::Relaxed);
+                out.kill();
+            }
+            self.gone = true;
+        }
+    }
+}
+
+/// Connections are looked up in this many independently locked shards, so
+/// producers working for different connections rarely meet on a lock.
+const CONN_SHARDS: usize = 64;
+
+type ConnShard = parking_lot::RwLock<HashMap<u64, Arc<ConnEntry>>>;
+
+/// Every frame for a connection is queued under that connection's own lock,
+/// which also guards its subscription gate (see `sub_gate`). So a subscription
+/// frame is checked against its generation and queued in one step, ordered
+/// against the ingester's REQ, COUNT, CLOSE and refusals, while frames for
+/// other connections go ahead in parallel. A shard lock is only held to find
+/// the connection, never while its own lock is taken.
 struct ConnTable {
-    map: Mutex<HashMap<u64, ConnEntry>>,
+    shards: Box<[ConnShard]>,
 }
 
 impl ConnTable {
     fn new() -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            shards: (0..CONN_SHARDS)
+                .map(|_| parking_lot::RwLock::new(HashMap::new()))
+                .collect(),
         }
-    }
-    fn insert(&self, id: u64, out: Outbound) {
-        self.map.lock().insert(
-            id,
-            ConnEntry {
-                out,
-                subs: SubGate::default(),
-            },
-        );
-    }
-    fn remove(&self, id: u64) {
-        self.map.lock().remove(&id);
     }
 
-    /// Queue a frame, terminating the connection if it is over its
-    /// pending-bytes budget (C++ slow-client termination).
-    fn push(
-        map: &mut HashMap<u64, ConnEntry>,
-        conn_id: u64,
-        payload: String,
-        generation: Option<(Current, u64)>,
-        metrics: &Metrics,
-    ) {
-        let Some(entry) = map.get(&conn_id) else {
-            return;
-        };
-        if let Err(error) = entry.out.try_send(payload, generation) {
-            if error == OutboundSendError::OverByteLimit {
-                metrics
-                    .slow_client_terminations
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if let Some(entry) = map.remove(&conn_id) {
-                if error == OutboundSendError::OverByteLimit {
-                    entry.out.kill();
-                }
-            }
+    fn shard(&self, id: u64) -> &ConnShard {
+        &self.shards[id as usize % self.shards.len()]
+    }
+
+    fn entry(&self, id: u64) -> Option<Arc<ConnEntry>> {
+        self.shard(id).read().get(&id).cloned()
+    }
+
+    fn insert(&self, id: u64, out: Outbound) {
+        let entry = Arc::new(ConnEntry {
+            out,
+            state: Mutex::new(ConnState {
+                subs: SubGate::default(),
+                gone: false,
+            }),
+        });
+        self.shard(id).write().insert(id, entry);
+    }
+
+    fn remove(&self, id: u64) {
+        let entry = self.shard(id).write().remove(&id);
+        if let Some(entry) = entry {
+            entry.state.lock().gone = true;
         }
+    }
+
+    /// Run `f` under the connection's lock, unless it is gone. A connection
+    /// that `f` terminated is dropped from the table afterwards.
+    fn with<R>(&self, id: u64, f: impl FnOnce(&Outbound, &mut ConnState) -> R) -> Option<R> {
+        let entry = self.entry(id)?;
+        let mut state = entry.state.lock();
+        if state.gone {
+            return None;
+        }
+        let result = f(&entry.out, &mut state);
+        let gone = state.gone;
+        drop(state);
+        if gone {
+            self.shard(id).write().remove(&id);
+        }
+        Some(result)
     }
 
     /// Deliver a frame that belongs to no subscription (OK, NOTICE, AUTH,
     /// NEG-*), or a CLOSED for an id the relay never held.
     fn deliver(&self, conn_id: u64, payload: String, metrics: &Metrics) {
-        Self::push(&mut self.map.lock(), conn_id, payload, None, metrics);
+        self.with(conn_id, |out, state| {
+            state.push(out, payload, None, metrics);
+        });
     }
 
     fn send(&self, id: u64, msg: RelayMessage, metrics: &Metrics) {
@@ -226,15 +274,14 @@ impl ConnTable {
     /// The ingester admitted a REQ or COUNT: from now on only frames of
     /// `generation` pass for the id.
     fn open_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId, generation: u64) {
-        if let Some(entry) = self.map.lock().get_mut(&conn_id) {
-            entry.subs.open(ns, sub_id, generation);
-        }
+        self.with(conn_id, |_, state| state.subs.open(ns, sub_id, generation));
     }
 
     /// CLOSE, or a REQ that names the id and fails before refusal (no CLOSED
     /// owed). Returns the generation it closed, for the workers' cleanup.
     fn close_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> Option<u64> {
-        self.map.lock().get_mut(&conn_id)?.subs.close(ns, sub_id)
+        self.with(conn_id, |_, state| state.subs.close(ns, sub_id))
+            .flatten()
     }
 
     /// Refuse a REQ or COUNT: close its id and queue the CLOSED in one step,
@@ -250,28 +297,24 @@ impl ConnTable {
         let msg = RelayMessage::closed_error(sub_id, reason);
         bump_relay_metrics(&msg, metrics);
         let json = msg.to_json();
-        let mut map = self.map.lock();
-        let closed = match (map.get_mut(&conn_id), SubId::new(sub_id)) {
-            (Some(entry), Ok(sub_id)) => entry.subs.close(ns, &sub_id),
-            _ => None,
-        };
-        Self::push(&mut map, conn_id, json, None, metrics);
-        closed
+        let sub_id = SubId::new(sub_id).ok();
+        self.with(conn_id, |out, state| {
+            let closed = sub_id.and_then(|sub_id| state.subs.close(ns, &sub_id));
+            state.push(out, json, None, metrics);
+            closed
+        })
+        .flatten()
     }
 
     /// Open REQ subscriptions (pending or live) or COUNTs on a connection.
     fn open_count(&self, conn_id: u64, ns: Ns) -> usize {
-        self.map
-            .lock()
-            .get(&conn_id)
-            .map_or(0, |entry| entry.subs.len(ns))
+        self.with(conn_id, |_, state| state.subs.len(ns))
+            .unwrap_or(0)
     }
 
     fn is_open(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> bool {
-        self.map
-            .lock()
-            .get(&conn_id)
-            .is_some_and(|entry| entry.subs.is_open(ns, sub_id))
+        self.with(conn_id, |_, state| state.subs.is_open(ns, sub_id))
+            .unwrap_or(false)
     }
 
     /// Queue a frame of one generation of a subscription, if that generation
@@ -285,22 +328,14 @@ impl ConnTable {
         payload: String,
         metrics: &Metrics,
     ) -> bool {
-        let mut map = self.map.lock();
-        let Some(current) = map
-            .get(&conn_id)
-            .and_then(|entry| entry.subs.admit(ns, sub_id, generation))
-            .cloned()
-        else {
-            return false;
-        };
-        Self::push(
-            &mut map,
-            conn_id,
-            payload,
-            Some((current, generation)),
-            metrics,
-        );
-        true
+        self.with(conn_id, |out, state| {
+            let Some(current) = state.subs.admit(ns, sub_id, generation).cloned() else {
+                return false;
+            };
+            state.push(out, payload, Some((current, generation)), metrics);
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// A subscription frame that the generation goes on after (EOSE).
@@ -330,16 +365,14 @@ impl ConnTable {
         metrics: &Metrics,
     ) {
         let json = msg.to_json();
-        let mut map = self.map.lock();
-        let Some(entry) = map.get_mut(&conn_id) else {
-            return;
-        };
-        if entry.subs.admit(ns, sub_id, generation).is_none() {
-            return;
-        }
-        entry.subs.close(ns, sub_id);
-        bump_relay_metrics(&msg, metrics);
-        Self::push(&mut map, conn_id, json, None, metrics);
+        self.with(conn_id, |out, state| {
+            if state.subs.admit(ns, sub_id, generation).is_none() {
+                return;
+            }
+            state.subs.close(ns, sub_id);
+            bump_relay_metrics(&msg, metrics);
+            state.push(out, json, None, metrics);
+        });
     }
 
     /// Build the EVENT frame once (pre-sized) and queue it.
@@ -351,6 +384,19 @@ impl ConnTable {
         ev_json: &str,
         metrics: &Metrics,
     ) {
+        if self.queue_event(conn_id, sub_id, generation, ev_json, metrics) {
+            metrics.relay_event.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn queue_event(
+        &self,
+        conn_id: u64,
+        sub_id: &SubId,
+        generation: u64,
+        ev_json: &str,
+        metrics: &Metrics,
+    ) -> bool {
         let sub = sub_id.as_str();
         let mut payload = String::with_capacity(sub.len() + ev_json.len() + 12);
         payload.push_str("[\"EVENT\",\"");
@@ -358,14 +404,23 @@ impl ConnTable {
         payload.push_str("\",");
         payload.push_str(ev_json);
         payload.push(']');
-        if self.push_sub(conn_id, Ns::Req, sub_id, generation, payload, metrics) {
-            metrics.relay_event.fetch_add(1, Ordering::Relaxed);
-        }
+        self.push_sub(conn_id, Ns::Req, sub_id, generation, payload, metrics)
     }
 
+    /// One event for many subscriptions. The shared counter is bumped once,
+    /// not once per frame, so monitors fanning out to many connections do
+    /// not contend on it.
     fn send_event_batch(&self, recipients: &[(u64, SubId, u64)], ev_json: &str, metrics: &Metrics) {
-        for (conn, sub, generation) in recipients {
-            self.send_event(*conn, sub, *generation, ev_json, metrics);
+        let queued = recipients
+            .iter()
+            .filter(|(conn, sub, generation)| {
+                self.queue_event(*conn, sub, *generation, ev_json, metrics)
+            })
+            .count();
+        if queued != 0 {
+            metrics
+                .relay_event
+                .fetch_add(queued as u64, Ordering::Relaxed);
         }
     }
 }
@@ -1012,7 +1067,7 @@ impl RelayHandle {
     /// stalled worker would. For transport tests.
     #[doc(hidden)]
     pub fn set_ingress_paused(&self, conn_id: u64, paused: bool) {
-        if let Some(entry) = self.conns.map.lock().get(&conn_id) {
+        if let Some(entry) = self.conns.entry(conn_id) {
             entry.out.gate.send_replace(!paused);
         }
     }
@@ -6138,5 +6193,142 @@ mod tests {
         assert_eq!(frame(&mut relay), r#"["EVENT","x",{"b":1}]"#);
         assert!(relay.outbound.try_recv().is_err());
         relay.finish();
+    }
+
+    /// Producers on several threads queue frames for the same subscription
+    /// ids while the ingester opens, replaces, closes and refuses them. The
+    /// gate check and the enqueue are one step under the connection's lock,
+    /// as are a refusal's close and its CLOSED, so in the queue the transport
+    /// reads nothing of a generation follows the point where the gate moved
+    /// past it, and generations never go backwards.
+    #[test]
+    fn the_gate_admits_and_queues_atomically_under_concurrent_producers() {
+        const IDS: usize = 3;
+        const PRODUCERS: u64 = 4;
+        let conns = Arc::new(ConnTable::new());
+        let metrics = Arc::new(Metrics::default());
+        let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let sid = |id: usize| SubId::new(&format!("s{id}")).unwrap();
+        // The newest generation the ingester gave each id.
+        let newest: Arc<Vec<AtomicU64>> = Arc::new((0..IDS).map(|_| AtomicU64::new(0)).collect());
+        let stop = Arc::new(AtomicBool::new(false));
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|producer| {
+                let (conns, metrics) = (conns.clone(), metrics.clone());
+                let (newest, stop) = (newest.clone(), stop.clone());
+                thread::spawn(move || {
+                    let mut rng = rand::thread_rng();
+                    let mut seq = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let id = rng.gen_range(0..IDS);
+                        // Producers lag: an older generation may still emit.
+                        let generation = newest[id]
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(rng.gen_range(0..3));
+                        if generation == 0 {
+                            continue;
+                        }
+                        seq += 1;
+                        if rng.gen_ratio(1, 16) {
+                            let closed = RelayMessage::closed_error(
+                                sid(id).as_str(),
+                                format!("last {generation}"),
+                            );
+                            conns.send_last(1, Ns::Req, &sid(id), generation, closed, &metrics);
+                        } else {
+                            let event = json!({"g": generation, "p": producer, "n": seq});
+                            conns.send_event(1, &sid(id), generation, &event.to_string(), &metrics);
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut rng = rand::thread_rng();
+        let mut next = 0u64;
+        for _ in 0..20_000 {
+            let id = rng.gen_range(0..IDS);
+            // Everything up to the generation in a marker is over for the id.
+            let over = match rng.gen_range(0..4) {
+                0 | 1 => {
+                    next += 1;
+                    conns.open_sub(1, Ns::Req, &sid(id), next);
+                    newest[id].store(next, Ordering::Relaxed);
+                    next - 1
+                }
+                2 => {
+                    conns.close_sub(1, Ns::Req, &sid(id));
+                    newest[id].load(Ordering::Relaxed)
+                }
+                _ => {
+                    let over = newest[id].load(Ordering::Relaxed);
+                    conns.refuse(
+                        1,
+                        Ns::Req,
+                        sid(id).as_str(),
+                        format!("refused {over}"),
+                        &metrics,
+                    );
+                    continue;
+                }
+            };
+            conns.deliver(
+                1,
+                json!(["MARK", format!("s{id}"), over]).to_string(),
+                &metrics,
+            );
+            if rng.gen_ratio(1, 64) {
+                thread::yield_now();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for producer in producers {
+            producer.join().unwrap();
+        }
+
+        let mut floor = [0u64; IDS];
+        let mut seen = [0u64; IDS];
+        let mut admitted = 0;
+        while let Ok(frame) = outbound.try_recv() {
+            let frame: Value = serde_json::from_str(&frame.into_text()).unwrap();
+            let id: usize = frame[1].as_str().unwrap()[1..].parse().unwrap();
+            let number = |text: &Value| -> u64 {
+                text.as_str()
+                    .unwrap()
+                    .split(' ')
+                    .nth(1)
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            let (generation, ends) = match frame[0].as_str().unwrap() {
+                "MARK" => {
+                    floor[id] = floor[id].max(frame[2].as_u64().unwrap());
+                    continue;
+                }
+                "CLOSED" if frame[2].as_str().unwrap().starts_with("refused") => {
+                    floor[id] = floor[id].max(number(&frame[2]));
+                    continue;
+                }
+                "CLOSED" => (number(&frame[2]), true),
+                "EVENT" => (frame[2]["g"].as_u64().unwrap(), false),
+                other => panic!("unexpected frame {other}"),
+            };
+            assert!(
+                generation > floor[id],
+                "s{id} generation {generation} queued after the gate moved past {}",
+                floor[id]
+            );
+            assert!(generation >= seen[id], "s{id} generations went backwards");
+            seen[id] = generation;
+            if ends {
+                floor[id] = generation;
+            }
+            admitted += 1;
+        }
+        assert!(
+            admitted > 100,
+            "too few producer frames got through: {admitted}"
+        );
     }
 }

@@ -72,8 +72,8 @@ threads: the ingester (a refusal's CLOSED), the req worker (history, COUNT
 results, its own refusals) and the req monitor (EOSE, live events). What the
 client sees for an id is decided in one place, not by coordinating them.
 
-- Every frame for a connection is queued in `ConnTable` under one lock, and
-  each connection there has a gate: for REQ ids and, separately, COUNT ids,
+- Every frame for a connection is queued in `ConnTable` under that
+  connection's own lock, and each connection there has a gate: for REQ ids and, separately, COUNT ids,
   the current generation of each open id. An absent id is closed.
 - The ingester gives each REQ and COUNT a generation as it handles it, in
   client order, and moves the gate at that moment: an admitted REQ or COUNT

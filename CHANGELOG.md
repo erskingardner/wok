@@ -153,6 +153,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EOSE stays newest-first. Before, stored events committed during the scan came
   before EOSE, as in strfry. A client that sends CLOSE at EOSE no longer gets
   them.
+- Frames for different connections are queued under per-connection locks
+  instead of one relay-wide lock, so live fan-out to many connections no
+  longer serializes on it.
 
 ### Removed
 

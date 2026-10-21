@@ -130,6 +130,12 @@ behind a separately sandboxed local service and keep the relay-side plugin as
 a minimal protocol adapter. Extend the unit's sandbox only for the exact path
 or address family that adapter requires.
 
+A `reject` record's `msg` becomes the OK reason the client sees. Start it with
+a NIP-01 prefix such as `blocked:` or `rate-limited:`. Wok sends any other
+message as `blocked: <msg>`, and an empty one as
+`blocked: rejected by write policy`. A `shadowReject` keeps its `msg` only when
+it is prefixed; otherwise the client gets the empty reason of an accepted event.
+
 ## Logs and user content
 
 Prefer `observability.log_format = "json"` in production and send stdout/stderr

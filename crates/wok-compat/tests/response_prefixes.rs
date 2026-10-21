@@ -123,6 +123,27 @@ async fn restricted_reads_are_final_when_auth_is_unusable() {
     }
 }
 
+/// A full disk is the relay's failure, not a policy decision about the event or
+/// its author, so it is `error:` (NIP-01: "for when none of that fits"), not
+/// `blocked:`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disk_reserve_refusals_are_errors() {
+    let relay = Relay::new(|cfg| cfg.db_min_free_disk_bytes = u64::MAX);
+    let (conn, mut rx) = relay.connection().await;
+    let event =
+        wok_compat::sign_event(json!({"created_at":now(),"kind":1,"tags":[],"content":"reserve"}));
+    send(&conn, json!(["EVENT", event])).await;
+    let reply = recv(&mut rx).await;
+    assert_eq!(reply[0], "OK", "{reply}");
+    assert_eq!(reply[2], false, "{reply}");
+    assert_eq!(
+        reply[3],
+        format!("error: disk reserve requires {} free bytes", u64::MAX),
+        "{reply}"
+    );
+    conn.close().await;
+}
+
 /// NIP-42 flow: `auth-required:` and a challenge, AUTH, then the same REQ id
 /// is re-sent and served. Once authenticated, a COUNT not scoped to an
 /// authenticated key is `restricted:` rather than another `auth-required:`, so

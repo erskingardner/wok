@@ -262,6 +262,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NIP-11 `software` is the homepage URL `https://github.com/erskingardner/wok`,
   as NIP-11 requires. It was the git remote
   `git+https://github.com/erskingardner/wok.git`.
+- Refused events get OK reasons with NIP-01's standard prefixes. An event
+  older than the stored version of its replaceable or addressable event gets
+  `blocked: have a newer version` (was `replaced: have newer event`), and a
+  deleted one `blocked: user requested deletion` (was `deleted:`). `wok sync`
+  counts an upload refused with either the new or the old superseded reason as
+  `upload_superseded`, so peers running strfry or earlier Wok releases are
+  still recognized.
+- A write-policy plugin that rejects an event with an empty or unprefixed
+  `msg` no longer produces an OK reason without a NIP-01 prefix: the client
+  gets `blocked: <msg>`, or `blocked: rejected by write policy` for an empty
+  one. Messages that already start with a standard prefix are unchanged. A
+  `shadowReject` with an unprefixed `msg` now sends an empty reason, like an
+  accepted event.
+- An ephemeral event published with an `expiration` tag in the past is refused
+  with `invalid: event expired`, as NIP-40 asks. It was accepted and sent to
+  matching live subscriptions, because the ephemeral marker replaced the
+  expiration before it was checked. `wok sync` and `wok router` downloads drop
+  such events too. `wok sync` neither uploads nor fails on one that a `ttl`-mode
+  database still holds; its summary counts them as `expired` and
+  `upload_expired`.
+- Events refused because free disk space is below
+  `database.min_free_disk_bytes` get `error: disk reserve requires N free
+  bytes` instead of `blocked:`. A low disk is the relay's own failure, not a
+  policy decision about the event or its author.
 
 ## [0.7.0] - 2026-09-08
 

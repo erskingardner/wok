@@ -246,6 +246,31 @@ fn nip01_eose_encoding() {
     assert_eq!(s, r#"["EOSE","abc"]"#);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip01_stale_replaceable_versions_are_refused_with_a_standard_prefix() {
+    // A false OK "MUST be a string formed by a machine-readable single-word
+    // prefix followed by a `:`" from the standardized list. strfry replied
+    // `replaced: have newer event`.
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    let key = key();
+    for (kind, tags) in [(0, json!([])), (30000, json!([["d", "x"]]))] {
+        let signed = |created_at: u64| {
+            sign_event_with_key(
+                json!({"created_at": created_at, "kind": kind, "tags": tags, "content": ""}),
+                &key,
+            )
+        };
+        assert_eq!(conn.publish(&signed(now())).await[2], true);
+        let reply = conn.publish(&signed(now() - 60)).await;
+        assert_eq!(reply[2], false, "{reply}");
+        assert_eq!(reply[3], "blocked: have a newer version", "{reply}");
+        assert!(wok_relay::protocol::has_reason_prefix(
+            reply[3].as_str().unwrap()
+        ));
+    }
+}
+
 #[test]
 fn nip09_kind5_is_deletion() {
     assert_eq!(wok_event::DELETION_KIND, 5);
@@ -285,10 +310,7 @@ async fn nip09_deleting_a_deletion_request_has_no_effect() {
     assert_eq!(stored, ids(&[&d1, &d2]));
     let reply = conn.publish(&note).await;
     assert_eq!(reply[2], false, "{reply}");
-    assert!(
-        reply[3].as_str().unwrap().starts_with("deleted:"),
-        "{reply}"
-    );
+    assert_eq!(reply[3], "blocked: user requested deletion", "{reply}");
 
     // A request against a deletion request that arrives first does not
     // tombstone it either: the later deletion request is stored and applied.
@@ -320,6 +342,36 @@ fn nip40_expiration_too_small_rejected() {
         "sig": "00".repeat(64),
     });
     assert!(wok_event::nostr_json_to_packed_event(&ev, &EventLimits::default()).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip40_expired_ephemeral_events_are_refused_and_not_broadcast() {
+    // "Relays SHOULD drop any events that are published to them if they are
+    // expired." Live-only ephemeral events are never stored, so the only
+    // place to drop one is at publication.
+    let relay = Relay::new(|_| {});
+    let mut subscriber = relay.connect().await;
+    subscriber
+        .subscribe("ephemeral", json!({"kinds": [20001]}))
+        .await;
+    let mut publisher = relay.connect().await;
+    let ephemeral = |expiration: u64| {
+        sign_event(json!({
+            "created_at": now(),
+            "kind": 20001,
+            "tags": [["expiration", expiration.to_string()]],
+            "content": "",
+        }))
+    };
+    let expired = ephemeral(now() - 1);
+    let reply = publisher.publish(&expired).await;
+    assert_eq!(reply[2], false, "{reply}");
+    assert_eq!(reply[3], "invalid: event expired", "{reply}");
+    assert_eq!(subscriber.try_recv().await, None);
+
+    let live = ephemeral(now() + 60);
+    assert_eq!(publisher.publish(&live).await[2], true);
+    assert_eq!(subscriber.recv().await, json!(["EVENT", "ephemeral", live]));
 }
 
 #[test]

@@ -400,15 +400,17 @@ fn moderation_reason_inner(
         return Ok(Some(ModerationReason::BannedAuthor));
     }
     if let Some(bits) = txn.get(dbi, &[PREFIX_KIND_POLICY])? {
-        let kind = packed.kind() as usize;
-        let allowed = bits
-            .get(kind / 8)
-            .is_some_and(|byte| byte & (1 << (kind % 8)) != 0);
-        if !allowed {
+        if !kind_allowed(bits, packed.kind()) {
             return Ok(Some(ModerationReason::KindNotAllowed));
         }
     }
     Ok(None)
+}
+
+fn kind_allowed(bits: &[u8], kind: u64) -> bool {
+    let kind = kind as usize;
+    bits.get(kind / 8)
+        .is_some_and(|byte| byte & (1 << (kind % 8)) != 0)
 }
 
 /// True when the event id, its author, or its kind is moderated.
@@ -417,6 +419,94 @@ pub fn is_event_moderated_ro(
     packed: PackedEventView<'_>,
 ) -> Result<bool, DbError> {
     Ok(moderation_reason_ro(txn, packed)?.is_some())
+}
+
+/// [`is_event_moderated_ro`] for many events of one read transaction. What
+/// the table holds is read once, so each event looks up only the kinds of
+/// record present: allowlists, reports, roles and IP blocks hide no event,
+/// and the kind policy is tested on the bitmap read here. A record whose
+/// presence cannot be read is looked up for every event, as before.
+#[derive(Clone, Copy)]
+pub struct ModerationView<'t> {
+    txn: &'t RoTxn<'t>,
+    /// None when the table is missing or empty.
+    dbi: Option<MDB_dbi>,
+    banned_events: bool,
+    banned_pubkeys: bool,
+    kind_policy: KindPolicyRecord<'t>,
+}
+
+#[derive(Clone, Copy)]
+enum KindPolicyRecord<'t> {
+    None,
+    Bits(&'t [u8]),
+    Unread,
+}
+
+impl<'t> ModerationView<'t> {
+    pub fn new(txn: &'t RoTxn<'t>) -> Self {
+        let dbi = txn
+            .env()
+            .dbis()
+            .moderation
+            .filter(|&dbi| txn.entries(dbi).map_or(true, |entries| entries != 0));
+        let has = |prefix: u8| {
+            dbi.is_some_and(|dbi| {
+                let mut found = false;
+                txn.foreach_full(dbi, &[prefix], &[], false, |key, _| {
+                    found = key.first() == Some(&prefix);
+                    false
+                })
+                .map_or(true, |_| found)
+            })
+        };
+        let kind_policy = match dbi.map(|dbi| txn.get(dbi, &[PREFIX_KIND_POLICY])) {
+            None | Some(Ok(None)) => KindPolicyRecord::None,
+            Some(Ok(Some(bits))) => KindPolicyRecord::Bits(bits),
+            Some(Err(_)) => KindPolicyRecord::Unread,
+        };
+        Self {
+            txn,
+            dbi,
+            banned_events: has(PREFIX_BANNED_EVENT),
+            banned_pubkeys: has(PREFIX_BANNED_PUBKEY),
+            kind_policy,
+        }
+    }
+
+    /// True when the event id, its author, or its kind is moderated.
+    pub fn hides(&self, packed: PackedEventView<'_>) -> Result<bool, DbError> {
+        let Some(dbi) = self.dbi else {
+            return Ok(false);
+        };
+        let key = |prefix: u8, payload: &[u8]| {
+            let mut key = [prefix; 33];
+            key[1..].copy_from_slice(payload);
+            key
+        };
+        if self.banned_events
+            && self
+                .txn
+                .get(dbi, &key(PREFIX_BANNED_EVENT, packed.id()))?
+                .is_some()
+        {
+            return Ok(true);
+        }
+        if self.banned_pubkeys
+            && self
+                .txn
+                .get(dbi, &key(PREFIX_BANNED_PUBKEY, packed.pubkey()))?
+                .is_some()
+        {
+            return Ok(true);
+        }
+        let bits = match self.kind_policy {
+            KindPolicyRecord::None => return Ok(false),
+            KindPolicyRecord::Bits(bits) => Some(bits),
+            KindPolicyRecord::Unread => self.txn.get(dbi, &[PREFIX_KIND_POLICY])?,
+        };
+        Ok(bits.is_some_and(|bits| !kind_allowed(bits, packed.kind())))
+    }
 }
 
 pub fn load_moderation_snapshot_ro(txn: &RoTxn<'_>) -> Result<ModerationSnapshot, DbError> {

@@ -99,7 +99,7 @@ All event settings reload live and are available in the dashboard.
 |---|---:|---|
 | `events.max_event_size` | `1048576` | Maximum normalized serialized event size in bytes. |
 | `events.reject_newer_than_secs` | `900` | Maximum accepted future clock skew. |
-| `events.reject_older_than_secs` | `94608000` | Maximum age for non-ephemeral events. |
+| `events.reject_older_than_secs` | `0` | Maximum age for regular events; `0` means no lower bound. |
 | `events.reject_ephemeral_older_than_secs` | `60` | Maximum age for ephemeral events at publication. |
 | `events.ephemeral_lifetime_secs` | `300` | Retention window when ephemeral persistence is `ttl`. |
 | `events.ephemeral_persistence` | `live_only` | `live_only` broadcasts without storage; `ttl` persists then expires. |
@@ -123,6 +123,36 @@ decrypt or identify NIP-44 content, so this remains a global event limit and is
 measured after Base64 encoding, JSON escaping, and event metadata are present.
 The NIP-44 theoretical maximum is not a relay allocation target. Existing
 operator files that explicitly retain `65536` continue enforcing 64 KiB.
+
+### Timestamp windows
+
+`reject_older_than_secs` is off (`0`) in the public preset, and NIP-11 then
+omits `created_at_lower_limit`.
+
+- **If too low:** old regular events are refused, so a history import or a
+  rebroadcast of old notes fails.
+- **If too high:** nothing meaningful. Old events sort below new ones, and
+  rates and quotas already bound storage.
+
+A bound that an operator sets applies to regular kinds only. Replaceable
+(0, 3, 10000–19999) and addressable (30000–39999) events, deletions (5) and
+vanish requests (62) are exempt from it.
+
+Two kinds follow their NIPs instead of the `[events]` windows:
+
+- **AUTH (22242)** is accepted within 600 seconds of the relay clock, in
+  either direction, as NIP-42 suggests. The per-connection challenge already
+  prevents replay.
+- **Ephemeral gift wraps (21059)** may be dated up to three days in the
+  past, because NIP-59 backdates wraps by up to two days. This allowance is
+  fixed; `reject_ephemeral_older_than_secs` does not change it. Future dates
+  are still bounded by `reject_newer_than_secs`. In `ttl` mode a wrap older than
+  `ephemeral_lifetime_secs` reaches live subscribers, but the next purge
+  removes it, so history does not serve it.
+
+`reject_ephemeral_older_than_secs` still bounds every other ephemeral kind,
+such as NIP-46 requests, against replays reaching live subscribers. An event
+outside its window is refused with `invalid:`.
 
 ## Observability
 

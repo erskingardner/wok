@@ -356,7 +356,6 @@ async fn server(env: Env, dir: &std::path::Path) -> (wok_relay::RelayHandle, Wir
         ..Default::default()
     };
     cfg.relay.auth.enabled = false;
-    cfg.events.reject_older_than_secs = u64::MAX / 4;
     let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

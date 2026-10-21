@@ -29,7 +29,10 @@ min_free_disk_bytes = 1073741824
 # NIP-44 payloads such as gift wraps and MLS group events.
 max_event_size = 1048576
 reject_newer_than_secs = 900
-reject_older_than_secs = 94608000
+# 0 means no lower bound. A bound applies to regular kinds only; replaceable,
+# addressable, deletion (5) and vanish (62) events are exempt.
+reject_older_than_secs = 0
+# AUTH (±600 s) and kind 21059 gift wraps (up to 3 days) have their own windows.
 reject_ephemeral_older_than_secs = 60
 ephemeral_lifetime_secs = 300
 # "live_only" or "ttl".

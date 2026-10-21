@@ -301,6 +301,10 @@ const REASON_PREFIXES: &[&str] = &[
     "restricted",
 ];
 
+/// OK reason for a replaceable or addressable event older than the version
+/// already stored. `wok sync` counts an upload refused with it as superseded.
+pub const SUPERSEDED_OK_REASON: &str = "blocked: have a newer version";
+
 /// True when `reason` already starts with a standard `prefix: ` so it can be
 /// sent as is.
 pub fn has_reason_prefix(reason: &str) -> bool {

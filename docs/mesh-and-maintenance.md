@@ -157,7 +157,8 @@ Only ACKs matching outstanding upload IDs count. Unsolicited events/EOSE/ACKs
 cannot complete a batch. Duplicate records already stored are successful outcomes.
 `superseded` counts downloads discarded because a newer local version exists.
 `upload_superseded` counts local records superseded before sending and negative
-peer ACKs explicitly prefixed `replaced:`. These are terminal successful outcomes;
+peer ACKs whose reason starts with `blocked: have a newer version`, or with
+`replaced:` from strfry and earlier Wok releases. These are terminal successful outcomes;
 other policy rejections still fail the transfer.
 The client caps combined unique differences at five million; partition larger
 comparisons with explicit filters or time windows. The default timeout is 60

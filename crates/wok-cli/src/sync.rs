@@ -73,6 +73,12 @@ pub async fn run(cfg: &Config, options: Options) -> Result<()> {
     result
 }
 
+/// True when a peer refused an upload because it stores a newer version.
+/// strfry and earlier Wok releases reply `replaced:` instead.
+fn upload_superseded(reason: &str) -> bool {
+    reason.starts_with(wok_relay::protocol::SUPERSEDED_OK_REASON) || reason.starts_with("replaced:")
+}
+
 fn store_downloads(
     env: &Env,
     cfg: &Config,
@@ -390,10 +396,7 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 if pending_up.remove(id) {
                     if accepted {
                         report.uploaded += 1;
-                    } else if reply[3]
-                        .as_str()
-                        .is_some_and(|message| message.starts_with("replaced:"))
-                    {
+                    } else if reply[3].as_str().is_some_and(upload_superseded) {
                         report.upload_superseded += 1;
                     } else {
                         report.upload_rejected += 1;
@@ -513,5 +516,19 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
             }
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn superseded_upload_acks_from_current_and_older_peers() {
+        assert!(upload_superseded("blocked: have a newer version"));
+        assert!(upload_superseded("replaced: have newer event"));
+        assert!(!upload_superseded("blocked: user requested deletion"));
+        assert!(!upload_superseded("blocked: author storage quota exceeded"));
+        assert!(!upload_superseded("have a newer version"));
     }
 }

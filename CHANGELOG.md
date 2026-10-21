@@ -217,6 +217,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Stored payloads keep that escaping. `wok import`, `wok sync` and
   `wok router` downloads also accept the legacy id, so data from strfry and
   earlier Wok releases still verifies.
+- Refused events get OK reasons with NIP-01's standard prefixes. An event
+  older than the stored version of its replaceable or addressable event gets
+  `blocked: have a newer version` (was `replaced: have newer event`), and a
+  deleted one `blocked: user requested deletion` (was `deleted:`). `wok sync`
+  counts an upload refused with either the new or the old superseded reason as
+  `upload_superseded`, so peers running strfry or earlier Wok releases are
+  still recognized.
 
 ## [0.7.0] - 2026-09-08
 

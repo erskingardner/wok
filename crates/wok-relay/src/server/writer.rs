@@ -1,5 +1,6 @@
 //! Single-writer mutation, publication receipts and maintenance.
 use super::*;
+use crate::protocol::SUPERSEDED_OK_REASON;
 
 pub(super) fn run_writer(
     env: Env,
@@ -428,13 +429,13 @@ pub(super) fn run_writer(
                     metrics
                         .rejected_events_total
                         .fetch_add(1, Ordering::Relaxed);
-                    (false, "replaced: have newer event".into())
+                    (false, SUPERSEDED_OK_REASON.into())
                 }
                 EventWriteStatus::Deleted => {
                     metrics
                         .rejected_events_total
                         .fetch_add(1, Ordering::Relaxed);
-                    (false, "deleted: user requested deletion".into())
+                    (false, "blocked: user requested deletion".into())
                 }
                 EventWriteStatus::QuotaExceeded => {
                     metrics

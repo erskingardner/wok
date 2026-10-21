@@ -203,6 +203,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   req monitors exit together, which made this reachable: about one in a
   thousand runs of a test that starts and stops six relays crashed on Linux.
   The database now closes only after every relay thread has exited.
+- A filter with an empty `ids`, `authors`, `kinds` or `#x` list now matches no
+  event, as NIP-01 requires. Before, the whole REQ, COUNT or NEG-OPEN was
+  refused with `must not be empty`, so the request lost its other valid filters
+  and a client with an empty follow list got an error. The subscription now
+  gets EOSE and stays open for its other filters.
 - `wok reindex` rebuilt negentropy trees from what relay reads serve, so a
   database with superseded versions (retained by a strfry migration, or created
   when reindex repacks a long address next to a newer version) came out with

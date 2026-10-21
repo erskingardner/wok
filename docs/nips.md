@@ -31,6 +31,12 @@ capabilities.
 ID and author filter values must be exactly 64 lowercase hexadecimal
 characters, as required by current NIP-01. Prefix filters are rejected.
 
+An empty `ids`, `authors`, `kinds` or `#x` list matches no event, as NIP-01
+requires; it is not treated as an absent field. Such a filter is skipped and
+the request's other filters still apply. A REQ whose filters all have an empty
+list gets EOSE and stays open, a COUNT reports 0, and a NEG-OPEN reconciles
+against no events. Filter-validation limits still count the skipped filters.
+
 NIP-01 replacement is enforced when reading, even if a lossless migration
 retained multiple versions. Kinds 0, 3 (contact lists), and 10000–19999 select
 the newest event per author and kind; kinds 30000–39999 additionally use the

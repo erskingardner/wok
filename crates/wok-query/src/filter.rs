@@ -156,6 +156,9 @@ pub struct NostrFilter {
     pub since: u64,
     pub until: u64,
     pub limit: u64,
+    /// An `ids`, `authors`, `kinds` or `#x` list was empty, so no event can
+    /// match (NIP-01). [`NostrFilterGroup`] drops such filters.
+    pub never_match: bool,
     pub index_only_scans: bool,
 }
 
@@ -179,6 +182,7 @@ impl NostrFilter {
             since: 0,
             until: u64::MAX,
             limit: u64::MAX,
+            never_match: false,
             index_only_scans: false,
         };
         let mut num_major_non_tag = 0u64;
@@ -189,7 +193,8 @@ impl NostrFilter {
                     return Err(QueryError::msg("ids not an array"));
                 }
                 if v.as_array().unwrap().is_empty() {
-                    return Err(QueryError::msg("ids array must not be empty"));
+                    f.never_match = true;
+                    continue;
                 }
                 num_major_non_tag += 1;
                 f.ids = Some(
@@ -201,7 +206,8 @@ impl NostrFilter {
                     return Err(QueryError::msg("authors not an array"));
                 }
                 if v.as_array().unwrap().is_empty() {
-                    return Err(QueryError::msg("authors array must not be empty"));
+                    f.never_match = true;
+                    continue;
                 }
                 num_major_non_tag += 1;
                 f.authors = Some(
@@ -213,7 +219,8 @@ impl NostrFilter {
                     return Err(QueryError::msg("kinds not an array"));
                 }
                 if v.as_array().unwrap().is_empty() {
-                    return Err(QueryError::msg("kinds array must not be empty"));
+                    f.never_match = true;
+                    continue;
                 }
                 num_major_non_tag += 1;
                 f.kinds = Some(
@@ -224,10 +231,11 @@ impl NostrFilter {
                 if !v.is_array() {
                     return Err(QueryError::msg(format!("{k} not an array")));
                 }
-                if v.as_array().unwrap().is_empty() {
-                    return Err(QueryError::msg(format!("{k} array must not be empty")));
-                }
                 if k.len() == 2 && k.as_bytes()[1].is_ascii_alphabetic() {
+                    if v.as_array().unwrap().is_empty() {
+                        f.never_match = true;
+                        continue;
+                    }
                     let tag = k.as_bytes()[1] as char;
                     let set = if tag == 'p' || tag == 'e' {
                         FilterSetBytes::parse(v, true, 32, 32)
@@ -325,7 +333,7 @@ impl NostrFilter {
     }
 
     pub fn does_match_without_search(&self, ev: PackedEventView<'_>) -> bool {
-        if !self.does_match_times(ev.created_at()) {
+        if self.never_match || !self.does_match_times(ev.created_at()) {
             return false;
         }
         if let Some(ids) = &self.ids {
@@ -397,7 +405,8 @@ impl NostrFilter {
     }
 
     pub fn is_full_db_query(&self) -> bool {
-        self.ids.is_none()
+        !self.never_match
+            && self.ids.is_none()
             && self.authors.is_none()
             && self.kinds.is_none()
             && self.tags.is_empty()
@@ -409,6 +418,10 @@ impl NostrFilter {
 #[derive(Debug, Clone, Default)]
 pub struct NostrFilterGroup {
     pub filters: Vec<NostrFilter>,
+    /// Filters dropped because they can never match (an empty list). They
+    /// need no scan and no live monitor entry, but count toward limits on
+    /// the number of filters a request sends.
+    pub never_matching: usize,
 }
 
 impl NostrFilterGroup {
@@ -453,7 +466,11 @@ impl NostrFilterGroup {
         max_and_entries: usize,
     ) -> Result<(), QueryError> {
         let f = NostrFilter::parse(item, max_filter_limit, max_tags, max_and_entries)?;
-        self.filters.push(f);
+        if f.never_match {
+            self.never_matching += 1;
+        } else {
+            self.filters.push(f);
+        }
         Ok(())
     }
 
@@ -548,7 +565,7 @@ impl FilterValidator {
         if !self.enabled {
             return Ok(());
         }
-        let n = fg.filters.len() as u64;
+        let n = (fg.filters.len() + fg.never_matching) as u64;
         if n < self.min_filters_per_req || n > self.max_filters_per_req {
             return Err(QueryError::msg(format!("invalid number of filters: {n}")));
         }
@@ -631,11 +648,56 @@ mod tests {
     }
 
     #[test]
-    fn empty_filter_lists_are_rejected() {
-        assert!(NostrFilterGroup::from_value(&json!({"ids": []}), 500, 3, 16).is_err());
-        assert!(NostrFilterGroup::from_value(&json!({"authors": []}), 500, 3, 16).is_err());
-        assert!(NostrFilterGroup::from_value(&json!({"kinds": []}), 500, 3, 16).is_err());
-        assert!(NostrFilterGroup::from_value(&json!({"#p": []}), 500, 3, 16).is_err());
+    fn empty_filter_lists_match_nothing() {
+        // NIP-01: an empty list matches no event and is not an absent field.
+        let ev = packed_note(1, 2, 15, 1, &[("p", &[3; 32])]);
+        for empty in [
+            json!({"ids": []}),
+            json!({"authors": []}),
+            json!({"kinds": []}),
+            json!({"#p": []}),
+            json!({"#t": [], "kinds": [1]}),
+        ] {
+            let f = NostrFilter::parse(&empty, 500, 3, 16).unwrap();
+            assert!(f.never_match, "{empty}");
+            assert!(!f.does_match(ev.view()), "{empty}");
+            assert!(!f.is_full_db_query(), "{empty}");
+            let fg = NostrFilterGroup::from_value(&empty, 500, 3, 16).unwrap();
+            assert_eq!((fg.size(), fg.never_matching), (0, 1), "{empty}");
+            assert!(!fg.does_match(ev.view()), "{empty}");
+        }
+
+        // The other filters of the request still apply.
+        let fg = NostrFilterGroup::from_value(&json!([{"kinds": []}, {"kinds": [1]}]), 500, 3, 16)
+            .unwrap();
+        assert_eq!((fg.size(), fg.never_matching), (1, 1));
+        assert!(fg.does_match(ev.view()));
+
+        // The rest of the filter is still validated.
+        assert!(NostrFilter::parse(&json!({"kinds": [], "ids": ["aa"]}), 500, 3, 16).is_err());
+        assert!(NostrFilter::parse(&json!({"#1": []}), 500, 3, 16).is_err());
+    }
+
+    #[test]
+    fn never_matching_filters_count_toward_the_filter_limits() {
+        let validator = FilterValidator {
+            enabled: true,
+            min_filters_per_req: 1,
+            max_filters_per_req: 2,
+            max_kinds_per_filter: 10,
+            require_author_or_tag: true,
+            ..Default::default()
+        };
+        let empty = NostrFilterGroup::from_value(&json!([{"authors": []}]), 500, 3, 16).unwrap();
+        assert!(validator.validate(&empty).is_ok());
+        let three = NostrFilterGroup::from_value(
+            &json!([{"authors": []}, {"kinds": []}, {"authors": ["11".repeat(32)]}]),
+            500,
+            3,
+            16,
+        )
+        .unwrap();
+        assert!(validator.validate(&three).is_err());
     }
 
     #[test]

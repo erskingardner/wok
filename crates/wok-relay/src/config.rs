@@ -338,7 +338,7 @@ impl Default for Config {
             events: EventsConfig {
                 max_event_size: wok_event::DEFAULT_MAX_EVENT_SIZE,
                 reject_newer_than_secs: 900,
-                reject_older_than_secs: 94_608_000,
+                reject_older_than_secs: 0,
                 reject_ephemeral_older_than_secs: 60,
                 ephemeral_lifetime_secs: 300,
                 ephemeral_persistence: EphemeralPersistence::LiveOnly,
@@ -587,15 +587,39 @@ fn merge_toml(base: &mut toml::Value, supplied: toml::Value) {
 }
 
 impl Config {
+    /// The `created_at` window an event of `kind` must fall in.
+    ///
+    /// `events.reject_older_than_secs` bounds regular events only.
+    /// Replaceable and addressable events, deletions and vanish requests are
+    /// exempt, so profiles, lists and deletions can always be rebroadcast.
+    /// AUTH uses NIP-42's fixed window instead of `[events]`, and kind 21059
+    /// may be backdated as far as NIP-59 recommends.
     pub fn timestamp_policy_for_kind(&self, kind: u64) -> wok_event::TimestampPolicy {
+        use wok_event::{AUTH_TIMESTAMP_WINDOW_SECS, GIFT_WRAP_BACKDATE_SECS};
+        if kind == wok_event::AUTH_KIND {
+            return wok_event::TimestampPolicy::from_now(
+                AUTH_TIMESTAMP_WINDOW_SECS,
+                AUTH_TIMESTAMP_WINDOW_SECS,
+                AUTH_TIMESTAMP_WINDOW_SECS,
+            );
+        }
+        let unbounded = wok_event::is_replaceable_kind(kind)
+            || wok_event::is_param_replaceable_kind(kind)
+            || kind == wok_event::DELETION_KIND
+            || kind == wok_db::VANISH_KIND;
+        let ephemeral_max_age = self.events.reject_ephemeral_older_than_secs;
         wok_event::TimestampPolicy::from_now(
             self.events.reject_newer_than_secs,
-            if kind == wok_db::VANISH_KIND {
-                u64::MAX
+            if unbounded {
+                0
             } else {
                 self.events.reject_older_than_secs
             },
-            self.events.reject_ephemeral_older_than_secs,
+            if kind == 21059 {
+                ephemeral_max_age.max(GIFT_WRAP_BACKDATE_SECS)
+            } else {
+                ephemeral_max_age
+            },
         )
     }
 
@@ -2115,6 +2139,37 @@ mod tests {
             Config::default().relay.auth.restricted_read_kinds,
             vec![4, 1059, 21059]
         );
+    }
+
+    #[test]
+    fn timestamp_windows_follow_the_kind() {
+        let mut c = Config::default();
+        assert_eq!(c.events.reject_older_than_secs, 0, "no lower bound");
+        c.events.reject_older_than_secs = 86_400;
+        // A set bound spares replaceable, addressable, deletion and vanish
+        // events.
+        for kind in [0, 3, 5, 62, 10_000, 19_999, 30_000, 39_999] {
+            let policy = c.timestamp_policy_for_kind(kind);
+            assert_eq!(policy.reject_older_than_secs, 0, "kind {kind}");
+        }
+        for kind in [1, 4, 41, 1059, 9_999, 40_000] {
+            let policy = c.timestamp_policy_for_kind(kind);
+            assert_eq!(policy.reject_older_than_secs, 86_400, "kind {kind}");
+        }
+        assert_eq!(
+            c.timestamp_policy_for_kind(20_001)
+                .reject_ephemeral_older_than_secs,
+            60
+        );
+        let wrap = c.timestamp_policy_for_kind(21059);
+        assert_eq!(wrap.reject_ephemeral_older_than_secs, 3 * 86_400);
+        assert_eq!(wrap.reject_newer_than_secs, 900);
+        // NIP-42: AUTH has its own window, whatever [events] says.
+        c.events.reject_newer_than_secs = 1;
+        c.events.reject_ephemeral_older_than_secs = 1;
+        let auth = c.timestamp_policy_for_kind(wok_event::AUTH_KIND);
+        assert_eq!(auth.reject_newer_than_secs, 600);
+        assert_eq!(auth.reject_ephemeral_older_than_secs, 600);
     }
 
     #[test]

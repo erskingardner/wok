@@ -27,7 +27,6 @@ fn test_cfg(dir: &std::path::Path) -> Config {
     cfg.relay.port = 0;
     cfg.relay.unix.enabled = false;
     cfg.relay.auth.enabled = false;
-    cfg.events.reject_older_than_secs = u64::MAX / 4;
     cfg
 }
 
@@ -1033,6 +1032,7 @@ async fn nip11_http_document() {
         "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6".into();
     cfg.relay.info.terms = "https://example.com/tos".into();
     cfg.relay.abuse.min_pow_difficulty = 20;
+    cfg.events.reject_older_than_secs = 86_400;
     let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1053,7 +1053,7 @@ async fn nip11_http_document() {
     );
     assert_eq!(client["limitation"]["max_event_tags"], 2000);
     assert_eq!(client["limitation"]["max_message_length"], 2_097_152);
-    assert_eq!(client["limitation"]["created_at_lower_limit"], u64::MAX / 4);
+    assert_eq!(client["limitation"]["created_at_lower_limit"], 86_400);
     assert_eq!(client["limitation"]["created_at_upper_limit"], 900);
     assert_eq!(client["limitation"]["default_limit"], 500);
     assert_eq!(client["limitation"]["max_total_events_per_req"], 2000);
@@ -1148,6 +1148,31 @@ fn assert_cors(response: &str) {
     ] {
         assert!(headers.contains(header), "missing {header:?}: {response}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip11_omits_created_at_lower_limit_without_a_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let cfg = test_cfg(dir.path());
+    assert_eq!(cfg.events.reject_older_than_secs, 0);
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(
+        limitation.get("created_at_lower_limit"),
+        None,
+        "{limitation}"
+    );
+    assert_eq!(limitation["created_at_upper_limit"], 900);
+    handle.request_shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

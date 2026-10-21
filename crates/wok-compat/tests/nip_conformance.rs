@@ -85,11 +85,18 @@ impl Conn {
 
     /// Answer the challenge sent on connect as `key`.
     async fn auth(&mut self, key: &Keypair) {
+        let reply = self.auth_at(key, now()).await;
+        assert_eq!(reply[2], true, "{reply}");
+    }
+
+    /// Answer the challenge sent on connect as `key` with an AUTH event
+    /// dated `created_at`, and return the OK reply.
+    async fn auth_at(&mut self, key: &Keypair, created_at: u64) -> Value {
         let challenge = self.recv().await;
         assert_eq!(challenge[0], "AUTH", "{challenge}");
         let event = sign_event_with_key(
             json!({
-                "created_at": now(),
+                "created_at": created_at,
                 "kind": 22242,
                 "tags": [["relay", AUTH_RELAY], ["challenge", challenge[1]]],
                 "content": "",
@@ -99,7 +106,7 @@ impl Conn {
         self.send(json!(["AUTH", event])).await;
         let reply = self.recv().await;
         assert_eq!(reply[0], "OK", "{reply}");
-        assert_eq!(reply[2], true, "{reply}");
+        reply
     }
 
     /// Subscribe and wait until stored events are done, so live delivery
@@ -374,6 +381,60 @@ async fn nip40_expired_ephemeral_events_are_refused_and_not_broadcast() {
     assert_eq!(subscriber.recv().await, json!(["EVENT", "ephemeral", live]));
 }
 
+/// 2020-01-01T00:00:00Z, older than the 3-year bound Wok inherited from
+/// strfry.
+const JAN_2020: u64 = 1_577_836_800;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip01_reject_older_than_zero_means_no_lower_bound() {
+    // Audit C2: a 2020 profile could not be rebroadcast. A configured 0 used
+    // to refuse every event dated in the past.
+    let relay = Relay::new(|cfg| cfg.events.reject_older_than_secs = 0);
+    let mut conn = relay.connect().await;
+    for kind in [0, 1] {
+        let old = sign_event(json!({
+            "created_at": JAN_2020,
+            "kind": kind,
+            "tags": [],
+            "content": "",
+        }));
+        let reply = conn.publish(&old).await;
+        assert_eq!(reply[2], true, "kind {kind}: {reply}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip01_lower_bound_spares_replaceable_addressable_deletion_and_vanish() {
+    // An operator-set bound applies to regular events only, so profiles,
+    // lists, deletions and vanish requests can still be rebroadcast.
+    let relay = Relay::new(|cfg| cfg.events.reject_older_than_secs = 86_400);
+    let mut conn = relay.connect().await;
+    let old = |kind: u64, tags: Value| {
+        sign_event(json!({
+            "created_at": JAN_2020,
+            "kind": kind,
+            "tags": tags,
+            "content": "",
+        }))
+    };
+    for (kind, tags) in [
+        (0, json!([])),
+        (3, json!([])),
+        (10_002, json!([["r", "wss://relay.example.com"]])),
+        (30_023, json!([["d", "post"]])),
+        (5, json!([["e", "11".repeat(32)]])),
+        (62, json!([["relay", "ALL_RELAYS"]])),
+    ] {
+        let reply = conn.publish(&old(kind, tags)).await;
+        assert_eq!(reply[2], true, "kind {kind}: {reply}");
+    }
+    let regular = old(1, json!([]));
+    assert_eq!(
+        conn.publish(&regular).await,
+        json!(["OK", regular["id"], false, "invalid: created_at too early"])
+    );
+}
+
 #[test]
 fn nip70_protected_tag_constant() {
     assert_eq!(wok_event::PROTECTED_TAG, '-');
@@ -477,6 +538,31 @@ async fn nip42_auth_events_written_by_other_writers_are_never_sent() {
             (&count[0], &count[2]["count"]),
             (&json!("COUNT"), &json!(0))
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip42_auth_accepts_about_ten_minutes_of_clock_skew() {
+    // NIP-42 suggests a window of about ten minutes. Audit B3: an AUTH signed
+    // 120 s earlier was refused by the 60 s ephemeral window.
+    let relay = auth_relay();
+    let now = now();
+    for (created_at, refusal) in [
+        (now - 120, None),
+        (now + 120, None),
+        (now - 700, Some("invalid: ephemeral event expired")),
+        (now + 700, Some("invalid: created_at too late")),
+    ] {
+        let mut conn = relay.connect().await;
+        let reply = conn.auth_at(&key(), created_at).await;
+        match refusal {
+            None => assert_eq!(reply[2], true, "{reply}"),
+            Some(reason) => assert_eq!(
+                (&reply[2], &reply[3]),
+                (&json!(false), &json!(reason)),
+                "{reply}"
+            ),
+        }
     }
 }
 
@@ -626,18 +712,29 @@ async fn nip59_ephemeral_gift_wraps_reach_only_their_recipient() {
 
     let mut publisher = relay.connect().await;
     assert_eq!(publisher.recv().await[0], "AUTH");
-    let wrap = sign_event(json!({
-        "created_at": now(),
-        "kind": 21059,
-        "tags": [["p", pubkey_hex(&recipient)]],
-        "content": "sealed",
-    }));
-    assert_eq!(publisher.publish(&wrap).await[2], true);
+    let wrap = |created_at: u64| {
+        sign_event(json!({
+            "created_at": created_at,
+            "kind": 21059,
+            "tags": [["p", pubkey_hex(&recipient)]],
+            "content": "sealed",
+        }))
+    };
+    // NIP-59 backdates wraps by up to two days, far past the 60 s window for
+    // other ephemeral kinds (audit B3).
+    for created_at in [now(), now() - 3600] {
+        let wrap = wrap(created_at);
+        assert_eq!(publisher.publish(&wrap).await[2], true);
 
-    let delivered = inbox.recv().await;
-    assert_eq!(delivered, json!(["EVENT", "inbox", wrap]));
-    assert_eq!(anonymous.try_recv().await, None);
-    assert_eq!(stranger.try_recv().await, None);
+        let delivered = inbox.recv().await;
+        assert_eq!(delivered, json!(["EVENT", "inbox", wrap]));
+        assert_eq!(anonymous.try_recv().await, None);
+        assert_eq!(stranger.try_recv().await, None);
+    }
+    let stale = wrap(now() - wok_event::GIFT_WRAP_BACKDATE_SECS - 60);
+    let reply = publisher.publish(&stale).await;
+    assert_eq!(reply[3], "invalid: ephemeral event expired", "{reply}");
+    assert_eq!(inbox.try_recv().await, None);
 }
 
 #[test]

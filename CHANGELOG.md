@@ -130,8 +130,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `listallowedevents` returns; the allow list records the approval and
   changes no visibility. The NIP-43 claim methods are not implemented.
 
+### Preset changes
+
+- `public`: `events.reject_older_than_secs` is `0`, no lower bound on
+  `created_at` (was 94608000, three years), and NIP-11 omits
+  `created_at_lower_limit`. A 2020 profile, follow list or deletion can be
+  rebroadcast again. Files that pin the old value, as copies of the 0.7
+  `docs/wok.toml` do, keep the bound, but it now spares the kinds listed
+  under Changed.
+
 ### Changed
 
+- A bound set with `events.reject_older_than_secs` applies to regular kinds
+  only. Replaceable (0, 3, 10000–19999) and addressable (30000–39999) events
+  and deletions (5) are now accepted whatever their age, like vanish requests
+  (62) already were.
+- AUTH events that fail validation (id, signature, timestamp window or NIP-40
+  expiration) are refused with `invalid:`, as they would be if sent as
+  EVENT, instead of `error:`.
 - Events that arrive while a REQ's history is being sent now come after EOSE,
   as NIP-01's "newly received in real-time" events, and the stream before
   EOSE stays newest-first. Before, stored events committed during the scan came
@@ -147,6 +163,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `events.reject_older_than_secs = 0` refused every event dated in the past.
+  It now means no lower bound.
+- AUTH used the 60-second window for ephemeral events, so a client whose
+  clock ran two minutes slow could not authenticate (`error: ephemeral event
+  expired`). AUTH is now accepted within 600 seconds of the relay clock in
+  either direction, as NIP-42 suggests, whatever `[events]` says.
+- Kind 21059 ephemeral gift wraps dated more than 60 seconds in the past were
+  refused, which was every wrap backdated as NIP-59 recommends. They may now
+  be dated up to three days in the past.
 - Ephemeral events published while a REQ's history was being sent were lost.
   The live filter was installed only after the history, and live-only events
   are never stored, so nothing could catch them up: NIP-46 replies and

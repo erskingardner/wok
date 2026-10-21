@@ -180,11 +180,21 @@ impl ReadVisibility {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        // NIP-59 backdates gift wraps by days, so a kind 21059's lifetime
+        // starts at the oldest date it may carry. Otherwise a wrap accepted
+        // at publication would already have expired and reach no one.
+        let lifetime_start = if event.kind() == 21059 {
+            event
+                .created_at()
+                .saturating_add(wok_event::GIFT_WRAP_BACKDATE_SECS)
+        } else {
+            event.created_at()
+        };
         if (event.expiration() > 1 && event.expiration() <= now)
             || (event.expiration() == 1
                 && self
                     .ephemeral_lifetime_secs
-                    .is_some_and(|ttl| event.created_at().saturating_add(ttl) <= now))
+                    .is_some_and(|ttl| lifetime_start.saturating_add(ttl) <= now))
         {
             return Ok(false);
         }
@@ -267,6 +277,40 @@ mod tests {
         };
         let auth = PackedEventBuilder::build(&[1u8; 32], &author, now, 22242, 1, &tags).unwrap();
         assert!(operator.allows(&txn, auth.view()).unwrap());
+    }
+
+    #[test]
+    fn ephemeral_gift_wraps_live_as_long_as_they_may_be_backdated() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let txn = env.begin_ro().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let visibility = ReadVisibility {
+            ephemeral_lifetime_secs: Some(300),
+            ..ReadVisibility::default()
+        };
+        let backdate = wok_event::GIFT_WRAP_BACKDATE_SECS;
+        let tags = PackedEventTagBuilder::default();
+        for (kind, created_at, visible) in [
+            (20_001, now - 60, true),
+            (20_001, now - 3600, false),
+            (21059, now - 3600, true),
+            (21059, now - backdate, true),
+            (21059, now - backdate - 400, false),
+        ] {
+            let ev = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], created_at, kind, 1, &tags)
+                .unwrap();
+            assert_eq!(
+                visibility.globally_visible(&txn, ev.view()).unwrap(),
+                visible,
+                "kind {kind} dated {} s ago",
+                now - created_at
+            );
+        }
     }
 
     #[test]

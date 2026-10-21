@@ -119,6 +119,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps them, and verification compares the result with the original's
   fingerprint without them.
 
+- NIP-86 `unbanevent`, `unallowevent`, `listallowedevents` and
+  `listdisallowedkinds`, from the current NIP-86 draft. `allowevent` also
+  puts the event on an allow list, with its optional reason, which
+  `listallowedevents` returns; the allow list records the approval and
+  changes no visibility. The NIP-43 claim methods are not implemented.
+
 ### Removed
 
 - Dated benchmark, soak, lab and audit reports, the definition-of-done report
@@ -217,6 +223,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Stored payloads keep that escaping. `wok import`, `wok sync` and
   `wok router` downloads also accept the legacy id, so data from strfry and
   earlier Wok releases still verifies.
+- NIP-86 ban and allow lists replace each other, as NIP-86 asks:
+  `banpubkey` and `banevent` take the pubkey or event off the allow list,
+  and `allowpubkey` and `allowevent` lift its ban. A pubkey could be on both
+  lists, and the ban won.
+- NIP-86 `supportedmethods` lists only the methods the caller may call, so
+  moderators no longer see the admin-only ones.
+- NIP-86 `listallowedkinds` lists the kinds named by `allowkind` since their
+  last `disallowkind`. It listed every allowed kind: all 65,536 with no kind
+  policy, and 65,535 after one `disallowkind`. `listdisallowedkinds` lists
+  the disallowed kinds. Which kinds are accepted does not change.
 - The relay is served on a single endpoint, as NIP-01 requires. Only `/`
   accepts WebSocket upgrades and serves NIP-11, NIP-86 and the landing page;
   other paths return 404, apart from `/admin`, `/metrics` and the nodeinfo

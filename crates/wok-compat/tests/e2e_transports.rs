@@ -1515,8 +1515,50 @@ async fn nip86_management_api_e2e() {
         !msgs.iter().any(|t| t.contains("nip86-e2e-one")),
         "banned event must be suppressed, got {msgs:?}"
     );
-    let (_, result) = nip86_rpc(addr, &admin_key, "allowevent", json!([ev1_id])).await;
+    let (_, result) = nip86_rpc(addr, &admin_key, "unbanevent", json!([ev1_id])).await;
     assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedevents", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedevents", json!([])).await;
+    assert_eq!(
+        result["result"],
+        json!([]),
+        "unbanevent must not allow the event: {result}"
+    );
+    ws.send(Message::Text(
+        json!(["REQ", "s5", {"ids": [ev1_id]}]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        msgs.iter().any(|t| t.contains("nip86-e2e-one")),
+        "unbanevent must restore the event, got {msgs:?}"
+    );
+
+    // allowevent and banevent move the event between the two lists.
+    let (_, result) = nip86_rpc(addr, &admin_key, "banevent", json!([ev1_id, "illegal"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowevent", json!([ev1_id, "fine"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedevents", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedevents", json!([])).await;
+    assert_eq!(
+        result["result"],
+        json!([{"id": ev1_id, "reason": "fine"}]),
+        "{result}"
+    );
+    let (_, result) = nip86_rpc(addr, &admin_key, "unallowevent", json!([ev1_id])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedevents", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedevents", json!([])).await;
+    assert_eq!(
+        result["result"],
+        json!([]),
+        "unallowevent must not ban the event: {result}"
+    );
 
     // A NIP-56 report feeds the moderation queue; banevent dequeues it.
     let report = sign_event_with_key(
@@ -1573,6 +1615,13 @@ async fn nip86_management_api_e2e() {
     )
     .await;
     assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &mod_key, "supportedmethods", json!([])).await;
+    let methods = result["result"].as_array().unwrap();
+    assert!(methods.contains(&json!("banpubkey")), "{result}");
+    assert!(
+        !methods.contains(&json!("changerelayname")),
+        "moderators are offered only what they may call: {result}"
+    );
     let (_, result) = nip86_rpc(addr, &mod_key, "banpubkey", json!([alice_hex])).await;
     assert_eq!(
         result["result"],
@@ -1767,6 +1816,25 @@ async fn nip86_restrict_writes_allowlist_e2e() {
     let msgs = ws_publish(&mut ws, publish("allowed-after-allow")).await;
     assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
 
+    // banpubkey takes the pubkey off the allow list, and allowpubkey lifts
+    // the ban.
+    let (_, result) = nip86_rpc(addr, &admin_key, "banpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedpubkeys", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let msgs = ws_publish(&mut ws, publish("denied-after-ban")).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains("false") && t.contains("restricted")),
+        "{msgs:?}"
+    );
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedpubkeys", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let msgs = ws_publish(&mut ws, publish("allowed-after-reallow")).await;
+    assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
+
     let (_, result) = nip86_rpc(addr, &admin_key, "unallowpubkey", json!([alice_hex])).await;
     assert_eq!(result["result"], json!(true), "{result}");
     let msgs = ws_publish(&mut ws, publish("denied-after-unallow")).await;
@@ -1825,14 +1893,20 @@ async fn nip86_kind_policy_e2e() {
     let msgs = ws_publish(&mut ws, publish("kind-policy-one")).await;
     assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
 
+    // With no policy both lists are empty, not all 65,536 kinds.
+    for method in ["listallowedkinds", "listdisallowedkinds"] {
+        let (_, result) = nip86_rpc(addr, &admin_key, method, json!([])).await;
+        assert_eq!(result["result"], json!([]), "{method}: {result}");
+    }
+
     // disallowkind rejects new writes and suppresses stored events, including
     // from REQs without a kinds field.
     let (_, result) = nip86_rpc(addr, &admin_key, "disallowkind", json!([1])).await;
     assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listdisallowedkinds", json!([])).await;
+    assert_eq!(result["result"], json!([1]), "{result}");
     let (_, result) = nip86_rpc(addr, &admin_key, "listallowedkinds", json!([])).await;
-    let kinds = result["result"].as_array().unwrap();
-    assert_eq!(kinds.len(), 65535, "{result}");
-    assert!(!kinds.contains(&json!(1)), "{result}");
+    assert_eq!(result["result"], json!([]), "{result}");
     let msgs = ws_publish(&mut ws, publish("kind-policy-two")).await;
     assert!(
         msgs.iter()
@@ -1853,6 +1927,10 @@ async fn nip86_kind_policy_e2e() {
     // allowkind restores both admission and visibility.
     let (_, result) = nip86_rpc(addr, &admin_key, "allowkind", json!([1])).await;
     assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedkinds", json!([])).await;
+    assert_eq!(result["result"], json!([1]), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listdisallowedkinds", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
     let msgs = ws_publish(&mut ws, publish("kind-policy-three")).await;
     assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
     ws.send(Message::Text(

@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod clients;
+mod live;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -137,6 +138,38 @@ struct Args {
     /// Fail --scenario clients when any request is refused.
     #[arg(long)]
     expect_no_refusals: bool,
+    /// Authors that monitor_index and live_subscriptions follow lists, posts
+    /// and mentions draw from, by a Zipf law.
+    #[arg(long, default_value_t = 20_000)]
+    live_authors: usize,
+    /// Connections in --scenario monitor_index and live_subscriptions.
+    #[arg(long, default_value_t = 1_000)]
+    live_conns: usize,
+    /// Subscriptions per connection. Of every ten, six are author feeds, then
+    /// a `#p` mention, a `#p` zap receipt and two `#e` thread subscriptions.
+    #[arg(long, default_value_t = 10)]
+    live_subs_per_conn: usize,
+    /// Smallest feed author list.
+    #[arg(long, default_value_t = 50)]
+    live_min_authors: usize,
+    /// Largest feed author list, also the size churn REQs use.
+    #[arg(long, default_value_t = 500)]
+    live_max_authors: usize,
+    /// Events --scenario monitor_index matches before its churn.
+    #[arg(long, default_value_t = 20_000)]
+    live_events: usize,
+    /// Publications per second in --scenario live_subscriptions.
+    #[arg(long, default_value_t = 50.0)]
+    live_rate: f64,
+    /// Seconds of the steady, churn and recovered live_subscriptions phases.
+    #[arg(long, default_value_t = 10)]
+    live_phase_secs: u64,
+    /// Extra connections that churn subscriptions in live_subscriptions.
+    #[arg(long, default_value_t = 50)]
+    live_churners: usize,
+    /// REQs per second the live_subscriptions churners send in total.
+    #[arg(long, default_value_t = 200.0)]
+    live_churn_rate: f64,
 }
 
 impl Args {
@@ -180,6 +213,10 @@ struct Trial {
     client_tcp_nodelay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     clients: Option<clients::ClientsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor_index: Option<live::IndexReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_subscriptions: Option<live::LiveReport>,
 }
 
 #[derive(Serialize)]
@@ -309,6 +346,8 @@ fn main() -> Result<()> {
         "duplicate_import",
         "cold_start",
         "clients",
+        "monitor_index",
+        "live_subscriptions",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -436,7 +475,10 @@ fn main() -> Result<()> {
         for scenario in &scenarios {
             let mut relays: Vec<&str> = if args.has_external_target() {
                 vec![args.target_label.as_str()]
-            } else if matches!(*scenario, "nip50_search" | "clients") {
+            } else if matches!(
+                *scenario,
+                "nip50_search" | "clients" | "monitor_index" | "live_subscriptions"
+            ) {
                 vec!["wok"]
             } else {
                 RELAYS.to_vec()
@@ -509,8 +551,11 @@ fn run_trial(
     let mut notes = String::new();
     let mut throughput = 0.0f64;
     let mut clients_report = None;
+    let mut monitor_index_report = None;
+    let mut live_report = None;
 
-    let bin = if args.has_external_target() {
+    let bin = if args.has_external_target() || scenario == "monitor_index" {
+        // monitor_index runs the index compiled into this binary.
         None
     } else if relay == "wok" {
         Some(args.wok.as_path())
@@ -818,6 +863,48 @@ fn run_trial(
                 }
             }
         }
+        "monitor_index" => match live::run_index(&live_options(args)) {
+            Ok(report) => {
+                throughput = 1e9 / report.matched.mean().max(f64::MIN_POSITIVE);
+                // The latency columns hold per-event match time in µs, not ms.
+                for v in report.matched.iter_recorded() {
+                    hist.record_n(v.value_iterated_to(), v.count_at_value())?;
+                }
+                mismatches += report.mismatches;
+                ok = report.mismatches == 0;
+                notes = format!(
+                    "in-process ActiveMonitors: {} subscriptions, {} events matched per second of monitor CPU; latency columns are per-event match time in µs, not ms; see the monitor_index table",
+                    report.subscriptions, report.events
+                );
+                monitor_index_report = Some(report);
+            }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e:#}");
+            }
+        },
+        "live_subscriptions" => {
+            let bin = local_bin()?;
+            match live_subscriptions_trial(rt, args, bin, dir.path(), &mut hist) {
+                Ok(report) => {
+                    let steady = report.steady();
+                    throughput = steady.deliveries as f64 / steady.secs.max(f64::MIN_POSITIVE);
+                    mismatches += report.mismatches();
+                    ok = report.mismatches() == 0;
+                    notes = format!(
+                        "{} subscriptions on {} connections; latency is steady-phase fan-out, see the live_subscriptions table",
+                        report.subscriptions, report.conns
+                    );
+                    live_report = Some(report);
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e:#}");
+                }
+            }
+        }
         _ => {
             notes = "unrecognized scenario".into();
             ok = false;
@@ -826,6 +913,8 @@ fn run_trial(
 
     Ok(Trial {
         clients: clients_report,
+        monitor_index: monitor_index_report,
+        live_subscriptions: live_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -864,6 +953,8 @@ fn failed_trial(
 ) -> Trial {
     Trial {
         clients: None,
+        monitor_index: None,
+        live_subscriptions: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -2428,6 +2519,40 @@ fn cold_start_trial(
     Ok(ms)
 }
 
+fn live_options(args: &Args) -> live::Options {
+    live::Options {
+        authors: args.live_authors.max(2 * args.live_max_authors).max(2),
+        conns: args.live_conns,
+        subs_per_conn: args.live_subs_per_conn,
+        min_authors: args.live_min_authors.min(args.live_max_authors),
+        max_authors: args.live_max_authors,
+        events: args.live_events,
+        rate: args.live_rate,
+        phase_secs: args.live_phase_secs,
+        churners: args.live_churners,
+        churn_rate: args.live_churn_rate,
+        seed: args.seed,
+    }
+}
+
+/// Spawn the relay, run the live_subscriptions phases against it, and record
+/// steady-phase fan-out latency in `hist` (µs).
+fn live_subscriptions_trial(
+    rt: &tokio::runtime::Runtime,
+    args: &Args,
+    bin: &Path,
+    dbdir: &Path,
+    hist: &mut Histogram<u64>,
+) -> Result<live::LiveReport> {
+    let (url, mut child) = start_target(Some(bin), None, dbdir)?;
+    let pid = child.as_ref().map(Child::id);
+    let report = rt.block_on(live::run_live(&url, pid, &live_options(args)));
+    stop_target(&mut child, &url);
+    let report = report?;
+    hist.add(&report.steady_fanout)?;
+    Ok(report)
+}
+
 fn clients_options(args: &Args) -> clients::ClientsOptions {
     clients::ClientsOptions {
         outbox_clients: args.clients,
@@ -2610,6 +2735,12 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.clients {
             s.push_str(&clients::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.monitor_index {
+            s.push_str(&live::render_index_markdown(report));
+        }
+        if let Some(report) = &t.live_subscriptions {
+            s.push_str(&live::render_live_markdown(report));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -2636,6 +2767,24 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if args.expect_no_refusals {
             selection.push_str(" --expect-no-refusals");
         }
+    }
+    if matches!(
+        args.scenario.as_deref(),
+        Some("monitor_index" | "live_subscriptions")
+    ) {
+        selection.push_str(&format!(
+            " --live-authors {} --live-conns {} --live-subs-per-conn {} --live-min-authors {} --live-max-authors {} --live-events {} --live-rate {} --live-phase-secs {} --live-churners {} --live-churn-rate {}",
+            args.live_authors,
+            args.live_conns,
+            args.live_subs_per_conn,
+            args.live_min_authors,
+            args.live_max_authors,
+            args.live_events,
+            args.live_rate,
+            args.live_phase_secs,
+            args.live_churners,
+            args.live_churn_rate,
+        ));
     }
     let target = if let Some(path) = &args.target_unix {
         format!(

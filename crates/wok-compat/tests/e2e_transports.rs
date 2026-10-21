@@ -1061,16 +1061,163 @@ async fn nip11_http_document() {
     assert_eq!(client["limitation"]["max_query_cost"], 1000);
     assert_eq!(client["limitation"]["max_tags_per_filter"], 3);
     assert_eq!(client["limitation"]["max_and_entries"], 16);
-    assert_eq!(
-        client["software"],
-        "git+https://github.com/erskingardner/wok.git"
-    );
+    // NIP-11: `software` MUST be a URL to the project's homepage.
+    assert_eq!(client["software"], "https://github.com/erskingardner/wok");
     // npub is converted to hex like C++.
     assert_eq!(
         client["pubkey"],
         "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
     );
     assert_eq!(client["terms_of_service"], "https://example.com/tos");
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_is_served_on_a_single_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let handle = wok_relay::start(env, test_cfg(dir.path())).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // NIP-01: path segments do not change the relay, so only the root
+    // accepts connections and serves the relay documents.
+    for path in ["/foo", "/foo/bar", "//", "/admin/x"] {
+        match tokio_tungstenite::connect_async(format!("ws://{addr}{path}")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 404, "{path}")
+            }
+            other => panic!("{path} must not upgrade: {:?}", other.map(|_| ())),
+        }
+        let nip11 = raw_http(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(nip11.starts_with("HTTP/1.1 404"), "{path}: {nip11}");
+        let page = raw_http(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(page.starts_with("HTTP/1.1 404"), "{path}: {page}");
+    }
+
+    for url in [format!("ws://{addr}"), format!("ws://{addr}/?client=x")] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(Message::Text(
+            json!(["REQ", "root", {"limit": 0}]).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+        assert!(msgs.iter().any(|t| t.contains("EOSE")), "{url}: {msgs:?}");
+    }
+    let nip11 = raw_http(
+        addr,
+        "GET /?client=x HTTP/1.1\r\nHost: localhost\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(nip11.starts_with("HTTP/1.1 200"), "{nip11}");
+    assert!(nip11.contains("\"supported_nips\""), "{nip11}");
+    let metrics = raw_http(
+        addr,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
+    handle.request_shutdown();
+}
+
+fn assert_cors(response: &str) {
+    let headers = response
+        .split("\r\n\r\n")
+        .next()
+        .unwrap()
+        .to_ascii_lowercase();
+    for header in [
+        "access-control-allow-origin: *",
+        "access-control-allow-headers: content-type, authorization, accept",
+        "access-control-allow-methods: get, post, options",
+    ] {
+        assert!(headers.contains(header), "missing {header:?}: {response}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip11_and_nip86_accept_cors_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(admin_key.x_only_public_key().0.serialize())];
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // NIP-11: relays MUST accept CORS requests. A browser NIP-86 tool sends
+    // this preflight before its POST.
+    let preflight = raw_http(
+        addr,
+        &format!("OPTIONS / HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://manager.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization, content-type\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(preflight.starts_with("HTTP/1.1 204"), "{preflight}");
+    assert!(!preflight.contains("<html"), "{preflight}");
+    assert_cors(&preflight);
+
+    // Accept is a media-range list, not one exact string.
+    let nip11 = raw_http(
+        addr,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept: application/nostr+json, application/json;q=0.9\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(nip11.starts_with("HTTP/1.1 200"), "{nip11}");
+    assert!(nip11.contains("\"supported_nips\""), "{nip11}");
+    assert_cors(&nip11);
+    assert!(
+        nip11.to_ascii_lowercase().contains("vary: accept"),
+        "{nip11}"
+    );
+    let page = raw_http(
+        addr,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept: text/html,*/*;q=0.8\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(page.contains("<html"), "{page}");
+    assert_cors(&page);
+    assert!(page.to_ascii_lowercase().contains("vary: accept"), "{page}");
+
+    // NIP-86 replies carry the headers too, refusals included.
+    let body = json!({"method": "supportedmethods", "params": []}).to_string();
+    let unauthorized = raw_http(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/nostr+json+rpc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert!(unauthorized.starts_with("HTTP/1.1 401"), "{unauthorized}");
+    assert_cors(&unauthorized);
+    let authorized = raw_http(addr, &nip86_request(addr, &admin_key, &body)).await;
+    assert!(authorized.starts_with("HTTP/1.1 200"), "{authorized}");
+    assert!(authorized.contains("banpubkey"), "{authorized}");
+    assert_cors(&authorized);
     handle.request_shutdown();
 }
 
@@ -1373,8 +1520,50 @@ async fn nip86_management_api_e2e() {
         !msgs.iter().any(|t| t.contains("nip86-e2e-one")),
         "banned event must be suppressed, got {msgs:?}"
     );
-    let (_, result) = nip86_rpc(addr, &admin_key, "allowevent", json!([ev1_id])).await;
+    let (_, result) = nip86_rpc(addr, &admin_key, "unbanevent", json!([ev1_id])).await;
     assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedevents", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedevents", json!([])).await;
+    assert_eq!(
+        result["result"],
+        json!([]),
+        "unbanevent must not allow the event: {result}"
+    );
+    ws.send(Message::Text(
+        json!(["REQ", "s5", {"ids": [ev1_id]}]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        msgs.iter().any(|t| t.contains("nip86-e2e-one")),
+        "unbanevent must restore the event, got {msgs:?}"
+    );
+
+    // allowevent and banevent move the event between the two lists.
+    let (_, result) = nip86_rpc(addr, &admin_key, "banevent", json!([ev1_id, "illegal"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowevent", json!([ev1_id, "fine"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedevents", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedevents", json!([])).await;
+    assert_eq!(
+        result["result"],
+        json!([{"id": ev1_id, "reason": "fine"}]),
+        "{result}"
+    );
+    let (_, result) = nip86_rpc(addr, &admin_key, "unallowevent", json!([ev1_id])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedevents", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedevents", json!([])).await;
+    assert_eq!(
+        result["result"],
+        json!([]),
+        "unallowevent must not ban the event: {result}"
+    );
 
     // A NIP-56 report feeds the moderation queue; banevent dequeues it.
     let report = sign_event_with_key(
@@ -1431,6 +1620,13 @@ async fn nip86_management_api_e2e() {
     )
     .await;
     assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &mod_key, "supportedmethods", json!([])).await;
+    let methods = result["result"].as_array().unwrap();
+    assert!(methods.contains(&json!("banpubkey")), "{result}");
+    assert!(
+        !methods.contains(&json!("changerelayname")),
+        "moderators are offered only what they may call: {result}"
+    );
     let (_, result) = nip86_rpc(addr, &mod_key, "banpubkey", json!([alice_hex])).await;
     assert_eq!(
         result["result"],
@@ -1625,6 +1821,25 @@ async fn nip86_restrict_writes_allowlist_e2e() {
     let msgs = ws_publish(&mut ws, publish("allowed-after-allow")).await;
     assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
 
+    // banpubkey takes the pubkey off the allow list, and allowpubkey lifts
+    // the ban.
+    let (_, result) = nip86_rpc(addr, &admin_key, "banpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedpubkeys", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let msgs = ws_publish(&mut ws, publish("denied-after-ban")).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains("false") && t.contains("restricted")),
+        "{msgs:?}"
+    );
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowpubkey", json!([alice_hex])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listbannedpubkeys", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
+    let msgs = ws_publish(&mut ws, publish("allowed-after-reallow")).await;
+    assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
+
     let (_, result) = nip86_rpc(addr, &admin_key, "unallowpubkey", json!([alice_hex])).await;
     assert_eq!(result["result"], json!(true), "{result}");
     let msgs = ws_publish(&mut ws, publish("denied-after-unallow")).await;
@@ -1683,14 +1898,20 @@ async fn nip86_kind_policy_e2e() {
     let msgs = ws_publish(&mut ws, publish("kind-policy-one")).await;
     assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
 
+    // With no policy both lists are empty, not all 65,536 kinds.
+    for method in ["listallowedkinds", "listdisallowedkinds"] {
+        let (_, result) = nip86_rpc(addr, &admin_key, method, json!([])).await;
+        assert_eq!(result["result"], json!([]), "{method}: {result}");
+    }
+
     // disallowkind rejects new writes and suppresses stored events, including
     // from REQs without a kinds field.
     let (_, result) = nip86_rpc(addr, &admin_key, "disallowkind", json!([1])).await;
     assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listdisallowedkinds", json!([])).await;
+    assert_eq!(result["result"], json!([1]), "{result}");
     let (_, result) = nip86_rpc(addr, &admin_key, "listallowedkinds", json!([])).await;
-    let kinds = result["result"].as_array().unwrap();
-    assert_eq!(kinds.len(), 65535, "{result}");
-    assert!(!kinds.contains(&json!(1)), "{result}");
+    assert_eq!(result["result"], json!([]), "{result}");
     let msgs = ws_publish(&mut ws, publish("kind-policy-two")).await;
     assert!(
         msgs.iter()
@@ -1711,6 +1932,10 @@ async fn nip86_kind_policy_e2e() {
     // allowkind restores both admission and visibility.
     let (_, result) = nip86_rpc(addr, &admin_key, "allowkind", json!([1])).await;
     assert_eq!(result["result"], json!(true), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listallowedkinds", json!([])).await;
+    assert_eq!(result["result"], json!([1]), "{result}");
+    let (_, result) = nip86_rpc(addr, &admin_key, "listdisallowedkinds", json!([])).await;
+    assert_eq!(result["result"], json!([]), "{result}");
     let msgs = ws_publish(&mut ws, publish("kind-policy-three")).await;
     assert!(msgs.iter().any(|t| t.contains("true")), "{msgs:?}");
     ws.send(Message::Text(

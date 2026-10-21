@@ -31,7 +31,8 @@ use wok_relay::{
     supported_nips, Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource,
 };
 
-const SOFTWARE: &str = "git+https://github.com/erskingardner/wok.git";
+/// NIP-11 `software` MUST be the project's homepage URL.
+const SOFTWARE: &str = "https://github.com/erskingardner/wok";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("WOK_GIT_HASH");
 pub(crate) const WOK_MARK_SVG: &str = r##"<svg viewBox="0 0 1028 1028" aria-hidden="true" focusable="false"><rect width="1028" height="1028" fill="#090B0F"/><path fill="currentColor" d="M299.15 797.05C278.15 797.05 260 791.65 244.7 780.85C229.7 769.75 217.1 754 206.9 733.6C196.7 712.9 188 688.15 180.8 659.35C176.9 643.45 173.3 625.6 170 605.8C167 585.7 164.3 564.55 161.9 542.35C159.8 520.15 158 497.65 156.5 474.85C155.3 452.05 154.4 429.7 153.8 407.8C153.5 385.9 153.35 365.5 153.35 346.6C153.35 333.4 153.95 320.95 155.15 309.25C156.65 297.25 159.5 286.75 163.7 277.75C167.9 268.45 173.9 261.25 181.7 256.15C189.5 250.75 199.7 248.05 212.3 248.05C232.4 248.05 246.65 253.6 255.05 264.7C263.75 275.8 269 291.85 270.8 312.85C271.1 334.15 271.55 354.25 272.15 373.15C272.75 391.75 273.5 409.6 274.4 426.7C275.3 443.5 276.2 460 277.1 476.2C278.3 492.1 279.65 507.85 281.15 523.45C282.65 539.05 284.3 554.95 286.1 571.15C289.4 601.15 294.65 623.95 301.85 639.55C309.05 655.15 318.65 662.95 330.65 662.95C342.65 662.95 352.25 655.75 359.45 641.35C366.65 626.95 373.7 604.6 380.6 574.3C384.2 558.1 387.8 540.85 391.4 522.55C395 504.25 398.6 485.65 402.2 466.75C405.8 447.55 409.4 428.95 413 410.95C416.6 392.65 419.9 375.4 422.9 359.2C430.7 319.9 441.35 289.6 454.85 268.3C468.65 247 488.6 236.35 514.7 236.35C530 236.35 542.75 241.75 552.95 252.55C563.45 263.35 572.15 277.75 579.05 295.75C585.95 313.75 591.8 333.4 596.6 354.7C599.3 368.2 602 382.15 604.7 396.55C607.4 410.95 610.1 425.5 612.8 440.2C615.5 454.9 618.2 469.6 620.9 484.3C623.6 499 626.15 513.4 628.55 527.5C630.95 541.3 633.2 554.5 635.3 567.1C640.1 596.2 645.2 618.25 650.6 633.25C656.3 648.25 665.3 655.75 677.6 655.75C689 655.75 698.3 647.8 705.5 631.9C713 615.7 719.45 594.7 724.85 568.9C728.15 553.9 731.15 537.7 733.85 520.3C736.85 502.6 739.4 484.45 741.5 465.85C743.9 446.95 746 428.5 747.8 410.5C749.9 392.2 751.7 374.95 753.2 358.75C754.7 342.25 756.05 327.55 757.25 314.65C759.05 302.95 762.05 292.9 766.25 284.5C770.45 275.8 776.75 269.05 785.15 264.25C793.55 259.15 804.65 256.6 818.45 256.6C828.95 256.6 837.65 258.7 844.55 262.9C851.75 267.1 857.45 272.95 861.65 280.45C865.85 287.65 868.85 296.2 870.65 306.1C872.45 315.7 873.35 326.35 873.35 338.05C873.35 353.65 872.6 372.55 871.1 394.75C869.6 416.65 867.35 440.2 864.35 465.4C861.65 490.6 858.05 515.95 853.55 541.45C849.35 566.65 844.4 590.65 838.7 613.45C833.3 635.95 827.15 655.6 820.25 672.4C805.25 710.8 786.8 740.2 764.9 760.6C743 780.7 719 790.75 692.9 790.75C663.8 790.75 640.7 782.2 623.6 765.1C606.5 747.7 592.55 720.55 581.75 683.65C579.05 671.95 576.35 659.95 573.65 647.65C570.95 635.05 568.25 622.15 565.55 608.95C563.15 595.75 560.6 582.25 557.9 568.45C555.2 554.35 552.5 540.1 549.8 525.7C547.4 511 545 496.15 542.6 481.15C538.1 453.55 533.45 431.5 528.65 415C523.85 398.2 517.4 389.8 509.3 389.8C501.5 389.8 494.75 398.65 489.05 416.35C483.65 433.75 478.4 455.2 473.3 480.7C465.8 517.9 458.6 554.05 451.7 589.15C445.1 623.95 437 656.35 427.4 686.35C416.9 714.25 405.5 736.3 393.2 752.5C380.9 768.4 366.95 779.8 351.35 786.7C336.05 793.6 318.65 797.05 299.15 797.05Z"/></svg>"##;
@@ -216,20 +217,11 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
-    let source = TransportSource::ip_address(peer.ip());
-    if is_ws_upgrade {
-        if !handle.admit_connection(&source) {
-            return text_status_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate-limited: connection budget exhausted",
-            );
-        }
-        return upgrade_ws(req, handle, peer).await;
-    }
-    // Plain HTTP endpoints (/admin/api/*, /metrics, NIP-11, ...) otherwise
-    // have no per-IP budget: every /admin/api attempt runs a Schnorr
+    // WebSocket upgrades and plain HTTP share the per-IP connection budget.
+    // Plain HTTP endpoints (/admin/api/*, /metrics, NIP-11, ...) would
+    // otherwise have none: every /admin/api attempt runs a Schnorr
     // verification before rejection, a straight unauthenticated CPU drain.
-    // Gate them behind the connection budget.
+    let source = TransportSource::ip_address(peer.ip());
     if !handle.admit_connection(&source) {
         return text_status_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -237,10 +229,28 @@ async fn dispatch(
         );
     }
     let path = req.uri().path().to_string();
+    // NIP-01: the relay is a single endpoint. Extra path segments change
+    // nothing, so only the root upgrades and serves the relay documents.
+    if is_ws_upgrade {
+        if path != "/" {
+            return not_found();
+        }
+        return upgrade_ws(req, handle, peer).await;
+    }
     if matches!(path.as_str(), "/admin" | "/admin/") || path.starts_with("/admin/api/") {
         return admin::dispatch(req, handle, admin_state).await;
     }
+    if !matches!(
+        path.as_str(),
+        "/" | "/metrics" | "/.well-known/nodeinfo" | "/nodeinfo/2.1" | "/favicon.ico"
+    ) {
+        return not_found();
+    }
+    if req.method() == hyper::Method::OPTIONS {
+        return preflight_response();
+    }
     // NIP-86 management RPC arrives as an HTTP POST to the relay URI itself.
+    // Browser management tools call it cross-origin, so it carries CORS too.
     if path == "/"
         && req.method() == hyper::Method::POST
         && req
@@ -250,7 +260,7 @@ async fn dispatch(
             .map(|value| value.starts_with(nip86::RPC_CONTENT_TYPE))
             .unwrap_or(false)
     {
-        return nip86::dispatch(req, handle, admin_state).await;
+        return with_cors(nip86::dispatch(req, handle, admin_state).await);
     }
     let host = req
         .headers()
@@ -258,12 +268,7 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let accept = req
-        .headers()
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let wants_nip11 = accepts_nip11(req.headers());
     let cfg = handle.config.read().clone();
     if path == "/metrics" {
         return text_response("text/plain; version=0.0.4", handle.metrics.render());
@@ -295,18 +300,48 @@ async fn dispatch(
         return json_response(&body);
     }
     if path == "/favicon.ico" {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "image/x-icon")
-            .header("Cache-Control", "public, max-age=31536000")
-            .header("Access-Control-Allow-Origin", "*")
-            .body(Full::new(Bytes::from_static(&[0, 0, 1, 0])))
-            .unwrap_or_else(|_| empty(StatusCode::OK));
+        return with_cors(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "image/x-icon")
+                .header("Cache-Control", "public, max-age=31536000")
+                .body(Full::new(Bytes::from_static(&[0, 0, 1, 0])))
+                .unwrap_or_else(|_| empty(StatusCode::OK)),
+        );
     }
-    if accept == "application/nostr+json" {
-        return json_response(&nip11(&cfg, &handle));
-    }
-    html_response(&landing(&cfg, &handle.supported_nips()))
+    let mut response = if wants_nip11 {
+        json_response(&nip11(&cfg, &handle))
+    } else {
+        html_response(&landing(&cfg, &handle.supported_nips()))
+    };
+    // `/` serves two documents, so caches must key on Accept too.
+    response.headers_mut().insert(
+        hyper::header::VARY,
+        hyper::header::HeaderValue::from_static("Accept"),
+    );
+    response
+}
+
+/// Whether the `Accept` media-range list names `application/nostr+json` with
+/// a nonzero quality. Wildcards don't count: browsers send `*/*` and get the
+/// landing page.
+fn accepts_nip11(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get_all(hyper::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|range| {
+            let mut parts = range.split(';');
+            let media_type = parts.next().unwrap_or("").trim();
+            media_type.eq_ignore_ascii_case("application/nostr+json")
+                && !parts.any(|param| {
+                    param.split_once('=').is_some_and(|(name, value)| {
+                        name.trim().eq_ignore_ascii_case("q")
+                            && value.trim().parse::<f32>() == Ok(0.0)
+                    })
+                })
+        })
 }
 
 fn maybe_npub(s: &str) -> String {
@@ -569,45 +604,68 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// NIP-11 requires CORS on the relay URI. Every public response carries
+/// these headers, NIP-86 replies included.
+const CORS_HEADERS: [(&str, &str); 3] = [
+    ("Access-Control-Allow-Origin", "*"),
+    (
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, Accept",
+    ),
+    ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+];
+
+fn with_cors(mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+    for (name, value) in CORS_HEADERS {
+        response
+            .headers_mut()
+            .insert(name, hyper::header::HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// Answer a CORS preflight. The headers already say what is allowed.
+fn preflight_response() -> Response<Full<Bytes>> {
+    with_cors(empty(StatusCode::NO_CONTENT))
+}
+
+fn public_response(status: StatusCode, content_type: &str, body: Bytes) -> Response<Full<Bytes>> {
+    with_cors(
+        Response::builder()
+            .status(status)
+            .header("Content-Type", content_type)
+            .header("Server", "wok")
+            .body(Full::new(body))
+            .unwrap_or_else(|_| empty(status)),
+    )
+}
+
 fn json_response(v: &serde_json::Value) -> Response<Full<Bytes>> {
-    let body = v.to_string();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/json")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Server", "wok")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| empty(StatusCode::OK))
+    public_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(v.to_string()),
+    )
 }
 
 fn text_response(ct: &str, body: String) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", ct)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Server", "wok")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| empty(StatusCode::OK))
+    public_response(StatusCode::OK, ct, Bytes::from(body))
 }
 
 fn text_status_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header("Content-Type", "text/plain; charset=utf-8")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Server", "wok")
-        .body(Full::new(Bytes::copy_from_slice(body.as_bytes())))
-        .unwrap_or_else(|_| empty(status))
+    public_response(
+        status,
+        "text/plain; charset=utf-8",
+        Bytes::copy_from_slice(body.as_bytes()),
+    )
 }
 
 fn html_response(body: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/html")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Server", "wok")
-        .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap_or_else(|_| empty(StatusCode::OK))
+    public_response(StatusCode::OK, "text/html", Bytes::from(body.to_string()))
+}
+
+fn not_found() -> Response<Full<Bytes>> {
+    text_status_response(StatusCode::NOT_FOUND, "not found")
 }
 
 fn empty(status: StatusCode) -> Response<Full<Bytes>> {
@@ -925,6 +983,61 @@ mod landing_tests {
 
         assert!(server.nodelay().unwrap());
         drop(client);
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+
+    fn accept(values: &[&str]) -> bool {
+        let mut headers = hyper::HeaderMap::new();
+        for value in values {
+            headers.append(
+                hyper::header::ACCEPT,
+                hyper::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        accepts_nip11(&headers)
+    }
+
+    #[test]
+    fn accept_is_parsed_as_a_media_range_list() {
+        assert!(accept(&["application/nostr+json"]));
+        assert!(accept(&["application/nostr+json, application/json;q=0.9"]));
+        assert!(accept(&["application/json;q=0.9 , Application/Nostr+JSON"]));
+        assert!(accept(&["application/nostr+json; charset=utf-8; q=0.5"]));
+        assert!(accept(&["text/html", "application/nostr+json"]));
+        assert!(!accept(&[]));
+        assert!(!accept(&["application/json"]));
+        assert!(!accept(&["*/*"]));
+        assert!(!accept(&["application/*"]));
+        assert!(!accept(&["text/html,application/xhtml+xml,*/*;q=0.8"]));
+        assert!(!accept(&["application/nostr+json;q=0"]));
+        assert!(!accept(&["application/nostr+json; q=0.000"]));
+        assert!(!accept(&["application/nostr+jsonx"]));
+    }
+
+    #[test]
+    fn public_responses_carry_every_cors_header() {
+        for response in [
+            json_response(&serde_json::json!({})),
+            text_status_response(StatusCode::NOT_FOUND, "not found"),
+            html_response("<p>"),
+            preflight_response(),
+        ] {
+            let headers = response.headers();
+            assert_eq!(headers["access-control-allow-origin"], "*");
+            assert_eq!(
+                headers["access-control-allow-headers"],
+                "Content-Type, Authorization, Accept"
+            );
+            assert_eq!(
+                headers["access-control-allow-methods"],
+                "GET, POST, OPTIONS"
+            );
+        }
+        assert_eq!(preflight_response().status(), StatusCode::NO_CONTENT);
     }
 }
 

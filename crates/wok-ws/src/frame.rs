@@ -316,10 +316,21 @@ pub enum Role {
     Client,
 }
 
+/// Read buffer a connection keeps between messages, which most client
+/// messages fit. A read that fills the buffer grows it by `READ_CHUNK` for the
+/// next, and once drained after a read that did not fill it (the client
+/// paused) it shrinks back, so idle connections do not each pin 16 KiB.
+const READ_IDLE: usize = 1024;
+const READ_CHUNK: usize = 16 * 1024;
+
 /// Incremental frame parser + message assembler (read half).
 pub struct WsParser {
     max_message: usize,
     buf: BytesMut,
+    /// The last socket read filled all the room the buffer had.
+    read_filled: bool,
+    /// The buffer may have grown past `READ_IDLE`.
+    grown: bool,
     frag_opcode: Option<u8>,
     frag_rsv1: bool,
     frag: Vec<u8>,
@@ -335,7 +346,9 @@ impl WsParser {
     pub fn with_role(max_message: usize, inflater: Option<InflateCtx>, role: Role) -> Self {
         Self {
             max_message,
-            buf: BytesMut::with_capacity(16 * 1024),
+            buf: BytesMut::with_capacity(READ_IDLE),
+            read_filled: false,
+            grown: false,
             frag_opcode: None,
             frag_rsv1: false,
             frag: Vec::new(),
@@ -676,6 +689,17 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
         // advances only on an actual socket read — unrelated outbound
         // traffic waking the select must not restart the guard.
         let assembly_pending = !parser.buf.is_empty() || parser.frag_opcode.is_some();
+        let want = if parser.read_filled {
+            READ_CHUNK
+        } else {
+            READ_IDLE
+        };
+        if parser.buf.capacity() - parser.buf.len() < want / 2 {
+            // An empty buffer reclaims its own allocation; otherwise it grows.
+            parser.grown |= !parser.buf.is_empty() || want > READ_IDLE;
+            parser.buf.reserve(want);
+        }
+        let room = parser.buf.capacity() - parser.buf.len();
         let n = match frame_idle_timeout.filter(|_| assembly_pending) {
             Some(gap) => {
                 let deadline =
@@ -690,7 +714,12 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
         if n == 0 {
             return Err(WsError::Protocol("eof"));
         }
+        parser.read_filled = n >= room;
         parser.drain_events_into(events)?;
+        if parser.buf.is_empty() && !parser.read_filled && parser.grown {
+            parser.buf = BytesMut::with_capacity(READ_IDLE);
+            parser.grown = false;
+        }
         // Arm or advance the deadline after every read that leaves assembly
         // pending — including the empty-to-partial transition where this
         // same read also produced events — so the guard is armed before the
@@ -779,6 +808,64 @@ mod tests {
             deadline.is_some(),
             "deadline must be armed for the retained partial frame"
         );
+    }
+
+    async fn read_all(
+        rx: &mut tokio::io::DuplexStream,
+        parser: &mut WsParser,
+        n: usize,
+    ) -> Vec<WsEvent> {
+        let mut all = Vec::new();
+        let mut events = Vec::new();
+        let mut deadline = None;
+        while all.len() < n {
+            read_events_into(rx, parser, &mut events, None, &mut deadline)
+                .await
+                .unwrap();
+            all.append(&mut events);
+        }
+        all
+    }
+
+    #[tokio::test]
+    async fn read_buffer_stays_small_for_small_messages() {
+        let (mut tx, mut rx) = tokio::io::duplex(1 << 20);
+        let mut parser = WsParser::new(1 << 20, None);
+        for i in 0..50 {
+            let msg = format!("[\"REQ\",\"s{i}\",{{\"kinds\":[1],\"limit\":20}}]").repeat(6);
+            tx.write_all(&masked_frame(true, false, OP_TEXT, msg.as_bytes()))
+                .await
+                .unwrap();
+            let events = read_all(&mut rx, &mut parser, 1).await;
+            assert!(matches!(&events[..], [WsEvent::Message(_, p)] if p == msg.as_bytes()));
+            assert!(!parser.grown, "message {i} grew the buffer");
+            assert!(parser.buf.capacity() <= READ_IDLE);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_buffer_grows_for_large_or_streamed_input_then_shrinks() {
+        let (mut tx, mut rx) = tokio::io::duplex(1 << 20);
+        let mut parser = WsParser::new(1 << 20, None);
+        let big = vec![b'x'; 40_000];
+        tx.write_all(&masked_frame(true, false, OP_TEXT, &big))
+            .await
+            .unwrap();
+        let events = read_all(&mut rx, &mut parser, 1).await;
+        assert!(matches!(&events[..], [WsEvent::Message(_, p)] if p == &big));
+        assert!(!parser.grown, "drained after a short read: shrunk");
+        assert_eq!(parser.buf.capacity(), READ_IDLE);
+
+        let mut burst = Vec::new();
+        for i in 0..200 {
+            let msg = format!("[\"CLOSE\",\"subscription-{i:04}\"]").repeat(4);
+            burst.extend(masked_frame(true, false, OP_TEXT, msg.as_bytes()));
+        }
+        tx.write_all(&burst).await.unwrap();
+        let events = read_all(&mut rx, &mut parser, 200).await;
+        assert_eq!(events.len(), 200);
+        assert!(!parser.grown);
+        assert_eq!(parser.buf.capacity(), READ_IDLE);
     }
 
     #[test]

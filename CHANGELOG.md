@@ -143,6 +143,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the new REQ is refused. Before, the old filter kept delivering until the
   new history finished, and forever after a refused REQ, so `CLOSED x` was
   followed by more `EVENT x`.
+- Events and EOSE already queued for a subscription that was then replaced or
+  closed are dropped instead of sent. On a slow link, a client that replaced a
+  subscription could otherwise receive the old filter's backlog after the new
+  REQ.
 - A REQ over `relay.max_subs_per_connection` gets `CLOSED` (`blocked: too many
   concurrent REQs`) and no EOSE. Before, it got its history, an EOSE and a
   NOTICE, and never went live.
@@ -152,10 +156,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sends no EOSE itself and never waits for the monitor. Gone with it is the
   5-second wait that could end in a "live subscription monitor unavailable"
   NOTICE and an EOSE for a subscription that never went live.
-- The relay could crash with a segmentation fault while shutting down. A relay
-  thread clearing its LMDB reader slot on exit could race another thread
-  closing the database. The database now closes only after every relay thread
-  has exited.
 - `wok reindex` rebuilt negentropy trees from what relay reads serve, so a
   database with superseded versions (retained by a strfry migration, or created
   when reindex repacks a long address next to a newer version) came out with

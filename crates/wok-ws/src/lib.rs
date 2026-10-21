@@ -833,6 +833,9 @@ async fn handle_ws<S>(
                 }
                 out = rx.recv() => {
                     match out {
+                        // Its subscription was replaced or closed while it
+                        // waited: the client no longer wants it.
+                        Some(frame) if frame.is_stale() => {}
                         Some(frame) => {
                             let bytes = match encoder.encode_message(MessageKind::Text, frame.text.as_bytes()) {
                                 Ok(b) => b,

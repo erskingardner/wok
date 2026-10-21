@@ -109,8 +109,9 @@ pub struct Row {
     pub author_events: u64,
     pub events: usize,
     pub result_sha256: String,
-    /// Digest of the events newer than the oldest returned `created_at`,
-    /// and how many events have that oldest one.
+    /// The oldest returned `created_at`, a digest of the events newer than
+    /// it, and how many events have it.
+    pub cut_created_at: u64,
     pub above_cut_sha256: String,
     pub at_cut: usize,
     pub cold_ms: f64,
@@ -604,6 +605,7 @@ struct Received {
     elapsed: Duration,
     events: usize,
     sha256: String,
+    cut_created_at: u64,
     above_cut_sha256: String,
     at_cut: usize,
 }
@@ -696,8 +698,19 @@ async fn time_to_eose(
         events: ids.len(),
         sha256: digest_ids(all.iter()),
         at_cut: ids.len() - above.len(),
+        cut_created_at: oldest.unwrap_or_default(),
         above_cut_sha256: digest_ids(above.iter()),
     })
+}
+
+/// Whether two result sets differ only in which events a limit kept from a
+/// tie: the same events newer than one shared oldest `created_at`, and as
+/// many at it.
+fn differs_only_at_tie(a: &Row, b: &Row) -> bool {
+    a.result_sha256 != b.result_sha256
+        && a.cut_created_at == b.cut_created_at
+        && a.above_cut_sha256 == b.above_cut_sha256
+        && a.at_cut == b.at_cut
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -752,6 +765,7 @@ fn measure(
         author_events: shape.author_events,
         events: cold.events,
         result_sha256: cold.sha256,
+        cut_created_at: cold.cut_created_at,
         above_cut_sha256: cold.above_cut_sha256,
         at_cut: cold.at_cut,
         cold_ms: cold.elapsed.as_secs_f64() * 1000.0,
@@ -790,7 +804,7 @@ pub fn run(rt: &tokio::runtime::Runtime, opts: &Options) -> Result<Report> {
         let label = format!("{} ({} authors)", shape.label, shape.authors);
         match rows[first..] {
             [ref a, ref b] if a.result_sha256 != b.result_sha256 => {
-                if a.above_cut_sha256 == b.above_cut_sha256 && a.at_cut == b.at_cut {
+                if differs_only_at_tie(a, b) {
                     tie_cuts.push(label);
                 } else {
                     mismatches.push(label);
@@ -848,9 +862,7 @@ pub fn render_markdown(report: &Report) -> String {
                 base.p50_ms / row.p50_ms.max(0.001),
                 if base.result_sha256 == row.result_sha256 {
                     "yes"
-                } else if base.above_cut_sha256 == row.above_cut_sha256
-                    && base.at_cut == row.at_cut
-                {
+                } else if differs_only_at_tie(base, row) {
                     "tie at cut"
                 } else {
                     "**no**"
@@ -892,6 +904,44 @@ pub fn render_markdown(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(result: &str, cut_created_at: u64, above: &str, at_cut: usize) -> Row {
+        Row {
+            relay: "wok".into(),
+            group: "feed",
+            shape: "shape".into(),
+            authors: 1,
+            author_events: 1,
+            events: 50,
+            result_sha256: result.into(),
+            cut_created_at,
+            above_cut_sha256: above.into(),
+            at_cut,
+            cold_ms: 0.0,
+            warm_runs: 0,
+            p50_ms: 0.0,
+            p95_ms: 0.0,
+            max_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn only_a_shared_cut_timestamp_excuses_a_different_result() {
+        // The same 49 newest events, and a different 50th at the same second.
+        assert!(differs_only_at_tie(
+            &row("a", 100, "newest", 1),
+            &row("b", 100, "newest", 1)
+        ));
+        // A skipped 50th event replaced by an older one is a mismatch.
+        assert!(!differs_only_at_tie(
+            &row("a", 100, "newest", 1),
+            &row("b", 99, "newest", 1)
+        ));
+        assert!(!differs_only_at_tie(
+            &row("a", 100, "newest", 1),
+            &row("a", 100, "newest", 1)
+        ));
+    }
 
     #[test]
     fn history_follows_zipf_and_sums_to_the_total() {

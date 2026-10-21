@@ -3248,7 +3248,9 @@ const REQ_PASS_MAX: usize = 64;
 /// when nothing is waiting, or once the new queries' first slices since their
 /// last slice have taken as long as that slice did. It is checked before each
 /// first slice and at the end of each pass, so new queries go first, and
-/// however many keep coming, the running queries keep about half the worker.
+/// however many keep coming, each stretch of new work as long as the running
+/// queries' last slice (overrun by at most one first slice) is followed by a
+/// slice of theirs: about half the worker when the two take similar time.
 struct RunningShare {
     /// When the running queries' last slice ended, or they started waiting.
     since: std::time::Instant,

@@ -125,9 +125,10 @@ history as well as live ones; a REQ reusing an open id always fits.
      next new query once the new queries' first slices since its last slice
      have taken as long as that slice did, and at the end of a pass when no
      more messages are waiting. So new queries go first, a REQ queued during
-     a pass does not wait for another slice of a long scan, and however many
-     REQs come, small or costly, the running queries keep about half the
-     worker.
+     a pass does not wait for another slice of a long scan. However many REQs
+     come, each stretch of new work as long as the running queries' last
+     slice, overrun by at most one first slice, is followed by a slice of
+     theirs: about half the worker when the two take similar time.
 4. **Going live, on the req monitor.** For the current generation only, the
    monitor sends EOSE, then the held matches in arrival order, then delivers
    live. NIP-01 defines EOSE as the boundary to "events newly received in

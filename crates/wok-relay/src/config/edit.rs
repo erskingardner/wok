@@ -289,6 +289,10 @@ max_num_tags = 5000
             "[events]\n\
              reject_older_than_secs = 94608000\n\
              \n\
+             [relay]\n\
+             # Maximum combined compact-JSON bytes across all filters in one REQ/COUNT.\n\
+             max_req_filter_size = 65536\n\
+             \n\
              [relay.auth]\n\
              restricted_read_kinds = [4, 1059]\n"
         );

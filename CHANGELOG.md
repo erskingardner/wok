@@ -73,6 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `relay.max_filter_bytes_per_connection` (default 2097152, 2 MiB) bounds the
+  filter bytes of the REQ subscriptions open on one connection. Live filters
+  stay in memory until closed, so without it a larger
+  `relay.max_req_filter_size` multiplied the memory one connection can hold
+  (200 subscriptions of 256 KiB is 50 MiB). A REQ over the budget gets
+  `CLOSED` with `blocked: this connection's filters exceed <budget> bytes`.
+  Reusing an open subscription ID is charged only for the difference, and
+  COUNT is not charged. Zero is unlimited and is warned about on reload. The
+  setting reloads live and is in the dashboard.
 - NIP-67 EOSE completeness hints, advertised in NIP-11. EOSE gains a third
   element when Wok knows the answer: `finish` when every stored match the
   connection may read was sent, `more` when a filter's `limit`, the
@@ -164,6 +173,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebroadcast again. Files that pin the old value, as copies of the 0.7
   `docs/wok.toml` do, keep the bound, but it now spares the kinds listed
   under Changed.
+- `public`: `relay.max_req_filter_size` is `262144`, 256 KiB of filters per
+  REQ or COUNT (was 65536). An outbox client's REQ for a follow list of
+  2,000 authors is accepted; 64 KiB refused one of about 970 authors or
+  more. One filter still lists at most 2,047 authors. Files that pin 65536,
+  as copies of the 0.7 `docs/wok.toml` do, keep the old cap, and `wok
+  doctor` flags them.
 
 ### Changed
 

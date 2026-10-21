@@ -192,6 +192,9 @@ pub struct RelayConfig {
     /// Maximum combined compact-JSON bytes across all filter objects in one
     /// REQ or COUNT command.
     pub max_req_filter_size: usize,
+    /// Maximum combined compact-JSON filter bytes of the REQ subscriptions
+    /// open on one connection; zero is unlimited.
+    pub max_filter_bytes_per_connection: usize,
     /// Unconditional protocol ceiling for filter objects in one REQ/COUNT.
     pub max_filters_per_req: usize,
     pub auto_ping_seconds: u64,
@@ -383,7 +386,8 @@ impl Default for Config {
                     terms: String::new(),
                 },
                 max_websocket_payload_size: 2 * wok_event::DEFAULT_MAX_EVENT_SIZE,
-                max_req_filter_size: 65_536,
+                max_req_filter_size: 262_144,
+                max_filter_bytes_per_connection: 2_097_152,
                 max_filters_per_req: 200,
                 auto_ping_seconds: 55,
                 enable_tcp_keepalive: false,
@@ -1181,6 +1185,12 @@ impl Config {
         if self.relay.max_total_events_per_req == 0 {
             warnings.push("relay.max_total_events_per_req is zero — unlimited".to_string());
         }
+        if self.relay.max_filter_bytes_per_connection == 0 {
+            warnings.push(
+                "relay.max_filter_bytes_per_connection is zero — live filter memory per connection is unlimited"
+                    .to_string(),
+            );
+        }
         if self.relay.max_pending_outbound_bytes == 0 {
             warnings.push(
                 "relay.max_pending_outbound_bytes is zero — slow-client queue is unlimited"
@@ -1909,7 +1919,7 @@ mod tests {
         assert_eq!(c.relay.info.self_pk, "cafe");
         assert_eq!(c.relay.info.terms, "https://example.com/t");
         assert_eq!(c.relay.max_filters_per_req, 7);
-        assert_eq!(c.relay.max_req_filter_size, 65_536);
+        assert_eq!(c.relay.max_req_filter_size, 262_144);
         assert_eq!(c.relay.max_total_events_per_req, 4321);
         assert_eq!(c.relay.auto_ping_seconds, 30);
         assert!(c.relay.enable_tcp_keepalive);
@@ -2116,6 +2126,7 @@ mod tests {
         }
         for field in [
             "max_total_events_per_req",
+            "max_filter_bytes_per_connection",
             "max_pending_outbound_bytes",
             "handshake_timeout_secs",
             "frame_read_timeout_secs",

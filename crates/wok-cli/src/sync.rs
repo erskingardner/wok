@@ -462,13 +462,14 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_secs();
                 let txn = env.begin_ro()?;
+                let snapshot = wok_query::visibility::ReadSnapshot::for_stored(&txn);
                 let mut decompressor = Decompressor::new();
                 while pending_up.len() + outgoing.len() < 100 {
                     let Some(id) = have.pop_front() else { break };
                     if let Some((lev, raw)) = wok_db::lookup_event_by_id_ro(&txn, &id)? {
                         let packed = PackedEventView::new(&raw)?;
                         if !wok_query::visibility::ReadVisibility::default()
-                            .globally_visible(&txn, packed)?
+                            .globally_visible(&snapshot, packed)?
                         {
                             // Classify only a hidden event: visible uploads need
                             // one replacement lookup. Other visibility changes

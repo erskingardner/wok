@@ -3689,7 +3689,7 @@ fn route_stored_match(
 /// Send `sub` the stored events in `from..=to` it may read, as live events.
 #[allow(clippy::too_many_arguments)]
 fn send_stored_range(
-    txn: &wok_db::RoTxn<'_>,
+    snapshot: &crate::restrict::ReadSnapshot<'_>,
     decomp: &mut Decompressor,
     conns: &ConnTable,
     metrics: &Metrics,
@@ -3699,6 +3699,7 @@ fn send_stored_range(
     from: u64,
     to: u64,
 ) {
+    let txn = snapshot.txn();
     let requires_content = sub.filter_group.requires_content();
     let _ = wok_db::foreach_event_from(txn, from, |lev, packed_bytes| {
         if lev > to {
@@ -3707,7 +3708,7 @@ fn send_stored_range(
         let Ok(packed) = PackedEventView::new(packed_bytes) else {
             return true;
         };
-        if !visibility.allows(txn, packed).unwrap_or(false)
+        if !visibility.allows(snapshot, packed).unwrap_or(false)
             || (!requires_content && !sub.filter_group.does_match(packed))
         {
             return true;
@@ -3739,7 +3740,7 @@ fn send_stored_range(
 /// Send one buffered stored event, if it still exists and is still readable.
 #[allow(clippy::too_many_arguments)]
 fn send_buffered_stored(
-    txn: &wok_db::RoTxn<'_>,
+    snapshot: &crate::restrict::ReadSnapshot<'_>,
     decomp: &mut Decompressor,
     conns: &ConnTable,
     metrics: &Metrics,
@@ -3750,6 +3751,7 @@ fn send_buffered_stored(
     visibility: &crate::restrict::ReadVisibility,
     lev_id: u64,
 ) {
+    let txn = snapshot.txn();
     let dbis = txn.env().dbis();
     let Some(packed) = txn
         .get_u64(dbis.event, lev_id)
@@ -3759,7 +3761,7 @@ fn send_buffered_stored(
     else {
         return;
     };
-    if !visibility.allows(txn, packed).unwrap_or(false) {
+    if !visibility.allows(snapshot, packed).unwrap_or(false) {
         return;
     }
     let Some(raw) = txn.get_u64(dbis.event_payload, lev_id).ok().flatten() else {
@@ -3853,6 +3855,9 @@ fn run_req_monitor(
             }
         };
         retry = false;
+        // The clock and which policy tables can hide an event, read once for
+        // the batch rather than for each event.
+        let read_snapshot = crate::restrict::ReadSnapshot::for_stored(&txn);
         let latest = most_recent_levid_ro(&txn).unwrap_or(0);
         if curr_event_id > latest {
             curr_event_id = latest;
@@ -3923,7 +3928,7 @@ fn run_req_monitor(
                     if reread_to > snapshot {
                         let sub = monitors.subscription(conn_id, &sub_id).unwrap();
                         send_stored_range(
-                            &txn,
+                            &read_snapshot,
                             &mut decomp,
                             &conns,
                             &metrics,
@@ -3939,7 +3944,7 @@ fn run_req_monitor(
                     for event in buffer.into_events() {
                         match event {
                             PendingEvent::Stored(lev) => send_buffered_stored(
-                                &txn,
+                                &read_snapshot,
                                 &mut decomp,
                                 &conns,
                                 &metrics,
@@ -3953,7 +3958,7 @@ fn run_req_monitor(
                             PendingEvent::Ephemeral(event) => {
                                 let readable =
                                     PackedEventView::new(&event.packed).is_ok_and(|packed| {
-                                        visibility.allows(&txn, packed).unwrap_or(false)
+                                        visibility.allows(&read_snapshot, packed).unwrap_or(false)
                                     });
                                 if readable {
                                     conns.send_event(
@@ -3993,7 +3998,7 @@ fn run_req_monitor(
                         // Live-only events skip the database, but not the
                         // moderation policy: id/author/kind checks all apply.
                         if !global_visibility
-                            .globally_visible(&txn, event)
+                            .globally_visible(&read_snapshot, event)
                             .unwrap_or(false)
                         {
                             continue;
@@ -4064,7 +4069,7 @@ fn run_req_monitor(
                         return true;
                     };
                     if !global_visibility
-                        .globally_visible(&txn, packed)
+                        .globally_visible(&read_snapshot, packed)
                         .unwrap_or(false)
                     {
                         return true;
@@ -4121,7 +4126,7 @@ fn run_req_monitor(
                     .is_ok_and(|stored| stored.is_some());
                 if !stored
                     || !global_visibility
-                        .globally_visible(&txn, packed)
+                        .globally_visible(&read_snapshot, packed)
                         .unwrap_or(false)
                 {
                     continue;

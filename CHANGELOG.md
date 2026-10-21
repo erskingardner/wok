@@ -232,6 +232,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each stretch of new work as long as their last slice.
 - Live delivery does less work per event: the writer hands each commit's
   events to the req monitors instead of each monitor reading them back.
+- History scans, COUNT and live delivery check read visibility more cheaply.
+  Each event used to cost a vanish lookup, three moderation lookups, a
+  replacement lookup for replaceable kinds and a clock read. Now the clock and
+  which of those tables hold records are read once per scan slice or live
+  batch, and an event is looked up only where a record could hide it. With no
+  moderation or vanish records, a scan does about a quarter less work per
+  event.
 
 ### Removed
 

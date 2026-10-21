@@ -10,7 +10,7 @@ use wire::Wire;
 use wok_compat::sign_event_with_key;
 use wok_db::{Env, EnvOptions};
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
-use wok_query::visibility::ReadVisibility;
+use wok_query::visibility::{ReadSnapshot, ReadVisibility};
 use wok_query::{DbQuery, NostrFilterGroup, SubId, Subscription};
 
 fn key() -> Keypair {
@@ -331,7 +331,9 @@ fn replacement_visibility_refreshes_with_the_read_transaction() {
     let read = env.begin_ro().unwrap();
     let packed = PackedEventView::new(read.get_u64(env.dbis().event, 1).unwrap().unwrap()).unwrap();
     let policy = ReadVisibility::default();
-    assert!(policy.allows(&read, packed).unwrap());
+    assert!(policy
+        .allows(&ReadSnapshot::for_stored(&read), packed)
+        .unwrap());
     let newest = event(&key, 30443, 200, json!([["d", "a"]]), "newest");
     std::thread::scope(|scope| {
         scope
@@ -339,12 +341,16 @@ fn replacement_visibility_refreshes_with_the_read_transaction() {
             .join()
             .unwrap()
     });
-    assert!(policy.allows(&read, packed).unwrap());
+    assert!(policy
+        .allows(&ReadSnapshot::for_stored(&read), packed)
+        .unwrap());
     let owned = read.get_u64(env.dbis().event, 1).unwrap().unwrap().to_vec();
     drop(read);
+    // The copy is no longer stored, so only a snapshot for any event sees
+    // that the newest version, which is, replaces it.
     assert!(!policy
         .allows(
-            &env.begin_ro().unwrap(),
+            &ReadSnapshot::new(&env.begin_ro().unwrap()),
             PackedEventView::new(&owned).unwrap()
         )
         .unwrap());
@@ -669,6 +675,111 @@ async fn channel_metadata_for_each_channel_survives() {
         assert_eq!(ids(&stored), ids(&expected), "{filter}");
     }
     handle.request_shutdown();
+}
+
+/// A read snapshot reads which policy tables can hide an event once, and
+/// then skips the lookups they cannot answer. For every stored event, with
+/// and without retained history and as each kind of policy record is added,
+/// it must answer exactly as the lookups themselves do.
+#[test]
+fn read_snapshots_answer_as_the_policy_lookups_do() {
+    let (author, other, recipient) = (key(), key(), key());
+    let pubkey = |key: &Keypair| key.x_only_public_key().0.serialize();
+    let note = event(&author, 1, 100, json!([]), "note");
+    let latest = vec![
+        note.clone(),
+        event(&other, 1, 101, json!([]), "other note"),
+        event(&author, 7, 102, json!([]), "reaction"),
+        event(&author, 0, 200, json!([]), "profile"),
+        event(&other, 30023, 200, json!([["d", "a"]]), "article"),
+        event(&other, 30023, 150, json!([["d", "b"]]), "other article"),
+        event(
+            &other,
+            1059,
+            103,
+            json!([["p", hex::encode(pubkey(&recipient))]]),
+            "wrap",
+        ),
+    ];
+    let mut history = latest.clone();
+    history.push(event(&author, 0, 100, json!([]), "old profile"));
+    history.push(event(
+        &other,
+        30023,
+        100,
+        json!([["d", "a"]]),
+        "old article",
+    ));
+    let note_id: [u8; 32] = hex::decode(note["id"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    type Step<'a> = (&'a str, Box<dyn Fn(&mut wok_db::RwTxn<'_>) + 'a>);
+    let steps: Vec<Step> = vec![
+        ("no policy records", Box::new(|_| {})),
+        (
+            "an allowed pubkey",
+            Box::new(|txn| wok_db::allow_pubkey(txn, &pubkey(&other), "").unwrap()),
+        ),
+        (
+            "a banned event",
+            Box::new(|txn| wok_db::ban_event(txn, &note_id, "").unwrap()),
+        ),
+        (
+            "a disallowed kind",
+            Box::new(|txn| wok_db::disallow_kind(txn, 7).unwrap()),
+        ),
+        (
+            "a vanished recipient",
+            Box::new(|txn| wok_db::mark_vanished(txn, &pubkey(&recipient), 1).unwrap()),
+        ),
+        (
+            "a vanished author",
+            Box::new(|txn| wok_db::mark_vanished(txn, &pubkey(&other), 150).unwrap()),
+        ),
+        (
+            "a banned author",
+            Box::new(|txn| wok_db::ban_pubkey(txn, &pubkey(&author), "").unwrap()),
+        ),
+    ];
+    for (events, superseded) in [(&latest, 0), (&history, 2)] {
+        let (_dir, env) = snapshot(events);
+        assert_eq!(
+            wok_db::state::superseded_events_ro(&env.begin_ro().unwrap()).unwrap(),
+            Some(superseded)
+        );
+        let mut hidden = Vec::new();
+        for (step, apply) in &steps {
+            let mut txn = env.begin_rw().unwrap();
+            apply(&mut txn);
+            txn.commit().unwrap();
+            let txn = env.begin_ro().unwrap();
+            let (any, stored) = (ReadSnapshot::new(&txn), ReadSnapshot::for_stored(&txn));
+            let mut count = 0;
+            wok_db::foreach_event_from(&txn, 1, |_, raw| {
+                let packed = PackedEventView::new(raw).unwrap();
+                let expected = !wok_db::is_event_vanished_ro(&txn, packed).unwrap()
+                    && !wok_db::is_event_moderated_ro(&txn, packed).unwrap()
+                    && !wok_db::is_event_superseded_ro(&txn, packed).unwrap();
+                for snapshot in [&any, &stored] {
+                    assert_eq!(
+                        ReadVisibility::default()
+                            .globally_visible(snapshot, packed)
+                            .unwrap(),
+                        expected,
+                        "{step}, kind {}, {superseded} superseded",
+                        packed.kind()
+                    );
+                }
+                count += usize::from(!expected);
+                true
+            })
+            .unwrap();
+            hidden.push(count);
+        }
+        // Each step hides more, so every kind of record was exercised.
+        assert!(hidden.windows(2).skip(1).all(|w| w[0] < w[1]), "{hidden:?}");
+    }
 }
 
 #[test]

@@ -43,6 +43,10 @@ Crate boundaries: `wok-event`, `wok-db`, `wok-query`, `wok-negentropy`, `wok-rel
 
 Read visibility lives in `wok-query::ReadVisibility` and applies before history,
 COUNT/HLL and search limits. Live delivery and temporary sync use the same policy.
+Each check runs against a `ReadSnapshot`, built once per scan slice or live
+batch: it reads the clock and finds which of the vanish, moderation and
+replacement records exist, so an event is looked up only in tables that could
+hide it.
 Direct persistent-tree sync requires an explicit public-visibility proof.
 `server/writer.rs` owns mutation and receipts; `server/negentropy.rs` owns sync
 sessions and a reservation pool shared across all workers. Unix reader and writer

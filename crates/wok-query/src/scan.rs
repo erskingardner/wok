@@ -1,6 +1,6 @@
 //! Resumable DBScan matching `src/DBQuery.h`.
 
-use crate::visibility::ReadVisibility;
+use crate::visibility::{ReadSnapshot, ReadVisibility};
 
 use crate::filter::NostrFilter;
 use crate::subid::Subscription;
@@ -292,7 +292,7 @@ impl SearchGroupScan {
 
     fn process<H>(
         &mut self,
-        txn: &RoTxn<'_>,
+        snapshot: &ReadSnapshot<'_>,
         filters: &[NostrFilter],
         latest_event_id: u64,
         time_budget_us: u64,
@@ -308,7 +308,7 @@ impl SearchGroupScan {
                 let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 let remaining_us = time_budget_us.saturating_sub(elapsed_us);
                 let complete = self.scans[self.gather_index].gather(
-                    txn,
+                    snapshot,
                     &filters[self.gather_index],
                     latest_event_id,
                     remaining_us,
@@ -399,12 +399,13 @@ impl SearchScan {
     #[allow(clippy::manual_is_multiple_of)]
     fn gather(
         &mut self,
-        txn: &RoTxn<'_>,
+        snapshot: &ReadSnapshot<'_>,
         filter: &NostrFilter,
         latest_event_id: u64,
         time_budget_us: u64,
         visibility: &ReadVisibility,
     ) -> Result<bool, wok_db::DbError> {
+        let txn = snapshot.txn();
         if self.gathering_complete {
             return Ok(true);
         }
@@ -477,7 +478,7 @@ impl SearchScan {
             if !filter.does_match_without_search(packed) {
                 return true;
             }
-            match visibility.allows_noting_restricted(txn, packed, &mut self.restricted) {
+            match visibility.allows_noting_restricted(snapshot, packed, &mut self.restricted) {
                 Ok(true) => {}
                 Ok(false) => return true,
                 Err(err) => {
@@ -525,7 +526,7 @@ impl SearchScan {
 
     fn scan<H>(
         &mut self,
-        txn: &RoTxn<'_>,
+        snapshot: &ReadSnapshot<'_>,
         filter: &NostrFilter,
         latest_event_id: u64,
         time_budget_us: u64,
@@ -535,7 +536,13 @@ impl SearchScan {
     where
         H: FnMut(u64) -> bool,
     {
-        if !self.gather(txn, filter, latest_event_id, time_budget_us, visibility)? {
+        if !self.gather(
+            snapshot,
+            filter,
+            latest_event_id,
+            time_budget_us,
+            visibility,
+        )? {
             return Ok(false);
         }
         while self.emit_index < self.ranked_hits.len() {
@@ -1057,16 +1064,17 @@ impl DbQuery {
     }
 
     fn visible_event_pubkey(
-        txn: &RoTxn<'_>,
+        snapshot: &ReadSnapshot<'_>,
         lev_id: u64,
         visibility: &ReadVisibility,
         restricted: &mut bool,
     ) -> Result<Option<[u8; 32]>, wok_db::DbError> {
+        let txn = snapshot.txn();
         let Some(raw) = txn.get_u64(txn.env().dbis().event, lev_id)? else {
             return Ok(None);
         };
         let packed = PackedEventView::new(raw)?;
-        if !visibility.allows_noting_restricted(txn, packed, restricted)? {
+        if !visibility.allows_noting_restricted(snapshot, packed, restricted)? {
             return Ok(None);
         }
         let mut pubkey = [0u8; 32];
@@ -1079,7 +1087,7 @@ impl DbQuery {
     #[allow(clippy::too_many_arguments)]
     fn peek(
         scanner: &mut DbScan,
-        txn: &RoTxn<'_>,
+        snapshot: &ReadSnapshot<'_>,
         filter: &NostrFilter,
         latest: u64,
         sent: &HashSet<u64>,
@@ -1097,7 +1105,7 @@ impl DbQuery {
         let mut error = None;
         let candidates = &mut budget.candidates;
         let complete = scanner.scan(
-            txn,
+            snapshot.txn(),
             filter,
             |lev_id| {
                 if lev_id > latest || sent.contains(&lev_id) {
@@ -1108,7 +1116,7 @@ impl DbQuery {
                     return true;
                 }
                 *candidates -= 1;
-                match Self::visible_event_pubkey(txn, lev_id, visibility, restricted) {
+                match Self::visible_event_pubkey(snapshot, lev_id, visibility, restricted) {
                     Ok(Some(_)) => {
                         found = Some(lev_id);
                         true
@@ -1135,7 +1143,7 @@ impl DbQuery {
 
     /// After the request-wide ceiling cut the scan, look in the filters it
     /// never reached for a match the reader may see that was not sent.
-    fn peek_unscanned(&mut self, txn: &RoTxn<'_>) -> Result<Peek, wok_db::DbError> {
+    fn peek_unscanned(&mut self, snapshot: &ReadSnapshot<'_>) -> Result<Peek, wok_db::DbError> {
         let latest = self.sub.latest_event_id;
         for f in &self.sub.filter_group.filters[self.filter_group_index + 1..] {
             // A limit of 0 asks for no stored events, and a search ranks all
@@ -1144,8 +1152,8 @@ impl DbQuery {
                 return Ok(Peek::Unknown);
             }
             let peek = Self::peek(
-                &mut DbScan::new(f, txn),
-                txn,
+                &mut DbScan::new(f, snapshot.txn()),
+                snapshot,
                 f,
                 latest,
                 &self.sent_events_full,
@@ -1180,6 +1188,9 @@ impl DbQuery {
             self.policy_generation = generation;
         }
         self.started = true;
+        // The clock and which policy tables can hide an event, read once for
+        // the slice rather than for each event.
+        let snapshot = ReadSnapshot::for_stored(txn);
         if self.all_filters_search {
             let mut group = match self.search_group.take() {
                 Some(group) => group,
@@ -1194,14 +1205,14 @@ impl DbQuery {
             let mut unsent = None;
             let count_dedup_budget = self.count_dedup_budget;
             let complete = group.process(
-                txn,
+                &snapshot,
                 &self.sub.filter_group.filters,
                 self.sub.latest_event_id,
                 time_budget_us,
                 &self.visibility,
                 |lev_id| {
                     let pubkey = match Self::visible_event_pubkey(
-                        txn,
+                        &snapshot,
                         lev_id,
                         &self.visibility,
                         &mut restricted,
@@ -1311,7 +1322,7 @@ impl DbQuery {
                     return false;
                 }
                 let pubkey = match Self::visible_event_pubkey(
-                    txn,
+                    &snapshot,
                     lev_id,
                     &self.visibility,
                     &mut restricted,
@@ -1350,7 +1361,7 @@ impl DbQuery {
                     })?
                 }
                 QueryScanner::Search(scanner) => scanner.scan(
-                    txn,
+                    &snapshot,
                     &f,
                     latest,
                     time_budget_us.saturating_sub(elapsed_us()),
@@ -1369,7 +1380,7 @@ impl DbQuery {
                 _ if f.limit == 0 => Some(Peek::Unknown),
                 QueryScanner::Chronological(scanner) if cut => Some(Self::peek(
                     scanner,
-                    txn,
+                    &snapshot,
                     &f,
                     latest,
                     &sent_full,
@@ -1404,7 +1415,7 @@ impl DbQuery {
                 // Nothing more is sent, so whatever the filters not reached
                 // hold, and this one does not, decides between the hints.
                 if self.completeness && exhausted {
-                    let peek = self.peek_unscanned(txn)?;
+                    let peek = self.peek_unscanned(&snapshot)?;
                     self.note(peek);
                 }
                 return Ok(true);

@@ -129,8 +129,8 @@ operator files that explicitly retain `65536` continue enforcing 64 KiB.
 `reject_older_than_secs` is off (`0`) in the public preset, and NIP-11 then
 omits `created_at_lower_limit`.
 
-- **If too low:** profiles, follow and relay lists, and deletions can't be
-  rebroadcast, and history can't be imported.
+- **If too low:** old regular events are refused, so a history import or a
+  rebroadcast of old notes fails.
 - **If too high:** nothing meaningful. Old events sort below new ones, and
   rates and quotas already bound storage.
 
@@ -144,9 +144,9 @@ Two kinds follow their NIPs instead of the `[events]` windows:
   either direction, as NIP-42 suggests. The per-connection challenge already
   prevents replay.
 - **Ephemeral gift wraps (21059)** may be dated up to three days in the
-  past, because NIP-59 backdates wraps by up to two days. A longer
-  `reject_ephemeral_older_than_secs` applies instead. Future dates are still
-  bounded by `reject_newer_than_secs`. In `ttl` mode a wrap older than
+  past, because NIP-59 backdates wraps by up to two days. This allowance is
+  fixed; `reject_ephemeral_older_than_secs` does not change it. Future dates
+  are still bounded by `reject_newer_than_secs`. In `ttl` mode a wrap older than
   `ephemeral_lifetime_secs` reaches live subscribers, but the next purge
   removes it, so history does not serve it.
 

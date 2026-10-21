@@ -180,9 +180,10 @@ impl ReadVisibility {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // NIP-59 backdates gift wraps by days, so a kind 21059's lifetime
-        // starts at the oldest date it may carry. Otherwise a wrap accepted
-        // at publication would already have expired and reach no one.
+        // NIP-59 backdates gift wraps, so a kind 21059 may be published up to
+        // GIFT_WRAP_BACKDATE_SECS after its created_at. Its lifetime counts
+        // from that latest publication time; from created_at, a backdated
+        // wrap accepted at publication would already have expired.
         let lifetime_start = if event.kind() == 21059 {
             event
                 .created_at()

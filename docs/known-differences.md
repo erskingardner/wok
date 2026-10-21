@@ -250,8 +250,8 @@ regression test. Differential parity alone is not a reason to retain it.
   client whose clock ran a minute slow could not authenticate. An AUTH event
   that fails validation is refused with `invalid:`, where strfry uses
   `error:`.
-- NIP-59: kind 21059 gift wraps may be dated up to three days in the past
-  (or `reject_ephemeral_older_than_secs`, if longer), because NIP-59
+- NIP-59: kind 21059 gift wraps may be dated up to three days in the past,
+  whatever `reject_ephemeral_older_than_secs` says, because NIP-59
   backdates wraps by up to two days. The pinned strfry refused every such
   wrap older than 60 seconds. In `ttl` mode a wrap older than
   `ephemeral_lifetime_secs` reaches live subscribers, but the next purge

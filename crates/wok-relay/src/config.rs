@@ -607,7 +607,6 @@ impl Config {
             || wok_event::is_param_replaceable_kind(kind)
             || kind == wok_event::DELETION_KIND
             || kind == wok_db::VANISH_KIND;
-        let ephemeral_max_age = self.events.reject_ephemeral_older_than_secs;
         wok_event::TimestampPolicy::from_now(
             self.events.reject_newer_than_secs,
             if unbounded {
@@ -615,10 +614,12 @@ impl Config {
             } else {
                 self.events.reject_older_than_secs
             },
+            // The same allowance read visibility grants, so an accepted wrap
+            // is never already expired.
             if kind == 21059 {
-                ephemeral_max_age.max(GIFT_WRAP_BACKDATE_SECS)
+                GIFT_WRAP_BACKDATE_SECS
             } else {
-                ephemeral_max_age
+                self.events.reject_ephemeral_older_than_secs
             },
         )
     }
@@ -2164,6 +2165,10 @@ mod tests {
         let wrap = c.timestamp_policy_for_kind(21059);
         assert_eq!(wrap.reject_ephemeral_older_than_secs, 3 * 86_400);
         assert_eq!(wrap.reject_newer_than_secs, 900);
+        // The gift-wrap allowance is a constant, as read visibility assumes.
+        c.events.reject_ephemeral_older_than_secs = 7 * 86_400;
+        let wrap = c.timestamp_policy_for_kind(21059);
+        assert_eq!(wrap.reject_ephemeral_older_than_secs, 3 * 86_400);
         // NIP-42: AUTH has its own window, whatever [events] says.
         c.events.reject_newer_than_secs = 1;
         c.events.reject_ephemeral_older_than_secs = 1;

@@ -5,7 +5,7 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use wok_db::{
     check_integrity, event_json_owned, foreach_negentropy_filter, Decompressor, Env, EnvOptions,
-    EnvironmentStats, IntegrityReport,
+    EnvironmentStats, IntegrityReport, TagKindIndexReport, TAG_KIND_SCHEMA_VERSION,
 };
 use wok_event::PackedEventView;
 use wok_relay::Config;
@@ -339,6 +339,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
                             integrity.legacy_untombstoned_deletions,
                         ),
                     );
+                    check_tag_kind_index(integrity.tag_kind_index.as_ref(), &mut report);
                     report.integrity = Some(integrity);
                 }
                 Err(error) => report.add("integrity", CheckStatus::Fail, error.to_string()),
@@ -350,6 +351,75 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
     }
 
     report
+}
+
+/// Report how far `wok_Event__tagKind` indexes the stored events, and the
+/// entries that do not match them.
+fn check_tag_kind_index(tag_kind: Option<&TagKindIndexReport>, report: &mut DoctorReport) {
+    const NAME: &str = "tag-kind-index";
+    const REINDEX: &str = "`wok reindex --confirm-relay-stopped`";
+    let Some(tag_kind) = tag_kind else {
+        report.add(
+            NAME,
+            CheckStatus::Warn,
+            format!("the (tag, kind, created_at) index is absent; the next writable open creates it, and {REINDEX} indexes the stored events"),
+        );
+        return;
+    };
+    let state = tag_kind.state;
+    match state.schema {
+        Some(TAG_KIND_SCHEMA_VERSION) => {}
+        Some(schema) => {
+            report.add(
+                NAME,
+                CheckStatus::Warn,
+                format!("the (tag, kind, created_at) index has layout {schema}, not {TAG_KIND_SCHEMA_VERSION}; the next writable open empties it"),
+            );
+            return;
+        }
+        None => {
+            report.add(
+                NAME,
+                CheckStatus::Warn,
+                "the (tag, kind, created_at) index is not initialized; the next writable open initializes it",
+            );
+            return;
+        }
+    }
+    let mut status = CheckStatus::Pass;
+    let mut details = Vec::new();
+    if tag_kind.missing_entries != 0 || tag_kind.unexpected_entries != 0 {
+        status = CheckStatus::Fail;
+        details.push(format!(
+            "{} entries are missing and {} do not match their event; {REINDEX} rebuilds the index",
+            tag_kind.missing_entries, tag_kind.unexpected_entries
+        ));
+    }
+    if !tag_kind.complete {
+        if status == CheckStatus::Pass {
+            status = CheckStatus::Warn;
+        }
+        details.push(format!(
+            "indexed through local ID {} of {}; {REINDEX} indexes the rest",
+            state.indexed_through, state.high_water
+        ));
+    }
+    if tag_kind.stale_entries != 0 {
+        if status == CheckStatus::Pass {
+            status = CheckStatus::Warn;
+        }
+        details.push(format!(
+            "{} entries name events that an earlier Wok release deleted; reads skip them, and {REINDEX} rebuilds the index without them",
+            tag_kind.stale_entries
+        ));
+    }
+    if details.is_empty() {
+        details.push(format!(
+            "{} entries index every stored event",
+            tag_kind.actual_entries
+        ));
+    }
+    report.add(NAME, status, details.join("; "));
 }
 
 /// Warn about keys the file pins to a built-in default that an earlier
@@ -641,6 +711,110 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "write-policy" && check.status == CheckStatus::Fail));
+    }
+
+    fn check<'a>(report: &'a DoctorReport, name: &str) -> &'a DoctorCheck {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn tag_kind_index_drift_is_reported() {
+        use secp256k1::SECP256K1;
+        use serde_json::json;
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let keypair = secp256k1::Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let mut events = Vec::new();
+        for created_at in [1_700_000_000, 1_700_000_001] {
+            let mut event = json!({
+                "created_at": created_at,
+                "kind": 1059,
+                "tags": [["p", "33".repeat(32)]],
+                "content": "",
+                "pubkey": hex::encode(keypair.x_only_public_key().0.serialize()),
+            });
+            let id = wok_event::event_id_hash(&event).unwrap();
+            event["id"] = json!(hex::encode(id));
+            event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &keypair).as_ref()));
+            let parsed = wok_event::parse_and_verify_event(
+                &event,
+                &Default::default(),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+            events.push(wok_db::EventToWrite::new(
+                parsed.packed.into_bytes(),
+                parsed.json,
+            ));
+        }
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let key = |event: &wok_db::EventToWrite| {
+            let view = PackedEventView::new(&event.packed).unwrap();
+            wok_db::tag_kind_key(b'p', &[0x33; 32], view.kind(), view.created_at())
+        };
+        let dbi = env.dbis().event_tag_kind.unwrap();
+        drop(env);
+        // One process opens an environment once, so doctor needs it closed.
+        let reopen = || Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+        let cfg = Config {
+            db: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        // These writes skip negentropy trees; only the index checks matter.
+        let report = run(&cfg, Path::new("missing-test-config.toml"));
+        assert_eq!(check(&report, "integrity").status, CheckStatus::Pass);
+        let tag_kind = check(&report, "tag-kind-index");
+        assert_eq!(tag_kind.status, CheckStatus::Pass, "{}", tag_kind.detail);
+        assert_eq!(tag_kind.detail, "2 entries index every stored event");
+
+        // An earlier release deleted the first event and left its entry.
+        let env = reopen();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [events[0].lev_id]).unwrap();
+        txn.put(dbi, &key(&events[0]), &events[0].lev_id.to_ne_bytes(), 0)
+            .unwrap();
+        txn.commit().unwrap();
+        drop(env);
+        let report = run(&cfg, Path::new("missing-test-config.toml"));
+        assert_eq!(check(&report, "integrity").status, CheckStatus::Pass);
+        let tag_kind = check(&report, "tag-kind-index");
+        assert_eq!(tag_kind.status, CheckStatus::Warn);
+        assert!(
+            tag_kind
+                .detail
+                .starts_with("1 entries name events that an earlier Wok release deleted"),
+            "{}",
+            tag_kind.detail
+        );
+
+        // The second event, still stored, lost its entry.
+        let env = reopen();
+        let mut txn = env.begin_rw().unwrap();
+        assert!(txn
+            .del(dbi, &key(&events[1]), Some(&events[1].lev_id.to_ne_bytes()))
+            .unwrap());
+        txn.commit().unwrap();
+        drop(env);
+        let report = run(&cfg, Path::new("missing-test-config.toml"));
+        assert_eq!(check(&report, "integrity").status, CheckStatus::Fail);
+        let tag_kind = check(&report, "tag-kind-index");
+        assert_eq!(tag_kind.status, CheckStatus::Fail);
+        assert!(
+            tag_kind
+                .detail
+                .starts_with("1 entries are missing and 0 do not match their event"),
+            "{}",
+            tag_kind.detail
+        );
     }
 
     fn config_defaults_check(text: &str) -> DoctorCheck {

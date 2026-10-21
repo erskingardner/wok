@@ -223,8 +223,9 @@ their history is sent. The steps:
 - **storm:** close every connection, then register all its subscriptions
   again.
 
-The first 500 events, and up to 1,000 after the storm, are checked against an
-independent matcher; any difference fails the trial.
+The first 500 events matched, and the first 500 of the up to 1,000 matched
+after the storm, are checked against an independent matcher; any difference
+fails the trial.
 
 The table gives count, mean, p50, p99, max and total time per step. The
 trial's latency columns hold the per-event match time in **µs**, not ms.
@@ -265,7 +266,8 @@ the report gives their total.
 Every delivery to a stable connection of an event published outside the
 storm is checked against the independent matcher: each event exactly once on
 every subscription that matches it. Missing or unexpected deliveries fail the
-trial. Events published during the storm are not checked, because a
+trial, and so does any refused publication other than a kind 3 contact list
+(which can lose to a newer list from the same author in the same second). Events published during the storm are not checked, because a
 subscription that is reconnecting may miss them.
 
 The table has one row per phase:

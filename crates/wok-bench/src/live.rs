@@ -754,6 +754,10 @@ pub struct LiveReport {
     pub churners: usize,
     pub published: u64,
     pub rejected: u64,
+    /// Refused events other than kind 3 contact lists, which may lose to a
+    /// newer list from the same author in the same second. Each fails the
+    /// trial: the relay would be matching less than the workload sends.
+    pub rejected_unexpectedly: u64,
     pub phases: Vec<PhaseRow>,
     pub subscribe_p50_ms: f64,
     pub subscribe_p99_ms: f64,
@@ -776,7 +780,7 @@ pub struct LiveReport {
 
 impl LiveReport {
     pub fn mismatches(&self) -> u64 {
-        self.missing + self.unexpected
+        self.missing + self.unexpected + self.rejected_unexpectedly
     }
 
     pub fn steady(&self) -> &PhaseRow {
@@ -1381,6 +1385,10 @@ fn analyse(
         churners: opts.churners,
         published: published.len() as u64,
         rejected: published.iter().filter(|e| !e.accepted).count() as u64,
+        rejected_unexpectedly: published
+            .iter()
+            .filter(|e| !e.accepted && e.draft.kind != 3)
+            .count() as u64,
         phases,
         subscribe_p50_ms: ms(&subscribe, 0.5),
         subscribe_p99_ms: ms(&subscribe, 0.99),
@@ -1401,12 +1409,13 @@ fn analyse(
 pub fn render_live_markdown(report: &LiveReport) -> String {
     let churn_secs = report.phases[1].secs.max(f64::MIN_POSITIVE);
     let mut s = format!(
-        "\n### live_subscriptions\n\n{} connections with {} subscriptions, {} churners. {} events published ({} rejected). Deliveries outside the storm checked: {} missing, {} unexpected.\n\n",
+        "\n### live_subscriptions\n\n{} connections with {} subscriptions, {} churners. {} events published ({} rejected, {} of them not kind 3). Deliveries outside the storm checked: {} missing, {} unexpected.\n\n",
         report.conns,
         report.subscriptions,
         report.churners,
         report.published,
         report.rejected,
+        report.rejected_unexpectedly,
         report.missing,
         report.unexpected,
     );
@@ -1465,6 +1474,33 @@ mod tests {
         }
     }
 
+    /// A relay that refuses part of the load matches less of it, so only a
+    /// contact list may be refused.
+    #[test]
+    fn a_refused_publication_fails_the_trial_unless_it_is_a_contact_list() {
+        let opts = small();
+        let workload = Workload::new(&opts);
+        let refused = |kind| Published {
+            draft: Draft {
+                author: 0,
+                kind,
+                e: Vec::new(),
+                p: Vec::new(),
+            },
+            phase: Phase::Steady,
+            sent_ns: 0,
+            accepted: false,
+        };
+        let check = |published: &[Published]| {
+            analyse(&workload, &opts, published, &[], &[], &[], Duration::ZERO).unwrap()
+        };
+        let report = check(&[refused(3)]);
+        assert_eq!((report.rejected, report.mismatches()), (1, 0));
+        let report = check(&[refused(3), refused(1)]);
+        assert_eq!((report.rejected, report.rejected_unexpectedly), (2, 1));
+        assert_eq!(report.mismatches(), 1);
+    }
+
     #[test]
     fn monitor_index_matches_the_reference() {
         let report = run_index(&small()).unwrap();
@@ -1497,6 +1533,7 @@ mod tests {
             .unwrap();
         handle.request_shutdown();
         assert_eq!((report.missing, report.unexpected), (0, 0), "{report:#?}");
+        assert_eq!(report.mismatches(), 0, "{report:#?}");
         assert!(report.steady().deliveries > 0);
         assert!(report.churn_reqs > 0 && report.churn_closes > 0);
         assert!(render_live_markdown(&report).contains("| Storm |"));

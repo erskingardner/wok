@@ -227,6 +227,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A REQ with many filters could hold a req worker well past its time slice
+  (`relay.query_timeslice_budget_us`), and every query behind it waited.
+  Each filter restarted the slice's clock, and a filter that followed a long
+  one did not check the clock until it had done as much work. A REQ's filters
+  now share one slice, and each checks the clock from its start. A 30-filter
+  REQ that once ran 100 ms without yielding now yields every 10 ms.
 - With `relay.compression_sliding_window = false`, the relay reset its
   inflater before every client message although it had not asked the client
   to stop context takeover, so a client compressing against its earlier

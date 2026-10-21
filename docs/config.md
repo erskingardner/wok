@@ -1,10 +1,12 @@
 # Configuration
 
-Wok uses strict TOML configuration. Copy [wok.toml](wok.toml), or start with
-the file produced by `wok migrate strfry`. Omitted settings inherit the
+Wok uses strict TOML configuration. Start from [wok.toml](wok.toml), a short
+annotated file showing the settings a relay must or commonly should set, or
+from the file produced by `wok migrate strfry`. Omitted settings inherit the
 selected [preset](#preset), whose values are the defaults below; unknown keys,
 unknown preset names, wrong types, invalid admin URLs, invalid log filters,
-and out-of-range history settings are rejected.
+and out-of-range history settings are rejected. This page documents every
+setting; `wok config show --defaults` lists each with the preset's value.
 
 The legacy HOCON-subset reader is used only for explicit strfry migration.
 It accepts named objects, arrays, and anonymous object blocks inside arrays
@@ -60,10 +62,36 @@ relay.auth.service_url = "wss://relay.example.com"     # wok.toml:8 (preset publ
 relay.bind = "127.0.0.1"                               # default
 ```
 
+`wok config show --defaults` prints every setting with the value the file's
+preset gives it, ignoring the rest of the file.
+
 Changing `preset` on reload is allowed. The reload log names the preset change,
 and every resulting security-scope change is warn-logged like any other
 reload. Restart settings keep their startup values. Dashboard saves keep the
 file's `preset`.
+
+### Set only overrides
+
+A setting in the file pins its value, even when it equals today's default.
+When a release improves a default, a relay whose file repeats the old value
+keeps it. Set only what the relay needs and leave the rest to the preset.
+
+- **Dashboard and NIP-86 saves** edit the file in place. They change only the
+  settings whose value changed, add a new setting to the end of its table,
+  and remove a setting set back to its preset value. Comments, layout and
+  `preset` are kept; removing a setting also removes the comment lines
+  directly above it.
+- **`wok config minimize`** removes every setting that repeats its preset's
+  value, so the relay resolves to the same configuration afterwards. It keeps
+  the original beside the file as `<file>.bak`, or `.bak.1` and so on if that
+  exists. `--dry-run` prints the change as a unified diff and writes nothing.
+- **`wok doctor`** warns, in its `config-defaults` check, about settings
+  pinned to a default that an earlier release used and the preset has since
+  replaced, such as `events.reject_older_than_secs = 94608000`, the default
+  through 0.7.0. The relay keeps the old value. Delete the line to use the
+  preset's value, or keep it if you chose that value; `minimize` leaves such
+  settings alone because removing them changes behavior. The check also
+  counts the settings that `minimize` would remove.
 
 ## Admin
 

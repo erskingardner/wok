@@ -4,7 +4,8 @@
 # outbox lookups, DMs and gift-wrap inboxes.
 #
 # The public preset is Wok's built-in defaults, so this overlay changes
-# nothing. docs/wok.toml lists every default value, and `wok config show`
+# nothing. docs/config.md documents every setting, `wok config show
+# --defaults` lists each with this preset's value, and `wok config show`
 # prints the effective configuration with the origin of each value.
 #
 # Wok resolves configuration in three layers: the built-in defaults, then the

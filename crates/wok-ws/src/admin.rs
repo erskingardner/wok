@@ -7,7 +7,6 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use sha2::Digest;
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wok_relay::{Config, EphemeralPersistence, RelayHandle};
@@ -346,84 +345,89 @@ fn overview(handle: &RelayHandle) -> Response<Full<Bytes>> {
             "version": env!("CARGO_PKG_VERSION"),
             "history": handle.metrics.history_json(),
             "can_write_config": cfg.admin.allow_config_writes && handle.config_path().is_some(),
-            "config": {
-                "info": {
-                    "name": cfg.relay.info.name,
-                    "description": cfg.relay.info.description,
-                    "pubkey": cfg.relay.info.pubkey,
-                    "self_pk": cfg.relay.info.self_pk,
-                    "contact": cfg.relay.info.contact,
-                    "icon": cfg.relay.info.icon,
-                    "banner": cfg.relay.info.banner,
-                    "privacy": cfg.relay.info.privacy,
-                    "terms": cfg.relay.info.terms,
-                },
-                "events": {
-                    "max_event_size": cfg.events.max_event_size,
-                    "reject_newer_than_secs": cfg.events.reject_newer_than_secs,
-                    "reject_older_than_secs": cfg.events.reject_older_than_secs,
-                    "reject_ephemeral_older_than_secs": cfg.events.reject_ephemeral_older_than_secs,
-                    "ephemeral_lifetime_secs": cfg.events.ephemeral_lifetime_secs,
-                    "ephemeral_persistence": cfg.events.ephemeral_persistence,
-                    "max_num_tags": cfg.events.max_num_tags,
-                    "max_tag_val_size": cfg.events.max_tag_val_size,
-                },
-                "limits": {
-                    "max_req_filter_size": cfg.relay.max_req_filter_size,
-                    "max_filters_per_req": cfg.relay.max_filters_per_req,
-                    "query_timeslice_budget_us": cfg.relay.query_timeslice_budget_us,
-                    "max_filter_limit": cfg.relay.max_filter_limit,
-                    "max_tags_per_filter": cfg.relay.max_tags_per_filter,
-                    "max_and_entries": cfg.relay.max_and_entries,
-                    "max_filter_limit_count": cfg.relay.max_filter_limit_count,
-                    "max_total_events_per_req": cfg.relay.max_total_events_per_req,
-                    "max_subs_per_connection": cfg.relay.max_subs_per_connection,
-                    "max_pending_outbound_bytes": cfg.relay.max_pending_outbound_bytes,
-                    "write_policy_timeout_secs": cfg.relay.write_policy_timeout_secs,
-                    "negentropy_enabled": cfg.relay.negentropy_enabled,
-                    "max_sync_events": cfg.relay.max_sync_events,
-                },
-                "abuse": {
-                    "enabled": cfg.relay.abuse.enabled,
-                    "connection_rate_per_second": cfg.relay.abuse.connection_rate_per_second,
-                    "connection_burst": cfg.relay.abuse.connection_burst,
-                    "event_rate_per_second": cfg.relay.abuse.event_rate_per_second,
-                    "event_burst": cfg.relay.abuse.event_burst,
-                    "pubkey_event_rate_per_second": cfg.relay.abuse.pubkey_event_rate_per_second,
-                    "pubkey_event_burst": cfg.relay.abuse.pubkey_event_burst,
-                    "req_rate_per_second": cfg.relay.abuse.req_rate_per_second,
-                    "req_burst": cfg.relay.abuse.req_burst,
-                    "count_rate_per_second": cfg.relay.abuse.count_rate_per_second,
-                    "count_burst": cfg.relay.abuse.count_burst,
-                    "invalid_rate_per_second": cfg.relay.abuse.invalid_rate_per_second,
-                    "invalid_burst": cfg.relay.abuse.invalid_burst,
-                    "max_concurrent_historical_queries": cfg.relay.abuse.max_concurrent_historical_queries,
-                    "max_query_cost": cfg.relay.abuse.max_query_cost,
-                    "max_stored_events": cfg.relay.abuse.max_stored_events,
-                    "max_stored_events_per_pubkey": cfg.relay.abuse.max_stored_events_per_pubkey,
-                    "min_pow_difficulty": cfg.relay.abuse.min_pow_difficulty,
-                },
-                "filters": {
-                    "enabled": cfg.relay.filter_validation.enabled,
-                    "max_filters_per_req": cfg.relay.filter_validation.max_filters_per_req,
-                    "min_filters_per_req": cfg.relay.filter_validation.min_filters_per_req,
-                    "max_kinds_per_filter": cfg.relay.filter_validation.max_kinds_per_filter,
-                    "allowed_kinds": cfg.relay.filter_validation.allowed_kinds,
-                    "require_author_or_tag": cfg.relay.filter_validation.require_author_or_tag,
-                },
-                "nip62": {
-                    "enabled": cfg.relay.nip62.enabled,
-                    "service_url": cfg.relay.nip62.service_url,
-                    "deletion_batch_size": cfg.relay.nip62.deletion_batch_size,
-                },
-                "history": {
-                    "enabled": cfg.observability.history_enabled,
-                    "interval_secs": cfg.observability.history_interval_secs,
-                    "max_points": cfg.observability.history_max_points,
-                }
-            }
+            "config": dashboard_config(&cfg),
         }),
     )
+}
+
+/// The settings the dashboard shows and sends back on save, by form group.
+fn dashboard_config(cfg: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "info": {
+            "name": cfg.relay.info.name,
+            "description": cfg.relay.info.description,
+            "pubkey": cfg.relay.info.pubkey,
+            "self_pk": cfg.relay.info.self_pk,
+            "contact": cfg.relay.info.contact,
+            "icon": cfg.relay.info.icon,
+            "banner": cfg.relay.info.banner,
+            "privacy": cfg.relay.info.privacy,
+            "terms": cfg.relay.info.terms,
+        },
+        "events": {
+            "max_event_size": cfg.events.max_event_size,
+            "reject_newer_than_secs": cfg.events.reject_newer_than_secs,
+            "reject_older_than_secs": cfg.events.reject_older_than_secs,
+            "reject_ephemeral_older_than_secs": cfg.events.reject_ephemeral_older_than_secs,
+            "ephemeral_lifetime_secs": cfg.events.ephemeral_lifetime_secs,
+            "ephemeral_persistence": cfg.events.ephemeral_persistence,
+            "max_num_tags": cfg.events.max_num_tags,
+            "max_tag_val_size": cfg.events.max_tag_val_size,
+        },
+        "limits": {
+            "max_req_filter_size": cfg.relay.max_req_filter_size,
+            "max_filters_per_req": cfg.relay.max_filters_per_req,
+            "query_timeslice_budget_us": cfg.relay.query_timeslice_budget_us,
+            "max_filter_limit": cfg.relay.max_filter_limit,
+            "max_tags_per_filter": cfg.relay.max_tags_per_filter,
+            "max_and_entries": cfg.relay.max_and_entries,
+            "max_filter_limit_count": cfg.relay.max_filter_limit_count,
+            "max_total_events_per_req": cfg.relay.max_total_events_per_req,
+            "max_subs_per_connection": cfg.relay.max_subs_per_connection,
+            "max_pending_outbound_bytes": cfg.relay.max_pending_outbound_bytes,
+            "write_policy_timeout_secs": cfg.relay.write_policy_timeout_secs,
+            "negentropy_enabled": cfg.relay.negentropy_enabled,
+            "max_sync_events": cfg.relay.max_sync_events,
+        },
+        "abuse": {
+            "enabled": cfg.relay.abuse.enabled,
+            "connection_rate_per_second": cfg.relay.abuse.connection_rate_per_second,
+            "connection_burst": cfg.relay.abuse.connection_burst,
+            "event_rate_per_second": cfg.relay.abuse.event_rate_per_second,
+            "event_burst": cfg.relay.abuse.event_burst,
+            "pubkey_event_rate_per_second": cfg.relay.abuse.pubkey_event_rate_per_second,
+            "pubkey_event_burst": cfg.relay.abuse.pubkey_event_burst,
+            "req_rate_per_second": cfg.relay.abuse.req_rate_per_second,
+            "req_burst": cfg.relay.abuse.req_burst,
+            "count_rate_per_second": cfg.relay.abuse.count_rate_per_second,
+            "count_burst": cfg.relay.abuse.count_burst,
+            "invalid_rate_per_second": cfg.relay.abuse.invalid_rate_per_second,
+            "invalid_burst": cfg.relay.abuse.invalid_burst,
+            "max_concurrent_historical_queries": cfg.relay.abuse.max_concurrent_historical_queries,
+            "max_query_cost": cfg.relay.abuse.max_query_cost,
+            "max_stored_events": cfg.relay.abuse.max_stored_events,
+            "max_stored_events_per_pubkey": cfg.relay.abuse.max_stored_events_per_pubkey,
+            "min_pow_difficulty": cfg.relay.abuse.min_pow_difficulty,
+        },
+        "filters": {
+            "enabled": cfg.relay.filter_validation.enabled,
+            "max_filters_per_req": cfg.relay.filter_validation.max_filters_per_req,
+            "min_filters_per_req": cfg.relay.filter_validation.min_filters_per_req,
+            "max_kinds_per_filter": cfg.relay.filter_validation.max_kinds_per_filter,
+            "allowed_kinds": cfg.relay.filter_validation.allowed_kinds,
+            "require_author_or_tag": cfg.relay.filter_validation.require_author_or_tag,
+        },
+        "nip62": {
+            "enabled": cfg.relay.nip62.enabled,
+            "service_url": cfg.relay.nip62.service_url,
+            "deletion_batch_size": cfg.relay.nip62.deletion_batch_size,
+        },
+        "history": {
+            "enabled": cfg.observability.history_enabled,
+            "interval_secs": cfg.observability.history_interval_secs,
+            "max_points": cfg.observability.history_max_points,
+        }
+    })
 }
 
 fn update_config(handle: &RelayHandle, body: &[u8]) -> Response<Full<Bytes>> {
@@ -433,14 +437,17 @@ fn update_config(handle: &RelayHandle, body: &[u8]) -> Response<Full<Bytes>> {
     }
 }
 
+/// Serializes reading, editing and replacing the config file, so concurrent
+/// saves cannot drop each other's edits.
+static CONFIG_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Validate, atomically persist, and live-reload a configuration patch.
 /// Shared by the dashboard API and the NIP-86 relay-info methods.
 pub(crate) fn apply_config_patch(
     handle: &RelayHandle,
     body: &[u8],
 ) -> Result<(), (StatusCode, String)> {
-    let current = handle.config.read().clone();
-    if !current.admin.allow_config_writes {
+    if !handle.config.read().admin.allow_config_writes {
         return Err((StatusCode::FORBIDDEN, "config writes are disabled".into()));
     }
     let Some(path) = handle.config_path() else {
@@ -451,21 +458,30 @@ pub(crate) fn apply_config_patch(
     };
     let patch: ConfigPatch = serde_json::from_slice(body)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let (encoded, verified) =
-        patched_config(current, patch).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    atomic_write_config(&path, encoded.as_bytes())
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let _writing = CONFIG_WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        (
+            StatusCode::CONFLICT,
+            format!("cannot read {}: {error}", path.display()),
+        )
+    })?;
+    let (edited, verified) =
+        patched_file(&text, patch).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    if edited != text {
+        wok_relay::config::write_file(&path, edited.as_bytes())
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    }
     handle.config.write().apply_reload(verified);
     Ok(())
 }
 
-/// Apply a patch and encode the whole result as the file to persist, checked
-/// by parsing it back. The encoding keeps the running `preset`.
-fn patched_config(mut config: Config, patch: ConfigPatch) -> Result<(String, Config), String> {
-    apply_patch(&mut config, patch);
-    let encoded = config.to_toml()?;
-    let verified = Config::parse_toml(&encoded)?;
-    Ok((encoded, verified))
+/// Apply a patch to the configuration of the file on disk and edit the file
+/// in place: only keys whose value changes are touched, a key set back to its
+/// preset value is removed, and comments, layout and `preset` are kept.
+fn patched_file(text: &str, patch: ConfigPatch) -> Result<(String, Config), String> {
+    Config::edit_toml(text, |config| apply_patch(config, patch))
 }
 
 fn apply_patch(config: &mut Config, patch: ConfigPatch) {
@@ -665,26 +681,6 @@ fn apply_patch(config: &mut Config, patch: ConfigPatch) {
     }
 }
 
-fn atomic_write_config(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "config path has no parent directory".to_string())?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        temporary
-            .as_file()
-            .set_permissions(metadata.permissions())
-            .map_err(|e| e.to_string())?;
-    }
-    temporary.write_all(contents).map_err(|e| e.to_string())?;
-    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
-    temporary.persist(path).map_err(|e| e.error.to_string())?;
-    if let Ok(directory) = std::fs::File::open(parent) {
-        let _ = directory.sync_all();
-    }
-    Ok(())
-}
-
 pub(crate) fn unauthorized(message: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
@@ -863,10 +859,10 @@ function draw(points){
 }
 async function load(first=false){try{$('status').textContent='Signing…';const next=await authFetch('/admin/api/overview');$('loginView').hidden=true;$('dashboard').hidden=false;render(next);$('status').textContent='Authenticated';$('status').className='status ok';$('loginStatus').textContent=''}catch(error){if(first){$('loginStatus').textContent=error.message;$('loginStatus').className='login-status bad'}else{$('status').textContent=error.message;$('status').className='status bad'}}}
 function signOut(){data=null;$('dashboard').hidden=true;$('loginView').hidden=false;$('loginStatus').textContent='Signed out. A fresh signature is required to return.';$('loginStatus').className='login-status muted'}
-function configBody(){const body={};for(const group of GROUPS){body[group.key]={};for(const input of document.querySelectorAll('[data-group="'+group.key+'"]'))body[group.key][input.dataset.key]=getInput(input)}return JSON.stringify(body)}
+function configBody(){const body={};for(const group of GROUPS){const loaded=data.config[group.key];for(const input of document.querySelectorAll('[data-group="'+group.key+'"]')){const value=getInput(input);if(value!==loaded[input.dataset.key])(body[group.key]=body[group.key]||{})[input.dataset.key]=value}}return body}
 createForm();
 $('login').onclick=()=>load(true);$('refresh').onclick=()=>load(false);$('logout').onclick=signOut;
-$('save').onclick=async()=>{try{$('saveStatus').textContent='Signing and saving…';await authFetch('/admin/api/config','PUT',configBody());$('saveStatus').textContent='Saved. Refreshing…';await load(false)}catch(error){$('saveStatus').textContent=error.message;$('saveStatus').className='bad'}};
+$('save').onclick=async()=>{try{const changes=configBody();if(!Object.keys(changes).length){$('saveStatus').textContent='No changes to save.';$('saveStatus').className='muted';return}$('saveStatus').textContent='Signing and saving…';await authFetch('/admin/api/config','PUT',JSON.stringify(changes));$('saveStatus').textContent='Saved. Refreshing…';await load(false)}catch(error){$('saveStatus').textContent=error.message;$('saveStatus').className='bad'}};
 addEventListener('resize',()=>data&&draw(data.history.points||[]));
 </script>
 </body>
@@ -1098,7 +1094,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wok.toml");
         std::fs::write(&path, "old").unwrap();
-        atomic_write_config(&path, b"new").unwrap();
+        wok_relay::config::write_file(&path, b"new").unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
 
         let patch: ConfigPatch = serde_json::from_value(json!({
@@ -1131,19 +1127,151 @@ mod tests {
         .is_err());
     }
 
+    /// A hand-written file: comments, an inline comment, and a preset.
+    const COMMENTED: &str = r#"# Example relay, behind nginx on this host.
+preset = "public"
+
+[relay]
+# Loopback only: nginx terminates TLS.
+bind = "127.0.0.1"
+port = 7778          # 7777 is taken
+
+[relay.info]
+name = "Example relay"   # shown in NIP-11
+description = "Notes and DMs."
+
+[relay.abuse]
+# Raised for the bridge that republishes in bursts.
+event_burst = 500
+"#;
+
+    /// Save the way the dashboard does when the form was loaded from the
+    /// file `loaded` and the file is now `disk`: like `configBody()`, send
+    /// only the fields `edit` changes in the loaded form.
+    fn dashboard_save_from(
+        loaded: &str,
+        disk: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<(String, Config), String> {
+        let form = dashboard_config(&Config::parse_toml(loaded).unwrap());
+        let mut edited = form.clone();
+        edit(&mut edited);
+        let mut body = json!({});
+        for (group, fields) in edited.as_object().unwrap() {
+            for (key, value) in fields.as_object().unwrap() {
+                if form[group][key] != *value {
+                    body.as_object_mut()
+                        .unwrap()
+                        .entry(group.clone())
+                        .or_insert_with(|| json!({}))[key] = value.clone();
+                }
+            }
+        }
+        patched_file(disk, serde_json::from_value(body).unwrap())
+    }
+
+    fn dashboard_save(
+        text: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<(String, Config), String> {
+        dashboard_save_from(text, text, edit)
+    }
+
     #[test]
-    fn config_patch_keeps_the_preset() {
-        let current =
-            Config::parse_toml("preset = \"public\"\n[relay.info]\nname = \"before\"\n").unwrap();
-        let patch: ConfigPatch =
-            serde_json::from_value(json!({"info": {"name": "after"}})).unwrap();
-        let (encoded, verified) = patched_config(current, patch).unwrap();
-        assert!(
-            encoded.lines().any(|line| line == "preset = \"public\""),
-            "{encoded}"
+    fn dashboard_save_from_a_stale_form_keeps_newer_changes() {
+        // Another save raised event_burst after this form was loaded.
+        let disk = COMMENTED.replace("event_burst = 500", "event_burst = 900");
+        let (edited, verified) = dashboard_save_from(COMMENTED, &disk, |body| {
+            body["info"]["name"] = json!("Renamed relay");
+        })
+        .unwrap();
+        assert_eq!(
+            edited,
+            disk.replace(
+                "name = \"Example relay\"   #",
+                "name = \"Renamed relay\"   #"
+            )
+        );
+        assert_eq!(verified.relay.abuse.event_burst, 900);
+        // The page sends only the fields that differ from what it loaded.
+        assert!(ADMIN_HTML_V2.contains(
+            "if(value!==loaded[input.dataset.key])(body[group.key]=body[group.key]||{})"
+        ));
+        assert!(ADMIN_HTML_V2.contains("No changes to save."));
+    }
+
+    #[test]
+    fn dashboard_save_changes_only_the_edited_key() {
+        let (edited, verified) = dashboard_save(COMMENTED, |body| {
+            body["info"]["name"] = json!("Renamed relay");
+        })
+        .unwrap();
+        assert_eq!(
+            edited,
+            COMMENTED.replace(
+                "name = \"Example relay\"   #",
+                "name = \"Renamed relay\"   #"
+            )
         );
         assert_eq!(verified.preset, Preset::Public);
-        assert_eq!(verified.relay.info.name, "after");
+        assert_eq!(verified.relay.info.name, "Renamed relay");
+        assert_eq!(verified.relay.port, 7778);
+
+        // Saving the form unchanged leaves the file as it is.
+        let (unchanged, _) = dashboard_save(COMMENTED, |_| {}).unwrap();
+        assert_eq!(unchanged, COMMENTED);
+        // A file without `preset` does not gain one.
+        let (edited, _) = dashboard_save("[relay.info]\nname = \"a\"\n", |body| {
+            body["info"]["name"] = json!("b");
+        })
+        .unwrap();
+        assert_eq!(edited, "[relay.info]\nname = \"b\"\n");
+    }
+
+    #[test]
+    fn dashboard_save_writes_overrides_only() {
+        // A key the file does not set is added to its table, or to a new one.
+        let (edited, _) = dashboard_save(COMMENTED, |body| {
+            body["abuse"]["req_burst"] = json!(80);
+        })
+        .unwrap();
+        assert_eq!(
+            edited,
+            COMMENTED.replace("event_burst = 500\n", "event_burst = 500\nreq_burst = 80\n")
+        );
+        let (edited, _) = dashboard_save(COMMENTED, |body| {
+            body["events"]["max_num_tags"] = json!(5000);
+        })
+        .unwrap();
+        assert_eq!(
+            edited,
+            format!("{COMMENTED}\n[events]\nmax_num_tags = 5000\n")
+        );
+
+        // A key set back to its preset's value is removed with its comment,
+        // and so is the table that leaves empty.
+        let (edited, verified) = dashboard_save(COMMENTED, |body| {
+            body["abuse"]["event_burst"] = json!(100);
+        })
+        .unwrap();
+        assert_eq!(
+            edited,
+            COMMENTED.replace(
+                "\n[relay.abuse]\n# Raised for the bridge that republishes in bursts.\nevent_burst = 500\n",
+                ""
+            )
+        );
+        assert_eq!(verified.relay.abuse.event_burst, 100);
+
+        // Invalid values are refused before anything is written.
+        let error = dashboard_save(COMMENTED, |body| {
+            body["history"]["interval_secs"] = json!(0);
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("history_interval_secs must be at least 1"),
+            "{error}"
+        );
     }
 
     #[test]

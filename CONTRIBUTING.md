@@ -111,7 +111,8 @@ is welcome, as long as it comes with a test and an entry in
   |---|---|
   | A NIP | [docs/nips.md](docs/nips.md) and the capabilities catalog |
   | A difference from strfry | [docs/known-differences.md](docs/known-differences.md) |
-  | A config key | [docs/config.md](docs/config.md) and [docs/wok.toml](docs/wok.toml) |
+  | A config key | [docs/config.md](docs/config.md), plus [docs/wok.toml](docs/wok.toml) if most operators must set it |
+  | A default | `Preset changes` in [CHANGELOG.md](CHANGELOG.md), and the old value in `PAST_DEFAULTS` (`crates/wok-relay/src/config/history.rs`) so `wok doctor` can flag files that pin it |
   | Something operators will notice | The `Unreleased` section of [CHANGELOG.md](CHANGELOG.md) |
 
 - **Commits.** Use the form `type(scope): summary`, for example

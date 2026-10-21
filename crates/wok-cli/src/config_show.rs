@@ -10,9 +10,20 @@ use wok_relay::Config;
 /// the origin column, so one long array doesn't push every comment right.
 const ALIGN_LIMIT: usize = 60;
 
+/// What `wok config show` prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// Every effective value, with its origin.
+    Effective,
+    /// Only the keys the file sets to a value other than its preset's.
+    Overrides,
+    /// Every value of the file's preset, ignoring the rest of the file.
+    Defaults,
+}
+
 /// Explain the config file at `path`. A missing file explains the built-in
 /// defaults, which is what the relay would run with.
-pub fn run(path: &Path, overrides_only: bool) -> Result<String> {
+pub fn run(path: &Path, view: View) -> Result<String> {
     let label = path.display();
     let (text, found) = match std::fs::read_to_string(path) {
         Ok(text) => (text, true),
@@ -20,7 +31,13 @@ pub fn run(path: &Path, overrides_only: bool) -> Result<String> {
         Err(error) => return Err(anyhow!("{label}: {error}")),
     };
     let explanation = Config::explain_toml(&text).map_err(|error| anyhow!("{label}: {error}"))?;
-    Ok(render(&explanation, path, found, overrides_only))
+    if view == View::Defaults {
+        let preset = explanation.config.preset;
+        let defaults = Config::explain_toml(&format!("preset = \"{preset}\"\n"))
+            .map_err(|error| anyhow!("preset {preset}: {error}"))?;
+        return Ok(render_defaults(&defaults, &explanation, path));
+    }
+    Ok(render(&explanation, path, found, view == View::Overrides))
 }
 
 /// Render an explanation as TOML dotted keys with the origin of each value
@@ -34,33 +51,73 @@ fn render(
 ) -> String {
     let preset = explanation.config.preset;
     let label = path.display();
-    let file = path
-        .file_name()
-        .map_or_else(|| label.to_string(), |name| name.to_string_lossy().into());
-    let mut out = if !found {
+    let header = if !found {
         format!("# {label} not found: built-in defaults (preset {preset})\n")
     } else if overrides_only {
         format!("# Keys {label} sets to a value other than preset {preset}'s\n")
     } else {
         format!("# Effective configuration of {label} (preset {preset})\n")
     };
-    let lines: Vec<(String, String)> = explanation
+    let lines = explanation
         .entries
         .iter()
         .filter(|entry| !overrides_only || entry.is_override())
         .map(|entry| {
-            let mut origin = match entry.origin {
-                Origin::Default => "default".to_string(),
-                Origin::Preset(preset) => format!("preset {preset}"),
-                Origin::File { line: Some(line) } => format!("{file}:{line}"),
-                Origin::File { line: None } => file.clone(),
-            };
+            let mut origin = origin_label(entry.origin, path);
             if let Some(value) = &entry.preset_value {
                 origin.push_str(&format!(" (preset {preset}: {value})"));
             }
             (format!("{} = {}", entry.key, entry.value), origin)
         })
         .collect();
+    aligned(header, lines)
+}
+
+/// Render the values of the preset `file` selects, each with the layer that
+/// gives it. The `preset` line names where the file selects it.
+fn render_defaults(defaults: &ConfigExplanation, file: &ConfigExplanation, path: &Path) -> String {
+    let preset = defaults.config.preset;
+    let selected = file
+        .entries
+        .iter()
+        .find(|entry| entry.key == "preset")
+        .map_or(Origin::Default, |entry| entry.origin);
+    let lines = defaults
+        .entries
+        .iter()
+        .map(|entry| {
+            let origin = if entry.key == "preset" {
+                origin_label(selected, path)
+            } else {
+                origin_label(entry.origin, path)
+            };
+            (format!("{} = {}", entry.key, entry.value), origin)
+        })
+        .collect();
+    aligned(
+        format!("# Every setting under preset {preset}: built-in defaults and its overlay\n"),
+        lines,
+    )
+}
+
+/// Name a layer, using the file name of `path` for the operator's file.
+fn origin_label(origin: Origin, path: &Path) -> String {
+    let file = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into(),
+    );
+    match origin {
+        Origin::Default => "default".to_string(),
+        Origin::Preset(preset) => format!("preset {preset}"),
+        Origin::File { line: Some(line) } => format!("{file}:{line}"),
+        Origin::File { line: None } => file,
+    }
+}
+
+/// `header` followed by each `key = value` with its origin in an aligned
+/// trailing comment.
+fn aligned(header: String, lines: Vec<(String, String)>) -> String {
+    let mut out = header;
     let width = lines
         .iter()
         .map(|(assignment, _)| assignment.len())
@@ -134,7 +191,7 @@ mod tests {
     #[test]
     fn missing_file_shows_the_defaults() {
         let directory = tempfile::tempdir().unwrap();
-        let rendered = run(&directory.path().join("absent.toml"), false).unwrap();
+        let rendered = run(&directory.path().join("absent.toml"), View::Effective).unwrap();
         assert!(rendered
             .lines()
             .next()
@@ -144,7 +201,7 @@ mod tests {
             .lines()
             .skip(1)
             .all(|line| line.ends_with("  # default")));
-        let overrides = run(&directory.path().join("absent.toml"), true).unwrap();
+        let overrides = run(&directory.path().join("absent.toml"), View::Overrides).unwrap();
         assert_eq!(overrides.lines().count(), 1, "{overrides}");
     }
 
@@ -153,10 +210,39 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wok.toml");
         std::fs::write(&path, "preset = \"private\"\n").unwrap();
-        let error = run(&path, false).unwrap_err().to_string();
+        let error = run(&path, View::Effective).unwrap_err().to_string();
         assert!(
             error.contains("wok.toml: unknown preset \"private\"; valid presets: public"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn defaults_list_every_setting_of_the_files_preset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wok.toml");
+        std::fs::write(&path, FILE).unwrap();
+        let rendered = run(&path, View::Defaults).unwrap();
+        assert!(rendered.starts_with(
+            "# Every setting under preset public: built-in defaults and its overlay\n"
+        ));
+        assert!(line_for(&rendered, "preset").ends_with("  # wok.toml:1"));
+        // The file's own values are ignored.
+        assert!(line_for(&rendered, "relay.port").starts_with("relay.port = 7777 "));
+        assert!(line_for(&rendered, "relay.port").ends_with("  # default"));
+        let reparsed = Config::parse_toml(&rendered).unwrap();
+        assert_eq!(
+            reparsed.to_toml().unwrap(),
+            Config::default().to_toml().unwrap()
+        );
+        assert_eq!(
+            rendered.lines().count(),
+            explain("").entries.len() + 1,
+            "{rendered}"
+        );
+
+        // Without a file, the default preset's.
+        let rendered = run(&directory.path().join("absent.toml"), View::Defaults).unwrap();
+        assert!(line_for(&rendered, "preset").ends_with("  # default"));
     }
 }

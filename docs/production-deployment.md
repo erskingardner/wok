@@ -22,7 +22,15 @@ sudo install -d -o wok -g wok -m 0700 /var/lib/wok
 sudo install -o root -g root -m 0644 contrib/systemd/wok.service /etc/systemd/system/wok.service
 ```
 
-Set at least these deployment-specific values in `/etc/wok/wok.toml`:
+The sample selects the preset and shows, commented out, the settings most
+relays must set; every other setting comes from the preset, so upgrades
+bring improved defaults. Add only the settings
+this relay needs, and after an upgrade run `wok doctor`: its
+`config-defaults` check names settings pinned to a default the preset has
+since replaced. See [Set only overrides](config.md#set-only-overrides).
+
+Set at least these deployment-specific values in `/etc/wok/wok.toml`, with
+the relay's real public URL and details:
 
 ```toml
 [database]
@@ -30,6 +38,13 @@ path = "/var/lib/wok/db"
 
 [relay]
 bind = "127.0.0.1"
+
+[relay.auth]
+service_url = "wss://relay.example.com"
+
+[relay.info]
+name = "Example relay"
+contact = "mailto:ops@example.com"
 
 [relay.unix]
 path = "/run/wok/relay.sock"

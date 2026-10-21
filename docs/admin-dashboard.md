@@ -55,11 +55,21 @@ self-lockout, trust-boundary change, or process-execution risk. Edit those in
 `wok.toml`; the full inventory and reload behavior are in
 [Configuration](config.md).
 
-Before replacing the file, Wok serializes the complete next configuration and
-parses it through the normal strict validator. It writes a temporary file in
-the same directory, preserves permissions, syncs it, atomically renames it over
-the configuration, syncs the directory, and then applies normal live-reload
-rules. Keep writes disabled if the dashboard is needed only for visibility.
+A save edits the file on disk in place, so hand-written comments and layout
+survive. The page sends only the fields changed since it loaded, so a save
+from a tab opened earlier does not undo settings changed since. Wok reads the
+file, applies those fields to the file's own configuration, and touches only
+the settings whose value changed: a changed setting is
+rewritten where it is, a new one goes at the end of its table, and one set
+back to its preset's value is removed, so the file holds overrides only (see
+[Set only overrides](config.md#set-only-overrides)). The file's `preset` is
+kept. Wok then parses the edited file through the normal strict validator,
+writes it to a temporary file in the same directory with the same
+permissions, syncs it, atomically renames it over the configuration, syncs
+the directory, and applies normal live-reload rules. A save that changes
+nothing leaves the file untouched, and a file that no longer parses is
+refused rather than overwritten. Keep writes disabled if the dashboard is
+needed only for visibility.
 
 Terminate TLS at the reverse proxy and keep the relay clock synchronized;
 NIP-98 freshness depends on both. Serve the dashboard from the same origin set

@@ -4,9 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+mod edit;
+mod history;
 mod preset;
 mod provenance;
 
+pub use edit::{write_file, Minimized};
+pub use history::StaleDefault;
 pub use preset::Preset;
 pub use provenance::{ConfigEntry, ConfigExplanation, Origin};
 
@@ -541,6 +545,16 @@ impl Layers {
         Ok(merged)
     }
 
+    /// [`Layers::preset_value`] round-tripped through its typed form, so its
+    /// values are encoded exactly like [`encode`]'s.
+    fn preset_encoded(&self) -> Result<toml::Value, String> {
+        let preset: TomlConfig = self
+            .preset_value()?
+            .try_into()
+            .map_err(|e: toml::de::Error| e.to_string())?;
+        toml::Value::try_from(preset).map_err(|e| e.to_string())
+    }
+
     fn resolve(&self) -> Result<Config, String> {
         let mut merged = self.preset_value()?;
         merge_toml(&mut merged, self.file.clone());
@@ -549,6 +563,11 @@ impl Layers {
             .map_err(|e: toml::de::Error| e.to_string())?;
         validate(parsed)
     }
+}
+
+/// A resolved configuration as a TOML value, in the native file layout.
+fn encode(config: &Config) -> Result<toml::Value, String> {
+    toml::Value::try_from(TomlConfig::from(config.clone())).map_err(|e| e.to_string())
 }
 
 /// Check and normalize a merged configuration.
@@ -680,6 +699,26 @@ impl Config {
     /// effective value with the layer it came from.
     pub fn explain_toml(text: &str) -> Result<ConfigExplanation, String> {
         provenance::explain(text, Preset::overlay)
+    }
+
+    /// Edit a native TOML file in place so it resolves to the configuration
+    /// `edit` makes of the file's own. Only keys whose value changes are
+    /// touched: a key set to its preset's value is removed, and any other is
+    /// set where it is or added to its table. Comments, layout and `preset`
+    /// are kept. Returns the new text and its configuration, which is
+    /// checked by parsing the text again.
+    pub fn edit_toml(
+        text: &str,
+        edit: impl FnOnce(&mut Config),
+    ) -> Result<(String, Config), String> {
+        edit::edit(text, Preset::overlay, edit)
+    }
+
+    /// Remove the keys of a native TOML file that repeat its preset's value,
+    /// keeping comments, layout and `preset`. The file resolves to the same
+    /// configuration afterwards.
+    pub fn minimize_toml(text: &str) -> Result<Minimized, String> {
+        edit::minimize(text, Preset::overlay)
     }
 
     pub fn to_toml(&self) -> Result<String, String> {
@@ -2484,15 +2523,35 @@ max_event_size = 99999999999
     }
 
     #[test]
-    fn documented_toml_example_parses() {
-        let documented = include_str!("../../../docs/wok.toml");
-        Config::parse_toml(documented).unwrap();
+    fn sample_config_parses_and_sets_only_overrides() {
+        let sample = include_str!("../../../docs/wok.toml");
+        let explained = Config::explain_toml(sample).unwrap();
+        assert_eq!(explained.config.preset, Preset::Public);
+        let repeated: Vec<&str> = explained
+            .repeated_preset_values()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert!(
+            repeated.is_empty(),
+            "docs/wok.toml repeats preset values, which pins them: {repeated:?}"
+        );
+        assert_eq!(Config::minimize_toml(sample).unwrap().text, sample);
+    }
 
-        let documented: toml::Value = toml::from_str(documented).unwrap();
-        let defaults: toml::Value = toml::from_str(&Config::default().to_toml().unwrap()).unwrap();
-        assert_eq!(
-            documented, defaults,
-            "docs/wok.toml must list every default"
+    #[test]
+    fn every_setting_is_documented_in_config_md() {
+        let reference = include_str!("../../../docs/config.md");
+        let mut leaves = Vec::new();
+        let defaults = encode(&Config::default()).unwrap();
+        provenance::flatten(&defaults, &mut Vec::new(), &mut leaves);
+        let undocumented: Vec<String> = leaves
+            .iter()
+            .map(|(path, _)| path.join("."))
+            .filter(|key| !reference.contains(&format!("| `{key}` |")))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "docs/config.md has no table row for {undocumented:?}"
         );
     }
 }

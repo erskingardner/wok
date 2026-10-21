@@ -16,6 +16,7 @@ parking_lot.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -29,7 +30,6 @@ wok-query = { path = "../wok-query" }
 
 [dev-dependencies]
 proptest.workspace = true
-tempfile.workspace = true
 hex.workspace = true
 secp256k1.workspace = true
 rand.workspace = true

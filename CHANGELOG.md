@@ -164,8 +164,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than to the running configuration, so it no longer reverts a
   restart-only setting changed in the file since startup, and refuses a file
   that does not parse instead of overwriting it.
-- `docs/wok.toml` is a short annotated sample with only the settings a relay
-  must or commonly should set. The full list of settings is in
+- `docs/wok.toml` is a short annotated sample that selects the preset and
+  shows, commented out, the settings a relay must or commonly should set,
+  such as `relay.auth.service_url`. The full list of settings is in
   `docs/config.md` and `wok config show --defaults`.
 - WebSocket connections cost less memory and CPU. permessage-deflate state
   (about 300 KiB per connection) is allocated by a connection's first message

@@ -859,10 +859,10 @@ function draw(points){
 }
 async function load(first=false){try{$('status').textContent='Signing…';const next=await authFetch('/admin/api/overview');$('loginView').hidden=true;$('dashboard').hidden=false;render(next);$('status').textContent='Authenticated';$('status').className='status ok';$('loginStatus').textContent=''}catch(error){if(first){$('loginStatus').textContent=error.message;$('loginStatus').className='login-status bad'}else{$('status').textContent=error.message;$('status').className='status bad'}}}
 function signOut(){data=null;$('dashboard').hidden=true;$('loginView').hidden=false;$('loginStatus').textContent='Signed out. A fresh signature is required to return.';$('loginStatus').className='login-status muted'}
-function configBody(){const body={};for(const group of GROUPS){body[group.key]={};for(const input of document.querySelectorAll('[data-group="'+group.key+'"]'))body[group.key][input.dataset.key]=getInput(input)}return JSON.stringify(body)}
+function configBody(){const body={};for(const group of GROUPS){const loaded=data.config[group.key];for(const input of document.querySelectorAll('[data-group="'+group.key+'"]')){const value=getInput(input);if(value!==loaded[input.dataset.key])(body[group.key]=body[group.key]||{})[input.dataset.key]=value}}return body}
 createForm();
 $('login').onclick=()=>load(true);$('refresh').onclick=()=>load(false);$('logout').onclick=signOut;
-$('save').onclick=async()=>{try{$('saveStatus').textContent='Signing and saving…';await authFetch('/admin/api/config','PUT',configBody());$('saveStatus').textContent='Saved. Refreshing…';await load(false)}catch(error){$('saveStatus').textContent=error.message;$('saveStatus').className='bad'}};
+$('save').onclick=async()=>{try{const changes=configBody();if(!Object.keys(changes).length){$('saveStatus').textContent='No changes to save.';$('saveStatus').className='muted';return}$('saveStatus').textContent='Signing and saving…';await authFetch('/admin/api/config','PUT',JSON.stringify(changes));$('saveStatus').textContent='Saved. Refreshing…';await load(false)}catch(error){$('saveStatus').textContent=error.message;$('saveStatus').className='bad'}};
 addEventListener('resize',()=>data&&draw(data.history.points||[]));
 </script>
 </body>
@@ -1145,15 +1145,59 @@ description = "Notes and DMs."
 event_burst = 500
 "#;
 
-    /// Save the way the dashboard does: every field of every form group,
-    /// as loaded from the file, with `edit` applied.
+    /// Save the way the dashboard does when the form was loaded from the
+    /// file `loaded` and the file is now `disk`: like `configBody()`, send
+    /// only the fields `edit` changes in the loaded form.
+    fn dashboard_save_from(
+        loaded: &str,
+        disk: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<(String, Config), String> {
+        let form = dashboard_config(&Config::parse_toml(loaded).unwrap());
+        let mut edited = form.clone();
+        edit(&mut edited);
+        let mut body = json!({});
+        for (group, fields) in edited.as_object().unwrap() {
+            for (key, value) in fields.as_object().unwrap() {
+                if form[group][key] != *value {
+                    body.as_object_mut()
+                        .unwrap()
+                        .entry(group.clone())
+                        .or_insert_with(|| json!({}))[key] = value.clone();
+                }
+            }
+        }
+        patched_file(disk, serde_json::from_value(body).unwrap())
+    }
+
     fn dashboard_save(
         text: &str,
         edit: impl FnOnce(&mut serde_json::Value),
     ) -> Result<(String, Config), String> {
-        let mut body = dashboard_config(&Config::parse_toml(text).unwrap());
-        edit(&mut body);
-        patched_file(text, serde_json::from_value(body).unwrap())
+        dashboard_save_from(text, text, edit)
+    }
+
+    #[test]
+    fn dashboard_save_from_a_stale_form_keeps_newer_changes() {
+        // Another save raised event_burst after this form was loaded.
+        let disk = COMMENTED.replace("event_burst = 500", "event_burst = 900");
+        let (edited, verified) = dashboard_save_from(COMMENTED, &disk, |body| {
+            body["info"]["name"] = json!("Renamed relay");
+        })
+        .unwrap();
+        assert_eq!(
+            edited,
+            disk.replace(
+                "name = \"Example relay\"   #",
+                "name = \"Renamed relay\"   #"
+            )
+        );
+        assert_eq!(verified.relay.abuse.event_burst, 900);
+        // The page sends only the fields that differ from what it loaded.
+        assert!(ADMIN_HTML_V2.contains(
+            "if(value!==loaded[input.dataset.key])(body[group.key]=body[group.key]||{})"
+        ));
+        assert!(ADMIN_HTML_V2.contains("No changes to save."));
     }
 
     #[test]

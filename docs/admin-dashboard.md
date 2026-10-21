@@ -56,8 +56,10 @@ self-lockout, trust-boundary change, or process-execution risk. Edit those in
 [Configuration](config.md).
 
 A save edits the file on disk in place, so hand-written comments and layout
-survive. It reads the file, applies the form to the file's own configuration,
-and touches only the settings whose value changed: a changed setting is
+survive. The page sends only the fields changed since it loaded, so a save
+from a tab opened earlier does not undo settings changed since. Wok reads the
+file, applies those fields to the file's own configuration, and touches only
+the settings whose value changed: a changed setting is
 rewritten where it is, a new one goes at the end of its table, and one set
 back to its preset's value is removed, so the file holds overrides only (see
 [Set only overrides](config.md#set-only-overrides)). The file's `preset` is

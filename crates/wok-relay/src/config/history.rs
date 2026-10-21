@@ -6,8 +6,9 @@ use super::provenance::{ConfigEntry, ConfigExplanation, Origin};
 /// Built-in defaults a later release replaced, oldest first: the dotted key,
 /// the old value encoded as TOML, and the last release whose default it was.
 ///
-/// When you change a default, add its old value here. The test that loads
-/// the last release's complete sample fails until you do.
+/// When you change a default, add its old value here. The test against the
+/// complete 0.7.0 sample catches only the first change, since 0.7.0, to a key
+/// that sample lists; record every other change by hand.
 const PAST_DEFAULTS: &[(&str, &str, &str)] = &[
     ("database.map_size", "10995116277760", "0.1.0"),
     ("relay.abuse.max_stored_events_per_pubkey", "0", "0.1.0"),

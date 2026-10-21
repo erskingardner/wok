@@ -1,7 +1,7 @@
 # Configuration
 
 Wok uses strict TOML configuration. Start from [wok.toml](wok.toml), a short
-annotated file with only the settings a relay must or commonly should set, or
+annotated file showing the settings a relay must or commonly should set, or
 from the file produced by `wok migrate strfry`. Omitted settings inherit the
 selected [preset](#preset), whose values are the defaults below; unknown keys,
 unknown preset names, wrong types, invalid admin URLs, invalid log filters,

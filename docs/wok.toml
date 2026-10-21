@@ -26,15 +26,16 @@ preset = "public"
 # real_ip_header = "x-real-ip"
 
 [relay.auth]
-# The relay's public URL, which NIP-42 AUTH events must name. Until it is
-# set, AUTH is unavailable, so DMs and gift wraps cannot be read.
-service_url = "wss://relay.example.com"
+# The relay's public URL, exactly as clients open it: NIP-42 AUTH events must
+# name it. Until it is set, AUTH is unavailable, so DMs and gift wraps cannot
+# be read. Set it before the first start.
+# service_url = "wss://relay.example.com"
 
 [relay.info]
 # Shown to clients in NIP-11 and on the landing page.
-name = "Example relay"
-description = "A public Nostr relay."
-contact = "mailto:ops@example.com"
+# name = "Example relay"
+# description = "A public Nostr relay."
+# contact = "mailto:ops@example.com"
 
 # Where the database lives. The default is ./wok-db/.
 # [database]

@@ -369,3 +369,95 @@ fn nip91_and_tag_seeds_a_single_cursor() {
         2
     );
 }
+
+fn sign_note(kp: &Keypair, created: u64, tags: &[&str], content: &str) -> (Vec<u8>, String) {
+    let (xonly, _) = kp.x_only_public_key();
+    let mut ev = json!({
+        "created_at": created,
+        "kind": 1,
+        "tags": tags.iter().map(|value| json!(["t", value])).collect::<Vec<_>>(),
+        "content": content,
+        "pubkey": hex::encode(xonly.serialize()),
+    });
+    let id = wok_event::event_id_hash(&ev).unwrap();
+    ev["id"] = json!(hex::encode(id));
+    let sig = SECP256K1.sign_schnorr(&id, kp);
+    ev["sig"] = json!(hex::encode(sig.as_ref()));
+    let parsed = parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).unwrap();
+    (parsed.packed.into_bytes(), parsed.json)
+}
+
+/// NIP-01: "in the case of ties the event with the lowest id (first in
+/// lexical order) should be first", which also decides what `limit` keeps.
+/// The ties outnumber each plan's first index read, and span its cursors.
+#[test]
+fn created_at_ties_put_the_lowest_id_first_on_every_plan() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut rng = rand::thread_rng();
+    let keys: Vec<_> = (0..3).map(|_| Keypair::new(SECP256K1, &mut rng)).collect();
+    let authors: Vec<_> = keys
+        .iter()
+        .map(|kp| hex::encode(kp.x_only_public_key().0.serialize()))
+        .collect();
+    let tie = 1_700_000_000;
+    let mut events = Vec::new();
+    for (k, kp) in keys.iter().enumerate() {
+        for i in 0..12 {
+            // Some events carry both tags, so two `#t` cursors queue them.
+            let tags: &[&str] = match i % 3 {
+                0 => &["x"],
+                1 => &["y"],
+                _ => &["x", "y"],
+            };
+            let (packed, json) = sign_note(kp, tie, tags, &format!("tie-{k}-{i}"));
+            events.push(EventToWrite::new(packed, json));
+        }
+    }
+    for (offset, n) in [(1, 2), (-1, 3)] {
+        for i in 0..n {
+            let at = tie.checked_add_signed(offset).unwrap();
+            let (packed, json) = sign_note(&keys[i % 3], at, &["x"], &format!("{offset}-{i}"));
+            events.push(EventToWrite::new(packed, json));
+        }
+    }
+    let mut write = env.begin_rw().unwrap();
+    write_events(&mut write, &mut NoopNegentropy, &mut events, false).unwrap();
+    write.commit().unwrap();
+
+    let txn = env.begin_ro().unwrap();
+    let view = |lev: u64| {
+        let raw = txn.get_u64(txn.env().dbis().event, lev).unwrap().unwrap();
+        wok_event::PackedEventView::new(raw).unwrap()
+    };
+    let id_of = |lev: u64| view(lev).id().to_vec();
+    let mut expected: Vec<_> = events
+        .iter()
+        .map(|event| {
+            (
+                std::cmp::Reverse(view(event.lev_id).created_at()),
+                id_of(event.lev_id),
+            )
+        })
+        .collect();
+    expected.sort();
+    let expected: Vec<_> = expected.into_iter().map(|(_, id)| id).collect();
+
+    for filter in [
+        json!({"kinds": [1]}),
+        json!({}),
+        json!({"authors": authors}),
+        json!({"authors": authors, "kinds": [1]}),
+        json!({"#t": ["x", "y"]}),
+    ] {
+        for limit in [1, 7, 10, 500] {
+            let mut filter = filter.clone();
+            filter["limit"] = json!(limit);
+            let mut got = Vec::new();
+            foreach_by_filter(&txn, &filter, 500, 3, 16, |lev| got.push(id_of(lev))).unwrap();
+            let want = &expected[..expected.len().min(limit)];
+            assert_eq!(got, want, "{filter}");
+        }
+    }
+}

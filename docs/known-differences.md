@@ -112,6 +112,9 @@ regression test. Differential parity alone is not a reason to retain it.
   AUTH failures that already carry a NIP-01 prefix are not wrapped in a second
   `error:`.
 - NIP-77 network payload hex rejects `0x` prefixes and half bytes.
+- NIP-01 history order: events with the same `created_at` are sent lowest id
+  first, so a `limit` that cuts a tie keeps the lowest ids. The pinned strfry
+  orders ties by local insertion order (newest first).
 - NIP-01 IDs, pubkeys, signatures, and standard `e`/`p` values require the
   specified lowercase hex form.
 - Event kinds are limited to 0 through 65535, every tag element must be a

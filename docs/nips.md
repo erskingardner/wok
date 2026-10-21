@@ -37,6 +37,11 @@ the request's other filters still apply. A REQ whose filters all have an empty
 list gets EOSE and stays open, a COUNT reports 0, and a NEG-OPEN reconciles
 against no events. Filter-validation limits still count the skipped filters.
 
+Stored events are sent newest first, and events with the same `created_at`
+lowest id first, as NIP-01 orders them. That order also decides which tied
+events a `limit` keeps. Ranked NIP-50 results are the exception: see
+[NIP-50 search](nip50-search.md).
+
 NIP-01 replacement is enforced when reading, even if a lossless migration
 retained multiple versions. Kinds 0, 3 (contact lists), and 10000–19999 select
 the newest event per author and kind; kinds 30000–39999 additionally use the

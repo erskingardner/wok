@@ -128,6 +128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stored events with the same `created_at` are now sent lowest id first, as
+  NIP-01 specifies, and a `limit` that cuts such a tie keeps the lowest ids.
+  Before, ties followed local insertion order, newest first.
 - A filter with an empty `ids`, `authors`, `kinds` or `#x` list now matches no
   event, as NIP-01 requires. Before, the whole REQ, COUNT or NEG-OPEN was
   refused with `must not be empty`, so the request lost its other valid filters

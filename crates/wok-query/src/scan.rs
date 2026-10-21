@@ -40,7 +40,8 @@ impl CandidateEvent {
 }
 
 fn cmp_cand(a: &CandidateEvent, b: &CandidateEvent) -> std::cmp::Ordering {
-    // Newer first; if equal created, higher levId first (matches C++ sort predicate).
+    // Newer first. Equal created_at is ordered by id later, when the run
+    // reaches the front (`DbScan::gather_front_run`); levId keeps this total.
     b.created()
         .cmp(&a.created())
         .then_with(|| b.lev_id().cmp(&a.lev_id()))
@@ -65,6 +66,13 @@ enum MatchMode {
 impl ScanCursor {
     fn active(&self) -> bool {
         !self.resume_key.is_empty()
+    }
+
+    /// Whether entries not collected yet can have this `created_at`. A reverse
+    /// scan resumes at or below `resume_key`.
+    fn may_hold(&self, created: u64) -> bool {
+        self.active()
+            && parse_key_string_u64(&self.resume_key).map_or(true, |(_, next)| next >= created)
     }
 
     fn key_match(&self, k: &[u8]) -> bool {
@@ -167,12 +175,26 @@ impl ScanCursor {
     }
 }
 
+/// The newest `created_at` run while the cursors that can still yield it are
+/// drained.
+struct PendingRun {
+    created: u64,
+    members: Vec<CandidateEvent>,
+    /// Cursors that may still yield `created`.
+    cursors: Vec<usize>,
+    /// Older candidates those cursors yielded, queued once the run is complete.
+    older: Vec<CandidateEvent>,
+}
+
 pub struct DbScan {
     index_only: bool,
     index_dbi: lmdb_sys::MDB_dbi,
     pub desc: &'static str,
     cursors: Vec<ScanCursor>,
     event_queue: VecDeque<CandidateEvent>,
+    /// The newest candidates, all with one `created_at`, in id order.
+    front_run: VecDeque<CandidateEvent>,
+    pending_run: Option<PendingRun>,
     initial_scan_depth: u64,
     refill_scan_depth: u64,
     next_init_index: usize,
@@ -692,6 +714,8 @@ impl DbScan {
             desc,
             cursors,
             event_queue: VecDeque::new(),
+            front_run: VecDeque::new(),
+            pending_run: None,
             initial_scan_depth: initial,
             refill_scan_depth: 10 * initial,
             next_init_index: 0,
@@ -735,11 +759,15 @@ impl DbScan {
                     self.event_queue = v.into();
                 }
                 continue;
-            } else if self.event_queue.is_empty() {
-                return Ok(true);
+            } else if self.front_run.is_empty() {
+                if self.pending_run.is_none() && self.event_queue.is_empty() {
+                    return Ok(true);
+                }
+                self.gather_front_run(txn)?;
+                continue;
             }
 
-            let ev = self.event_queue.pop_front().unwrap();
+            let ev = self.front_run.pop_front().unwrap();
             let lev_id = ev.lev_id();
             let mut do_send = false;
             if self.index_only {
@@ -762,21 +790,119 @@ impl DbScan {
             let si = ev.scan_index() as usize;
             self.cursors[si].outstanding -= 1;
             if self.cursors[si].outstanding == 0 {
-                let mut more = VecDeque::new();
-                self.approx_work += self.cursors[si].collect(
-                    txn,
-                    self.index_dbi,
-                    ev.scan_index(),
-                    self.since,
-                    self.until,
-                    self.refill_scan_depth,
-                    &mut more,
-                )?;
-                let mut merged: Vec<_> = self.event_queue.drain(..).chain(more).collect();
-                merged.sort_by(cmp_cand);
-                self.event_queue = merged.into();
+                self.refill(txn, si)?;
             }
         }
+    }
+
+    fn refill(&mut self, txn: &RoTxn<'_>, si: usize) -> Result<(), wok_db::DbError> {
+        let mut more = VecDeque::new();
+        self.approx_work += self.cursors[si].collect(
+            txn,
+            self.index_dbi,
+            si as u64,
+            self.since,
+            self.until,
+            self.refill_scan_depth,
+            &mut more,
+        )?;
+        let mut merged: Vec<_> = self.event_queue.drain(..).chain(more).collect();
+        merged.sort_by(cmp_cand);
+        self.event_queue = merged.into();
+        Ok(())
+    }
+
+    /// Gather the newest `created_at` run into `front_run`, lowest id first,
+    /// as NIP-01 orders ties; that also decides which events a `limit` keeps.
+    /// No index orders by id, so every cursor that can still yield that
+    /// `created_at` is drained first, one chunk per call so a long run can
+    /// pause. Only a cursor whose queued candidates are all in the run can
+    /// (each active cursor has one queued, and the run is the newest).
+    fn gather_front_run(&mut self, txn: &RoTxn<'_>) -> Result<(), wok_db::DbError> {
+        let mut run = match self.pending_run.take() {
+            Some(run) => run,
+            None => {
+                let created = self.event_queue[0].created();
+                let len = self
+                    .event_queue
+                    .iter()
+                    .take_while(|c| c.created() == created)
+                    .count();
+                // Most runs are one event whose cursor has moved past it.
+                let first = self.event_queue[0].scan_index() as usize;
+                if len == 1 && !self.cursors[first].may_hold(created) {
+                    self.front_run.extend(self.event_queue.pop_front());
+                    return Ok(());
+                }
+                let members: Vec<_> = self.event_queue.drain(..len).collect();
+                let mut cursors: Vec<_> = members
+                    .iter()
+                    .map(|c| c.scan_index() as usize)
+                    .filter(|&si| self.cursors[si].may_hold(created))
+                    .collect();
+                cursors.sort_unstable();
+                cursors.dedup();
+                PendingRun {
+                    created,
+                    members,
+                    cursors,
+                    older: Vec::new(),
+                }
+            }
+        };
+        if let Some(&si) = run.cursors.last() {
+            let mut more = VecDeque::new();
+            self.approx_work += self.cursors[si].collect(
+                txn,
+                self.index_dbi,
+                si as u64,
+                self.since,
+                self.until,
+                self.refill_scan_depth,
+                &mut more,
+            )?;
+            let same = more
+                .iter()
+                .take_while(|c| c.created() == run.created)
+                .count();
+            run.members.extend(more.drain(..same));
+            run.older.extend(more);
+            if !self.cursors[si].may_hold(run.created) {
+                run.cursors.pop();
+            }
+            if !run.cursors.is_empty() {
+                self.pending_run = Some(run);
+                return Ok(());
+            }
+        }
+        if !run.older.is_empty() {
+            let mut merged: Vec<_> = self.event_queue.drain(..).chain(run.older).collect();
+            merged.sort_by(cmp_cand);
+            self.event_queue = merged.into();
+        }
+        let mut members = run.members;
+        if members.len() > 1 {
+            let event_dbi = txn.env().dbis().event;
+            let mut keyed = Vec::with_capacity(members.len());
+            for candidate in members {
+                self.approx_work += 10;
+                // A missing record sorts last; the scan drops it anyway.
+                let mut id = [0xFF; 32];
+                if let Some(view) = txn
+                    .get_u64(event_dbi, candidate.lev_id())?
+                    .and_then(|raw| PackedEventView::new(raw).ok())
+                {
+                    id.copy_from_slice(view.id());
+                }
+                keyed.push((id, candidate));
+            }
+            keyed.sort_by(|(a_id, a), (b_id, b)| {
+                a_id.cmp(b_id).then_with(|| a.lev_id().cmp(&b.lev_id()))
+            });
+            members = keyed.into_iter().map(|(_, candidate)| candidate).collect();
+        }
+        self.front_run = members.into();
+        Ok(())
     }
 }
 

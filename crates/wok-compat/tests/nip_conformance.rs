@@ -301,6 +301,49 @@ async fn nip01_empty_filter_lists_match_nothing() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip01_created_at_ties_put_the_lowest_id_first() {
+    // "Newer events should appear first, and in the case of ties the event
+    // with the lowest id (first in lexical order) should be first." The
+    // order also decides which tied events a `limit` keeps.
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    let at = now() - 10;
+    let note = |created_at: u64, content: String| {
+        sign_event(json!({
+            "created_at": created_at,
+            "kind": 1,
+            "tags": [],
+            "content": content,
+        }))
+    };
+    let mut tied = Vec::new();
+    for i in 0..10 {
+        let event = note(at, format!("tie {i}"));
+        assert_eq!(conn.publish(&event).await[2], true);
+        tied.push(event["id"].clone());
+    }
+    let newer = note(at + 1, "newer".into());
+    assert_eq!(conn.publish(&newer).await[2], true);
+    tied.sort_by_key(|id| id.as_str().unwrap().to_owned());
+
+    let ids = |events: Vec<Value>| -> Vec<Value> {
+        events
+            .into_iter()
+            .map(|event| event["id"].clone())
+            .collect()
+    };
+    let mut want = vec![newer["id"].clone()];
+    want.extend(tied[..4].iter().cloned());
+    assert_eq!(
+        ids(conn.history(json!({"kinds": [1], "limit": 5})).await),
+        want
+    );
+    want.truncate(1);
+    want.extend(tied.iter().cloned());
+    assert_eq!(ids(conn.history(json!({"kinds": [1]})).await), want);
+}
+
 #[test]
 fn nip01_unknown_filter_field_rejected() {
     assert!(NostrFilterGroup::from_value(&json!({"foo":1}), 500, 3, 16).is_err());

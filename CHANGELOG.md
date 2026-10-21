@@ -160,6 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slice for each of them while other queries run. The req worker now takes
   everything queued in one pass, and starts each new REQ or COUNT as it takes
   it. Running queries still get a slice every pass.
+- Live delivery does less work per event: the writer hands each commit's
+  events to the req monitors instead of each monitor reading them back.
 
 ### Removed
 

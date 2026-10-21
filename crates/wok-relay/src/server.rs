@@ -25,15 +25,16 @@ use parking_lot::Mutex;
 use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 use wok_db::{
     backfill_vanish_markers, is_event_vanished_ro, load_moderation_snapshot_ro,
     lookup_event_by_id_ro, moderation_reason_ignoring_author_ro, moderation_reason_ro,
     most_recent_levid_ro, report_event, sweep_vanished_events, Decompressor, Env, EventToWrite,
-    EventWriteStatus, ModerationSnapshot, MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
+    EventWriteStatus, ModerationSnapshot, SearchTermSet, MAX_MODERATION_RECORDS, MAX_REASON_BYTES,
+    VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, AUTH_CHALLENGE_LEN, AUTH_KIND,
@@ -739,9 +740,52 @@ enum MonitorMsg {
 
 /// What a req monitor matches, on its bounded data queue.
 enum MonitorData {
+    /// Events were stored that the monitor may not have been handed: match
+    /// everything newer than what it matched, read from LMDB.
     DbChange,
-    Ephemeral { packed: Vec<u8>, json: String },
+    /// Events the writer just committed, shared by every monitor.
+    Stored(Arc<StoredBatch>),
+    /// A live-only event, shared by every monitor.
+    Ephemeral(Arc<HeldEvent>),
 }
+
+/// The events one writer commit stored, handed to the req monitors as they
+/// were written, so that no monitor reads them back from LMDB.
+struct StoredBatch {
+    /// The commit stored local event ids `first..=last`, every one of them
+    /// in `events`, in order.
+    first: u64,
+    last: u64,
+    events: Vec<StoredEvent>,
+    /// This batch's share of the writer's hand-off budget, returned when the
+    /// last monitor drops it.
+    bytes: usize,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for StoredBatch {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+struct StoredEvent {
+    lev_id: u64,
+    packed: Vec<u8>,
+    /// The stored payload, as the writer stored it.
+    json: String,
+    /// Whether the event is still stored and globally visible, decided by
+    /// the first monitor that asks.
+    visible: OnceLock<bool>,
+    /// Tokenized once, by the first monitor with a search filter it may match.
+    search_terms: OnceLock<SearchTermSet>,
+}
+
+/// Most bytes of committed events handed to the req monitors that a monitor
+/// still holds. Past it the writer sends `DbChange` instead and the monitors
+/// read the commit from LMDB, so a monitor that falls behind holds no more
+/// than this.
+const STORED_HANDOFF_BYTES: usize = 16 << 20;
 
 enum NegMsg {
     Open {
@@ -1361,12 +1405,57 @@ fn broadcast_db_change(mon_txs: &[Sender<MonitorData>]) {
     }
 }
 
-fn broadcast_ephemeral(mon_txs: &[Sender<MonitorData>], packed: &[u8], json: &str) {
+fn broadcast_ephemeral(mon_txs: &[Sender<MonitorData>], event: HeldEvent) {
+    let event = Arc::new(event);
     for tx in mon_txs {
-        let _ = tx.send(MonitorData::Ephemeral {
-            packed: packed.to_vec(),
-            json: json.to_string(),
-        });
+        let _ = tx.send(MonitorData::Ephemeral(event.clone()));
+    }
+}
+
+/// Hand the events a commit wrote to every req monitor, taking them out of
+/// `events`. Over the hand-off budget, or for ids it cannot vouch for, it
+/// sends `DbChange` instead.
+fn broadcast_stored<C>(
+    mon_txs: &[Sender<MonitorData>],
+    in_flight: &Arc<AtomicUsize>,
+    events: &mut Vec<EventToWrite<C>>,
+) {
+    // Ids are allocated in write order, one per written event.
+    let stored: Vec<StoredEvent> = events
+        .drain(..)
+        .filter(|event| event.status == EventWriteStatus::Written)
+        .map(|event| StoredEvent {
+            lev_id: event.lev_id,
+            packed: event.packed,
+            json: event.json,
+            visible: OnceLock::new(),
+            search_terms: OnceLock::new(),
+        })
+        .collect();
+    let (Some(first), Some(last)) = (stored.first(), stored.last()) else {
+        return;
+    };
+    let (first, last) = (first.lev_id, last.lev_id);
+    let bytes = stored
+        .iter()
+        .map(|event| event.packed.len() + event.json.len())
+        .sum::<usize>();
+    let contiguous = last.checked_sub(first) == Some(stored.len() as u64 - 1);
+    if !contiguous || in_flight.load(Ordering::Relaxed).saturating_add(bytes) > STORED_HANDOFF_BYTES
+    {
+        broadcast_db_change(mon_txs);
+        return;
+    }
+    in_flight.fetch_add(bytes, Ordering::Relaxed);
+    let batch = Arc::new(StoredBatch {
+        first,
+        last,
+        events: stored,
+        bytes,
+        in_flight: in_flight.clone(),
+    });
+    for tx in mon_txs {
+        let _ = tx.send(MonitorData::Stored(batch.clone()));
     }
 }
 
@@ -3609,10 +3698,13 @@ fn run_req_monitor(
             Err(error) => {
                 // Subscription changes are sent once, so keep them and retry
                 // shortly; a lost one would leave a REQ without EOSE or
-                // CLOSED. One DbChange is enough: the next scan resumes from
-                // the same cursor. Live-only events are dropped.
+                // CLOSED. One DbChange is enough, for handed-off commits too:
+                // the next scan resumes from the same cursor. Live-only events
+                // are dropped.
                 tracing::warn!(%error, "req monitor cannot read the database");
-                let db_change = data.iter().any(|m| matches!(m, MonitorData::DbChange));
+                let db_change = data
+                    .iter()
+                    .any(|m| matches!(m, MonitorData::DbChange | MonitorData::Stored(_)));
                 data.clear();
                 if db_change {
                     data.push(MonitorData::DbChange);
@@ -3750,60 +3842,10 @@ fn run_req_monitor(
             }
         }
         for msg in data.drain(..) {
-            match msg {
-                MonitorData::DbChange => {
-                    let start = curr_event_id.saturating_add(1);
-                    let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
-                        let Ok(packed) = PackedEventView::new(packed_bytes) else {
-                            return true;
-                        };
-                        if !global_visibility
-                            .globally_visible(&txn, packed)
-                            .unwrap_or(false)
-                        {
-                            return true;
-                        }
-                        let payload = || {
-                            txn.get_u64(txn.env().dbis().event_payload, lev)
-                                .ok()
-                                .flatten()
-                        };
-                        let recipients = if monitors.event_requires_content(packed) {
-                            let Some(raw) = payload() else {
-                                return true;
-                            };
-                            let Ok(json) = decomp.decode(&txn, raw, max_event_size) else {
-                                return true;
-                            };
-                            let search_terms = wok_db::event_search_terms(json).unwrap_or_default();
-                            monitors.process(lev, packed, Some(&search_terms))
-                        } else {
-                            monitors.process(lev, packed, None)
-                        };
-                        if recipients.is_empty() {
-                            return true;
-                        }
-                        let readable = |conn_id| {
-                            let pk = authed.get(&conn_id).map(|a| a.as_slice()).unwrap_or(&[]);
-                            r.should_send_to_identities(packed, pk)
-                        };
-                        let live =
-                            route_stored_match(&mut monitors, recipients, readable, lev, &metrics);
-                        if live.is_empty() {
-                            return true;
-                        }
-                        if let Some(raw) = payload() {
-                            if let Ok(json) = decomp.decode(&txn, raw, max_event_size) {
-                                conns.send_event_batch(&live, json, &metrics);
-                            }
-                        }
-                        true
-                    });
-                    curr_event_id = latest;
-                }
-                MonitorData::Ephemeral { packed, json } => {
+            let batch = match msg {
+                MonitorData::Ephemeral(held) => {
                     let (live, pending) = {
-                        let Ok(event) = PackedEventView::new(&packed) else {
+                        let Ok(event) = PackedEventView::new(&held.packed) else {
                             continue;
                         };
                         // Live-only events skip the database, but not the
@@ -3815,7 +3857,7 @@ fn run_req_monitor(
                             continue;
                         }
                         let search_terms = if monitors.event_requires_content(event) {
-                            Some(wok_db::event_search_terms(&json).unwrap_or_default())
+                            Some(wok_db::event_search_terms(&held.json).unwrap_or_default())
                         } else {
                             None
                         };
@@ -3843,12 +3885,8 @@ fn run_req_monitor(
                         }
                         (live, pending)
                     };
-                    conns.send_event_batch(&live, &json, &metrics);
-                    if pending.is_empty() {
-                        continue;
-                    }
+                    conns.send_event_batch(&live, &held.json, &metrics);
                     // One copy shared by every pending subscription it matches.
-                    let held = Arc::new(HeldEvent { packed, json });
                     for (conn_id, sub_id) in pending {
                         if let Some(buffer) = monitors.pending_mut(conn_id, &sub_id) {
                             let (dropped, overflowed) = buffer.push_ephemeral(held.clone());
@@ -3862,8 +3900,109 @@ fn run_req_monitor(
                             }
                         }
                     }
+                    continue;
                 }
+                MonitorData::DbChange => None,
+                // Already matched, by a read of a later commit.
+                MonitorData::Stored(batch) if batch.last <= curr_event_id => continue,
+                // Something was stored before the batch that this monitor
+                // was not handed: read it all from LMDB instead.
+                MonitorData::Stored(batch) => {
+                    (batch.first <= curr_event_id.saturating_add(1)).then_some(batch)
+                }
+            };
+            let readable = |conn_id: u64, packed: PackedEventView<'_>| {
+                let pk = authed.get(&conn_id).map(|a| a.as_slice()).unwrap_or(&[]);
+                r.should_send_to_identities(packed, pk)
+            };
+            let Some(batch) = batch else {
+                let start = curr_event_id.saturating_add(1);
+                let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
+                    let Ok(packed) = PackedEventView::new(packed_bytes) else {
+                        return true;
+                    };
+                    if !global_visibility
+                        .globally_visible(&txn, packed)
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                    let payload = || {
+                        txn.get_u64(txn.env().dbis().event_payload, lev)
+                            .ok()
+                            .flatten()
+                    };
+                    let recipients = if monitors.event_requires_content(packed) {
+                        let Some(raw) = payload() else {
+                            return true;
+                        };
+                        let Ok(json) = decomp.decode(&txn, raw, max_event_size) else {
+                            return true;
+                        };
+                        let search_terms = wok_db::event_search_terms(json).unwrap_or_default();
+                        monitors.process(lev, packed, Some(&search_terms))
+                    } else {
+                        monitors.process(lev, packed, None)
+                    };
+                    if recipients.is_empty() {
+                        return true;
+                    }
+                    let live = route_stored_match(
+                        &mut monitors,
+                        recipients,
+                        |conn_id| readable(conn_id, packed),
+                        lev,
+                        &metrics,
+                    );
+                    if live.is_empty() {
+                        return true;
+                    }
+                    if let Some(raw) = payload() {
+                        if let Ok(json) = decomp.decode(&txn, raw, max_event_size) {
+                            conns.send_event_batch(&live, json, &metrics);
+                        }
+                    }
+                    true
+                });
+                curr_event_id = latest;
+                continue;
+            };
+            for event in batch.events.iter().filter(|e| e.lev_id > curr_event_id) {
+                let Ok(packed) = PackedEventView::new(&event.packed) else {
+                    continue;
+                };
+                // A later event of the same commit can have deleted it.
+                let visible = *event.visible.get_or_init(|| {
+                    txn.get_u64(txn.env().dbis().event, event.lev_id)
+                        .is_ok_and(|stored| stored.is_some())
+                        && global_visibility
+                            .globally_visible(&txn, packed)
+                            .unwrap_or(false)
+                });
+                if !visible {
+                    continue;
+                }
+                let recipients = if monitors.event_requires_content(packed) {
+                    let search_terms = event.search_terms.get_or_init(|| {
+                        wok_db::event_search_terms(&event.json).unwrap_or_default()
+                    });
+                    monitors.process(event.lev_id, packed, Some(search_terms))
+                } else {
+                    monitors.process(event.lev_id, packed, None)
+                };
+                if recipients.is_empty() {
+                    continue;
+                }
+                let live = route_stored_match(
+                    &mut monitors,
+                    recipients,
+                    |conn_id| readable(conn_id, packed),
+                    event.lev_id,
+                    &metrics,
+                );
+                conns.send_event_batch(&live, &event.json, &metrics);
             }
+            curr_event_id = batch.last;
         }
     }
 }
@@ -5766,10 +5905,10 @@ mod tests {
         fn ephemeral_at(&mut self, content: &str, created_at: u64) -> String {
             let parsed = Self::parse_at(20_001, content, created_at);
             let id = to_hex(parsed.packed.view().id());
-            self.feed(MonitorData::Ephemeral {
+            self.feed(MonitorData::Ephemeral(Arc::new(HeldEvent {
                 packed: parsed.packed.into_bytes(),
                 json: parsed.json,
-            });
+            })));
             self.observe(&id);
             id
         }
@@ -5806,10 +5945,10 @@ mod tests {
         fn sync(&mut self) {
             let sentinel = Self::parse(20_002, "sentinel");
             let id = to_hex(sentinel.packed.view().id());
-            self.feed(MonitorData::Ephemeral {
+            self.feed(MonitorData::Ephemeral(Arc::new(HeldEvent {
                 packed: sentinel.packed.into_bytes(),
                 json: sentinel.json,
-            });
+            })));
             self.observe(&id);
         }
 
@@ -5962,10 +6101,10 @@ mod tests {
         h.feed(MonitorData::DbChange);
         let ephemeral = MonitorHarness::parse_tagged(21059, "ephemeral wrap", now_secs(), p);
         let ephemeral_id = to_hex(ephemeral.packed.view().id());
-        h.feed(MonitorData::Ephemeral {
+        h.feed(MonitorData::Ephemeral(Arc::new(HeldEvent {
             packed: ephemeral.packed.into_bytes(),
             json: ephemeral.json,
-        });
+        })));
         // Both are matched before the connection authenticates.
         h.sync();
         assert!(h
@@ -6597,5 +6736,139 @@ mod tests {
             admitted > 100,
             "too few producer frames got through: {admitted}"
         );
+    }
+
+    /// A commit as the writer hands it to the monitors.
+    fn handed(events: Vec<(u64, &wok_event::ParsedEvent, String)>) -> MonitorData {
+        let (first, last) = (events[0].0, events[events.len() - 1].0);
+        MonitorData::Stored(Arc::new(StoredBatch {
+            first,
+            last,
+            events: events
+                .into_iter()
+                .map(|(lev_id, parsed, json)| StoredEvent {
+                    lev_id,
+                    packed: parsed.packed.clone().into_bytes(),
+                    json,
+                    visible: OnceLock::new(),
+                    search_terms: OnceLock::new(),
+                })
+                .collect(),
+            bytes: 0,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }))
+    }
+
+    /// `parsed`'s payload with different content, which LMDB does not hold:
+    /// a monitor that sends it did not read the event back.
+    fn with_content(parsed: &wok_event::ParsedEvent, content: &str) -> String {
+        let mut event: Value = serde_json::from_str(&parsed.json).unwrap();
+        event["content"] = json!(content);
+        event.to_string()
+    }
+
+    /// The monitor matches a handed-off commit as it was handed over,
+    /// without reading it back. Past a gap it reads LMDB instead, as for
+    /// `DbChange`, and it sends neither an event a later one in the same
+    /// commit deleted nor a commit a read already matched.
+    #[test]
+    fn the_monitor_matches_handed_off_commits_without_reading_them() {
+        let mut h = MonitorHarness::start(1 << 20);
+        h.store("a");
+
+        let b = MonitorHarness::parse(1, "b");
+        let (b_lev, b_id) = h.write_event(b.clone());
+        h.feed(handed(vec![(b_lev, &b, with_content(&b, "handed b"))]));
+        let event = MonitorHarness::next(&mut h.observer);
+        assert_eq!(
+            (&event[2]["id"], &event[2]["content"]),
+            (&json!(b_id), &json!("handed b"))
+        );
+
+        // Only d is handed over: c is past the monitor's cursor, so both are
+        // read from LMDB.
+        let (_, c_id) = h.write("c");
+        let d = MonitorHarness::parse(1, "d");
+        let (d_lev, d_id) = h.write_event(d.clone());
+        h.feed(handed(vec![(d_lev, &d, with_content(&d, "handed d"))]));
+        h.observe(&c_id);
+        let event = MonitorHarness::next(&mut h.observer);
+        assert_eq!(
+            (&event[2]["id"], &event[2]["content"]),
+            (&json!(d_id), &json!("d"))
+        );
+
+        // f's commit deleted e.
+        let e = MonitorHarness::parse(1, "e");
+        let (e_lev, _) = h.write_event(e.clone());
+        let mut txn = h.env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [e_lev]).unwrap();
+        txn.commit().unwrap();
+        let f = MonitorHarness::parse(1, "f");
+        let (f_lev, f_id) = h.write_event(f.clone());
+        h.feed(handed(vec![
+            (e_lev, &e, e.json.clone()),
+            (f_lev, &f, f.json.clone()),
+        ]));
+        h.observe(&f_id);
+
+        h.feed(handed(vec![(b_lev, &b, b.json.clone())]));
+        h.sync();
+    }
+
+    /// The writer hands the events a commit wrote to every monitor as one
+    /// shared batch, whose bytes count against its budget until the last
+    /// monitor drops it. Over the budget, or for ids it cannot vouch for, it
+    /// sends `DbChange` instead, and nothing for a commit that wrote nothing.
+    #[test]
+    fn the_writer_hands_over_written_events_within_its_budget() {
+        let (tx1, rx1) = unbounded();
+        let (tx2, rx2) = unbounded();
+        let monitors = [tx1, tx2];
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let event = |lev_id, status| {
+            let mut event = EventToWrite::new(vec![0; 3], "{}".to_string());
+            event.lev_id = lev_id;
+            event.status = status;
+            event
+        };
+        let written = EventWriteStatus::Written;
+        let mut events = vec![
+            event(7, written),
+            event(0, EventWriteStatus::Duplicate),
+            event(8, written),
+        ];
+        broadcast_stored(&monitors, &in_flight, &mut events);
+        assert!(events.is_empty());
+        let (Ok(MonitorData::Stored(a)), Ok(MonitorData::Stored(b))) =
+            (rx1.try_recv(), rx2.try_recv())
+        else {
+            panic!("expected a handed-off commit for each monitor");
+        };
+        assert!(Arc::ptr_eq(&a, &b));
+        let ids: Vec<u64> = a.events.iter().map(|event| event.lev_id).collect();
+        assert_eq!((a.first, a.last, ids), (7, 8, vec![7, 8]));
+        assert_eq!(in_flight.load(Ordering::Relaxed), 10);
+        drop(a);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 10);
+        drop(b);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+
+        let db_change = |events: &mut Vec<EventToWrite>| {
+            broadcast_stored(&monitors, &in_flight, events);
+            [&rx1, &rx2]
+                .iter()
+                .all(|rx| matches!(rx.try_recv(), Ok(MonitorData::DbChange)))
+        };
+        in_flight.store(STORED_HANDOFF_BYTES - 4, Ordering::Relaxed);
+        assert!(db_change(&mut vec![event(9, written)]));
+        in_flight.store(0, Ordering::Relaxed);
+        assert!(db_change(&mut vec![event(10, written), event(12, written)]));
+        broadcast_stored(
+            &monitors,
+            &in_flight,
+            &mut vec![event(0, EventWriteStatus::Duplicate)],
+        );
+        assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err());
     }
 }

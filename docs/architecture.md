@@ -147,8 +147,9 @@ COUNT never registers with a monitor, and COUNT ids are separate from REQ ids:
 neither cancels the other.
 
 Each req monitor has two queues: subscription changes (`Register`, `Remove`,
-`HistoryDone`, AUTH, disconnect) on an unbounded control queue, and database
-changes and live-only events on a bounded data queue. Each turn it takes what
+`HistoryDone`, AUTH, disconnect) on an unbounded control queue, and the
+events each commit stored, live-only events and database changes on a bounded
+data queue. Each turn it takes what
 is in the data queue, then what is in the control queue, and applies the
 changes first. So every change sent before an event taken that turn is
 applied before the event is matched: a live-only event published after a REQ
@@ -161,6 +162,18 @@ worker queue (a scan, a cancel) or is one per AUTH or connection, so the
 control queue grows only while a turn runs. If the monitor cannot open a read
 transaction, it keeps the subscription changes (and one database change) and
 retries.
+
+The writer hands each commit's events to every monitor as one shared,
+immutable batch, so the monitors match them without reading them back.
+Whether an event is still stored and globally visible, and its search terms,
+are worked out once, by the first monitor that needs them. A monitor reads the
+events from LMDB instead in these cases:
+
+- a database change from the file watcher, for commits by other processes;
+- a batch that does not follow on from what the monitor already matched;
+- a commit past the writer's hand-off budget (16 MiB of events that some
+  monitor still holds), so a monitor that falls behind holds no more than
+  that.
 
 ## Non-goals
 

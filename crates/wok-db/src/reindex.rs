@@ -2,12 +2,14 @@
 //! event secondary index from PackedEvent again.
 
 use crate::long_tags::{long_tag_packing, LongTagPacking};
-use crate::write::{delete_event_basic, event_index_entries, long_address_deletions};
+use crate::write::{
+    delete_event_basic, event_index_entries, is_repaired_address, repaired_address_deletions,
+};
 use crate::{index_event_search, payload::Decompressor, search::initialize_search_index_state};
 use crate::{DbError, RoTxn, RwTxn};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-use wok_event::{hashed_tag_value_digest, PackedEventView, DELETION_KIND};
+use wok_event::{PackedEventView, DELETION_KIND};
 
 /// What a rebuild does with each PackedEvent record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,9 +18,10 @@ pub enum PackedEventRebuild {
     Copy,
     /// Pack records that lack single-letter tag values longer than 255 bytes
     /// again from their payloads, as [`crate::long_tags`] allows, and copy
-    /// the others unchanged. Then delete the stored versions named by
-    /// deletion requests' `a` tags longer than 255 bytes, as the write path
-    /// does when a request arrives.
+    /// the others unchanged. Then delete the stored versions named by the
+    /// deletion requests' `a` tags whose tombstones strfry and earlier
+    /// releases lacked or misspelled, as the write path does when a request
+    /// arrives (see `write::is_repaired_address`).
     RepackLongTags,
 }
 
@@ -34,9 +37,10 @@ pub struct ReindexStats {
     /// packing their payload again changes more than those values.
     pub skipped_long_tag_records: u64,
     /// Local IDs of the stored versions deleted because a deletion request's
-    /// `a` tag longer than 255 bytes names their address. Before the repack,
-    /// the request had no tombstone or the version was keyed by another
-    /// address, so the write path had not deleted them.
+    /// `a` tag names their address: one longer than 255 bytes, a replaceable
+    /// event's, or one whose kind has leading zeros. strfry and earlier
+    /// releases left them stored: the request had no working tombstone, or
+    /// the version was keyed by another address.
     pub deleted_versions: BTreeSet<u64>,
 }
 
@@ -134,7 +138,7 @@ pub fn rebuild_primary_and_event_indices(
     let mut index_entries = 0u64;
     let mut repacked_long_tag_records = 0u64;
     let mut skipped_long_tag_records = 0u64;
-    let mut long_address_requests = Vec::new();
+    let mut repaired_requests = Vec::new();
     let mut error = None;
     let mut decompressor = Decompressor::new();
     source.foreach_full(source_dbis.event, &[], &[], false, |key, packed_bytes| {
@@ -174,8 +178,8 @@ pub fn rebuild_primary_and_event_indices(
                 return false;
             }
         };
-        if packing == PackedEventRebuild::RepackLongTags && names_long_address(packed) {
-            long_address_requests.push(lev_id);
+        if packing == PackedEventRebuild::RepackLongTags && names_repaired_address(packed) {
+            repaired_requests.push(lev_id);
         }
         if let Err(err) = target.put(target_dbis.event, key, &packed_bytes, 0) {
             error = Some(err);
@@ -208,11 +212,11 @@ pub fn rebuild_primary_and_event_indices(
         target.put_u64(target_dbis.meta, 1, &crate::encode_meta(&meta), 0)?;
     }
     // The sequence is set, so deleting the newest record cannot lower it.
-    let deleted_versions = delete_versions_under_long_addresses(
+    let deleted_versions = delete_versions_under_repaired_addresses(
         source,
         target,
         &mut decompressor,
-        &long_address_requests,
+        &repaired_requests,
     )?;
     crate::state::superseded_events(target)?;
     initialize_search_index_state(target, last_lev_id)?;
@@ -240,17 +244,17 @@ fn payload_json(
         .to_owned())
 }
 
-/// Whether `packed` is a deletion request with an `a` tag longer than 255
-/// bytes, which PackedEvent holds hashed.
-fn names_long_address(packed: PackedEventView<'_>) -> bool {
-    let mut long = false;
+/// Whether `packed` is a deletion request with an `a` tag that reindex
+/// applies again (`write::is_repaired_address`).
+fn names_repaired_address(packed: PackedEventView<'_>) -> bool {
+    let mut repaired = false;
     if packed.kind() == DELETION_KIND {
         packed.foreach_tag(|name, value| {
-            long = name == 'a' && hashed_tag_value_digest(value).is_some();
-            !long
+            repaired = name == 'a' && is_repaired_address(value);
+            !repaired
         });
     }
-    long
+    repaired
 }
 
 struct DeletedVersions {
@@ -258,14 +262,14 @@ struct DeletedVersions {
     index_entries: u64,
 }
 
-/// Apply the long `a` tags of the stored deletion requests `requests` to the
-/// rebuilt `target`, with the write path's deletion semantics: each stored
-/// version of an address a request's author published, up to the request's
-/// `created_at`, is deleted. strfry and earlier Wok releases dropped those
-/// tags and keyed a version with a long first `d` by another address, so
-/// such versions survived the requests that name them. A request whose
-/// shorter `a` tags were never applied is a different gap, and stays as it is.
-fn delete_versions_under_long_addresses(
+/// Apply the repaired `a` tags of the stored deletion requests `requests` to
+/// the rebuilt `target`, with the write path's deletion semantics: each
+/// stored version of an address a request's author published, up to the
+/// request's `created_at`, is deleted. strfry and earlier Wok releases left
+/// such versions stored. They dropped long tags and keyed a version with a
+/// long first `d` by another address, ignored replaceable addresses, and
+/// tombstoned a padded kind by its spelling, so older versions came back.
+fn delete_versions_under_repaired_addresses(
     source: &RoTxn<'_>,
     target: &mut RwTxn<'_>,
     decompressor: &mut Decompressor,
@@ -282,7 +286,7 @@ fn delete_versions_under_long_addresses(
     for &lev_id in requests {
         let request = stored(target, lev_id)?;
         let json = payload_json(source, decompressor, lev_id)?;
-        lev_ids.extend(long_address_deletions(
+        lev_ids.extend(repaired_address_deletions(
             target,
             PackedEventView::new(&request)?,
             &json,

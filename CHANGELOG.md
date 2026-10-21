@@ -191,12 +191,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kinds 0, 3 and 10000–19999, deletes that author's versions up to the
   request's `created_at` and refuses such versions published later, as NIP-09
   asks and as for addressable events. Such deletions did nothing. Deletion
-  requests already stored, including those migrated from strfry, gain their
-  tombstones from `wok reindex`; until then `wok doctor` warns
-  (`replaceable-tombstones`).
+  requests already stored, including those migrated from strfry, take effect
+  when `wok reindex` applies them; until then `wok doctor` warns
+  (`deletion-tombstones`).
 - A deletion `a` tag whose kind has leading zeros (`030000:<pubkey>:<d>`) is
   refused with `invalid: a tag kind has leading zeros`. It deleted the stored
-  versions of the address, but its tombstone never refused later ones.
+  versions of the address, but its tombstone never refused later ones. Such
+  requests stored by strfry or earlier releases still name the canonical
+  address: `wok reindex` deletes the versions that came back and tombstones
+  the canonical spelling, except for an `a` tag longer than 255 bytes.
 - A kind 22242 AUTH event sent with EVENT is refused with
   `invalid: AUTH events must be sent with AUTH`. It was accepted and delivered
   to matching subscriptions (and stored in `ttl` mode), which NIP-42 forbids.

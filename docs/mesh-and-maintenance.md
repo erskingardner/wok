@@ -69,21 +69,25 @@ relay does when such a request arrives: every version of that address by the
 request's author with a `created_at` at or before the request's. Newer
 versions and the request itself stay. The same applies when the request was
 stored with its tag but the versions were keyed by another address until
-the repack. Deletion requests whose `a` tags are 255 bytes or shorter are not
-applied again. The outcome and manifest count the deleted versions as
-`deleted_under_repaired_deletions`, and the original database in the backup
-still holds them. Verification accounts for them explicitly: the result must
+the repack. A shorter `a` tag is applied again only when it names a
+replaceable event or pads the kind (below). The outcome and manifest count the
+deleted versions as `deleted_under_repaired_deletions`, and the original
+database in the backup still holds them. Verification accounts for them explicitly: the result must
 match the original's fingerprint without exactly those versions. Nothing else
 changes: removing the hashed values from a repacked record gives its previous
 bytes back.
 See [lmdb-v3.md](lmdb-v3.md#packedevent).
 
-Reindex also tombstones replaceable events that deletion requests stored by
-strfry or Wok 0.7.0 and earlier name by `a` tag (`<kind>:<pubkey>:`). Those
-releases did not index them, so older versions of such an event can still be
-published. Integrity JSON counts the requests as `legacy_replaceable_deletions`,
-and doctor emits a `replaceable-tombstones` warning while it is nonzero. The
-versions a request predates stay stored, as before. See
+Reindex applies the same way the deletion requests that strfry or Wok 0.7.0
+and earlier stored with an `a` tag naming a replaceable event
+(`<kind>:<pubkey>:`), which those releases ignored, or spelling the kind with
+leading zeros (`030000:…`), which they tombstoned by that spelling so older
+versions came back. It deletes the versions the request names up to its
+`created_at`, counted in `deleted_under_repaired_deletions`, and adds the
+tombstone of the canonical address. Integrity JSON counts such requests as
+`legacy_untombstoned_deletions`, and doctor emits a `deletion-tombstones`
+warning while it is nonzero. A padded `a` tag longer than 255 bytes still
+deletes, but its tombstone matches nothing. See
 [lmdb-v3.md](lmdb-v3.md#eventreplacedeletion).
 
 ## Outbound connections

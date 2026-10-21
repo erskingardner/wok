@@ -34,11 +34,13 @@ pub struct IntegrityReport {
     /// `wok reindex` would pack again. Advisory, counted where payloads are
     /// decoded (databases with the search table).
     pub legacy_long_tag_records: u64,
-    /// Deletion requests stored by strfry or earlier Wok releases that lack
-    /// the tombstone of a plain replaceable address (`<kind>:<pubkey>:`) one
-    /// of their `a` tags names, which those releases did not index. Advisory:
-    /// `wok reindex` adds the tombstones.
-    pub legacy_replaceable_deletions: u64,
+    /// Deletion requests stored by strfry or earlier Wok releases that lack a
+    /// tombstone those releases did not index: for a plain replaceable
+    /// address (`<kind>:<pubkey>:`), or for the canonical spelling of an
+    /// address whose kind an `a` tag pads with leading zeros. Advisory:
+    /// `wok reindex` adds the tombstones and deletes the versions the
+    /// requests name.
+    pub legacy_untombstoned_deletions: u64,
     pub expected_index_entries: u64,
     pub actual_index_entries: u64,
     pub missing_payloads: Vec<u64>,
@@ -440,7 +442,7 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
             report.expected_index_entries += 1;
         }
         if lacks_legacy_entries {
-            report.legacy_replaceable_deletions += 1;
+            report.legacy_untombstoned_deletions += 1;
         }
         if let Some(search_dbi) = dbis.event_search {
             let payload = match txn.get_u64(dbis.event_payload, lev_id) {

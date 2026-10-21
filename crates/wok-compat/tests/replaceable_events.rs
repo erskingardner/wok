@@ -1045,7 +1045,7 @@ fn replaceable_address_deletion_removes_eligible_versions_and_keeps_newer_versio
         );
         let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
         assert!(report.ok(), "{:?}", report.issues);
-        assert_eq!(report.legacy_replaceable_deletions, 0);
+        assert_eq!(report.legacy_untombstoned_deletions, 0);
         wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap();
 
         // Once the newer version is gone too, the tombstone refuses older ones.
@@ -1102,32 +1102,63 @@ fn replaceable_address_deletion_removes_eligible_versions_and_keeps_newer_versio
 }
 
 #[test]
-fn deletions_stored_without_replaceable_tombstones_get_them_from_reindex() {
-    // strfry and earlier Wok releases did not tombstone `<kind>:<pubkey>:`.
-    // Integrity accepts their deletion requests without it and counts them.
+fn deletions_stored_without_tombstones_are_applied_by_reindex() {
+    // strfry and earlier Wok releases did not tombstone `<kind>:<pubkey>:`,
+    // and tombstoned a padded kind by its spelling, so the versions such a
+    // request names were never deleted or came back. Integrity accepts the
+    // missing tombstones and counts the requests; reindex applies them.
     let key = key();
     let pubkey = key.x_only_public_key().0.to_string();
-    let version = event(&key, 10002, 100, json!([]), "version");
-    let deletion = event(&key, 5, 200, json!([["a", format!("10002:{pubkey}:")]]), "");
-    let (_dir, env) = snapshot(&[version.clone(), deletion.clone()]);
+    let replaceable = event(&key, 10002, 100, json!([]), "never deleted");
+    let newer = event(&key, 10002, 300, json!([]), "newer");
+    let came_back = event(&key, 30000, 150, json!([["d", "x"]]), "came back");
+    let deletion = event(
+        &key,
+        5,
+        200,
+        json!([
+            ["a", format!("10002:{pubkey}:")],
+            ["a", format!("030000:{pubkey}:x")]
+        ]),
+        "",
+    );
+    let (_dir, env) = snapshot_records(&[
+        packing(&replaceable),
+        packing(&newer),
+        packing(&came_back),
+        stored_packing(&deletion),
+    ]);
     {
         let mut txn = env.begin_rw().unwrap();
-        txn.clear(env.dbis().event_replace_deletion).unwrap();
+        for address in [format!("10002:{pubkey}:"), format!("30000:{pubkey}:x")] {
+            let key =
+                wok_db::keys::make_key_string_u64(&wok_event::sha256(address.as_bytes()), 200);
+            let lev = 4u64.to_ne_bytes();
+            assert!(txn
+                .del(env.dbis().event_replace_deletion, &key, Some(&lev))
+                .unwrap());
+        }
         txn.commit().unwrap();
     }
     let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
     assert!(report.ok(), "{:?}", report.issues);
-    assert_eq!(report.legacy_replaceable_deletions, 1);
+    assert_eq!(report.legacy_untombstoned_deletions, 1);
     assert_eq!(report.expected_index_entries, report.actual_index_entries);
 
-    let (_repaired_dir, repaired, _) = reindex(&env);
+    let (_repaired_dir, repaired, stats) = reindex(&env);
+    assert_eq!(stats.deleted_versions, BTreeSet::from([1, 3]));
+    assert_eq!(stored_ids(&repaired), ids(&[newer, deletion]));
     let report = wok_db::check_integrity(&repaired.begin_ro().unwrap()).unwrap();
     assert!(report.ok(), "{:?}", report.issues);
-    assert_eq!(report.legacy_replaceable_deletions, 0);
-    // The version the request predates is not deleted, but later versions up
-    // to its created_at are refused.
-    assert_eq!(stored_ids(&repaired), ids(&[version, deletion]));
-    let stale = event(&key, 10002, 150, json!([]), "stale");
+    assert_eq!(report.legacy_untombstoned_deletions, 0);
+    // The padded spelling's own entry, and both canonical ones.
+    let txn = repaired.begin_ro().unwrap();
+    assert_eq!(
+        txn.entries(repaired.dbis().event_replace_deletion).unwrap(),
+        3
+    );
+    drop(txn);
+    let stale = event(&key, 30000, 180, json!([["d", "x"]]), "stale");
     assert_eq!(
         write_with_quota(&env, &stale, 0, false),
         wok_db::EventWriteStatus::Written
@@ -1139,10 +1170,10 @@ fn deletions_stored_without_replaceable_tombstones_get_them_from_reindex() {
 }
 
 #[test]
-fn stored_deletions_spelling_kinds_with_leading_zeros_neither_delete_nor_refuse() {
+fn stored_deletions_spelling_kinds_with_leading_zeros_act_on_the_canonical_address() {
     // Ingest refuses such requests now; strfry and earlier releases stored
-    // them. Writing one directly deletes nothing, and its tombstone, still
-    // derived from the stored record, refuses nothing either.
+    // them. Written directly, one deletes what the canonical spelling names
+    // and refuses older versions of it.
     let key = key();
     let pubkey = key.x_only_public_key().0.to_string();
     for (kind, address) in [
@@ -1155,27 +1186,23 @@ fn stored_deletions_spelling_kinds_with_leading_zeros_neither_delete_nor_refuse(
         assert!(
             parse_and_verify_event(&deletion, &EventLimits::default(), None, true, false).is_err()
         );
-        let mut tags = wok_event::PackedEventTagBuilder::default();
-        tags.add('a', address.as_bytes()).unwrap();
-        let id = hex::decode(deletion["id"].as_str().unwrap()).unwrap();
-        let author = key.x_only_public_key().0.serialize();
-        let packed = wok_event::PackedEventBuilder::build(&id, &author, 200, 5, 0, &tags).unwrap();
-        let json = wok_event::normalize_event_json(&deletion).unwrap();
-        let mut events = [wok_db::EventToWrite::new(packed.into_bytes(), json)];
+        let (packed, json) = stored_packing(&deletion);
+        let mut events = [wok_db::EventToWrite::new(packed, json)];
         let mut txn = env.begin_rw().unwrap();
         wok_db::write::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false)
             .unwrap();
         txn.commit().unwrap();
         assert_eq!(events[0].status, wok_db::EventWriteStatus::Written);
-        assert_eq!(stored_ids(&env), ids(&[version, deletion]), "{address}");
+        assert_eq!(stored_ids(&env), ids(&[deletion]), "{address}");
         let stale = event(&key, kind, 150, json!([]), "stale");
         assert_eq!(
             write_with_quota(&env, &stale, 0, false),
-            wok_db::EventWriteStatus::Written,
+            wok_db::EventWriteStatus::Deleted,
             "{address}"
         );
         let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
         assert!(report.ok(), "{:?}", report.issues);
+        assert_eq!(report.legacy_untombstoned_deletions, 0);
     }
 }
 
@@ -1417,10 +1444,18 @@ fn packing(event: &Value) -> (Vec<u8>, String) {
     (parsed.packed.into_bytes(), parsed.json)
 }
 
+/// Pack `event` as a stored record, without ingest's checks: strfry and
+/// earlier releases stored deletions whose `a` tags pad the kind.
+fn stored_packing(event: &Value) -> (Vec<u8>, String) {
+    let packed = wok_event::nostr_json_to_packed_event(event, &EventLimits::default()).unwrap();
+    let json = wok_event::normalize_event_json(event).unwrap();
+    (packed.into_bytes(), json)
+}
+
 /// What strfry and earlier Wok releases stored: every single-letter tag value
 /// longer than 255 bytes dropped.
 fn legacy_packing(event: &Value) -> (Vec<u8>, String) {
-    let (packed, json) = packing(event);
+    let (packed, json) = stored_packing(event);
     let view = PackedEventView::new(&packed).unwrap();
     let mut tags = wok_event::PackedEventTagBuilder::default();
     for tag in view.tags() {
@@ -1730,39 +1765,29 @@ fn reindex_restores_long_tag_values_to_legacy_records() {
 }
 
 #[test]
-fn reindex_ignores_long_addresses_spelled_with_a_padded_kind() {
-    // Ingest refuses an `a` tag whose kind has leading zeros, which strfry
-    // and earlier releases stored, with the tag dropped or hashed. Reindex
-    // deletes nothing under one, as its tombstone refuses nothing.
+fn reindex_deletes_under_long_addresses_spelled_with_a_padded_kind() {
+    // Ingest refuses an `a` tag whose kind has leading zeros, but strfry and
+    // earlier releases stored such requests, with the long tag dropped or
+    // hashed. Reindex must apply them like the write path did, not fail.
     let key = key();
     let pubkey = key.x_only_public_key().0.to_string();
     let d = "x".repeat(300);
     let version = event(&key, 30000, 100, json!([["d", &d]]), "version");
-    let address = format!("030000:{pubkey}:{d}");
-    let deletion = event(&key, 5, 200, json!([["a", &address]]), "");
+    let deletion = event(
+        &key,
+        5,
+        200,
+        json!([["a", format!("030000:{pubkey}:{d}")]]),
+        "",
+    );
     assert!(parse_and_verify_event(&deletion, &EventLimits::default(), None, true, false).is_err());
-    let id = hex::decode(deletion["id"].as_str().unwrap()).unwrap();
-    let author = key.x_only_public_key().0.serialize();
-    let json = wok_event::normalize_event_json(&deletion).unwrap();
-    for hashed in [false, true] {
-        let mut tags = wok_event::PackedEventTagBuilder::default();
-        if hashed {
-            tags.add('a', &wok_event::indexed_tag_value(address.as_bytes()))
-                .unwrap();
-        }
-        let packed = wok_event::PackedEventBuilder::build(&id, &author, 200, 5, 0, &tags).unwrap();
-        let (_dir, env) = snapshot_records(&[
-            legacy_packing(&version),
-            (packed.into_bytes(), json.clone()),
-        ]);
+
+    for stored_deletion in [legacy_packing(&deletion), stored_packing(&deletion)] {
+        let (_dir, env) = snapshot_records(&[legacy_packing(&version), stored_deletion]);
         let (_repaired_dir, repaired, stats) = reindex(&env);
-        assert!(stats.deleted_versions.is_empty(), "hashed {hashed}");
-        // A dropped tag cannot be restored, as packing the payload fails.
-        assert_eq!(stats.skipped_long_tag_records, u64::from(!hashed));
-        assert_eq!(
-            stored_ids(&repaired),
-            ids(&[version.clone(), deletion.clone()])
-        );
+        assert_eq!(stats.deleted_versions, BTreeSet::from([1]));
+        assert_eq!(stats.skipped_long_tag_records, 0);
+        assert_eq!(stored_ids(&repaired), ids(std::slice::from_ref(&deletion)));
         let report = wok_db::check_integrity(&repaired.begin_ro().unwrap()).unwrap();
         assert!(report.ok(), "{:?}", report.issues);
     }

@@ -40,7 +40,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
     }
     // strfry tombstones no replaceable event an `a` tag names, and a kind
     // spelled with leading zeros tombstones that spelling. Wok's integrity
-    // accepts both.
+    // accepts the canonical tombstones they lack.
     events.push(sign(
         json!({"kind":10002,"created_at":1_800_000_100,"tags":[],"content":"relays"}),
     ));
@@ -89,7 +89,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
     );
     assert!(
         String::from_utf8_lossy(&result.stdout)
-            .contains("1 deletion requests name replaceable events that strfry did not tombstone"),
+            .contains("1 deletion requests name replaceable events or kinds with leading zeros"),
         "{}",
         String::from_utf8_lossy(&result.stdout)
     );
@@ -126,7 +126,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
     let report = wok_db::check_integrity(&txn).unwrap();
     assert!(report.ok(), "{report:?}");
     assert_eq!(report.events, events.len() as u64);
-    assert_eq!(report.legacy_replaceable_deletions, 1);
+    assert_eq!(report.legacy_untombstoned_deletions, 1);
     let mut decompressor = wok_db::Decompressor::new();
     let mut actual = std::collections::BTreeMap::new();
     txn.foreach_full(target.dbis().event, &[], &[], false, |key, _| {

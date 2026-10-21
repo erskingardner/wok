@@ -327,15 +327,15 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
                         ),
                     );
                     report.add(
-                        "replaceable-tombstones",
-                        if integrity.legacy_replaceable_deletions == 0 {
+                        "deletion-tombstones",
+                        if integrity.legacy_untombstoned_deletions == 0 {
                             CheckStatus::Pass
                         } else {
                             CheckStatus::Warn
                         },
                         format!(
-                            "{} deletion requests lack the tombstone of a replaceable event their `a` tag names (stored by strfry or an earlier Wok), so older versions of it are not refused; `wok reindex --confirm-relay-stopped` adds them",
-                            integrity.legacy_replaceable_deletions,
+                            "{} deletion requests lack the tombstone of an address their `a` tag names (a replaceable event, or a kind with leading zeros; stored by strfry or an earlier Wok), so the versions they name were not deleted or can be published again; `wok reindex --confirm-relay-stopped` deletes them and adds the tombstones",
+                            integrity.legacy_untombstoned_deletions,
                         ),
                     );
                     report.integrity = Some(integrity);

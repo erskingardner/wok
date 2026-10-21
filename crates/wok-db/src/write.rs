@@ -202,7 +202,7 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
         expiration: Vec::new(),
         replace: Vec::new(),
         replace_deletion: Vec::new(),
-        replaceable_deletion: Vec::new(),
+        canonical_replace_deletion: Vec::new(),
     };
 
     packed.foreach_tag(|tag_name, tag_val| {
@@ -230,21 +230,24 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
                 idx.replace_deletion
                     .push(make_key_string_u64(digest, packed.created_at()));
             } else if let Ok(val) = std::str::from_utf8(tag_val) {
-                // The tombstone is the hash of the tag as written, and events
-                // look up the canonical spelling of their address. Ingest
-                // refuses kinds with leading zeros. An addressable kind spelled
-                // that way, which strfry and earlier releases stored, derives
-                // its entry as before; it never matches.
+                // Events look a tombstone up by the hash of the canonical
+                // spelling of their address. strfry and earlier releases
+                // derived only the hash of an addressable tag as written,
+                // whose kind ingest now refuses to pad with leading zeros.
                 if let Ok((kind, pubkey, d)) = parse_a_tag(val) {
                     if pubkey.as_slice() == packed.pubkey() {
-                        let key = make_key_string_u64(&sha256(tag_val), packed.created_at());
+                        let tombstone =
+                            |a_tag: &[u8]| make_key_string_u64(&sha256(a_tag), packed.created_at());
+                        let canonical = format!("{kind}:{}:{d}", to_hex(&pubkey));
                         if is_param_replaceable_kind(kind) {
-                            idx.replace_deletion.push(key);
-                        } else if is_replaceable_kind(kind)
-                            && d.is_empty()
-                            && parse_canonical_a_tag(val).is_ok()
-                        {
-                            idx.replaceable_deletion.push(key);
+                            idx.replace_deletion.push(tombstone(tag_val));
+                            if canonical.as_bytes() != tag_val {
+                                idx.canonical_replace_deletion
+                                    .push(tombstone(canonical.as_bytes()));
+                            }
+                        } else if is_replaceable_kind(kind) && d.is_empty() {
+                            idx.canonical_replace_deletion
+                                .push(tombstone(canonical.as_bytes()));
                         }
                     }
                 }
@@ -270,10 +273,11 @@ pub(crate) struct EventIndices {
     expiration: Vec<u64>,
     replace: Vec<Vec<u8>>,
     replace_deletion: Vec<Vec<u8>>,
-    /// `event_replace_deletion` keys of plain replaceable addresses
-    /// (`<kind>:<pubkey>:`). strfry and earlier Wok releases did not derive
-    /// them, so deletion requests they stored lack them until `wok reindex`.
-    replaceable_deletion: Vec<Vec<u8>>,
+    /// `event_replace_deletion` keys that strfry and earlier Wok releases did
+    /// not derive: a plain replaceable address (`<kind>:<pubkey>:`), and the
+    /// canonical spelling of an address whose kind the tag pads with leading
+    /// zeros. Deletion requests they stored lack them until `wok reindex`.
+    canonical_replace_deletion: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,7 +287,7 @@ pub(crate) struct EventIndexEntry {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
     /// A database written by strfry or an earlier Wok release can lack this
-    /// entry: the tombstone of a plain replaceable address.
+    /// entry, one of [`EventIndices::canonical_replace_deletion`].
     pub legacy_optional: bool,
 }
 
@@ -343,7 +347,7 @@ pub(crate) fn event_index_entries(
     for key in idx.tag {
         push("event_tag", dbis.event_tag, key);
     }
-    for key in idx.replaceable_deletion {
+    for key in idx.canonical_replace_deletion {
         entries.push(EventIndexEntry {
             name: "event_replace_deletion",
             dbi: dbis.event_replace_deletion,
@@ -353,12 +357,14 @@ pub(crate) fn event_index_entries(
         });
     }
     // DUPSORT databases store a key/value pair only once. Repeated identical
-    // tags therefore describe one physical index entry.
+    // tags therefore describe one physical index entry, which is required
+    // when any of them requires it (an address named both padded and not).
     entries.sort_by(|a, b| {
         a.dbi
             .cmp(&b.dbi)
             .then_with(|| a.key.cmp(&b.key))
             .then_with(|| a.value.cmp(&b.value))
+            .then_with(|| a.legacy_optional.cmp(&b.legacy_optional))
     });
     entries.dedup_by(|a, b| a.dbi == b.dbi && a.key == b.key && a.value == b.value);
     entries
@@ -391,7 +397,11 @@ fn put_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
     for k in &idx.replace {
         txn.put(dbis.event_replace, k, &lev, 0)?;
     }
-    for k in idx.replace_deletion.iter().chain(&idx.replaceable_deletion) {
+    for k in idx
+        .replace_deletion
+        .iter()
+        .chain(&idx.canonical_replace_deletion)
+    {
         txn.put(dbis.event_replace_deletion, k, &lev, 0)?;
     }
     for k in &idx.tag {
@@ -427,7 +437,11 @@ fn del_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
     for k in &idx.replace {
         txn.del(dbis.event_replace, k, Some(&lev))?;
     }
-    for k in idx.replace_deletion.iter().chain(&idx.replaceable_deletion) {
+    for k in idx
+        .replace_deletion
+        .iter()
+        .chain(&idx.canonical_replace_deletion)
+    {
         txn.del(dbis.event_replace_deletion, k, Some(&lev))?;
     }
     for k in &idx.tag {
@@ -505,9 +519,10 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
 /// the deletion request `deletion` deletes: every version of the addressable
 /// or replaceable event it names, when the request's author published it, up
 /// to the request's `created_at`. A replaceable event's address has an empty
-/// `d` (`<kind>:<pubkey>:`). `long_addresses` maps each hashed value to its
-/// original. Other addresses, and kinds spelled with leading zeros, delete
-/// nothing, as their tombstones refuse nothing.
+/// `d` (`<kind>:<pubkey>:`). A kind spelled with leading zeros names the
+/// canonical address: ingest refuses such tags, but strfry and earlier
+/// releases stored them, and reindex applies those. `long_addresses` maps
+/// each hashed value to its original. Other addresses delete nothing.
 fn push_address_deletions(
     txn: &RwTxn<'_>,
     deletion: PackedEventView<'_>,
@@ -519,7 +534,7 @@ fn push_address_deletions(
         Some(digest) => long_addresses.get(digest).map(String::as_str),
         None => std::str::from_utf8(tag_val).ok(),
     };
-    let Some((kind, pubkey, d_tag)) = address.and_then(|s| parse_canonical_a_tag(s).ok()) else {
+    let Some((kind, pubkey, d_tag)) = address.and_then(|s| parse_a_tag(s).ok()) else {
         return Ok(());
     };
     let replaces =
@@ -539,10 +554,32 @@ fn push_address_deletions(
     })
 }
 
-/// Stored versions that the `a` tags longer than [`MAX_INDEXED_TAG_VAL_SIZE`]
-/// of the stored deletion request `packed` delete, as [`write_events`] deletes
-/// them when the request arrives. Its shorter `a` tags are not applied.
-pub(crate) fn long_address_deletions(
+/// Whether reindex applies the deletion `a` tag `tag_val`, as packed, to the
+/// versions already stored. strfry and earlier Wok releases left those
+/// versions in place: they dropped an address longer than
+/// [`MAX_INDEXED_TAG_VAL_SIZE`], ignored a replaceable one
+/// (`<kind>:<pubkey>:`), and tombstoned a kind spelled with leading zeros by
+/// that spelling, so older versions of it could be published again. Each
+/// tag's tombstone is derived again too. Other tags were applied on arrival.
+pub(crate) fn is_repaired_address(tag_val: &[u8]) -> bool {
+    if hashed_tag_value_digest(tag_val).is_some() {
+        return true;
+    }
+    let Some(address) = std::str::from_utf8(tag_val).ok() else {
+        return false;
+    };
+    match parse_a_tag(address) {
+        Ok((kind, _, d)) => {
+            parse_canonical_a_tag(address).is_err() || (is_replaceable_kind(kind) && d.is_empty())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Stored versions that the [`is_repaired_address`] `a` tags of the stored
+/// deletion request `packed` delete, as [`write_events`] deletes them when a
+/// request arrives. Its other `a` tags are not applied.
+pub(crate) fn repaired_address_deletions(
     txn: &RwTxn<'_>,
     packed: PackedEventView<'_>,
     json: &str,
@@ -554,7 +591,7 @@ pub(crate) fn long_address_deletions(
     let long_addresses = hashed_tag_originals(json, "a")?;
     let mut scan_err = None;
     packed.foreach_tag(|tag_name, tag_val| {
-        if tag_name == 'a' && hashed_tag_value_digest(tag_val).is_some() {
+        if tag_name == 'a' && is_repaired_address(tag_val) {
             if let Err(error) =
                 push_address_deletions(txn, packed, tag_val, &long_addresses, &mut lev_ids)
             {

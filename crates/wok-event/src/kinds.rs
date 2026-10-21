@@ -51,9 +51,9 @@ pub fn parse_a_tag(input: &str) -> Result<(u64, [u8; 32], String), EventError> {
 }
 
 /// Parse an `a` tag like [`parse_a_tag`], with the kind also written in
-/// canonical decimal, without leading zeros. Wok tombstones an address by the
-/// hash of its canonical spelling, so a deletion naming `030000:<pubkey>:<d>`
-/// would delete the stored versions but not refuse later ones.
+/// canonical decimal, without leading zeros. Ingest requires it of deletion
+/// `a` tags: an event looks its tombstone up by the hash of the canonical
+/// spelling of its address, which `030000:<pubkey>:<d>` does not hash to.
 pub fn parse_canonical_a_tag(input: &str) -> Result<(u64, [u8; 32], String), EventError> {
     let address = parse_a_tag(input)?;
     if input.starts_with('0') && !input.starts_with("0:") {

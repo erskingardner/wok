@@ -165,15 +165,17 @@ regression test. Differential parity alone is not a reason to retain it.
   versions up to its `created_at` and refuses such versions that arrive
   later, as for addressable events. The pinned strfry applies `a` tags to
   addressable kinds only, so such a deletion did nothing. Deletion requests
-  migrated from strfry or stored by earlier Wok releases gain the tombstone
-  only from `wok reindex`, and the versions they predate stay stored (see
+  migrated from strfry or stored by earlier Wok releases take effect when
+  `wok reindex` applies them (see
   [lmdb-v3.md](lmdb-v3.md#eventreplacedeletion)).
 - NIP-09 `a` tags spelling a kind with leading zeros (`030000:<pubkey>:<d>`)
   are refused with `invalid: a tag kind has leading zeros`, like other
   non-canonical addresses. The pinned strfry reads such a kind as a number,
   so it deletes the stored versions, but tombstones that spelling, which no
-  later version is looked up by. A stored request spelled that way deletes
-  nothing and refuses nothing.
+  later version is looked up by. Requests stored that way still name the
+  canonical address: `wok reindex` deletes the versions that came back and
+  tombstones the canonical spelling. An `a` tag longer than 255 bytes is
+  held only as the hash of its spelling, so its tombstone stays ineffective.
 - NIP-59: kind 21059 ephemeral gift wraps are restricted reads by default,
   alongside kinds 4 and 1059, and NIP-59 is advertised only while both
   gift-wrap kinds are restricted. The previous default let any

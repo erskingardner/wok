@@ -6,7 +6,7 @@ use crate::parse::{
     from_lower_hex_array, normalize_event_json, nostr_json_to_packed_event, EventLimits,
     ParsedEvent,
 };
-use crate::EventError;
+use crate::{parse_canonical_a_tag, EventError, DELETION_KIND};
 
 // Re-export helper used by validate; keep json_get_string crate-private in parse
 // by duplicating the small accessor here for sig field.
@@ -131,6 +131,26 @@ pub fn verify_event_timestamp(
     Ok(())
 }
 
+/// Refuse a deletion whose `a` tag spells its kind with leading zeros. Wok
+/// tombstones an address by the hash of the tag, and looks it up by the
+/// canonical spelling. Packing accepts such tags, which strfry and earlier
+/// releases stored.
+fn require_canonical_addresses(orig: &Value) -> Result<(), EventError> {
+    let tags = orig
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for tag in tags.filter_map(Value::as_array) {
+        if tag.first().and_then(Value::as_str) == Some("a") {
+            if let Some(address) = tag.get(1).and_then(Value::as_str) {
+                parse_canonical_a_tag(address)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse and verify an event published to this relay. Its id must use the
 /// NIP-01 preimage.
 pub fn parse_and_verify_event(
@@ -163,6 +183,9 @@ pub fn parse_and_verify_event_with(
         return Err(EventError::msg("event is not an object"));
     }
     let packed = nostr_json_to_packed_event(orig, limits)?;
+    if packed.view().kind() == DELETION_KIND {
+        require_canonical_addresses(orig)?;
+    }
     let json = normalize_event_json(orig)?;
     if verify_msg {
         // Reject oversized events before hashing their content or performing
@@ -198,6 +221,37 @@ mod tests {
         let sig = SECP256K1.sign_schnorr(&id, &kp);
         ev["sig"] = json!(hex::encode(sig.as_ref()));
         ev
+    }
+
+    #[test]
+    fn deletion_a_tags_need_canonical_kinds_at_ingest() {
+        let pubkey = "22".repeat(32);
+        let event = |kind: u64, address: String| {
+            json!({
+                "id": "11".repeat(32),
+                "pubkey": pubkey,
+                "created_at": 1,
+                "kind": kind,
+                "content": "",
+                "tags": [["a", address]],
+                "sig": "00".repeat(64),
+            })
+        };
+        let limits = EventLimits::default();
+        let ingest = |event: &Value| parse_and_verify_event(event, &limits, None, false, false);
+        for address in [format!("0:{pubkey}:"), format!("30000:{pubkey}:d")] {
+            ingest(&event(5, address)).unwrap();
+        }
+        for address in [format!("00:{pubkey}:"), format!("030000:{pubkey}:d")] {
+            let deletion = event(5, address);
+            let error = ingest(&deletion).unwrap_err();
+            assert_eq!(error.to_string(), "a tag kind has leading zeros");
+            // strfry and earlier releases stored such requests; reindex packs
+            // them again.
+            nostr_json_to_packed_event(&deletion, &limits).unwrap();
+        }
+        // Other events may reference an address however they spell it.
+        ingest(&event(1, format!("030000:{pubkey}:d"))).unwrap();
     }
 
     #[test]

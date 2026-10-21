@@ -92,7 +92,9 @@ gains its tombstone, so older versions of its address are refused from then on,
 and reindex deletes the versions already stored at or before it, as the writer
 does when such a request arrives. It applies the long `a` tags of every stored
 deletion request this way, so a request stored with its tag also deletes the
-legacy versions that were keyed by another address until the repack. The
+legacy versions that were keyed by another address until the repack, and also
+the `a` tags that name a replaceable address or pad the kind with leading
+zeros (see [Event__replaceDeletion](#eventreplacedeletion)). The
 backup keeps the deleted versions. Nothing repacks implicitly. Finding
 legacy records means decoding every payload, which at writable open would make
 the first start after an upgrade scan the whole database, and migration keeps
@@ -107,17 +109,22 @@ for each `a` tag that names an address of its own author: an addressable kind
 (30000–39999), or a replaceable kind (0, 3, 10000–19999) with an empty `d`,
 `<kind>:<pubkey>:`. A writer refuses an addressable or replaceable event when
 the hash of its own canonical `a` tag has an entry at or after its
-`created_at`. strfry, and Wok 0.7.0 and earlier, index addressable kinds only.
-Ingest refuses a deletion `a` tag whose kind has leading zeros. A stored one
-keeps the entry its spelling derives, which no lookup matches, and deleting by
-it removes nothing.
+`created_at`. strfry, and Wok 0.7.0 and earlier, index addressable kinds only,
+by the hash of the tag as written. Ingest now refuses a deletion `a` tag whose
+kind has leading zeros. For one stored before, the entry of its spelling is
+derived as those releases did, and so is the entry of the canonical spelling,
+so the request refuses what it deletes. An `a` tag longer than 255 bytes is the
+exception: PackedEvent holds only the hash of its spelling, so its entry
+matches nothing.
 
 Deletion requests that strfry or an earlier Wok release stored therefore lack
-the entries of replaceable addresses. Integrity accepts their absence, so
-migration and older databases still verify, and counts such records as
-`legacy_replaceable_deletions`; `wok doctor` warns while any remain and
-`wok reindex` derives the entries. The versions such a request predates stay
-stored. An earlier Wok release opening a database written by this one does not
+the entries of replaceable addresses and of canonical spellings, and the
+versions they name were never deleted or could be published again. Integrity
+accepts the missing entries, so migration and older databases still verify, and
+counts such records as `legacy_untombstoned_deletions`; `wok doctor` warns
+while any remain. `wok reindex` derives the entries and deletes the versions
+those requests name up to their `created_at`, as it does for long `a` tags (see
+[PackedEvent](#packedevent)). An earlier Wok release opening a database written by this one does not
 derive those entries, so its integrity check reports them as unexpected, and
 if it deletes such a deletion request the entry stays behind; `wok integrity`
 reports it and `wok reindex` removes it.

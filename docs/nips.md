@@ -52,7 +52,8 @@ versions, and refuse such versions that arrive later. A deletion `a` tag whose
 kind has leading zeros is refused with `invalid:`, so every tombstone is found
 by the canonical spelling of its address.
 Databases from strfry or earlier releases can still hold versions under a
-deletion whose `a` tag is longer than 255 bytes; `wok reindex` deletes them.
+deletion whose `a` tag is longer than 255 bytes, names a replaceable event, or
+pads the kind with leading zeros; `wok reindex` deletes them.
 
 Persistent negentropy trees represent physical storage. A transactional count
 of retained superseded versions keeps clean databases on the persistent-tree

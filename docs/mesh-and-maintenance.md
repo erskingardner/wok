@@ -145,8 +145,8 @@ filter and the remote connection's readable view, not the remote operator's full
 
 `--json` emits one summary on stdout, including transfer/protocol failures; tracing
 logs go to stderr. Fields are `ok`, `reconciled`, `have`, `need`, `downloaded`,
-`written`, `duplicates`, `superseded`, `rejected`, `unavailable`, `uploaded`,
-`upload_rejected`, `upload_superseded`, and `error`. `have` and `need` count unique differences discovered during the run,
+`written`, `duplicates`, `superseded`, `expired`, `rejected`, `unavailable`,
+`uploaded`, `upload_rejected`, `upload_superseded`, `upload_expired`, and `error`. `have` and `need` count unique differences discovered during the run,
 not the remaining differences after transfer. `uploaded` counts positive relay
 ACKs, not recipient delivery. CLI parsing/config-loading errors may occur before a
 summary can be produced. JSON and missing-ID output are mutually exclusive.
@@ -158,8 +158,11 @@ cannot complete a batch. Duplicate records already stored are successful outcome
 `superseded` counts downloads discarded because a newer local version exists.
 `upload_superseded` counts local records superseded before sending and negative
 peer ACKs whose reason starts with `blocked: have a newer version`, or with
-`replaced:` from strfry and earlier Wok releases. These are terminal successful outcomes;
-other policy rejections still fail the transfer.
+`replaced:` from strfry and earlier Wok releases. `expired` and `upload_expired`
+count downloads dropped and local records not sent because their NIP-40
+expiration has passed. In `ttl` ephemeral mode a relay keeps serving such an
+ephemeral event until its purge, and relays refuse expired events. These are
+terminal successful outcomes; other policy rejections still fail the transfer.
 The client caps combined unique differences at five million; partition larger
 comparisons with explicit filters or time windows. The default timeout is 60
 seconds without protocol progress; ping traffic does not

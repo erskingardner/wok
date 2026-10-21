@@ -127,6 +127,18 @@ pub fn nostr_json_to_packed_event(
     pack_event(v, limits).map(|(packed, _)| packed)
 }
 
+/// The NIP-40 expiration of event JSON `v`: its first `expiration` tag, as
+/// packing reads it. `None` when it has none or the value is malformed.
+pub fn expiration_tag(v: &Value) -> Option<u64> {
+    let tag = v
+        .get("tags")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_array)
+        .find(|tag| tag.first().and_then(Value::as_str) == Some("expiration"))?;
+    parse_uint64(tag.get(1)?.as_str()?).ok()
+}
+
 /// [`nostr_json_to_packed_event`], also returning the NIP-40 expiration tag's
 /// value (0 when there is none). An ephemeral event packs the ephemeral
 /// marker in its place, so ingest checks expiry against this value.

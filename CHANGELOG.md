@@ -233,7 +233,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An ephemeral event published with an `expiration` tag in the past is refused
   with `invalid: event expired`, as NIP-40 asks. It was accepted and sent to
   matching live subscriptions, because the ephemeral marker replaced the
-  expiration before it was checked.
+  expiration before it was checked. `wok sync` and `wok router` downloads drop
+  such events too. `wok sync` neither uploads nor fails on one that a `ttl`-mode
+  database still holds; its summary counts them as `expired` and
+  `upload_expired`.
 - Events refused because free disk space is below
   `database.min_free_disk_bytes` get `error: disk reserve requires N free
   bytes` instead of `blocked:`. A low disk is the relay's own failure, not a

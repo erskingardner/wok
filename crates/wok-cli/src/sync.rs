@@ -43,11 +43,13 @@ struct Report {
     written: u64,
     duplicates: u64,
     superseded: u64,
+    expired: u64,
     rejected: u64,
     unavailable: u64,
     uploaded: u64,
     upload_rejected: u64,
     upload_superseded: u64,
+    upload_expired: u64,
     error: Option<String>,
 }
 
@@ -65,10 +67,11 @@ pub async fn run(cfg: &Config, options: Options) -> Result<()> {
             serde_json::to_string(&report)?
         )?;
     } else {
-        eprintln!("Sync {}: reconciled={} have={} need={} downloaded={} written={} duplicates={} superseded={} rejected={} unavailable={} uploaded={} upload_rejected={} upload_superseded={}",
+        eprintln!("Sync {}: reconciled={} have={} need={} downloaded={} written={} duplicates={} superseded={} expired={} rejected={} unavailable={} uploaded={} upload_rejected={} upload_superseded={} upload_expired={}",
             if report.ok { "complete" } else { "failed" }, report.reconciled,
             report.have, report.need, report.downloaded, report.written, report.duplicates, report.superseded,
-            report.rejected, report.unavailable, report.uploaded, report.upload_rejected, report.upload_superseded);
+            report.expired, report.rejected, report.unavailable, report.uploaded, report.upload_rejected,
+            report.upload_superseded, report.upload_expired);
     }
     result
 }
@@ -77,6 +80,14 @@ pub async fn run(cfg: &Config, options: Options) -> Result<()> {
 /// strfry and earlier Wok releases reply `replaced:` instead.
 fn upload_superseded(reason: &str) -> bool {
     reason.starts_with(wok_relay::protocol::SUPERSEDED_OK_REASON) || reason.starts_with("replaced:")
+}
+
+/// True when event JSON's NIP-40 expiration has passed. Relays drop such
+/// events, but a peer in `ttl` mode serves an ephemeral one until its purge:
+/// its record packs the ephemeral marker in place of the expiration. Neither
+/// side storing it is the end of that transfer, not a failure.
+fn expired(event: &Value, now: u64) -> bool {
+    wok_event::expiration_tag(event).is_some_and(|expiration| expiration <= now)
 }
 
 fn store_downloads(
@@ -88,6 +99,10 @@ fn store_downloads(
     let mut writes = Vec::with_capacity(events.len());
     for event in events.drain(..) {
         let policy = cfg.timestamp_policy_for_kind(event["kind"].as_u64().unwrap_or(u64::MAX));
+        if expired(&event, policy.now_secs) {
+            report.expired += 1;
+            continue;
+        }
         // A peer's stored events may carry legacy strfry/Wok ids.
         match parse_and_verify_event_with(
             &event,
@@ -440,6 +455,9 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
         if do_up && pending_up.len() <= 50 && !have.is_empty() {
             let mut outgoing = Vec::new();
             {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
                 let txn = env.begin_ro()?;
                 let mut decompressor = Decompressor::new();
                 while pending_up.len() + outgoing.len() < 100 {
@@ -466,6 +484,15 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                             lev,
                             cfg.events.max_event_size,
                         )?;
+                        // Read visibility sees an ephemeral record's marker,
+                        // not its expiration.
+                        if packed.expiration() == 1
+                            && wok_event::json::parse_strict(&event)
+                                .is_ok_and(|event| expired(&event, now))
+                        {
+                            report.upload_expired += 1;
+                            continue;
+                        }
                         outgoing.push((hex::encode(id), format!("[\"EVENT\",{event}]")));
                     } else {
                         report.unavailable += 1;

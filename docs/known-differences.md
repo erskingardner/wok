@@ -129,7 +129,11 @@ regression test. Differential parity alone is not a reason to retain it.
 - NIP-40: an ephemeral event whose `expiration` tag has passed is refused with
   `invalid: event expired` and reaches no subscriber. The pinned strfry packs
   the ephemeral marker in place of the expiration before checking it, so it
-  accepted and broadcast such events.
+  accepted and broadcast such events. `wok sync` and `wok router` downloads
+  drop them too. In `ttl` mode a stored ephemeral event
+  stays readable until the ephemeral purge even once its expiration passes,
+  so `wok sync` counts one it does not transfer, in either direction, as
+  `expired` or `upload_expired` instead of failing.
 - NIP-77 network payload hex rejects `0x` prefixes and half bytes.
 - NIP-01 IDs, pubkeys, signatures, and standard `e`/`p` values require the
   specified lowercase hex form.

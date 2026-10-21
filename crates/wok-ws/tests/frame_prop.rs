@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use wok_ws::frame::{InflateCtx, Role, WsEvent, WsParser};
+use wok_ws::frame::{DeflateCtx, InflateCtx, Role, WsEvent, WsParser};
 
 fn event_len(event: &WsEvent) -> usize {
     match event {
@@ -32,6 +32,41 @@ proptest! {
                     }
                 }
                 Err(_) => break,
+            }
+        }
+    }
+
+    /// Releasing either side's idle compression state at any point leaves
+    /// every message decoding to what was sent, with takeover on or off.
+    #[test]
+    fn release_points_do_not_change_what_decodes(
+        messages in proptest::collection::vec(
+            (proptest::collection::vec(0u8..8, 0..6_000), any::<bool>(), any::<bool>()),
+            1..24,
+        ),
+        server_takeover in any::<bool>(),
+        client_takeover in any::<bool>(),
+    ) {
+        let mut relay_out = DeflateCtx::new(server_takeover);
+        let mut client_in = InflateCtx::new(server_takeover);
+        let mut client_out = DeflateCtx::new(client_takeover);
+        let mut relay_in = InflateCtx::new(client_takeover);
+        for (msg, release_relay, release_client) in &messages {
+            // Few distinct bytes so messages refer back into earlier ones.
+            let down = relay_out.compress(msg).unwrap();
+            prop_assert_eq!(&client_in.decompress(&down, 1 << 20).unwrap(), msg);
+            let up = client_out.compress(msg).unwrap();
+            prop_assert_eq!(&relay_in.decompress(&up, 1 << 20).unwrap(), msg);
+            if *release_relay {
+                // Two checks without use in between: the state is dropped.
+                relay_out.release_idle();
+                relay_out.release_idle();
+                relay_in.release_idle();
+                relay_in.release_idle();
+            }
+            if *release_client {
+                client_out.release_idle();
+                client_out.release_idle();
             }
         }
     }

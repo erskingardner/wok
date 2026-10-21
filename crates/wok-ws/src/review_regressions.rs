@@ -20,8 +20,8 @@ async fn review_kill_interrupts_blocked_websocket_write() {
         handle.clone(),
         "127.0.0.1:9000".parse().unwrap(),
         1024,
-        false,
-        false,
+        None,
+        DEFLATE_IDLE_CHECK,
     ));
     let mut encoder = WsEncoder::with_role(None, frame::Role::Client);
     peer.write_all(&encoder.encode_message(MessageKind::Text, b"x").unwrap())
@@ -167,8 +167,8 @@ async fn paused_ingress_relay_with(
         handle.clone(),
         "127.0.0.1:9000".parse().unwrap(),
         max_message,
-        false,
-        false,
+        None,
+        DEFLATE_IDLE_CHECK,
     ));
     let mut peer = Peer {
         io,

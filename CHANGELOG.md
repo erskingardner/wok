@@ -84,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   match; when the peek cannot tell, EOSE has no `finish` or `more`. Clients
   that index EOSE by position are unaffected; a client that requires exactly
   two elements must accept three.
+- `wok-bench --scenario ws_transport` measures what WebSocket connections
+  cost the relay, with and without permessage-deflate: RSS per open, warm and
+  idle connection, history bursts, live fan-out, reconnect churn, and the
+  deflate codec at each level.
 - Configuration presets. The optional top-level key `preset` selects a named
   set of defaults; configuration resolves as built-in defaults, then the
   preset's overlay, then the file. `public`, the built-in defaults, is the
@@ -152,6 +156,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- WebSocket connections cost less memory and CPU. permessage-deflate state
+  (about 300 KiB per connection) is allocated by a connection's first message
+  instead of at upgrade, and released after 30–60 s without traffic. The read
+  buffer shrinks back to 1 KiB between messages. Outbound frames already
+  queued go out in one write instead of one write each. Outbound compression
+  uses level 1, as strfry does, instead of 6: less than half the CPU, for
+  about 15% more bytes on kind-1 history (4–15% depending on kind). A new
+  connection no longer waits up to a millisecond for a timer tick before it
+  reads its first message, which roughly triples reconnect throughput.
 - A bound set with `events.reject_older_than_secs` applies to regular kinds
   only. Replaceable (0, 3, 10000–19999) and addressable (30000–39999) events
   and deletions (5) are now accepted whatever their age, like vanish requests
@@ -191,6 +204,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- With `relay.compression_sliding_window = false`, the relay reset its
+  inflater before every client message although it had not asked the client
+  to stop context takeover, so a client compressing against its earlier
+  messages, as browsers do, was disconnected on its second compressed
+  message. The setting now applies only to the relay's own compressor.
 - `events.reject_older_than_secs = 0` refused every event dated in the past.
   It now means no lower bound.
 - AUTH used the 60-second window for ephemeral events, so a client whose

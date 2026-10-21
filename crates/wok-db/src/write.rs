@@ -7,6 +7,9 @@ use crate::keys::{
 };
 use crate::payload::{encode_raw_payload, Decompressor};
 use crate::search::{index_event_search, note_search_indexed_through, remove_event_search};
+use crate::tag_kind::{
+    del_tag_kind_entries, note_tag_kind_indexed, put_tag_kind_entries, tag_kind_keys,
+};
 use crate::txn::RwTxn;
 use crate::vanish::{is_event_vanished_rw, mark_vanished, VanishPolicy, VANISH_KIND};
 use crate::DbError;
@@ -198,6 +201,7 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
             index_time,
         )),
         tag: Vec::new(),
+        tag_kind: tag_kind_keys(packed),
         deletion: Vec::new(),
         expiration: Vec::new(),
         replace: Vec::new(),
@@ -269,6 +273,10 @@ pub(crate) struct EventIndices {
     kind: Option<Vec<u8>>,
     pubkey_kind: Option<Vec<u8>>,
     tag: Vec<Vec<u8>>,
+    /// `wok_Event__tagKind` keys. Integrity checks them apart from
+    /// [`event_index_entries`]: entries above the table's marker may be
+    /// absent until they are indexed.
+    tag_kind: Vec<Vec<u8>>,
     deletion: Vec<Vec<u8>>,
     expiration: Vec<u64>,
     replace: Vec<Vec<u8>>,
@@ -407,7 +415,7 @@ fn put_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
     for k in &idx.tag {
         txn.put(dbis.event_tag, k, &lev, 0)?;
     }
-    Ok(())
+    put_tag_kind_entries(txn, lev_id, &idx.tag_kind)
 }
 
 fn del_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(), DbError> {
@@ -447,7 +455,7 @@ fn del_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
     for k in &idx.tag {
         txn.del(dbis.event_tag, k, Some(&lev))?;
     }
-    Ok(())
+    del_tag_kind_entries(txn, lev_id, &idx.tag_kind)
 }
 
 pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbError> {
@@ -682,6 +690,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
     });
 
+    let mut first_inserted = None;
     let mut indexed_through = None;
 
     for i in 0..evs.len() {
@@ -918,6 +927,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
             mark_vanished(txn, packed.pubkey(), packed.created_at())?;
         }
         let inserted_lev_id = insert_event(txn, packed_bytes, json)?;
+        first_inserted.get_or_insert(inserted_lev_id);
         indexed_through = Some(inserted_lev_id);
         *lev_id = inserted_lev_id;
         ne.update(txn, packed, true)?;
@@ -936,6 +946,9 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
     // the same record throughout a batch.
     if let Some(lev_id) = indexed_through {
         note_search_indexed_through(txn, lev_id)?;
+    }
+    if let (Some(first), Some(last)) = (first_inserted, indexed_through) {
+        note_tag_kind_indexed(txn, first, last)?;
     }
 
     Ok(())

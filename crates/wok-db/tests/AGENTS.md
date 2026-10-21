@@ -8,6 +8,7 @@ Storage integration tests. They open disposable LMDB environments.
 | `txn_prop.rs` | Transaction sequences |
 | `foreach_full.rs` | Full-table scans; `MDB_GET_BOTH_RANGE` must not be used on non-DUPSORT DBIs |
 | `index_drift.rs` | Derived indexes stay consistent with primaries |
+| `tag_kind_index.rs` | `wok_Event__tagKind` through every write/delete path, reindex, drift reports |
 | `failure_recovery.rs` | Unclean shutdown / recovery |
 | `state_integrity.rs` | Corrupt state detection and valid lazy/deleted-tail state |
 | `nip59_gift_wrap.rs` | Gift-wrap deletion / recipient semantics |

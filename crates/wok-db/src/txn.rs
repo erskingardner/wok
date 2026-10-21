@@ -86,6 +86,10 @@ impl<'env> RoTxn<'env> {
         foreach_full(self.txn, dbi, start_key, start_dup, reverse, cb)
     }
 
+    pub(crate) fn largest_integer_key(&self, dbi: MDB_dbi) -> Result<u64, DbError> {
+        largest_integer_key(self.txn, dbi)
+    }
+
     pub fn abort(mut self) {
         self.committed = true;
         unsafe { mdb_txn_abort(self.txn) }

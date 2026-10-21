@@ -28,6 +28,10 @@ pub const DBI_VANISH_PUBKEY: &str = "wok_VanishPubkey";
 /// Wok-owned NIP-86 moderation records, prefixed by record type. This DBI is
 /// optional when opening a read-only strfry v3 migration source.
 pub const DBI_MODERATION: &str = "wok_Moderation";
+/// Wok-owned, rebuildable single-letter tag postings by kind, keyed
+/// `tagName || tagVal || kind || created_at`. This DBI is optional when
+/// opening a read-only strfry v3 migration source.
+pub const DBI_EVENT_TAG_KIND: &str = "wok_Event__tagKind";
 
 pub const DBI_NAMES: &[&str] = &[
     DBI_META,
@@ -50,6 +54,7 @@ pub const DBI_NAMES: &[&str] = &[
     DBI_VANISH_PUBKEY,
     DBI_MODERATION,
     DBI_STATE,
+    DBI_EVENT_TAG_KIND,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +177,11 @@ pub fn dbi_specs() -> &'static [DbiSpec] {
             name: DBI_STATE,
             flags: MDB_CREATE,
             comparator: ComparatorKind::Default,
+        },
+        DbiSpec {
+            name: DBI_EVENT_TAG_KIND,
+            flags: DUP,
+            comparator: ComparatorKind::StringUint64Uint64,
         },
     ]
 }

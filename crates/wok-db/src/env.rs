@@ -17,8 +17,8 @@ use crate::comparators::{
 use crate::error::check;
 use crate::fbs::{decode_meta, encode_meta, encode_negentropy_filter, Meta};
 use crate::schema::{
-    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_META, DBI_MODERATION, DBI_STATE,
-    DBI_VANISH_PUBKEY,
+    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_EVENT_TAG_KIND, DBI_META,
+    DBI_MODERATION, DBI_STATE, DBI_VANISH_PUBKEY,
 };
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
@@ -93,6 +93,9 @@ pub struct Dbis {
     /// Absent only while inspecting an unmodified strfry v3 source.
     pub moderation: Option<MDB_dbi>,
     pub state: Option<MDB_dbi>,
+    /// Absent while inspecting an unmodified strfry v3 source, or read-only
+    /// before the first writable open by a release that has it.
+    pub event_tag_kind: Option<MDB_dbi>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -253,7 +256,11 @@ impl Env {
             let mut dbi: MDB_dbi = 0;
             let wok_only = matches!(
                 spec.name,
-                DBI_EVENT_SEARCH | DBI_VANISH_PUBKEY | DBI_MODERATION | DBI_STATE
+                DBI_EVENT_SEARCH
+                    | DBI_VANISH_PUBKEY
+                    | DBI_MODERATION
+                    | DBI_STATE
+                    | DBI_EVENT_TAG_KIND
             );
             let foreign_source = wok_only && !opened.is_empty() && {
                 let version = match meta_version_in_open_txn(txn, opened[0]) {
@@ -339,6 +346,7 @@ impl Env {
             vanish_pubkey: (opened[17] != 0).then_some(opened[17]),
             moderation: (opened[18] != 0).then_some(opened[18]),
             state: (opened[19] != 0).then_some(opened[19]),
+            event_tag_kind: (opened[20] != 0).then_some(opened[20]),
         };
 
         #[cfg(test)]
@@ -441,6 +449,7 @@ impl Env {
         }
         crate::state::discard_legacy_superseded_events(&mut txn)?;
         crate::state::superseded_events(&mut txn)?;
+        crate::tag_kind::ensure_tag_kind_index(&mut txn)?;
         txn.commit()?;
         crate::search::ensure_search_index(self)?;
         Ok(())

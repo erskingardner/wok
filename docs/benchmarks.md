@@ -395,9 +395,9 @@ cargo test --release -p wok-compat --test req_path_latency -- \
 Both `close_then_req` and `req_bursts` run their probes twice: first idle,
 then while every req worker is busy. For the busy run, `HEAVY` (2) connections
 per req worker send NIP-50 searches one after another. Each search matches the
-whole corpus of `CORPUS` (200,000) events. The `heavy searches` line gives how
-many searches finished meanwhile, so a change that helps the probes at the
-searches' expense shows there.
+whole corpus of `CORPUS` (200,000) events. Two `heavy search` lines follow:
+how many searches were sent while the probes ran, and how long each took to
+EOSE. A change that helps the probes at the searches' expense shows there.
 
 Each line gives the sample count and p50/p90/p99/max in milliseconds. Read
 the heavy lines against the idle ones from the same run. Run each revision at

@@ -34,7 +34,7 @@
 use hdrhistogram::Histogram;
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wok_compat::sign_event_with_key;
@@ -160,31 +160,29 @@ fn percentiles(label: &str, mut samples: Vec<Duration>) {
 }
 
 /// Searches matching the whole corpus, one after another on `per_worker`
-/// connections per req worker, until dropped.
+/// connections per req worker, until stopped.
 struct Heavy {
     stop: Arc<AtomicBool>,
-    done: Arc<AtomicU64>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Searches finished before the measurement started, and when it did.
-    started: (u64, Instant),
+    /// Each task's searches: when each was sent and how long it took.
+    tasks: Vec<tokio::task::JoinHandle<Vec<(Instant, Duration)>>>,
+    started: Instant,
 }
 
 impl Heavy {
     async fn start(handle: &RelayHandle, per_worker: usize) -> Self {
         let workers = Config::default().relay.req_worker_threads;
         let stop = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicU64::new(0));
         let mut tasks = Vec::new();
         // Connection ids are consecutive, and a connection's req worker is
         // its id modulo the worker count: these cover every worker.
         for c in 0..workers * per_worker {
             let (conn, mut rx) = connect(handle).await;
-            let (stop, done) = (stop.clone(), done.clone());
+            let stop = stop.clone();
             tasks.push(tokio::spawn(async move {
-                let mut n = 0u64;
+                let mut searches = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
-                    let sub_id = format!("heavy{c}-{n}");
-                    n += 1;
+                    let sub_id = format!("heavy{c}-{}", searches.len());
+                    let sent = Instant::now();
                     send(
                         &conn,
                         json!(["REQ", sub_id, {"search": SEARCHED, "limit": 500}]),
@@ -192,32 +190,41 @@ impl Heavy {
                     .await;
                     let reply = eose(&mut rx, &sub_id).await;
                     assert_eq!(reply[0], "EOSE", "{reply}");
+                    searches.push((sent, sent.elapsed()));
                     send(&conn, json!(["CLOSE", sub_id])).await;
-                    done.fetch_add(1, Ordering::Relaxed);
                 }
+                searches
             }));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let started = (done.load(Ordering::Relaxed), Instant::now());
         Self {
             stop,
-            done,
             tasks,
-            started,
+            started: Instant::now(),
         }
     }
 
-    async fn stop(self, label: &str) {
-        let searches = self.done.load(Ordering::Relaxed) - self.started.0;
-        let secs = self.started.1.elapsed().as_secs_f64();
+    /// Report the searches sent while the probes ran.
+    async fn stop(self) {
+        let secs = self.started.elapsed().as_secs_f64();
         self.stop.store(true, Ordering::Relaxed);
+        let mut took = Vec::new();
         for task in self.tasks {
-            task.await.unwrap();
+            took.extend(
+                task.await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(sent, _)| *sent >= self.started)
+                    .map(|(_, took)| took),
+            );
         }
         println!(
-            "{label:<36} {searches} searches in {secs:.1} s ({:.1}/s)",
-            searches as f64 / secs
+            "{:<36} {} sent in {secs:.1} s ({:.1}/s)",
+            "  heavy searches",
+            took.len(),
+            took.len() as f64 / secs
         );
+        percentiles("  heavy search, REQ to EOSE", took);
     }
 }
 
@@ -266,7 +273,7 @@ async fn close_then_req() {
     let load = Heavy::start(&handle, heavy).await;
     let samples = close_then_req_probe(&handle, rounds, subs).await;
     percentiles("close+REQ, heavy", samples);
-    load.stop("  heavy searches").await;
+    load.stop().await;
     handle.request_shutdown();
 }
 
@@ -344,7 +351,7 @@ async fn req_bursts() {
         let samples = bursts(&handle, conns, burst, rounds).await;
         percentiles(&format!("burst of {burst}, heavy"), samples);
     }
-    load.stop("  heavy searches").await;
+    load.stop().await;
     handle.request_shutdown();
 }
 

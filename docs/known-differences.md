@@ -20,7 +20,7 @@ it is not a promise to reproduce upstream bugs.
 - Wok offers an optional Unix socket transport. Write-policy plugins see
   `sourceType: "unix"` for those connections.
 - `wok event <levId>` prints one event by local event ID.
-- NIP-11 reports Wok's repository as the software implementation.
+- NIP-11 `software` is Wok's homepage, `https://github.com/erskingardner/wok`.
 - Wok implements NIP-50 ranked content search using a Wok-owned derived LMDB
   index. The pinned strfry revision has no NIP-50 implementation.
 - Wok returns mergeable NIP-45 HyperLogLog sketches for canonical
@@ -226,3 +226,14 @@ regression test. Differential parity alone is not a reason to retain it.
   never has. Integrity checks, `wok migrate strfry` and `wok doctor` never
   rehash ids, so migrated data is unaffected. A Wok relay refuses legacy-id
   events that `wok sync` uploads to it, because uploads are EVENTs.
+- NIP-01 single endpoint: only `/` accepts WebSocket upgrades and serves
+  NIP-11, NIP-86 and the landing page. Other paths return 404, apart from
+  `/admin`, `/metrics` and the nodeinfo routes. The pinned strfry upgrades
+  and serves NIP-11 on every path, so one relay answers under many URLs. A
+  reverse proxy that serves the relay under a path prefix must strip it.
+- NIP-11 CORS: relay responses send `Access-Control-Allow-Origin`,
+  `-Allow-Headers` and `-Allow-Methods`, and `OPTIONS /` is a 204 preflight
+  reply. NIP-11 is chosen when `Accept` lists `application/nostr+json` among
+  other media ranges with a nonzero `q`. The pinned strfry sends only
+  `Access-Control-Allow-Origin`, answers OPTIONS with the landing page, and
+  serves NIP-11 only when `Accept` is exactly `application/nostr+json`.

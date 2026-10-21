@@ -2,7 +2,7 @@
 
 | File | Role |
 | --- | --- |
-| `lib.rs` | TCP listener, HTTP dispatch, WS upgrade, NIP-11, landing HTML |
+| `lib.rs` | TCP listener, HTTP dispatch (relay on `/` only), WS upgrade, NIP-11, landing HTML |
 | `frame.rs` | RFC 6455 frames + RFC 7692 inflate/deflate (`pub mod frame`) |
 | `admin.rs` | `/admin` UI and `/admin/api/*` (NIP-98-style signed auth) |
 | `nip86.rs` | NIP-86 management RPC on `POST /` (shares admin NIP-98 auth) |

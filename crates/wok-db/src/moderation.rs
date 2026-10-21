@@ -11,17 +11,20 @@
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
 use lmdb_sys::MDB_dbi;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wok_event::PackedEventView;
 
 const PREFIX_BANNED_PUBKEY: u8 = b'B';
 const PREFIX_ALLOWED_PUBKEY: u8 = b'A';
 const PREFIX_BANNED_EVENT: u8 = b'E';
+const PREFIX_ALLOWED_EVENT: u8 = b'V';
 const PREFIX_BLOCKED_IP: u8 = b'I';
 const PREFIX_REPORTED_EVENT: u8 = b'R';
 const PREFIX_ROLE: u8 = b'G';
 const PREFIX_PUBKEY_ROLES: u8 = b'P';
 const PREFIX_KIND_POLICY: u8 = b'K';
+/// A kind named by `allowkind`, keyed by its big-endian `u16`.
+const PREFIX_ALLOWED_KIND: u8 = b'L';
 
 /// Longest stored operator-supplied reason.
 pub const MAX_REASON_BYTES: usize = 512;
@@ -52,7 +55,8 @@ pub struct Role {
     pub order: u64,
 }
 
-const KIND_POLICY_BYTES: usize = (u16::MAX as usize + 1) / 8;
+const KIND_COUNT: usize = u16::MAX as usize + 1;
+const KIND_POLICY_BYTES: usize = KIND_COUNT / 8;
 
 /// NIP-86 allowed-kind set as a 65536-bit map (8 KiB), stored under a single
 /// `K` record. Absent record means every kind is allowed; a present map is
@@ -83,10 +87,10 @@ impl KindPolicy {
         }
     }
 
-    /// Enumerate the allowed kinds (used by `listallowedkinds`).
-    pub fn allowed_kinds(&self) -> Vec<u64> {
+    /// Enumerate the disallowed kinds (used by `listdisallowedkinds`).
+    pub fn disallowed_kinds(&self) -> Vec<u64> {
         (0..=u16::MAX as u64)
-            .filter(|kind| self.allows(*kind))
+            .filter(|kind| !self.allows(*kind))
             .collect()
     }
 }
@@ -98,12 +102,16 @@ pub struct ModerationSnapshot {
     pub banned_pubkeys: HashMap<[u8; 32], String>,
     pub allowed_pubkeys: HashMap<[u8; 32], String>,
     pub banned_events: HashMap<[u8; 32], String>,
+    pub allowed_events: HashMap<[u8; 32], String>,
     pub blocked_ips: HashMap<String, String>,
     pub reported_events: HashMap<[u8; 32], String>,
     pub roles: BTreeMap<String, Role>,
     pub pubkey_roles: HashMap<[u8; 32], Vec<String>>,
     /// `None` means every kind is allowed (no policy record stored).
     pub kind_policy: Option<KindPolicy>,
+    /// Kinds named by `allowkind` since their last `disallowkind`. This only
+    /// lists the decisions; admission follows `kind_policy`.
+    pub allowed_kinds: BTreeSet<u64>,
 }
 
 impl ModerationSnapshot {
@@ -426,6 +434,7 @@ pub fn load_moderation_snapshot_ro(txn: &RoTxn<'_>) -> Result<ModerationSnapshot
             PREFIX_BANNED_PUBKEY
             | PREFIX_ALLOWED_PUBKEY
             | PREFIX_BANNED_EVENT
+            | PREFIX_ALLOWED_EVENT
             | PREFIX_REPORTED_EVENT
             | PREFIX_PUBKEY_ROLES
                 if payload.len() == 32 =>
@@ -441,6 +450,9 @@ pub fn load_moderation_snapshot_ro(txn: &RoTxn<'_>) -> Result<ModerationSnapshot
                     }
                     PREFIX_BANNED_EVENT => {
                         snap.banned_events.insert(id, decode_reason(value));
+                    }
+                    PREFIX_ALLOWED_EVENT => {
+                        snap.allowed_events.insert(id, decode_reason(value));
                     }
                     PREFIX_REPORTED_EVENT => {
                         snap.reported_events.insert(id, decode_reason(value));
@@ -466,6 +478,11 @@ pub fn load_moderation_snapshot_ro(txn: &RoTxn<'_>) -> Result<ModerationSnapshot
                     return false;
                 }
             },
+            PREFIX_ALLOWED_KIND => {
+                if let Ok(kind) = <[u8; 2]>::try_from(payload) {
+                    snap.allowed_kinds.insert(u16::from_be_bytes(kind).into());
+                }
+            }
             PREFIX_KIND_POLICY if payload.is_empty() => {
                 let bits: Result<[u8; KIND_POLICY_BYTES], _> = value.try_into();
                 match bits {
@@ -488,6 +505,7 @@ pub fn load_moderation_snapshot_ro(txn: &RoTxn<'_>) -> Result<ModerationSnapshot
 
 // --- Mutations (RwTxn only) ---
 
+/// NIP-86 `banpubkey`: ban the pubkey and remove it from the allow list.
 pub fn ban_pubkey(txn: &mut RwTxn<'_>, pubkey: &[u8; 32], reason: &str) -> Result<(), DbError> {
     validate_reason(reason)?;
     put_record(
@@ -496,13 +514,15 @@ pub fn ban_pubkey(txn: &mut RwTxn<'_>, pubkey: &[u8; 32], reason: &str) -> Resul
         pubkey,
         reason.as_bytes(),
         MAX_MODERATION_RECORDS,
-    )
+    )?;
+    clear_record(txn, PREFIX_ALLOWED_PUBKEY, pubkey)
 }
 
 pub fn unban_pubkey(txn: &mut RwTxn<'_>, pubkey: &[u8; 32]) -> Result<(), DbError> {
     clear_record(txn, PREFIX_BANNED_PUBKEY, pubkey)
 }
 
+/// NIP-86 `allowpubkey`: allow the pubkey and remove it from the ban list.
 pub fn allow_pubkey(txn: &mut RwTxn<'_>, pubkey: &[u8; 32], reason: &str) -> Result<(), DbError> {
     validate_reason(reason)?;
     put_record(
@@ -511,13 +531,15 @@ pub fn allow_pubkey(txn: &mut RwTxn<'_>, pubkey: &[u8; 32], reason: &str) -> Res
         pubkey,
         reason.as_bytes(),
         MAX_MODERATION_RECORDS,
-    )
+    )?;
+    clear_record(txn, PREFIX_BANNED_PUBKEY, pubkey)
 }
 
 pub fn unallow_pubkey(txn: &mut RwTxn<'_>, pubkey: &[u8; 32]) -> Result<(), DbError> {
     clear_record(txn, PREFIX_ALLOWED_PUBKEY, pubkey)
 }
 
+/// NIP-86 `banevent`: ban the event and remove it from the allow list.
 pub fn ban_event(txn: &mut RwTxn<'_>, id: &[u8; 32], reason: &str) -> Result<(), DbError> {
     validate_reason(reason)?;
     put_record(
@@ -527,14 +549,35 @@ pub fn ban_event(txn: &mut RwTxn<'_>, id: &[u8; 32], reason: &str) -> Result<(),
         reason.as_bytes(),
         MAX_MODERATION_RECORDS,
     )?;
+    clear_record(txn, PREFIX_ALLOWED_EVENT, id)?;
     // A banned event no longer needs moderation.
     clear_record(txn, PREFIX_REPORTED_EVENT, id)
 }
 
-/// NIP-86 `allowevent`: lift a ban and clear any moderation queue entry.
-pub fn allow_event(txn: &mut RwTxn<'_>, id: &[u8; 32]) -> Result<(), DbError> {
+/// NIP-86 `unbanevent`: lift a ban without allowing the event.
+pub fn unban_event(txn: &mut RwTxn<'_>, id: &[u8; 32]) -> Result<(), DbError> {
+    clear_record(txn, PREFIX_BANNED_EVENT, id)
+}
+
+/// NIP-86 `allowevent`: allow the event, lift any ban, and clear any
+/// moderation queue entry.
+pub fn allow_event(txn: &mut RwTxn<'_>, id: &[u8; 32], reason: &str) -> Result<(), DbError> {
+    validate_reason(reason)?;
+    put_record(
+        txn,
+        PREFIX_ALLOWED_EVENT,
+        id,
+        reason.as_bytes(),
+        MAX_MODERATION_RECORDS,
+    )?;
     clear_record(txn, PREFIX_BANNED_EVENT, id)?;
     clear_record(txn, PREFIX_REPORTED_EVENT, id)
+}
+
+/// NIP-86 `unallowevent`: remove the event from the allow list without
+/// banning it.
+pub fn unallow_event(txn: &mut RwTxn<'_>, id: &[u8; 32]) -> Result<(), DbError> {
+    clear_record(txn, PREFIX_ALLOWED_EVENT, id)
 }
 
 fn store_kind_policy(txn: &mut RwTxn<'_>, policy: &KindPolicy) -> Result<(), DbError> {
@@ -548,12 +591,20 @@ fn store_kind_policy(txn: &mut RwTxn<'_>, policy: &KindPolicy) -> Result<(), DbE
     Ok(())
 }
 
-/// NIP-86 `allowkind`. A no-op when no policy exists (every kind is already
-/// allowed); otherwise sets the kind's bit in the stored map.
+/// NIP-86 `allowkind`: put the kind on the allow list and set its bit in the
+/// stored map. With no stored policy every kind is already allowed, so only
+/// the allow-list record changes.
 pub fn allow_kind(txn: &mut RwTxn<'_>, kind: u64) -> Result<(), DbError> {
     if kind > u16::MAX as u64 {
         return Err(DbError::msg("kind must be between 0 and 65535"));
     }
+    put_record(
+        txn,
+        PREFIX_ALLOWED_KIND,
+        &(kind as u16).to_be_bytes(),
+        &[],
+        KIND_COUNT,
+    )?;
     let Some(mut policy) = kind_policy_ro(txn)? else {
         return Ok(());
     };
@@ -561,13 +612,20 @@ pub fn allow_kind(txn: &mut RwTxn<'_>, kind: u64) -> Result<(), DbError> {
     store_kind_policy(txn, &policy)
 }
 
-/// NIP-86 `disallowkind`. With no stored policy this materializes the
-/// allow-all map and clears the kind's bit, so one exclusion does not
-/// enumerate 65,535 config entries. The all-zero map (no kinds allowed) is
-/// representable and intentional.
+/// NIP-86 `disallowkind`: clear the kind's bit and remove it from the allow
+/// list. With no stored policy this materializes the allow-all map first, so
+/// one exclusion does not enumerate 65,535 config entries. The all-zero map
+/// (no kinds allowed) is representable and intentional.
 pub fn disallow_kind(txn: &mut RwTxn<'_>, kind: u64) -> Result<(), DbError> {
     if kind > u16::MAX as u64 {
         return Err(DbError::msg("kind must be between 0 and 65535"));
+    }
+    if let Some(dbi) = txn.env().dbis().moderation {
+        txn.del(
+            dbi,
+            &prefixed(PREFIX_ALLOWED_KIND, &(kind as u16).to_be_bytes()),
+            None,
+        )?;
     }
     let mut policy = kind_policy_ro(txn)?.unwrap_or_else(KindPolicy::allow_all);
     policy.set_allowed(kind, false);
@@ -727,6 +785,10 @@ pub fn list_allowed_pubkeys_ro(txn: &RoTxn<'_>) -> Result<Vec<([u8; 32], String)
 
 pub fn list_banned_events_ro(txn: &RoTxn<'_>) -> Result<Vec<([u8; 32], String)>, DbError> {
     list_binary_records(txn, PREFIX_BANNED_EVENT)
+}
+
+pub fn list_allowed_events_ro(txn: &RoTxn<'_>) -> Result<Vec<([u8; 32], String)>, DbError> {
+    list_binary_records(txn, PREFIX_ALLOWED_EVENT)
 }
 
 pub fn list_reported_events_ro(txn: &RoTxn<'_>) -> Result<Vec<([u8; 32], String)>, DbError> {
@@ -1042,8 +1104,118 @@ mod tests {
         txn.commit().unwrap();
         let txn = env.begin_ro().unwrap();
         let policy = kind_policy_ro(&txn).unwrap().unwrap();
-        assert!(policy.allowed_kinds().is_empty());
+        assert_eq!(policy.disallowed_kinds().len(), KIND_COUNT);
         assert!(is_event_moderated_ro(&txn, kind2.view()).unwrap());
+    }
+
+    #[test]
+    fn bans_and_allows_replace_each_other() {
+        let (_dir, env) = test_env();
+        let pk = [1u8; 32];
+        let id = [2u8; 32];
+        let snapshot = |env: &Env| {
+            let txn = env.begin_ro().unwrap();
+            load_moderation_snapshot_ro(&txn).unwrap()
+        };
+
+        // NIP-86: banning removes from the allow list, and allowing from the
+        // ban list.
+        let mut txn = env.begin_rw().unwrap();
+        allow_pubkey(&mut txn, &pk, "member").unwrap();
+        ban_pubkey(&mut txn, &pk, "spam").unwrap();
+        allow_event(&mut txn, &id, "fine").unwrap();
+        ban_event(&mut txn, &id, "illegal").unwrap();
+        txn.commit().unwrap();
+        let snap = snapshot(&env);
+        assert_eq!(
+            snap.banned_pubkeys.get(&pk).map(String::as_str),
+            Some("spam")
+        );
+        assert!(!snap.allowed_pubkeys.contains_key(&pk));
+        assert_eq!(
+            snap.banned_events.get(&id).map(String::as_str),
+            Some("illegal")
+        );
+        assert!(!snap.allowed_events.contains_key(&id));
+
+        let mut txn = env.begin_rw().unwrap();
+        allow_pubkey(&mut txn, &pk, "appealed").unwrap();
+        let mut remaining = MAX_MODERATION_RECORDS;
+        assert!(report_event(&mut txn, &id, "reported", &mut remaining).unwrap());
+        allow_event(&mut txn, &id, "reviewed").unwrap();
+        txn.commit().unwrap();
+        let snap = snapshot(&env);
+        assert!(!snap.banned_pubkeys.contains_key(&pk));
+        assert_eq!(
+            snap.allowed_pubkeys.get(&pk).map(String::as_str),
+            Some("appealed")
+        );
+        assert!(!snap.banned_events.contains_key(&id));
+        assert!(!snap.reported_events.contains_key(&id));
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(
+            list_allowed_events_ro(&txn).unwrap(),
+            vec![(id, "reviewed".to_string())]
+        );
+        drop(txn);
+
+        // Lifting one list never adds to the other.
+        let mut txn = env.begin_rw().unwrap();
+        unallow_event(&mut txn, &id).unwrap();
+        unallow_pubkey(&mut txn, &pk).unwrap();
+        txn.commit().unwrap();
+        let snap = snapshot(&env);
+        assert!(snap.allowed_events.is_empty() && snap.banned_events.is_empty());
+        assert!(snap.allowed_pubkeys.is_empty() && snap.banned_pubkeys.is_empty());
+        let mut txn = env.begin_rw().unwrap();
+        ban_event(&mut txn, &id, "").unwrap();
+        ban_pubkey(&mut txn, &pk, "").unwrap();
+        unban_event(&mut txn, &id).unwrap();
+        unban_pubkey(&mut txn, &pk).unwrap();
+        txn.commit().unwrap();
+        let snap = snapshot(&env);
+        assert!(snap.allowed_events.is_empty() && snap.banned_events.is_empty());
+        assert!(snap.allowed_pubkeys.is_empty() && snap.banned_pubkeys.is_empty());
+    }
+
+    #[test]
+    fn allowed_kinds_list_only_named_kinds() {
+        let (_dir, env) = test_env();
+        let snapshot = |env: &Env| {
+            let txn = env.begin_ro().unwrap();
+            load_moderation_snapshot_ro(&txn).unwrap()
+        };
+
+        // allowkind with no policy records the kind without restricting any.
+        let mut txn = env.begin_rw().unwrap();
+        allow_kind(&mut txn, 1).unwrap();
+        allow_kind(&mut txn, 30023).unwrap();
+        txn.commit().unwrap();
+        let snap = snapshot(&env);
+        assert!(snap.kind_policy.is_none());
+        assert!(snap.kind_allowed(7));
+        assert_eq!(snap.allowed_kinds, BTreeSet::from([1, 30023]));
+
+        // disallowkind takes the kind off the allow list.
+        let mut txn = env.begin_rw().unwrap();
+        disallow_kind(&mut txn, 1).unwrap();
+        disallow_kind(&mut txn, 4).unwrap();
+        txn.commit().unwrap();
+        let snap = snapshot(&env);
+        assert!(!snap.kind_allowed(1));
+        assert_eq!(snap.allowed_kinds, BTreeSet::from([30023]));
+        assert_eq!(
+            snap.kind_policy.as_ref().unwrap().disallowed_kinds(),
+            vec![1, 4]
+        );
+
+        let mut txn = env.begin_rw().unwrap();
+        allow_kind(&mut txn, 4).unwrap();
+        txn.commit().unwrap();
+        let snap = snapshot(&env);
+        assert!(snap.kind_allowed(4));
+        assert_eq!(snap.allowed_kinds, BTreeSet::from([4, 30023]));
+        assert_eq!(snap.kind_policy.unwrap().disallowed_kinds(), vec![1]);
     }
 
     #[test]

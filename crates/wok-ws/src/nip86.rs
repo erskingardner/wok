@@ -32,14 +32,18 @@ const SUPPORTED_METHODS: &[&str] = &[
     "unassignrole",
     "listeventsneedingmoderation",
     "allowevent",
+    "unallowevent",
     "banevent",
+    "unbanevent",
     "listbannedevents",
+    "listallowedevents",
     "changerelayname",
     "changerelaydescription",
     "changerelayicon",
     "allowkind",
     "disallowkind",
     "listallowedkinds",
+    "listdisallowedkinds",
     "blockip",
     "unblockip",
     "listblockedips",
@@ -61,7 +65,22 @@ fn requires_admin(method: &str) -> bool {
             | "allowkind"
             | "disallowkind"
             | "listallowedkinds"
+            | "listdisallowedkinds"
     )
+}
+
+fn may_call(level: ManagementLevel, method: &str) -> bool {
+    level == ManagementLevel::Admin || !requires_admin(method)
+}
+
+/// NIP-86 returns the names of all *other* supported methods and lets them
+/// match the caller's permissions: a moderator sees only what it may call.
+fn supported_methods(level: ManagementLevel) -> Vec<&'static str> {
+    SUPPORTED_METHODS
+        .iter()
+        .copied()
+        .filter(|name| *name != "supportedmethods" && may_call(level, name))
+        .collect()
 }
 
 /// The signed `u` tag names the relay URL. Clients variously sign the ws(s)
@@ -185,17 +204,12 @@ async fn execute(
     if !SUPPORTED_METHODS.contains(&method) {
         return Err(format!("unsupported method {method:?}"));
     }
-    if requires_admin(method) && level != ManagementLevel::Admin {
+    if !may_call(level, method) {
         return Err(format!("method {method:?} requires the admin role"));
     }
 
     match method {
-        // The pinned spec returns the names of all *other* supported
-        // methods: the meta-method excludes itself.
-        "supportedmethods" => Ok(json!(SUPPORTED_METHODS
-            .iter()
-            .filter(|name| **name != "supportedmethods")
-            .collect::<Vec<_>>())),
+        "supportedmethods" => Ok(json!(supported_methods(level))),
         "banpubkey" => {
             let (pubkey, reason) = hex32_reason_params(params, "pubkey")?;
             manage(
@@ -249,12 +263,29 @@ async fn execute(
             )
             .await
         }
-        "allowevent" => {
+        "unbanevent" => {
             let (id, _) = hex32_reason_params(params, "event id")?;
-            manage(handle, ManagementCmd::AllowEvent { id }, reached_writer).await
+            manage(handle, ManagementCmd::UnbanEvent { id }, reached_writer).await
+        }
+        "allowevent" => {
+            let (id, reason) = hex32_reason_params(params, "event id")?;
+            manage(
+                handle,
+                ManagementCmd::AllowEvent { id, reason },
+                reached_writer,
+            )
+            .await
+        }
+        "unallowevent" => {
+            let (id, _) = hex32_reason_params(params, "event id")?;
+            manage(handle, ManagementCmd::UnallowEvent { id }, reached_writer).await
         }
         "listbannedevents" => Ok(list_hex_reasons(
             &handle.moderation.read().banned_events,
+            "id",
+        )),
+        "listallowedevents" => Ok(list_hex_reasons(
+            &handle.moderation.read().allowed_events,
             "id",
         )),
         "listeventsneedingmoderation" => Ok(list_hex_reasons(
@@ -328,12 +359,16 @@ async fn execute(
             let kind = kind_param(params)?;
             manage(handle, ManagementCmd::DisallowKind { kind }, reached_writer).await
         }
-        "listallowedkinds" => {
+        // Kinds are allowed unless disallowed. The allow list holds the
+        // kinds named by `allowkind`, not every kind that is allowed.
+        "listallowedkinds" => Ok(json!(handle.moderation.read().allowed_kinds)),
+        "listdisallowedkinds" => {
             let snap = handle.moderation.read();
-            let kinds = match &snap.kind_policy {
-                Some(policy) => policy.allowed_kinds(),
-                None => (0..=u16::MAX as u64).collect(),
-            };
+            let kinds = snap
+                .kind_policy
+                .as_ref()
+                .map(|policy| policy.disallowed_kinds())
+                .unwrap_or_default();
             Ok(json!(kinds))
         }
         _ => unreachable!("method checked against SUPPORTED_METHODS"),
@@ -506,20 +541,27 @@ mod tests {
         }
         assert!(requires_admin("changerelayname"));
         assert!(requires_admin("assignrole"));
+        assert!(requires_admin("listdisallowedkinds"));
         assert!(!requires_admin("banpubkey"));
+        assert!(!requires_admin("unbanevent"));
+        assert!(!requires_admin("listallowedevents"));
         assert!(!requires_admin("supportedmethods"));
     }
 
     #[test]
-    fn supportedmethods_excludes_itself_from_its_result() {
-        // Mirrors the execute() response construction.
-        let reported: Vec<&&str> = SUPPORTED_METHODS
+    fn supportedmethods_lists_what_the_caller_may_call() {
+        let admin = supported_methods(ManagementLevel::Admin);
+        assert!(!admin.contains(&"supportedmethods"));
+        assert_eq!(admin.len(), SUPPORTED_METHODS.len() - 1);
+        let moderator = supported_methods(ManagementLevel::Moderator);
+        assert!(!moderator.contains(&"supportedmethods"));
+        assert!(moderator.contains(&"banpubkey"));
+        assert!(moderator.contains(&"unallowevent"));
+        assert!(!moderator.contains(&"changerelayname"));
+        assert!(!moderator.contains(&"listallowedkinds"));
+        assert!(moderator
             .iter()
-            .filter(|name| **name != "supportedmethods")
-            .collect();
-        assert!(!reported.contains(&&"supportedmethods"));
-        assert_eq!(reported.len(), SUPPORTED_METHODS.len() - 1);
-        assert!(reported.contains(&&"banpubkey"));
+            .all(|method| may_call(ManagementLevel::Moderator, method)));
     }
 
     #[test]

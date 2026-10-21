@@ -40,7 +40,9 @@ host, bind to an explicitly firewalled private address. Set
 `relay.real_ip_header` only when every direct connection is from a trusted
 proxy that overwrites that header. Configure `relay.auth.service_url` and
 `admin.public_url` with the exact external HTTPS origins before enabling those
-features.
+features. Wok serves the relay only at `/`, NIP-01's single endpoint, so a
+proxy that publishes it under a path prefix must strip the prefix before
+forwarding.
 
 Validate and start the service:
 

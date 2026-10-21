@@ -211,6 +211,7 @@ impl AsyncWrite for GatedStream {
     }
 }
 
+/// Note `n` is dated `n` seconds ago, so a history returns them in order.
 fn signed_note(n: usize) -> serde_json::Value {
     use secp256k1::{Keypair, SECP256K1};
     let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
@@ -219,7 +220,8 @@ fn signed_note(n: usize) -> serde_json::Value {
         "created_at": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs(),
+            .as_secs()
+            - n as u64,
         "kind": 1,
         "tags": [],
         "content": format!("history burst note {n}"),
@@ -289,16 +291,17 @@ async fn queued_frames_are_coalesced_into_few_writes() {
         waker.wake();
     }
     let mut bytes = 0;
-    let mut last_created = u64::MAX;
-    for _ in 0..EVENTS {
+    for n in 0..EVENTS {
         let (len, text) = client.frame().await;
         bytes += len;
         let msg: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(msg[0], "EVENT");
         assert_eq!(msg[1], "h");
-        let created = msg[2]["created_at"].as_u64().unwrap();
-        assert!(created <= last_created, "out of order");
-        last_created = created;
+        assert_eq!(
+            msg[2]["content"],
+            format!("history burst note {n}"),
+            "frames out of order"
+        );
     }
     assert_eq!(client.frame().await.1, "[\"EOSE\",\"h\"]");
     let writes = flushes.load(Ordering::SeqCst) - before;

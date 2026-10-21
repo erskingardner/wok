@@ -211,17 +211,15 @@ impl AsyncWrite for GatedStream {
     }
 }
 
-/// Note `n` is dated `n` seconds ago, so a history returns them in order.
-fn signed_note(n: usize) -> serde_json::Value {
+/// Note `n` is dated `n` seconds before `now`, so a history returns them in
+/// order. One `now` for every note: reading the clock per note could give two
+/// neighbours the same second.
+fn signed_note(n: usize, now: u64) -> serde_json::Value {
     use secp256k1::{Keypair, SECP256K1};
     let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
     let mut event = serde_json::json!({
         "pubkey": hex::encode(kp.x_only_public_key().0.serialize()),
-        "created_at": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - n as u64,
+        "created_at": now - n as u64,
         "kind": 1,
         "tags": [],
         "content": format!("history burst note {n}"),
@@ -242,12 +240,16 @@ async fn queued_frames_are_coalesced_into_few_writes() {
     let (tx, mut acks) = tokio::sync::mpsc::unbounded_channel();
     let publisher = handle.next_conn_id();
     handle.register(publisher, Outbound::new(tx, 0)).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     for n in 0..EVENTS {
         handle
             .client_message(
                 publisher,
                 TransportSource::Unix,
-                serde_json::json!(["EVENT", signed_note(n)]).to_string(),
+                serde_json::json!(["EVENT", signed_note(n, now)]).to_string(),
             )
             .await;
     }

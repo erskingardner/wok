@@ -109,9 +109,11 @@ async fn ws_publish_and_subscribe() {
         msgs.iter().any(|t| t.contains("e2e-ws")),
         "expected historical EVENT, got {msgs:?}"
     );
-    assert!(
-        msgs.iter().any(|t| t.contains("EOSE")),
-        "expected EOSE, got {msgs:?}"
+    // NIP-67: the one stored match was sent.
+    assert_eq!(
+        msgs.last().map(String::as_str),
+        Some(r#"["EOSE","s1",["finish"]]"#),
+        "{msgs:?}"
     );
 
     ws.send(Message::Text(
@@ -891,6 +893,8 @@ async fn unix_publish_and_subscribe() {
                 got_event = true;
             }
             if t.contains("EOSE") {
+                // NIP-67: the one stored match was sent.
+                assert_eq!(t, r#"["EOSE","u1",["finish"]]"#);
                 got_eose = true;
                 break;
             }
@@ -1049,7 +1053,7 @@ async fn nip11_http_document() {
         .any(|n| n == 1));
     assert_eq!(
         client["supported_nips"],
-        json!([1, 9, 11, 13, 40, 45, 50, 62, 70, 77, 91])
+        json!([1, 9, 11, 13, 40, 45, 50, 62, 67, 70, 77, 91])
     );
     assert_eq!(client["limitation"]["max_event_tags"], 2000);
     assert_eq!(client["limitation"]["max_message_length"], 2_097_152);

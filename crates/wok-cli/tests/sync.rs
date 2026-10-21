@@ -327,7 +327,11 @@ async fn all_users_gift_wraps_transfer_then_require_the_correct_nip42_identity()
         ))
         .await
         .unwrap();
-        assert_eq!(recv(&mut ws).await, json!(["EOSE", "broad"]));
+        // The gift wraps are hidden until the connection authenticates.
+        assert_eq!(
+            recv(&mut ws).await,
+            json!(["EOSE", "broad", ["auth", "finish"]])
+        );
         ws.send(Message::Text(
             json!(["REQ","private",{"kinds":[1059]}]).to_string().into(),
         ))
@@ -470,7 +474,9 @@ async fn subscribe(ws: &mut Client, sub: &str, filter: Value) {
     ))
     .await
     .unwrap();
-    assert_eq!(recv(ws).await, json!(["EOSE", sub]));
+    let eose = recv(ws).await;
+    // Whatever NIP-67 hints follow.
+    assert!(eose[0] == "EOSE" && eose[1] == sub, "{eose}");
 }
 
 /// A peer that offers `events` over NIP-77 and answers every REQ with them,

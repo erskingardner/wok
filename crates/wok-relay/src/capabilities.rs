@@ -105,6 +105,11 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
         enabled_when: CapabilityCondition::Nip62Enabled,
     },
     RelayCapability {
+        nip: 67,
+        name: "EOSE completeness hint",
+        enabled_when: CapabilityCondition::Always,
+    },
+    RelayCapability {
         nip: 70,
         name: "Protected events",
         enabled_when: CapabilityCondition::Always,
@@ -157,19 +162,22 @@ mod tests {
         let mut cfg = Config::default();
         assert_eq!(
             supported_nips(&cfg),
-            vec![1, 9, 11, 40, 45, 50, 62, 70, 77, 91]
+            vec![1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91]
         );
 
         cfg.relay.auth.service_url = "wss://relay.example.com/".into();
         cfg.relay.max_filter_limit_count = 0;
         cfg.relay.negentropy_enabled = false;
         cfg.events.ephemeral_persistence = EphemeralPersistence::Ttl;
-        assert_eq!(supported_nips(&cfg), vec![1, 9, 11, 40, 42, 50, 62, 70, 91]);
+        assert_eq!(
+            supported_nips(&cfg),
+            vec![1, 9, 11, 40, 42, 50, 62, 67, 70, 91]
+        );
 
         cfg.relay.abuse.min_pow_difficulty = 20;
         assert_eq!(
             supported_nips(&cfg),
-            vec![1, 9, 11, 13, 40, 42, 50, 62, 70, 91]
+            vec![1, 9, 11, 13, 40, 42, 50, 62, 67, 70, 91]
         );
 
         cfg.relay.max_and_entries = 0;

@@ -2,6 +2,7 @@
 
 | File | Role |
 | --- | --- |
+| `completeness.rs` | NIP-67 completeness of finished REQ scans, including peeks past cuts |
 | `filter_prop.rs` | Filter compile/match properties |
 | `scan_kinds.rs` | Kind-index scan behavior |
 | `search.rs` | NIP-50 ranked search against the LMDB term index |

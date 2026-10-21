@@ -16,7 +16,7 @@ use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
 use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
 use crate::plugin::{PluginEventSifter, PluginResult};
-use crate::protocol::{has_reason_prefix, ClientCommand, ParseFailure, RelayMessage};
+use crate::protocol::{has_reason_prefix, ClientCommand, EoseHints, ParseFailure, RelayMessage};
 use crate::restrict::ReadRestrictor;
 use crate::source::TransportSource;
 use crate::supported_nips;
@@ -721,13 +721,14 @@ enum MonitorMsg {
         generation: u64,
     },
     /// The req worker sent this generation's history, up to the snapshot
-    /// `snapshot`. The monitor sends EOSE and what it held back, then
-    /// delivers live.
+    /// `snapshot`. The monitor sends EOSE, with the history's NIP-67 `hints`,
+    /// and what it held back, then delivers live.
     HistoryDone {
         conn_id: u64,
         sub_id: SubId,
         generation: u64,
         snapshot: u64,
+        hints: EoseHints,
     },
     SetAuth {
         conn_id: u64,
@@ -2745,6 +2746,13 @@ fn ingest_req(
         return;
     };
     sub.latest_event_id = snapshot;
+    // NIP-67 lets EOSE say that authenticating may reveal more, but only once
+    // a challenge was sent. The connection normally got one on connect; one
+    // that connected while AUTH was unusable gets it now, ahead of the EOSE.
+    if cfg.auth_usable() && restrictor(cfg).may_hide_matches(&sub.filter_group) {
+        issue_challenge(conns, metrics, auth, conn_id);
+        sub.auth_challenged = true;
+    }
     // From here on only this generation's frames reach the client for the id.
     conns.open_sub(conn_id, Ns::Req, &sub.sub_id, sub.generation);
     dispatch.subscription(MonitorMsg::Register(sub.clone()), ReqMsg::Scan(sub));
@@ -3307,6 +3315,7 @@ fn run_req_worker(
         initial_cfg.relay.max_filter_limit_count.saturating_add(1),
     );
     drop(initial_cfg);
+    queries.set_completeness(true);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut decomp = Decompressor::new();
     let mut pass = Vec::with_capacity(REQ_PASS_MAX);
@@ -3503,7 +3512,7 @@ impl ReqWorker<'_> {
                     }
                 }
             },
-            |sub, total, hll, dedup_limited| {
+            |sub, total, hll, dedup_limited, completeness| {
                 completed = Some(Completed {
                     conn_id: sub.conn_id,
                     sub_id: sub.sub_id.clone(),
@@ -3513,6 +3522,18 @@ impl ReqWorker<'_> {
                     total,
                     hll,
                     dedup_limited,
+                    hints: EoseHints {
+                        // Authenticating, which a challenge sent before this
+                        // EOSE allows, may reveal what the rule hid. Once the
+                        // connection has authenticated it hides events of
+                        // other pubkeys, as a refusal says `restricted:`.
+                        auth: completeness.restricted
+                            && sub.auth_challenged
+                            && cfg.auth_usable()
+                            && authed.get(&sub.conn_id).is_none_or(Vec::is_empty),
+                        finish: completeness.finish,
+                        more: completeness.more,
+                    },
                 });
             },
         );
@@ -3574,6 +3595,7 @@ impl ReqWorker<'_> {
                 sub_id: done.sub_id,
                 generation: done.generation,
                 snapshot: done.snapshot,
+                hints: done.hints,
             });
         }
     }
@@ -3590,6 +3612,8 @@ struct Completed {
     total: u64,
     hll: Option<String>,
     dedup_limited: bool,
+    /// NIP-67 hints for a REQ's EOSE.
+    hints: EoseHints,
 }
 
 /// Matches a req monitor sends live: connection, subscription and the
@@ -3829,6 +3853,7 @@ fn run_req_monitor(
                     sub_id,
                     generation,
                     snapshot,
+                    hints,
                 } => {
                     // Closed or replaced since: its history was for nothing.
                     if monitors.pending_generation(conn_id, &sub_id) != Some(generation) {
@@ -3850,8 +3875,10 @@ fn run_req_monitor(
                         .unwrap();
                     // NIP-01: EOSE ends stored events; what arrived while the
                     // history was sent is "newly received" and follows it.
+                    // The hints are about the history, up to its snapshot.
                     let eose = RelayMessage::Eose {
                         sub_id: sub_id.to_string(),
+                        hints,
                     };
                     conns.send_sub(conn_id, &sub_id, generation, eose, &metrics);
                     let visibility = read_visibility(&cfg_snap, identities(&authed, conn_id));
@@ -5871,6 +5898,7 @@ mod tests {
                 sub_id: SubId::new("all").unwrap(),
                 generation: 1,
                 snapshot: 0,
+                hints: EoseHints::default(),
             });
             let eose = Self::next(&mut harness.observer);
             assert_eq!(eose[0], "EOSE", "{eose}");
@@ -6041,6 +6069,7 @@ mod tests {
                 sub_id: SubId::new("x").unwrap(),
                 generation,
                 snapshot,
+                hints: EoseHints::default(),
             })
         }
     }
@@ -6215,6 +6244,7 @@ mod tests {
             sub_id: SubId::new("x").unwrap(),
             generation: 1,
             snapshot,
+            hints: EoseHints::default(),
         });
         let eose = MonitorHarness::next(&mut h.subject);
         assert_eq!(
@@ -6522,7 +6552,10 @@ mod tests {
         relay
             .conns
             .send_event(2, &x, first.generation, "{\"a\":2}", &metrics);
-        let eose = RelayMessage::Eose { sub_id: "x".into() };
+        let eose = RelayMessage::Eose {
+            sub_id: "x".into(),
+            hints: EoseHints::default(),
+        };
         relay
             .conns
             .send_sub(2, &x, first.generation, eose, &metrics);
@@ -6988,6 +7021,7 @@ mod tests {
             sub_id: all,
             generation: 1,
             snapshot: 0,
+            hints: EoseHints::default(),
         })
         .unwrap();
         assert_eq!(MonitorHarness::next(&mut observer)[0], "EOSE");

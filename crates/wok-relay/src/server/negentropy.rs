@@ -448,7 +448,7 @@ pub(super) fn run_negentropy(
                     failed.push(key);
                 }
             },
-            |sub, total, _, _| done.push((sub.clone(), total)),
+            |sub, total, _, _, _| done.push((sub.clone(), total)),
         );
         if scan.is_err() {
             for (conn, sid) in sessions.keys() {

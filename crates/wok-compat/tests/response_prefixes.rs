@@ -168,7 +168,7 @@ async fn auth_required_only_while_authenticating_can_help() {
     assert_eq!(recv(&mut rx).await[2], true);
 
     send(&conn, json!(["REQ", "dm", {"kinds":[4]}])).await;
-    assert_eq!(recv(&mut rx).await, json!(["EOSE", "dm"]));
+    assert_eq!(recv(&mut rx).await, json!(["EOSE", "dm", ["finish"]]));
 
     send(&conn, json!(["COUNT", "count", {"kinds":[4]}])).await;
     assert_reply(&recv(&mut rx).await, "CLOSED", "count", "restricted: ");
@@ -206,7 +206,10 @@ async fn auth_challenge_is_sent_on_connect() {
         json!(["REQ", "nip46", {"kinds":[24133],"#p":[client_pk]}]),
     )
     .await;
-    assert_eq!(recv(&mut client_rx).await, json!(["EOSE", "nip46"]));
+    assert_eq!(
+        recv(&mut client_rx).await,
+        json!(["EOSE", "nip46", ["finish"]])
+    );
 
     let (bunker, mut bunker_rx) = relay.connection().await;
     assert_eq!(recv(&mut bunker_rx).await[0], "AUTH");

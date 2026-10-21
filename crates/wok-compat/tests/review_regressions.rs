@@ -117,7 +117,8 @@ async fn review_default_negentropy_tree_respects_read_privacy() {
     publish(&conn, &mut rx, &event).await;
     conn.client_message(json!(["REQ", "ordinary", {}]).to_string())
         .await;
-    assert_eq!(recv(&mut rx).await, json!(["EOSE", "ordinary"]));
+    // The kind 4 is hidden, but this relay offers no AUTH to reveal it.
+    assert_eq!(recv(&mut rx).await, json!(["EOSE", "ordinary", ["finish"]]));
     // A semantically equivalent filter with a time bound uses the same tree.
     let ids = reconcile(&conn, &mut rx, json!({})).await;
     conn.close().await;
@@ -293,7 +294,9 @@ async fn review_count_and_req_use_the_same_recipient_policy() {
     let filter = json!({"kinds":[4],"#p":[pk]});
     conn.client_message(json!(["REQ", "read", filter]).to_string())
         .await;
-    assert_eq!(recv(&mut rx).await, json!(["EOSE", "read"]));
+    // Its first recipient is another pubkey, which this authenticated
+    // connection is not: no `auth` hint.
+    assert_eq!(recv(&mut rx).await, json!(["EOSE", "read", ["finish"]]));
     conn.client_message(json!(["COUNT", "count", filter]).to_string())
         .await;
     let reply = recv(&mut rx).await;
@@ -484,7 +487,7 @@ async fn author_reads_own_restricted_event_without_p_tag() {
 
     conn.client_message(json!(["REQ","live",{"kinds":[30078]}]).to_string())
         .await;
-    assert_eq!(recv(&mut rx).await, json!(["EOSE", "live"]));
+    assert_eq!(recv(&mut rx).await, json!(["EOSE", "live", ["finish"]]));
     let event = wok_compat::sign_event_with_key(
         json!({"created_at":now(),"kind":30078,"tags":[["d","app-settings"]],"content":"settings"}),
         &key,
@@ -514,7 +517,7 @@ async fn author_reads_own_restricted_event_without_p_tag() {
         let delivered = recv(&mut rx).await;
         assert_eq!(delivered[0], "EVENT", "{sub}: {delivered}");
         assert_eq!(delivered[2], event, "{sub}");
-        assert_eq!(recv(&mut rx).await, json!(["EOSE", sub]));
+        assert_eq!(recv(&mut rx).await, json!(["EOSE", sub, ["finish"]]));
     }
     conn.client_message(json!(["COUNT","count",{"kinds":[30078],"authors":[pk]}]).to_string())
         .await;

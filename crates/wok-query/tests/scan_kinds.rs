@@ -328,7 +328,7 @@ fn deep_author_kind_pages_are_complete_and_non_overlapping() {
                 &txn,
                 10_000,
                 |_, lev, _| scheduled.push(lev),
-                |_, total, _hll, _limited| completions.push(total),
+                |_, total, _hll, _limited, _| completions.push(total),
             )
             .unwrap();
     }
@@ -399,7 +399,7 @@ fn count_and_req_ids_are_separate_namespaces() {
                     &txn,
                     10_000,
                     |_, _, _| {},
-                    |sub, total, _, _| completed.push((sub.count_only, total)),
+                    |sub, total, _, _, _| completed.push((sub.count_only, total)),
                 )
                 .unwrap();
         }

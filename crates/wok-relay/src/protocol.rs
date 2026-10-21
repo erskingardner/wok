@@ -41,6 +41,7 @@ pub enum RelayMessage {
     },
     Eose {
         sub_id: String,
+        hints: EoseHints,
     },
     Ok {
         event_id: String,
@@ -72,6 +73,35 @@ pub enum RelayMessage {
         message: String,
         extra: Option<Value>,
     },
+}
+
+/// NIP-67 completeness hints, sent as EOSE's third element. A hint's presence
+/// is definitive, so each is set only when it holds; with none set, EOSE has
+/// its two NIP-01 elements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EoseHints {
+    /// Authenticating may make more stored events readable. A NIP-42
+    /// challenge was sent before this EOSE.
+    pub auth: bool,
+    /// Every stored event matching the filters that the connection may read
+    /// was sent.
+    pub finish: bool,
+    /// More stored events matching the filters, that the connection may
+    /// read, are held than were sent.
+    pub more: bool,
+}
+
+impl EoseHints {
+    fn names(self) -> Vec<&'static str> {
+        [
+            (self.auth, "auth"),
+            (self.finish, "finish"),
+            (self.more, "more"),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect()
+    }
 }
 
 /// How an inbound message failure maps to a reply, matching the catch sites
@@ -231,7 +261,14 @@ impl RelayMessage {
             Self::Event { sub_id, event_json } => {
                 format!("[\"EVENT\",\"{sub_id}\",{event_json}]")
             }
-            Self::Eose { sub_id } => encode(&("EOSE", sub_id)),
+            Self::Eose { sub_id, hints } => {
+                let names = hints.names();
+                if names.is_empty() {
+                    encode(&("EOSE", sub_id))
+                } else {
+                    encode(&("EOSE", sub_id, names))
+                }
+            }
             Self::Ok {
                 event_id,
                 accepted,
@@ -341,6 +378,26 @@ mod tests {
         }
         .to_json();
         assert_eq!(s, r#"["OK","ab",true,""]"#);
+    }
+
+    #[test]
+    fn eose_carries_nip67_hints_only_when_set() {
+        let eose = |hints| RelayMessage::Eose {
+            sub_id: "s".into(),
+            hints,
+        };
+        assert_eq!(eose(EoseHints::default()).to_json(), r#"["EOSE","s"]"#);
+        let finish = EoseHints {
+            finish: true,
+            ..EoseHints::default()
+        };
+        assert_eq!(eose(finish).to_json(), r#"["EOSE","s",["finish"]]"#);
+        let auth_more = EoseHints {
+            auth: true,
+            more: true,
+            ..EoseHints::default()
+        };
+        assert_eq!(eose(auth_more).to_json(), r#"["EOSE","s",["auth","more"]]"#);
     }
 
     #[test]

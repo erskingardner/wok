@@ -70,6 +70,9 @@ pub struct Subscription {
     /// Distinguishes successive REQs that reuse one subscription id, so a
     /// stage can ignore work left over from a replaced one.
     pub generation: u64,
+    /// The connection was sent a NIP-42 challenge before this REQ was
+    /// admitted, so its EOSE may carry NIP-67's `auth` hint.
+    pub auth_challenged: bool,
 }
 
 impl Subscription {
@@ -86,6 +89,7 @@ impl Subscription {
             count_only,
             latest_event_id: u64::MAX,
             generation: 0,
+            auth_challenged: false,
         }
     }
 }

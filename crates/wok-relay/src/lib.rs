@@ -20,7 +20,7 @@ pub use capabilities::{
 };
 pub use config::{Config, EphemeralPersistence, Preset, StrfryConfigTranslation};
 pub use moderation::{management_level, write_permitted, ManagementCmd, ManagementLevel, Role};
-pub use protocol::{ClientCommand, RelayMessage};
+pub use protocol::{ClientCommand, EoseHints, RelayMessage};
 pub use rlimit::apply_nofiles_limit;
 pub use server::{
     start, ConnectionGuard, HeldMessages, Outbound, OutboundFrame, RelayHandle,

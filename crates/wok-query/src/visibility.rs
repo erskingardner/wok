@@ -61,6 +61,18 @@ impl ReadRestrictor {
         kinds.iter().all(|k| self.restricted_kinds.contains(&k))
     }
 
+    /// Whether this rule can hide any event `fg` matches from a reader that
+    /// has not authenticated.
+    pub fn may_hide_matches(&self, fg: &NostrFilterGroup) -> bool {
+        self.restrict_to_involved
+            && !self.restricted_kinds.is_empty()
+            && fg.filters.iter().any(|f| {
+                f.kinds
+                    .as_ref()
+                    .is_none_or(|kinds| kinds.iter().any(|k| self.is_restricted_kind(k)))
+            })
+    }
+
     pub fn is_filter_group_fully_restricted(&self, fg: &NostrFilterGroup) -> bool {
         if self.restricted_kinds.is_empty() || fg.filters.is_empty() {
             return false;
@@ -161,6 +173,29 @@ impl ReadVisibility {
             return Ok(false);
         }
         self.globally_visible(txn, event)
+    }
+
+    /// [`allows`](Self::allows), also setting `restricted` when the event is
+    /// hidden by the restricted-read rule alone, which authenticating as an
+    /// involved pubkey lifts. Moderation, vanish, expiry and replacement are
+    /// not: AUTH changes none of them. Once `restricted` is set, hidden
+    /// events cost no more than `allows`.
+    pub fn allows_noting_restricted(
+        &self,
+        txn: &wok_db::RoTxn<'_>,
+        event: PackedEventView<'_>,
+        restricted: &mut bool,
+    ) -> Result<bool, wok_db::DbError> {
+        if self
+            .restrictor
+            .should_send_to_identities(event, &self.identities)
+        {
+            return self.globally_visible(txn, event);
+        }
+        if !*restricted && self.globally_visible(txn, event)? {
+            *restricted = true;
+        }
+        Ok(false)
     }
 
     pub fn globally_visible(

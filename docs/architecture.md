@@ -112,8 +112,8 @@ history as well as live ones; a REQ reusing an open id always fits.
    events in full. They are held whether or not the connection may read them
    yet, since it may AUTH before EOSE.
 3. **History, on the req worker.** The worker scans up to the snapshot, then
-   posts `HistoryDone{generation, snapshot}` to the monitor and moves on. It
-   never waits for a reply. A REQ or COUNT it cannot start (a read failure,
+   posts `HistoryDone{generation, snapshot, hints}` to the monitor and moves
+   on. It never waits for a reply. A REQ or COUNT it cannot start (a read failure,
    `relay.abuse.max_concurrent_historical_queries`) or whose scan fails gets
    CLOSED through the gate.
    - Each pass, the worker takes what is queued for it, up to 64 messages,
@@ -129,9 +129,16 @@ history as well as live ones; a REQ reusing an open id always fits.
      come, each stretch of new work as long as the running queries' last
      slice, overrun by at most one first slice, is followed by a slice of
      theirs: about half the worker when the two take similar time.
+   - `hints` are NIP-67's (see [nips.md](nips.md)). The scan knows when a
+     filter ran out of matches. When a filter's `limit` or the request-wide
+     ceiling cut it, the scan resumes past the cut for one more readable
+     match, within a per-REQ bound, and checks at the end that it is still
+     unsent. Read-policy refusals note whether the restricted-read rule alone
+     hid a match. The worker adds `auth` only for an unauthenticated
+     connection whose REQ was admitted after a challenge.
 4. **Going live, on the req monitor.** For the current generation only, the
-   monitor sends EOSE, then the held matches in arrival order, then delivers
-   live. NIP-01 defines EOSE as the boundary to "events newly received in
+   monitor sends EOSE, with the history's hints, then the held matches in
+   arrival order, then delivers live. NIP-01 defines EOSE as the boundary to "events newly received in
    real-time", so everything held follows it, including stored events
    committed during the scan (strfry sends those first). Held events are
    checked against the read policy again before they are sent.

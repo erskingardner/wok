@@ -19,6 +19,7 @@ arbitrary list.
 | 50 | Search capability | transactional LMDB term/bigram index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs` | always |
 | 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, restricted kinds 1059 and 21059 with involved-pubkey enforcement, and `events.ephemeral_persistence = "live_only"` |
 | 62 | Request to Vanish | persistent maximum-timestamp markers, immediate query/rebroadcast suppression, gift-wrap recipient cleanup, and bounded physical deletion | `nip62_vanish.rs`, relay e2e | `relay.nip62.enabled` |
+| 67 | EOSE completeness hint | `wok-query` scan completeness and bounded peek, req worker, monitor EOSE | `nip_conformance.rs`, `completeness.rs`, `e2e_transports.rs` | always |
 | 70 | Protected events | `-` tag + AUTH | `nip_conformance.rs` | always |
 | 77 | Negentropy | `wok-negentropy` | protocol unit tests | `negentropy.enabled` |
 | 86 | Relay management API | `wok-ws` RPC + `wok-db` moderation tables + `wok-relay` enforcement | `e2e_transports.rs` | `admin.enabled` with operator pubkeys |
@@ -43,6 +44,32 @@ EOSE once its other filters have sent theirs, and stays open for new events.
 Stored events are sent newest first. Events with the same `created_at` are
 sent in local arrival order, not lowest id first as NIP-01 suggests; see
 [known differences](known-differences.md).
+
+EOSE carries NIP-67 hints about a REQ's stored events, those stored when it
+was admitted; later ones follow EOSE as live events. A hint is sent only when
+it holds, and EOSE has two elements when none does.
+- `finish`: every filter ran out of matches the connection may read. A filter
+  cut by its `limit` (or `relay.max_filter_limit`), or a REQ cut by
+  `relay.max_total_events_per_req`, counts when a peek past the cut finds no
+  match left unsent. Filters with an empty list count, as they match nothing.
+- `more`: a peek past a cut found a readable match that is still unsent when
+  the REQ ends (another filter may send it).
+- `auth`: the restricted-read rule (`relay.auth.restricted_read_kinds` with
+  `restrict_read_to_involved_pubkey`) hid a match from a connection that has
+  not authenticated, while AUTH is usable. The connection is sent its
+  challenge first: on connect, or at admission if AUTH became usable later.
+  Moderation, vanish, expiry and replacement never give `auth`, and neither
+  does a match hidden for another pubkey once the connection has
+  authenticated, which is why a refusal then says `restricted:`.
+- Neither `finish` nor `more` is sent when a peek runs out of its bound (per
+  REQ, about a hundred event reads and 64 read-policy checks), when AUTH or a
+  reload changed the read policy during the scan, or for a REQ with a
+  `limit: 0` filter unless another filter's peek proves `more`.
+
+NIP-67 also says a relay SHOULD include every event of the boundary
+`created_at` in one response. Wok does not, for the same reason as the tie
+order above; as `finish` is sent only when nothing is left, a `limit` that cuts
+a same-second run never gets it.
 
 NIP-01 replacement is enforced when reading, even if a lossless migration
 retained multiple versions. Kinds 0, 3 (contact lists), and 10000–19999 select

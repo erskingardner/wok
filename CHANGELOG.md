@@ -179,6 +179,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more. One filter still lists at most 2,047 authors. Files that pin 65536,
   as copies of the 0.7 `docs/wok.toml` do, keep the old cap, and `wok
   doctor` flags them.
+- `public`: result sizes, all advertised in NIP-11 `limitation`. Files that
+  pin the old values, as copies of the 0.7 `docs/wok.toml` do, keep them,
+  and `wok doctor` flags them.
+  - `relay.max_filter_limit` is `2000` (was 500), and so are `max_limit` and
+    `default_limit`. MDK's directory batches (`limit` 1,200) and outbox
+    metadata fetches without a `limit` are no longer cut at 500.
+  - `relay.max_total_events_per_req` is `10000` (was 2000), so a merged
+    batch of filters is no longer cut at 2,000 events in all.
+  - `relay.max_tags_per_filter` is `8` (was 3), so NIP-22 comment queries on
+    `#E`, `#K`, `#P` and `#k`, and other filters with four or more tag
+    letters, are accepted.
+  - `events.max_num_tags` is `5000` (was 2000), NIP-11 `max_event_tags`, so
+    heavy users' follow and mute lists are accepted.
 
 ### Changed
 

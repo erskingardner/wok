@@ -5000,6 +5000,116 @@ mod tests {
         handle.request_shutdown();
     }
 
+    /// A relay with default limits over `count` stored notes of each
+    /// `(kind, count)`, written straight to the database.
+    fn relay_with_notes(kinds: &[(u64, u64)]) -> (tempfile::TempDir, RelayHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut events: Vec<EventToWrite> = kinds
+            .iter()
+            .flat_map(|&(kind, count)| (0..count).map(move |i| (kind, i)))
+            .map(|(kind, i)| {
+                let mut id = [0xCCu8; 32];
+                id[..8].copy_from_slice(&kind.to_be_bytes());
+                id[8..16].copy_from_slice(&i.to_be_bytes());
+                let event = json!({
+                    "id": hex::encode(id), "pubkey": "11".repeat(32),
+                    "created_at": 1_700_000_000 + i, "kind": kind, "tags": [],
+                    "content": "note", "sig": "00".repeat(64),
+                });
+                let parsed = wok_event::parse_and_verify_event(
+                    &event,
+                    &wok_event::EventLimits::default(),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+                EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        let handle = start(env, cfg).unwrap();
+        (dir, handle)
+    }
+
+    /// The EVENTs a REQ sends before its EOSE.
+    async fn history_len(
+        handle: &RelayHandle,
+        conn: u64,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+        req: Value,
+    ) -> usize {
+        handle
+            .client_message(conn, local_source(), req.to_string())
+            .await;
+        let mut events = 0;
+        loop {
+            let frame = recv_outbound(rx).await;
+            if frame.starts_with(r#"["EVENT""#) {
+                events += 1;
+            } else {
+                assert!(frame.starts_with(r#"["EOSE""#), "{frame}");
+                return events;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_limits_return_directory_batches_and_merged_reqs_whole() {
+        let (_dir, handle) =
+            relay_with_notes(&[(1, 2_100), (6, 500), (7, 500), (16, 500), (1111, 500)]);
+        let (conn, mut rx) = live_conn(&handle).await;
+        // MDK's directory batch: 200 authors x 6 kinds. The 500 clamp cut it.
+        let batch = json!(["REQ", "dir", {"kinds": [1], "limit": 1_200}]);
+        assert_eq!(history_len(&handle, conn, &mut rx, batch).await, 1_200);
+        // A filter without a limit gets the same 2,000 clamp (#97 decision 9).
+        let unlimited = json!(["REQ", "all", {"kinds": [1]}]);
+        assert_eq!(history_len(&handle, conn, &mut rx, unlimited).await, 2_000);
+        // A merged batch whose filters each fit is no longer cut at 2,000 in
+        // all (audit C1).
+        let merged = json!(["REQ", "merged",
+            {"kinds": [1], "limit": 500}, {"kinds": [6]}, {"kinds": [7]},
+            {"kinds": [16]}, {"kinds": [1111]}]);
+        assert_eq!(history_len(&handle, conn, &mut rx, merged).await, 2_500);
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_limits_accept_long_lists_and_four_tag_letters() {
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        let (conn, mut rx) = live_conn(&handle).await;
+        // A heavy user's follow list (audit F9): 2,000 tags used to be the cap.
+        let follows: Vec<Value> = (0..4_000u32)
+            .map(|i| json!(["p", format!("{i:064x}")]))
+            .collect();
+        let contacts = sign_event(json!({
+            "created_at": now_secs(), "kind": 3, "tags": follows, "content": "",
+        }));
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", contacts]).to_string())
+            .await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["OK""#) && reply.contains("true"),
+            "{reply}"
+        );
+        // NIP-22 comments on an event of kind 1, by root and kind: four tag
+        // letters, where three used to be the cap.
+        let comments = json!(["REQ", "comments", {
+            "kinds": [1111], "#E": ["ab".repeat(32)], "#K": ["1"],
+            "#P": ["cd".repeat(32)], "#k": ["1"],
+        }]);
+        assert_eq!(history_len(&handle, conn, &mut rx, comments).await, 0);
+        handle.request_shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_reload_applies_the_count_dedup_budget() {
         // The REQ worker sized its COUNT dedup budget from the startup

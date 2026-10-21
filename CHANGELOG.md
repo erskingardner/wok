@@ -132,9 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- WebSocket connections cost less memory. permessage-deflate state (about
-  300 KiB per connection) is allocated by a connection's first message instead
-  of at upgrade, and released after 30–60 s without traffic.
+- WebSocket connections cost less memory and CPU. permessage-deflate state
+  (about 300 KiB per connection) is allocated by a connection's first message
+  instead of at upgrade, and released after 30–60 s without traffic. Outbound
+  compression uses level 1, as strfry does, instead of 6: well under half the
+  CPU for a few percent more bytes.
 - Events that arrive while a REQ's history is being sent now come after EOSE,
   as NIP-01's "newly received in real-time" events, and the stream before
   EOSE stays newest-first. Before, stored events committed during the scan came

@@ -71,6 +71,11 @@ pub enum WsEvent {
     Close(Vec<u8>),
 }
 
+/// Outbound compression level. Level 1 is what uWS uses for strfry. On Nostr
+/// events it costs well under half the CPU of zlib's default level 6, for a
+/// few percent more bytes.
+pub const DEFAULT_LEVEL: u32 = 1;
+
 /// The farthest back a client's compressor may refer: RFC 7692 windows are
 /// at most 2^15 bytes, and the server never asks for less.
 const WINDOW: usize = 1 << 15;
@@ -230,14 +235,20 @@ fn inflate_into(
 /// next message simply starts from an empty history.
 pub struct DeflateCtx {
     takeover: bool,
+    level: flate2::Compression,
     inner: Option<flate2::Compress>,
     used: bool,
 }
 
 impl DeflateCtx {
     pub fn new(takeover: bool) -> Self {
+        Self::with_level(takeover, DEFAULT_LEVEL)
+    }
+
+    pub fn with_level(takeover: bool, level: u32) -> Self {
         Self {
             takeover,
+            level: flate2::Compression::new(level),
             inner: None,
             used: false,
         }
@@ -253,9 +264,7 @@ impl DeflateCtx {
                 }
                 inner
             }
-            None => self
-                .inner
-                .insert(flate2::Compress::new(flate2::Compression::default(), false)),
+            None => self.inner.insert(flate2::Compress::new(self.level, false)),
         };
         let mut out = Vec::with_capacity(msg.len() / 2 + 64);
         let start_in = inner.total_in();

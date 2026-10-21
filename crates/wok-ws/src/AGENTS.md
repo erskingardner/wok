@@ -10,4 +10,4 @@
 
 `serve` / `serve_listener` are the public entry points. Connection admission uses the relay abuse budget for both WS upgrades and plain HTTP (including admin). `relay.realIpHeader` rewrites peer IP behind a reverse proxy.
 
-Deflate negotiation mirrors uWS as strfry configures it: respond `permessage-deflate`, echo `client_no_context_takeover`, sliding-window takeover from config. The sliding window governs only the relay's compressor; the inflater keeps context unless the client agreed to `client_no_context_takeover`.
+Deflate negotiation mirrors uWS as strfry configures it: respond `permessage-deflate`, echo `client_no_context_takeover`, sliding-window takeover from config. The sliding window governs only the relay's compressor; the inflater keeps context unless the client agreed to `client_no_context_takeover`. Compression level 1, as uWS uses.

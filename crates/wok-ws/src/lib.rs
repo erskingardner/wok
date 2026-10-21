@@ -309,10 +309,17 @@ async fn dispatch(
                 .unwrap_or_else(|_| empty(StatusCode::OK)),
         );
     }
-    if wants_nip11 {
-        return json_response(&nip11(&cfg, &handle));
-    }
-    html_response(&landing(&cfg, &handle.supported_nips()))
+    let mut response = if wants_nip11 {
+        json_response(&nip11(&cfg, &handle))
+    } else {
+        html_response(&landing(&cfg, &handle.supported_nips()))
+    };
+    // `/` serves two documents, so caches must key on Accept too.
+    response.headers_mut().insert(
+        hyper::header::VARY,
+        hyper::header::HeaderValue::from_static("Accept"),
+    );
+    response
 }
 
 /// Whether the `Accept` media-range list names `application/nostr+json` with

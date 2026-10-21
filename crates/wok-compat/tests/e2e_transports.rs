@@ -1189,6 +1189,10 @@ async fn nip11_and_nip86_accept_cors_requests() {
     assert!(nip11.starts_with("HTTP/1.1 200"), "{nip11}");
     assert!(nip11.contains("\"supported_nips\""), "{nip11}");
     assert_cors(&nip11);
+    assert!(
+        nip11.to_ascii_lowercase().contains("vary: accept"),
+        "{nip11}"
+    );
     let page = raw_http(
         addr,
         "GET / HTTP/1.1\r\nHost: localhost\r\nAccept: text/html,*/*;q=0.8\r\nConnection: close\r\n\r\n",
@@ -1196,6 +1200,7 @@ async fn nip11_and_nip86_accept_cors_requests() {
     .await;
     assert!(page.contains("<html"), "{page}");
     assert_cors(&page);
+    assert!(page.to_ascii_lowercase().contains("vary: accept"), "{page}");
 
     // NIP-86 replies carry the headers too, refusals included.
     let body = json!({"method": "supportedmethods", "params": []}).to_string();

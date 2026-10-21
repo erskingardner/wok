@@ -226,7 +226,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NIP-86 ban and allow lists replace each other, as NIP-86 asks:
   `banpubkey` and `banevent` take the pubkey or event off the allow list,
   and `allowpubkey` and `allowevent` lift its ban. A pubkey could be on both
-  lists, and the ban won.
+  lists, and the ban won. A pubkey that an earlier release left on both lists
+  stays there, with the ban still winning, until the next `banpubkey` or
+  `allowpubkey` for it; `unbanpubkey` alone leaves it allowlisted.
 - NIP-86 `supportedmethods` lists only the methods the caller may call, so
   moderators no longer see the admin-only ones.
 - NIP-86 `listallowedkinds` lists the kinds named by `allowkind` since their
@@ -248,7 +250,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NIP-11 is served whenever the `Accept` header lists
   `application/nostr+json`, for example
   `application/nostr+json, application/json;q=0.9`. Only that exact header
-  value was recognized, and anything else got the landing page.
+  value was recognized, and anything else got the landing page. Both
+  documents at `/` now send `Vary: Accept`, so caches keep them apart.
 - NIP-11 `software` is the homepage URL `https://github.com/erskingardner/wok`,
   as NIP-11 requires. It was the git remote
   `git+https://github.com/erskingardner/wok.git`.

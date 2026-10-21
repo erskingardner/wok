@@ -85,7 +85,9 @@ A pubkey or event is on at most one of its ban list and allow list:
 `banpubkey` / `banevent` remove it from the allow list, and `allowpubkey` /
 `allowevent` lift its ban. `unbanpubkey` / `unbanevent` and
 `unallowpubkey` / `unallowevent` remove it from one list without adding it
-to the other.
+to the other. Earlier releases could leave a pubkey on both lists; the ban
+wins until the next `banpubkey` or `allowpubkey` for it, and `unbanpubkey`
+alone leaves it allowlisted.
 
 `allowpubkey` only has an effect when `relay.auth.restrict_writes = true`:
 then writes are accepted only from allowlisted pubkeys, pubkeys holding any

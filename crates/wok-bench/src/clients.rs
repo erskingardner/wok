@@ -1037,6 +1037,8 @@ fn setting_for(reason: &str) -> &'static str {
         "relay.abuse.max_concurrent_historical_queries"
     } else if r.contains("too many concurrent reqs") {
         "relay.max_subs_per_connection"
+    } else if r.contains("connection's filters exceed") {
+        "relay.max_filter_bytes_per_connection"
     } else if r.contains("filters exceed") {
         "relay.max_req_filter_size"
     } else if r.contains("arr too big") {
@@ -2848,6 +2850,10 @@ fn effective_limits(cfg: &wok_relay::Config) -> BTreeMap<String, String> {
             "relay.max_req_filter_size",
             r.max_req_filter_size.to_string(),
         ),
+        (
+            "relay.max_filter_bytes_per_connection",
+            r.max_filter_bytes_per_connection.to_string(),
+        ),
         ("relay.max_filter_limit", r.max_filter_limit.to_string()),
         (
             "relay.max_total_events_per_req",
@@ -3630,6 +3636,10 @@ mod tests {
             (
                 "error: bad req: filters exceed N serialized bytes",
                 "relay.max_req_filter_size",
+            ),
+            (
+                "blocked: this connection's filters exceed N bytes",
+                "relay.max_filter_bytes_per_connection",
             ),
             (
                 "ERROR: too many concurrent REQs",

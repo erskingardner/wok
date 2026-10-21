@@ -209,7 +209,8 @@ interface or protect the path at the reverse proxy.
 | `relay.nofiles` | `524288` | Restart | Requested process file-descriptor limit. |
 | `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-IP budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. |
 | `relay.max_websocket_payload_size` | `2097152` | Restart | Maximum reassembled WebSocket payload bytes. |
-| `relay.max_req_filter_size` | `65536` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. |
+| `relay.max_req_filter_size` | `262144` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. See [Filter size](#filter-size). |
+| `relay.max_filter_bytes_per_connection` | `2097152` | Live | Yes | Maximum combined compact-JSON filter bytes of the REQ subscriptions open on one connection; zero is unlimited. See [Filter size](#filter-size). |
 | `relay.max_filters_per_req` | `200` | Live | Yes | Unconditional maximum filter objects in one REQ or COUNT. |
 | `relay.auto_ping_seconds` | `55` | Restart | WebSocket ping interval; zero disables automatic pings. A ping unanswered for a full interval closes the connection. |
 | `relay.enable_tcp_keepalive` | `false` | Restart | Enable TCP keepalive on accepted sockets. |
@@ -242,6 +243,39 @@ interface or protect the path at the reverse proxy.
 | `relay.sync_memory_per_connection` | `268435456` | Live | Yes | Bytes reserved for sync sessions on one connection (256 MiB); zero rejects new sessions. |
 | `relay.sync_memory_total` | `1073741824` | Live | Yes | Shared sync reservation ceiling across workers (1 GiB); zero rejects new sessions. |
 | `relay.sync_idle_timeout_secs` | `60` | Live | Yes | Maximum idle wait for the next sync message; active construction has no fixed lifetime. Zero expires sessions immediately. |
+
+### Filter size
+
+Two settings bound the filters a client sends, both in compact JSON bytes.
+`max_req_filter_size` bounds the filters of one REQ or COUNT.
+`max_filter_bytes_per_connection` bounds the filters of every REQ
+subscription open on one connection, because live filters stay in memory
+until they are closed.
+
+- **Filters per request** (`max_req_filter_size`, 256 KiB).
+  - If too low: outbox clients can't fetch a large follow list in one
+    request. At 64 KiB, the default through 0.7, a REQ naming about 970
+    authors or more was refused.
+  - If too high: more memory per subscription. The connection budget caps
+    the total.
+- **Filters per connection** (`max_filter_bytes_per_connection`, 2 MiB).
+  - If too low: clients that keep several subscriptions over a long follow
+    list open, such as a home feed and a profile feed, have new ones refused.
+  - If too high: one connection can hold more filter memory, up to
+    `max_subs_per_connection` times `max_req_filter_size` (50 MiB at the
+    defaults) with the budget off.
+
+A REQ that would take the connection over its budget is refused with
+`CLOSED` and `blocked: this connection's filters exceed <budget> bytes`.
+Closing a subscription frees its bytes. A REQ that reuses an open
+subscription ID is charged only for the difference, so after a reload lowers
+the budget, a subscription can still be replaced by filters no larger than
+its own. COUNT holds no live filter and is not charged.
+
+One filter also stops at 65,535 decoded bytes per value list, whatever these
+settings are: at most 2,047 `authors`, `ids`, `#e` or `#p` values. 256 KiB
+lets one filter reach that ceiling and leaves room for the other filters in
+the same REQ.
 
 ## Authentication and private reads
 

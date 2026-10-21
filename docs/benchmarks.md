@@ -301,8 +301,10 @@ The query shapes:
   kinds alone, and 100 ids.
 
 The relays run the harness's usual configuration, except that
-`relay.max_req_filter_size` is raised to 1 MiB. The default of 64 KiB refuses a
-REQ that names about 970 authors or more.
+`relay.max_req_filter_size` is raised to 1 MiB. The default is 256 KiB, which
+fits 2,000 authors; the 64 KiB default of Wok 0.7 and earlier, which a
+`--wok-baseline` build may have, refuses a REQ that names about 970 authors or
+more.
 
 Each shape and binary starts a relay on a fresh copy-on-write clone of the
 dataset database (`cp -c` on macOS, `cp --reflink=auto` elsewhere). The first
@@ -569,7 +571,11 @@ steady-phase deliveries per second. Compare two relay binaries with the same
 | `--live-churners` | 50 | Churning connections |
 | `--live-churn-rate` | 200 | REQs per second, all churners together |
 
-Feeds of 500 authors fit the default `relay.max_req_filter_size` of 64 KiB.
+Feeds of 500 authors fit the default `relay.max_req_filter_size` of 256 KiB.
+A connection's subscriptions must also fit
+`relay.max_filter_bytes_per_connection` (2 MiB), about 31,000 authors in all:
+ten feeds always do, but with `--live-subs-per-conn` near 100 and the default
+author range, raise it or some subscriptions are refused.
 CI runs small versions of both scenarios as unit tests (`live::tests`). The
 `live_subscriptions` test uses an in-process relay.
 

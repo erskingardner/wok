@@ -92,15 +92,18 @@ So, per id, no frame of a replaced or closed generation follows the change,
 and a CLOSED is the last frame of its generation, however the producers
 interleave. The subscription cap (`relay.max_subs_per_connection`) is the
 number of open REQ ids in the gate, which counts subscriptions still sending
-history as well as live ones; a REQ reusing an open id always fits.
+history as well as live ones; a REQ reusing an open id always fits. The gate
+also keeps each open id's serialized filter bytes, and their sum is what the
+connection's filter budget (`relay.max_filter_bytes_per_connection`) bounds;
+a REQ reusing an open id is charged only for the difference.
 
 ### Stages
 
 1. **Admission, on the ingester.** Before any worker sees the REQ, the ingester
-   checks parsing and filter limits, query cost, AUTH and the cap. A refusal is
-   `CLOSED`. NIP-01 makes a REQ replace the subscription it names, so a refused
-   one still ends it. An admitted REQ gets its generation and history snapshot,
-   and the gate opens for it.
+   checks parsing and filter limits, query cost, AUTH, the cap and the filter
+   budget. A refusal is `CLOSED`. NIP-01 makes a REQ replace the subscription
+   it names, so a refused one still ends it. An admitted REQ gets its
+   generation and history snapshot, and the gate opens for it.
 2. **Registration, on the req monitor.** The ingester queues `Register` on the
    connection's req monitor's control queue, then the history scan for its req
    worker, so the scan's `HistoryDone` can never reach the monitor first. The

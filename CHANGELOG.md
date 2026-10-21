@@ -203,6 +203,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   req monitors exit together, which made this reachable: about one in a
   thousand runs of a test that starts and stops six relays crashed on Linux.
   The database now closes only after every relay thread has exited.
+- An `authors` and `kinds` filter naming 1000 or more (author, kind) pairs no
+  longer reads every event those authors wrote when its kinds are replaceable
+  or addressable, as in an outbox fetch of kinds 0, 3 and 10002 for a long
+  follow list. The same applies when it names one kind, or when its limit
+  covers the extra index seeks, as for COUNT and NEG-OPEN. Such a fetch for 334
+  authors took 70 ms or more instead of 2 ms on a 200,000-event database.
 - A filter with `until: 0` no longer reads its whole index to return nothing,
   and a filter with `limit: 0` reads no index at all.
 - A filter with an empty `ids`, `authors`, `kinds` or `#x` list now matches no

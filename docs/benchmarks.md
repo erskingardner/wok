@@ -188,6 +188,83 @@ stored part is bounded by `limit`.
 CI runs a small version as a unit test against an in-process relay with
 default limits (`clients::tests`).
 
+## WebSocket transport costs (`ws_transport`)
+
+Wok-only `--scenario ws_transport` measures what connections cost the relay
+process, the way browsers and apps use them. Every phase runs twice against a
+fresh relay, once with clients that offer permessage-deflate and once with
+clients that do not. Clients drive wok-ws's codec in client mode, so deflate is
+really negotiated. The corpus (`--events`/`--event-mix`, or `--corpus`) is
+imported first. Every fetch takes its kind-1 events up to its newest, and the
+fan-out notes are newer still, so both modes fetch exactly the same events.
+
+1. **Codec.** Compresses corpus EVENT frames (kind 0, kind 1, kind 7, all) and
+   EOSE frames in process with wok-ws's deflater at levels 1–6.
+2. **Memory.** Opens `--connections` sockets, then each fetches 10 events and
+   closes the subscription, then (with `--transport-idle-secs`) all stay
+   silent, and a second wave of as many connections opens and fetches beside
+   them. Relay RSS is sampled after each step.
+3. **Burst.** `--bursts` sequential `{"kinds":[1],"limit":--burst-events}`
+   fetches on one connection.
+4. **Fan-out.** `--fanout-subscribers` live subscribers receive
+   `--fanout-events` fresh notes, published one at a time by a client that
+   does not negotiate deflate.
+5. **Churn.** `--churn-connections` connect, fetch 10 events, close cycles
+   from 16 concurrent clients, like mobile apps reconnecting.
+
+```bash
+cargo build --release -p wok-cli -p wok-bench
+./target/release/wok-bench --scenario ws_transport --wok ./target/release/wok \
+  --events 5000 --event-mix realistic --connections 2000 \
+  --transport-idle-secs 65 --bursts 200 --fanout-subscribers 500 \
+  --fanout-events 40 --churn-connections 3000 --out bench-results/transport
+```
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--connections` | 1,000 | Sockets held open in the memory phase |
+| `--transport-idle-secs` | 0 | Silence before the last memory sample (0 skips it). Wok releases compression state after 30–60 s without traffic, so use at least 65 to see it |
+| `--burst-events` | 500 | Events per burst, at most the relay's default `max_filter_limit` (500); fewer if fewer kind-1 events are stored |
+| `--bursts` | 40 | Bursts per mode |
+| `--fanout-subscribers` | 32 | Live subscribers |
+| `--fanout-events` | 200 | Notes published per mode |
+| `--churn-connections` | 1,000 | Reconnect cycles per mode |
+
+### Reading the output
+
+`summary.md` has a table per trial with one row per mode (`off`, `offered`)
+and a codec table. `results.jsonl` holds the same values in each trial's
+`transport` field.
+
+- **KB/conn cold, warm, idle**: relay RSS growth over the warmed-up baseline,
+  divided by open connections. It includes everything a connection costs
+  (transport, relay bookkeeping, allocator overhead), not only the codec.
+  Freed memory leaves RSS only when the allocator returns it to the OS, which
+  differs between platforms and allocators, and macOS may compress idle pages
+  out of RSS, so read the idle column with care.
+- **KB/conn 2nd wave**: what each connection of the second wave adds to RSS
+  while the first wave is idle. An allocator that keeps freed memory instead
+  of returning it to the OS hides a release from the idle column; a second
+  wave that reuses that memory shows it here.
+- **burst first EVENT / EOSE**: time from sending the REQ to its first EVENT
+  and to its EOSE. **wire KB** is what the client read per burst, so the
+  `offered` row shows the compression ratio.
+- **CPU** columns are relay process CPU time (user + system) over the phase,
+  divided per burst, delivery or cycle. They are sampled from outside the
+  process: `/proc/<pid>/stat` on Linux and `ps` elsewhere, both with 10 ms
+  resolution, so keep phases long enough for that to be noise.
+- The scenario does not count syscalls. To count the relay's socket writes
+  on Linux, point `--wok` at an executable script named `wok` that runs the
+  real binary under `strace -f -c -o <file>`, and keep the other phases small.
+- **Codec**: µs per frame and compressed size over original size. "Takeover"
+  compresses each group as one stream, like a burst or a live subscription;
+  "fresh" compresses each frame with a new compressor, like a connection's
+  first message or its first after the compressor was released.
+
+The trial fails if any connection does not negotiate deflate when offered,
+or a fetch, burst, fan-out delivery or churn cycle returns other than the
+expected events.
+
 ## Author × kind sweep (`author_kinds`)
 
 Wok-only `--scenario author_kinds` measures time to EOSE of historical

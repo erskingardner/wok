@@ -14,6 +14,7 @@
 mod author_kinds;
 mod clients;
 mod live;
+mod transport;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -139,6 +140,19 @@ struct Args {
     /// Fail --scenario clients when any request is refused.
     #[arg(long)]
     expect_no_refusals: bool,
+    /// Events per history burst in --scenario ws_transport.
+    #[arg(long, default_value_t = 500)]
+    burst_events: u64,
+    /// History bursts per deflate mode in --scenario ws_transport.
+    #[arg(long, default_value_t = 40)]
+    bursts: usize,
+    /// Connect, fetch, close cycles per deflate mode in --scenario ws_transport.
+    #[arg(long, default_value_t = 1_000)]
+    churn_connections: usize,
+    /// Seconds --scenario ws_transport holds its connections silent before a
+    /// last memory sample (0 skips it).
+    #[arg(long, default_value_t = 0)]
+    transport_idle_secs: u64,
     /// Authors that monitor_index and live_subscriptions follow lists, posts
     /// and mentions draw from, by a Zipf law.
     #[arg(long, default_value_t = 20_000)]
@@ -231,6 +245,8 @@ struct Trial {
     client_tcp_nodelay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     clients: Option<clients::ClientsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<transport::TransportReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     monitor_index: Option<live::IndexReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -366,6 +382,7 @@ fn main() -> Result<()> {
         "duplicate_import",
         "cold_start",
         "clients",
+        "ws_transport",
         "monitor_index",
         "live_subscriptions",
         "author_kinds",
@@ -508,6 +525,7 @@ fn main() -> Result<()> {
                 *scenario,
                 "nip50_search"
                     | "clients"
+                    | "ws_transport"
                     | "author_kinds"
                     | "monitor_index"
                     | "live_subscriptions"
@@ -584,6 +602,7 @@ fn run_trial(
     let mut notes = String::new();
     let mut throughput = 0.0f64;
     let mut clients_report = None;
+    let mut transport_report = None;
     let mut monitor_index_report = None;
     let mut live_report = None;
     let mut author_kinds_report = None;
@@ -897,6 +916,22 @@ fn run_trial(
                 }
             }
         }
+        "ws_transport" => {
+            let bin = local_bin()?;
+            match transport_trial(rt, args, bin, dir.path(), corpus_path) {
+                Ok((nts, report)) => {
+                    notes = nts;
+                    ok = report.ok();
+                    errors += report.errors();
+                    transport_report = Some(report);
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e}");
+                }
+            }
+        }
         "monitor_index" => match live::run_index(&live_options(args)) {
             Ok(report) => {
                 throughput = 1e9 / report.matched.mean().max(f64::MIN_POSITIVE);
@@ -962,6 +997,7 @@ fn run_trial(
 
     Ok(Trial {
         clients: clients_report,
+        transport: transport_report,
         monitor_index: monitor_index_report,
         live_subscriptions: live_report,
         author_kinds: author_kinds_report,
@@ -1003,6 +1039,7 @@ fn failed_trial(
 ) -> Trial {
     Trial {
         clients: None,
+        transport: None,
         monitor_index: None,
         live_subscriptions: None,
         author_kinds: None,
@@ -2666,6 +2703,116 @@ fn log_tail(path: &Path) -> String {
     lines[lines.len().saturating_sub(5)..].join(" | ")
 }
 
+/// The kind-1 events a relay serves after importing `corpus`: deletions
+/// applied as `retained_events` models them, each id once, and none past a
+/// NIP-40 expiration.
+fn served_notes(corpus: &[Value], now: u64) -> Vec<Value> {
+    let expired = |event: &Value| {
+        event["tags"].as_array().is_some_and(|tags| {
+            tags.iter().any(|tag| {
+                tag[0] == "expiration"
+                    && tag[1]
+                        .as_str()
+                        .and_then(|at| at.parse::<u64>().ok())
+                        .is_some_and(|at| at <= now)
+            })
+        })
+    };
+    let mut seen = std::collections::HashSet::new();
+    retained_events(corpus)
+        .into_iter()
+        .filter(|event| event["kind"] == 1 && !expired(event))
+        .filter(|event| seen.insert(event["id"].as_str().unwrap_or_default().to_owned()))
+        .collect()
+}
+
+/// Per-connection transport costs with and without deflate (see
+/// transport.rs). Fan-out publications are fresh notes, newer than the corpus.
+fn transport_trial(
+    rt: &tokio::runtime::Runtime,
+    args: &Args,
+    bin: &Path,
+    dbdir: &Path,
+    corpus_path: &Path,
+) -> Result<(String, transport::TransportReport)> {
+    let opts = transport::TransportOptions {
+        connections: args.connections,
+        idle_secs: args.transport_idle_secs,
+        burst_events: args.burst_events,
+        bursts: args.bursts,
+        fanout_subscribers: args.fanout_subscribers,
+        fanout_events: args.fanout_events,
+        churn_connections: args.churn_connections,
+    };
+    // The spawned relay keeps its default filter limit, which would quietly
+    // shorten larger bursts.
+    let max_limit = wok_relay::Config::default().relay.max_filter_limit;
+    anyhow::ensure!(
+        args.burst_events <= max_limit,
+        "--burst-events {} is above the relay's max_filter_limit ({max_limit})",
+        args.burst_events
+    );
+    let corpus = read_event_values(corpus_path)?;
+    let newest = corpus
+        .iter()
+        .filter_map(|event| event["created_at"].as_u64())
+        .max()
+        .unwrap_or_default();
+    let now = unix_timestamp()?;
+    let kind1 = served_notes(&corpus, now);
+    // Every fan-out note takes one second after the corpus (or now), so no
+    // history fetch returns them, however many there are, and the relay's
+    // created_at window still accepts them.
+    let fanout_at = now.max(newest + 1);
+    let window = wok_relay::Config::default().events.reject_newer_than_secs;
+    anyhow::ensure!(
+        window == 0 || fanout_at < now + window,
+        "the corpus is dated too far in the future for live publications"
+    );
+    let key = {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed ^ 0x7472_616e_7370_6f72);
+        secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rng)
+    };
+    let fanout = (0..args.fanout_events * 2)
+        .map(|n| {
+            clients::signed(
+                &key,
+                fanout_at,
+                1,
+                Vec::new(),
+                format!("ws_transport fan-out note {n}"),
+            )
+        })
+        .collect();
+    let report = transport::run(
+        rt,
+        transport::RunInput {
+            bin,
+            dbdir,
+            corpus: corpus_path,
+            kind1,
+            newest,
+            fanout,
+            opts,
+        },
+    )?;
+    let summary: Vec<String> = report
+        .modes
+        .iter()
+        .map(|mode| {
+            format!(
+                "deflate {}: {:.0} KB/conn warm, burst {:.2} ms / {:.1} CPU ms",
+                if mode.offer_deflate { "on" } else { "off" },
+                mode.warm_kb_per_conn,
+                mode.burst_p50_ms,
+                mode.burst_cpu_ms,
+            )
+        })
+        .collect();
+    Ok((summary.join("; "), report))
+}
+
 /// Client-realistic load with abuse controls and AUTH on (see clients.rs).
 /// The relay gets the background corpus plus the scenario's own corpus, both
 /// imported with the trial's config before it starts.
@@ -2811,6 +2958,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.clients {
             s.push_str(&clients::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.transport {
+            s.push_str(&transport::render_markdown(report, &t.relay, t.repetition));
+        }
         if let Some(report) = &t.monitor_index {
             s.push_str(&live::render_index_markdown(report));
         }
@@ -2846,6 +2996,19 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if args.expect_no_refusals {
             selection.push_str(" --expect-no-refusals");
         }
+    }
+    if args.scenario.as_deref() == Some("ws_transport") {
+        selection.push_str(&format!(
+            " --connections {} --transport-idle-secs {} --burst-events {} --bursts {} --fanout-subscribers {} --fanout-events {} --churn-connections {} --events {}",
+            args.connections,
+            args.transport_idle_secs,
+            args.burst_events,
+            args.bursts,
+            args.fanout_subscribers,
+            args.fanout_events,
+            args.churn_connections,
+            args.events.unwrap_or_default(),
+        ));
     }
     if matches!(
         args.scenario.as_deref(),
@@ -3136,6 +3299,50 @@ mod tests {
                     .as_array()
                     .is_some_and(|tags| tags.iter().any(|tag| tag[0] == "e"))
         }));
+    }
+
+    #[test]
+    fn ws_transport_expects_only_notes_the_relay_serves() {
+        let now = 1_800_000_000;
+        let mut events = generate_values(EventWorkload {
+            count: 1000,
+            seed: 11,
+            base_timestamp: now,
+            mix: EventMix::Lifecycle,
+        })
+        .unwrap();
+        let deleted: Vec<String> = events
+            .iter()
+            .filter(|event| event["kind"] == 5)
+            .flat_map(|event| event["tags"].as_array().cloned().unwrap_or_default())
+            .filter(|tag| tag[0] == "e")
+            .filter_map(|tag| tag[1].as_str().map(str::to_owned))
+            .collect();
+        let kept = events
+            .iter()
+            .find(|event| {
+                event["kind"] == 1 && !deleted.iter().any(|id| event["id"] == id.as_str())
+            })
+            .cloned()
+            .unwrap();
+        events.push(kept.clone());
+        let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+        let expired = clients::signed(
+            &key,
+            now - 10,
+            1,
+            vec![json!(["expiration", (now - 5).to_string()])],
+            "expired".into(),
+        );
+        events.push(expired.clone());
+
+        let served = served_notes(&events, now);
+        let ids: Vec<&str> = served.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(!deleted.is_empty());
+        assert!(served.iter().all(|event| event["kind"] == 1));
+        assert!(deleted.iter().all(|id| !ids.contains(&id.as_str())));
+        assert_eq!(ids.iter().filter(|&&id| kept["id"] == id).count(), 1);
+        assert!(!ids.contains(&expired["id"].as_str().unwrap()));
     }
 
     #[test]

@@ -133,7 +133,13 @@ fn pubkey_hex(keys: &Keypair) -> String {
     hex::encode(keys.x_only_public_key().0.serialize())
 }
 
-fn signed(keys: &Keypair, created_at: u64, kind: u64, tags: Vec<Value>, content: String) -> Value {
+pub(crate) fn signed(
+    keys: &Keypair,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Value>,
+    content: String,
+) -> Value {
     let mut event = json!({
         "created_at": created_at,
         "kind": kind,
@@ -1163,21 +1169,32 @@ struct WsConn {
     deflate: bool,
 }
 
-enum ConnectFailure {
+pub(crate) enum ConnectFailure {
     Refused(String),
     Failed(String),
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => write!(f, "refused: {reason}"),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-async fn ws_connect(
+/// Upgrade a fresh TCP connection. Returns the stream, any bytes read past
+/// the response head, and whether the relay accepted permessage-deflate.
+pub(crate) async fn ws_handshake(
     addr: SocketAddr,
     forwarded_for: Option<IpAddr>,
     offer_deflate: bool,
     nodelay: bool,
-) -> Result<WsConn, ConnectFailure> {
+) -> Result<(tokio::net::TcpStream, Vec<u8>, bool), ConnectFailure> {
     let failed = |e: String| ConnectFailure::Failed(e);
     let mut stream = tokio::time::timeout(
         Duration::from_secs(10),
@@ -1253,6 +1270,16 @@ async fn ws_connect(
             let line = line.to_ascii_lowercase();
             line.starts_with("sec-websocket-extensions:") && line.contains("permessage-deflate")
         });
+    Ok((stream, rest, deflate))
+}
+
+async fn ws_connect(
+    addr: SocketAddr,
+    forwarded_for: Option<IpAddr>,
+    offer_deflate: bool,
+    nodelay: bool,
+) -> Result<WsConn, ConnectFailure> {
+    let (stream, rest, deflate) = ws_handshake(addr, forwarded_for, offer_deflate, nodelay).await?;
     let (mut reader, mut writer) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Out>();
     let (in_tx, in_rx) = mpsc::unbounded_channel::<In>();

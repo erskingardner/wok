@@ -3235,17 +3235,20 @@ mod trace {
 }
 
 /// Most messages a req worker takes from its queue in one pass. A REQ or COUNT
-/// gets its first time slice as soon as the pass takes it, and the queries
-/// still running after that get one slice at the end of every pass, so this
-/// bounds how long they wait behind a stream of new ones.
+/// gets its first time slice as soon as the pass takes it, so this bounds how
+/// long a pass runs before the queries already running get their turn.
 const REQ_PASS_MAX: usize = 64;
 
 /// A req worker pass takes every message already queued (up to `REQ_PASS_MAX`)
 /// and applies them in order under one read transaction. Cancels, AUTH and
 /// teardown cost no query time. Each new REQ or COUNT is scheduled and given
 /// its first slice at once, so a small one is answered within the pass, before
-/// the messages behind it. Then the longest-waiting running query gets a
-/// slice. strfry's ReqWorker drains its inbox the same way.
+/// the messages behind it. strfry's ReqWorker drains its inbox the same way.
+///
+/// Then the running query that has waited longest gets a slice. When more
+/// messages are already waiting, they go first unless the running queries
+/// have gone a whole slice budget without one: however busy the queue, they
+/// get at least one slice per budget of time.
 fn run_req_worker(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -3269,6 +3272,8 @@ fn run_req_worker(
         metrics: &metrics,
         mon_txs: &mon_txs,
     };
+    // When the running queries last got a slice, or started waiting for one.
+    let mut last_slice = std::time::Instant::now();
     let mut open = true;
     while open {
         if !queries.has_running() {
@@ -3276,6 +3281,7 @@ fn run_req_worker(
                 Ok(msg) => pass.push(msg),
                 Err(_) => break,
             }
+            last_slice = std::time::Instant::now();
         }
         while pass.len() < REQ_PASS_MAX {
             match rx.try_recv() {
@@ -3364,9 +3370,11 @@ fn run_req_worker(
             }
         }
         if let Some(txn) = &txn {
-            if open && queries.has_running() {
-                let cfg_snap = cfg.read();
+            let cfg_snap = cfg.read();
+            let budget = Duration::from_micros(cfg_snap.relay.query_timeslice_budget_us);
+            if open && queries.has_running() && (rx.is_empty() || last_slice.elapsed() >= budget) {
                 worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp);
+                last_slice = std::time::Instant::now();
             }
         }
     }
@@ -6548,10 +6556,11 @@ mod tests {
         worker.join().unwrap();
     }
 
-    /// A pass takes at most `REQ_PASS_MAX` messages and ends with a slice for
-    /// the running query that has waited longest, so a stream of new REQs
-    /// cannot keep a long scan from going on, and new REQs are still started
-    /// in the order they came.
+    /// A pass takes at most `REQ_PASS_MAX` messages and, once a slice budget
+    /// has gone by, ends with a slice for the running query that has waited
+    /// longest, even with more messages waiting: a stream of new REQs cannot
+    /// keep a long scan from going on, and new REQs are still started in the
+    /// order they came.
     #[test]
     fn a_stream_of_new_queries_cannot_starve_a_running_scan() {
         let (dir, env, snapshot) = long_history();
@@ -6597,6 +6606,48 @@ mod tests {
                 pair[1] - pair[0] - 1
             );
         }
+        drop(req_tx);
+        worker.join().unwrap();
+    }
+
+    /// Within a slice budget of the running queries' last slice, messages
+    /// that are already waiting go first: a REQ queued behind a full pass is
+    /// not held up by another slice of a long scan.
+    #[test]
+    fn waiting_queries_go_first_within_the_running_scans_budget() {
+        let (dir, env, snapshot) = long_history();
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, _outbound) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let small = 3 * REQ_PASS_MAX;
+        let (req_tx, req_rx) = bounded(small + 1);
+        let (mon_tx, mon_rx) = unbounded();
+        // A search yields every 4096 postings, whatever the budget.
+        let search = json!({"search": "history", "limit": 50_000});
+        req_tx
+            .send(ReqMsg::Scan(queued_sub("long", search, 1, false, snapshot)))
+            .unwrap();
+        let newest = json!({"kinds": [1], "limit": 1});
+        let ids: Vec<String> = (0..small).map(|i| format!("s{i}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let sub = queued_sub(id, newest.clone(), 2 + i as u64, false, snapshot);
+            req_tx.send(ReqMsg::Scan(sub)).unwrap();
+        }
+        let mut cfg = slow_scan_config(dir.path());
+        cfg.relay.query_timeslice_budget_us = 60_000_000;
+        let worker = traced_worker(&env, cfg, &conns, req_rx, mon_tx);
+
+        for _ in 0..=small {
+            history_done_for(&mon_rx);
+        }
+        let slices = trace::slices(env.path());
+        assert_eq!(slices[0], "long");
+        assert_eq!(&slices[1..=small], &ids[..], "{slices:?}");
+        assert!(
+            slices[small + 1..].iter().all(|id| id == "long"),
+            "{slices:?}"
+        );
+        assert!(slices.len() > small + 2, "the search fit in two slices");
         drop(req_tx);
         worker.join().unwrap();
     }

@@ -481,7 +481,7 @@ pub fn ensure_dataset(opts: &Options) -> Result<Dataset> {
     let wraps = opts.events * WRAP_PERCENT / 100;
     anyhow::ensure!(
         opts.authors > 0 && opts.events >= replaceable + zaps + wraps + opts.authors as u64,
-        "--events must leave at least one history event per author"
+        "--events must leave at least as many history events as authors"
     );
     // Without a manifest, whatever is here is an interrupted generation.
     if dir.exists() {

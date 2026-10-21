@@ -84,7 +84,7 @@ impl Client {
         self.send(serde_json::json!(["REQ", sid, {"kinds": [1], "limit": 1}]))
             .await;
         let (len, text) = self.frame().await;
-        assert_eq!(text, format!("[\"EOSE\",\"{sid}\"]"));
+        assert_eq!(text, format!("[\"EOSE\",\"{sid}\",[\"finish\"]]"));
         self.send(serde_json::json!(["CLOSE", sid])).await;
         len
     }
@@ -305,7 +305,7 @@ async fn queued_frames_are_coalesced_into_few_writes() {
             "frames out of order"
         );
     }
-    assert_eq!(client.frame().await.1, "[\"EOSE\",\"h\"]");
+    assert_eq!(client.frame().await.1, "[\"EOSE\",\"h\",[\"finish\"]]");
     let writes = flushes.load(Ordering::SeqCst) - before;
     assert!(
         writes <= bytes / COALESCE_BYTES + 3,

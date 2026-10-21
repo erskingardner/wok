@@ -415,3 +415,35 @@ Storage verification accounts for the documented ephemeral difference: Wok's
 live-only default must export no ephemeral records. strfry's temporary storage
 may export a duplicate-free subset of submitted ephemeral events, each with its
 exact original payload. Both must export the exact expected persistent set.
+
+## Time to EOSE under req monitor fan-out
+
+`crates/wok-compat/tests/eose_latency.rs` is an ignored test that times
+REQ → EOSE while the req monitors fan stored events out to many live
+subscriptions. It drives an in-process relay through the public
+`RelayHandle` API, so it measures the relay's own pipeline without transport
+or client costs, and the same file runs unchanged against older revisions for
+before/after comparisons.
+
+```bash
+FANOUT_CONNS=200 FANOUT_SUBS=50 PUBLISH_RATE=400 \
+  cargo test --release -p wok-compat --test eose_latency -- --ignored --nocapture
+```
+
+- `FANOUT_CONNS` × `FANOUT_SUBS` live `{"kinds":[1]}` subscriptions receive
+  every stored event, so each event costs the monitors that many frames.
+- `PUBLISH_RATE` stored events per second come from one connection, in 10 ms
+  ticks, pre-signed for five minutes of load.
+- The probe connection sends `PROBES` sequential REQ → EOSE → CLOSE round
+  trips, then `BURSTS` bursts of `BURST` REQs at once, each
+  `{"kinds":[1],"limit":5}`.
+
+The output has four lines, `idle` and `fan-out`, each for `sequential` and
+`burst of N`, with the sample count and p50/p90/p99/max in milliseconds. Burst
+times run from the burst's first REQ to each EOSE, so they show REQs waiting
+behind one another. Read the fan-out lines against the idle ones from the same
+run. Results swing widely near the monitors' saturation point: raise
+`PUBLISH_RATE` until fan-out p90 leaves the idle floor, then run each revision
+at least three times, alternating, and compare medians. A run that panics with
+"load ran out" lasted longer than its load, so its later lines were measured
+without it; discard them.

@@ -55,6 +55,106 @@ and deletions, including while quotas are disabled. Enabling a quota may therefo
 require a one-time author-index scan for an author without a cached count; no
 database upgrade or startup-wide scan is required.
 
+## REQ lifecycle
+
+A REQ is live before its history is read. When the REQ is admitted, the
+newest local event id splits the work: the history sends what was stored up
+to it, the live monitor everything stored or published after. Each event is
+the job of exactly one of them, so nothing is missed or sent twice, whatever
+the history's `limit` keeps out. That includes live-only (ephemeral) events,
+which never reach LMDB and so cannot be caught up later. No stage waits on
+another along the way.
+
+### The subscription gate
+
+Replies for one subscription id come from three producers on different
+threads: the ingester (a refusal's CLOSED), the req worker (history, COUNT
+results, its own refusals) and the req monitor (EOSE, live events). What the
+client sees for an id is decided in one place, not by coordinating them.
+
+- Every frame for a connection is queued in `ConnTable` under one lock, and
+  each connection there has a gate: for REQ ids and, separately, COUNT ids,
+  the current generation of each open id. An absent id is closed.
+- The ingester gives each REQ and COUNT a generation as it handles it, in
+  client order, and moves the gate at that moment: an admitted REQ or COUNT
+  makes its generation current, CLOSE removes the id, and a refusal removes
+  the id and queues its CLOSED in the same locked step.
+- Every subscription frame carries its id and generation, and is queued only
+  if that generation is current, checked under the same lock. A CLOSED from a
+  worker and a COUNT result are a generation's last frame: queuing one closes
+  the id. OK, NOTICE, AUTH and NEG-* are not gated.
+- Queued EVENT and EOSE frames keep their id's generation cell, and the
+  WebSocket and Unix transports skip any whose generation has since been
+  replaced or closed, so a slow link does not carry a replaced filter's
+  backlog.
+
+So, per id, no frame of a replaced or closed generation follows the change,
+and a CLOSED is the last frame of its generation, however the producers
+interleave. The subscription cap (`relay.max_subs_per_connection`) is the
+number of open REQ ids in the gate, which counts subscriptions still sending
+history as well as live ones; a REQ reusing an open id always fits.
+
+### Stages
+
+1. **Admission, on the ingester.** Before any worker sees the REQ, the ingester
+   checks parsing and filter limits, query cost, AUTH and the cap. A refusal is
+   `CLOSED`. NIP-01 makes a REQ replace the subscription it names, so a refused
+   one still ends it. An admitted REQ gets its generation and history snapshot,
+   and the gate opens for it.
+2. **Registration, on the req monitor.** The ingester queues `Register` on the
+   connection's req monitor's control queue, then the history scan for its req
+   worker, so the scan's `HistoryDone` can never reach the monitor first. The
+   control queue is unbounded, so `Register` is queued at admission and never
+   waits behind live traffic (see below). The monitor replaces any
+   subscription with that id and matches the new one against every later
+   event, as for a live subscription. Matches are held in a per-subscription
+   buffer instead of being sent: stored events by local event id, live-only
+   events in full. They are held whether or not the connection may read them
+   yet, since it may AUTH before EOSE.
+3. **History, on the req worker.** The worker scans up to the snapshot, then
+   posts `HistoryDone{generation, snapshot}` to the monitor and moves on. It
+   never waits for a reply. A REQ or COUNT it cannot start (a read failure,
+   `relay.abuse.max_concurrent_historical_queries`) or whose scan fails gets
+   CLOSED through the gate.
+4. **Going live, on the req monitor.** For the current generation only, the
+   monitor sends EOSE, then the held matches in arrival order, then delivers
+   live. NIP-01 defines EOSE as the boundary to "events newly received in
+   real-time", so everything held follows it, including stored events
+   committed during the scan (strfry sends those first). Held events are
+   checked against the read policy again before they are sent.
+   - Stored events after the snapshot that the buffer lacks are re-read from
+     LMDB after EOSE. That happens when the monitor matched commits past the
+     snapshot before it saw `Register`, or when the stored part of the buffer
+     outgrew `relay.max_live_buffer_bytes`.
+   - Live-only events cannot be re-read. A full buffer drops the oldest and
+     counts them (`wok_live_buffer_dropped_ephemeral_total`); one larger than
+     the whole bound is dropped alone.
+5. **CLOSE, replacement, refusal, disconnect.** These take effect at the gate
+   when the ingester handles them. The workers are then told to stop, as
+   cleanup only: `Remove{generation}` for the monitor and, behind it, a cancel
+   for the worker, each acting only on that generation. A replacing REQ's
+   `Register` and scan replace the old ones directly. Disconnect drops the
+   connection's gate and everything on every stage.
+
+COUNT never registers with a monitor, and COUNT ids are separate from REQ ids:
+neither cancels the other.
+
+Each req monitor has two queues: subscription changes (`Register`, `Remove`,
+`HistoryDone`, AUTH, disconnect) on an unbounded control queue, and database
+changes and live-only events on a bounded data queue. Each turn it takes what
+is in the data queue, then what is in the control queue, and applies the
+changes first. So every change sent before an event taken that turn is
+applied before the event is matched: a live-only event published after a REQ
+was admitted is matched against it however full the data queue was, and EOSE
+does not wait behind the turn's fan-out. A REQ also sees live-only events
+published just before it that share its turn. Each queue keeps its own order,
+and per-connection order holds because a connection's subscriptions all live
+on one monitor. Every control message is paired with work on a bounded req
+worker queue (a scan, a cancel) or is one per AUTH or connection, so the
+control queue grows only while a turn runs. If the monitor cannot open a read
+transaction, it keeps the subscription changes (and one database change) and
+retries.
+
 ## Non-goals
 
 - Storage-backend independence is deferred. LMDB stays until a concrete backend

@@ -1,6 +1,7 @@
 //! Live subscription inverted index matching `src/ActiveMonitors.h`.
 
 use crate::{
+    pending::PendingBuffer,
     subid::{SubId, Subscription},
     NostrFilter,
 };
@@ -12,6 +13,11 @@ use wok_event::PackedEventView;
 pub struct Recipient {
     pub conn_id: u64,
     pub sub_id: SubId,
+    /// The subscription's history is still being sent: buffer the match in
+    /// its [`PendingBuffer`] instead of delivering it.
+    pub pending: bool,
+    /// The REQ generation of the subscription that matched.
+    pub generation: u64,
 }
 
 struct MonitorItem {
@@ -19,8 +25,15 @@ struct MonitorItem {
     sub_id: SubId,
 }
 
+/// A subscription and, until its history has been sent, the live matches
+/// held back for it.
+struct Monitored {
+    sub: Subscription,
+    pending: Option<PendingBuffer>,
+}
+
 pub struct ActiveMonitors {
-    conns: HashMap<u64, HashMap<SubId, Subscription>>,
+    conns: HashMap<u64, HashMap<SubId, Monitored>>,
     all_ids: HashMap<[u8; 32], Vec<MonitorItem>>,
     all_authors: HashMap<[u8; 32], Vec<MonitorItem>>,
     all_tags: HashMap<Vec<u8>, Vec<MonitorItem>>,
@@ -60,39 +73,87 @@ impl ActiveMonitors {
         if !replacing && open.map_or(0, |conn| conn.len()) >= self.max_subs {
             return false;
         }
-        self.remove_sub(sub.conn_id, &sub.sub_id);
-        let conn = self.conns.entry(sub.conn_id).or_default();
-        let conn_id = sub.conn_id;
-        let sub_id = sub.sub_id.clone();
-        conn.insert(sub_id.clone(), sub);
-        let installed = self
-            .conns
-            .get(&conn_id)
-            .unwrap()
-            .get(&sub_id)
-            .unwrap()
-            .clone();
-        self.install(&installed);
+        self.insert(sub, None);
         true
+    }
+
+    /// Register a subscription whose history is still being sent. Its matches
+    /// are reported as pending, for `buffer`, until [`Self::finish_pending`].
+    /// It replaces any subscription with the same id and takes no slot check:
+    /// the caller admitted it.
+    pub fn add_pending(&mut self, sub: Subscription, buffer: PendingBuffer) {
+        self.insert(sub, Some(buffer));
+    }
+
+    fn insert(&mut self, sub: Subscription, pending: Option<PendingBuffer>) {
+        self.remove_sub(sub.conn_id, &sub.sub_id);
+        self.install(&sub);
+        self.conns
+            .entry(sub.conn_id)
+            .or_default()
+            .insert(sub.sub_id.clone(), Monitored { sub, pending });
     }
 
     pub fn remove_sub(&mut self, conn_id: u64, sub_id: &SubId) {
         if let Some(map) = self.conns.get_mut(&conn_id) {
-            if let Some(sub) = map.remove(sub_id) {
+            if let Some(entry) = map.remove(sub_id) {
                 if map.is_empty() {
                     self.conns.remove(&conn_id);
                 }
-                self.uninstall(&sub);
+                self.uninstall(&entry.sub);
             }
         }
     }
 
     pub fn close_conn(&mut self, conn_id: u64) {
         if let Some(map) = self.conns.remove(&conn_id) {
-            for (_, sub) in map {
-                self.uninstall(&sub);
+            for (_, entry) in map {
+                self.uninstall(&entry.sub);
             }
         }
+    }
+
+    pub fn subscription(&self, conn_id: u64, sub_id: &SubId) -> Option<&Subscription> {
+        self.conns
+            .get(&conn_id)?
+            .get(sub_id)
+            .map(|entry| &entry.sub)
+    }
+
+    /// The buffer of a subscription whose history is still being sent.
+    pub fn pending_mut(&mut self, conn_id: u64, sub_id: &SubId) -> Option<&mut PendingBuffer> {
+        self.conns
+            .get_mut(&conn_id)?
+            .get_mut(sub_id)?
+            .pending
+            .as_mut()
+    }
+
+    /// The history of this generation of the subscription has been sent up
+    /// to `delivered`: deliver it live from now on, skipping stored events up
+    /// to `delivered`, and hand back what was buffered. `None`, changing
+    /// nothing, if that generation is no longer pending (closed, replaced, or
+    /// already live).
+    pub fn finish_pending(
+        &mut self,
+        conn_id: u64,
+        sub_id: &SubId,
+        generation: u64,
+        delivered: u64,
+    ) -> Option<PendingBuffer> {
+        let entry = self.conns.get_mut(&conn_id)?.get_mut(sub_id)?;
+        if entry.sub.generation != generation {
+            return None;
+        }
+        let buffer = entry.pending.take()?;
+        entry.sub.latest_event_id = entry.sub.latest_event_id.max(delivered);
+        Some(buffer)
+    }
+
+    /// Whether the subscription with this id is pending, by generation.
+    pub fn pending_generation(&self, conn_id: u64, sub_id: &SubId) -> Option<u64> {
+        let entry = self.conns.get(&conn_id)?.get(sub_id)?;
+        entry.pending.as_ref().map(|_| entry.sub.generation)
     }
 
     pub fn requires_content(&self) -> bool {
@@ -128,11 +189,13 @@ impl ActiveMonitors {
         let candidates = self.candidates(packed);
 
         for (conn_id, sub_id) in candidates {
-            if let Some(sub) = self
+            if let Some(entry) = self
                 .conns
                 .get_mut(&conn_id)
                 .and_then(|m| m.get_mut(&sub_id))
             {
+                let pending = entry.pending.is_some();
+                let sub = &mut entry.sub;
                 if let Some(lev_id) = lev_id {
                     if sub.latest_event_id >= lev_id {
                         continue;
@@ -145,7 +208,12 @@ impl ActiveMonitors {
                     if let Some(lev_id) = lev_id {
                         sub.latest_event_id = lev_id;
                     }
-                    recipients.push(Recipient { conn_id, sub_id });
+                    recipients.push(Recipient {
+                        conn_id,
+                        sub_id,
+                        pending,
+                        generation: sub.generation,
+                    });
                 }
             }
         }
@@ -202,8 +270,10 @@ impl ActiveMonitors {
                 self.conns
                     .get(conn)
                     .and_then(|subs| subs.get(sid))
-                    .is_some_and(|sub| {
-                        sub.filter_group
+                    .is_some_and(|entry| {
+                        entry
+                            .sub
+                            .filter_group
                             .filters
                             .iter()
                             .any(|f| f.search.is_some() && f.does_match_without_search(packed))
@@ -353,5 +423,61 @@ mod tests {
         monitors.remove_sub(1, &sub_id);
         let later = event(4, &[b"meme", b"cat", b"black"]);
         assert!(monitors.process(4, later.view(), None).is_empty());
+    }
+
+    fn pending_sub(sub_id: &SubId, tag: &str, generation: u64, live_from: u64) -> Subscription {
+        let group = NostrFilterGroup::from_value(&json!({"#t": [tag]}), 500, 3, 16).unwrap();
+        let mut sub = Subscription::new(1, sub_id.clone(), group, false);
+        sub.generation = generation;
+        sub.latest_event_id = live_from;
+        sub
+    }
+
+    #[test]
+    fn pending_subscriptions_match_until_their_generation_goes_live() {
+        let sub_id = SubId::new("s").unwrap();
+        let mut monitors = ActiveMonitors::new(usize::MAX);
+        monitors.add_pending(pending_sub(&sub_id, "a", 1, 10), PendingBuffer::new(10, 0));
+        assert_eq!(monitors.pending_generation(1, &sub_id), Some(1));
+
+        // Matched like a live subscription, but reported as pending.
+        let first = event(11, &[b"a"]);
+        let recipients = monitors.process(11, first.view(), None);
+        assert_eq!(recipients.len(), 1);
+        assert!(recipients[0].pending);
+        // Stored events the monitor saw before registering are not rematched.
+        let old = event(9, &[b"a"]);
+        assert!(monitors.process(9, old.view(), None).is_empty());
+
+        // A stale generation changes nothing.
+        assert!(monitors.finish_pending(1, &sub_id, 0, 20).is_none());
+        assert!(monitors.pending_mut(1, &sub_id).is_some());
+
+        assert!(monitors.finish_pending(1, &sub_id, 1, 20).is_some());
+        assert_eq!(monitors.pending_generation(1, &sub_id), None);
+        // History covered everything up to 20.
+        let covered = event(20, &[b"a"]);
+        assert!(monitors.process(20, covered.view(), None).is_empty());
+        let live = event(21, &[b"a"]);
+        let recipients = monitors.process(21, live.view(), None);
+        assert!(!recipients[0].pending);
+        assert!(monitors.finish_pending(1, &sub_id, 1, 30).is_none());
+    }
+
+    #[test]
+    fn a_new_generation_replaces_the_old_filter_at_once() {
+        let sub_id = SubId::new("s").unwrap();
+        let mut monitors = ActiveMonitors::new(usize::MAX);
+        monitors.add_pending(pending_sub(&sub_id, "old", 1, 0), PendingBuffer::new(0, 0));
+        monitors.finish_pending(1, &sub_id, 1, 0).unwrap();
+        monitors.add_pending(pending_sub(&sub_id, "new", 2, 0), PendingBuffer::new(0, 0));
+
+        let old = event(1, &[b"old"]);
+        assert!(monitors.process(1, old.view(), None).is_empty());
+        let new = event(2, &[b"new"]);
+        let recipients = monitors.process_ephemeral(new.view(), None);
+        assert!(recipients[0].pending);
+        assert!(monitors.finish_pending(1, &sub_id, 1, 0).is_none());
+        assert_eq!(monitors.subscription(1, &sub_id).unwrap().generation, 2);
     }
 }

@@ -89,6 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NIP-77 passes, directory batches and add-member bursts. It reports time to
   first EVENT and to EOSE per subscription class, and counts refusals by
   reason. It measures the default changes planned in #97.
+- `relay.max_live_buffer_bytes` (default 262144) bounds the live matches held
+  for one subscription while its history is sent. Past it, stored events are
+  re-read from the database after EOSE and the oldest ephemeral events are
+  dropped. The new counters `wok_live_buffer_overflows_total` and
+  `wok_live_buffer_dropped_ephemeral_total` show when that happens.
 - `wok purge-superseded` deletes older versions of replaceable and addressable
   events retained by a strfry migration or written before 0.7.0, keeping the
   version relay reads serve. `--dry-run` reports counts without changing the
@@ -125,6 +130,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `listallowedevents` returns; the allow list records the approval and
   changes no visibility. The NIP-43 claim methods are not implemented.
 
+### Changed
+
+- Events that arrive while a REQ's history is being sent now come after EOSE,
+  as NIP-01's "newly received in real-time" events, and the stream before
+  EOSE stays newest-first. Before, stored events committed during the scan came
+  before EOSE, as in strfry. A client that sends CLOSE at EOSE no longer gets
+  them.
+
 ### Removed
 
 - Dated benchmark, soak, lab and audit reports, the definition-of-done report
@@ -134,6 +147,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ephemeral events published while a REQ's history was being sent were lost.
+  The live filter was installed only after the history, and live-only events
+  are never stored, so nothing could catch them up: NIP-46 replies and
+  ephemeral gift wraps sent during a slow scan never arrived. A REQ is now live
+  before its history scan starts, so every event published after it arrives,
+  exactly once. Stored events published after the REQ arrive even when its
+  `limit`, such as `limit: 0`, keeps them out of the history.
+- A REQ that reuses a subscription id now stops the old filter at once, even
+  when the new REQ is refused. Before, the old filter kept delivering until the
+  new history finished, and forever after a refused REQ, so `CLOSED x` was
+  followed by more `EVENT x`.
+- Events and EOSE already queued for a subscription that was then replaced or
+  closed are dropped instead of sent. On a slow link, a client that replaced a
+  subscription could otherwise receive the old filter's backlog after the new
+  REQ.
+- A REQ over `relay.max_subs_per_connection` gets `CLOSED` (`blocked: too many
+  concurrent REQs`) and no EOSE. Before, it got its history, an EOSE and a
+  NOTICE, and never went live.
+- A COUNT no longer cancels an in-flight REQ with the same id, which then never
+  sent EOSE. COUNT and REQ ids are separate, and CLOSE ends only the REQ.
+- A busy req monitor no longer holds up every REQ behind it: the req worker
+  sends no EOSE itself and never waits for the monitor. Gone with it is the
+  5-second wait that could end in a "live subscription monitor unavailable"
+  NOTICE and an EOSE for a subscription that never went live.
 - The relay could crash with a segmentation fault while shutting down. LMDB
   clears a thread's reader slot from a thread-local destructor as the thread
   exits, and the database was closed by whichever relay thread exited last,

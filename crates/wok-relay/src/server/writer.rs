@@ -8,7 +8,7 @@ pub(super) fn run_writer(
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     rx: Receiver<WriterMsg>,
-    mon_txs: Vec<Sender<MonitorMsg>>,
+    mon_txs: Vec<Sender<MonitorData>>,
     moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);

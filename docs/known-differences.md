@@ -44,6 +44,28 @@ it is not a promise to reproduce upstream bugs.
   checks they reach matching active subscriptions without being written to
   LMDB or negentropy. Operators can explicitly select `ttl` compatibility mode,
   and migrated historical ephemeral records continue to age out through cron.
+- A REQ is registered with the live monitor before its history is scanned
+  (see [architecture.md](architecture.md#req-lifecycle)). Pinned strfry
+  installs the live filter only after the history and catches up from the
+  database, which works there because it stores ephemeral events for five
+  minutes. Wok's live-only ephemeral events cannot be caught up, so they were
+  lost while the history was being sent.
+  - The history covers what was stored when the REQ was admitted. Anything
+    stored later is delivered live, even when the filter's `limit` (such as
+    `limit: 0`) keeps it out of the history. In pinned strfry the boundary is
+    when the req worker starts the scan, so an event committed between the
+    REQ's arrival and that point is history and can be cut by `limit`.
+  - Everything that arrives while the history is sent follows EOSE, as NIP-01
+    defines EOSE as the boundary to "events newly received in real-time".
+    Pinned strfry sends stored events committed during the scan before EOSE.
+    Clients treat events after EOSE as new, and the stream before EOSE stays
+    strictly newest-first. The cost: a fetch-and-close client that sends
+    CLOSE at EOSE does not get events that arrived during the scan.
+  - The held matches are bounded per subscription
+    (`relay.max_live_buffer_bytes`). Past the bound, stored events are re-read
+    from the database and the oldest ephemeral events are dropped and counted.
+  - No req worker waits on a monitor. Pinned strfry's worker blocks on the
+    monitor for every REQ before sending EOSE.
 - Wok has native, reloadable abuse controls rather than delegating every
   admission decision to a write-policy plugin: IP/pubkey token buckets,
   pre-scan query costing, historical-query concurrency, author storage quotas,
@@ -134,6 +156,18 @@ regression test. Differential parity alone is not a reason to retain it.
   stays readable until the ephemeral purge even once its expiration passes,
   so `wok sync` counts one it does not transfer, in either direction, as
   `expired` or `upload_expired` instead of failing.
+- NIP-01: a REQ over `relay.max_subs_per_connection` is refused with
+  `CLOSED` (`blocked: too many concurrent REQs`) before its history is sent.
+  Pinned strfry sends the history, EOSE, and then a NOTICE, and the
+  subscription is never live.
+- NIP-01: a REQ that reuses an open subscription id replaces it even when the
+  REQ is refused. The old subscription stops at once, and the refusal's CLOSED
+  follows its last EVENT. In pinned strfry a refused REQ leaves the old live
+  filter running, so `CLOSED x` is followed by more `EVENT x`, and an accepted
+  one keeps the old filter live until the new history finishes.
+- COUNT and REQ ids are separate. In pinned strfry a COUNT that reuses an
+  in-flight REQ's id cancels the REQ's history scan, which then never sends
+  EOSE. CLOSE ends only the REQ.
 - NIP-77 network payload hex rejects `0x` prefixes and half bytes.
 - NIP-01 history order: events with the same `created_at` are sent lowest id
   first, so a `limit` that cuts a tie keeps the lowest ids. The pinned strfry

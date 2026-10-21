@@ -35,6 +35,8 @@ or protect it at the reverse proxy. The endpoint is unauthenticated and sends
 | `wok_written_events_total` | counter | none | Events committed to durable storage. |
 | `wok_ephemeral_events_total` | counter | none | Accepted ephemeral events handled by the live/TTL path. |
 | `wok_dup_events_total` | counter | none | Publications already present in the database. |
+| `wok_live_buffer_overflows_total` | counter | none | Subscriptions whose stored matches outgrew `relay.max_live_buffer_bytes` while their history was sent; those are re-read from the database after EOSE instead. |
+| `wok_live_buffer_dropped_ephemeral_total` | counter | none | Ephemeral events dropped, oldest first, from a full live buffer. They cannot be re-read; a steady rate means the bound is too small for the traffic. |
 | `wok_rejected_events_total` | counter | none | Event publications rejected by validation or policy. |
 | `wok_auth_challenges_sent_total` | counter | none | NIP-42 AUTH challenges issued. |
 | `wok_auth_success_total` | counter | none | Successful NIP-42 authentications. |

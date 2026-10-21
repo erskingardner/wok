@@ -355,7 +355,7 @@ fn the_scheduler_reports_completeness_for_reqs_only() {
             .process(
                 &txn,
                 u64::MAX,
-                |_, _, _| {},
+                |_, _, _| true,
                 |sub, _, _, _, completeness| done.push((sub.sub_id.to_string(), completeness)),
             )
             .unwrap();
@@ -368,4 +368,72 @@ fn the_scheduler_reports_completeness_for_reqs_only() {
             ("req".into(), MORE)
         ]
     );
+}
+
+#[test]
+fn an_event_that_did_not_reach_the_reader_gives_up_finish() {
+    let (_dir, env) = store(notes(1, 3, 1_700_000_100));
+    let txn = env.begin_ro().unwrap();
+    for (lost, expected) in [(0u32, FINISH), (1, NEITHER)] {
+        let mut scheduler = QueryScheduler::new(8, 0, 0);
+        scheduler.set_completeness(true);
+        let group = NostrFilterGroup::from_value(&json!({"kinds": [1]}), 500, 3, 16).unwrap();
+        let sub = Subscription::new(1, SubId::new("s").unwrap(), group, false);
+        assert!(scheduler.add_sub(&txn, sub).unwrap());
+        // The relay could not decode this many of the payloads.
+        let mut to_lose = lost;
+        let mut done = None;
+        while scheduler.has_running() {
+            scheduler
+                .process(
+                    &txn,
+                    u64::MAX,
+                    |_, _, _| {
+                        let delivered = to_lose == 0;
+                        to_lose = to_lose.saturating_sub(1);
+                        delivered
+                    },
+                    |_, _, _, _, completeness| done = Some(completeness),
+                )
+                .unwrap();
+        }
+        assert_eq!(done, Some(expected), "{lost} lost");
+    }
+}
+
+#[test]
+fn a_moderation_change_between_slices_says_nothing() {
+    let author = keypair();
+    let (_dir, env) = store(
+        (0..600)
+            .map(|i| event(&author, 1, 1_700_000_000 + i, json!([["t", "x"]]), "n"))
+            .collect(),
+    );
+    let set_ban = |banned: bool| {
+        let mut txn = env.begin_rw().unwrap();
+        if banned {
+            wok_db::moderation::ban_pubkey(&mut txn, &pubkey(&author), "spam").unwrap();
+        } else {
+            wok_db::moderation::unban_pubkey(&mut txn, &pubkey(&author)).unwrap();
+        }
+        txn.commit().unwrap();
+    };
+    // The first slice reads with the author banned, so it sends nothing of
+    // what it covers; after the unban, the rest is sent and the filter runs
+    // out below its limit, though what the first slice hid is now readable.
+    set_ban(true);
+    let mut query = query(json!({"kinds": [1], "#t": ["x"]}), 0);
+    query.set_visibility(ReadVisibility::default());
+    let first = env.begin_ro().unwrap();
+    let mut sent = 0;
+    assert!(
+        !query.process(&first, |_, _| sent += 1, 0).unwrap(),
+        "one slice"
+    );
+    drop(first);
+    set_ban(false);
+    let rest = env.begin_ro().unwrap();
+    while !query.process(&rest, |_, _| sent += 1, u64::MAX).unwrap() {}
+    assert!(sent < 500, "{sent}");
+    assert_eq!(query.completeness(), Completeness::default());
 }

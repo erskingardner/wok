@@ -29,3 +29,4 @@ tokio-tungstenite.workspace = true
 wok-unix = { path = "../wok-unix" }
 wok-ws = { path = "../wok-ws" }
 futures-util = "0.3"
+zstd.workspace = true

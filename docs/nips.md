@@ -62,9 +62,12 @@ it holds, and EOSE has two elements when none does.
   does a match hidden for another pubkey once the connection has
   authenticated, which is why a refusal then says `restricted:`.
 - Neither `finish` nor `more` is sent when a peek runs out of its bound (per
-  REQ, about a hundred event reads and 64 read-policy checks), when AUTH or a
-  reload changed the read policy during the scan, or for a REQ with a
-  `limit: 0` filter unless another filter's peek proves `more`.
+  REQ, about a hundred event reads and 64 read-policy checks), when AUTH, a
+  reload, or a moderation, vanish or deletion commit changed the read policy
+  between the scan's time slices, or for a REQ with a `limit: 0` filter unless
+  another filter's peek proves `more`. `finish` is also withheld when a match
+  could not be sent, such as a compressed payload larger than a lowered
+  `events.max_event_size`.
 
 NIP-67 also says a relay SHOULD include every event of the boundary
 `created_at` in one response. Wok does not, for the same reason as the tie

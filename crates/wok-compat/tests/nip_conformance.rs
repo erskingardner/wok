@@ -1029,6 +1029,56 @@ async fn nip67_auth_waits_for_usable_auth_and_its_challenge() {
     assert_eq!(eose, json!(["EOSE", "mixed", ["auth", "finish"]]));
 }
 
+/// Store `event` straight to LMDB with its payload compressed, as a relay
+/// with a trained dictionary and a larger `events.max_event_size` would have.
+fn store_compressed(env: &wok_db::Env, event: &Value) {
+    let parsed = parse_and_verify_event(event, &EventLimits::default(), None, true, false).unwrap();
+    let json = parsed.json.clone();
+    let mut txn = env.begin_rw().unwrap();
+    let mut events = vec![wok_db::EventToWrite::new(
+        parsed.packed.into_bytes(),
+        parsed.json,
+    )];
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+    let dict = br#"{"content":"xxxxxxxxxxxxxxxx","kind":1,"tags":[]}"#.repeat(32);
+    let dict_id = wok_db::insert_compression_dictionary(&mut txn, &dict).unwrap();
+    let compressed = zstd::bulk::Compressor::with_dictionary(3, &dict)
+        .unwrap()
+        .compress(json.as_bytes())
+        .unwrap();
+    let payload = wok_db::encode_zstd_payload(u32::try_from(dict_id).unwrap(), &compressed);
+    let event_payload = txn.env().dbis().event_payload;
+    txn.put_u64(event_payload, events[0].lev_id, &payload, 0)
+        .unwrap();
+    txn.commit().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip67_no_finish_when_a_stored_event_could_not_be_sent() {
+    // A compressed payload larger than a lowered `events.max_event_size`
+    // cannot be decoded, so the relay skips the event. EOSE must not then
+    // say that every stored match was sent.
+    let relay = Relay::new(|cfg| cfg.events.max_event_size = 65_536);
+    let large = sign_event(json!({
+        "created_at": now() - 10,
+        "kind": 1,
+        "tags": [],
+        "content": "x".repeat(70_000),
+    }));
+    store_compressed(&relay.env, &large);
+    let mut conn = relay.connect().await;
+    let small = publish_notes(&mut conn, 1, 1).await;
+
+    let (events, _, eose) = conn.backfill("s", json!([{"kinds": [1]}])).await;
+    assert_eq!(events, small);
+    assert_eq!(eose, json!(["EOSE", "s"]));
+    // Without the large event, the same REQ is finished.
+    let (_, _, eose) = conn
+        .backfill("t", json!([{"kinds": [1], "since": now() - 5}]))
+        .await;
+    assert_eq!(eose, json!(["EOSE", "t", ["finish"]]));
+}
+
 #[test]
 fn nip62_is_enabled_by_default_and_can_be_disabled() {
     let mut cfg = wok_relay::Config::default();

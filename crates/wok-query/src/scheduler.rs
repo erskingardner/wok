@@ -153,7 +153,7 @@ impl QueryScheduler {
         on_complete: C,
     ) -> Result<(), QueryFailure>
     where
-        F: FnMut(&Subscription, u64, Option<&[u8]>),
+        F: FnMut(&Subscription, u64, Option<&[u8]>) -> bool,
         C: FnMut(&Subscription, u64, Option<String>, bool, Completeness),
     {
         self.process_visible(
@@ -165,6 +165,9 @@ impl QueryScheduler {
         )
     }
 
+    /// Give the first running query a time slice. `on_event` gets each event
+    /// it sends and says whether the event reached the subscriber; a REQ that
+    /// lost one cannot report NIP-67 `finish`.
     pub fn process_visible<F, C, V>(
         &mut self,
         txn: &RoTxn<'_>,
@@ -175,7 +178,7 @@ impl QueryScheduler {
     ) -> Result<(), QueryFailure>
     where
         V: Fn(&Subscription) -> crate::visibility::ReadVisibility,
-        F: FnMut(&Subscription, u64, Option<&[u8]>),
+        F: FnMut(&Subscription, u64, Option<&[u8]>) -> bool,
         C: FnMut(&Subscription, u64, Option<String>, bool, Completeness),
     {
         let Some(idx) = self.running.pop_front() else {
@@ -196,7 +199,8 @@ impl QueryScheduler {
         let result = {
             let q = self.queries[idx].as_mut().unwrap();
             q.set_visibility(visibility(&q.sub));
-            q.process(
+            let mut undelivered = false;
+            let result = q.process(
                 txn,
                 |sub, lev| {
                     let payload = if ensure_exists {
@@ -207,12 +211,19 @@ impl QueryScheduler {
                         None
                     };
                     if ensure_exists && payload.is_none() {
+                        undelivered = true;
                         return;
                     }
-                    on_event(sub, lev, payload);
+                    if !on_event(sub, lev, payload) {
+                        undelivered = true;
+                    }
                 },
                 time_budget_us,
-            )
+            );
+            if undelivered {
+                q.mark_incomplete();
+            }
+            result
         };
         let complete = match result {
             Ok(complete) => complete,

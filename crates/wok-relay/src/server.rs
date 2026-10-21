@@ -3504,13 +3504,17 @@ impl ReqWorker<'_> {
             |sub| read_visibility(cfg, authed.get(&sub.conn_id).cloned().unwrap_or_default()),
             |sub, _lev, payload| {
                 if sub.count_only {
-                    return;
+                    return true;
                 }
-                if let Some(raw) = payload {
-                    if let Ok(json) = decomp.decode(txn, raw, cfg.events.max_event_size) {
-                        conns.send_event(sub.conn_id, &sub.sub_id, sub.generation, json, metrics);
-                    }
-                }
+                // A payload that does not decode, such as a compressed one
+                // larger than a lowered `events.max_event_size`, is skipped.
+                let Some(Ok(json)) =
+                    payload.map(|raw| decomp.decode(txn, raw, cfg.events.max_event_size))
+                else {
+                    return false;
+                };
+                conns.send_event(sub.conn_id, &sub.sub_id, sub.generation, json, metrics);
+                true
             },
             |sub, total, hll, dedup_limited, completeness| {
                 completed = Some(Completed {

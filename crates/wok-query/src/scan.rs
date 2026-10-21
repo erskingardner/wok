@@ -861,8 +861,10 @@ impl DbScan {
 
 /// Most work the NIP-67 peeks of one REQ do, looking past where cut filters
 /// stopped for one more match, in `DbScan::approx_work` units: a refill of
-/// one cursor and about a hundred event reads. A peek that runs out has
-/// learned nothing, and the REQ's EOSE carries neither `finish` nor `more`.
+/// one cursor and about a hundred event reads. The peek that spends the last
+/// of it may overrun it by one cursor refill; later ones do no work. A peek
+/// that runs out has learned nothing, and the REQ's EOSE carries neither
+/// `finish` nor `more`.
 const PEEK_WORK: u64 = 2048;
 /// Most candidates those peeks check the read policy of.
 const PEEK_CANDIDATES: u32 = 64;
@@ -919,9 +921,12 @@ pub struct DbQuery {
     unknown: bool,
     restricted: bool,
     peek_budget: PeekBudget,
-    /// The read policy changed between time slices, after an AUTH or a
-    /// reload, so earlier slices hid or sent by another.
+    /// The read policy changed between time slices, after an AUTH, a reload
+    /// or a moderation, vanish or deletion commit, so earlier slices hid or
+    /// sent by another.
     visibility_changed: bool,
+    /// The database's visibility generation the first slice read under.
+    policy_generation: Option<u64>,
     started: bool,
 }
 
@@ -983,6 +988,7 @@ impl DbQuery {
                 candidates: PEEK_CANDIDATES,
             },
             visibility_changed: false,
+            policy_generation: None,
             started: false,
         }
     }
@@ -1036,6 +1042,12 @@ impl DbQuery {
         }
     }
 
+    /// An event the scan counted as sent did not reach the reader (its
+    /// payload could not be read or decoded), so `finish` would be wrong.
+    pub fn mark_incomplete(&mut self) {
+        self.unknown = true;
+    }
+
     fn note(&mut self, peek: Peek) {
         match peek {
             Peek::Found(lev_id) => self.witnesses.push(lev_id),
@@ -1075,6 +1087,10 @@ impl DbQuery {
         restricted: &mut bool,
         budget: &mut PeekBudget,
     ) -> Result<Peek, wok_db::DbError> {
+        // Resuming would settle the stopped cursor, a refill, for nothing.
+        if budget.work == 0 || budget.candidates == 0 {
+            return Ok(Peek::Unknown);
+        }
         let (start, work) = (scanner.approx_work, budget.work);
         let mut found = None;
         let mut out_of_candidates = false;
@@ -1154,6 +1170,15 @@ impl DbQuery {
     where
         F: FnMut(&Subscription, u64),
     {
+        if self.completeness {
+            // Moderation, vanish and deletion commits change what a slice
+            // may send without changing `visibility`.
+            let generation = wok_db::state::policy_generation(txn).ok();
+            if generation.is_none() || (self.started && generation != self.policy_generation) {
+                self.visibility_changed = true;
+            }
+            self.policy_generation = generation;
+        }
         self.started = true;
         if self.all_filters_search {
             let mut group = match self.search_group.take() {

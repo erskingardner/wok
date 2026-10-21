@@ -7,9 +7,10 @@
 //! REQ and COUNT a generation, in client order, and moves the gate as it
 //! handles the client's REQ, COUNT and CLOSE. A producer's frame is queued only
 //! while its generation is the id's current one, and that check runs under the
-//! connection table's lock, the same lock every frame is queued under. So no
-//! frame of a replaced or closed generation follows the change, and a CLOSED is
-//! the last frame of its generation, whatever order the producers run in.
+//! connection's lock in the connection table, the same lock every frame for
+//! the connection is queued under. So no frame of a replaced or closed
+//! generation follows the change, and a CLOSED is the last frame of its
+//! generation, whatever order the producers run in.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

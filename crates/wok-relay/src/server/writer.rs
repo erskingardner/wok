@@ -19,6 +19,8 @@ pub(super) fn run_writer(
     let mut maintenance_cursor = Vec::new();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
     let mut events: Vec<EventToWrite<u64>> = Vec::with_capacity(256);
+    // Bytes of committed events the req monitors still hold.
+    let stored_in_flight = Arc::new(AtomicUsize::new(0));
     let mut stop = false;
     while !stop {
         let Ok(msg) = rx.recv() else { break };
@@ -258,7 +260,7 @@ pub(super) fn run_writer(
                         let id_hex = PackedEventView::new(&packed)
                             .map(|event| to_hex(event.id()))
                             .unwrap_or_else(|_| "?".into());
-                        broadcast_ephemeral(&mon_txs, &packed, &json);
+                        broadcast_ephemeral(&mon_txs, HeldEvent { packed, json });
                         metrics
                             .ephemeral_events_total
                             .fetch_add(1, Ordering::Relaxed);
@@ -455,7 +457,7 @@ pub(super) fn run_writer(
                 &metrics,
             );
         }
-        broadcast_db_change(&mon_txs);
+        broadcast_stored(&mon_txs, &stored_in_flight, &mut events);
     }
 }
 

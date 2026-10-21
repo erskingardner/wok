@@ -237,6 +237,12 @@ impl QueryScheduler {
         !self.running.is_empty()
     }
 
+    /// The query the next `process` call gives a time slice to.
+    pub fn next_query(&self) -> Option<&Subscription> {
+        let idx = *self.running.front()?;
+        self.queries[idx].as_ref().map(|q| &q.sub)
+    }
+
     pub fn set_max_subs_per_connection(&mut self, maximum: usize) {
         self.max_subs_per_connection = maximum;
     }

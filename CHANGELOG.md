@@ -160,6 +160,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remove and reconnect storms grew quadratically. Matching an event no longer
   allocates per tag or per candidate, and it skips filters that cannot take
   the event's kind.
+- Frames for different connections are queued under per-connection locks
+  instead of one relay-wide lock, so live fan-out to many connections no
+  longer serializes on it.
+- A REQ queued behind CLOSEs, AUTH or disconnects no longer waits a query time
+  slice for each of them while other queries run. The req worker now takes
+  everything queued in one pass, and starts each new REQ or COUNT as it takes
+  it. While new REQs keep coming, running queries still get a slice after
+  each stretch of new work as long as their last slice.
+- Live delivery does less work per event: the writer hands each commit's
+  events to the req monitors instead of each monitor reading them back.
 
 ### Removed
 

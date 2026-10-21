@@ -25,15 +25,16 @@ use parking_lot::Mutex;
 use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 use wok_db::{
     backfill_vanish_markers, is_event_vanished_ro, load_moderation_snapshot_ro,
     lookup_event_by_id_ro, moderation_reason_ignoring_author_ro, moderation_reason_ro,
     most_recent_levid_ro, report_event, sweep_vanished_events, Decompressor, Env, EventToWrite,
-    EventWriteStatus, ModerationSnapshot, MAX_MODERATION_RECORDS, MAX_REASON_BYTES, VANISH_KIND,
+    EventWriteStatus, ModerationSnapshot, SearchTermSet, MAX_MODERATION_RECORDS, MAX_REASON_BYTES,
+    VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, AUTH_CHALLENGE_LEN, AUTH_KIND,
@@ -155,66 +156,114 @@ enum OutboundSendError {
 /// A connection's outbound queue and the gate in front of it.
 struct ConnEntry {
     out: Outbound,
-    subs: SubGate,
+    /// Held while a frame is queued for the connection, together with the
+    /// gate check that admits it.
+    state: Mutex<ConnState>,
 }
 
-/// Every frame for every connection is queued here, under one lock. That lock
-/// also guards each connection's subscription gate (see `sub_gate`), so a
-/// subscription frame is checked against its generation and queued in one
-/// step, ordered against the ingester's REQ, COUNT, CLOSE and refusals.
+struct ConnState {
+    subs: SubGate,
+    /// The connection was removed, or terminated for a failed send: nothing
+    /// more is queued for it, even by a producer that found it just before.
+    gone: bool,
+}
+
+impl ConnState {
+    /// Queue a frame, terminating the connection if it is over its
+    /// pending-bytes budget (C++ slow-client termination).
+    fn push(
+        &mut self,
+        out: &Outbound,
+        payload: String,
+        generation: Option<(Current, u64)>,
+        metrics: &Metrics,
+    ) {
+        if let Err(error) = out.try_send(payload, generation) {
+            if error == OutboundSendError::OverByteLimit {
+                metrics
+                    .slow_client_terminations
+                    .fetch_add(1, Ordering::Relaxed);
+                out.kill();
+            }
+            self.gone = true;
+        }
+    }
+}
+
+/// Connections are looked up in this many independently locked shards, so
+/// producers working for different connections rarely meet on a lock.
+const CONN_SHARDS: usize = 64;
+
+type ConnShard = parking_lot::RwLock<HashMap<u64, Arc<ConnEntry>>>;
+
+/// Every frame for a connection is queued under that connection's own lock,
+/// which also guards its subscription gate (see `sub_gate`). So a subscription
+/// frame is checked against its generation and queued in one step, ordered
+/// against the ingester's REQ, COUNT, CLOSE and refusals, while frames for
+/// other connections go ahead in parallel. A shard lock is only held to find
+/// the connection, never while its own lock is taken.
 struct ConnTable {
-    map: Mutex<HashMap<u64, ConnEntry>>,
+    shards: Box<[ConnShard]>,
 }
 
 impl ConnTable {
     fn new() -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            shards: (0..CONN_SHARDS)
+                .map(|_| parking_lot::RwLock::new(HashMap::new()))
+                .collect(),
         }
-    }
-    fn insert(&self, id: u64, out: Outbound) {
-        self.map.lock().insert(
-            id,
-            ConnEntry {
-                out,
-                subs: SubGate::default(),
-            },
-        );
-    }
-    fn remove(&self, id: u64) {
-        self.map.lock().remove(&id);
     }
 
-    /// Queue a frame, terminating the connection if it is over its
-    /// pending-bytes budget (C++ slow-client termination).
-    fn push(
-        map: &mut HashMap<u64, ConnEntry>,
-        conn_id: u64,
-        payload: String,
-        generation: Option<(Current, u64)>,
-        metrics: &Metrics,
-    ) {
-        let Some(entry) = map.get(&conn_id) else {
-            return;
-        };
-        if let Err(error) = entry.out.try_send(payload, generation) {
-            if error == OutboundSendError::OverByteLimit {
-                metrics
-                    .slow_client_terminations
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if let Some(entry) = map.remove(&conn_id) {
-                if error == OutboundSendError::OverByteLimit {
-                    entry.out.kill();
-                }
-            }
+    fn shard(&self, id: u64) -> &ConnShard {
+        &self.shards[id as usize % self.shards.len()]
+    }
+
+    fn entry(&self, id: u64) -> Option<Arc<ConnEntry>> {
+        self.shard(id).read().get(&id).cloned()
+    }
+
+    fn insert(&self, id: u64, out: Outbound) {
+        let entry = Arc::new(ConnEntry {
+            out,
+            state: Mutex::new(ConnState {
+                subs: SubGate::default(),
+                gone: false,
+            }),
+        });
+        self.shard(id).write().insert(id, entry);
+    }
+
+    fn remove(&self, id: u64) {
+        let entry = self.shard(id).write().remove(&id);
+        if let Some(entry) = entry {
+            entry.state.lock().gone = true;
         }
+    }
+
+    /// Run `f` under the connection's lock, unless it is gone. A connection
+    /// that `f` terminated is dropped from the table afterwards.
+    fn with<R>(&self, id: u64, f: impl FnOnce(&Outbound, &mut ConnState) -> R) -> Option<R> {
+        let entry = self.entry(id)?;
+        let mut state = entry.state.lock();
+        if state.gone {
+            return None;
+        }
+        let result = f(&entry.out, &mut state);
+        let gone = state.gone;
+        drop(state);
+        if gone {
+            self.shard(id).write().remove(&id);
+        }
+        Some(result)
     }
 
     /// Deliver a frame that belongs to no subscription (OK, NOTICE, AUTH,
     /// NEG-*), or a CLOSED for an id the relay never held.
     fn deliver(&self, conn_id: u64, payload: String, metrics: &Metrics) {
-        Self::push(&mut self.map.lock(), conn_id, payload, None, metrics);
+        self.with(conn_id, |out, state| {
+            state.push(out, payload, None, metrics);
+        });
     }
 
     fn send(&self, id: u64, msg: RelayMessage, metrics: &Metrics) {
@@ -226,15 +275,14 @@ impl ConnTable {
     /// The ingester admitted a REQ or COUNT: from now on only frames of
     /// `generation` pass for the id.
     fn open_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId, generation: u64) {
-        if let Some(entry) = self.map.lock().get_mut(&conn_id) {
-            entry.subs.open(ns, sub_id, generation);
-        }
+        self.with(conn_id, |_, state| state.subs.open(ns, sub_id, generation));
     }
 
     /// CLOSE, or a REQ that names the id and fails before refusal (no CLOSED
     /// owed). Returns the generation it closed, for the workers' cleanup.
     fn close_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> Option<u64> {
-        self.map.lock().get_mut(&conn_id)?.subs.close(ns, sub_id)
+        self.with(conn_id, |_, state| state.subs.close(ns, sub_id))
+            .flatten()
     }
 
     /// Refuse a REQ or COUNT: close its id and queue the CLOSED in one step,
@@ -250,28 +298,24 @@ impl ConnTable {
         let msg = RelayMessage::closed_error(sub_id, reason);
         bump_relay_metrics(&msg, metrics);
         let json = msg.to_json();
-        let mut map = self.map.lock();
-        let closed = match (map.get_mut(&conn_id), SubId::new(sub_id)) {
-            (Some(entry), Ok(sub_id)) => entry.subs.close(ns, &sub_id),
-            _ => None,
-        };
-        Self::push(&mut map, conn_id, json, None, metrics);
-        closed
+        let sub_id = SubId::new(sub_id).ok();
+        self.with(conn_id, |out, state| {
+            let closed = sub_id.and_then(|sub_id| state.subs.close(ns, &sub_id));
+            state.push(out, json, None, metrics);
+            closed
+        })
+        .flatten()
     }
 
     /// Open REQ subscriptions (pending or live) or COUNTs on a connection.
     fn open_count(&self, conn_id: u64, ns: Ns) -> usize {
-        self.map
-            .lock()
-            .get(&conn_id)
-            .map_or(0, |entry| entry.subs.len(ns))
+        self.with(conn_id, |_, state| state.subs.len(ns))
+            .unwrap_or(0)
     }
 
     fn is_open(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> bool {
-        self.map
-            .lock()
-            .get(&conn_id)
-            .is_some_and(|entry| entry.subs.is_open(ns, sub_id))
+        self.with(conn_id, |_, state| state.subs.is_open(ns, sub_id))
+            .unwrap_or(false)
     }
 
     /// Queue a frame of one generation of a subscription, if that generation
@@ -285,22 +329,14 @@ impl ConnTable {
         payload: String,
         metrics: &Metrics,
     ) -> bool {
-        let mut map = self.map.lock();
-        let Some(current) = map
-            .get(&conn_id)
-            .and_then(|entry| entry.subs.admit(ns, sub_id, generation))
-            .cloned()
-        else {
-            return false;
-        };
-        Self::push(
-            &mut map,
-            conn_id,
-            payload,
-            Some((current, generation)),
-            metrics,
-        );
-        true
+        self.with(conn_id, |out, state| {
+            let Some(current) = state.subs.admit(ns, sub_id, generation).cloned() else {
+                return false;
+            };
+            state.push(out, payload, Some((current, generation)), metrics);
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// A subscription frame that the generation goes on after (EOSE).
@@ -330,16 +366,14 @@ impl ConnTable {
         metrics: &Metrics,
     ) {
         let json = msg.to_json();
-        let mut map = self.map.lock();
-        let Some(entry) = map.get_mut(&conn_id) else {
-            return;
-        };
-        if entry.subs.admit(ns, sub_id, generation).is_none() {
-            return;
-        }
-        entry.subs.close(ns, sub_id);
-        bump_relay_metrics(&msg, metrics);
-        Self::push(&mut map, conn_id, json, None, metrics);
+        self.with(conn_id, |out, state| {
+            if state.subs.admit(ns, sub_id, generation).is_none() {
+                return;
+            }
+            state.subs.close(ns, sub_id);
+            bump_relay_metrics(&msg, metrics);
+            state.push(out, json, None, metrics);
+        });
     }
 
     /// Build the EVENT frame once (pre-sized) and queue it.
@@ -351,6 +385,19 @@ impl ConnTable {
         ev_json: &str,
         metrics: &Metrics,
     ) {
+        if self.queue_event(conn_id, sub_id, generation, ev_json, metrics) {
+            metrics.relay_event.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn queue_event(
+        &self,
+        conn_id: u64,
+        sub_id: &SubId,
+        generation: u64,
+        ev_json: &str,
+        metrics: &Metrics,
+    ) -> bool {
         let sub = sub_id.as_str();
         let mut payload = String::with_capacity(sub.len() + ev_json.len() + 12);
         payload.push_str("[\"EVENT\",\"");
@@ -358,14 +405,23 @@ impl ConnTable {
         payload.push_str("\",");
         payload.push_str(ev_json);
         payload.push(']');
-        if self.push_sub(conn_id, Ns::Req, sub_id, generation, payload, metrics) {
-            metrics.relay_event.fetch_add(1, Ordering::Relaxed);
-        }
+        self.push_sub(conn_id, Ns::Req, sub_id, generation, payload, metrics)
     }
 
+    /// One event for many subscriptions. The shared counter is bumped once,
+    /// not once per frame, so monitors fanning out to many connections do
+    /// not contend on it.
     fn send_event_batch(&self, recipients: &[(u64, SubId, u64)], ev_json: &str, metrics: &Metrics) {
-        for (conn, sub, generation) in recipients {
-            self.send_event(*conn, sub, *generation, ev_json, metrics);
+        let queued = recipients
+            .iter()
+            .filter(|(conn, sub, generation)| {
+                self.queue_event(*conn, sub, *generation, ev_json, metrics)
+            })
+            .count();
+        if queued != 0 {
+            metrics
+                .relay_event
+                .fetch_add(queued as u64, Ordering::Relaxed);
         }
     }
 }
@@ -684,9 +740,51 @@ enum MonitorMsg {
 
 /// What a req monitor matches, on its bounded data queue.
 enum MonitorData {
+    /// Events were stored that the monitor may not have been handed: match
+    /// everything newer than what it matched, read from LMDB.
     DbChange,
-    Ephemeral { packed: Vec<u8>, json: String },
+    /// Events the writer just committed, shared by every monitor.
+    Stored(Arc<StoredBatch>),
+    /// A live-only event, shared by every monitor.
+    Ephemeral(Arc<HeldEvent>),
 }
+
+/// The events one writer commit stored, handed to the req monitors as they
+/// were written, so that no monitor reads them back from LMDB.
+struct StoredBatch {
+    /// The commit stored local event ids `first..=last`, every one of them
+    /// in `events`, in order.
+    first: u64,
+    last: u64,
+    events: Vec<StoredEvent>,
+    /// This batch's share of the writer's hand-off budget, returned when the
+    /// last monitor drops it.
+    bytes: usize,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for StoredBatch {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+struct StoredEvent {
+    lev_id: u64,
+    packed: Vec<u8>,
+    /// The stored payload, as the writer stored it.
+    json: String,
+    /// Tokenized once, by the first monitor with a search filter it may match.
+    /// Whether the event is still stored and visible depends on each
+    /// monitor's read, so every monitor checks that itself.
+    search_terms: OnceLock<SearchTermSet>,
+}
+
+/// Most bytes of committed events handed to the req monitors that a monitor
+/// still holds. Past it the writer sends `DbChange` instead and the monitors
+/// read the commit from LMDB, so a monitor that falls behind holds no more
+/// than this.
+const STORED_HANDOFF_BYTES: usize = 16 << 20;
 
 enum NegMsg {
     Open {
@@ -1012,7 +1110,7 @@ impl RelayHandle {
     /// stalled worker would. For transport tests.
     #[doc(hidden)]
     pub fn set_ingress_paused(&self, conn_id: u64, paused: bool) {
-        if let Some(entry) = self.conns.map.lock().get(&conn_id) {
+        if let Some(entry) = self.conns.entry(conn_id) {
             entry.out.gate.send_replace(!paused);
         }
     }
@@ -1306,12 +1404,56 @@ fn broadcast_db_change(mon_txs: &[Sender<MonitorData>]) {
     }
 }
 
-fn broadcast_ephemeral(mon_txs: &[Sender<MonitorData>], packed: &[u8], json: &str) {
+fn broadcast_ephemeral(mon_txs: &[Sender<MonitorData>], event: HeldEvent) {
+    let event = Arc::new(event);
     for tx in mon_txs {
-        let _ = tx.send(MonitorData::Ephemeral {
-            packed: packed.to_vec(),
-            json: json.to_string(),
-        });
+        let _ = tx.send(MonitorData::Ephemeral(event.clone()));
+    }
+}
+
+/// Hand the events a commit wrote to every req monitor, taking them out of
+/// `events`. Over the hand-off budget, or for ids it cannot vouch for, it
+/// sends `DbChange` instead.
+fn broadcast_stored<C>(
+    mon_txs: &[Sender<MonitorData>],
+    in_flight: &Arc<AtomicUsize>,
+    events: &mut Vec<EventToWrite<C>>,
+) {
+    // Ids are allocated in write order, one per written event.
+    let stored: Vec<StoredEvent> = events
+        .drain(..)
+        .filter(|event| event.status == EventWriteStatus::Written)
+        .map(|event| StoredEvent {
+            lev_id: event.lev_id,
+            packed: event.packed,
+            json: event.json,
+            search_terms: OnceLock::new(),
+        })
+        .collect();
+    let (Some(first), Some(last)) = (stored.first(), stored.last()) else {
+        return;
+    };
+    let (first, last) = (first.lev_id, last.lev_id);
+    let bytes = stored
+        .iter()
+        .map(|event| event.packed.len() + event.json.len())
+        .sum::<usize>();
+    let contiguous = last.checked_sub(first) == Some(stored.len() as u64 - 1);
+    if !contiguous || in_flight.load(Ordering::Relaxed).saturating_add(bytes) > STORED_HANDOFF_BYTES
+    {
+        broadcast_db_change(mon_txs);
+        return;
+    }
+    in_flight.fetch_add(bytes, Ordering::Relaxed);
+    let batch = Arc::new(StoredBatch {
+        first,
+        last,
+        events: stored,
+        bytes,
+        in_flight: in_flight.clone(),
+    });
+    for tx in mon_txs {
+        let _ = tx.send(MonitorData::Stored(batch.clone()));
     }
 }
 
@@ -3056,6 +3198,100 @@ mod fault {
     }
 }
 
+/// The order a req worker gives time slices in, recorded per database path
+/// once a test asks for it.
+#[cfg(test)]
+mod trace {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// The sub id of each query given a slice, and how long the slice took.
+    type Log = Vec<(String, Duration)>;
+
+    /// Per traced database.
+    static LOGS: Mutex<Vec<(PathBuf, Log)>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(path: &Path) {
+        let mut logs = LOGS.lock().unwrap();
+        logs.retain(|(p, _)| p != path);
+        logs.push((path.to_path_buf(), Vec::new()));
+    }
+
+    pub(super) fn slice(path: &Path, sub_id: Option<String>, took: Duration) {
+        let mut logs = LOGS.lock().unwrap();
+        if let (Some((_, log)), Some(sub_id)) = (logs.iter_mut().find(|(p, _)| p == path), sub_id) {
+            log.push((sub_id, took));
+        }
+    }
+
+    pub(super) fn log(path: &Path) -> Log {
+        let logs = LOGS.lock().unwrap();
+        logs.iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, log)| log.clone())
+            .unwrap_or_default()
+    }
+
+    /// The sub ids given slices, in order.
+    pub(super) fn slices(path: &Path) -> Vec<String> {
+        log(path).into_iter().map(|(sub_id, _)| sub_id).collect()
+    }
+}
+
+/// Most messages a req worker takes from its queue in one pass, which bounds
+/// how long its read transaction stays open.
+const REQ_PASS_MAX: usize = 64;
+
+/// How a req worker splits its time between the queries already running and
+/// the new REQs and COUNTs waiting for it. The running queries get a slice
+/// when nothing is waiting, or once the new queries' first slices since their
+/// last slice have taken as long as that slice did. It is checked before each
+/// first slice and at the end of each pass, so new queries go first, and
+/// however many keep coming, each stretch of new work as long as the running
+/// queries' last slice (overrun by at most one first slice) is followed by a
+/// slice of theirs: about half the worker when the two take similar time.
+struct RunningShare {
+    /// When the running queries' last slice ended, or they started waiting.
+    since: std::time::Instant,
+    /// How long that slice took.
+    took: Duration,
+}
+
+impl RunningShare {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            since: now,
+            took: Duration::ZERO,
+        }
+    }
+
+    fn due(&self, waiting: bool, now: std::time::Instant) -> bool {
+        !waiting || now.saturating_duration_since(self.since) >= self.took
+    }
+
+    fn ran(&mut self, started: std::time::Instant, ended: std::time::Instant) {
+        self.took = ended.saturating_duration_since(started);
+        self.since = ended;
+    }
+
+    /// Give the running queries their slice, timing it.
+    fn slice(&mut self, slice: impl FnOnce()) {
+        let started = std::time::Instant::now();
+        slice();
+        self.ran(started, std::time::Instant::now());
+    }
+}
+
+/// A req worker pass takes every message already queued (up to `REQ_PASS_MAX`)
+/// and applies them in order under one read transaction. Cancels, AUTH and
+/// teardown cost no query time. Each new REQ or COUNT is scheduled and given
+/// its first slice at once, so a small one is answered within the pass, before
+/// the messages behind it. strfry's ReqWorker drains its inbox the same way.
+///
+/// The running query that has waited longest gets a slice ahead of a new
+/// query whenever its share is due, and at the end of the pass unless more
+/// messages are waiting and it is not (see `RunningShare`).
 fn run_req_worker(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -3073,44 +3309,50 @@ fn run_req_worker(
     drop(initial_cfg);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut decomp = Decompressor::new();
-    // A REQ or COUNT that will send no (more) history: its CLOSED goes through
-    // the gate as the generation's last frame, and a REQ's registration with
-    // the monitor is dropped.
-    let refuse = |conn_id: u64, sub_id: SubId, generation: u64, count_only: bool, reason: &str| {
-        let ns = if count_only { Ns::Count } else { Ns::Req };
-        let closed = RelayMessage::closed_error(sub_id.as_str(), reason);
-        conns.send_last(conn_id, ns, &sub_id, generation, closed, &metrics);
-        if !count_only {
-            let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::Remove {
-                conn_id,
-                sub_id,
-                generation,
-            });
-        }
+    let mut pass = Vec::with_capacity(REQ_PASS_MAX);
+    let worker = ReqWorker {
+        conns: &conns,
+        metrics: &metrics,
+        mon_txs: &mon_txs,
     };
-    loop {
-        let msg = if queries.has_running() {
-            match rx.try_recv() {
-                Ok(m) => Some(m),
-                Err(crossbeam_channel::TryRecvError::Empty) => None,
-                Err(_) => break,
-            }
-        } else {
+    let mut share = RunningShare::new(std::time::Instant::now());
+    let mut open = true;
+    while open {
+        if !queries.has_running() {
             match rx.recv() {
-                Ok(m) => Some(m),
+                Ok(msg) => pass.push(msg),
                 Err(_) => break,
             }
-        };
-        let cfg_snap = cfg.read();
-        queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
-        queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
-        queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
-        // Without a read transaction a REQ or COUNT is refused rather than
-        // dropped: a registered REQ would otherwise never get EOSE or CLOSED.
+            share = RunningShare::new(std::time::Instant::now());
+        }
+        while pass.len() < REQ_PASS_MAX {
+            match rx.try_recv() {
+                Ok(msg) => pass.push(msg),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                // Answer what was taken, then stop: running queries are
+                // not finished for a relay that is shutting down.
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    open = false;
+                    break;
+                }
+            }
+        }
+        {
+            let cfg_snap = cfg.read();
+            queries.set_max_subs_per_connection(
+                cfg_snap.relay.abuse.max_concurrent_historical_queries,
+            );
+            queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
+            queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
+        }
+        // Opened after the messages were taken, so it sees everything up to
+        // each REQ's snapshot, fixed at admission before the REQ was queued.
+        // Without it a REQ or COUNT is refused rather than dropped: a
+        // registered REQ would otherwise never get EOSE or CLOSED.
         let txn = begin_read(&env)
             .inspect_err(|error| tracing::warn!(%error, "req worker cannot read the database"))
             .ok();
-        if let Some(msg) = msg {
+        for msg in pass.drain(..) {
             match msg {
                 ReqMsg::Scan(sub) | ReqMsg::Count(sub) => {
                     let (conn, sub_id, generation, count_only) = (
@@ -3120,16 +3362,44 @@ fn run_req_worker(
                         sub.count_only,
                     );
                     let reason = match &txn {
-                        Some(txn) => match queries.add_sub(txn, sub) {
-                            Ok(true) => None,
-                            Ok(false) => {
-                                metrics
-                                    .abuse_query_concurrency_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
-                                Some("rate-limited: too many concurrent historical queries")
+                        Some(txn) => {
+                            if queries.has_running() && share.due(true, std::time::Instant::now()) {
+                                let cfg_snap = cfg.read();
+                                share.slice(|| {
+                                    worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp)
+                                });
                             }
-                            Err(_) => Some("error: history scan could not start"),
-                        },
+                            // With nothing running, this slice starts the share.
+                            let idle = !queries.has_running();
+                            match queries.add_sub(txn, sub) {
+                                Ok(true) => {
+                                    // The new query is first in the run queue.
+                                    let cfg_snap = cfg.read();
+                                    let mut first = || {
+                                        worker.slice(
+                                            &mut queries,
+                                            txn,
+                                            &cfg_snap,
+                                            &authed,
+                                            &mut decomp,
+                                        )
+                                    };
+                                    if idle {
+                                        share.slice(first);
+                                    } else {
+                                        first();
+                                    }
+                                    None
+                                }
+                                Ok(false) => {
+                                    metrics
+                                        .abuse_query_concurrency_rejections
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    Some("rate-limited: too many concurrent historical queries")
+                                }
+                                Err(_) => Some("error: history scan could not start"),
+                            }
+                        }
                         None => {
                             // The query this one replaces ends with it, as
                             // `add_sub` would have ended it.
@@ -3138,7 +3408,7 @@ fn run_req_worker(
                         }
                     };
                     if let Some(reason) = reason {
-                        refuse(conn, sub_id, generation, count_only, reason);
+                        worker.refuse(conn, sub_id, generation, count_only, reason);
                     }
                 }
                 ReqMsg::SetAuth {
@@ -3164,34 +3434,77 @@ fn run_req_worker(
                 }
             }
         }
-        let Some(txn) = txn else {
-            continue;
-        };
-        let mut completed: Vec<Completed> = Vec::new();
+        if let Some(txn) = &txn {
+            let waiting = !rx.is_empty();
+            if open && queries.has_running() && share.due(waiting, std::time::Instant::now()) {
+                let cfg_snap = cfg.read();
+                share.slice(|| worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp));
+            }
+        }
+    }
+}
+
+/// What a req worker delivers to.
+struct ReqWorker<'a> {
+    conns: &'a ConnTable,
+    metrics: &'a Metrics,
+    mon_txs: &'a [Sender<MonitorMsg>],
+}
+
+impl ReqWorker<'_> {
+    /// A REQ or COUNT that will send no (more) history: its CLOSED goes through
+    /// the gate as the generation's last frame, and a REQ's registration with
+    /// the monitor is dropped.
+    fn refuse(&self, conn_id: u64, sub_id: SubId, generation: u64, count_only: bool, reason: &str) {
+        let ns = if count_only { Ns::Count } else { Ns::Req };
+        let closed = RelayMessage::closed_error(sub_id.as_str(), reason);
+        self.conns
+            .send_last(conn_id, ns, &sub_id, generation, closed, self.metrics);
+        if !count_only {
+            let _ = route_tx(self.mon_txs, conn_id).send(MonitorMsg::Remove {
+                conn_id,
+                sub_id,
+                generation,
+            });
+        }
+    }
+
+    /// Give the first query in the run queue one time slice, and answer it if
+    /// that finished it.
+    fn slice(
+        &self,
+        queries: &mut QueryScheduler,
+        txn: &wok_db::RoTxn<'_>,
+        cfg: &Config,
+        authed: &HashMap<u64, Vec<[u8; 32]>>,
+        decomp: &mut Decompressor,
+    ) {
+        #[cfg(test)]
+        let traced = (
+            queries.next_query().map(|sub| sub.sub_id.to_string()),
+            std::time::Instant::now(),
+        );
+        let (conns, metrics) = (self.conns, self.metrics);
+        let mut completed: Option<Completed> = None;
         // Events are framed and delivered inside the scan callback: no
         // per-event Subscription clone, no intermediate collection, and the
         // payload JSON is copied exactly once (into the frame).
         let scanned = queries.process_visible(
-            &txn,
-            cfg_snap.relay.query_timeslice_budget_us,
-            |sub| {
-                read_visibility(
-                    &cfg_snap,
-                    authed.get(&sub.conn_id).cloned().unwrap_or_default(),
-                )
-            },
+            txn,
+            cfg.relay.query_timeslice_budget_us,
+            |sub| read_visibility(cfg, authed.get(&sub.conn_id).cloned().unwrap_or_default()),
             |sub, _lev, payload| {
                 if sub.count_only {
                     return;
                 }
                 if let Some(raw) = payload {
-                    if let Ok(json) = decomp.decode(&txn, raw, cfg_snap.events.max_event_size) {
-                        conns.send_event(sub.conn_id, &sub.sub_id, sub.generation, json, &metrics);
+                    if let Ok(json) = decomp.decode(txn, raw, cfg.events.max_event_size) {
+                        conns.send_event(sub.conn_id, &sub.sub_id, sub.generation, json, metrics);
                     }
                 }
             },
             |sub, total, hll, dedup_limited| {
-                completed.push(Completed {
+                completed = Some(Completed {
                     conn_id: sub.conn_id,
                     sub_id: sub.sub_id.clone(),
                     generation: sub.generation,
@@ -3203,7 +3516,8 @@ fn run_req_worker(
                 });
             },
         );
-        drop(txn);
+        #[cfg(test)]
+        trace::slice(txn.env().path(), traced.0, traced.1.elapsed());
         if let Err(failure) = scanned {
             tracing::warn!(
                 conn_id = failure.sub.conn_id,
@@ -3212,7 +3526,7 @@ fn run_req_worker(
                 "historical query failed"
             );
             let sub = failure.sub;
-            refuse(
+            self.refuse(
                 sub.conn_id,
                 sub.sub_id,
                 sub.generation,
@@ -3220,46 +3534,47 @@ fn run_req_worker(
                 "error: history scan failed",
             );
         }
-        for done in completed {
-            tracing::debug!(
-                conn_id = done.conn_id,
-                sub_id = %done.sub_id,
-                count_only = done.count_only,
-                matched_events = done.total,
-                hll = done.hll.is_some(),
-                "historical query completed"
-            );
-            if done.count_only {
-                let mut count = done.total;
-                let mut limited = done.dedup_limited;
-                if count > cfg_snap.relay.max_filter_limit_count {
-                    count = cfg_snap.relay.max_filter_limit_count;
-                    limited = true;
-                }
-                let reply = RelayMessage::Count {
-                    sub_id: done.sub_id.to_string(),
-                    count,
-                    limited,
-                    hll: if limited { None } else { done.hll },
-                };
-                conns.send_last(
-                    done.conn_id,
-                    Ns::Count,
-                    &done.sub_id,
-                    done.generation,
-                    reply,
-                    &metrics,
-                );
-            } else {
-                // The monitor sends EOSE and goes live. No reply is awaited,
-                // so a busy monitor never holds up other queries here.
-                let _ = route_tx(&mon_txs, done.conn_id).send(MonitorMsg::HistoryDone {
-                    conn_id: done.conn_id,
-                    sub_id: done.sub_id,
-                    generation: done.generation,
-                    snapshot: done.snapshot,
-                });
+        let Some(done) = completed else {
+            return;
+        };
+        tracing::debug!(
+            conn_id = done.conn_id,
+            sub_id = %done.sub_id,
+            count_only = done.count_only,
+            matched_events = done.total,
+            hll = done.hll.is_some(),
+            "historical query completed"
+        );
+        if done.count_only {
+            let mut count = done.total;
+            let mut limited = done.dedup_limited;
+            if count > cfg.relay.max_filter_limit_count {
+                count = cfg.relay.max_filter_limit_count;
+                limited = true;
             }
+            let reply = RelayMessage::Count {
+                sub_id: done.sub_id.to_string(),
+                count,
+                limited,
+                hll: if limited { None } else { done.hll },
+            };
+            conns.send_last(
+                done.conn_id,
+                Ns::Count,
+                &done.sub_id,
+                done.generation,
+                reply,
+                metrics,
+            );
+        } else {
+            // The monitor sends EOSE and goes live. No reply is awaited, so a
+            // busy monitor never holds up other queries here.
+            let _ = route_tx(self.mon_txs, done.conn_id).send(MonitorMsg::HistoryDone {
+                conn_id: done.conn_id,
+                sub_id: done.sub_id,
+                generation: done.generation,
+                snapshot: done.snapshot,
+            });
         }
     }
 }
@@ -3460,10 +3775,13 @@ fn run_req_monitor(
             Err(error) => {
                 // Subscription changes are sent once, so keep them and retry
                 // shortly; a lost one would leave a REQ without EOSE or
-                // CLOSED. One DbChange is enough: the next scan resumes from
-                // the same cursor. Live-only events are dropped.
+                // CLOSED. One DbChange is enough, for handed-off commits too:
+                // the next scan resumes from the same cursor. Live-only events
+                // are dropped.
                 tracing::warn!(%error, "req monitor cannot read the database");
-                let db_change = data.iter().any(|m| matches!(m, MonitorData::DbChange));
+                let db_change = data
+                    .iter()
+                    .any(|m| matches!(m, MonitorData::DbChange | MonitorData::Stored(_)));
                 data.clear();
                 if db_change {
                     data.push(MonitorData::DbChange);
@@ -3601,60 +3919,10 @@ fn run_req_monitor(
             }
         }
         for msg in data.drain(..) {
-            match msg {
-                MonitorData::DbChange => {
-                    let start = curr_event_id.saturating_add(1);
-                    let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
-                        let Ok(packed) = PackedEventView::new(packed_bytes) else {
-                            return true;
-                        };
-                        if !global_visibility
-                            .globally_visible(&txn, packed)
-                            .unwrap_or(false)
-                        {
-                            return true;
-                        }
-                        let payload = || {
-                            txn.get_u64(txn.env().dbis().event_payload, lev)
-                                .ok()
-                                .flatten()
-                        };
-                        let recipients = if monitors.event_requires_content(packed) {
-                            let Some(raw) = payload() else {
-                                return true;
-                            };
-                            let Ok(json) = decomp.decode(&txn, raw, max_event_size) else {
-                                return true;
-                            };
-                            let search_terms = wok_db::event_search_terms(json).unwrap_or_default();
-                            monitors.process(lev, packed, Some(&search_terms))
-                        } else {
-                            monitors.process(lev, packed, None)
-                        };
-                        if recipients.is_empty() {
-                            return true;
-                        }
-                        let readable = |conn_id| {
-                            let pk = authed.get(&conn_id).map(|a| a.as_slice()).unwrap_or(&[]);
-                            r.should_send_to_identities(packed, pk)
-                        };
-                        let live =
-                            route_stored_match(&mut monitors, recipients, readable, lev, &metrics);
-                        if live.is_empty() {
-                            return true;
-                        }
-                        if let Some(raw) = payload() {
-                            if let Ok(json) = decomp.decode(&txn, raw, max_event_size) {
-                                conns.send_event_batch(&live, json, &metrics);
-                            }
-                        }
-                        true
-                    });
-                    curr_event_id = latest;
-                }
-                MonitorData::Ephemeral { packed, json } => {
+            let batch = match msg {
+                MonitorData::Ephemeral(held) => {
                     let (live, pending) = {
-                        let Ok(event) = PackedEventView::new(&packed) else {
+                        let Ok(event) = PackedEventView::new(&held.packed) else {
                             continue;
                         };
                         // Live-only events skip the database, but not the
@@ -3666,7 +3934,7 @@ fn run_req_monitor(
                             continue;
                         }
                         let search_terms = if monitors.event_requires_content(event) {
-                            Some(wok_db::event_search_terms(&json).unwrap_or_default())
+                            Some(wok_db::event_search_terms(&held.json).unwrap_or_default())
                         } else {
                             None
                         };
@@ -3694,12 +3962,8 @@ fn run_req_monitor(
                         }
                         (live, pending)
                     };
-                    conns.send_event_batch(&live, &json, &metrics);
-                    if pending.is_empty() {
-                        continue;
-                    }
+                    conns.send_event_batch(&live, &held.json, &metrics);
                     // One copy shared by every pending subscription it matches.
-                    let held = Arc::new(HeldEvent { packed, json });
                     for (conn_id, sub_id) in pending {
                         if let Some(buffer) = monitors.pending_mut(conn_id, &sub_id) {
                             let (dropped, overflowed) = buffer.push_ephemeral(held.clone());
@@ -3713,8 +3977,111 @@ fn run_req_monitor(
                             }
                         }
                     }
+                    continue;
                 }
+                MonitorData::DbChange => None,
+                // Already matched, by a read of a later commit.
+                MonitorData::Stored(batch) if batch.last <= curr_event_id => continue,
+                // Something was stored before the batch that this monitor
+                // was not handed: read it all from LMDB instead.
+                MonitorData::Stored(batch) => {
+                    (batch.first <= curr_event_id.saturating_add(1)).then_some(batch)
+                }
+            };
+            let readable = |conn_id: u64, packed: PackedEventView<'_>| {
+                let pk = authed.get(&conn_id).map(|a| a.as_slice()).unwrap_or(&[]);
+                r.should_send_to_identities(packed, pk)
+            };
+            let Some(batch) = batch else {
+                let start = curr_event_id.saturating_add(1);
+                let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
+                    let Ok(packed) = PackedEventView::new(packed_bytes) else {
+                        return true;
+                    };
+                    if !global_visibility
+                        .globally_visible(&txn, packed)
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                    let payload = || {
+                        txn.get_u64(txn.env().dbis().event_payload, lev)
+                            .ok()
+                            .flatten()
+                    };
+                    let recipients = if monitors.event_requires_content(packed) {
+                        let Some(raw) = payload() else {
+                            return true;
+                        };
+                        let Ok(json) = decomp.decode(&txn, raw, max_event_size) else {
+                            return true;
+                        };
+                        let search_terms = wok_db::event_search_terms(json).unwrap_or_default();
+                        monitors.process(lev, packed, Some(&search_terms))
+                    } else {
+                        monitors.process(lev, packed, None)
+                    };
+                    if recipients.is_empty() {
+                        return true;
+                    }
+                    let live = route_stored_match(
+                        &mut monitors,
+                        recipients,
+                        |conn_id| readable(conn_id, packed),
+                        lev,
+                        &metrics,
+                    );
+                    if live.is_empty() {
+                        return true;
+                    }
+                    if let Some(raw) = payload() {
+                        if let Ok(json) = decomp.decode(&txn, raw, max_event_size) {
+                            conns.send_event_batch(&live, json, &metrics);
+                        }
+                    }
+                    true
+                });
+                curr_event_id = latest;
+                continue;
+            };
+            for event in batch.events.iter().filter(|e| e.lev_id > curr_event_id) {
+                let Ok(packed) = PackedEventView::new(&event.packed) else {
+                    continue;
+                };
+                // Checked in this monitor's read: since the commit, a later
+                // one (or a later event of the same commit) can have deleted
+                // it, and a ban, vanish request or expiry can hide it.
+                let stored = txn
+                    .get_u64(txn.env().dbis().event, event.lev_id)
+                    .is_ok_and(|stored| stored.is_some());
+                if !stored
+                    || !global_visibility
+                        .globally_visible(&txn, packed)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let recipients = if monitors.event_requires_content(packed) {
+                    let search_terms = event.search_terms.get_or_init(|| {
+                        wok_db::event_search_terms(&event.json).unwrap_or_default()
+                    });
+                    monitors.process(event.lev_id, packed, Some(search_terms))
+                } else {
+                    monitors.process(event.lev_id, packed, None)
+                };
+                if recipients.is_empty() {
+                    continue;
+                }
+                let live = route_stored_match(
+                    &mut monitors,
+                    recipients,
+                    |conn_id| readable(conn_id, packed),
+                    event.lev_id,
+                    &metrics,
+                );
+                conns.send_event_batch(&live, &event.json, &metrics);
             }
+            curr_event_id = batch.last;
         }
     }
 }
@@ -5617,10 +5984,10 @@ mod tests {
         fn ephemeral_at(&mut self, content: &str, created_at: u64) -> String {
             let parsed = Self::parse_at(20_001, content, created_at);
             let id = to_hex(parsed.packed.view().id());
-            self.feed(MonitorData::Ephemeral {
+            self.feed(MonitorData::Ephemeral(Arc::new(HeldEvent {
                 packed: parsed.packed.into_bytes(),
                 json: parsed.json,
-            });
+            })));
             self.observe(&id);
             id
         }
@@ -5657,10 +6024,10 @@ mod tests {
         fn sync(&mut self) {
             let sentinel = Self::parse(20_002, "sentinel");
             let id = to_hex(sentinel.packed.view().id());
-            self.feed(MonitorData::Ephemeral {
+            self.feed(MonitorData::Ephemeral(Arc::new(HeldEvent {
                 packed: sentinel.packed.into_bytes(),
                 json: sentinel.json,
-            });
+            })));
             self.observe(&id);
         }
 
@@ -5813,10 +6180,10 @@ mod tests {
         h.feed(MonitorData::DbChange);
         let ephemeral = MonitorHarness::parse_tagged(21059, "ephemeral wrap", now_secs(), p);
         let ephemeral_id = to_hex(ephemeral.packed.view().id());
-        h.feed(MonitorData::Ephemeral {
+        h.feed(MonitorData::Ephemeral(Arc::new(HeldEvent {
             packed: ephemeral.packed.into_bytes(),
             json: ephemeral.json,
-        });
+        })));
         // Both are matched before the connection authenticates.
         h.sync();
         assert!(h
@@ -5959,15 +6326,13 @@ mod tests {
         worker.join().unwrap();
     }
 
-    /// When a req worker cannot open a read for a REQ or COUNT that replaces
-    /// one it is still running, the old query ends with the refusal rather
-    /// than scanning on for nothing: the gate already drops what it sends.
-    #[test]
-    fn a_replacement_refused_on_a_failed_read_ends_the_old_query() {
+    /// A database with enough kind-1 history that a query reading all of it
+    /// spans many time slices at `slow_scan_config`'s budget. Returns the
+    /// newest local event id with it.
+    fn long_history() -> (tempfile::TempDir, Env, u64) {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), small_map_env_options()).unwrap();
         env.ensure_initialized().unwrap();
-        // Enough history that the first query spans many time slices.
         let mut events: Vec<EventToWrite> = (0..20_000u64)
             .map(|i| {
                 let mut id = [0xBBu8; 32];
@@ -5992,27 +6357,54 @@ mod tests {
         wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
         txn.commit().unwrap();
         let snapshot = most_recent_levid_ro(&env.begin_ro().unwrap()).unwrap();
+        (dir, env, snapshot)
+    }
 
+    /// Time slices as short as they go, so a query's slice count depends on
+    /// the work it does, not on how fast the machine is.
+    fn slow_scan_config(dir: &std::path::Path) -> Config {
         let mut cfg = Config::default();
-        cfg.db = dir.path().to_path_buf();
+        cfg.db = dir.to_path_buf();
         cfg.relay.auth.enabled = false;
         cfg.relay.query_timeslice_budget_us = 1;
         cfg.relay.max_filter_limit = 50_000;
         cfg.relay.max_total_events_per_req = 0;
+        cfg
+    }
+
+    /// A REQ (or COUNT) on connection 1 as the ingester hands it over.
+    fn queued_sub(
+        sub_id: &str,
+        filter: Value,
+        generation: u64,
+        count_only: bool,
+        snapshot: u64,
+    ) -> Subscription {
+        let group = NostrFilterGroup::from_value(&filter, 50_000, 3, 16).unwrap();
+        let mut sub = Subscription::new(1, SubId::new(sub_id).unwrap(), group, count_only);
+        sub.generation = generation;
+        if !count_only {
+            sub.latest_event_id = snapshot;
+        }
+        sub
+    }
+
+    /// When a req worker cannot open a read for a REQ or COUNT that replaces
+    /// one it is still running, the old query ends with the refusal rather
+    /// than scanning on for nothing: the gate already drops what it sends.
+    #[test]
+    fn a_replacement_refused_on_a_failed_read_ends_the_old_query() {
+        // Enough history that the first query spans many time slices.
+        let (dir, env, snapshot) = long_history();
+        let cfg = slow_scan_config(dir.path());
         let sub = |generation, count_only| {
-            let group = NostrFilterGroup::from_value(
-                &json!({"kinds": [1], "limit": 50_000}),
-                50_000,
-                3,
-                16,
+            queued_sub(
+                "x",
+                json!({"kinds": [1], "limit": 50_000}),
+                generation,
+                count_only,
+                snapshot,
             )
-            .unwrap();
-            let mut sub = Subscription::new(1, SubId::new("x").unwrap(), group, count_only);
-            sub.generation = generation;
-            if !count_only {
-                sub.latest_event_id = snapshot;
-            }
-            sub
         };
 
         for (first, replacement) in [
@@ -6028,11 +6420,8 @@ mod tests {
             conns.open_sub(1, ns, &SubId::new("x").unwrap(), 2);
             let (req_tx, req_rx) = bounded(8);
             let (mon_tx, mon_rx) = bounded(8);
-            // Both are queued before the worker starts: the first pass reads
-            // and starts the first query, the second pass cannot read.
+            trace::record(env.path());
             req_tx.send(first).unwrap();
-            req_tx.send(replacement).unwrap();
-            fault::fail_reads_after(env.path(), 1, 1);
             let worker = {
                 let env = env.clone();
                 let cfg = Arc::new(parking_lot::RwLock::new(cfg.clone()));
@@ -6052,7 +6441,18 @@ mod tests {
                         thread::sleep(Duration::from_millis(1));
                     }
                 };
+            // Once the first query has had a slice, no read succeeds: the
+            // pass that takes the replacement cannot read.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while trace::slices(env.path()).is_empty() {
+                assert!(std::time::Instant::now() < deadline, "no slice");
+                thread::yield_now();
+            }
+            fault::fail_reads(env.path(), usize::MAX);
+            req_tx.send(replacement).unwrap();
             let closed = recv_frame(&mut outbound);
+            let sliced = trace::slices(env.path()).len();
+            fault::fail_reads(env.path(), 0);
             assert!(closed.starts_with(r#"["CLOSED","x","error: "#), "{closed}");
             if !count {
                 assert!(matches!(
@@ -6061,6 +6461,11 @@ mod tests {
                 ));
             }
             thread::sleep(Duration::from_millis(300));
+            assert_eq!(
+                trace::slices(env.path()).len(),
+                sliced,
+                "the replaced query kept running"
+            );
             assert!(outbound.try_recv().is_err(), "a frame followed CLOSED");
             // A replaced REQ that kept scanning would report its history done.
             assert!(
@@ -6138,5 +6543,529 @@ mod tests {
         assert_eq!(frame(&mut relay), r#"["EVENT","x",{"b":1}]"#);
         assert!(relay.outbound.try_recv().is_err());
         relay.finish();
+    }
+
+    /// Start a req worker for connection 1 on `env`, recording its slices.
+    fn traced_worker(
+        env: &Env,
+        cfg: Config,
+        conns: &Arc<ConnTable>,
+        req_rx: Receiver<ReqMsg>,
+        mon_tx: Sender<MonitorMsg>,
+    ) -> thread::JoinHandle<()> {
+        trace::record(env.path());
+        let (env, conns) = (env.clone(), conns.clone());
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let metrics = Arc::new(Metrics::default());
+        thread::spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, vec![mon_tx]))
+    }
+
+    /// The sub id of the next `HistoryDone` the req worker sends.
+    fn history_done_for(mon_rx: &Receiver<MonitorMsg>) -> String {
+        match mon_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(MonitorMsg::HistoryDone { sub_id, .. }) => sub_id.to_string(),
+            Ok(_) => panic!("expected HistoryDone"),
+            Err(error) => panic!("no HistoryDone: {error}"),
+        }
+    }
+
+    /// A pass takes everything queued and applies it in order. Cancels, AUTH
+    /// and teardown take no query time, and each new REQ or COUNT gets its
+    /// first slice as the pass takes it, in queue order: small queries queued
+    /// behind a long scan and 50 cancels are answered after one slice of the
+    /// scan, not one per message ahead of them.
+    #[test]
+    fn a_pass_answers_queued_queries_without_a_slice_per_message() {
+        let (dir, env, snapshot) = long_history();
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        conns.open_sub(1, Ns::Count, &SubId::new("d").unwrap(), 5);
+        let (req_tx, req_rx) = bounded(REQ_PASS_MAX);
+        let (mon_tx, mon_rx) = unbounded();
+        let all = json!({"kinds": [1], "limit": 50_000});
+        let newest = json!({"kinds": [1], "limit": 1});
+        let one = json!({"ids": [format!("{}{}", "00".repeat(8), "bb".repeat(24))]});
+        let queue = |msg| req_tx.send(msg).unwrap();
+        queue(ReqMsg::Scan(queued_sub("long", all, 1, false, snapshot)));
+        for i in 0..50 {
+            queue(ReqMsg::Cancel {
+                conn_id: 1,
+                sub_id: SubId::new(&format!("gone{i}")).unwrap(),
+                generation: 100 + i,
+                count_only: false,
+            });
+        }
+        queue(ReqMsg::SetAuth {
+            conn_id: 1,
+            authed: [7; 32],
+        });
+        queue(ReqMsg::Scan(queued_sub(
+            "b",
+            newest.clone(),
+            2,
+            false,
+            snapshot,
+        )));
+        queue(ReqMsg::Scan(queued_sub("c", newest, 3, false, snapshot)));
+        queue(ReqMsg::Count(queued_sub("d", one, 5, true, snapshot)));
+        let worker = traced_worker(&env, slow_scan_config(dir.path()), &conns, req_rx, mon_tx);
+
+        assert_eq!(history_done_for(&mon_rx), "b");
+        assert_eq!(history_done_for(&mon_rx), "c");
+        assert_eq!(history_done_for(&mon_rx), "long");
+        let slices = trace::slices(env.path());
+        assert_eq!(slices[..4], ["long", "b", "c", "d"], "{slices:?}");
+        assert!(slices[4..].iter().all(|s| s == "long"), "{slices:?}");
+        assert!(
+            slices.len() > 5,
+            "the long scan fit in one slice: {slices:?}"
+        );
+        let count: Value = serde_json::from_str(&outbound.try_recv().unwrap().into_text()).unwrap();
+        assert_eq!(count, json!(["COUNT", "d", {"count": 1}]));
+        drop(req_tx);
+        worker.join().unwrap();
+    }
+
+    /// New REQs are started in the order they came, and however many keep
+    /// coming, small or costly, the running queries keep their share of the
+    /// worker: between two of their slices, the new queries' first slices
+    /// before the last one took less than the earlier of the two.
+    #[test]
+    fn a_stream_of_new_queries_cannot_starve_running_ones() {
+        // More small queries than one slice of the scan takes, then queries
+        // whose first slices each cost as much as one of its slices.
+        for (arrivals, filter) in [
+            (20 * REQ_PASS_MAX, json!({"kinds": [1], "limit": 1})),
+            (2 * REQ_PASS_MAX, json!({"kinds": [1], "limit": 5_000})),
+        ] {
+            let (dir, env, snapshot) = long_history();
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, _outbound) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let (req_tx, req_rx) = bounded(arrivals + 1);
+            let (mon_tx, mon_rx) = unbounded();
+            let all = json!({"kinds": [1], "limit": 50_000});
+            req_tx
+                .send(ReqMsg::Scan(queued_sub("long", all, 1, false, snapshot)))
+                .unwrap();
+            let ids: Vec<String> = (0..arrivals).map(|i| format!("s{i}")).collect();
+            for (i, id) in ids.iter().enumerate() {
+                let sub = queued_sub(id, filter.clone(), 2 + i as u64, false, snapshot);
+                req_tx.send(ReqMsg::Scan(sub)).unwrap();
+            }
+            let mut cfg = slow_scan_config(dir.path());
+            cfg.relay.abuse.max_concurrent_historical_queries = arrivals + 1;
+            let worker = traced_worker(&env, cfg, &conns, req_rx, mon_tx);
+            for _ in 0..=arrivals {
+                history_done_for(&mon_rx);
+            }
+            drop(req_tx);
+            worker.join().unwrap();
+
+            let log = trace::log(env.path());
+            let mut first_seen = HashSet::new();
+            let starts: Vec<&String> = log
+                .iter()
+                .map(|(id, _)| id)
+                .filter(|id| first_seen.insert(*id))
+                .collect();
+            assert_eq!(starts[0], "long");
+            assert_eq!(&starts[1..], ids.iter().collect::<Vec<_>>());
+            // A query runs from its first slice to its last one.
+            let last: HashMap<&String, usize> = log
+                .iter()
+                .enumerate()
+                .map(|(at, (id, _))| (id, at))
+                .collect();
+            let mut started = HashSet::new();
+            let mut previous: Option<Duration> = None;
+            let mut first_slices: Vec<Duration> = Vec::new();
+            let mut running_slices = 0;
+            for (at, (id, took)) in log.iter().enumerate() {
+                if started.insert(id) {
+                    first_slices.push(*took);
+                } else {
+                    running_slices += 1;
+                    if let Some(previous) = previous {
+                        let owed: Duration = first_slices.iter().rev().skip(1).copied().sum();
+                        assert!(
+                            owed.is_zero() || owed < previous,
+                            "{owed:?} of new queries ran before running ones, \
+                             whose last slice took {previous:?}"
+                        );
+                    }
+                    previous = Some(*took);
+                    first_slices.clear();
+                }
+                // Nothing left running: no share is owed until something is.
+                if !started.iter().any(|id| last[*id] > at) {
+                    previous = None;
+                    first_slices.clear();
+                }
+            }
+            let last_start = log
+                .iter()
+                .rposition(|(id, _)| *id == ids[arrivals - 1])
+                .unwrap();
+            assert!(
+                log[..last_start]
+                    .iter()
+                    .filter(|(id, _)| *id == "long")
+                    .count()
+                    > 1,
+                "the scan waited for every new query"
+            );
+            assert!(running_slices > 2, "{running_slices} running slices");
+        }
+    }
+
+    /// Running queries get the end of a pass when nothing is waiting, or
+    /// once what ran since their last slice has taken as long as that slice.
+    #[test]
+    fn running_queries_get_their_share_of_a_busy_worker() {
+        let start = std::time::Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut share = RunningShare::new(start);
+        assert!(share.due(true, start), "nothing has run for them yet");
+        share.ran(at(0), at(3));
+        assert!(share.due(false, at(3)));
+        assert!(!share.due(true, at(5)));
+        assert!(share.due(true, at(6)));
+        share.ran(at(6), at(16));
+        assert!(!share.due(true, at(25)));
+        assert!(share.due(true, at(26)));
+    }
+
+    /// Producers on several threads queue frames for the same subscription
+    /// ids while the ingester opens, replaces, closes and refuses them. The
+    /// gate check and the enqueue are one step under the connection's lock,
+    /// as are a refusal's close and its CLOSED, so in the queue the transport
+    /// reads nothing of a generation follows the point where the gate moved
+    /// past it, and generations never go backwards.
+    #[test]
+    fn the_gate_admits_and_queues_atomically_under_concurrent_producers() {
+        const IDS: usize = 3;
+        const PRODUCERS: u64 = 4;
+        let conns = Arc::new(ConnTable::new());
+        let metrics = Arc::new(Metrics::default());
+        let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let sid = |id: usize| SubId::new(&format!("s{id}")).unwrap();
+        // The newest generation the ingester gave each id.
+        let newest: Arc<Vec<AtomicU64>> = Arc::new((0..IDS).map(|_| AtomicU64::new(0)).collect());
+        let stop = Arc::new(AtomicBool::new(false));
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|producer| {
+                let (conns, metrics) = (conns.clone(), metrics.clone());
+                let (newest, stop) = (newest.clone(), stop.clone());
+                thread::spawn(move || {
+                    let mut rng = rand::thread_rng();
+                    let mut seq = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let id = rng.gen_range(0..IDS);
+                        // Producers lag: an older generation may still emit.
+                        let generation = newest[id]
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(rng.gen_range(0..3));
+                        if generation == 0 {
+                            continue;
+                        }
+                        seq += 1;
+                        if rng.gen_ratio(1, 16) {
+                            let closed = RelayMessage::closed_error(
+                                sid(id).as_str(),
+                                format!("last {generation}"),
+                            );
+                            conns.send_last(1, Ns::Req, &sid(id), generation, closed, &metrics);
+                        } else {
+                            let event = json!({"g": generation, "p": producer, "n": seq});
+                            conns.send_event(1, &sid(id), generation, &event.to_string(), &metrics);
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut rng = rand::thread_rng();
+        let mut next = 0u64;
+        for _ in 0..20_000 {
+            let id = rng.gen_range(0..IDS);
+            // Everything up to the generation in a marker is over for the id.
+            let over = match rng.gen_range(0..4) {
+                0 | 1 => {
+                    next += 1;
+                    conns.open_sub(1, Ns::Req, &sid(id), next);
+                    newest[id].store(next, Ordering::Relaxed);
+                    next - 1
+                }
+                2 => {
+                    conns.close_sub(1, Ns::Req, &sid(id));
+                    newest[id].load(Ordering::Relaxed)
+                }
+                _ => {
+                    let over = newest[id].load(Ordering::Relaxed);
+                    conns.refuse(
+                        1,
+                        Ns::Req,
+                        sid(id).as_str(),
+                        format!("refused {over}"),
+                        &metrics,
+                    );
+                    continue;
+                }
+            };
+            conns.deliver(
+                1,
+                json!(["MARK", format!("s{id}"), over]).to_string(),
+                &metrics,
+            );
+            if rng.gen_ratio(1, 64) {
+                thread::yield_now();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for producer in producers {
+            producer.join().unwrap();
+        }
+
+        let mut floor = [0u64; IDS];
+        let mut seen = [0u64; IDS];
+        let mut admitted = 0;
+        while let Ok(frame) = outbound.try_recv() {
+            let frame: Value = serde_json::from_str(&frame.into_text()).unwrap();
+            let id: usize = frame[1].as_str().unwrap()[1..].parse().unwrap();
+            let number = |text: &Value| -> u64 {
+                text.as_str()
+                    .unwrap()
+                    .split(' ')
+                    .nth(1)
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            let (generation, ends) = match frame[0].as_str().unwrap() {
+                "MARK" => {
+                    floor[id] = floor[id].max(frame[2].as_u64().unwrap());
+                    continue;
+                }
+                "CLOSED" if frame[2].as_str().unwrap().starts_with("refused") => {
+                    floor[id] = floor[id].max(number(&frame[2]));
+                    continue;
+                }
+                "CLOSED" => (number(&frame[2]), true),
+                "EVENT" => (frame[2]["g"].as_u64().unwrap(), false),
+                other => panic!("unexpected frame {other}"),
+            };
+            assert!(
+                generation > floor[id],
+                "s{id} generation {generation} queued after the gate moved past {}",
+                floor[id]
+            );
+            assert!(generation >= seen[id], "s{id} generations went backwards");
+            seen[id] = generation;
+            if ends {
+                floor[id] = generation;
+            }
+            admitted += 1;
+        }
+        assert!(
+            admitted > 100,
+            "too few producer frames got through: {admitted}"
+        );
+    }
+
+    /// A commit as the writer hands it to the monitors.
+    fn handed(events: Vec<(u64, &wok_event::ParsedEvent, String)>) -> MonitorData {
+        MonitorData::Stored(handed_batch(events))
+    }
+
+    fn handed_batch(events: Vec<(u64, &wok_event::ParsedEvent, String)>) -> Arc<StoredBatch> {
+        let (first, last) = (events[0].0, events[events.len() - 1].0);
+        Arc::new(StoredBatch {
+            first,
+            last,
+            events: events
+                .into_iter()
+                .map(|(lev_id, parsed, json)| StoredEvent {
+                    lev_id,
+                    packed: parsed.packed.clone().into_bytes(),
+                    json,
+                    search_terms: OnceLock::new(),
+                })
+                .collect(),
+            bytes: 0,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// `parsed`'s payload with different content, which LMDB does not hold:
+    /// a monitor that sends it did not read the event back.
+    fn with_content(parsed: &wok_event::ParsedEvent, content: &str) -> String {
+        let mut event: Value = serde_json::from_str(&parsed.json).unwrap();
+        event["content"] = json!(content);
+        event.to_string()
+    }
+
+    /// The monitor matches a handed-off commit as it was handed over,
+    /// without reading it back. Past a gap it reads LMDB instead, as for
+    /// `DbChange`, and it sends neither an event a later one in the same
+    /// commit deleted nor a commit a read already matched.
+    #[test]
+    fn the_monitor_matches_handed_off_commits_without_reading_them() {
+        let mut h = MonitorHarness::start(1 << 20);
+        h.store("a");
+
+        let b = MonitorHarness::parse(1, "b");
+        let (b_lev, b_id) = h.write_event(b.clone());
+        h.feed(handed(vec![(b_lev, &b, with_content(&b, "handed b"))]));
+        let event = MonitorHarness::next(&mut h.observer);
+        assert_eq!(
+            (&event[2]["id"], &event[2]["content"]),
+            (&json!(b_id), &json!("handed b"))
+        );
+
+        // Only d is handed over: c is past the monitor's cursor, so both are
+        // read from LMDB.
+        let (_, c_id) = h.write("c");
+        let d = MonitorHarness::parse(1, "d");
+        let (d_lev, d_id) = h.write_event(d.clone());
+        h.feed(handed(vec![(d_lev, &d, with_content(&d, "handed d"))]));
+        h.observe(&c_id);
+        let event = MonitorHarness::next(&mut h.observer);
+        assert_eq!(
+            (&event[2]["id"], &event[2]["content"]),
+            (&json!(d_id), &json!("d"))
+        );
+
+        // f's commit deleted e.
+        let e = MonitorHarness::parse(1, "e");
+        let (e_lev, _) = h.write_event(e.clone());
+        let mut txn = h.env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [e_lev]).unwrap();
+        txn.commit().unwrap();
+        let f = MonitorHarness::parse(1, "f");
+        let (f_lev, f_id) = h.write_event(f.clone());
+        h.feed(handed(vec![
+            (e_lev, &e, e.json.clone()),
+            (f_lev, &f, f.json.clone()),
+        ]));
+        h.observe(&f_id);
+
+        h.feed(handed(vec![(b_lev, &b, b.json.clone())]));
+        h.sync();
+    }
+
+    /// Every monitor checks a handed-off event against its own read. One that
+    /// takes the commit after another monitor sent it, and after a later
+    /// commit deleted the event, does not send it.
+    #[test]
+    fn each_monitor_checks_handed_off_events_against_its_own_read() {
+        let mut first = MonitorHarness::start(1 << 20);
+        // A second monitor on the same database, with its own match-all
+        // subscription.
+        let conns = Arc::new(ConnTable::new());
+        let (observer_tx, mut observer) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(2, Outbound::new(observer_tx, 0));
+        let (tx, rx) = unbounded();
+        let (data, data_rx) = bounded(64);
+        let second = {
+            let (env, cfg, conns) = (first.env.clone(), first.cfg.clone(), conns.clone());
+            let metrics = Arc::new(Metrics::default());
+            thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx, data_rx))
+        };
+        let all = SubId::new("all").unwrap();
+        conns.open_sub(2, Ns::Req, &all, 1);
+        tx.send(MonitorMsg::Register(MonitorHarness::sub(
+            2,
+            "all",
+            json!({}),
+            1,
+            0,
+        )))
+        .unwrap();
+        tx.send(MonitorMsg::HistoryDone {
+            conn_id: 2,
+            sub_id: all,
+            generation: 1,
+            snapshot: 0,
+        })
+        .unwrap();
+        assert_eq!(MonitorHarness::next(&mut observer)[0], "EOSE");
+
+        let event = MonitorHarness::parse(1, "deleted later");
+        let (lev, id) = first.write_event(event.clone());
+        let batch = handed_batch(vec![(lev, &event, event.json.clone())]);
+        first.feed(MonitorData::Stored(batch.clone()));
+        first.observe(&id);
+        let mut txn = first.env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [lev]).unwrap();
+        txn.commit().unwrap();
+        data.send(MonitorData::Stored(batch)).unwrap();
+        let sentinel = MonitorHarness::parse(20_002, "sentinel");
+        let sentinel_id = to_hex(sentinel.packed.view().id());
+        data.send(MonitorData::Ephemeral(Arc::new(HeldEvent {
+            packed: sentinel.packed.into_bytes(),
+            json: sentinel.json,
+        })))
+        .unwrap();
+        assert_eq!(MonitorHarness::next(&mut observer)[2]["id"], sentinel_id);
+        drop((tx, data));
+        second.join().unwrap();
+    }
+
+    /// The writer hands the events a commit wrote to every monitor as one
+    /// shared batch, whose bytes count against its budget until the last
+    /// monitor drops it. Over the budget, or for ids it cannot vouch for, it
+    /// sends `DbChange` instead, and nothing for a commit that wrote nothing.
+    #[test]
+    fn the_writer_hands_over_written_events_within_its_budget() {
+        let (tx1, rx1) = unbounded();
+        let (tx2, rx2) = unbounded();
+        let monitors = [tx1, tx2];
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let event = |lev_id, status| {
+            let mut event = EventToWrite::new(vec![0; 3], "{}".to_string());
+            event.lev_id = lev_id;
+            event.status = status;
+            event
+        };
+        let written = EventWriteStatus::Written;
+        let mut events = vec![
+            event(7, written),
+            event(0, EventWriteStatus::Duplicate),
+            event(8, written),
+        ];
+        broadcast_stored(&monitors, &in_flight, &mut events);
+        assert!(events.is_empty());
+        let (Ok(MonitorData::Stored(a)), Ok(MonitorData::Stored(b))) =
+            (rx1.try_recv(), rx2.try_recv())
+        else {
+            panic!("expected a handed-off commit for each monitor");
+        };
+        assert!(Arc::ptr_eq(&a, &b));
+        let ids: Vec<u64> = a.events.iter().map(|event| event.lev_id).collect();
+        assert_eq!((a.first, a.last, ids), (7, 8, vec![7, 8]));
+        assert_eq!(in_flight.load(Ordering::Relaxed), 10);
+        drop(a);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 10);
+        drop(b);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+
+        let db_change = |events: &mut Vec<EventToWrite>| {
+            broadcast_stored(&monitors, &in_flight, events);
+            [&rx1, &rx2]
+                .iter()
+                .all(|rx| matches!(rx.try_recv(), Ok(MonitorData::DbChange)))
+        };
+        in_flight.store(STORED_HANDOFF_BYTES - 4, Ordering::Relaxed);
+        assert!(db_change(&mut vec![event(9, written)]));
+        in_flight.store(0, Ordering::Relaxed);
+        assert!(db_change(&mut vec![event(10, written), event(12, written)]));
+        broadcast_stored(
+            &monitors,
+            &in_flight,
+            &mut vec![event(0, EventWriteStatus::Duplicate)],
+        );
+        assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err());
     }
 }

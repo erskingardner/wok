@@ -72,8 +72,8 @@ threads: the ingester (a refusal's CLOSED), the req worker (history, COUNT
 results, its own refusals) and the req monitor (EOSE, live events). What the
 client sees for an id is decided in one place, not by coordinating them.
 
-- Every frame for a connection is queued in `ConnTable` under one lock, and
-  each connection there has a gate: for REQ ids and, separately, COUNT ids,
+- Every frame for a connection is queued in `ConnTable` under that
+  connection's own lock, and each connection there has a gate: for REQ ids and, separately, COUNT ids,
   the current generation of each open id. An absent id is closed.
 - The ingester gives each REQ and COUNT a generation as it handles it, in
   client order, and moves the gate at that moment: an admitted REQ or COUNT
@@ -116,6 +116,19 @@ history as well as live ones; a REQ reusing an open id always fits.
    never waits for a reply. A REQ or COUNT it cannot start (a read failure,
    `relay.abuse.max_concurrent_historical_queries`) or whose scan fails gets
    CLOSED through the gate.
+   - Each pass, the worker takes what is queued for it, up to 64 messages,
+     and applies it in order under one read transaction. Cancels, AUTH and
+     disconnects take no query time. Each new REQ or COUNT gets its first
+     time slice (`relay.query_timeslice_budget_us`) as it is taken, so a
+     small one is answered before the messages behind it.
+   - The running query that has waited longest gets a slice ahead of the
+     next new query once the new queries' first slices since its last slice
+     have taken as long as that slice did, and at the end of a pass when no
+     more messages are waiting. So new queries go first, a REQ queued during
+     a pass does not wait for another slice of a long scan. However many REQs
+     come, each stretch of new work as long as the running queries' last
+     slice, overrun by at most one first slice, is followed by a slice of
+     theirs: about half the worker when the two take similar time.
 4. **Going live, on the req monitor.** For the current generation only, the
    monitor sends EOSE, then the held matches in arrival order, then delivers
    live. NIP-01 defines EOSE as the boundary to "events newly received in
@@ -140,8 +153,9 @@ COUNT never registers with a monitor, and COUNT ids are separate from REQ ids:
 neither cancels the other.
 
 Each req monitor has two queues: subscription changes (`Register`, `Remove`,
-`HistoryDone`, AUTH, disconnect) on an unbounded control queue, and database
-changes and live-only events on a bounded data queue. Each turn it takes what
+`HistoryDone`, AUTH, disconnect) on an unbounded control queue, and the
+events each commit stored, live-only events and database changes on a bounded
+data queue. Each turn it takes what
 is in the data queue, then what is in the control queue, and applies the
 changes first. So every change sent before an event taken that turn is
 applied before the event is matched: a live-only event published after a REQ
@@ -154,6 +168,19 @@ worker queue (a scan, a cancel) or is one per AUTH or connection, so the
 control queue grows only while a turn runs. If the monitor cannot open a read
 transaction, it keeps the subscription changes (and one database change) and
 retries.
+
+The writer hands each commit's events to every monitor as one shared,
+immutable batch, so the monitors match them without reading them back. Each
+monitor still checks, in its own read transaction, that an event is stored
+and globally visible; only its search terms are worked out once, by the
+first monitor that needs them. A monitor reads the events from LMDB instead
+in these cases:
+
+- a database change from the file watcher, for commits by other processes;
+- a batch that does not follow on from what the monitor already matched;
+- a commit past the writer's hand-off budget (16 MiB of events that some
+  monitor still holds), so a monitor that falls behind holds no more than
+  that.
 
 ## Non-goals
 

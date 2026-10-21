@@ -20,7 +20,7 @@ use crate::protocol::{has_reason_prefix, ClientCommand, ParseFailure, RelayMessa
 use crate::restrict::ReadRestrictor;
 use crate::source::TransportSource;
 use crate::supported_nips;
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 use rand::Rng;
 use serde_json::{json, Value};
@@ -619,6 +619,13 @@ enum ReqMsg {
     },
 }
 
+/// Subscription changes for a req monitor, on its control queue. The queue
+/// is unbounded so a REQ's registration is queued the moment it is admitted
+/// and never waits behind live traffic. Each turn the monitor takes what is in
+/// its data queue, then what is in this one, and applies these first: so any
+/// event sent after a registration is matched against it, however full the
+/// data queue was. Every message here is paired with work the bounded req
+/// worker queues pace, so the queue grows only while a monitor turn runs.
 enum MonitorMsg {
     /// An admitted REQ. The monitor matches it at once but holds matches back
     /// until `HistoryDone`. It replaces any subscription with the same id.
@@ -647,11 +654,12 @@ enum MonitorMsg {
     Close {
         conn_id: u64,
     },
+}
+
+/// What a req monitor matches, on its bounded data queue.
+enum MonitorData {
     DbChange,
-    Ephemeral {
-        packed: Vec<u8>,
-        json: String,
-    },
+    Ephemeral { packed: Vec<u8>, json: String },
 }
 
 enum NegMsg {
@@ -1092,7 +1100,10 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let (req_txs, req_rxs): (Vec<_>, Vec<_>) =
         (0..n_req_worker).map(|_| bounded::<ReqMsg>(4096)).unzip();
     let (mon_txs, mon_rxs): (Vec<_>, Vec<_>) = (0..n_req_monitor)
-        .map(|_| bounded::<MonitorMsg>(4096))
+        .map(|_| unbounded::<MonitorMsg>())
+        .unzip();
+    let (mon_data_txs, mon_data_rxs): (Vec<_>, Vec<_>) = (0..n_req_monitor)
+        .map(|_| bounded::<MonitorData>(4096))
         .unzip();
     let (neg_txs, neg_rxs): (Vec<_>, Vec<_>) =
         (0..n_negentropy).map(|_| bounded::<NegMsg>(4096)).unzip();
@@ -1165,10 +1176,20 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
-        let mon_txs = mon_txs.clone();
+        let mon_data_txs = mon_data_txs.clone();
         thread::Builder::new()
             .name("writer".into())
-            .spawn(move || run_writer(env, cfg, conns, metrics, writer_rx, mon_txs, moderation))
+            .spawn(move || {
+                run_writer(
+                    env,
+                    cfg,
+                    conns,
+                    metrics,
+                    writer_rx,
+                    mon_data_txs,
+                    moderation,
+                )
+            })
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1184,14 +1205,14 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
-    for (i, mon_rx) in mon_rxs.into_iter().enumerate() {
+    for (i, (mon_rx, data_rx)) in mon_rxs.into_iter().zip(mon_data_rxs).enumerate() {
         let env = env.clone();
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
         thread::Builder::new()
             .name(format!("req-monitor-{i}"))
-            .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx))
+            .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx, data_rx))
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1222,7 +1243,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let shutdown = shutdown.clone();
         thread::Builder::new()
             .name("db-watch".into())
-            .spawn(move || run_db_watch(env, mon_txs, shutdown))
+            .spawn(move || run_db_watch(env, mon_data_txs, shutdown))
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1253,15 +1274,15 @@ fn run_metrics_history(
 }
 
 /// Broadcast a database-change notification to every req-monitor thread.
-fn broadcast_db_change(mon_txs: &[Sender<MonitorMsg>]) {
+fn broadcast_db_change(mon_txs: &[Sender<MonitorData>]) {
     for tx in mon_txs {
-        let _ = tx.send(MonitorMsg::DbChange);
+        let _ = tx.send(MonitorData::DbChange);
     }
 }
 
-fn broadcast_ephemeral(mon_txs: &[Sender<MonitorMsg>], packed: &[u8], json: &str) {
+fn broadcast_ephemeral(mon_txs: &[Sender<MonitorData>], packed: &[u8], json: &str) {
     for tx in mon_txs {
-        let _ = tx.send(MonitorMsg::Ephemeral {
+        let _ = tx.send(MonitorData::Ephemeral {
             packed: packed.to_vec(),
             json: json.to_string(),
         });
@@ -1272,7 +1293,7 @@ fn broadcast_ephemeral(mon_txs: &[Sender<MonitorMsg>], packed: &[u8], json: &str
 /// and poke the req-monitor. strfry must never write a Wok database. Like
 /// RelayReqMonitor's hoytech::file_change_monitor (100ms debounce). Polling
 /// is used for portability; semantics match.
-fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorMsg>>, shutdown: Arc<AtomicBool>) {
+fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorData>>, shutdown: Arc<AtomicBool>) {
     let path = env.path().join("data.mdb");
     // Reconcile once after establishing the baseline so a commit that lands
     // before this thread is first scheduled cannot be absorbed as baseline.
@@ -1488,8 +1509,6 @@ impl Routed for MonitorMsg {
             | Self::HistoryDone { conn_id, .. }
             | Self::SetAuth { conn_id, .. }
             | Self::Close { conn_id } => *conn_id,
-            // Never sent by an ingester.
-            Self::DbChange | Self::Ephemeral { .. } => 0,
         }
     }
 
@@ -1570,9 +1589,10 @@ struct Dispatch {
     writer: Lane<WriterMsg>,
     req: Vec<Lane<ReqMsg>>,
     /// A REQ's or CLOSE's message for the req worker follows its monitor
-    /// message: a REQ's history never finishes before the monitor queue holds
-    /// its registration, and both see a connection's REQs and CLOSEs in the
-    /// same order.
+    /// message: a REQ's history never finishes before the monitor's control
+    /// queue holds its registration, and both see a connection's REQs and
+    /// CLOSEs in the same order. That queue is unbounded, so nothing parks
+    /// here and the follow-up goes at once.
     mon: Vec<Lane<MonitorMsg, ReqMsg>>,
     neg: Vec<Lane<NegMsg>>,
     gates: Gates,
@@ -3353,6 +3373,7 @@ fn run_req_monitor(
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     rx: Receiver<MonitorMsg>,
+    data_rx: Receiver<MonitorData>,
 ) {
     // The ingester caps subscriptions per connection before registering them.
     let mut monitors = ActiveMonitors::new(usize::MAX);
@@ -3360,31 +3381,49 @@ fn run_req_monitor(
     // Newest local event id already matched against every subscription.
     let mut curr_event_id = u64::MAX;
     let mut decomp = Decompressor::new();
+    let (mut rx, mut data_rx) = (rx, data_rx);
+    let (mut control_open, mut data_open) = (true, true);
     let mut control = Vec::new();
     let mut data = Vec::new();
     let mut retry = false;
     loop {
-        let first = if retry {
-            match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(msg) => Some(msg),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-            }
+        // After a failed read, retry shortly with what was kept.
+        let retry_timer = if retry {
+            crossbeam_channel::after(Duration::from_millis(10))
         } else {
-            match rx.recv() {
-                Ok(msg) => Some(msg),
-                Err(_) => break,
-            }
+            crossbeam_channel::never()
         };
-        // Subscription changes are applied before the events queued with
-        // them, each in its own order: a REQ then also sees events published
-        // just before it, CLOSE stops delivery sooner, and EOSE does not wait
-        // behind the batch's fan-out.
-        for msg in first.into_iter().chain(rx.try_iter()) {
-            match msg {
-                MonitorMsg::DbChange | MonitorMsg::Ephemeral { .. } => data.push(msg),
-                _ => control.push(msg),
-            }
+        crossbeam_channel::select! {
+            recv(rx) -> msg => match msg {
+                Ok(msg) => control.push(msg),
+                Err(_) => control_open = false,
+            },
+            recv(data_rx) -> msg => match msg {
+                Ok(msg) => data.push(msg),
+                Err(_) => data_open = false,
+            },
+            recv(retry_timer) -> _ => {}
+        }
+        // A closed queue never wakes the monitor again; it stops once both are.
+        if !control_open {
+            rx = crossbeam_channel::never();
+        }
+        if !data_open {
+            data_rx = crossbeam_channel::never();
+        }
+        if !control_open && !data_open {
+            break;
+        }
+        // Data first, then control. Every subscription change sent before a
+        // data message taken here is then in `control`, and changes are
+        // applied first: a REQ sees every event sent after its registration
+        // and some sent just before, CLOSE stops delivery sooner, and EOSE
+        // does not wait behind the batch's fan-out.
+        data.extend(data_rx.try_iter());
+        control.extend(rx.try_iter());
+        if control.is_empty() && data.is_empty() {
+            retry = false;
+            continue;
         }
         let cfg_snap = cfg.read();
         let r = restrictor(&cfg_snap);
@@ -3398,10 +3437,10 @@ fn run_req_monitor(
                 // CLOSED. One DbChange is enough: the next scan resumes from
                 // the same cursor. Live-only events are dropped.
                 tracing::warn!(%error, "req monitor cannot read the database");
-                let db_change = data.iter().any(|m| matches!(m, MonitorMsg::DbChange));
+                let db_change = data.iter().any(|m| matches!(m, MonitorData::DbChange));
                 data.clear();
                 if db_change {
-                    data.push(MonitorMsg::DbChange);
+                    data.push(MonitorData::DbChange);
                 }
                 retry = true;
                 continue;
@@ -3415,7 +3454,7 @@ fn run_req_monitor(
         let identities = |authed: &HashMap<u64, Vec<[u8; 32]>>, conn_id: u64| {
             authed.get(&conn_id).cloned().unwrap_or_default()
         };
-        for msg in control.drain(..).chain(data.drain(..)) {
+        for msg in control.drain(..) {
             match msg {
                 MonitorMsg::Register(mut sub) => {
                     // Stored events after the REQ's history snapshot are the
@@ -3533,7 +3572,11 @@ fn run_req_monitor(
                     authed.remove(&conn_id);
                     monitors.close_conn(conn_id);
                 }
-                MonitorMsg::DbChange => {
+            }
+        }
+        for msg in data.drain(..) {
+            match msg {
+                MonitorData::DbChange => {
                     let start = curr_event_id.saturating_add(1);
                     let _ = wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
                         let Ok(packed) = PackedEventView::new(packed_bytes) else {
@@ -3583,7 +3626,7 @@ fn run_req_monitor(
                     });
                     curr_event_id = latest;
                 }
-                MonitorMsg::Ephemeral { packed, json } => {
+                MonitorData::Ephemeral { packed, json } => {
                     let (live, pending) = {
                         let Ok(event) = PackedEventView::new(&packed) else {
                             continue;
@@ -4912,7 +4955,7 @@ mod tests {
     /// An ingester whose worker queues the test drains itself. Connection 1
     /// routes to `req[1]`, a two-slot queue nobody reads until the test says
     /// so: a REQ worker stuck in a long scan. Connection 2 routes to `req[0]`.
-    /// Both share one req monitor queue.
+    /// Both share one req monitor, whose control queue the test reads.
     struct StalledWorker {
         ingest: tokio::sync::mpsc::Sender<IngestMsg>,
         writer: Receiver<WriterMsg>,
@@ -4930,12 +4973,11 @@ mod tests {
 
     impl StalledWorker {
         fn start() -> Self {
-            Self::with_capacity(2, 1024)
+            Self::with_capacity(2)
         }
 
-        /// `stalled` slots in connection 1's req worker queue and `monitor`
-        /// in the shared req monitor queue.
-        fn with_capacity(stalled: usize, monitor: usize) -> Self {
+        /// `stalled` slots in connection 1's req worker queue.
+        fn with_capacity(stalled: usize) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let env = Env::open(dir.path(), small_map_env_options()).unwrap();
             env.ensure_initialized().unwrap();
@@ -4956,7 +4998,7 @@ mod tests {
             let (writer_tx, writer) = bounded(64);
             let (healthy_tx, healthy) = bounded(64);
             let (stalled_tx, stalled) = bounded(stalled);
-            let (mon_tx, mon) = bounded(monitor);
+            let (mon_tx, mon) = unbounded();
             let (neg_tx, neg) = bounded(64);
             let (ingest, ingest_rx) = tokio::sync::mpsc::channel(64);
             let ingester = thread::spawn({
@@ -5170,41 +5212,43 @@ mod tests {
         relay.finish();
     }
 
-    /// A REQ's history scan is never started before its registration is in
-    /// the req monitor queue: the scan's snapshot would otherwise miss events
-    /// the monitor matches first. With the monitor queue full, the
-    /// registration parks and its scan waits behind it, as does a CLOSE.
+    /// A REQ's registration is queued for the req monitor when the REQ is
+    /// admitted, however far behind the monitor is, and its history scan only
+    /// after that. So an event published after the REQ cannot reach the
+    /// monitor ahead of the registration, and the scan's snapshot cannot miss
+    /// events the monitor matched first. Nothing reads the monitor here.
     #[test]
-    fn scans_wait_for_their_registration_to_reach_the_monitor() {
-        let relay = StalledWorker::with_capacity(64, 2);
-        for sub_id in ["a", "b", "c"] {
-            relay.send(1, json!(["REQ", sub_id, {"kinds": [1]}]));
+    fn registrations_never_wait_for_the_monitor() {
+        let relay = StalledWorker::with_capacity(64);
+        for i in 0..100 {
+            relay.send(1, json!(["REQ", format!("s{i}"), {"kinds": [1]}]));
         }
-        relay.send(1, json!(["CLOSE", "c"]));
-        assert_new_sub(relay.recv_stalled(), "a");
-        assert_new_sub(relay.recv_stalled(), "b");
-        thread::sleep(Duration::from_millis(20));
-        assert!(
-            relay.req[1].try_recv().is_err(),
-            "REQ c was scanned before the monitor could register it"
-        );
-        assert!(!relay.gate_open(1), "connection 1 is paused");
-
-        let registered = |msg: MonitorMsg| match msg {
-            MonitorMsg::Register(sub) => sub.sub_id.to_string(),
-            MonitorMsg::Remove { sub_id, .. } => format!("-{sub_id}"),
-            _ => panic!("unexpected monitor message"),
-        };
-        let recv_mon = || relay.mon.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(registered(recv_mon()), "a");
-        assert_new_sub(relay.recv_stalled(), "c");
-        assert_eq!(registered(recv_mon()), "b");
-        assert_eq!(registered(recv_mon()), "c");
-        assert_eq!(registered(recv_mon()), "-c");
+        relay.send(1, json!(["CLOSE", "s99"]));
+        for i in 0..100 {
+            assert_new_sub(relay.recv_stalled(), &format!("s{i}"));
+            assert!(
+                relay.mon.len() > i,
+                "REQ s{i} was scanned before it was registered"
+            );
+        }
         assert!(matches!(
             relay.recv_stalled(),
-            ReqMsg::Cancel { conn_id: 1, ref sub_id, count_only: false, .. } if sub_id.as_str() == "c"
+            ReqMsg::Cancel { conn_id: 1, ref sub_id, count_only: false, .. } if sub_id.as_str() == "s99"
         ));
+        let registered: Vec<String> = relay
+            .mon
+            .try_iter()
+            .map(|msg| match msg {
+                MonitorMsg::Register(sub) => sub.sub_id.to_string(),
+                MonitorMsg::Remove { sub_id, .. } => format!("-{sub_id}"),
+                _ => panic!("unexpected monitor message"),
+            })
+            .collect();
+        let expected: Vec<String> = (0..100)
+            .map(|i| format!("s{i}"))
+            .chain(["-s99".to_string()])
+            .collect();
+        assert_eq!(registered, expected);
         relay.finish();
     }
 
@@ -5216,6 +5260,7 @@ mod tests {
         env: Env,
         cfg: Arc<parking_lot::RwLock<Config>>,
         tx: Sender<MonitorMsg>,
+        data: Sender<MonitorData>,
         conns: Arc<ConnTable>,
         metrics: Arc<Metrics>,
         subject: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
@@ -5239,17 +5284,19 @@ mod tests {
             conns.insert(1, Outbound::new(subject_tx, 0));
             conns.insert(2, Outbound::new(observer_tx, 0));
             let metrics = Arc::new(Metrics::default());
-            let (tx, rx) = bounded(64);
+            let (tx, rx) = unbounded();
+            let (data, data_rx) = bounded(64);
             let cfg = Arc::new(parking_lot::RwLock::new(cfg));
             let thread = {
                 let (env, cfg, conns, metrics) =
                     (env.clone(), cfg.clone(), conns.clone(), metrics.clone());
-                thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx))
+                thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx, data_rx))
             };
             let mut harness = Self {
                 env,
                 cfg,
                 tx,
+                data,
                 conns,
                 metrics,
                 subject,
@@ -5296,6 +5343,10 @@ mod tests {
 
         fn send(&self, msg: MonitorMsg) {
             self.tx.send(msg).unwrap();
+        }
+
+        fn feed(&self, msg: MonitorData) {
+            self.data.send(msg).unwrap();
         }
 
         fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>) -> Value {
@@ -5350,7 +5401,7 @@ mod tests {
         /// Store a kind-1 event, tell the monitor and wait until it matched it.
         fn store(&mut self, content: &str) -> (u64, String) {
             let (lev, id) = self.write(content);
-            self.send(MonitorMsg::DbChange);
+            self.feed(MonitorData::DbChange);
             self.observe(&id);
             (lev, id)
         }
@@ -5362,7 +5413,7 @@ mod tests {
         fn ephemeral_at(&mut self, content: &str, created_at: u64) -> String {
             let parsed = Self::parse_at(20_001, content, created_at);
             let id = to_hex(parsed.packed.view().id());
-            self.send(MonitorMsg::Ephemeral {
+            self.feed(MonitorData::Ephemeral {
                 packed: parsed.packed.into_bytes(),
                 json: parsed.json,
             });
@@ -5390,17 +5441,23 @@ mod tests {
         }
 
         /// Send `msg` and return the subject's frames once the monitor has
-        /// handled it: the observer sees a later sentinel event.
+        /// handled it.
         fn apply(&mut self, msg: MonitorMsg) -> Vec<(String, String, String)> {
             self.send(msg);
+            self.sync();
+            self.frames()
+        }
+
+        /// Wait until the monitor has handled everything sent so far: the
+        /// observer sees a later sentinel event.
+        fn sync(&mut self) {
             let sentinel = Self::parse(20_002, "sentinel");
             let id = to_hex(sentinel.packed.view().id());
-            self.send(MonitorMsg::Ephemeral {
+            self.feed(MonitorData::Ephemeral {
                 packed: sentinel.packed.into_bytes(),
                 json: sentinel.json,
             });
             self.observe(&id);
-            self.frames()
         }
 
         fn history_done(
@@ -5419,8 +5476,10 @@ mod tests {
 
     impl Drop for MonitorHarness {
         fn drop(&mut self) {
-            let (tx, _) = bounded(1);
+            let (tx, _) = unbounded();
             drop(std::mem::replace(&mut self.tx, tx));
+            let (data, _) = bounded(1);
+            drop(std::mem::replace(&mut self.data, data));
             if let Some(thread) = self.thread.take() {
                 thread.join().unwrap();
             }
@@ -5484,7 +5543,7 @@ mod tests {
         let mut h = MonitorHarness::start(0);
         let (snapshot, history) = h.write("stored before the REQ, matched after it");
         h.register(1, json!({"kinds": [1]}), snapshot);
-        h.send(MonitorMsg::DbChange);
+        h.feed(MonitorData::DbChange);
         h.observe(&history);
         let (_, live) = h.store("after the REQ");
         assert_eq!(
@@ -5530,6 +5589,37 @@ mod tests {
         h.store("restricted while held");
         h.cfg.write().relay.auth.restricted_read_kinds = vec![1, 20001];
         assert_eq!(h.history_done(2, 0), [eose_frame()]);
+    }
+
+    /// A monitor that cannot open a read transaction keeps the subscription
+    /// changes and database change it was handed, which nobody resends, and
+    /// applies them once reads work again.
+    #[test]
+    fn monitor_keeps_subscription_changes_through_read_failures() {
+        let mut h = MonitorHarness::start(0);
+        let (snapshot, _) = h.store("before the REQ");
+        h.register(1, json!({"kinds": [1]}), snapshot);
+        let (_, held) = h.store("held");
+        let event_id = |frame: Value| frame[2]["id"].as_str().unwrap().to_string();
+
+        fault::fail_reads(h.env.path(), 3);
+        h.send(MonitorMsg::HistoryDone {
+            conn_id: 1,
+            sub_id: SubId::new("x").unwrap(),
+            generation: 1,
+            snapshot,
+        });
+        let eose = MonitorHarness::next(&mut h.subject);
+        assert_eq!(
+            (eose[0].as_str(), eose[1].as_str()),
+            (Some("EOSE"), Some("x"))
+        );
+        assert_eq!(event_id(MonitorHarness::next(&mut h.subject)), held);
+
+        fault::fail_reads(h.env.path(), 3);
+        let (_, live) = h.write("committed while reads fail");
+        h.feed(MonitorData::DbChange);
+        assert_eq!(event_id(MonitorHarness::next(&mut h.subject)), live);
     }
 
     /// `Remove` drops only the generation it names: cleanup of an older REQ

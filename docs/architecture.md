@@ -101,13 +101,15 @@ history as well as live ones; a REQ reusing an open id always fits.
    `CLOSED`. NIP-01 makes a REQ replace the subscription it names, so a refused
    one still ends it. An admitted REQ gets its generation and history snapshot,
    and the gate opens for it.
-2. **Registration, on the req monitor.** The ingester queues `Register` for the
-   connection's req monitor, and the history scan for its req worker only once
-   `Register` is in the monitor queue, so the scan's `HistoryDone` can never
-   reach the monitor first. The monitor replaces any subscription with that id
-   and matches the new one against every later event, as for a live
-   subscription. Matches are held in a per-subscription buffer instead of being
-   sent: stored events by local event id, live-only events in full.
+2. **Registration, on the req monitor.** The ingester queues `Register` on the
+   connection's req monitor's control queue, then the history scan for its req
+   worker, so the scan's `HistoryDone` can never reach the monitor first. The
+   control queue is unbounded, so `Register` is queued at admission and never
+   waits behind live traffic (see below). The monitor replaces any
+   subscription with that id and matches the new one against every later
+   event, as for a live subscription. Matches are held in a per-subscription
+   buffer instead of being sent: stored events by local event id, live-only
+   events in full.
 3. **History, on the req worker.** The worker scans up to the snapshot, then
    posts `HistoryDone{generation, snapshot}` to the monitor and moves on. It
    never waits for a reply. A REQ or COUNT it cannot start (a read failure,
@@ -136,13 +138,21 @@ history as well as live ones; a REQ reusing an open id always fits.
 COUNT never registers with a monitor, and COUNT ids are separate from REQ ids:
 neither cancels the other.
 
-Each req monitor drains its queue in batches and applies subscription changes
-(`Register`, `Remove`, `HistoryDone`, AUTH, disconnect) before the events
-queued with them. A REQ then also sees live-only events published just before
-it, and EOSE does not wait behind the batch's fan-out. Each kind keeps its own
-order, and per-connection order holds because a connection's subscriptions all
-live on one monitor. If the monitor cannot open a read transaction, it keeps
-the subscription changes (and one database change) and retries.
+Each req monitor has two queues: subscription changes (`Register`, `Remove`,
+`HistoryDone`, AUTH, disconnect) on an unbounded control queue, and database
+changes and live-only events on a bounded data queue. Each turn it takes what
+is in the data queue, then what is in the control queue, and applies the
+changes first. So every change sent before an event taken that turn is
+applied before the event is matched: a live-only event published after a REQ
+was admitted is matched against it however full the data queue was, and EOSE
+does not wait behind the turn's fan-out. A REQ also sees live-only events
+published just before it that share its turn. Each queue keeps its own order,
+and per-connection order holds because a connection's subscriptions all live
+on one monitor. Every control message is paired with work on a bounded req
+worker queue (a scan, a cancel) or is one per AUTH or connection, so the
+control queue grows only while a turn runs. If the monitor cannot open a read
+transaction, it keeps the subscription changes (and one database change) and
+retries.
 
 ## Non-goals
 

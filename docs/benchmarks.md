@@ -252,9 +252,9 @@ and a codec table. `results.jsonl` holds the same values in each trial's
   divided per burst, delivery or cycle. They are sampled from outside the
   process: `/proc/<pid>/stat` on Linux and `ps` elsewhere, both with 10 ms
   resolution, so keep phases long enough for that to be noise.
-- **burst write syscalls** are read from `/proc/<pid>/io` (`syscw`) and
-  appear only on Linux. They count every write-like syscall the relay made
-  during the bursts, including LMDB and logging, not only socket writes.
+- The scenario does not count syscalls. To count the relay's socket writes
+  on Linux, point `--wok` at an executable script named `wok` that runs the
+  real binary under `strace -f -c -o <file>`, and keep the other phases small.
 - **Codec**: µs per frame and compressed size over original size. "Takeover"
   compresses each group as one stream, like a burst or a live subscription;
   "fresh" compresses each frame with a new compressor, like a connection's

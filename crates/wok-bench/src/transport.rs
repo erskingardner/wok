@@ -8,8 +8,8 @@
 //!   `--transport-idle-secs` of silence (idle) and for a second wave of as
 //!   many warmed connections opened beside the idle ones;
 //! - **burst**: `--bursts` sequential history bursts of `--burst-events`
-//!   events on one connection: time to EOSE, bytes on the wire, relay CPU and,
-//!   on Linux, relay write syscalls per burst;
+//!   events on one connection: time to first EVENT and to EOSE, bytes on the
+//!   wire and relay CPU per burst;
 //! - **fanout**: `--fanout-subscribers` live subscribers receive
 //!   `--fanout-events` publications: relay CPU per delivered event;
 //! - **churn**: `--churn-connections` connect, fetch, close cycles (mobile
@@ -65,8 +65,6 @@ pub struct TransportReport {
     /// Kind-1 events in the imported corpus (the burst filter).
     pub kind1_events: u64,
     pub modes: Vec<ModeReport>,
-    /// Whether relay write syscalls could be read (Linux `/proc/<pid>/io`).
-    pub syscalls_measured: bool,
     pub codec: Vec<CodecRow>,
 }
 
@@ -103,7 +101,6 @@ pub struct ModeReport {
     pub burst_p99_ms: f64,
     pub burst_wire_bytes: f64,
     pub burst_cpu_ms: f64,
-    pub burst_write_syscalls: Option<f64>,
     pub fanout_deliveries: u64,
     pub fanout_secs: f64,
     pub fanout_cpu_us_per_delivery: f64,
@@ -172,7 +169,6 @@ pub fn run(rt: &tokio::runtime::Runtime, input: RunInput<'_>) -> Result<Transpor
         });
         crate::stop_relay(&mut child, &url);
         let mode = mode?;
-        report.syscalls_measured = mode.burst_write_syscalls.is_some();
         report.modes.push(mode);
     }
     Ok(report)
@@ -378,10 +374,6 @@ async fn run_mode(
     let bursts = opts.bursts.max(1) as f64;
     report.burst_wire_bytes = (conn.wire_in - wire_before) as f64 / bursts;
     report.burst_cpu_ms = (after.cpu_ms - before.cpu_ms) / bursts;
-    report.burst_write_syscalls = after
-        .write_syscalls
-        .zip(before.write_syscalls)
-        .map(|(a, b)| a.saturating_sub(b) as f64 / bursts);
     times.sort_by(f64::total_cmp);
     firsts.sort_by(f64::total_cmp);
     report.burst_first_p50_ms = percentile(&firsts, 0.50);
@@ -717,7 +709,6 @@ impl Conn {
 struct ProcSample {
     rss_kb: u64,
     cpu_ms: f64,
-    write_syscalls: Option<u64>,
 }
 
 impl ProcSample {
@@ -739,17 +730,9 @@ impl ProcSample {
             .split_whitespace()
             .collect();
         let ticks: u64 = fields[11].parse::<u64>()? + fields[12].parse::<u64>()?;
-        let write_syscalls = std::fs::read_to_string(format!("/proc/{pid}/io"))
-            .ok()
-            .and_then(|io| {
-                io.lines()
-                    .find_map(|line| line.strip_prefix("syscw:"))
-                    .and_then(|v| v.trim().parse().ok())
-            });
         Ok(Self {
             rss_kb,
             cpu_ms: ticks as f64 * 10.0,
-            write_syscalls,
         })
     }
 
@@ -770,7 +753,6 @@ impl ProcSample {
         Ok(Self {
             rss_kb,
             cpu_ms: cpu_secs * 1000.0,
-            write_syscalls: None,
         })
     }
 }
@@ -790,10 +772,10 @@ pub fn render_markdown(report: &TransportReport, relay: &str, repetition: u32) -
         opts.fanout_events,
         opts.churn_connections,
     );
-    s.push_str("| deflate | negotiated | KB/conn cold | KB/conn warm | KB/conn idle | KB/conn 2nd wave | burst first EVENT p50 ms | burst EOSE p50 ms | burst EOSE p99 ms | burst wire KB | burst CPU ms | burst write syscalls | fan-out CPU µs/delivery | fan-out wire B/delivery | churn cycles/s | churn CPU µs/cycle | errors |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    s.push_str("| deflate | negotiated | KB/conn cold | KB/conn warm | KB/conn idle | KB/conn 2nd wave | burst first EVENT p50 ms | burst EOSE p50 ms | burst EOSE p99 ms | burst wire KB | burst CPU ms | fan-out CPU µs/delivery | fan-out wire B/delivery | churn cycles/s | churn CPU µs/cycle | errors |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for mode in &report.modes {
         s.push_str(&format!(
-            "| {} | {}/{} | {:.1} | {:.1} | {} | {} | {:.2} | {:.2} | {:.2} | {:.1} | {:.2} | {} | {:.1} | {:.0} | {:.0} | {:.0} | {} |\n",
+            "| {} | {}/{} | {:.1} | {:.1} | {} | {} | {:.2} | {:.2} | {:.2} | {:.1} | {:.2} | {:.1} | {:.0} | {:.0} | {:.0} | {} |\n",
             if mode.offer_deflate { "offered" } else { "off" },
             mode.negotiated,
             mode.opened,
@@ -808,8 +790,6 @@ pub fn render_markdown(report: &TransportReport, relay: &str, repetition: u32) -
             mode.burst_p99_ms,
             mode.burst_wire_bytes / 1024.0,
             mode.burst_cpu_ms,
-            mode.burst_write_syscalls
-                .map_or_else(|| "—".into(), |v| format!("{v:.0}")),
             mode.fanout_cpu_us_per_delivery,
             mode.fanout_wire_bytes_per_delivery,
             mode.churn_per_s,

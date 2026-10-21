@@ -1245,12 +1245,12 @@ event_burst = 500
             COMMENTED.replace("event_burst = 500\n", "event_burst = 500\nreq_burst = 80\n")
         );
         let (edited, _) = dashboard_save(COMMENTED, |body| {
-            body["events"]["max_num_tags"] = json!(5000);
+            body["events"]["max_num_tags"] = json!(8000);
         })
         .unwrap();
         assert_eq!(
             edited,
-            format!("{COMMENTED}\n[events]\nmax_num_tags = 5000\n")
+            format!("{COMMENTED}\n[events]\nmax_num_tags = 8000\n")
         );
 
         // A key set back to its preset's value is removed with its comment,

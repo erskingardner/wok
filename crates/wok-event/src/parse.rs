@@ -11,6 +11,10 @@ use crate::{EventError, MAX_INDEXED_TAG_VAL_SIZE};
 /// gift wraps and MLS group events.
 pub const DEFAULT_MAX_EVENT_SIZE: usize = 1024 * 1024;
 
+/// Default ceiling for tags on one event: room for the kind-3 follow lists
+/// and kind-10000/30000 lists of heavy users.
+pub const DEFAULT_MAX_NUM_TAGS: usize = 5_000;
+
 #[derive(Debug, Clone)]
 pub struct EventLimits {
     pub max_event_size: usize,
@@ -22,7 +26,7 @@ impl Default for EventLimits {
     fn default() -> Self {
         Self {
             max_event_size: DEFAULT_MAX_EVENT_SIZE,
-            max_num_tags: 2000,
+            max_num_tags: DEFAULT_MAX_NUM_TAGS,
             max_tag_val_size: 1024,
         }
     }

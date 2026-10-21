@@ -224,7 +224,7 @@ cargo build --release -p wok-cli -p wok-bench
 |---|---:|---|
 | `--connections` | 1,000 | Sockets held open in the memory phase |
 | `--transport-idle-secs` | 0 | Silence before the last memory sample (0 skips it). Wok releases compression state after 30–60 s without traffic, so use at least 65 to see it |
-| `--burst-events` | 500 | Events per burst, at most the relay's default `max_filter_limit` (500); fewer if fewer kind-1 events are stored |
+| `--burst-events` | 500 | Events per burst, at most the relay's default `max_filter_limit` (2,000); fewer if fewer kind-1 events are stored |
 | `--bursts` | 40 | Bursts per mode |
 | `--fanout-subscribers` | 32 | Live subscribers |
 | `--fanout-events` | 200 | Notes published per mode |

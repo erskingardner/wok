@@ -753,6 +753,32 @@ at least three times, alternating, and compare medians. A run that panics with
 "load ran out" lasted longer than its load, so its later lines were measured
 without it; discard them.
 
+## Time slices of many-filter REQs
+
+`crates/wok-query/tests/timeslice.rs` holds an ignored test that times the
+slices of one REQ with many filters, in process, through a `QueryScheduler`
+as a req worker runs it. It uses only public `wok-query` API, so the same file
+runs unchanged against older revisions.
+
+```bash
+cargo test --release -p wok-query --test timeslice -- --ignored --nocapture
+```
+
+- `EVENTS` (20000) stored kind-1 notes each mention `FILTERS` (30) accounts.
+  The REQ has one filter per account, `{"kinds":[7],"#p":[<account>],
+  "limit":500}`, so each filter reads every note and finds no match.
+- It runs in slices of `BUDGET_US` (10000). A small REQ,
+  `{"kinds":[1],"limit":5}`, arrives every `ARRIVAL_US` (2000) and runs
+  before the many-filter REQ's next slice, as a new query does on a req
+  worker.
+
+Each of three rounds prints the many-filter REQ's time to its end, then
+sample counts and p50/p90/p99/max for its slice lengths and for each small
+REQ's time from arrival to its end. The longest slice is how long a query
+can wait behind it. Set `EVENTS` large enough that one filter takes longer
+than a slice to see each filter's checks; set `ARRIVAL_US` past the run's
+length to time the many-filter REQ alone.
+
 ## REQ path latency for client traffic shapes
 
 `crates/wok-compat/tests/req_path_latency.rs` holds three ignored tests that

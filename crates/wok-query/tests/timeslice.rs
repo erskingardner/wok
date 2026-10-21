@@ -1,14 +1,22 @@
 //! Time slices of multi-filter REQ scans: a REQ's filters share one slice's
 //! budget, and every filter checks it as often as the first.
 //!
-//! The tests use a budget of 0, so a slice ends at the first check and how
-//! much a slice does depends on the work alone.
+//! The regression tests use a budget of 0, so a slice ends at the first
+//! check and how much a slice does depends on the work alone. The ignored
+//! `many_filter_req_slices` times slices at a real budget; run it by hand, in
+//! release mode, to compare builds:
+//!
+//! ```text
+//! cargo test --release -p wok-query --test timeslice -- --ignored --nocapture
+//! ```
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use wok_db::{write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
 use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
-use wok_query::{DbQuery, NostrFilterGroup, SubId, Subscription};
+use wok_query::{DbQuery, NostrFilterGroup, QueryScheduler, SubId, Subscription};
 
 /// A database of kind-1 events, a second apart, oldest first: one for each
 /// entry of `tags`, which lists the event's single-letter tags.
@@ -111,4 +119,110 @@ fn a_spent_slice_starts_no_further_filter() {
         .collect();
     assert_eq!(slices(&env, filters.clone(), 0), vec![10; 30]);
     assert_eq!(slices(&env, filters, u64::MAX), vec![300]);
+}
+
+fn knob(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn percentiles(label: &str, mut samples: Vec<Duration>) {
+    if samples.is_empty() {
+        println!("{label:<28} n=0");
+        return;
+    }
+    samples.sort();
+    let at = |p: f64| {
+        let i = ((samples.len() as f64 - 1.0) * p).round() as usize;
+        samples[i].as_secs_f64() * 1e3
+    };
+    println!(
+        "{label:<28} n={:<6} p50={:>8.2} ms  p90={:>8.2} ms  p99={:>8.2} ms  max={:>8.2} ms",
+        samples.len(),
+        at(0.5),
+        at(0.9),
+        at(0.99),
+        at(1.0),
+    );
+}
+
+/// Not a regression test. One REQ of `FILTERS` (30) filters, each asking for
+/// the reactions (kind 7) to one of `FILTERS` accounts, where every one of
+/// `EVENTS` (20000) stored notes mentions all of them: each filter reads
+/// every note to find no reaction. It runs through a `QueryScheduler` in
+/// slices of `BUDGET_US` (10000), as on a req worker, while a small REQ
+/// (`{"kinds":[1],"limit":5}`) arrives every `ARRIVAL_US` (2000) and goes
+/// first. Prints the many-filter REQ's slice lengths, its REQ-to-end time,
+/// and each small REQ's time from arrival to its end: how long it waited for
+/// the slice it arrived during.
+#[test]
+#[ignore]
+fn many_filter_req_slices() {
+    let events = knob("EVENTS", 20_000);
+    let filters = knob("FILTERS", 30);
+    let budget_us = knob("BUDGET_US", 10_000) as u64;
+    let arrival = Duration::from_micros(knob("ARRIVAL_US", 2_000) as u64);
+    let account = |i: usize| {
+        let mut pubkey = [0xAA; 32];
+        pubkey[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        pubkey
+    };
+    let (_dir, env) =
+        store((0..events).map(|_| (0..filters).map(|i| ('p', account(i).to_vec())).collect()));
+    let txn = env.begin_ro().unwrap();
+    let many: Vec<Value> = (0..filters)
+        .map(|i| json!({"kinds": [7], "#p": [hex::encode(account(i))], "limit": 500}))
+        .collect();
+    for round in 0..3 {
+        let mut scheduler = QueryScheduler::new(100_000, 0, 0);
+        assert!(scheduler.add_sub(&txn, sub("many", many.clone())).unwrap());
+        let started = Instant::now();
+        let mut next_arrival = started + arrival;
+        let mut arrivals = HashMap::new();
+        let mut waits = Vec::new();
+        let mut slices = Vec::new();
+        let mut took: Option<Duration> = None;
+        // Small REQs arrive until the many-filter one is done; those queued
+        // behind its last slice then run.
+        loop {
+            let until = took.map_or_else(Instant::now, |took| started + took);
+            while next_arrival <= until {
+                let sub_id = format!("small{}", arrivals.len());
+                let small = sub(&sub_id, vec![json!({"kinds": [1], "limit": 5})]);
+                assert!(scheduler.add_sub(&txn, small).unwrap());
+                arrivals.insert(sub_id, next_arrival);
+                next_arrival += arrival;
+            }
+            if !scheduler.has_running() {
+                break;
+            }
+            let many_slice = scheduler
+                .next_query()
+                .is_some_and(|s| s.sub_id.to_string() == "many");
+            let slice_start = Instant::now();
+            scheduler
+                .process(
+                    &txn,
+                    budget_us,
+                    |_, _, _| true,
+                    |sub, _, _, _, _| match arrivals.get(&sub.sub_id.to_string()) {
+                        Some(arrived) => waits.push(arrived.elapsed()),
+                        None => took = Some(started.elapsed()),
+                    },
+                )
+                .unwrap();
+            if many_slice {
+                slices.push(slice_start.elapsed());
+            }
+        }
+        println!(
+            "round {round}: {filters} filters over {events} notes, {budget_us} us slices: \
+             REQ to end {:.1} ms",
+            took.unwrap().as_secs_f64() * 1e3
+        );
+        percentiles("  many-filter slice", slices);
+        percentiles("  small REQ wait", waits);
+    }
 }

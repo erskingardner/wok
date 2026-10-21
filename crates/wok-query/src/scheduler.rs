@@ -94,6 +94,26 @@ impl QueryScheduler {
         self.remove_query(conn_id, sub_id, false);
     }
 
+    /// Drop the REQ (`count_only` false) or COUNT query with this id, if it
+    /// is still this generation's.
+    pub fn remove_generation(
+        &mut self,
+        conn_id: u64,
+        sub_id: &SubId,
+        count_only: bool,
+        generation: u64,
+    ) {
+        let current = self
+            .conns
+            .get(&conn_id)
+            .and_then(|map| map.get(&(sub_id.clone(), count_only)))
+            .and_then(|&idx| self.queries[idx].as_ref())
+            .is_some_and(|q| q.sub.generation == generation);
+        if current {
+            self.remove_query(conn_id, sub_id, count_only);
+        }
+    }
+
     /// Drop the REQ (`count_only` false) or COUNT query with this id.
     pub fn remove_query(&mut self, conn_id: u64, sub_id: &SubId, count_only: bool) {
         if let Some(map) = self.conns.get_mut(&conn_id) {

@@ -16,6 +16,8 @@ pub struct Recipient {
     /// The subscription's history is still being sent: buffer the match in
     /// its [`PendingBuffer`] instead of delivering it.
     pub pending: bool,
+    /// The REQ generation of the subscription that matched.
+    pub generation: u64,
 }
 
 struct MonitorItem {
@@ -210,6 +212,7 @@ impl ActiveMonitors {
                         conn_id,
                         sub_id,
                         pending,
+                        generation: sub.generation,
                     });
                 }
             }

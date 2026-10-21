@@ -65,24 +65,54 @@ the history's `limit` keeps out. That includes live-only (ephemeral) events,
 which never reach LMDB and so cannot be caught up later. No stage waits on
 another along the way.
 
+### The subscription gate
+
+Replies for one subscription id come from three producers on different
+threads: the ingester (a refusal's CLOSED), the req worker (history, COUNT
+results, its own refusals) and the req monitor (EOSE, live events). What the
+client sees for an id is decided in one place, not by coordinating them.
+
+- Every frame for a connection is queued in `ConnTable` under one lock, and
+  each connection there has a gate: for REQ ids and, separately, COUNT ids,
+  the current generation of each open id. An absent id is closed.
+- The ingester gives each REQ and COUNT a generation as it handles it, in
+  client order, and moves the gate at that moment: an admitted REQ or COUNT
+  makes its generation current, CLOSE removes the id, and a refusal removes
+  the id and queues its CLOSED in the same locked step.
+- Every subscription frame carries its id and generation, and is queued only
+  if that generation is current, checked under the same lock. A CLOSED from a
+  worker and a COUNT result are a generation's last frame: queuing one closes
+  the id. OK, NOTICE, AUTH and NEG-* are not gated.
+- Queued EVENT and EOSE frames keep their id's generation cell, and the
+  WebSocket and Unix transports skip any whose generation has since been
+  replaced or closed, so a slow link does not carry a replaced filter's
+  backlog.
+
+So, per id, no frame of a replaced or closed generation follows the change,
+and a CLOSED is the last frame of its generation, however the producers
+interleave. The subscription cap (`relay.max_subs_per_connection`) is the
+number of open REQ ids in the gate, which counts subscriptions still sending
+history as well as live ones; a REQ reusing an open id always fits.
+
+### Stages
+
 1. **Admission, on the ingester.** Before any worker sees the REQ, the ingester
-   checks parsing and filter limits, query cost, AUTH and the subscription cap.
-   The cap (`relay.max_subs_per_connection`) counts subscriptions that are
-   still sending history as well as live ones; a REQ reusing an open id always
-   fits. A refusal is `CLOSED`. NIP-01 makes a REQ replace the subscription it
-   names, so a refused one still ends it (step 5). The ingester keeps each
-   connection's open REQ ids, gives every REQ a new generation, and fixes its
-   history snapshot.
+   checks parsing and filter limits, query cost, AUTH and the cap. A refusal is
+   `CLOSED`. NIP-01 makes a REQ replace the subscription it names, so a refused
+   one still ends it. An admitted REQ gets its generation and history snapshot,
+   and the gate opens for it.
 2. **Registration, on the req monitor.** The ingester queues `Register` for the
    connection's req monitor, and the history scan for its req worker only once
-   `Register` is in the monitor queue, so the scan's result can never reach the
-   monitor first. The monitor replaces any subscription with that id and
-   matches the new one against every later event, as for a live subscription.
-   Matches are held in a per-subscription buffer instead of being sent: stored
-   events by local event id, live-only events in full.
+   `Register` is in the monitor queue, so the scan's `HistoryDone` can never
+   reach the monitor first. The monitor replaces any subscription with that id
+   and matches the new one against every later event, as for a live
+   subscription. Matches are held in a per-subscription buffer instead of being
+   sent: stored events by local event id, live-only events in full.
 3. **History, on the req worker.** The worker scans up to the snapshot, then
    posts `HistoryDone{generation, snapshot}` to the monitor and moves on. It
-   never waits for a reply.
+   never waits for a reply. A REQ or COUNT it cannot start (a read failure,
+   `relay.abuse.max_concurrent_historical_queries`) or whose scan fails gets
+   CLOSED through the gate.
 4. **Going live, on the req monitor.** For the current generation only, the
    monitor sends EOSE, then the held matches in arrival order, then delivers
    live. NIP-01 defines EOSE as the boundary to "events newly received in
@@ -96,28 +126,23 @@ another along the way.
    - Live-only events cannot be re-read. A full buffer drops the oldest and
      counts them (`wok_live_buffer_dropped_ephemeral_total`); one larger than
      the whole bound is dropped alone.
-5. **CLOSE, replacement, refusal, disconnect.** CLOSE queues `Remove` for the
-   monitor and, behind it, a cancel for the worker. The worker passes the
-   teardown on to the monitor once the history scan has stopped, and the
-   monitor confirms it to the ingester. A refused REQ that names an open
-   subscription, or one whose teardown is not yet confirmed, takes the same
-   path with its CLOSED, so no EVENT for the id can follow that CLOSED. A req
-   worker that refuses a registered REQ itself
-   (`relay.abuse.max_concurrent_historical_queries`, or a scan error) has the
-   monitor drop it and send CLOSED, and the ingester stops counting it on the
-   monitor's confirmation. A `HistoryDone` or CLOSED for a generation that a
-   later REQ replaced is ignored. Disconnect drops everything, pending or
-   live, on every stage.
+5. **CLOSE, replacement, refusal, disconnect.** These take effect at the gate
+   when the ingester handles them. The workers are then told to stop, as
+   cleanup only: `Remove{generation}` for the monitor and, behind it, a cancel
+   for the worker, each acting only on that generation. A replacing REQ's
+   `Register` and scan replace the old ones directly. Disconnect drops the
+   connection's gate and everything on every stage.
 
 COUNT never registers with a monitor, and COUNT ids are separate from REQ ids:
 neither cancels the other.
 
 Each req monitor drains its queue in batches and applies subscription changes
-(`Register`, `Remove`, `HistoryDone`, CLOSED, AUTH, disconnect) before the
-events queued with them. A REQ then also sees live-only events published just
-before it, CLOSE takes effect sooner, and EOSE does not wait behind the batch's
-fan-out. Each kind keeps its own order, and per-connection order holds because
-a connection's subscriptions all live on one monitor.
+(`Register`, `Remove`, `HistoryDone`, AUTH, disconnect) before the events
+queued with them. A REQ then also sees live-only events published just before
+it, and EOSE does not wait behind the batch's fan-out. Each kind keeps its own
+order, and per-connection order holds because a connection's subscriptions all
+live on one monitor. If the monitor cannot open a read transaction, it keeps
+the subscription changes (and one database change) and retries.
 
 ## Non-goals
 

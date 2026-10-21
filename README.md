@@ -29,10 +29,11 @@ quirk. It also provides an additional Unix-domain socket transport.
   CLOSED/AUTH and NEG-* are tested against pinned NIPs. Differential tests are
   migration and regression evidence, not a promise to retain upstream bugs.
 - **NIP-42 AUTH, NIP-45 COUNT with mergeable HyperLogLog sketches, NIP-50
-  ranked content search, NIP-62 restart-safe Request to Vanish, NIP-70
-  protected events, NIP-59 gift-wrap deletion semantics, NIP-77 negentropy set
-  reconciliation** (persistent LMDB B-tree, tree-backed multi-round sync
-  sessions), and **draft NIP-91 AND tag filters**.
+  ranked content search, NIP-62 restart-safe Request to Vanish, NIP-67 EOSE
+  completeness hints, NIP-70 protected events, NIP-59 gift-wrap deletion
+  semantics, NIP-77 negentropy set reconciliation** (persistent LMDB B-tree,
+  tree-backed multi-round sync sessions), and **draft NIP-91 AND tag
+  filters**.
 - **Standards-first ephemeral delivery**: ephemeral kinds are live-only by
   default, with an explicit persisted TTL compatibility mode.
 - **permessage-deflate** via an in-house RFC 6455/7692 codec (no Rust WS

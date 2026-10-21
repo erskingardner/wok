@@ -111,7 +111,8 @@ regression test. Differential parity alone is not a reason to retain it.
   produces a NOTICE.
 - OK reasons for storage failures use `error:` instead of `Write error:`, and
   AUTH failures that already carry a NIP-01 prefix are not wrapped in a second
-  `error:`.
+  `error:`. Events refused because free disk space is below
+  `database.min_free_disk_bytes` also get `error:`.
 - OK reasons for refused events use NIP-01's standardized prefixes. An event
   older than the stored version of its replaceable or addressable event gets
   `blocked: have a newer version`, and one that a deletion or vanish request

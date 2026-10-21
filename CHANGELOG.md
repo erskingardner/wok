@@ -234,6 +234,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `invalid: event expired`, as NIP-40 asks. It was accepted and sent to
   matching live subscriptions, because the ephemeral marker replaced the
   expiration before it was checked.
+- Events refused because free disk space is below
+  `database.min_free_disk_bytes` get `error: disk reserve requires N free
+  bytes` instead of `blocked:`. A low disk is the relay's own failure, not a
+  policy decision about the event or its author.
 
 ## [0.7.0] - 2026-09-08
 

@@ -310,7 +310,7 @@ pub(super) fn run_writer(
                                 event_id: id_hex,
                                 accepted: false,
                                 message: format!(
-                                    "blocked: disk reserve requires {} free bytes",
+                                    "error: disk reserve requires {} free bytes",
                                     cfg_snap.db_min_free_disk_bytes
                                 ),
                             },

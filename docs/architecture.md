@@ -168,10 +168,11 @@ transaction, it keeps the subscription changes (and one database change) and
 retries.
 
 The writer hands each commit's events to every monitor as one shared,
-immutable batch, so the monitors match them without reading them back.
-Whether an event is still stored and globally visible, and its search terms,
-are worked out once, by the first monitor that needs them. A monitor reads the
-events from LMDB instead in these cases:
+immutable batch, so the monitors match them without reading them back. Each
+monitor still checks, in its own read transaction, that an event is stored
+and globally visible; only its search terms are worked out once, by the
+first monitor that needs them. A monitor reads the events from LMDB instead
+in these cases:
 
 - a database change from the file watcher, for commits by other processes;
 - a batch that does not follow on from what the monitor already matched;

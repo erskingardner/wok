@@ -774,10 +774,9 @@ struct StoredEvent {
     packed: Vec<u8>,
     /// The stored payload, as the writer stored it.
     json: String,
-    /// Whether the event is still stored and globally visible, decided by
-    /// the first monitor that asks.
-    visible: OnceLock<bool>,
     /// Tokenized once, by the first monitor with a search filter it may match.
+    /// Whether the event is still stored and visible depends on each
+    /// monitor's read, so every monitor checks that itself.
     search_terms: OnceLock<SearchTermSet>,
 }
 
@@ -1428,7 +1427,6 @@ fn broadcast_stored<C>(
             lev_id: event.lev_id,
             packed: event.packed,
             json: event.json,
-            visible: OnceLock::new(),
             search_terms: OnceLock::new(),
         })
         .collect();
@@ -4039,15 +4037,17 @@ fn run_req_monitor(
                 let Ok(packed) = PackedEventView::new(&event.packed) else {
                     continue;
                 };
-                // A later event of the same commit can have deleted it.
-                let visible = *event.visible.get_or_init(|| {
-                    txn.get_u64(txn.env().dbis().event, event.lev_id)
-                        .is_ok_and(|stored| stored.is_some())
-                        && global_visibility
-                            .globally_visible(&txn, packed)
-                            .unwrap_or(false)
-                });
-                if !visible {
+                // Checked in this monitor's read: since the commit, a later
+                // one (or a later event of the same commit) can have deleted
+                // it, and a ban, vanish request or expiry can hide it.
+                let stored = txn
+                    .get_u64(txn.env().dbis().event, event.lev_id)
+                    .is_ok_and(|stored| stored.is_some());
+                if !stored
+                    || !global_visibility
+                        .globally_visible(&txn, packed)
+                        .unwrap_or(false)
+                {
                     continue;
                 }
                 let recipients = if monitors.event_requires_content(packed) {
@@ -6836,8 +6836,12 @@ mod tests {
 
     /// A commit as the writer hands it to the monitors.
     fn handed(events: Vec<(u64, &wok_event::ParsedEvent, String)>) -> MonitorData {
+        MonitorData::Stored(handed_batch(events))
+    }
+
+    fn handed_batch(events: Vec<(u64, &wok_event::ParsedEvent, String)>) -> Arc<StoredBatch> {
         let (first, last) = (events[0].0, events[events.len() - 1].0);
-        MonitorData::Stored(Arc::new(StoredBatch {
+        Arc::new(StoredBatch {
             first,
             last,
             events: events
@@ -6846,13 +6850,12 @@ mod tests {
                     lev_id,
                     packed: parsed.packed.clone().into_bytes(),
                     json,
-                    visible: OnceLock::new(),
                     search_terms: OnceLock::new(),
                 })
                 .collect(),
             bytes: 0,
             in_flight: Arc::new(AtomicUsize::new(0)),
-        }))
+        })
     }
 
     /// `parsed`'s payload with different content, which LMDB does not hold:
@@ -6910,6 +6913,64 @@ mod tests {
 
         h.feed(handed(vec![(b_lev, &b, b.json.clone())]));
         h.sync();
+    }
+
+    /// Every monitor checks a handed-off event against its own read. One that
+    /// takes the commit after another monitor sent it, and after a later
+    /// commit deleted the event, does not send it.
+    #[test]
+    fn each_monitor_checks_handed_off_events_against_its_own_read() {
+        let mut first = MonitorHarness::start(1 << 20);
+        // A second monitor on the same database, with its own match-all
+        // subscription.
+        let conns = Arc::new(ConnTable::new());
+        let (observer_tx, mut observer) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(2, Outbound::new(observer_tx, 0));
+        let (tx, rx) = unbounded();
+        let (data, data_rx) = bounded(64);
+        let second = {
+            let (env, cfg, conns) = (first.env.clone(), first.cfg.clone(), conns.clone());
+            let metrics = Arc::new(Metrics::default());
+            thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx, data_rx))
+        };
+        let all = SubId::new("all").unwrap();
+        conns.open_sub(2, Ns::Req, &all, 1);
+        tx.send(MonitorMsg::Register(MonitorHarness::sub(
+            2,
+            "all",
+            json!({}),
+            1,
+            0,
+        )))
+        .unwrap();
+        tx.send(MonitorMsg::HistoryDone {
+            conn_id: 2,
+            sub_id: all,
+            generation: 1,
+            snapshot: 0,
+        })
+        .unwrap();
+        assert_eq!(MonitorHarness::next(&mut observer)[0], "EOSE");
+
+        let event = MonitorHarness::parse(1, "deleted later");
+        let (lev, id) = first.write_event(event.clone());
+        let batch = handed_batch(vec![(lev, &event, event.json.clone())]);
+        first.feed(MonitorData::Stored(batch.clone()));
+        first.observe(&id);
+        let mut txn = first.env.begin_rw().unwrap();
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [lev]).unwrap();
+        txn.commit().unwrap();
+        data.send(MonitorData::Stored(batch)).unwrap();
+        let sentinel = MonitorHarness::parse(20_002, "sentinel");
+        let sentinel_id = to_hex(sentinel.packed.view().id());
+        data.send(MonitorData::Ephemeral(Arc::new(HeldEvent {
+            packed: sentinel.packed.into_bytes(),
+            json: sentinel.json,
+        })))
+        .unwrap();
+        assert_eq!(MonitorHarness::next(&mut observer)[2]["id"], sentinel_id);
+        drop((tx, data));
+        second.join().unwrap();
     }
 
     /// The writer hands the events a commit wrote to every monitor as one

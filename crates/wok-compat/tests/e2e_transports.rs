@@ -1075,6 +1075,69 @@ async fn nip11_http_document() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_is_served_on_a_single_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let handle = wok_relay::start(env, test_cfg(dir.path())).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // NIP-01: path segments do not change the relay, so only the root
+    // accepts connections and serves the relay documents.
+    for path in ["/foo", "/foo/bar", "//", "/admin/x"] {
+        match tokio_tungstenite::connect_async(format!("ws://{addr}{path}")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 404, "{path}")
+            }
+            other => panic!("{path} must not upgrade: {:?}", other.map(|_| ())),
+        }
+        let nip11 = raw_http(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(nip11.starts_with("HTTP/1.1 404"), "{path}: {nip11}");
+        let page = raw_http(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(page.starts_with("HTTP/1.1 404"), "{path}: {page}");
+    }
+
+    for url in [format!("ws://{addr}"), format!("ws://{addr}/?client=x")] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(Message::Text(
+            json!(["REQ", "root", {"limit": 0}]).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+        assert!(msgs.iter().any(|t| t.contains("EOSE")), "{url}: {msgs:?}");
+    }
+    let nip11 = raw_http(
+        addr,
+        "GET /?client=x HTTP/1.1\r\nHost: localhost\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(nip11.starts_with("HTTP/1.1 200"), "{nip11}");
+    assert!(nip11.contains("\"supported_nips\""), "{nip11}");
+    let metrics = raw_http(
+        addr,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
+    handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip98_admin_http_route_authenticates_and_rejects_replay() {
     let dir = tempfile::tempdir().unwrap();
     let env = test_env(dir.path());

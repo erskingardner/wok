@@ -216,20 +216,11 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
-    let source = TransportSource::ip_address(peer.ip());
-    if is_ws_upgrade {
-        if !handle.admit_connection(&source) {
-            return text_status_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate-limited: connection budget exhausted",
-            );
-        }
-        return upgrade_ws(req, handle, peer).await;
-    }
-    // Plain HTTP endpoints (/admin/api/*, /metrics, NIP-11, ...) otherwise
-    // have no per-IP budget: every /admin/api attempt runs a Schnorr
+    // WebSocket upgrades and plain HTTP share the per-IP connection budget.
+    // Plain HTTP endpoints (/admin/api/*, /metrics, NIP-11, ...) would
+    // otherwise have none: every /admin/api attempt runs a Schnorr
     // verification before rejection, a straight unauthenticated CPU drain.
-    // Gate them behind the connection budget.
+    let source = TransportSource::ip_address(peer.ip());
     if !handle.admit_connection(&source) {
         return text_status_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -237,8 +228,22 @@ async fn dispatch(
         );
     }
     let path = req.uri().path().to_string();
+    // NIP-01: the relay is a single endpoint. Extra path segments change
+    // nothing, so only the root upgrades and serves the relay documents.
+    if is_ws_upgrade {
+        if path != "/" {
+            return not_found();
+        }
+        return upgrade_ws(req, handle, peer).await;
+    }
     if matches!(path.as_str(), "/admin" | "/admin/") || path.starts_with("/admin/api/") {
         return admin::dispatch(req, handle, admin_state).await;
+    }
+    if !matches!(
+        path.as_str(),
+        "/" | "/metrics" | "/.well-known/nodeinfo" | "/nodeinfo/2.1" | "/favicon.ico"
+    ) {
+        return not_found();
     }
     // NIP-86 management RPC arrives as an HTTP POST to the relay URI itself.
     if path == "/"
@@ -608,6 +613,10 @@ fn html_response(body: &str) -> Response<Full<Bytes>> {
         .header("Server", "wok")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap_or_else(|_| empty(StatusCode::OK))
+}
+
+fn not_found() -> Response<Full<Bytes>> {
+    text_status_response(StatusCode::NOT_FOUND, "not found")
 }
 
 fn empty(status: StatusCode) -> Response<Full<Bytes>> {

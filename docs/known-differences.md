@@ -203,3 +203,8 @@ regression test. Differential parity alone is not a reason to retain it.
   never has. Integrity checks, `wok migrate strfry` and `wok doctor` never
   rehash ids, so migrated data is unaffected. A Wok relay refuses legacy-id
   events that `wok sync` uploads to it, because uploads are EVENTs.
+- NIP-01 single endpoint: only `/` accepts WebSocket upgrades and serves
+  NIP-11, NIP-86 and the landing page. Other paths return 404, apart from
+  `/admin`, `/metrics` and the nodeinfo routes. The pinned strfry upgrades
+  and serves NIP-11 on every path, so one relay answers under many URLs. A
+  reverse proxy that serves the relay under a path prefix must strip it.

@@ -217,6 +217,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Stored payloads keep that escaping. `wok import`, `wok sync` and
   `wok router` downloads also accept the legacy id, so data from strfry and
   earlier Wok releases still verifies.
+- The relay is served on a single endpoint, as NIP-01 requires. Only `/`
+  accepts WebSocket upgrades and serves NIP-11, NIP-86 and the landing page;
+  other paths return 404, apart from `/admin`, `/metrics` and the nodeinfo
+  routes. Before, every path upgraded and served NIP-11, so one relay
+  answered under any number of URLs. A reverse proxy that serves the relay
+  under a path prefix must now strip the prefix.
 
 ## [0.7.0] - 2026-09-08
 

@@ -3,8 +3,7 @@ use serde_json::Value;
 use crate::hash::{verify_id, verify_id_allowing_legacy, verify_sig};
 use crate::packed::PackedEventView;
 use crate::parse::{
-    from_lower_hex_array, normalize_event_json, nostr_json_to_packed_event, EventLimits,
-    ParsedEvent,
+    from_lower_hex_array, normalize_event_json, pack_event, EventLimits, ParsedEvent,
 };
 use crate::{parse_canonical_a_tag, EventError, DELETION_KIND};
 
@@ -183,7 +182,7 @@ pub fn parse_and_verify_event_with(
     if !orig.is_object() {
         return Err(EventError::msg("event is not an object"));
     }
-    let packed = nostr_json_to_packed_event(orig, limits)?;
+    let (packed, expiration) = pack_event(orig, limits)?;
     if packed.view().kind() == DELETION_KIND {
         require_canonical_addresses(orig)?;
     }
@@ -197,6 +196,11 @@ pub fn parse_and_verify_event_with(
     if verify_time {
         let p = policy.ok_or_else(|| EventError::msg("timestamp policy required"))?;
         verify_event_timestamp(packed.view(), p)?;
+        // NIP-40: an ephemeral event packs the ephemeral marker instead of
+        // its expiration, which the packed check above cannot see.
+        if expiration != 0 && expiration <= p.now_secs {
+            return Err(EventError::msg("event expired"));
+        }
     }
     if verify_msg {
         verify_nostr_event_with(packed.view(), orig, ids)?;
@@ -249,7 +253,7 @@ mod tests {
             assert_eq!(error.to_string(), "a tag kind has leading zeros");
             // strfry and earlier releases stored such requests; reindex packs
             // them again.
-            nostr_json_to_packed_event(&deletion, &limits).unwrap();
+            crate::nostr_json_to_packed_event(&deletion, &limits).unwrap();
         }
         // Other events may reference an address however they spell it.
         ingest(&event(1, format!("030000:{pubkey}:d"))).unwrap();
@@ -328,5 +332,39 @@ mod tests {
         assert!(verify_event_timestamp(packed.view(), &policy).is_ok());
         let packed = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 95, 1, 90, &tags).unwrap();
         assert!(verify_event_timestamp(packed.view(), &policy).is_err());
+    }
+
+    #[test]
+    fn expired_events_are_refused_whatever_their_kind() {
+        // NIP-40: relays SHOULD drop expired events published to them. An
+        // ephemeral event packs the ephemeral marker, not its expiration.
+        let now = 1_700_000_000u64;
+        let policy = TimestampPolicy {
+            now_secs: now,
+            reject_newer_than_secs: 900,
+            reject_older_than_secs: 3600,
+            reject_ephemeral_older_than_secs: 60,
+        };
+        for kind in [1, 20001, 30000] {
+            for (expiration, expired) in [(now - 1, true), (now, true), (now + 60, false)] {
+                let ev = sign_event(json!({
+                    "created_at": now,
+                    "kind": kind,
+                    "tags": [["expiration", expiration.to_string()]],
+                    "content": "",
+                }));
+                let parsed =
+                    parse_and_verify_event(&ev, &EventLimits::default(), Some(&policy), true, true);
+                if expired {
+                    assert_eq!(
+                        parsed.unwrap_err().to_string(),
+                        "event expired",
+                        "kind {kind}"
+                    );
+                } else {
+                    parsed.unwrap();
+                }
+            }
+        }
     }
 }

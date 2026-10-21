@@ -91,7 +91,8 @@ it is not a promise to reproduce upstream bugs.
 - Mesh client connections do not currently offer permessage-deflate. Wok's
   WebSocket server does negotiate it.
 - `wok sync` classifies a peer's negative upload ACK as superseded only when
-  its reason starts with `replaced:` (the prefix used by Wok). A foreign peer
+  its reason starts with `blocked: have a newer version` (Wok's reason) or
+  `replaced:` (what strfry and earlier Wok releases send). A foreign peer
   using different wording is counted as `upload_rejected`, and the run exits
   nonzero even if replacement semantics explain the difference. Arbitrary
   human-readable rejection text is not treated as evidence of supersession.
@@ -132,7 +133,29 @@ regression test. Differential parity alone is not a reason to retain it.
   produces a NOTICE.
 - OK reasons for storage failures use `error:` instead of `Write error:`, and
   AUTH failures that already carry a NIP-01 prefix are not wrapped in a second
-  `error:`.
+  `error:`. Events refused because free disk space is below
+  `database.min_free_disk_bytes` also get `error:`.
+- OK reasons for refused events use NIP-01's standardized prefixes. An event
+  older than the stored version of its replaceable or addressable event gets
+  `blocked: have a newer version`, and one that a deletion or vanish request
+  covers gets `blocked: user requested deletion`. The pinned strfry replies
+  `replaced: have newer event` and `deleted: user requested deletion`, whose
+  prefixes NIP-01 does not define.
+- A write-policy plugin's rejection message is sent as is only when it starts
+  with a standard NIP-01 prefix. Any other message is sent as
+  `blocked: <msg>`, and an empty one as `blocked: rejected by write policy`. A
+  `shadowReject` message without a prefix is replaced by the empty reason of
+  an accepted event. The pinned strfry sends the plugin's `msg` verbatim, so a
+  plugin could produce `false` OKs with an empty or unprefixed reason, which
+  NIP-01 forbids.
+- NIP-40: an ephemeral event whose `expiration` tag has passed is refused with
+  `invalid: event expired` and reaches no subscriber. The pinned strfry packs
+  the ephemeral marker in place of the expiration before checking it, so it
+  accepted and broadcast such events. `wok sync` and `wok router` downloads
+  drop them too. In `ttl` mode a stored ephemeral event
+  stays readable until the ephemeral purge even once its expiration passes,
+  so `wok sync` counts one it does not transfer, in either direction, as
+  `expired` or `upload_expired` instead of failing.
 - NIP-01: a REQ over `relay.max_subs_per_connection` is refused with
   `CLOSED` (`blocked: too many concurrent REQs`) before its history is sent.
   Pinned strfry sends the history, EOSE, and then a NOTICE, and the

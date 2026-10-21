@@ -1,178 +1,47 @@
-# Complete Wok configuration reference with built-in defaults.
+# Wok configuration: a starting point for a public relay.
+#
+# Set only what this relay needs. Every setting left out comes from the
+# preset, so the relay gets improved defaults when you upgrade. A setting in
+# this file keeps its value, even one equal to today's default.
+#
+# docs/config.md describes every setting. `wok config show` prints the value
+# of each and where it comes from, `wok config show --defaults` the preset's
+# values, and `wok config minimize` removes settings that repeat them.
 
-# Named preset this file overlays. Settings resolve as built-in defaults, then
-# the preset, then this file. Only "public" (the built-in defaults) exists.
+# The preset this file overlays. "public", the default, suits a general
+# public relay.
 preset = "public"
 
-[admin]
-# Serve the signed-out operator shell at /admin.
-enabled = false
-# Exact browser-visible HTTP(S) origin, without a path.
-public_url = ""
-# Administrators as npub or lowercase 64-character hex public keys.
-pubkeys = []
-# Maximum NIP-98 clock skew/freshness window (1-300 seconds).
-auth_window_secs = 60
-# Allow the dashboard's typed, validated live-configuration editor.
-allow_config_writes = false
-
-[database]
-path = "./wok-db/"
-max_readers = 256
-map_size = 68719476736
-no_read_ahead = false
-# Stop accepting durable writes before the filesystem is completely full.
-min_free_disk_bytes = 1073741824
-
-[events]
-# Normalized event JSON. The 1 MiB default accommodates bounded extended
-# NIP-44 payloads such as gift wraps and MLS group events.
-max_event_size = 1048576
-reject_newer_than_secs = 900
-# 0 means no lower bound. A bound applies to regular kinds only; replaceable,
-# addressable, deletion (5) and vanish (62) events are exempt.
-reject_older_than_secs = 0
-# AUTH (±600 s) and kind 21059 gift wraps (up to 3 days) have their own windows.
-reject_ephemeral_older_than_secs = 60
-ephemeral_lifetime_secs = 300
-# "live_only" or "ttl".
-ephemeral_persistence = "live_only"
-max_num_tags = 2000
-max_tag_val_size = 1024
-
-[observability]
-# "pretty" for humans or "json" for log collectors.
-log_format = "pretty"
-# RUST_LOG takes precedence when set.
-log_filter = "wok=info"
-history_enabled = true
-history_interval_secs = 15
-# 24 hours at 15-second resolution; hard maximum 100000.
-history_max_points = 5760
-
 [relay]
-# IPv4/IPv6 literal or hostname; a hostname binds every address it resolves to.
-bind = "127.0.0.1"
-port = 7777
-nofiles = 524288
-# Trusted reverse-proxy header containing the client IP; empty disables it.
-real_ip_header = ""
-max_websocket_payload_size = 2097152
-# Maximum combined compact-JSON bytes across all filters in one REQ/COUNT.
-max_req_filter_size = 65536
-# Unconditional maximum filter objects in one REQ/COUNT.
-max_filters_per_req = 200
-# Zero disables automatic ping frames. A ping unanswered for a full
-# interval closes the connection.
-auto_ping_seconds = 55
-enable_tcp_keepalive = false
-# Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it.
-handshake_timeout_secs = 10
-# Maximum idle gap between socket reads while a partial WebSocket frame or
-# unfinished fragmented message is buffered (slow-trickle guard); zero
-# disables it.
-frame_read_timeout_secs = 30
-query_timeslice_budget_us = 10000
-max_filter_limit = 500
-max_tags_per_filter = 3
-# Maximum distinct values across all NIP-91 & filters in one filter object.
-max_and_entries = 16
-max_filter_limit_count = 1000000
-# Zero means unlimited.
-max_total_events_per_req = 2000
-max_subs_per_connection = 200
-# Per subscription: live matches held while its history is sent. Past it,
-# stored events are re-read from the database and the oldest ephemeral events
-# are dropped. Zero means unlimited.
-max_live_buffer_bytes = 262144
-max_pending_outbound_bytes = 33554432
-# Executable path; empty disables the external write-policy plugin.
-write_policy_plugin = ""
-write_policy_timeout_secs = 10
-compression_enabled = true
-compression_sliding_window = true
-dump_in_all = false
-dump_in_events = false
-dump_in_reqs = false
-db_scan_perf = false
-invalid_events = true
-ingester_threads = 3
-req_worker_threads = 3
-req_monitor_threads = 3
-negentropy_threads = 2
-negentropy_enabled = true
-max_sync_events = 1000000
-sync_memory_per_connection = 268435456
-sync_memory_total = 1073741824
-sync_idle_timeout_secs = 60
+# Wok listens on 127.0.0.1:7777 by default, for a TLS-terminating reverse
+# proxy on the same host. If the proxy runs elsewhere, bind to a firewalled
+# private address.
+# bind = "127.0.0.1"
+# port = 7777
+
+# The header in which the proxy passes the client's address. Set it only if
+# every connection comes from a proxy that overwrites the header: a client
+# that reaches the relay directly could send a new address each time and
+# escape every per-address rate limit.
+# real_ip_header = "x-real-ip"
 
 [relay.auth]
-enabled = true
-# Public relay URL used in NIP-42 challenges.
-service_url = ""
-restricted_read_kinds = [4, 1059, 21059]
-restrict_read_to_involved_pubkey = true
-# When true, only NIP-86 allowlisted or role-holding pubkeys (and operator
-# admin pubkeys) may write events.
-restrict_writes = false
+# The relay's public URL, which NIP-42 AUTH events must name. Until it is
+# set, AUTH is unavailable, so DMs and gift wraps cannot be read.
+service_url = "wss://relay.example.com"
 
 [relay.info]
-name = "wok default"
-description = "This is a wok instance."
-pubkey = ""
-self_pk = ""
-contact = ""
-icon = ""
-banner = ""
-privacy = ""
-terms = ""
+# Shown to clients in NIP-11 and on the landing page.
+name = "Example relay"
+description = "A public Nostr relay."
+contact = "mailto:ops@example.com"
 
-[relay.nip62]
-enabled = true
-# Falls back to relay.auth.service_url when empty; ALL_RELAYS always matches.
-service_url = ""
-deletion_batch_size = 1000
+# Where the database lives. The default is ./wok-db/.
+# [database]
+# path = "/var/lib/wok/db"
 
-[relay.filter_validation]
-enabled = false
-max_filters_per_req = 3
-min_filters_per_req = 1
-max_kinds_per_filter = 3
-# Comma-separated integer kinds; empty allows all kinds.
-allowed_kinds = ""
-require_author_or_tag = false
-
-[relay.abuse]
-enabled = true
-connection_rate_per_second = 10
-connection_burst = 50
-event_rate_per_second = 50
-event_burst = 100
-pubkey_event_rate_per_second = 25
-pubkey_event_burst = 50
-req_rate_per_second = 20
-req_burst = 40
-count_rate_per_second = 5
-count_burst = 10
-# Malformed messages, including CLOSE/NEG-CLOSE with an invalid id.
-invalid_rate_per_second = 5
-invalid_burst = 20
-max_concurrent_historical_queries = 8
-max_query_cost = 1000
-# Zero means unlimited. Secure defaults bound both global and per-author use.
-max_stored_events = 10000000
-max_stored_events_per_pubkey = 100000
-# Zero disables NIP-13 proof-of-work enforcement.
-min_pow_difficulty = 0
-
-[relay.unix]
-enabled = false
-path = "./wok-db/wok.sock"
-mode = 0o600
-owner = ""
-group = ""
-# Empty allowlists accept any local UID/GID.
-auth_uids = []
-auth_gids = []
-max_frame_bytes = 2097152
-max_pending_outbound_bytes = 33554432
+# The operator dashboard at /admin; see docs/admin-dashboard.md.
+# [admin]
+# enabled = true
+# public_url = "https://relay.example.com"
+# pubkeys = ["npub1..."]

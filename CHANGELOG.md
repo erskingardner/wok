@@ -80,8 +80,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Unknown preset names are rejected. `wok config show` prints the effective
   configuration with each value's origin (default, preset, or file and line),
   and `--overrides` prints only the keys the file changes from its preset.
-  Files written by dashboard saves and `wok migrate strfry` now include
-  `preset = "public"`.
+  Files written by `wok migrate strfry` now include `preset = "public"`, and
+  dashboard saves keep a file's `preset`.
+- `wok config minimize` removes the settings a config file sets to its
+  preset's value, keeping comments, so the relay follows the preset when a
+  default changes. The effective configuration is unchanged. It keeps the
+  original as `<file>.bak`; `--dry-run` prints a unified diff instead.
+  `wok config show --defaults` lists every setting with the preset's value.
+- `wok doctor` has a `config-defaults` check. It warns about settings pinned
+  to a default an earlier release used and the preset has since replaced,
+  such as `events.reject_older_than_secs = 94608000` and
+  `relay.auth.restricted_read_kinds = [4, 1059]` from a copy of the 0.7
+  `docs/wok.toml`, and counts the settings `wok config minimize` would
+  remove.
 - `wok-bench --scenario clients` measures default limits the way clients hit
   them. Abuse controls and AUTH stay on, or the scenario runs a supplied relay
   TOML (`--relay-config`). It simulates outbox clients with about 30
@@ -141,6 +152,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Dashboard saves and the NIP-86 relay-info methods edit `wok.toml` in place.
+  They change only the settings whose value changed, remove a setting set
+  back to its preset's value, and keep comments and layout. Before, a save
+  rewrote the whole file with every setting, which dropped comments and
+  pinned every default. A save now applies the form to the file on disk
+  rather than to the running configuration, so it no longer reverts a
+  restart-only setting changed in the file since startup, and refuses a file
+  that does not parse instead of overwriting it.
+- `docs/wok.toml` is a short annotated sample with only the settings a relay
+  must or commonly should set. The full list of settings is in
+  `docs/config.md` and `wok config show --defaults`.
 - A bound set with `events.reject_older_than_secs` applies to regular kinds
   only. Replaceable (0, 3, 10000–19999) and addressable (30000–39999) events
   and deletions (5) are now accepted whatever their age, like vanish requests

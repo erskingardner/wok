@@ -81,6 +81,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             CheckStatus::Pass,
             format!("loaded {}", config_path.display()),
         );
+        check_config_defaults(config_path, &mut report);
     } else {
         report.add(
             "config",
@@ -351,6 +352,71 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
     report
 }
 
+/// Warn about keys the file pins to a built-in default that an earlier
+/// release used and the preset has since replaced: the relay keeps the old
+/// value. Keys that repeat the preset's current values would go stale the
+/// same way when a default changes, so point to `wok config minimize`.
+fn check_config_defaults(path: &Path, report: &mut DoctorReport) {
+    let explanation = match std::fs::read_to_string(path)
+        .map_err(|error| error.to_string())
+        .and_then(|text| Config::explain_toml(&text))
+    {
+        Ok(explanation) => explanation,
+        Err(error) => {
+            report.add("config-defaults", CheckStatus::Warn, error);
+            return;
+        }
+    };
+    let preset = explanation.config.preset;
+    let minimize = match explanation.repeated_preset_values().count() {
+        0 => String::new(),
+        1 => format!(
+            " 1 key repeats preset {preset}'s value and will not follow it if it changes; \
+             `wok config minimize` removes it."
+        ),
+        repeated => format!(
+            " {repeated} keys repeat preset {preset}'s values and will not follow them if \
+             they change; `wok config minimize` removes them."
+        ),
+    };
+    let stale = explanation.stale_defaults();
+    if stale.is_empty() {
+        report.add(
+            "config-defaults",
+            CheckStatus::Pass,
+            format!("no key pins a replaced default.{minimize}"),
+        );
+        return;
+    }
+    let pinned: Vec<String> = stale
+        .iter()
+        .map(|stale| {
+            let line = stale
+                .line
+                .map_or_else(String::new, |line| format!("line {line}, "));
+            format!(
+                "{} = {} ({line}the default through {}; preset {preset}: {})",
+                stale.key, stale.value, stale.last_release, stale.preset_value
+            )
+        })
+        .collect();
+    report.add(
+        "config-defaults",
+        CheckStatus::Warn,
+        format!(
+            "{} {} a default that has since changed: {}. Delete a line to use the \
+             preset's value, or keep it if you chose that value.{minimize}",
+            stale.len(),
+            if stale.len() == 1 {
+                "key pins"
+            } else {
+                "keys pin"
+            },
+            pinned.join("; "),
+        ),
+    );
+}
+
 fn check_payload_identity(txn: &wok_db::RoTxn<'_>, max_size: usize, report: &mut DoctorReport) {
     let mut checked = 0u64;
     let mut failures = Vec::new();
@@ -575,5 +641,63 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "write-policy" && check.status == CheckStatus::Fail));
+    }
+
+    fn config_defaults_check(text: &str) -> DoctorCheck {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wok.toml");
+        std::fs::write(&path, text).unwrap();
+        let mut report = DoctorReport::new();
+        check_config_defaults(&path, &mut report);
+        assert_eq!(report.checks.len(), 1);
+        report.checks.pop().unwrap()
+    }
+
+    #[test]
+    fn pinned_old_default_is_a_warning() {
+        let check = config_defaults_check(
+            "preset = \"public\"\n\
+             [events]\n\
+             reject_older_than_secs = 94608000\n\
+             max_num_tags = 2000\n",
+        );
+        assert_eq!(check.name, "config-defaults");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(
+            check.detail,
+            "1 key pins a default that has since changed: \
+             events.reject_older_than_secs = 94608000 \
+             (line 3, the default through 0.7.0; preset public: 0). \
+             Delete a line to use the preset's value, or keep it if you chose that value. \
+             1 key repeats preset public's value and will not follow it if it changes; \
+             `wok config minimize` removes it."
+        );
+
+        // The complete 0.7.0 sample pins two replaced defaults.
+        let check = config_defaults_check(include_str!(
+            "../../wok-relay/src/config/testdata/wok-0.7.0.toml"
+        ));
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.starts_with("2 keys pin"), "{}", check.detail);
+        assert!(check
+            .detail
+            .contains("relay.auth.restricted_read_kinds = [4, 1059] (line 101,"));
+        assert!(check
+            .detail
+            .ends_with("`wok config minimize` removes them."));
+    }
+
+    #[test]
+    fn config_without_old_defaults_passes() {
+        let check = config_defaults_check(
+            "[events]\nreject_older_than_secs = 31536000\n[relay]\nport = 7777\n",
+        );
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check
+            .detail
+            .starts_with("no key pins a replaced default. 1 key repeats"));
+        let check = config_defaults_check(include_str!("../../../docs/wok.toml"));
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.detail, "no key pins a replaced default.");
     }
 }

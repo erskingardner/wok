@@ -10,6 +10,7 @@ Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default conf
 - `src/main.rs` — clap CLI and most dbutils (import/export/scan/…)
 - `src/migrate.rs` — `wok migrate strfry`
 - `src/config_show.rs` — `wok config show` (effective config with per-key origin)
+- `src/config_minimize.rs` — `wok config minimize` (drop keys equal to the preset, diff or backup)
 - `src/doctor.rs` — `wok doctor`
 - `src/reindex.rs` — `wok reindex`
 - `src/router.rs` — `wok router`
@@ -23,7 +24,7 @@ Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default conf
 | Migration | `migrate strfry` (`--check` preflight) |
 | Relay | `relay` |
 | Diagnostics | `doctor`, `integrity`, `info`, `config show` |
-| Maintenance | `reindex`, `purge-superseded`, `compact`, `dict`, `negentropy` |
+| Maintenance | `reindex`, `purge-superseded`, `compact`, `dict`, `negentropy`, `config minimize` |
 | Data | `import`, `export`, `scan`, `event`, `delete`, `monitor` |
 | Mesh | `router`, `sync`, `upload`, `download` |
 

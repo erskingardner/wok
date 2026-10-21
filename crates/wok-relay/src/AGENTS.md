@@ -8,6 +8,7 @@
 | `server/negentropy.rs` | Visibility-safe sync sessions and shared memory reservations |
 | `protocol.rs` | `ClientCommand` / `RelayMessage` (EVENT/REQ/CLOSE/COUNT/AUTH/NEG-*) |
 | `config.rs` | Native TOML `Config` plus strfry HOCON translation for migrate |
+| `config/` | Presets, `wok config show` provenance, in-place file edits (`edit.rs`) and replaced defaults (`history.rs`) |
 | `capabilities.rs` | NIP-11 capability catalog and `supported_nips` |
 | `moderation.rs` | NIP-86 commands, management levels, write-permission decisions |
 | `abuse.rs` | Per-IP / per-pubkey token buckets, query cost, PoW bits |

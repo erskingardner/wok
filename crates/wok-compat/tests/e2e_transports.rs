@@ -1977,6 +1977,75 @@ async fn nip86_kind_policy_e2e() {
     handle.request_shutdown();
 }
 
+/// NIP-86 relay-info methods save the way the dashboard does: the file on
+/// disk is edited in place, so its comments and other keys survive, and a
+/// value equal to the preset's is removed rather than pinned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip86_config_methods_edit_the_file_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let admin_hex = hex::encode(admin_key.x_only_public_key().0.serialize());
+
+    let config_dir = tempfile::tempdir().unwrap();
+    let path = config_dir.path().join("wok.toml");
+    let text = format!(
+        r#"# Test relay.
+preset = "public"
+
+[admin]
+enabled = true
+public_url = "http://{addr}"
+pubkeys = ["{admin_hex}"]
+allow_config_writes = true   # changerelayname needs it
+
+[relay.info]
+# Shown in NIP-11.
+name = "Before"
+description = "Kept as written."
+"#
+    );
+    std::fs::write(&path, &text).unwrap();
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin = wok_relay::Config::parse_toml(&text).unwrap().admin;
+    let handle = wok_relay::start(env, cfg).unwrap();
+    handle.set_config_path(path.clone());
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (_, result) = nip86_rpc(addr, &admin_key, "changerelayname", json!(["After"])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        text.replace("name = \"Before\"", "name = \"After\"")
+    );
+    assert_eq!(handle.config.read().relay.info.name, "After");
+
+    let default_name = wok_relay::Config::default().relay.info.name;
+    let (_, result) = nip86_rpc(addr, &admin_key, "changerelayname", json!([default_name])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        text.replace("# Shown in NIP-11.\nname = \"Before\"\n", "")
+    );
+    assert_eq!(handle.config.read().relay.info.name, default_name);
+
+    handle.request_shutdown();
+}
+
 /// A DB change queued before a ban commits must not deliver the banned
 /// author's events afterwards: the live monitor rechecks moderation against
 /// committed state on every batch.

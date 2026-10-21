@@ -13,6 +13,7 @@ use wok_event::{
     parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView, AUTH_KIND, DELETION_KIND,
 };
 use wok_negentropy::Storage;
+mod config_minimize;
 mod config_show;
 mod doctor;
 mod mesh;
@@ -239,8 +240,19 @@ enum ConfigCmd {
     /// Print the effective configuration and where each value comes from
     Show {
         /// Print only keys the file sets to a value other than its preset's
-        #[arg(long)]
+        #[arg(long, conflicts_with = "defaults")]
         overrides: bool,
+        /// Print every setting with the value of the file's preset, ignoring
+        /// the rest of the file
+        #[arg(long)]
+        defaults: bool,
+    },
+    /// Remove the keys that repeat the preset's values, keeping comments, and
+    /// keep the original as <config>.bak
+    Minimize {
+        /// Print the change as a unified diff and leave the file unchanged
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -335,10 +347,23 @@ async fn main() -> Result<()> {
                 }
             };
         }
-        Command::Config {
-            cmd: ConfigCmd::Show { overrides },
-        } => {
-            let shown = config_show::run(&config, overrides)?;
+        Command::Config { cmd } => {
+            let shown = match cmd {
+                ConfigCmd::Show {
+                    overrides,
+                    defaults,
+                } => config_show::run(
+                    &config,
+                    if defaults {
+                        config_show::View::Defaults
+                    } else if overrides {
+                        config_show::View::Overrides
+                    } else {
+                        config_show::View::Effective
+                    },
+                )?,
+                ConfigCmd::Minimize { dry_run } => config_minimize::run(&config, dry_run)?,
+            };
             cli_print!("{shown}");
             return Ok(());
         }

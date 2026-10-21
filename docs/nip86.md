@@ -140,10 +140,10 @@ list (100,000 records per type, 512-byte reasons).
 ## Config-backed methods
 
 `changerelayname`, `changerelaydescription`, and `changerelayicon` edit the
-live configuration through the same validated, atomic `wok.toml` rewrite as
-the admin dashboard, so they require `admin.allow_config_writes` and a relay
-started from a writable config file; otherwise they return the dashboard's
-error.
+live configuration through the same validated, atomic, in-place `wok.toml`
+edit as the admin dashboard, so they require `admin.allow_config_writes` and
+a relay started from a writable config file; otherwise they return the
+dashboard's error.
 
 ## Kind policy
 

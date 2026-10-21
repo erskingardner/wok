@@ -22,6 +22,12 @@ sudo install -d -o wok -g wok -m 0700 /var/lib/wok
 sudo install -o root -g root -m 0644 contrib/systemd/wok.service /etc/systemd/system/wok.service
 ```
 
+The sample sets only what most relays must set; every other setting comes
+from the preset, so upgrades bring improved defaults. Add only the settings
+this relay needs, and after an upgrade run `wok doctor`: its
+`config-defaults` check names settings pinned to a default the preset has
+since replaced. See [Set only overrides](config.md#set-only-overrides).
+
 Set at least these deployment-specific values in `/etc/wok/wok.toml`:
 
 ```toml

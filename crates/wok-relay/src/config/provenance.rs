@@ -1,7 +1,7 @@
 //! Where each effective configuration value comes from: the built-in
 //! defaults, the selected preset's overlay, or the operator's file.
 
-use super::{Config, Layers, OverlayFn, Preset, TomlConfig};
+use super::{encode, Config, Layers, OverlayFn, Preset};
 
 /// The layer that supplied an effective configuration value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,15 @@ impl ConfigEntry {
     pub fn is_override(&self) -> bool {
         self.preset_value.is_some()
     }
+
+    /// True when the operator's file sets this key to the value the preset
+    /// already gives, so removing it changes nothing. The `preset` key itself
+    /// never repeats anything.
+    pub fn repeats_preset(&self) -> bool {
+        matches!(self.origin, Origin::File { .. })
+            && self.preset_value.is_none()
+            && self.key != "preset"
+    }
 }
 
 /// The effective configuration of one TOML file, key by key.
@@ -47,15 +56,8 @@ pub struct ConfigExplanation {
 pub(super) fn explain(text: &str, overlay_of: OverlayFn) -> Result<ConfigExplanation, String> {
     let layers = Layers::parse(text, overlay_of)?;
     let config = layers.resolve()?;
-    let effective =
-        toml::Value::try_from(TomlConfig::from(config.clone())).map_err(|e| e.to_string())?;
-    // Round-trip the preset layer through its typed form so its values are
-    // encoded exactly like the effective ones.
-    let preset: TomlConfig = layers
-        .preset_value()?
-        .try_into()
-        .map_err(|e: toml::de::Error| e.to_string())?;
-    let preset = toml::Value::try_from(preset).map_err(|e| e.to_string())?;
+    let effective = encode(&config)?;
+    let preset = layers.preset_encoded()?;
     // `toml` already accepted the text, so this only fails if the two
     // parsers disagree; values then keep their file origin without a line.
     let document = toml_edit::ImDocument::parse(text).ok();
@@ -95,7 +97,7 @@ pub(super) fn explain(text: &str, overlay_of: OverlayFn) -> Result<ConfigExplana
 }
 
 /// Collect every non-table value under `value` with its key path.
-fn flatten<'a>(
+pub(super) fn flatten<'a>(
     value: &'a toml::Value,
     path: &mut Vec<&'a str>,
     out: &mut Vec<(Vec<&'a str>, &'a toml::Value)>,
@@ -113,7 +115,7 @@ fn flatten<'a>(
 }
 
 /// The non-table value at `path`, if this layer sets one.
-fn leaf<'a>(value: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+pub(super) fn leaf<'a>(value: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
     let found = path
         .iter()
         .try_fold(value, |value, key| value.as_table()?.get(*key))?;

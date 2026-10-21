@@ -36,4 +36,4 @@ Operator and design documentation. Code remains the authority for current behavi
 
 Docs describe how Wok works and how to run it. Do not commit plans, proposals, audits, code reviews, or dated benchmark, soak, and lab run reports. Put findings and results in the pull request or issue, and keep only the reusable methodology (how to run and read a benchmark) in these files. `wok.svg` is the logo.
 
-When behavior changes, update the relevant doc in the same change: NIPs → `nips.md` + capabilities; strfry diffs → `known-differences.md`; config keys → `config.md` + `wok.toml`.
+When behavior changes, update the relevant doc in the same change: NIPs → `nips.md` + capabilities; strfry diffs → `known-differences.md`; config keys → `config.md` (and `wok.toml` only for settings most operators must set; it holds overrides, not defaults); changed defaults → `PAST_DEFAULTS` in `wok-relay/src/config/history.rs`.

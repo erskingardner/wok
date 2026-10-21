@@ -72,7 +72,8 @@ subscriber delivery completeness), `ws_publish_scaled` (configurable
 connection count), `idle_connections` (open-and-hold connection capacity),
 `duplicate_import`, `cold_start`, and Wok-only
 `nip50_search` (rare, intersected, and full-corpus ranked searches with
-result/limit verification). Use `--scenario <name>` to isolate one scenario.
+result/limit verification). Wok-only `clients` and `author_kinds` have their
+own sections below. Use `--scenario <name>` to isolate one scenario.
 
 ## Client-realistic scenario (`clients`)
 
@@ -185,6 +186,85 @@ stored part is bounded by `limit`.
 
 CI runs a small version as a unit test against an in-process relay with
 default limits (`clients::tests`).
+
+## Author × kind sweep (`author_kinds`)
+
+Wok-only `--scenario author_kinds` measures time to EOSE of historical
+`authors` × `kinds` REQs as the author list grows. Those are the outbox-model
+fetches of profiles, contact lists and relay lists, and home feeds. The corpus
+is large enough for the cost of each query plan to show. With
+`--wok-baseline` every query shape also runs against a second wok binary on
+the same database files, so a change can be compared before and after.
+
+The dataset has `--authors` authors and `--events` events:
+
+- Every author has one kind 0, 3, 10002 and 10050 event.
+- The rest is kind 1, 7 and 6 history, in the ratio 60:30:10. History sizes
+  follow a Zipf law over author rank, with exponent 0.8.
+- Timestamps spread over two years before a fixed anchor, and events are
+  imported in timestamp order, so authors interleave as they do on a relay.
+- Mentions, reactions, reposts and follow lists name popular authors more
+  often.
+
+The dataset is generated and imported once for each combination of events,
+authors and seed. It is kept under `--dataset-dir`, and later runs and both
+binaries reuse its database. Delete the directory to rebuild it.
+
+The query shapes:
+
+- `authors` with kinds `[0,3,10002]` or `[0,3,10002,10050]` and no limit, so
+  the relay's `max_filter_limit` applies. Also kinds `[1]` with limit 50 and
+  `[1,6,7]` with limit 100.
+- Each of those for 50, 100, 300, 333, 334, 500, 1,000 and 2,000 authors.
+  Author lists sample authors in proportion to their activity, and each list
+  extends the smaller ones. So 333 and 334 differ by one author, at strfry's
+  1,000-pair bound for the PubkeyKind index.
+- Guards that use other plans: `authors` with limit 100, `#p` with kinds,
+  kinds alone, and 100 ids.
+
+The relays run the harness's usual configuration, except that
+`relay.max_req_filter_size` is raised to 1 MiB. The default of 64 KiB refuses a
+REQ that names about 970 authors or more.
+
+Each shape and binary starts a relay on a fresh copy-on-write clone of the
+dataset database (`cp -c` on macOS, `cp --reflink=auto` elsewhere). The first
+query after the relay starts is the cold run. Warm runs follow, stopping
+after `--warm-runs` runs or `--shape-secs` seconds, with at least three. The
+binaries alternate which runs first. On a filesystem that cannot clone, the
+copy leaves the file's pages cached, so the cold run is not cold.
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--events` | 1,000,000 | Events in the dataset |
+| `--authors` | 5,000 | Authors in the dataset |
+| `--dataset-dir` | `bench-results/datasets` | Where datasets are kept for reuse |
+| `--wok-baseline` | none | Second wok binary to measure on the same dataset |
+| `--warm-runs` | 15 | Warm runs per shape, after the cold run |
+| `--shape-secs` | 30 | Stop a shape's warm runs after this long (at least three run) |
+
+Both binaries must be named `wok`. For example, to compare a change against
+master, build master in a separate worktree:
+
+```bash
+git worktree add ../wok-master master
+(cd ../wok-master && cargo build --release -p wok-cli)
+cargo build --release -p wok-cli -p wok-bench
+./target/release/wok-bench --scenario author_kinds --events 5000000 \
+  --wok ./target/release/wok --wok-baseline ../wok-master/target/release/wok \
+  --out bench-results/author_kinds
+```
+
+`summary.md` has one row per shape and author count:
+
+- `author events`: the events those authors hold, which is what reading the
+  Pubkey index for them costs;
+- `events`: the events returned;
+- cold, p50, p95 and max time to EOSE for each binary, in milliseconds, and
+  the p50 speedup;
+- `same results`: whether the SHA-256 of the sorted returned ids matches.
+  Any difference is a mismatch and fails the trial.
+
+`results.jsonl` holds every row in the trial's `author_kinds` field.
 
 ## Portable Docker lab
 

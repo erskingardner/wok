@@ -29,6 +29,7 @@ tokio-tungstenite.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+wok-db = { path = "../wok-db" }
 wok-event = { path = "../wok-event" }
 wok-negentropy = { path = "../wok-negentropy" }
 wok-query = { path = "../wok-query" }
@@ -38,6 +39,3 @@ wok-ws = { path = "../wok-ws" }
 futures-util = "0.3"
 walkdir.workspace = true
 tempfile.workspace = true
-
-[dev-dependencies]
-wok-db = { path = "../wok-db" }

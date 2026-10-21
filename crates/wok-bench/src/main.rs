@@ -14,6 +14,7 @@
 mod author_kinds;
 mod clients;
 mod live;
+mod tag_kinds;
 mod transport;
 
 use anyhow::{Context, Result};
@@ -185,20 +186,26 @@ struct Args {
     /// REQs per second the live_subscriptions churners send in total.
     #[arg(long, default_value_t = 200.0)]
     live_churn_rate: f64,
-    /// Second wok binary that --scenario author_kinds measures on the same
-    /// dataset, for a before/after comparison (for example a build of master).
+    /// Second wok binary that --scenario author_kinds or tag_kinds measures
+    /// on the same dataset, for a before/after comparison (for example a
+    /// build of master).
     #[arg(long)]
     wok_baseline: Option<PathBuf>,
-    /// Authors in the --scenario author_kinds dataset.
+    /// Authors in the --scenario author_kinds or tag_kinds dataset.
     #[arg(long, default_value_t = 5_000)]
     authors: usize,
-    /// Directory that keeps --scenario author_kinds datasets, so later runs
-    /// and other binaries reuse the same database files.
+    /// Directory that keeps --scenario author_kinds and tag_kinds datasets,
+    /// so later runs and other binaries reuse the same database files.
     #[arg(long, default_value = "bench-results/datasets")]
     dataset_dir: PathBuf,
-    /// Warm runs per --scenario author_kinds query shape, after one cold run.
+    /// Warm runs per --scenario author_kinds or tag_kinds query shape, after
+    /// the cold runs.
     #[arg(long, default_value_t = 15)]
     warm_runs: usize,
+    /// Relays --scenario tag_kinds starts per query shape and binary, each on
+    /// a fresh clone of the dataset; the first query of each is a cold run.
+    #[arg(long, default_value_t = 3)]
+    cold_runs: usize,
     /// Seconds after which a shape stops its warm runs (it keeps at least 3).
     #[arg(long, default_value_t = 30)]
     shape_secs: u64,
@@ -253,6 +260,8 @@ struct Trial {
     live_subscriptions: Option<live::LiveReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     author_kinds: Option<author_kinds::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_kinds: Option<tag_kinds::Report>,
 }
 
 #[derive(Serialize)]
@@ -386,6 +395,7 @@ fn main() -> Result<()> {
         "monitor_index",
         "live_subscriptions",
         "author_kinds",
+        "tag_kinds",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -457,6 +467,14 @@ fn main() -> Result<()> {
         let opts = author_kinds_options(&args)?;
         author_kinds::ensure_dataset(&opts)?;
         (author_kinds::Dataset::corpus_path(&opts), opts.events)
+    } else if args.scenario.as_deref() == Some("tag_kinds") {
+        anyhow::ensure!(
+            args.corpus.is_none() && !args.has_external_target(),
+            "--scenario tag_kinds generates its own dataset and starts its own relays"
+        );
+        let opts = tag_kinds_options(&args)?;
+        tag_kinds::ensure_dataset(&opts)?;
+        (tag_kinds::Dataset::corpus_path(&opts), opts.events)
     } else if let Some(path) = &args.corpus {
         let path = std::fs::canonicalize(path)
             .with_context(|| format!("open corpus {}", path.display()))?;
@@ -527,6 +545,7 @@ fn main() -> Result<()> {
                     | "clients"
                     | "ws_transport"
                     | "author_kinds"
+                    | "tag_kinds"
                     | "monitor_index"
                     | "live_subscriptions"
             ) {
@@ -606,6 +625,7 @@ fn run_trial(
     let mut monitor_index_report = None;
     let mut live_report = None;
     let mut author_kinds_report = None;
+    let mut tag_kinds_report = None;
 
     let bin = if args.has_external_target() || scenario == "monitor_index" {
         // monitor_index runs the index compiled into this binary.
@@ -968,6 +988,21 @@ fn run_trial(
                 notes = format!("{e:#}");
             }
         },
+        "tag_kinds" => match tag_kinds::run(rt, &tag_kinds_options(args)?) {
+            Ok(report) => {
+                mismatches += report.mismatches.len() as u64;
+                notes = format!(
+                    "{} measurements; time to EOSE per shape in the tag_kinds table",
+                    report.rows.len()
+                );
+                tag_kinds_report = Some(report);
+            }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e:#}");
+            }
+        },
         "live_subscriptions" => {
             let bin = local_bin()?;
             match live_subscriptions_trial(rt, args, bin, dir.path(), &mut hist) {
@@ -1001,6 +1036,7 @@ fn run_trial(
         monitor_index: monitor_index_report,
         live_subscriptions: live_report,
         author_kinds: author_kinds_report,
+        tag_kinds: tag_kinds_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1043,6 +1079,7 @@ fn failed_trial(
         monitor_index: None,
         live_subscriptions: None,
         author_kinds: None,
+        tag_kinds: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -2666,6 +2703,21 @@ fn author_kinds_options(args: &Args) -> Result<author_kinds::Options> {
     })
 }
 
+fn tag_kinds_options(args: &Args) -> Result<tag_kinds::Options> {
+    let sweep = author_kinds_options(args)?;
+    Ok(tag_kinds::Options {
+        wok: sweep.wok,
+        baseline: sweep.baseline,
+        dataset_dir: sweep.dataset_dir,
+        authors: sweep.authors,
+        events: sweep.events,
+        seed: sweep.seed,
+        cold_runs: args.cold_runs,
+        warm_runs: sweep.warm_runs,
+        shape_secs: sweep.shape_secs,
+    })
+}
+
 fn clients_options(args: &Args) -> clients::ClientsOptions {
     clients::ClientsOptions {
         outbox_clients: args.clients,
@@ -2970,6 +3022,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.author_kinds {
             s.push_str(&author_kinds::render_markdown(report));
         }
+        if let Some(report) = &t.tag_kinds {
+            s.push_str(&tag_kinds::render_markdown(report));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -3028,7 +3083,7 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             args.live_churn_rate,
         ));
     }
-    if args.scenario.as_deref() == Some("author_kinds") {
+    if let Some(scenario @ ("author_kinds" | "tag_kinds")) = args.scenario.as_deref() {
         selection.push_str(&format!(
             " --events {} --authors {} --warm-runs {} --shape-secs {} --dataset-dir \"{}\"",
             args.events.unwrap_or_default(),
@@ -3037,6 +3092,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             args.shape_secs,
             args.dataset_dir.display(),
         ));
+        if scenario == "tag_kinds" {
+            selection.push_str(&format!(" --cold-runs {}", args.cold_runs));
+        }
         if let Some(path) = &args.wok_baseline {
             selection.push_str(&format!(" --wok-baseline \"{}\"", path.display()));
         }

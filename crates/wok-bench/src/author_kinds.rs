@@ -37,7 +37,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::{connect_retry, free_port, stop_relay, write_conf, ClientConnection};
 
 /// Zipf exponent of history size over author rank.
-const ZIPF: f64 = 0.8;
+pub(crate) const ZIPF: f64 = 0.8;
 /// Corpus timestamps fall in this window before [`ANCHOR`].
 const SPAN: u64 = 730 * 86_400;
 /// Fixed so the dataset, and so its reuse, does not depend on the clock.
@@ -148,7 +148,7 @@ fn author_key(seed: u64, rank: usize) -> Keypair {
     }
 }
 
-fn mix(parts: &[u64]) -> u64 {
+pub(crate) fn mix(parts: &[u64]) -> u64 {
     // FNV-1a over the parts: stable across Rust versions.
     let mut hash = 0xcbf29ce484222325u64;
     for part in parts {
@@ -161,7 +161,7 @@ fn mix(parts: &[u64]) -> u64 {
 }
 
 /// History events per author rank: Zipf over rank, summing to `history`.
-fn history_sizes(authors: usize, history: u64) -> Vec<u64> {
+pub(crate) fn history_sizes(authors: usize, history: u64) -> Vec<u64> {
     let weights: Vec<f64> = (0..authors)
         .map(|rank| ((rank + 1) as f64).powf(-ZIPF))
         .collect();
@@ -218,12 +218,12 @@ fn skeletons(seed: u64, sizes: &[u64]) -> Vec<Skeleton> {
 }
 
 /// Samples author ranks in proportion to their activity.
-struct Popularity {
+pub(crate) struct Popularity {
     cumulative: Vec<f64>,
 }
 
 impl Popularity {
-    fn new(authors: usize) -> Self {
+    pub(crate) fn new(authors: usize) -> Self {
         let mut total = 0.0;
         let cumulative = (0..authors)
             .map(|rank| {
@@ -234,7 +234,7 @@ impl Popularity {
         Self { cumulative }
     }
 
-    fn sample(&self, rng: &mut StdRng) -> usize {
+    pub(crate) fn sample(&self, rng: &mut StdRng) -> usize {
         let target = rng.gen::<f64>() * self.cumulative.last().copied().unwrap_or(0.0);
         self.cumulative
             .partition_point(|&c| c < target)
@@ -242,7 +242,7 @@ impl Popularity {
     }
 }
 
-const WORDS: [&str; 24] = [
+pub(crate) const WORDS: [&str; 24] = [
     "nostr", "relay", "outbox", "note", "client", "today", "sats", "zap", "follow", "key", "event",
     "filter", "index", "query", "coffee", "bitcoin", "music", "photo", "thread", "reply", "good",
     "morning", "build", "ship",
@@ -562,7 +562,7 @@ fn shapes(dataset: &Dataset, seed: u64) -> Vec<Shape> {
 
 /// Clone the dataset database for one relay start. A copy-on-write clone
 /// starts with none of its pages in the OS cache.
-fn clone_db(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn clone_db(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for name in ["data.mdb", "lock.mdb"] {
         let from = src.join(name);
@@ -591,27 +591,36 @@ fn clone_db(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-struct Received {
-    elapsed: Duration,
-    events: usize,
-    sha256: String,
+pub(crate) struct Received {
+    pub elapsed: Duration,
+    pub events: usize,
+    pub sha256: String,
 }
 
-/// Start a relay with the harness's usual file, except for room for a
-/// 2,000-author filter: the default `relay.max_req_filter_size` (64 KiB)
-/// refuses a REQ naming about 970 authors or more.
-fn spawn_relay(bin: &Path, dbdir: &Path, port: u16) -> Result<std::process::Child> {
+/// Room for a 2,000-author filter: the default `relay.max_req_filter_size`
+/// (64 KiB) refuses a REQ naming about 970 authors or more.
+const RELAY_OVERRIDES: &[(&str, &str)] = &[("[relay]", "max_req_filter_size = 1048576")];
+
+/// Start a relay with the harness's usual file, plus each `(section, line)`
+/// of `overrides` added at the top of that section.
+pub(crate) fn spawn_relay(
+    bin: &Path,
+    dbdir: &Path,
+    port: u16,
+    overrides: &[(&str, &str)],
+) -> Result<std::process::Child> {
     let conf = write_conf(bin, dbdir, port);
-    let text = std::fs::read_to_string(&conf)?;
-    anyhow::ensure!(
-        text.contains("[relay]\n"),
-        "unexpected relay file for {}",
-        bin.display()
-    );
-    std::fs::write(
-        &conf,
-        text.replacen("[relay]\n", "[relay]\nmax_req_filter_size = 1048576\n", 1),
-    )?;
+    let mut text = std::fs::read_to_string(&conf)?;
+    for (section, line) in overrides {
+        let header = format!("{section}\n");
+        anyhow::ensure!(
+            text.contains(&header),
+            "relay file for {} has no {section}",
+            bin.display()
+        );
+        text = text.replacen(&header, &format!("{header}{line}\n"), 1);
+    }
+    std::fs::write(&conf, text)?;
     std::process::Command::new(bin)
         .arg("--config")
         .arg(&conf)
@@ -624,7 +633,7 @@ fn spawn_relay(bin: &Path, dbdir: &Path, port: u16) -> Result<std::process::Chil
 }
 
 /// Time from sending the REQ to its EOSE, and a digest of what it returned.
-async fn time_to_eose(
+pub(crate) async fn time_to_eose(
     socket: &mut ClientConnection,
     sid: &str,
     filter: &Value,
@@ -671,7 +680,7 @@ async fn time_to_eose(
     })
 }
 
-fn percentile(sorted: &[f64], p: f64) -> f64 {
+pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
@@ -682,7 +691,10 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// Connect to a relay that is still starting. A loaded host, or the OS
 /// checking a newly built binary on its first launch, can take longer than
 /// one `connect_retry` round; a relay that exits fails at once.
-async fn connect_starting(url: &str, child: &mut std::process::Child) -> Result<ClientConnection> {
+pub(crate) async fn connect_starting(
+    url: &str,
+    child: &mut std::process::Child,
+) -> Result<ClientConnection> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match connect_retry(url).await {
@@ -710,7 +722,7 @@ fn measure(
     let scratch = tempfile::TempDir::new()?;
     clone_db(db, scratch.path())?;
     let port = free_port();
-    let mut child = spawn_relay(bin, scratch.path(), port)?;
+    let mut child = spawn_relay(bin, scratch.path(), port, RELAY_OVERRIDES)?;
     let url = format!("ws://127.0.0.1:{port}");
     let measured = rt.block_on(async {
         let mut socket = connect_starting(&url, &mut child).await?;

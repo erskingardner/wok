@@ -344,6 +344,104 @@ cargo build --release -p wok-cli -p wok-bench
 
 `results.jsonl` holds every row in the trial's `author_kinds` field.
 
+## Tag × kind fetches (`tag_kinds`)
+
+Wok-only `--scenario tag_kinds` measures time to EOSE of historical `#p` and
+`#e` REQs that also name `kinds`: the notification, zap, DM-inbox and reaction
+fetches clients send. Wok answers them from the Tag index and reads each
+candidate's event to check its kind, so a pubkey or note that many events tag
+costs more when few of those events have a requested kind. With
+`--wok-baseline` every shape also runs against a second wok binary on the same
+database files, as in `author_kinds`.
+
+The dataset has `--authors` authors and `--events` events:
+
+- Every author has one kind 0, 3, 10002 and 10050 event.
+- Authors' histories are kind 1, 7, 6 and 1111 events, in the ratio
+  55:31:10:4. History sizes follow a Zipf law over author rank, with exponent
+  0.8.
+- 4% of the events are zap receipts (kind 9735), signed by 16 zapper keys.
+- 5% are gift wraps (kind 1059), each signed by a one-time key. Half
+  `p`-tag a recipient drawn by popularity, half one drawn uniformly.
+- Replies, reactions, reposts, comments and zaps name a note of a popular
+  author and `p`-tag that author. Notes are drawn by a Zipf law over each
+  author's 1,000 notes; they are named, not stored. Follow lists also name
+  popular authors more often.
+- Timestamps spread over two years before a fixed anchor, and events are
+  imported in timestamp order.
+
+As in `author_kinds`, the dataset is generated and imported once for each
+combination of events, authors and seed, and kept under `--dataset-dir`.
+
+The query shapes, each with limit 50 and limit 500:
+
+- For three pubkeys (the most `p`-tagged, the one nearest 10,000 `p`
+  postings, and the median): notifications (`#p` with kinds
+  `[1,6,7,9735,1111]`), zaps (`#p` with kinds `[9735]`) and the DM inbox (`#p`
+  with kinds `[1059]`).
+- For the most tagged pubkey, `#p` alone, which reads the Tag index without
+  reading events.
+- For the most tagged note, reactions (`#e` with kinds `[7]`) and zaps (`#e`
+  with kinds `[9735]`).
+
+Before any relay starts, the bench reads each shape's postings from the
+dataset's Tag index in the order Wok's scan reads them. It counts the events
+a Tag-index plan reads before it has `limit` matches, and the relay must
+return the same events. Any difference is a mismatch and fails the trial.
+
+The relays run the harness's usual configuration, except that
+`relay.auth.restricted_read_kinds` is empty. AUTH is off in the bench relay,
+and by default gift wraps are readable only by their recipient after AUTH.
+The scan is the same either way; AUTH adds a recipient check for each event
+returned.
+
+Each shape and binary starts `--cold-runs` relays, each on a fresh
+copy-on-write clone of the dataset database, and the first query of each is a
+cold run. Warm runs follow on the last relay, stopping after `--warm-runs` runs
+or `--shape-secs` seconds, with at least three. The binaries alternate which
+runs first. The same caveat as `author_kinds` applies: on a filesystem that
+cannot clone, the cold runs are not cold.
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--events` | 1,000,000 | Events in the dataset |
+| `--authors` | 5,000 | Authors in the dataset |
+| `--dataset-dir` | `bench-results/datasets` | Where datasets are kept for reuse |
+| `--wok-baseline` | none | Second wok binary to measure on the same dataset |
+| `--cold-runs` | 3 | Relay starts per shape and binary, each timing one cold query |
+| `--warm-runs` | 15 | Warm runs per shape, after the cold runs |
+| `--shape-secs` | 30 | Stop a shape's warm runs after this long (at least three run) |
+
+For example, against a build of master in a separate worktree:
+
+```bash
+git worktree add ../wok-master master
+(cd ../wok-master && cargo build --release -p wok-cli)
+cargo build --release -p wok-cli -p wok-bench
+./target/release/wok-bench --scenario tag_kinds --events 5000000 --cold-runs 5 \
+  --wok ./target/release/wok --wok-baseline ../wok-master/target/release/wok \
+  --out bench-results/tag_kinds
+```
+
+The dataset's database is imported by `--wok`. To measure a binary that
+derives a new index at import, import the corpus with that binary (the first
+run with it as `--wok` and a fresh `--dataset-dir` does this) and compare the
+other binary on that database.
+
+`summary.md` has one row per shape and limit:
+
+- `postings`: the tag value's Tag index entries, and `matching` those of a
+  requested kind;
+- `events`: the events returned;
+- `reads`: the events a Tag-index plan reads before EOSE. With `kinds` that
+  is every posting until `limit` match, or all of them; without, only the
+  events returned;
+- cold p50, p95 and max, and warm p50, p95 and max time to EOSE, in
+  milliseconds. With `--wok-baseline` the table shows cold p50 and warm p50,
+  p95 and max for each binary, the warm p50 speedup, and `same results`.
+
+`results.jsonl` holds every row in the trial's `tag_kinds` field.
+
 ## Live subscriptions (`monitor_index`, `live_subscriptions`)
 
 Two Wok-only scenarios measure the live-subscription monitor under the load

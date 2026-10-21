@@ -116,6 +116,13 @@ history as well as live ones; a REQ reusing an open id always fits.
    never waits for a reply. A REQ or COUNT it cannot start (a read failure,
    `relay.abuse.max_concurrent_historical_queries`) or whose scan fails gets
    CLOSED through the gate.
+   - Each pass, the worker takes what is queued for it, up to 64 messages,
+     and applies it in order under one read transaction. Cancels, AUTH and
+     disconnects take no query time. Each new REQ or COUNT gets its first
+     time slice (`relay.query_timeslice_budget_us`) as it is taken, so a
+     small one is answered before the messages behind it.
+   - The pass ends with one slice for the running query that has waited
+     longest, so a stream of new REQs cannot starve a long scan.
 4. **Going live, on the req monitor.** For the current generation only, the
    monitor sends EOSE, then the held matches in arrival order, then delivers
    live. NIP-01 defines EOSE as the boundary to "events newly received in

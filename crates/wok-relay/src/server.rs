@@ -3111,6 +3111,52 @@ mod fault {
     }
 }
 
+/// The order a req worker gives time slices in, recorded per database path
+/// once a test asks for it.
+#[cfg(test)]
+mod trace {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use wok_query::Subscription;
+
+    /// Per traced database: the sub id of each query given a slice.
+    static SLICES: Mutex<Vec<(PathBuf, Vec<String>)>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(path: &Path) {
+        let mut slices = SLICES.lock().unwrap();
+        slices.retain(|(p, _)| p != path);
+        slices.push((path.to_path_buf(), Vec::new()));
+    }
+
+    pub(super) fn slice(path: &Path, sub: Option<&Subscription>) {
+        let mut slices = SLICES.lock().unwrap();
+        if let (Some((_, log)), Some(sub)) = (slices.iter_mut().find(|(p, _)| p == path), sub) {
+            log.push(sub.sub_id.to_string());
+        }
+    }
+
+    pub(super) fn slices(path: &Path) -> Vec<String> {
+        let slices = SLICES.lock().unwrap();
+        slices
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, log)| log.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Most messages a req worker takes from its queue in one pass. A REQ or COUNT
+/// gets its first time slice as soon as the pass takes it, and the queries
+/// still running after that get one slice at the end of every pass, so this
+/// bounds how long they wait behind a stream of new ones.
+const REQ_PASS_MAX: usize = 64;
+
+/// A req worker pass takes every message already queued (up to `REQ_PASS_MAX`)
+/// and applies them in order under one read transaction. Cancels, AUTH and
+/// teardown cost no query time. Each new REQ or COUNT is scheduled and given
+/// its first slice at once, so a small one is answered within the pass, before
+/// the messages behind it. Then the longest-waiting running query gets a
+/// slice. strfry's ReqWorker drains its inbox the same way.
 fn run_req_worker(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -3128,44 +3174,48 @@ fn run_req_worker(
     drop(initial_cfg);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut decomp = Decompressor::new();
-    // A REQ or COUNT that will send no (more) history: its CLOSED goes through
-    // the gate as the generation's last frame, and a REQ's registration with
-    // the monitor is dropped.
-    let refuse = |conn_id: u64, sub_id: SubId, generation: u64, count_only: bool, reason: &str| {
-        let ns = if count_only { Ns::Count } else { Ns::Req };
-        let closed = RelayMessage::closed_error(sub_id.as_str(), reason);
-        conns.send_last(conn_id, ns, &sub_id, generation, closed, &metrics);
-        if !count_only {
-            let _ = route_tx(&mon_txs, conn_id).send(MonitorMsg::Remove {
-                conn_id,
-                sub_id,
-                generation,
-            });
-        }
+    let mut pass = Vec::with_capacity(REQ_PASS_MAX);
+    let worker = ReqWorker {
+        conns: &conns,
+        metrics: &metrics,
+        mon_txs: &mon_txs,
     };
-    loop {
-        let msg = if queries.has_running() {
-            match rx.try_recv() {
-                Ok(m) => Some(m),
-                Err(crossbeam_channel::TryRecvError::Empty) => None,
-                Err(_) => break,
-            }
-        } else {
+    let mut open = true;
+    while open {
+        if !queries.has_running() {
             match rx.recv() {
-                Ok(m) => Some(m),
+                Ok(msg) => pass.push(msg),
                 Err(_) => break,
             }
-        };
-        let cfg_snap = cfg.read();
-        queries.set_max_subs_per_connection(cfg_snap.relay.abuse.max_concurrent_historical_queries);
-        queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
-        queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
-        // Without a read transaction a REQ or COUNT is refused rather than
-        // dropped: a registered REQ would otherwise never get EOSE or CLOSED.
+        }
+        while pass.len() < REQ_PASS_MAX {
+            match rx.try_recv() {
+                Ok(msg) => pass.push(msg),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                // Answer what was taken, then stop: running queries are
+                // not finished for a relay that is shutting down.
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    open = false;
+                    break;
+                }
+            }
+        }
+        {
+            let cfg_snap = cfg.read();
+            queries.set_max_subs_per_connection(
+                cfg_snap.relay.abuse.max_concurrent_historical_queries,
+            );
+            queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
+            queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
+        }
+        // Opened after the messages were taken, so it sees everything up to
+        // each REQ's snapshot, fixed at admission before the REQ was queued.
+        // Without it a REQ or COUNT is refused rather than dropped: a
+        // registered REQ would otherwise never get EOSE or CLOSED.
         let txn = begin_read(&env)
             .inspect_err(|error| tracing::warn!(%error, "req worker cannot read the database"))
             .ok();
-        if let Some(msg) = msg {
+        for msg in pass.drain(..) {
             match msg {
                 ReqMsg::Scan(sub) | ReqMsg::Count(sub) => {
                     let (conn, sub_id, generation, count_only) = (
@@ -3176,7 +3226,12 @@ fn run_req_worker(
                     );
                     let reason = match &txn {
                         Some(txn) => match queries.add_sub(txn, sub) {
-                            Ok(true) => None,
+                            Ok(true) => {
+                                // The new query is first in the run queue.
+                                let cfg_snap = cfg.read();
+                                worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp);
+                                None
+                            }
                             Ok(false) => {
                                 metrics
                                     .abuse_query_concurrency_rejections
@@ -3193,7 +3248,7 @@ fn run_req_worker(
                         }
                     };
                     if let Some(reason) = reason {
-                        refuse(conn, sub_id, generation, count_only, reason);
+                        worker.refuse(conn, sub_id, generation, count_only, reason);
                     }
                 }
                 ReqMsg::SetAuth {
@@ -3219,34 +3274,73 @@ fn run_req_worker(
                 }
             }
         }
-        let Some(txn) = txn else {
-            continue;
-        };
-        let mut completed: Vec<Completed> = Vec::new();
+        if let Some(txn) = &txn {
+            if open && queries.has_running() {
+                let cfg_snap = cfg.read();
+                worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp);
+            }
+        }
+    }
+}
+
+/// What a req worker delivers to.
+struct ReqWorker<'a> {
+    conns: &'a ConnTable,
+    metrics: &'a Metrics,
+    mon_txs: &'a [Sender<MonitorMsg>],
+}
+
+impl ReqWorker<'_> {
+    /// A REQ or COUNT that will send no (more) history: its CLOSED goes through
+    /// the gate as the generation's last frame, and a REQ's registration with
+    /// the monitor is dropped.
+    fn refuse(&self, conn_id: u64, sub_id: SubId, generation: u64, count_only: bool, reason: &str) {
+        let ns = if count_only { Ns::Count } else { Ns::Req };
+        let closed = RelayMessage::closed_error(sub_id.as_str(), reason);
+        self.conns
+            .send_last(conn_id, ns, &sub_id, generation, closed, self.metrics);
+        if !count_only {
+            let _ = route_tx(self.mon_txs, conn_id).send(MonitorMsg::Remove {
+                conn_id,
+                sub_id,
+                generation,
+            });
+        }
+    }
+
+    /// Give the first query in the run queue one time slice, and answer it if
+    /// that finished it.
+    fn slice(
+        &self,
+        queries: &mut QueryScheduler,
+        txn: &wok_db::RoTxn<'_>,
+        cfg: &Config,
+        authed: &HashMap<u64, Vec<[u8; 32]>>,
+        decomp: &mut Decompressor,
+    ) {
+        #[cfg(test)]
+        trace::slice(txn.env().path(), queries.next_query());
+        let (conns, metrics) = (self.conns, self.metrics);
+        let mut completed: Option<Completed> = None;
         // Events are framed and delivered inside the scan callback: no
         // per-event Subscription clone, no intermediate collection, and the
         // payload JSON is copied exactly once (into the frame).
         let scanned = queries.process_visible(
-            &txn,
-            cfg_snap.relay.query_timeslice_budget_us,
-            |sub| {
-                read_visibility(
-                    &cfg_snap,
-                    authed.get(&sub.conn_id).cloned().unwrap_or_default(),
-                )
-            },
+            txn,
+            cfg.relay.query_timeslice_budget_us,
+            |sub| read_visibility(cfg, authed.get(&sub.conn_id).cloned().unwrap_or_default()),
             |sub, _lev, payload| {
                 if sub.count_only {
                     return;
                 }
                 if let Some(raw) = payload {
-                    if let Ok(json) = decomp.decode(&txn, raw, cfg_snap.events.max_event_size) {
-                        conns.send_event(sub.conn_id, &sub.sub_id, sub.generation, json, &metrics);
+                    if let Ok(json) = decomp.decode(txn, raw, cfg.events.max_event_size) {
+                        conns.send_event(sub.conn_id, &sub.sub_id, sub.generation, json, metrics);
                     }
                 }
             },
             |sub, total, hll, dedup_limited| {
-                completed.push(Completed {
+                completed = Some(Completed {
                     conn_id: sub.conn_id,
                     sub_id: sub.sub_id.clone(),
                     generation: sub.generation,
@@ -3258,7 +3352,6 @@ fn run_req_worker(
                 });
             },
         );
-        drop(txn);
         if let Err(failure) = scanned {
             tracing::warn!(
                 conn_id = failure.sub.conn_id,
@@ -3267,7 +3360,7 @@ fn run_req_worker(
                 "historical query failed"
             );
             let sub = failure.sub;
-            refuse(
+            self.refuse(
                 sub.conn_id,
                 sub.sub_id,
                 sub.generation,
@@ -3275,46 +3368,47 @@ fn run_req_worker(
                 "error: history scan failed",
             );
         }
-        for done in completed {
-            tracing::debug!(
-                conn_id = done.conn_id,
-                sub_id = %done.sub_id,
-                count_only = done.count_only,
-                matched_events = done.total,
-                hll = done.hll.is_some(),
-                "historical query completed"
-            );
-            if done.count_only {
-                let mut count = done.total;
-                let mut limited = done.dedup_limited;
-                if count > cfg_snap.relay.max_filter_limit_count {
-                    count = cfg_snap.relay.max_filter_limit_count;
-                    limited = true;
-                }
-                let reply = RelayMessage::Count {
-                    sub_id: done.sub_id.to_string(),
-                    count,
-                    limited,
-                    hll: if limited { None } else { done.hll },
-                };
-                conns.send_last(
-                    done.conn_id,
-                    Ns::Count,
-                    &done.sub_id,
-                    done.generation,
-                    reply,
-                    &metrics,
-                );
-            } else {
-                // The monitor sends EOSE and goes live. No reply is awaited,
-                // so a busy monitor never holds up other queries here.
-                let _ = route_tx(&mon_txs, done.conn_id).send(MonitorMsg::HistoryDone {
-                    conn_id: done.conn_id,
-                    sub_id: done.sub_id,
-                    generation: done.generation,
-                    snapshot: done.snapshot,
-                });
+        let Some(done) = completed else {
+            return;
+        };
+        tracing::debug!(
+            conn_id = done.conn_id,
+            sub_id = %done.sub_id,
+            count_only = done.count_only,
+            matched_events = done.total,
+            hll = done.hll.is_some(),
+            "historical query completed"
+        );
+        if done.count_only {
+            let mut count = done.total;
+            let mut limited = done.dedup_limited;
+            if count > cfg.relay.max_filter_limit_count {
+                count = cfg.relay.max_filter_limit_count;
+                limited = true;
             }
+            let reply = RelayMessage::Count {
+                sub_id: done.sub_id.to_string(),
+                count,
+                limited,
+                hll: if limited { None } else { done.hll },
+            };
+            conns.send_last(
+                done.conn_id,
+                Ns::Count,
+                &done.sub_id,
+                done.generation,
+                reply,
+                metrics,
+            );
+        } else {
+            // The monitor sends EOSE and goes live. No reply is awaited, so a
+            // busy monitor never holds up other queries here.
+            let _ = route_tx(self.mon_txs, done.conn_id).send(MonitorMsg::HistoryDone {
+                conn_id: done.conn_id,
+                sub_id: done.sub_id,
+                generation: done.generation,
+                snapshot: done.snapshot,
+            });
         }
     }
 }
@@ -6014,15 +6108,13 @@ mod tests {
         worker.join().unwrap();
     }
 
-    /// When a req worker cannot open a read for a REQ or COUNT that replaces
-    /// one it is still running, the old query ends with the refusal rather
-    /// than scanning on for nothing: the gate already drops what it sends.
-    #[test]
-    fn a_replacement_refused_on_a_failed_read_ends_the_old_query() {
+    /// A database with enough kind-1 history that a query reading all of it
+    /// spans many time slices at `slow_scan_config`'s budget. Returns the
+    /// newest local event id with it.
+    fn long_history() -> (tempfile::TempDir, Env, u64) {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), small_map_env_options()).unwrap();
         env.ensure_initialized().unwrap();
-        // Enough history that the first query spans many time slices.
         let mut events: Vec<EventToWrite> = (0..20_000u64)
             .map(|i| {
                 let mut id = [0xBBu8; 32];
@@ -6047,27 +6139,54 @@ mod tests {
         wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
         txn.commit().unwrap();
         let snapshot = most_recent_levid_ro(&env.begin_ro().unwrap()).unwrap();
+        (dir, env, snapshot)
+    }
 
+    /// Time slices as short as they go, so a query's slice count depends on
+    /// the work it does, not on how fast the machine is.
+    fn slow_scan_config(dir: &std::path::Path) -> Config {
         let mut cfg = Config::default();
-        cfg.db = dir.path().to_path_buf();
+        cfg.db = dir.to_path_buf();
         cfg.relay.auth.enabled = false;
         cfg.relay.query_timeslice_budget_us = 1;
         cfg.relay.max_filter_limit = 50_000;
         cfg.relay.max_total_events_per_req = 0;
+        cfg
+    }
+
+    /// A REQ (or COUNT) on connection 1 as the ingester hands it over.
+    fn queued_sub(
+        sub_id: &str,
+        filter: Value,
+        generation: u64,
+        count_only: bool,
+        snapshot: u64,
+    ) -> Subscription {
+        let group = NostrFilterGroup::from_value(&filter, 50_000, 3, 16).unwrap();
+        let mut sub = Subscription::new(1, SubId::new(sub_id).unwrap(), group, count_only);
+        sub.generation = generation;
+        if !count_only {
+            sub.latest_event_id = snapshot;
+        }
+        sub
+    }
+
+    /// When a req worker cannot open a read for a REQ or COUNT that replaces
+    /// one it is still running, the old query ends with the refusal rather
+    /// than scanning on for nothing: the gate already drops what it sends.
+    #[test]
+    fn a_replacement_refused_on_a_failed_read_ends_the_old_query() {
+        // Enough history that the first query spans many time slices.
+        let (dir, env, snapshot) = long_history();
+        let cfg = slow_scan_config(dir.path());
         let sub = |generation, count_only| {
-            let group = NostrFilterGroup::from_value(
-                &json!({"kinds": [1], "limit": 50_000}),
-                50_000,
-                3,
-                16,
+            queued_sub(
+                "x",
+                json!({"kinds": [1], "limit": 50_000}),
+                generation,
+                count_only,
+                snapshot,
             )
-            .unwrap();
-            let mut sub = Subscription::new(1, SubId::new("x").unwrap(), group, count_only);
-            sub.generation = generation;
-            if !count_only {
-                sub.latest_event_id = snapshot;
-            }
-            sub
         };
 
         for (first, replacement) in [
@@ -6083,11 +6202,8 @@ mod tests {
             conns.open_sub(1, ns, &SubId::new("x").unwrap(), 2);
             let (req_tx, req_rx) = bounded(8);
             let (mon_tx, mon_rx) = bounded(8);
-            // Both are queued before the worker starts: the first pass reads
-            // and starts the first query, the second pass cannot read.
+            trace::record(env.path());
             req_tx.send(first).unwrap();
-            req_tx.send(replacement).unwrap();
-            fault::fail_reads_after(env.path(), 1, 1);
             let worker = {
                 let env = env.clone();
                 let cfg = Arc::new(parking_lot::RwLock::new(cfg.clone()));
@@ -6107,7 +6223,18 @@ mod tests {
                         thread::sleep(Duration::from_millis(1));
                     }
                 };
+            // Once the first query has had a slice, no read succeeds: the
+            // pass that takes the replacement cannot read.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while trace::slices(env.path()).is_empty() {
+                assert!(std::time::Instant::now() < deadline, "no slice");
+                thread::yield_now();
+            }
+            fault::fail_reads(env.path(), usize::MAX);
+            req_tx.send(replacement).unwrap();
             let closed = recv_frame(&mut outbound);
+            let sliced = trace::slices(env.path()).len();
+            fault::fail_reads(env.path(), 0);
             assert!(closed.starts_with(r#"["CLOSED","x","error: "#), "{closed}");
             if !count {
                 assert!(matches!(
@@ -6116,6 +6243,11 @@ mod tests {
                 ));
             }
             thread::sleep(Duration::from_millis(300));
+            assert_eq!(
+                trace::slices(env.path()).len(),
+                sliced,
+                "the replaced query kept running"
+            );
             assert!(outbound.try_recv().is_err(), "a frame followed CLOSED");
             // A replaced REQ that kept scanning would report its history done.
             assert!(
@@ -6193,6 +6325,141 @@ mod tests {
         assert_eq!(frame(&mut relay), r#"["EVENT","x",{"b":1}]"#);
         assert!(relay.outbound.try_recv().is_err());
         relay.finish();
+    }
+
+    /// Start a req worker for connection 1 on `env`, recording its slices.
+    fn traced_worker(
+        env: &Env,
+        cfg: Config,
+        conns: &Arc<ConnTable>,
+        req_rx: Receiver<ReqMsg>,
+        mon_tx: Sender<MonitorMsg>,
+    ) -> thread::JoinHandle<()> {
+        trace::record(env.path());
+        let (env, conns) = (env.clone(), conns.clone());
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let metrics = Arc::new(Metrics::default());
+        thread::spawn(move || run_req_worker(env, cfg, conns, metrics, req_rx, vec![mon_tx]))
+    }
+
+    /// The sub id of the next `HistoryDone` the req worker sends.
+    fn history_done_for(mon_rx: &Receiver<MonitorMsg>) -> String {
+        match mon_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(MonitorMsg::HistoryDone { sub_id, .. }) => sub_id.to_string(),
+            Ok(_) => panic!("expected HistoryDone"),
+            Err(error) => panic!("no HistoryDone: {error}"),
+        }
+    }
+
+    /// A pass takes everything queued and applies it in order. Cancels, AUTH
+    /// and teardown take no query time, and each new REQ or COUNT gets its
+    /// first slice as the pass takes it, in queue order: small queries queued
+    /// behind a long scan and 50 cancels are answered after one slice of the
+    /// scan, not one per message ahead of them.
+    #[test]
+    fn a_pass_answers_queued_queries_without_a_slice_per_message() {
+        let (dir, env, snapshot) = long_history();
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        conns.open_sub(1, Ns::Count, &SubId::new("d").unwrap(), 5);
+        let (req_tx, req_rx) = bounded(REQ_PASS_MAX);
+        let (mon_tx, mon_rx) = unbounded();
+        let all = json!({"kinds": [1], "limit": 50_000});
+        let newest = json!({"kinds": [1], "limit": 1});
+        let one = json!({"ids": [format!("{}{}", "00".repeat(8), "bb".repeat(24))]});
+        let queue = |msg| req_tx.send(msg).unwrap();
+        queue(ReqMsg::Scan(queued_sub("long", all, 1, false, snapshot)));
+        for i in 0..50 {
+            queue(ReqMsg::Cancel {
+                conn_id: 1,
+                sub_id: SubId::new(&format!("gone{i}")).unwrap(),
+                generation: 100 + i,
+                count_only: false,
+            });
+        }
+        queue(ReqMsg::SetAuth {
+            conn_id: 1,
+            authed: [7; 32],
+        });
+        queue(ReqMsg::Scan(queued_sub(
+            "b",
+            newest.clone(),
+            2,
+            false,
+            snapshot,
+        )));
+        queue(ReqMsg::Scan(queued_sub("c", newest, 3, false, snapshot)));
+        queue(ReqMsg::Count(queued_sub("d", one, 5, true, snapshot)));
+        let worker = traced_worker(&env, slow_scan_config(dir.path()), &conns, req_rx, mon_tx);
+
+        assert_eq!(history_done_for(&mon_rx), "b");
+        assert_eq!(history_done_for(&mon_rx), "c");
+        assert_eq!(history_done_for(&mon_rx), "long");
+        let slices = trace::slices(env.path());
+        assert_eq!(slices[..4], ["long", "b", "c", "d"], "{slices:?}");
+        assert!(slices[4..].iter().all(|s| s == "long"), "{slices:?}");
+        assert!(
+            slices.len() > 5,
+            "the long scan fit in one slice: {slices:?}"
+        );
+        let count: Value = serde_json::from_str(&outbound.try_recv().unwrap().into_text()).unwrap();
+        assert_eq!(count, json!(["COUNT", "d", {"count": 1}]));
+        drop(req_tx);
+        worker.join().unwrap();
+    }
+
+    /// A pass takes at most `REQ_PASS_MAX` messages and ends with a slice for
+    /// the running query that has waited longest, so a stream of new REQs
+    /// cannot keep a long scan from going on, and new REQs are still started
+    /// in the order they came.
+    #[test]
+    fn a_stream_of_new_queries_cannot_starve_a_running_scan() {
+        let (dir, env, snapshot) = long_history();
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, _outbound) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let small = 3 * REQ_PASS_MAX;
+        let (req_tx, req_rx) = bounded(small + 1);
+        let (mon_tx, mon_rx) = unbounded();
+        let all = json!({"kinds": [1], "limit": 50_000});
+        req_tx
+            .send(ReqMsg::Scan(queued_sub("long", all, 1, false, snapshot)))
+            .unwrap();
+        let newest = json!({"kinds": [1], "limit": 1});
+        let ids: Vec<String> = (0..small).map(|i| format!("s{i}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let sub = queued_sub(id, newest.clone(), 2 + i as u64, false, snapshot);
+            req_tx.send(ReqMsg::Scan(sub)).unwrap();
+        }
+        let worker = traced_worker(&env, slow_scan_config(dir.path()), &conns, req_rx, mon_tx);
+
+        let mut done: Vec<String> = (0..=small).map(|_| history_done_for(&mon_rx)).collect();
+        let long_done = done.iter().position(|id| id == "long").unwrap();
+        done.remove(long_done);
+        assert_eq!(done, ids);
+        let slices = trace::slices(env.path());
+        let started: Vec<&String> = slices.iter().filter(|id| *id != "long").collect();
+        assert_eq!(started, ids.iter().collect::<Vec<_>>());
+        let long: Vec<usize> = slices
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| *id == "long")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(
+            long.len() >= 4,
+            "the long scan was not sliced each pass: {slices:?}"
+        );
+        for pair in long.windows(2) {
+            assert!(
+                pair[1] - pair[0] - 1 <= REQ_PASS_MAX,
+                "{} new queries ran between two slices of the long scan",
+                pair[1] - pair[0] - 1
+            );
+        }
+        drop(req_tx);
+        worker.join().unwrap();
     }
 
     /// Producers on several threads queue frames for the same subscription

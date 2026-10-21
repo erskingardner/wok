@@ -156,6 +156,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Frames for different connections are queued under per-connection locks
   instead of one relay-wide lock, so live fan-out to many connections no
   longer serializes on it.
+- A REQ queued behind CLOSEs, AUTH or disconnects no longer waits a query time
+  slice for each of them while other queries run. The req worker now takes
+  everything queued in one pass, and starts each new REQ or COUNT as it takes
+  it. Running queries still get a slice every pass.
 
 ### Removed
 

@@ -858,6 +858,12 @@ fn ensure_tag_kind_index(rt: &tokio::runtime::Runtime, opts: &Options, db: &Path
         .block_on(connect_starting(&url, &mut child))
         .map(drop)
         .and_then(|()| loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!(
+                    "{} exited with {status} before the tag-kind index was complete",
+                    opts.wok.display()
+                );
+            }
             match tag_kind_index_state(db)? {
                 None => return Ok(false),
                 Some(state) if state.complete() => return Ok(true),

@@ -598,3 +598,65 @@ fn outbox_fetch_past_a_thousand_pairs_returns_the_newest_versions() {
         assert_eq!(got, want, "limit {limit}");
     }
 }
+
+/// One OR tag with `kinds` seeks each (value, kind) pair in the TagKind index
+/// once it holds every stored event, within the PubkeyKind plan's pair
+/// bounds. Other shapes, and an index the writer is still building, keep
+/// their plans.
+#[test]
+fn one_tag_and_kinds_plan_the_tag_kind_index_once_it_is_complete() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let (packed, json, _) = sign(1059, "wrapped", 1_700_000_000);
+    let mut events = [EventToWrite::new(packed, json)];
+    let mut txn = env.begin_rw().unwrap();
+    write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+    txn.commit().unwrap();
+    let pubkeys = |n: usize| (0..n).map(|i| format!("{i:064x}")).collect::<Vec<_>>();
+    let plan = |filter: serde_json::Value| {
+        let txn = env.begin_ro().unwrap();
+        let group = NostrFilterGroup::from_value(&filter, 5_000, 3, 16).unwrap();
+        let scan = DbScan::new(&group.filters[0], &txn);
+        (scan.desc, scan.cursor_count())
+    };
+
+    assert_eq!(
+        plan(json!({"#p": pubkeys(1), "kinds": [1059]})),
+        ("TagKind", 1)
+    );
+    assert_eq!(
+        plan(json!({"#e": pubkeys(2), "kinds": [7, 9735]})),
+        ("TagKind", 4)
+    );
+    assert_eq!(plan(json!({"#p": pubkeys(1)})), ("Tag", 1));
+    assert_eq!(
+        plan(json!({"#p": pubkeys(1), "#t": ["x"], "kinds": [1]})),
+        ("Tag", 1)
+    );
+    assert_eq!(plan(json!({"&t": ["x"], "kinds": [1]})), ("Tag", 1));
+    assert_eq!(
+        plan(json!({"ids": pubkeys(1), "#p": pubkeys(1), "kinds": [1]})),
+        ("ID", 1)
+    );
+    // Past 1000 pairs, the seeks this plan adds must fit the limit.
+    let kinds: Vec<_> = (1..=10).collect();
+    assert_eq!(
+        plan(json!({"#p": pubkeys(99), "kinds": kinds})),
+        ("TagKind", 990)
+    );
+    assert_eq!(
+        plan(json!({"#p": pubkeys(100), "kinds": kinds, "limit": 899})),
+        ("Tag", 100)
+    );
+    assert_eq!(
+        plan(json!({"#p": pubkeys(100), "kinds": kinds, "limit": 900})),
+        ("TagKind", 1000)
+    );
+
+    // While the writer builds the index, the Tag plan stands.
+    let mut txn = env.begin_rw().unwrap();
+    wok_db::reset_tag_kind_index(&mut txn).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(plan(json!({"#p": pubkeys(1), "kinds": [1059]})), ("Tag", 1));
+}

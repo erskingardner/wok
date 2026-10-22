@@ -78,6 +78,31 @@ fn plans_pubkey_kind(f: &NostrFilter) -> bool {
     pairs - authors.size() <= usize::try_from(f.limit).unwrap_or(usize::MAX)
 }
 
+/// Whether a filter with one OR tag and `kinds` seeks each (value, kind) pair
+/// in the TagKind index instead of reading, from the Tag index, every event
+/// that tags its values and checking its kind. A popular value has thousands
+/// of events, of which a DM inbox or a zap list wants one kind.
+///
+/// The index must hold every event in this snapshot; until the writer's
+/// background build completes it, the Tag plan stands. The pair bounds are
+/// the PubkeyKind plan's, for the same reason: past 1000 pairs, the seeks
+/// this plan adds must fit the limit. The Tag plan checks each candidate's
+/// event as well, so both plans return the same events in the same order.
+fn plans_tag_kind(f: &NostrFilter, txn: &RoTxn<'_>) -> bool {
+    if f.ids.is_some() || !f.and_tags.is_empty() || f.tags.len() != 1 {
+        return false;
+    }
+    let (Some(kinds), Some((_, values))) = (&f.kinds, f.tags.iter().next()) else {
+        return false;
+    };
+    let pairs = values.size().saturating_mul(kinds.size());
+    let bounded = pairs < 1000
+        || (pairs <= MAX_PUBKEY_KIND_CURSORS
+            && pairs - values.size() <= usize::try_from(f.limit).unwrap_or(usize::MAX));
+    // A read failure keeps the established plan.
+    bounded && wok_db::tag_kind_index_complete_ro(txn).unwrap_or(false)
+}
+
 fn cmp_cand(a: &CandidateEvent, b: &CandidateEvent) -> std::cmp::Ordering {
     // Newer first; if equal created, higher levId first (matches C++ sort predicate).
     b.created()
@@ -640,8 +665,17 @@ impl DbScan {
         let dbis = txn.env().dbis();
         let mut index_only = f.index_only_scans;
         let mut cursors = Vec::new();
+        let tag_kind = match dbis.event_tag_kind {
+            Some(dbi) if f.limit != 0 && !f.never_match && plans_tag_kind(f, txn) => Some(dbi),
+            _ => None,
+        };
         let (index_dbi, desc) = if f.ids.is_some() {
             (dbis.event_id, "ID")
+        } else if let Some(dbi) = tag_kind {
+            // An entry can outlive its event when an earlier release deleted
+            // it, so every candidate is checked against its stored event.
+            index_only = false;
+            (dbi, "TagKind")
         } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
             (dbis.event_tag, "Tag")
         } else if plans_pubkey_kind(f) {
@@ -672,6 +706,27 @@ impl DbScan {
                     match_mode: MatchMode::Prefix,
                     outstanding: 0,
                 });
+            }
+        } else if tag_kind.is_some() {
+            // A TagKind key is the Tag key with the kind before the time, so
+            // the cursors read it the same way.
+            let (tag_name, values) = f.tags.iter().next().unwrap();
+            let kinds = f.kinds.as_ref().unwrap();
+            for i in 0..values.size() {
+                for j in 0..kinds.size() {
+                    let mut search = vec![*tag_name as u8];
+                    search.extend_from_slice(values.at(i));
+                    search.extend_from_slice(&kinds.at(j).to_ne_bytes());
+                    let mut resume = search.clone();
+                    resume.extend_from_slice(&[0xFF; 8]);
+                    cursors.push(ScanCursor {
+                        resume_key: resume,
+                        resume_val: u64::MAX,
+                        search,
+                        match_mode: MatchMode::PrefixExactLen,
+                        outstanding: 0,
+                    });
+                }
             }
         } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
             // A required (`&`) tag seeds a single cursor because every listed

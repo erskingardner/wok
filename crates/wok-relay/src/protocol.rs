@@ -259,7 +259,13 @@ impl RelayMessage {
         }
         match self {
             Self::Event { sub_id, event_json } => {
-                format!("[\"EVENT\",\"{sub_id}\",{event_json}]")
+                let mut frame = String::with_capacity(sub_id.len() + event_json.len() + 12);
+                frame.push_str("[\"EVENT\",");
+                push_json_str(&mut frame, sub_id);
+                frame.push(',');
+                frame.push_str(event_json);
+                frame.push(']');
+                frame
             }
             Self::Eose { sub_id, hints } => {
                 let names = hints.names();
@@ -352,6 +358,20 @@ pub fn has_reason_prefix(reason: &str) -> bool {
         .is_some_and(|(prefix, _)| REASON_PREFIXES.contains(&prefix))
 }
 
+/// Append `s` as a JSON string, quotes included. It is escaped as the frames
+/// that serialize a sub id (EOSE, CLOSED, COUNT, NEG-*) escape it, so an id
+/// reads the same in every frame. Most ids need no escaping and are copied
+/// as they are.
+pub fn push_json_str(out: &mut String, s: &str) {
+    if s.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\') {
+        out.push_str(&serde_json::to_string(s).expect("string serialization"));
+    } else {
+        out.push('"');
+        out.push_str(s);
+        out.push('"');
+    }
+}
+
 pub fn parse_sub_id(s: &str) -> Result<SubId, String> {
     SubId::new(s).map_err(|e| e.to_string())
 }
@@ -369,6 +389,42 @@ mod tests {
         let c = ClientCommand::parse("\n").unwrap();
         assert!(matches!(c, ClientCommand::Newline));
         assert!(ClientCommand::parse("hello").is_err());
+    }
+
+    #[test]
+    fn sub_ids_are_escaped_alike_in_every_frame() {
+        for id in [
+            "s",
+            "é",
+            "😀",
+            "a\"b",
+            "a\\b",
+            "line\nbreak",
+            "nul\0",
+            "del\u{7f}",
+            "\u{2028}",
+        ] {
+            let escaped = serde_json::to_string(id).unwrap();
+            let mut pushed = String::new();
+            push_json_str(&mut pushed, id);
+            assert_eq!(pushed, escaped, "{id:?}");
+            let event = RelayMessage::Event {
+                sub_id: id.into(),
+                event_json: "{}".into(),
+            }
+            .to_json();
+            assert_eq!(event, format!("[\"EVENT\",{escaped},{{}}]"));
+            let eose = RelayMessage::Eose {
+                sub_id: id.into(),
+                hints: EoseHints::default(),
+            }
+            .to_json();
+            assert_eq!(eose, format!("[\"EOSE\",{escaped}]"));
+            for frame in [event, eose, RelayMessage::closed_error(id, "x").to_json()] {
+                let parsed: Value = serde_json::from_str(&frame).unwrap();
+                assert_eq!(parsed[1], id, "{frame}");
+            }
+        }
     }
 
     #[test]

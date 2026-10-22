@@ -16,7 +16,9 @@ use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
 use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
 use crate::plugin::{PluginEventSifter, PluginResult};
-use crate::protocol::{has_reason_prefix, ClientCommand, EoseHints, ParseFailure, RelayMessage};
+use crate::protocol::{
+    has_reason_prefix, push_json_str, ClientCommand, EoseHints, ParseFailure, RelayMessage,
+};
 use crate::restrict::ReadRestrictor;
 use crate::source::TransportSource;
 use crate::supported_nips;
@@ -410,9 +412,9 @@ impl ConnTable {
     ) -> bool {
         let sub = sub_id.as_str();
         let mut payload = String::with_capacity(sub.len() + ev_json.len() + 12);
-        payload.push_str("[\"EVENT\",\"");
-        payload.push_str(sub);
-        payload.push_str("\",");
+        payload.push_str("[\"EVENT\",");
+        push_json_str(&mut payload, sub);
+        payload.push(',');
         payload.push_str(ev_json);
         payload.push(']');
         self.push_sub(conn_id, Ns::Req, sub_id, generation, payload, metrics)
@@ -2716,6 +2718,15 @@ fn ingest_req(
     dispatch: &mut Dispatch,
 ) {
     let ns = if count_only { Ns::Count } else { Ns::Req };
+    // The id comes first: every other refusal names it.
+    let sid = match SubId::new(&sub_id) {
+        Ok(sid) => sid,
+        Err(e) => {
+            let reason = format!("invalid: bad req: {e}");
+            refuse_req(conns, metrics, dispatch, conn_id, ns, &sub_id, reason);
+            return;
+        }
+    };
     if filters.is_empty() {
         // NIP-01: a refused REQ gets CLOSED. C++ RelayIngester raises
         // "arr too small" as a NOTICE, before it reads the sub id.
@@ -2724,7 +2735,7 @@ fn ingest_req(
         return;
     }
     let admitted = admit_req(
-        cfg, conns, metrics, auth, conn_id, &sub_id, filters, count_only,
+        cfg, conns, metrics, auth, conn_id, &sid, filters, count_only,
     );
     let (mut sub, filter_bytes) = match admitted {
         Ok(admitted) => admitted,
@@ -2778,7 +2789,7 @@ fn admit_req(
     metrics: &Metrics,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
-    sub_id: &str,
+    sid: &SubId,
     filters: Vec<Value>,
     count_only: bool,
 ) -> Result<(Subscription, usize), String> {
@@ -2810,7 +2821,7 @@ fn admit_req(
     } else {
         cfg.relay.max_filter_limit
     };
-    let mut arr = vec![json!("REQ"), json!(sub_id)];
+    let mut arr = vec![json!("REQ"), json!(sid.as_str())];
     arr.extend(filters);
     let fg = NostrFilterGroup::from_req(
         &arr,
@@ -2851,11 +2862,10 @@ fn admit_req(
     if requires_auth {
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
-    let sid = SubId::new(sub_id).map_err(|e| bad_req("invalid", e.to_string()))?;
     // Pending and live subscriptions both count. Over a lowered cap an open
     // id can still be replaced; new ids wait until the count drops.
     if !count_only
-        && !conns.is_open(conn_id, Ns::Req, &sid)
+        && !conns.is_open(conn_id, Ns::Req, sid)
         && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
     {
         return Err("blocked: too many concurrent REQs".into());
@@ -2865,7 +2875,7 @@ fn admit_req(
     // an open id be replaced by filters no larger than its own.
     let filter_budget = cfg.relay.max_filter_bytes_per_connection;
     if !count_only && filter_budget != 0 {
-        let (held, replaced) = conns.filter_bytes(conn_id, Ns::Req, &sid);
+        let (held, replaced) = conns.filter_bytes(conn_id, Ns::Req, sid);
         if serialized_filter_bytes > replaced
             && held - replaced + serialized_filter_bytes > filter_budget
         {
@@ -2875,7 +2885,7 @@ fn admit_req(
         }
     }
     Ok((
-        Subscription::new(conn_id, sid, fg, count_only),
+        Subscription::new(conn_id, sid.clone(), fg, count_only),
         serialized_filter_bytes,
     ))
 }

@@ -39,7 +39,8 @@ pub use validate::{
     TimestampPolicy, AUTH_TIMESTAMP_WINDOW_SECS, GIFT_WRAP_BACKDATE_SECS,
 };
 
-pub const MAX_SUBID_SIZE: usize = 64;
+/// Longest subscription id NIP-01 allows, in Unicode characters (not bytes).
+pub const MAX_SUBID_CHARS: usize = 64;
 /// Longest single-letter tag value packed and indexed as is. Longer values are
 /// packed as [`indexed_tag_value`].
 pub const MAX_INDEXED_TAG_VAL_SIZE: usize = 255;

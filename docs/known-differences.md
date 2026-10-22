@@ -158,6 +158,12 @@ regression test. Differential parity alone is not a reason to retain it.
   NEG-ERR closes the session. A NEG-OPEN with an invalid subscription
   id is refused with NEG-ERR too. Only a sub id that is not a string, or a
   NEG-MSG or NEG-CLOSE with an invalid one, still produces a NOTICE.
+- NIP-01: a subscription id may be any non-empty string of at most 64
+  characters, counted in Unicode characters. Every frame JSON-escapes it,
+  and subscriptions are keyed by the exact id. Pinned strfry splices the id
+  into EVENT frames as it is, so it refuses any id with a control character,
+  `"`, `\` or a byte of 0x7F or above, which rules out every non-ASCII id,
+  and it counts the 64 in bytes.
 - NIP-01: a REQ or COUNT with no filters gets `CLOSED` with
   `invalid: bad req: arr too small`, and like any refused REQ it ends an open
   subscription with its id. Pinned strfry sends only a NOTICE,

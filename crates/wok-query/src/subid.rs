@@ -1,5 +1,5 @@
 use thiserror::Error;
-use wok_event::MAX_SUBID_SIZE;
+use wok_event::MAX_SUBID_CHARS;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum QueryError {
@@ -36,15 +36,12 @@ pub struct SubId {
 }
 
 impl SubId {
+    /// NIP-01: "an arbitrary, non-empty string of max length 64 chars". Any
+    /// character is allowed, since frames JSON-escape the id; the length is
+    /// counted in characters, so a non-ASCII id gets all 64.
     pub fn new(val: &str) -> Result<Self, QueryError> {
-        if val.is_empty() || val.len() > MAX_SUBID_SIZE {
+        if val.is_empty() || val.chars().count() > MAX_SUBID_CHARS {
             return Err(QueryError::msg("invalid subscription id length"));
-        }
-        if val
-            .bytes()
-            .any(|c| c < 0x20 || c == b'\\' || c == b'"' || c >= 0x7F)
-        {
-            return Err(QueryError::msg("invalid character in subscription id"));
         }
         Ok(Self {
             inner: val.to_string(),
@@ -116,11 +113,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_bad_subids() {
+    fn subids_are_any_string_of_1_to_64_characters() {
         assert!(SubId::new("").is_err());
-        assert!(SubId::new(&"x".repeat(65)).is_err());
         assert!(SubId::new("ok").is_ok());
-        assert!(SubId::new("has\"quote").is_err());
-        assert!(SubId::new("has\\slash").is_err());
+        assert!(SubId::new(&"x".repeat(64)).is_ok());
+        assert!(SubId::new(&"x".repeat(65)).is_err());
+        // Counted in characters: 64 two-byte and four-byte characters fit.
+        assert!(SubId::new(&"é".repeat(64)).is_ok());
+        assert!(SubId::new(&"é".repeat(65)).is_err());
+        assert!(SubId::new(&"😀".repeat(64)).is_ok());
+        assert!(SubId::new(&"😀".repeat(65)).is_err());
+        for id in [
+            "has\"quote",
+            "has\\slash",
+            "tab\there",
+            "nul\0",
+            "del\u{7f}",
+        ] {
+            assert_eq!(SubId::new(id).unwrap().as_str(), id);
+        }
     }
 }

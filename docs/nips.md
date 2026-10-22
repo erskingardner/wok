@@ -32,6 +32,12 @@ capabilities.
 ID and author filter values must be exactly 64 lowercase hexadecimal
 characters, as required by current NIP-01. Prefix filters are rejected.
 
+A subscription id is any non-empty string of at most 64 characters, as NIP-01
+says, counted in Unicode characters rather than bytes. Frames JSON-escape it.
+Subscriptions are told apart by the exact id, so two ids that look alike but
+differ in code points, such as a precomposed and a decomposed `é`, are two
+subscriptions.
+
 An empty `ids`, `authors`, `kinds` or `#x` list matches no event, as NIP-01
 requires; it is not treated as an absent field. Such a filter is skipped and
 the request's other filters still apply. A REQ whose filters all have an empty

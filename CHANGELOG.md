@@ -335,6 +335,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A subscription id may be any non-empty string of up to 64 characters, as
+  NIP-01 says. Before, an id containing a control character, `"`, `\` or any
+  character outside ASCII was refused, so every non-ASCII id failed, and the
+  limit counted bytes, so 64 two-byte characters were too long. EVENT frames
+  now JSON-escape the id, as EOSE, CLOSED and COUNT frames already did.
 - A REQ or COUNT with no filters is refused with `CLOSED` (`invalid: bad req:
   arr too small`), as NIP-01 requires for a refused REQ, instead of a NOTICE
   that did not say which subscription was refused. A NEG-OPEN with an

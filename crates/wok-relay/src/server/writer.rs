@@ -48,7 +48,8 @@ pub(super) fn run_writer(
         // While the index is behind, each pass indexes one bounded batch
         // first, and an idle writer keeps going until it is complete.
         let msg = if tag_kind.pending() {
-            tag_kind.step(&env, &metrics);
+            let reserve = cfg.read().db_min_free_disk_bytes;
+            tag_kind.step(&env, &metrics, reserve);
             match rx.try_recv() {
                 Ok(msg) => msg,
                 Err(crossbeam_channel::TryRecvError::Empty) => continue,
@@ -503,6 +504,7 @@ pub(super) fn run_writer(
 pub(super) struct TagKindBackfill {
     step: TagKindStep,
     pending: bool,
+    paused_for_disk: bool,
     run: Option<TagKindBackfillRun>,
 }
 
@@ -518,6 +520,7 @@ impl TagKindBackfill {
         Self {
             step,
             pending: false,
+            paused_for_disk: false,
             run: None,
         }
     }
@@ -547,8 +550,35 @@ impl TagKindBackfill {
         }
     }
 
-    /// Index one bounded step in its own write transaction.
-    pub(super) fn step(&mut self, env: &Env, metrics: &Metrics) {
+    /// Index one bounded step in its own write transaction, unless free disk
+    /// space is below `min_free_disk_bytes`, the reserve that also refuses
+    /// publications: the build then waits for a maintenance tick that finds
+    /// the space.
+    pub(super) fn step(&mut self, env: &Env, metrics: &Metrics, min_free_disk_bytes: u64) {
+        if min_free_disk_bytes != 0 {
+            let available = env.available_disk_bytes();
+            if !matches!(available, Ok(bytes) if bytes >= min_free_disk_bytes) {
+                if !self.paused_for_disk {
+                    match available {
+                        Ok(bytes) => tracing::warn!(
+                            available = bytes,
+                            reserve = min_free_disk_bytes,
+                            "pausing the (tag, kind, created_at) index build: free disk space is below database.min_free_disk_bytes"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "pausing the (tag, kind, created_at) index build: free disk space could not be checked"
+                        ),
+                    }
+                }
+                self.paused_for_disk = true;
+                self.pending = false;
+                return;
+            }
+            if std::mem::take(&mut self.paused_for_disk) {
+                tracing::info!("resuming the (tag, kind, created_at) index build");
+            }
+        }
         let started = std::time::Instant::now();
         let result = (|| {
             let mut txn = env.begin_rw()?;
@@ -575,6 +605,7 @@ impl TagKindBackfill {
         let state = step.state;
         tracing::debug!(
             entries = step.entries,
+            prepared = step.prepared,
             ms = elapsed.as_secs_f64() * 1000.0,
             "tag-kind index backfill step"
         );
@@ -1074,6 +1105,44 @@ mod tests {
         )
         .unwrap();
         assert!(indexed);
+    }
+
+    #[test]
+    fn backfill_waits_while_free_disk_space_is_below_the_reserve() {
+        let (dir, env) = unindexed_database(50);
+        let mut config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.db_min_free_disk_bytes = u64::MAX;
+        let metrics = Arc::new(Metrics::default());
+        let (writer_tx, writer_rx) = bounded(4);
+        writer_tx.send(add_event(50)).unwrap();
+        drop(writer_tx);
+
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config)),
+            Arc::new(ConnTable::new()),
+            metrics.clone(),
+            writer_rx,
+            Vec::new(),
+            moderation(&env),
+            TEN_ENTRIES,
+        );
+
+        // Neither the publication nor the build wrote anything.
+        let state = tag_kind_state(&env);
+        assert_eq!((state.indexed_through, state.bulk_pass), (0, None));
+        assert_eq!(
+            metrics
+                .tag_kind_backfill_entries_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event).unwrap(), 50);
+        assert_eq!(txn.entries(env.dbis().event_tag_kind.unwrap()).unwrap(), 2);
     }
 
     #[test]

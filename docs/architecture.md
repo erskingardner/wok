@@ -75,8 +75,13 @@ index again with each event's kind before its time. A filter with one tag and
 `kinds`, such as a DM inbox `{"#p":[me],"kinds":[1059]}`, can then read only
 events of those kinds; through the tag index it reads the value's history and
 the primary record of each entry to check its kind, which for a popular
-pubkey means thousands of records per query. Queries do not use the table
-yet. It costs one entry per single-letter tag, about 14% more disk. A marker
+pubkey means thousands of records per query. The scan plans this index
+(`TagKind`) for a filter with exactly one OR tag, `kinds`, and no `ids` or
+`&` tags, opening one cursor per (value, kind) pair within the bounds the
+author-kind plan uses, but only when the read's own snapshot shows the index
+complete; otherwise the tag index plan stands. Each candidate is still
+checked against its event, so the two plans return the same events in the
+same order. It costs one entry per single-letter tag, about 14% more disk. A marker
 records which events it covers, so a database that predates it, or events an
 earlier release inserted, are known to be missing; entries an earlier
 release left when it deleted their events name events no longer stored.

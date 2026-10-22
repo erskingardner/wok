@@ -825,10 +825,64 @@ fn measure(
     })
 }
 
+/// The dataset's `(tag, kind, created_at)` index, as a fresh reader sees it;
+/// `None` when the database has no such table.
+fn tag_kind_index_state(db: &Path) -> Result<Option<wok_db::TagKindIndexState>> {
+    let env = wok_db::Env::open(
+        db,
+        wok_db::EnvOptions {
+            read_only: true,
+            create_dir: false,
+            create_dbis: false,
+            ..wok_db::EnvOptions::default()
+        },
+    )?;
+    let txn = env.begin_ro()?;
+    Ok(wok_db::tag_kind_index_state_ro(&txn)?)
+}
+
+/// Have `--wok` build the `(tag, kind, created_at)` index into the dataset
+/// before anything is timed. A dataset imported by a release from before the
+/// index lacks it, and a relay started on a clone of it would build it in the
+/// background: the cold query would read the Tag index while the writer is
+/// busy. A binary that keeps no such index leaves the dataset as it is.
+fn ensure_tag_kind_index(rt: &tokio::runtime::Runtime, opts: &Options, db: &Path) -> Result<()> {
+    if tag_kind_index_state(db)?.is_some_and(|state| state.complete()) {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let port = free_port();
+    let mut child = spawn_relay(&opts.wok, db, port, RELAY_OVERRIDES)?;
+    let url = format!("ws://127.0.0.1:{port}");
+    let built = rt
+        .block_on(connect_starting(&url, &mut child))
+        .map(drop)
+        .and_then(|()| loop {
+            match tag_kind_index_state(db)? {
+                None => return Ok(false),
+                Some(state) if state.complete() => return Ok(true),
+                Some(_) if started.elapsed() > Duration::from_secs(3_600) => {
+                    anyhow::bail!("the relay did not complete the tag-kind index in an hour")
+                }
+                Some(_) => std::thread::sleep(Duration::from_millis(500)),
+            }
+        });
+    stop_relay(&mut child, &url);
+    if built? {
+        eprintln!(
+            "tag_kinds: {} built the (tag, kind, created_at) index in {:.1}s",
+            opts.wok.display(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
 pub fn run(rt: &tokio::runtime::Runtime, opts: &Options) -> Result<Report> {
     anyhow::ensure!(opts.cold_runs > 0, "--cold-runs must be at least 1");
     let dataset = ensure_dataset(opts)?;
     let db = Dataset::db_dir(opts);
+    ensure_tag_kind_index(rt, opts, &db)?;
     let shapes = shapes(&dataset);
     // Walk before any relay opens a clone, so no clone copies this reader.
     let walks = {

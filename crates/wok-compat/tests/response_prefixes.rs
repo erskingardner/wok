@@ -226,6 +226,27 @@ async fn req_refusals_use_the_prefix_that_fits() {
             json!(["REQ", "s", {"&tt": ["x"]}]),
             "unsupported: bad req: unindexed AND tag filter",
         ),
+        // An undefined key is unsupported whatever its value.
+        (
+            json!(["REQ", "s", {"#tt": "x"}]),
+            "unsupported: bad req: unindexed tag filter",
+        ),
+        (
+            json!(["REQ", "s", {"#1": 1}]),
+            "unsupported: bad req: unindexed tag filter",
+        ),
+        (
+            json!(["REQ", "s", {"&tt": []}]),
+            "unsupported: bad req: unindexed AND tag filter",
+        ),
+        (
+            json!(["REQ", "s", {"#t": "x"}]),
+            "invalid: bad req: #t not an array",
+        ),
+        (
+            json!(["REQ", "s", {"&t": []}]),
+            "invalid: bad req: &t array must not be empty",
+        ),
     ];
     for (req, reason) in cases {
         send(&conn, req.clone()).await;

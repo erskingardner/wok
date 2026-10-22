@@ -228,44 +228,43 @@ impl NostrFilter {
                         .map_err(|e| QueryError::msg(format!("error parsing kinds: {e}")))?,
                 );
             } else if k.starts_with('#') {
+                // A key NIP-01 does not define is unsupported, whatever its value.
+                if k.len() != 2 || !k.as_bytes()[1].is_ascii_alphabetic() {
+                    return Err(QueryError::unsupported("unindexed tag filter"));
+                }
                 if !v.is_array() {
                     return Err(QueryError::msg(format!("{k} not an array")));
                 }
-                if k.len() == 2 && k.as_bytes()[1].is_ascii_alphabetic() {
-                    if v.as_array().unwrap().is_empty() {
-                        f.never_match = true;
-                        continue;
-                    }
-                    let tag = k.as_bytes()[1] as char;
-                    let set = if tag == 'p' || tag == 'e' {
-                        FilterSetBytes::parse(v, true, 32, 32)
-                    } else {
-                        FilterSetBytes::parse_tag_values(v)
-                    }
-                    .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
-                    f.tags.insert(tag, set);
-                } else {
-                    return Err(QueryError::unsupported("unindexed tag filter"));
+                if v.as_array().unwrap().is_empty() {
+                    f.never_match = true;
+                    continue;
                 }
+                let tag = k.as_bytes()[1] as char;
+                let set = if tag == 'p' || tag == 'e' {
+                    FilterSetBytes::parse(v, true, 32, 32)
+                } else {
+                    FilterSetBytes::parse_tag_values(v)
+                }
+                .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
+                f.tags.insert(tag, set);
             } else if k.starts_with('&') {
+                if k.len() != 2 || !k.as_bytes()[1].is_ascii_alphabetic() {
+                    return Err(QueryError::unsupported("unindexed AND tag filter"));
+                }
                 if !v.is_array() {
                     return Err(QueryError::msg(format!("{k} not an array")));
                 }
                 if v.as_array().unwrap().is_empty() {
                     return Err(QueryError::msg(format!("{k} array must not be empty")));
                 }
-                if k.len() == 2 && k.as_bytes()[1].is_ascii_alphabetic() {
-                    let tag = k.as_bytes()[1] as char;
-                    let set = if tag == 'p' || tag == 'e' {
-                        FilterSetBytes::parse(v, true, 32, 32)
-                    } else {
-                        FilterSetBytes::parse_tag_values(v)
-                    }
-                    .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
-                    f.and_tags.insert(tag, set);
+                let tag = k.as_bytes()[1] as char;
+                let set = if tag == 'p' || tag == 'e' {
+                    FilterSetBytes::parse(v, true, 32, 32)
                 } else {
-                    return Err(QueryError::unsupported("unindexed AND tag filter"));
+                    FilterSetBytes::parse_tag_values(v)
                 }
+                .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
+                f.and_tags.insert(tag, set);
             } else if k == "since" {
                 f.since = v
                     .as_u64()

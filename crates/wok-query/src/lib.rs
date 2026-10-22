@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod cost;
 pub mod filter;
 pub mod hll;
 pub mod monitor;
@@ -8,6 +9,7 @@ pub mod scan;
 pub mod scheduler;
 pub mod subid;
 
+pub use cost::CostedRequest;
 pub use filter::{
     dumb_match, FilterValidator, NostrFilter, NostrFilterGroup, DEFAULT_MAX_AND_ENTRIES,
 };

@@ -505,50 +505,6 @@ impl NostrFilterGroup {
     pub fn is_full_db_query(&self) -> bool {
         self.size() == 1 && self.filters[0].is_full_db_query()
     }
-
-    /// Conservative, database-independent admission cost. This intentionally
-    /// estimates index breadth rather than execution time so expensive scans
-    /// can be rejected before an LMDB cursor is opened.
-    pub fn estimated_cost(&self, count_only: bool) -> u64 {
-        let mut cost = 0u64;
-        for filter in &self.filters {
-            let and_surcharge = 25u64.saturating_mul(
-                filter
-                    .and_tags
-                    .values()
-                    .map(|values| values.size() as u64)
-                    .sum(),
-            );
-            let base_cost = if filter.search.is_some() {
-                250
-            } else if let Some(ids) = &filter.ids {
-                ids.size() as u64
-            } else if !filter.and_tags.is_empty() {
-                // `DbScan` seeds a single cursor from one required tag value,
-                // whatever else the filter carries; `and_surcharge` covers the
-                // per-event verification the seed then requires.
-                25
-            } else if !filter.tags.is_empty() {
-                25u64.saturating_mul(filter.tags.len() as u64)
-            } else if filter.authors.is_some() && filter.kinds.is_some() {
-                5
-            } else if let Some(authors) = &filter.authors {
-                10u64.saturating_mul(authors.size() as u64)
-            } else if let Some(kinds) = &filter.kinds {
-                100u64.saturating_mul(kinds.size() as u64)
-            } else if filter.since != 0 || filter.until != u64::MAX {
-                500
-            } else {
-                1_000
-            };
-            cost = cost.saturating_add(base_cost.saturating_add(and_surcharge).max(1));
-        }
-        if count_only {
-            cost.saturating_mul(2)
-        } else {
-            cost
-        }
-    }
 }
 
 /// Optional rules for a REQ's filters. Each is off at its zero or empty
@@ -778,21 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn estimates_broad_queries_before_opening_a_cursor() {
-        let broad = NostrFilterGroup::from_value(&json!({}), 500, 3, 16).unwrap();
-        let targeted = NostrFilterGroup::from_value(
-            &json!({"ids":["11".repeat(32), "22".repeat(32)]}),
-            500,
-            3,
-            16,
-        )
-        .unwrap();
-        assert_eq!(broad.estimated_cost(false), 1_000);
-        assert_eq!(broad.estimated_cost(true), 2_000);
-        assert_eq!(targeted.estimated_cost(false), 2);
-    }
-
-    #[test]
     fn search_matching_accepts_precomputed_event_terms() {
         let filter = NostrFilter::parse(&json!({"search":"café nostr"}), 500, 3, 16).unwrap();
         let event = packed_note(1, 2, 15, 1, &[]);
@@ -864,50 +805,5 @@ mod tests {
         assert!(
             NostrFilter::parse(&json!({"&t":["a"], "#p":["11".repeat(32)]}), 500, 1, 2,).is_err()
         );
-    }
-
-    #[test]
-    fn nip91_entries_are_always_charged_to_query_cost() {
-        let tags = NostrFilterGroup::from_value(&json!({"&t":["a", "b"]}), 500, 3, 16).unwrap();
-        assert_eq!(tags.estimated_cost(false), 75);
-        assert_eq!(tags.estimated_cost(true), 150);
-
-        let id = NostrFilterGroup::from_value(
-            &json!({"ids":["11".repeat(32)], "&t":["a", "b"]}),
-            500,
-            3,
-            16,
-        )
-        .unwrap();
-        assert_eq!(id.estimated_cost(false), 51);
-
-        let author_and = NostrFilterGroup::from_value(
-            &json!({"authors":["11".repeat(32)], "&t":["a", "b"]}),
-            500,
-            3,
-            16,
-        )
-        .unwrap();
-        assert_eq!(author_and.estimated_cost(false), 75);
-
-        let author_kind_and = NostrFilterGroup::from_value(
-            &json!({"authors":["11".repeat(32)], "kinds":[1], "&t":["a"]}),
-            500,
-            3,
-            16,
-        )
-        .unwrap();
-        assert_eq!(author_kind_and.estimated_cost(false), 50);
-
-        // A required tag seeds one cursor, so the OR alternatives `DbScan`
-        // never opens are not charged; without it they are.
-        let or_and =
-            NostrFilterGroup::from_value(&json!({"#e":["11".repeat(32)], "&t":["a"]}), 500, 3, 16)
-                .unwrap();
-        assert_eq!(or_and.estimated_cost(false), 50);
-        let or_only =
-            NostrFilterGroup::from_value(&json!({"#e":["11".repeat(32)], "#t":["a"]}), 500, 3, 16)
-                .unwrap();
-        assert_eq!(or_only.estimated_cost(false), 50);
     }
 }

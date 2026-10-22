@@ -96,8 +96,10 @@ keeps it. Set only what the relay needs and leave the rest to the preset.
   translation, so the relay behaves as before. Each is warned about at
   startup and on reload, and in `wok doctor`'s `config-deprecations` check.
   `wok config minimize` and dashboard saves rewrite them as their
-  translation. The [filter validation](#filter-validation) switch is the
-  only one so far.
+  translation. The [filter validation](#filter-validation) switch is one.
+  The other, `relay.abuse.max_query_cost`, is ignored instead: its values
+  mean something else in the units of
+  [`max_query_work`](#query-work), which replaced it.
 
 ## Admin
 
@@ -450,7 +452,7 @@ All abuse settings reload live and are dashboard-editable.
 | `relay.abuse.invalid_rate_per_second` | `5` | Refilled tokens per network address each second for malformed messages, including CLOSE and NEG-CLOSE with an invalid subscription id. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until the bucket refills. Valid CLOSE and NEG-CLOSE are never budgeted. |
 | `relay.abuse.invalid_burst` | `20` | Per-address malformed-message bucket capacity. |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Historical scans per connection; zero rejects new scans. |
-| `relay.abuse.max_query_cost` | `1000` | Conservative pre-scan filter cost ceiling; zero is unlimited. |
+| `relay.abuse.max_query_work` | `20000` | Most index entries a REQ, COUNT or NEG-OPEN may touch, estimated before the scan; zero is unlimited. See [Query work](#query-work). |
 | `relay.abuse.max_stored_events` | `0` | Global durable event ceiling; the entire write transaction aborts before exceeding it. Zero, the public preset's value, is unlimited. See [Storage](#storage). |
 | `relay.abuse.max_stored_events_per_pubkey` | `1000000` | Hard author storage quota; zero is unlimited. See [Storage](#storage). |
 | `relay.abuse.min_pow_difficulty` | `0` | Required NIP-13 leading-zero bits; zero disables it. |
@@ -465,6 +467,74 @@ still apply to them. Keep the socket on a trusted host with tight
 On reload, the relay logs a warning for each guard the file sets to zero
 (unlimited) while its preset does not. A guard that the preset itself turns
 off, such as `max_stored_events` in the public preset, is not warned about.
+
+### Query work
+
+Before a REQ, COUNT or NEG-OPEN opens a cursor, the relay estimates how many
+index entries it would touch and refuses it if the estimate is over
+`max_query_work`. A REQ gets `CLOSED rate-limited: estimated query cost
+<n> exceeds <max>`, a COUNT the same, and a NEG-OPEN `NEG-ERR` with that
+reason. `wok_abuse_rejections_total{reason="query_cost"}` counts them, and
+NIP-11 advertises the ceiling as `limitation.max_query_work`.
+
+A filter's estimate follows the plan its scan will run. It counts the
+cursors the plan opens:
+
+- one per id for `ids`;
+- for tags, one per value of the tag the scan seeds from (one for a NIP-91
+  `&` tag). Once the `(tag, kind, created_at)` index is complete, one tag
+  with `kinds` costs one per (value, kind) pair;
+- one per (author, kind) pair for `authors` with `kinds`, whichever index
+  the scan reads;
+- one per author for `authors` alone, one per kind for `kinds` alone, and
+  one for a filter with neither;
+- 1,000 for a NIP-50 `search` filter.
+
+A REQ adds the rows it can return: each filter's `limit`, or
+`max_filter_limit` when it has none, and no more than its `ids`. The rows of
+all its filters count up to `max_total_events_per_req`. Each NIP-91 `&`
+value adds the filter's rows again, for the check on every candidate. A
+COUNT costs twice its cursors and a NEG-OPEN its cursors, with no rows:
+their scans are not bounded by `limit`, but while they run, by
+`max_filter_limit_count` and the COUNT budget, and by `max_sync_events` and
+the sync memory budgets.
+
+With the public preset's limits:
+
+| Request | Cost |
+|---|---:|
+| `{"authors":[150 keys],"limit":20}` | 170 |
+| `{"kinds":[11 kinds],"limit":50}` | 61 |
+| 45 × `{"#e":[id],"kinds":[7]}` | 10,045 |
+| `{"authors":[1000 keys],"kinds":[0,3,10002,10050]}` | 6,000 |
+| `{"kinds":[445],"#h":[group id]}` | 2,001 |
+| `{}` | 2,001 |
+| `{"authors":[2000 keys],"kinds":[50 kinds]}` | 102,000, refused |
+| `COUNT {"kinds":[3],"#p":[pubkey]}` | 2 |
+| `COUNT {"authors":[2000 keys],"kinds":[50 kinds]}` | 200,000, refused |
+| `NEG-OPEN {"kinds":[445],"#h":[group id]}` | 1 |
+
+- **Query work ceiling** (`max_query_work`, 20,000). One unit is about
+  2–4 µs of warm index work, so the ceiling lets one request run for about
+  50–80 ms.
+  - If too low: batched and outbox queries are refused. Through 0.7,
+    `max_query_cost = 1000` capped an estimate that ignored `limit`, and
+    refused 150 authors with `limit` 20, an 11-kind feed and NDK's
+    45-filter reaction batches.
+  - If too high: one request can hold a query worker for longer.
+  - The estimate cannot see how many entries a cursor reads before it finds
+    a match. `{"#t":["nostr"],"authors":[key]}` costs 2,001, but reads the
+    `nostr` tag's entries until the author's events turn up. Past 1,000
+    (author, kind) pairs under a small `limit`, `authors` with regular kinds
+    read the authors' whole history, which takes seconds for kinds they
+    rarely publish.
+
+`relay.abuse.max_query_cost`, which copies of the 0.7 `docs/wok.toml` set to
+1000, is deprecated and ignored, with a warning at startup, on reload and in
+`wok doctor`. Its values would mean something else in these units: 1,000
+would refuse every filter without a `limit`, such as `{"kinds":[1]}` (2,001).
+`wok config minimize`, or a dashboard save, removes it. To set a ceiling,
+set `max_query_work`.
 
 ### Storage
 

@@ -953,6 +953,15 @@ mod tests {
             "{}",
             check.detail
         );
+        // Its old query cost ceiling is ignored, in favor of the new key.
+        assert!(
+            check
+                .detail
+                .contains("relay.abuse.max_query_cost is deprecated and ignored")
+                && check.detail.contains("relay.abuse.max_query_work"),
+            "{}",
+            check.detail
+        );
         // An enabled zero kind cap gets its own entry: it no longer refuses
         // filters that list kinds.
         let (check, _) =

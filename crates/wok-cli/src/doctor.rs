@@ -928,6 +928,19 @@ mod tests {
             "{}",
             check.detail
         );
+        // An enabled zero kind cap gets its own entry: it no longer refuses
+        // filters that list kinds.
+        let (check, _) =
+            config_checks("[relay.filter_validation]\nenabled = true\nmax_kinds_per_filter = 0\n");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check
+                .detail
+                .contains("relay.filter_validation.max_kinds_per_filter = 0 in an enabled section")
+                && check.detail.contains("allowed_kinds"),
+            "{}",
+            check.detail
+        );
         let (check, _) = config_checks(include_str!("../../../docs/wok.toml"));
         assert_eq!(check.status, CheckStatus::Pass);
         assert_eq!(check.detail, "no deprecated key is set");

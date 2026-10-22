@@ -420,6 +420,9 @@ deprecation warning:
     `relay.max_filters_per_req` when it is lower. Such a REQ is now refused
     with `error: bad req: arr too big`.
   - `min_filters_per_req` is dropped. A REQ needs only one filter.
+  - `max_kinds_per_filter = 0` refused every filter that lists kinds. Zero
+    now means no limit, so those filters are accepted, with a warning at
+    startup and in `wok doctor`. To restrict kinds, set `allowed_kinds`.
 - **No `enabled`**: the section is read as a current one, so each rule it
   sets applies. Under 0.7 a section without `enabled` was off.
 

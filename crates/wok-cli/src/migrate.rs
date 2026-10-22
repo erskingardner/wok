@@ -412,6 +412,7 @@ fn prepare_strfry(
     if let Some(warning) = source_cfg.auth_configuration_warning() {
         warnings.push(format!("{warning}; review AUTH before cutover"));
     }
+    warnings.extend(source_cfg.deprecations.iter().cloned());
     if !output_available {
         warnings.push(format!(
             "output {} already exists and will not be overwritten",

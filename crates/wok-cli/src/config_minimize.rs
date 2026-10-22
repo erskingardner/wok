@@ -34,14 +34,16 @@ pub fn run(path: &Path, dry_run: bool) -> Result<String> {
     let backup = write_backup(path, &text)?;
     wok_relay::config::write_file(path, minimized.text.as_bytes())
         .map_err(|error| anyhow!("{label}: {error}"))?;
-    let mut out = format!(
-        "Removed {} {} that repeated preset {preset}'s values from {label}; the original is {}\n",
-        removed.len(),
-        if removed.len() == 1 { "key" } else { "keys" },
-        backup.display()
-    );
-    for key in removed {
-        out.push_str(&format!("  {key}\n"));
+    let mut out = format!("Minimized {label}; the original is {}\n", backup.display());
+    if !removed.is_empty() {
+        out.push_str(&format!(
+            "Removed {} {} that repeated preset {preset}'s values:\n",
+            removed.len(),
+            if removed.len() == 1 { "key" } else { "keys" },
+        ));
+        for key in removed {
+            out.push_str(&format!("  {key}\n"));
+        }
     }
     if !rewritten.is_empty() {
         out.push_str("Rewrote deprecated keys as their translation:\n");
@@ -211,9 +213,10 @@ mod tests {
         let report = run(&path, false).unwrap();
         let backup = directory.path().join("wok.toml.bak.1");
         assert!(
-            report.starts_with("Removed 2 keys that repeated preset public's values"),
+            report.contains("\nRemoved 2 keys that repeated preset public's values:\n"),
             "{report}"
         );
+        assert!(!report.contains("Rewrote"), "{report}");
         assert!(
             report.ends_with("  relay.abuse.event_burst\n  relay.bind\n"),
             "{report}"
@@ -236,6 +239,28 @@ mod tests {
         let report = run(&path, false).unwrap();
         assert!(report.ends_with("nothing to remove\n"), "{report}");
         assert!(!directory.path().join("wok.toml.bak.2").exists());
+    }
+
+    #[test]
+    fn minimize_reports_a_rewrite_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wok.toml");
+        std::fs::write(
+            &path,
+            "[relay.filter_validation]\nenabled = false\nmax_kinds_per_filter = 3\n",
+        )
+        .unwrap();
+        let report = run(&path, false).unwrap();
+        assert!(!report.contains("Removed"), "{report}");
+        assert!(
+            report.ends_with(
+                "Rewrote deprecated keys as their translation:\n  \
+                 relay.filter_validation.enabled\n  \
+                 relay.filter_validation.max_kinds_per_filter\n"
+            ),
+            "{report}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     }
 
     #[test]

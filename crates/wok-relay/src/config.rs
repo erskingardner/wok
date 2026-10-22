@@ -980,6 +980,11 @@ impl Config {
                 .relay
                 .max_filters_per_req
                 .min(usize::try_from(max_filters).unwrap_or(usize::MAX));
+            if max_kinds == 0 {
+                cfg.deprecations.push(legacy::zero_kind_cap_warning(
+                    "relay.filterValidation.maxKindsPerFilter",
+                ));
+            }
             cfg.relay.filter_validation = FilterValidationConfig {
                 max_kinds_per_filter: max_kinds,
                 allowed_kinds,
@@ -2048,6 +2053,17 @@ mod tests {
             .config;
         assert_eq!(enabled.relay.max_filters_per_req, 3);
         assert_eq!(enabled.relay.filter_validation.max_kinds_per_filter, 3);
+        assert!(enabled.deprecations.is_empty());
+        // Its zero kind cap no longer refuses kind filters, with a warning.
+        let zero = Config::translate_strfry(
+            "relay { filterValidation { enabled = true\n maxKindsPerFilter = 0 } }",
+        )
+        .unwrap()
+        .config;
+        assert_eq!(zero.relay.filter_validation.max_kinds_per_filter, 0);
+        assert_eq!(zero.deprecations.len(), 1);
+        assert!(zero.deprecations[0]
+            .starts_with("relay.filterValidation.maxKindsPerFilter = 0 in an enabled section"));
     }
 
     #[test]

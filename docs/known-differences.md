@@ -17,7 +17,10 @@ it is not a promise to reproduce upstream bugs.
   `relay.filterValidation` section to no rules when it is disabled. An
   enabled section keeps its rules, and its `maxFiltersPerReq` lowers
   `relay.max_filters_per_req`, so such a REQ is refused with `arr too big`.
-  `minFiltersPerReq` is ignored; see [config.md](config.md#files-from-07-and-earlier).
+  `minFiltersPerReq` is ignored, and an enabled `maxKindsPerFilter = 0`,
+  which strfry applies to refuse every filter that lists kinds, means no
+  limit in Wok (migration warns about it); see
+  [config.md](config.md#files-from-07-and-earlier).
 - Wok creates a missing directory for a new Wok database; strfry requires its
   directory to exist.
 

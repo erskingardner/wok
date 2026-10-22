@@ -300,8 +300,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     lower, so such a REQ is now refused with `error: bad req: arr too big`
     instead of `filter validation failed: invalid number of filters`.
     `min_filters_per_req` is dropped with a warning, because nothing
-    equivalent remains and a REQ needs only one filter. These two choices
-    are the owner's (#97).
+    equivalent remains and a REQ needs only one filter.
+    `max_kinds_per_filter = 0`, which refused every filter that lists kinds,
+    now means no limit, so those filters are accepted; a dedicated warning
+    at startup and in `wok doctor` says so and points to `allowed_kinds`.
+    These three choices are the owner's (#97): upgrades never fail on the
+    old keys.
   - No `enabled`: the section is read as a current one, so each rule it
     sets applies. Under 0.7 such a section was off.
 

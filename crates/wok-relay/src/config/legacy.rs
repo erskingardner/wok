@@ -15,6 +15,17 @@ const FILTER_VALIDATION: [&str; 2] = ["relay", "filter_validation"];
 pub(super) const LEGACY_MAX_FILTERS_PER_REQ: u64 = 3;
 pub(super) const LEGACY_MAX_KINDS_PER_FILTER: u64 = 3;
 
+/// The warning for a zero kind cap in a section that applied it. Through 0.7
+/// it refused every filter that listed kinds; 0 now means no limit, which the
+/// owner chose over refusing to load (#97).
+pub(super) fn zero_kind_cap_warning(key: &str) -> String {
+    format!(
+        "{key} = 0 in an enabled section refused every filter that lists kinds through 0.7. \
+         0 now means no limit, so such filters are accepted; to restrict the kinds a filter \
+         may list, set relay.filter_validation.allowed_kinds."
+    )
+}
+
 /// The rules that remain, each off at its zero or empty value.
 const RULES: [&str; 3] = [
     "max_kinds_per_filter",
@@ -149,11 +160,15 @@ pub(super) fn translate(file: &toml::Value, preset: &toml::Value) -> Result<Tran
         dotted("enabled")
     ));
     // An enabled section enforced the 0.7 default for a rule it left out.
-    if !section.contains_key("max_kinds_per_filter") {
-        translation.changes.push(Change::Set(
+    match count("max_kinds_per_filter")? {
+        None => translation.changes.push(Change::Set(
             key("max_kinds_per_filter"),
             toml::Value::Integer(LEGACY_MAX_KINDS_PER_FILTER as i64),
-        ));
+        )),
+        Some(0) => translation
+            .warnings
+            .push(zero_kind_cap_warning(&dotted("max_kinds_per_filter"))),
+        Some(_) => {}
     }
     // Its filter-count cap moves to the relay's own, whichever is lower.
     let cap = max_filters.unwrap_or(LEGACY_MAX_FILTERS_PER_REQ);
@@ -254,6 +269,24 @@ mod tests {
         assert!(
             warnings.contains("min_filters_per_req = 2 is no longer supported"),
             "{warnings}"
+        );
+
+        // A zero kind cap no longer refuses every kind filter, loudly.
+        let (translation, file) =
+            translated("[relay.filter_validation]\nenabled = true\nmax_kinds_per_filter = 0\n");
+        assert_eq!(
+            file["relay"]["filter_validation"]["max_kinds_per_filter"].as_integer(),
+            Some(0)
+        );
+        assert!(
+            translation
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with(
+                    "relay.filter_validation.max_kinds_per_filter = 0 in an enabled section"
+                ) && warning.contains("allowed_kinds")),
+            "{:?}",
+            translation.warnings
         );
 
         // A lower relay cap in the file stays.

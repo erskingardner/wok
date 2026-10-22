@@ -350,11 +350,12 @@ cargo build --release -p wok-cli -p wok-bench
 
 Wok-only `--scenario tag_kinds` measures time to EOSE of historical `#p` and
 `#e` REQs that also name `kinds`: the notification, zap, DM-inbox and reaction
-fetches clients send. Wok answers them from the Tag index and reads each
-candidate's event to check its kind, so a pubkey or note that many events tag
-costs more when few of those events have a requested kind. With
-`--wok-baseline` every shape also runs against a second wok binary on the same
-database files, as in `author_kinds`.
+fetches clients send. Through the Tag index, Wok reads each candidate's
+event to check its kind, so a pubkey or note that many events tag costs more
+when few of those events have a requested kind. Once the `(tag, kind,
+created_at)` index is complete, Wok seeks each (value, kind) pair in it
+instead. With `--wok-baseline` every shape also runs against a second wok
+binary on the same database files, as in `author_kinds`.
 
 The dataset has `--authors` authors and `--events` events:
 
@@ -425,10 +426,16 @@ cargo build --release -p wok-cli -p wok-bench
   --out bench-results/tag_kinds
 ```
 
-The dataset's database is imported by `--wok`. To measure a binary that
-derives a new index at import, import the corpus with that binary (the first
-run with it as `--wok` and a fresh `--dataset-dir` does this) and compare the
-other binary on that database.
+The dataset's database is imported by `--wok`. Before anything is timed,
+`--wok` builds the `(tag, kind, created_at)` index into it if the database
+lacks it or the index is incomplete (a dataset imported by an earlier
+release), and the bench waits for the build. Otherwise each relay, started on
+a fresh clone, would build the index in the background while its cold query
+read the Tag index. A binary without that index, as `--wok` or
+`--wok-baseline`, ignores the table. To measure another binary that derives
+a new index at import, import the corpus with that binary (the first run with
+it as `--wok` and a fresh `--dataset-dir` does this) and compare the other
+binary on that database.
 
 `summary.md` has one row per shape and limit:
 
@@ -437,7 +444,8 @@ other binary on that database.
 - `events`: the events returned;
 - `reads`: the events a Tag-index plan reads before EOSE. With `kinds` that
   is every posting until `limit` match, or all of them; without, only the
-  events returned;
+  events returned. A plan on the `(tag, kind, created_at)` index reads about
+  as many entries and events as it returns;
 - cold p50, p95 and max, and warm p50, p95 and max time to EOSE, in
   milliseconds. With `--wok-baseline` the table shows cold p50 and warm p50,
   p95 and max for each binary, the warm p50 speedup, and `same results`.

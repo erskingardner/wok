@@ -76,7 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `(tag, kind, created_at)` index, the LMDB table `wok_Event__tagKind`, for
   filters that combine one single-letter tag with `kinds`: DM inboxes
   (`{"#p":[me],"kinds":[1059]}`), zaps, reactions to a note, `#a` filters.
-  Queries do not use it yet. The writer keeps an entry for every
+  Once the index is complete, such a filter reads only the events of the
+  requested kinds from it, instead of the tag value's whole history, and
+  still checks each against its stored event, so it returns the same events.
+  At 5M events, the top pubkey's DM inbox (limit 500) takes 0.95 ms warm and
+  0.14 s cold instead of 9.1 ms and 1.07 s, and a busy pubkey's zaps 0.9 ms
+  and 0.24 s instead of 7.7 ms and 2.1 s. Shapes where most of the value's
+  events match, such as notifications, are unchanged. The writer keeps an entry for every
   single-letter tag of every event it stores, so the database grows by about
   14% once every event is indexed, and imports and writes take about 18%
   longer (measured at 5M events). A new database is complete from the start.

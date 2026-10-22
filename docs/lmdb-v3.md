@@ -168,9 +168,10 @@ one bounded transaction at a time (see
 earlier Wok release opens neither table: the events it inserts take IDs
 above the marker, which stops there until they are indexed, and the events
 it deletes leave their entries. Local IDs are never reused, so a leftover
-entry names an event that is no longer stored; readers must check the event
-exists, `wok integrity` counts these entries as stale, and `wok reindex`
-drops them.
+entry names an event that is no longer stored. The scan reads each
+candidate's event to check it, which skips such an entry, `wok integrity`
+counts these entries as stale, and `wok reindex` drops them. The scan uses
+the index only when its read snapshot shows it complete.
 
 ### Building in the background
 

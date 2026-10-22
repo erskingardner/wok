@@ -233,8 +233,8 @@ async fn any_string_of_up_to_64_characters_is_a_subscription_id() {
                 frames.last().unwrap()[2],
                 "unsupported: bad req: unrecognised filter item: nope"
             );
-            let (after, _) = wire.publish(&case("after")).await;
-            let late = wire.settle(Duration::from_millis(100)).await;
+            let (after, mut late) = wire.publish(&case("after")).await;
+            late.extend(wire.settle(Duration::from_millis(100)).await);
             assert!(
                 !late.iter().any(|f| delivers(f, sid, &after)),
                 "{transport} {sid:?}: delivered after CLOSED: {late:?}"
@@ -244,8 +244,8 @@ async fn any_string_of_up_to_64_characters_is_a_subscription_id() {
             wire.send(json!(["REQ", sid, filter])).await;
             wire.recv_until(|f| is(f, "EOSE", sid)).await;
             wire.send(json!(["CLOSE", sid])).await;
-            let (closed, _) = wire.publish(&case("after")).await;
-            let late = wire.settle(Duration::from_millis(100)).await;
+            let (closed, mut late) = wire.publish(&case("after")).await;
+            late.extend(wire.settle(Duration::from_millis(100)).await);
             assert!(
                 !late.iter().any(|f| delivers(f, sid, &closed)),
                 "{transport} {sid:?}: delivered after CLOSE: {late:?}"

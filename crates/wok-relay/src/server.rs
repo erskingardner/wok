@@ -3596,7 +3596,7 @@ impl ReqWorker<'_> {
         if let Err(failure) = scanned {
             tracing::warn!(
                 conn_id = failure.sub.conn_id,
-                sub_id = %failure.sub.sub_id,
+                sub_id = ?failure.sub.sub_id.as_str(),
                 error = %failure.error,
                 "historical query failed"
             );
@@ -3614,7 +3614,7 @@ impl ReqWorker<'_> {
         };
         tracing::debug!(
             conn_id = done.conn_id,
-            sub_id = %done.sub_id,
+            sub_id = ?done.sub_id.as_str(),
             count_only = done.count_only,
             matched_events = done.total,
             hll = done.hll.is_some(),

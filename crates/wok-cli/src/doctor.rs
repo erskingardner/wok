@@ -115,17 +115,26 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             format!("write-policy plugin: {}", cfg.relay.write_policy_plugin)
         },
     );
+    let rules = &cfg.relay.filter_validation;
+    let active: Vec<&str> = [
+        (rules.max_kinds_per_filter != 0, "max_kinds_per_filter"),
+        (!rules.allowed_kinds.is_empty(), "allowed_kinds"),
+        (rules.require_author_or_tag, "require_author_or_tag"),
+    ]
+    .into_iter()
+    .filter_map(|(set, rule)| set.then_some(rule))
+    .collect();
     report.add(
         "filter-validation",
-        if cfg.relay.filter_validation.enabled {
-            CheckStatus::Pass
-        } else {
+        if active.is_empty() {
             CheckStatus::Warn
-        },
-        if cfg.relay.filter_validation.enabled {
-            "ingress filter validation is enabled".to_string()
         } else {
-            "ingress filter validation is disabled".to_string()
+            CheckStatus::Pass
+        },
+        if active.is_empty() {
+            "no ingress filter rule is set".to_string()
+        } else {
+            format!("ingress filter rules: {}", active.join(", "))
         },
     );
     report.add(
@@ -444,6 +453,20 @@ fn check_config_defaults(path: &Path, report: &mut DoctorReport) {
             return;
         }
     };
+    let deprecations = &explanation.config.deprecations;
+    report.add(
+        "config-deprecations",
+        if deprecations.is_empty() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        if deprecations.is_empty() {
+            "no deprecated key is set".to_string()
+        } else {
+            deprecations.join(" ")
+        },
+    );
     let preset = explanation.config.preset;
     let minimize = match explanation.repeated_preset_values().count() {
         0 => String::new(),
@@ -819,14 +842,26 @@ mod tests {
         );
     }
 
-    fn config_defaults_check(text: &str) -> DoctorCheck {
+    /// The checks `check_config_defaults` reports for a file: deprecated
+    /// keys, then replaced defaults.
+    fn config_checks(text: &str) -> (DoctorCheck, DoctorCheck) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("wok.toml");
         std::fs::write(&path, text).unwrap();
         let mut report = DoctorReport::new();
         check_config_defaults(&path, &mut report);
-        assert_eq!(report.checks.len(), 1);
-        report.checks.pop().unwrap()
+        let names: Vec<&str> = report
+            .checks
+            .iter()
+            .map(|check| check.name.as_str())
+            .collect();
+        assert_eq!(names, ["config-deprecations", "config-defaults"]);
+        let defaults = report.checks.pop().unwrap();
+        (report.checks.pop().unwrap(), defaults)
+    }
+
+    fn config_defaults_check(text: &str) -> DoctorCheck {
+        config_checks(text).1
     }
 
     #[test]
@@ -878,5 +913,23 @@ mod tests {
         let check = config_defaults_check(include_str!("../../../docs/wok.toml"));
         assert_eq!(check.status, CheckStatus::Pass);
         assert_eq!(check.detail, "no key pins a replaced default.");
+    }
+
+    #[test]
+    fn deprecated_keys_are_a_warning() {
+        let (check, _) = config_checks(include_str!(
+            "../../wok-relay/src/config/testdata/wok-0.7.0.toml"
+        ));
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check
+                .detail
+                .starts_with("relay.filter_validation.enabled = false is deprecated"),
+            "{}",
+            check.detail
+        );
+        let (check, _) = config_checks(include_str!("../../../docs/wok.toml"));
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.detail, "no deprecated key is set");
     }
 }

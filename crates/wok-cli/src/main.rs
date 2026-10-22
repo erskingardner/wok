@@ -492,6 +492,9 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     if let Some(warning) = cfg.auth_configuration_warning() {
         tracing::warn!("{warning}; restricted reads fail closed");
     }
+    for deprecation in &cfg.deprecations {
+        tracing::warn!("{deprecation}");
+    }
     if !cfg.relay.real_ip_header.is_empty() {
         tracing::warn!(
             "relay.real_ip_header = {:?} is fully trusted for per-IP rate limits: \

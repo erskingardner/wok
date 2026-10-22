@@ -214,6 +214,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `database.min_free_disk_bytes` bound storage.
   - `relay.abuse.max_stored_events_per_pubkey` is `1000000` (was 100000),
     so active users and bots keep posting.
+- `public`: `relay.filter_validation.max_kinds_per_filter` is `0`, no limit
+  (was 3), now that the section has no `enabled` switch. Otherwise the
+  switch's removal would have turned on a three-kind cap that refuses MDK's
+  six-kind directory batches.
 
 ### Changed
 
@@ -281,6 +285,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `relay.filter_validation.enabled`, `max_filters_per_req` and
+  `min_filters_per_req`. Each remaining filter rule (`max_kinds_per_filter`,
+  `allowed_kinds`, `require_author_or_tag`) applies when it is set, and
+  `relay.max_filters_per_req` alone bounds the filters in a REQ. A file that
+  still sets the old keys loads with a deprecation warning, at startup, on
+  reload and in `wok doctor`'s new `config-deprecations` check, and keeps
+  the rules it had:
+  - `enabled = false`, as in copies of the 0.7 `docs/wok.toml`: the
+    section's rules are ignored, as before.
+  - `enabled = true`: its rules still apply, with 0.7's default of 3 for a
+    `max_kinds_per_filter` it leaves out. Its `max_filters_per_req` (or the
+    old default, 3) becomes `relay.max_filters_per_req` when that is
+    lower, so such a REQ is now refused with `error: bad req: arr too big`
+    instead of `filter validation failed: invalid number of filters`.
+    `min_filters_per_req` is dropped with a warning, because nothing
+    equivalent remains and a REQ needs only one filter. These two choices
+    are the owner's (#97).
+  - No `enabled`: the section is read as a current one, so each rule it
+    sets applies. Under 0.7 such a section was off.
+
+  `wok config minimize` and dashboard saves rewrite the section that way, and
+  `wok migrate strfry` translates strfry's `relay.filterValidation` the same
+  way. The dashboard no longer shows the three fields.
 - Dated benchmark, soak, lab and audit reports, the definition-of-done report
   and `PLAN.md` are no longer kept in the repository or shipped in release
   archives. `docs/` now holds only design, policy, operations and benchmark

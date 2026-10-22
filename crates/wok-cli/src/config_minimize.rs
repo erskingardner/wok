@@ -21,7 +21,8 @@ pub fn run(path: &Path, dry_run: bool) -> Result<String> {
         .preset;
     let minimized = Config::minimize_toml(&text).map_err(|error| anyhow!("{label}: {error}"))?;
     let removed = &minimized.removed;
-    if removed.is_empty() {
+    let rewritten = &minimized.rewritten;
+    if removed.is_empty() && rewritten.is_empty() {
         return Ok(format!(
             "{label} sets no key to preset {preset}'s value; nothing to remove\n"
         ));
@@ -41,6 +42,12 @@ pub fn run(path: &Path, dry_run: bool) -> Result<String> {
     );
     for key in removed {
         out.push_str(&format!("  {key}\n"));
+    }
+    if !rewritten.is_empty() {
+        out.push_str("Rewrote deprecated keys as their translation:\n");
+        for key in rewritten {
+            out.push_str(&format!("  {key}\n"));
+        }
     }
     Ok(out)
 }

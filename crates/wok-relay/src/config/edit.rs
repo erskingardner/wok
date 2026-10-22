@@ -3,8 +3,10 @@
 //! A key in the file pins its value, so a file that repeats the preset's
 //! values never picks up a better default. Dashboard saves therefore change
 //! only the keys they edit and remove a key set back to its preset value, and
-//! `wok config minimize` removes every key that repeats the preset.
+//! `wok config minimize` removes every key that repeats the preset. Both
+//! rewrite deprecated keys as their translation.
 
+use super::legacy::{Change, Translation};
 use super::provenance::{explain, flatten, leaf};
 use super::{encode, validate, Config, Layers, OverlayFn, TomlConfig};
 use std::io::Write;
@@ -14,10 +16,14 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 /// A file without the keys that repeated its preset's values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Minimized {
-    /// The file with those keys removed and everything else unchanged.
+    /// The file with those keys removed, its deprecated keys rewritten, and
+    /// everything else unchanged.
     pub text: String,
     /// The dotted keys removed, sorted.
     pub removed: Vec<String>,
+    /// The dotted keys set or removed to rewrite deprecated keys as their
+    /// translation, in the order written.
+    pub rewritten: Vec<String>,
 }
 
 pub(super) fn edit(
@@ -40,6 +46,7 @@ pub(super) fn edit(
     let preset = layers.preset_encoded()?;
 
     let mut document = parse_document(text)?;
+    rewrite_legacy(&mut document, &layers.legacy)?;
     let mut leaves = Vec::new();
     flatten(&after, &mut Vec::new(), &mut leaves);
     for (path, value) in leaves {
@@ -62,19 +69,22 @@ pub(super) fn edit(
 
 pub(super) fn minimize(text: &str, overlay_of: OverlayFn) -> Result<Minimized, String> {
     let explanation = explain(text, overlay_of)?;
+    let legacy = Layers::parse(text, overlay_of)?.legacy;
     let removed: Vec<String> = explanation
         .entries
         .iter()
         .filter(|entry| entry.repeats_preset())
         .map(|entry| entry.key.clone())
         .collect();
-    if removed.is_empty() {
+    if removed.is_empty() && legacy.changes.is_empty() {
         return Ok(Minimized {
             text: text.to_string(),
             removed,
+            rewritten: Vec::new(),
         });
     }
     let mut document = parse_document(text)?;
+    let rewritten = rewrite_legacy(&mut document, &legacy)?;
     for key in &removed {
         // Every setting is a plain identifier, so dots only separate tables.
         let path: Vec<&str> = key.split('.').collect();
@@ -90,7 +100,31 @@ pub(super) fn minimize(text: &str, overlay_of: OverlayFn) -> Result<Minimized, S
     Ok(Minimized {
         text: minimized,
         removed,
+        rewritten,
     })
+}
+
+/// Write the translation of the file's deprecated keys into the document:
+/// the keys it sets first, so a table that keeps keys keeps its place, then
+/// the keys it removes. Returns the dotted keys written.
+fn rewrite_legacy(document: &mut DocumentMut, legacy: &Translation) -> Result<Vec<String>, String> {
+    let (sets, removes): (Vec<&Change>, Vec<&Change>) = legacy
+        .changes
+        .iter()
+        .partition(|change| matches!(change, Change::Set(..)));
+    for change in sets.iter().chain(&removes) {
+        match change {
+            Change::Set(path, value) => set_key(document.as_item_mut(), path, value)?,
+            Change::Remove(path) => {
+                remove_key(document.as_table_mut(), path);
+            }
+        }
+    }
+    Ok(sets
+        .iter()
+        .chain(&removes)
+        .map(|change| change.path().join("."))
+        .collect())
 }
 
 fn parse_document(text: &str) -> Result<DocumentMut, String> {

@@ -103,9 +103,6 @@ struct AbusePatch {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FiltersPatch {
-    enabled: Option<bool>,
-    max_filters_per_req: Option<u64>,
-    min_filters_per_req: Option<u64>,
     max_kinds_per_filter: Option<u64>,
     allowed_kinds: Option<String>,
     require_author_or_tag: Option<bool>,
@@ -412,9 +409,6 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
             "min_pow_difficulty": cfg.relay.abuse.min_pow_difficulty,
         },
         "filters": {
-            "enabled": cfg.relay.filter_validation.enabled,
-            "max_filters_per_req": cfg.relay.filter_validation.max_filters_per_req,
-            "min_filters_per_req": cfg.relay.filter_validation.min_filters_per_req,
             "max_kinds_per_filter": cfg.relay.filter_validation.max_kinds_per_filter,
             "allowed_kinds": cfg.relay.filter_validation.allowed_kinds,
             "require_author_or_tag": cfg.relay.filter_validation.require_author_or_tag,
@@ -643,15 +637,6 @@ fn apply_patch(config: &mut Config, patch: ConfigPatch) {
         }
     }
     if let Some(filters) = patch.filters {
-        if let Some(value) = filters.enabled {
-            config.relay.filter_validation.enabled = value;
-        }
-        if let Some(value) = filters.max_filters_per_req {
-            config.relay.filter_validation.max_filters_per_req = value;
-        }
-        if let Some(value) = filters.min_filters_per_req {
-            config.relay.filter_validation.min_filters_per_req = value;
-        }
         if let Some(value) = filters.max_kinds_per_filter {
             config.relay.filter_validation.max_kinds_per_filter = value;
         }
@@ -809,8 +794,8 @@ const GROUPS=[
  {key:'abuse',title:'Abuse protection',help:'Token-bucket rates, bursts, query budgets, quotas, and proof-of-work requirements.',fields:[
   ['enabled','Abuse protection enabled','Apply all configured connection, message, query, quota, and PoW guards.','checkbox'],['connection_rate_per_second','Connection rate','New connections allowed per second before burst capacity is consumed; zero disables this bucket (unlimited).','number'],['connection_burst','Connection burst','Maximum accumulated burst capacity for new connections; zero disables this bucket (unlimited).','number'],['event_rate_per_second','Address EVENT/AUTH rate','EVENT and AUTH messages allowed per second from one network address; zero disables this bucket (unlimited).','number'],['event_burst','Address EVENT/AUTH burst','Maximum accumulated EVENT and AUTH burst per network address; zero disables this bucket (unlimited).','number'],['pubkey_event_rate_per_second','Pubkey EVENT rate','Accepted events per second across connections for one author; zero disables this bucket (unlimited).','number'],['pubkey_event_burst','Pubkey EVENT burst','Maximum accumulated EVENT burst for one author; zero disables this bucket (unlimited).','number'],['req_rate_per_second','REQ rate','REQ, NEG-OPEN, and NEG-MSG messages allowed per second from one network address; zero disables this bucket (unlimited).','number'],['req_burst','REQ burst','Maximum accumulated REQ, NEG-OPEN, and NEG-MSG burst per network address; zero disables this bucket (unlimited).','number'],['count_rate_per_second','COUNT rate','COUNT messages allowed per second from one network address; zero disables this bucket (unlimited).','number'],['count_burst','COUNT burst','Maximum accumulated COUNT burst per network address; zero disables this bucket (unlimited).','number'],['invalid_rate_per_second','Malformed message rate','Malformed messages answered per second from one network address; zero disables this bucket (unlimited).','number'],['invalid_burst','Malformed message burst','Maximum accumulated malformed-message burst per network address; zero disables this bucket (unlimited).','number'],['max_concurrent_historical_queries','Concurrent historical queries','Maximum historical scans running at once per connection; zero rejects new scans.','number'],['max_query_cost','Query cost ceiling','Reject filters whose estimated scan cost exceeds this value; zero is unlimited.','number'],['max_stored_events','Stored events globally','Total durable event ceiling across every author; zero means unlimited.','number'],['max_stored_events_per_pubkey','Stored events per pubkey','Per-author durable event ceiling; zero means unlimited.','number'],['min_pow_difficulty','Minimum proof of work','Required NIP-13 difficulty; zero disables the requirement.','number']
  ]},
- {key:'filters',title:'Filter validation',help:'Optional structural rules that reject overly broad or unexpected subscription filters.',fields:[
-  ['enabled','Filter validation enabled','Apply the structural filter rules in this section.','checkbox'],['max_filters_per_req','Maximum filters per REQ','Largest number of filter objects accepted in one REQ.','number'],['min_filters_per_req','Minimum filters per REQ','Smallest number of filter objects required in one REQ.','number'],['max_kinds_per_filter','Kinds per filter','Largest number of event kinds allowed in one filter.','number'],['allowed_kinds','Allowed kinds','Comma-separated event kinds; empty allows every kind.','text','wide'],['require_author_or_tag','Require author or tag','Require each filter to constrain an author or a tag.','checkbox']
+ {key:'filters',title:'Filter validation',help:'Optional structural rules that reject overly broad or unexpected subscription filters. Each applies when set.',fields:[
+  ['max_kinds_per_filter','Kinds per filter','Largest number of event kinds allowed in one filter; zero is unlimited.','number'],['allowed_kinds','Allowed kinds','Comma-separated event kinds; empty allows every kind.','text','wide'],['require_author_or_tag','Require author or tag','Require each filter to constrain an author or a tag.','checkbox']
  ]},
  {key:'nip62',title:'NIP-62 deletion',help:'Controls Request to Vanish support and the size of durable deletion batches.',fields:[
   ['enabled','NIP-62 enabled','Advertise and process Request to Vanish events.','checkbox'],['service_url','Relay service URL','Public relay URL used to validate targeted vanish requests.','url','wide'],['deletion_batch_size','Deletion batch size','Maximum records removed in one transaction while processing a vanish request.','number']
@@ -1107,7 +1092,7 @@ mod tests {
             "events": {"ephemeral_persistence": "ttl", "max_num_tags": 99},
             "limits": {"max_total_events_per_req": 123, "negentropy_enabled": false},
             "abuse": {"connection_burst": 7, "min_pow_difficulty": 8},
-            "filters": {"enabled": true, "allowed_kinds": "1,7"},
+            "filters": {"max_kinds_per_filter": 6, "allowed_kinds": "1,7"},
             "nip62": {"deletion_batch_size": 44},
             "history": {"max_points": 10}
         }))
@@ -1121,7 +1106,7 @@ mod tests {
         assert!(!cfg.relay.negentropy_enabled);
         assert_eq!(cfg.relay.abuse.connection_burst, 7);
         assert_eq!(cfg.relay.abuse.min_pow_difficulty, 8);
-        assert!(cfg.relay.filter_validation.enabled);
+        assert_eq!(cfg.relay.filter_validation.max_kinds_per_filter, 6);
         assert_eq!(cfg.relay.filter_validation.allowed_kinds, "1,7");
         assert_eq!(cfg.relay.nip62.deletion_batch_size, 44);
         assert_eq!(cfg.observability.history_max_points, 10);

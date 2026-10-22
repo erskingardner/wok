@@ -2506,7 +2506,7 @@ fn ingest_event(
         // and the single writer. The writer still performs the authoritative
         // lookup inside its transaction to close the concurrent-insert race.
         let dup = (|| -> Result<bool, String> {
-            let txn = env.begin_ro().map_err(|e| e.to_string())?;
+            let txn = begin_read(env).map_err(|e| e.to_string())?;
             Ok(lookup_event_by_id_ro(&txn, packed.id())
                 .map_err(|e| e.to_string())?
                 .is_some())
@@ -2531,7 +2531,7 @@ fn ingest_event(
                     RelayMessage::Ok {
                         event_id: id_hex,
                         accepted: false,
-                        message: format!("invalid: {error}"),
+                        message: format!("error: {error}"),
                     },
                     metrics,
                 );
@@ -3196,8 +3196,9 @@ fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::
     }
 }
 
-/// A read transaction for the req worker and monitor. Tests can make the
-/// next few fail for one database (`fault::fail_reads`).
+/// A read transaction for the req worker, the monitor and the ingester's
+/// duplicate pre-check. Tests can make the next few fail for one database
+/// (`fault::fail_reads`).
 fn begin_read(env: &Env) -> Result<wok_db::RoTxn<'_>, wok_db::DbError> {
     #[cfg(test)]
     if fault::read_fails(env.path()) {
@@ -5672,6 +5673,41 @@ mod tests {
                 .abuse_disk_reserve_rejections
                 .load(Ordering::Relaxed),
             1
+        );
+        handle.request_shutdown();
+    }
+
+    /// The duplicate pre-check failing to read is the relay's failure, not
+    /// the event's, so the OK is `error:` (NIP-01: "for when none of that
+    /// fits"), not `invalid:`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_precheck_read_failures_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        let handle = start(env.clone(), cfg).unwrap();
+        let (conn, mut rx) = live_conn(&handle).await;
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "precheck"
+        }));
+        let id = event["id"].as_str().unwrap().to_string();
+        fault::fail_reads(env.path(), 1);
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", event]).to_string())
+            .await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            json!(["OK", id, false, "error: injected read failure"]).to_string()
+        );
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", event]).to_string())
+            .await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            json!(["OK", id, true, ""]).to_string()
         );
         handle.request_shutdown();
     }

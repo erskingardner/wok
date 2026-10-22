@@ -346,6 +346,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     disabled by `relay.max_filter_limit_count = 0`.
   A write-policy plugin's reason that starts with `unsupported:` is now sent
   as is, rather than as `blocked: unsupported: ...`.
+- An EVENT whose duplicate check could not read the database was refused
+  with `invalid:`. It now gets `error:`, because the failure is the relay's.
 - A REQ with many filters could hold a req worker well past its time slice
   (`relay.query_timeslice_budget_us`), and every query behind it waited.
   Each filter restarted the slice's clock, and a filter that followed a long

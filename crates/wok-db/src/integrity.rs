@@ -5,8 +5,8 @@ use crate::fbs::{decode_compression_dictionary, decode_meta, decode_negentropy_f
 use crate::payload::{parse_payload, Decompressor, PayloadView};
 use crate::search::{is_search_marker, search_index_entries, search_term_from_key};
 use crate::tag_kind::{
-    is_tag_kind_marker, tag_kind_index_state_ro, tag_kind_keys, TagKindIndexState,
-    TAG_KIND_SCHEMA_VERSION,
+    is_tag_kind_marker, is_valid_pass_record, tag_kind_index_state_ro, tag_kind_keys,
+    TagKindIndexState, TAG_KIND_SCHEMA_VERSION,
 };
 use crate::txn::RoTxn;
 use crate::write::{event_index_entries, EventIndexEntry};
@@ -72,6 +72,8 @@ pub struct TagKindIndexReport {
     pub state: TagKindIndexState,
     /// Every stored event has its entries, so queries may rely on the index.
     pub complete: bool,
+    /// `Event__tag` entries, which a key-ordered pass visits once.
+    pub tag_entries: u64,
     /// Entries derived from the events at or below `indexed_through`.
     pub expected_entries: u64,
     /// Postings stored, markers excluded.
@@ -89,10 +91,11 @@ pub struct TagKindIndexReport {
 }
 
 impl TagKindIndexReport {
-    fn new(state: TagKindIndexState) -> Self {
+    fn new(state: TagKindIndexState, tag_entries: u64) -> Self {
         Self {
             state,
             complete: state.complete(),
+            tag_entries,
             expected_entries: 0,
             actual_entries: 0,
             missing_entries: 0,
@@ -489,6 +492,30 @@ fn check_tag_kind_postings(
     Ok(())
 }
 
+/// Check the records of a key-ordered pass in progress.
+fn check_tag_kind_pass(
+    txn: &RoTxn<'_>,
+    build: MDB_dbi,
+    report: &mut IntegrityReport,
+) -> Result<(), DbError> {
+    txn.foreach_full(build, &[], &[], false, |key, value| {
+        if !is_valid_pass_record(key, value) {
+            report.malformed_records += 1;
+            report.issue(
+                "malformed-record",
+                "event_tag_kind_build",
+                format!(
+                    "key {} with a {}-byte value",
+                    String::from_utf8_lossy(key),
+                    value.len()
+                ),
+            );
+        }
+        true
+    })?;
+    Ok(())
+}
+
 fn index_specs(txn: &RoTxn<'_>) -> [(&'static str, MDB_dbi); 10] {
     let dbis = txn.env().dbis();
     [
@@ -511,7 +538,9 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
     let mut search_decompressor = Decompressor::new();
     let mut authors = HashMap::<[u8; 32], u64>::new();
     let mut largest_id = 0;
-    let mut tag_kind = tag_kind_index_state_ro(txn)?.map(TagKindIndexReport::new);
+    let tag_entries = txn.entries(dbis.event_tag)? as u64;
+    let mut tag_kind =
+        tag_kind_index_state_ro(txn)?.map(|state| TagKindIndexReport::new(state, tag_entries));
     let tag_kind_through = tag_kind
         .as_ref()
         .map_or(0, TagKindIndexReport::expected_through);
@@ -817,6 +846,9 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
 
     if let (Some(dbi), Some(tag_kind)) = (dbis.event_tag_kind, tag_kind.as_mut()) {
         check_tag_kind_postings(txn, dbi, tag_kind, &mut report)?;
+    }
+    if let Some(build) = dbis.event_tag_kind_build {
+        check_tag_kind_pass(txn, build, &mut report)?;
     }
     report.tag_kind_index = tag_kind;
 

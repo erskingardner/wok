@@ -61,6 +61,7 @@ fn check_routing(author_quota: u64, global_quota: u64, first_ok: bool, second_ok
         rx,
         vec![],
         moderation,
+        TAG_KIND_STEP,
     );
     let first: Value = serde_json::from_str(&rx1.try_recv().unwrap().into_text()).unwrap();
     let second: Value = serde_json::from_str(&rx2.try_recv().unwrap().into_text()).unwrap();

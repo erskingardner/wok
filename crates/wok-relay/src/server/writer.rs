@@ -2,6 +2,25 @@
 use super::*;
 use crate::protocol::SUPERSEDED_OK_REASON;
 
+/// Bounds on one `(tag, kind, created_at)` backfill transaction. The writer
+/// runs one before each batch of messages it takes, so a publication waits
+/// behind at most one.
+#[derive(Clone, Copy)]
+pub(super) struct TagKindStep {
+    pub(super) max_entries: usize,
+    pub(super) budget: Duration,
+}
+
+/// A step stops after 10 ms of indexing, plus its commit, so publications
+/// during a backfill are acknowledged about as fast as without one. An
+/// entry cap alone let a step that hit cold pages run for most of a second.
+pub(super) const TAG_KIND_STEP: TagKindStep = TagKindStep {
+    max_entries: 5_000,
+    budget: Duration::from_millis(10),
+};
+/// How often a running backfill logs its progress.
+const TAG_KIND_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+
 pub(super) fn run_writer(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -10,6 +29,7 @@ pub(super) fn run_writer(
     rx: Receiver<WriterMsg>,
     mon_txs: Vec<Sender<MonitorData>>,
     moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
+    tag_kind_step: TagKindStep,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
     let mut negentropy_max_tags = cfg.read().relay.max_tags_per_filter;
@@ -21,9 +41,24 @@ pub(super) fn run_writer(
     let mut events: Vec<EventToWrite<u64>> = Vec::with_capacity(256);
     // Bytes of committed events the req monitors still hold.
     let stored_in_flight = Arc::new(AtomicUsize::new(0));
+    let mut tag_kind = TagKindBackfill::new(tag_kind_step);
+    tag_kind.recheck(&env, &metrics);
     let mut stop = false;
     while !stop {
-        let Ok(msg) = rx.recv() else { break };
+        // While the index is behind, each pass indexes one bounded batch
+        // first, and an idle writer keeps going until it is complete.
+        let msg = if tag_kind.pending() {
+            let reserve = cfg.read().db_min_free_disk_bytes;
+            tag_kind.step(&env, &metrics, reserve);
+            match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        } else {
+            let Ok(msg) = rx.recv() else { break };
+            msg
+        };
         batch.clear();
         event_batch.clear();
         batch_vanish.clear();
@@ -57,6 +92,7 @@ pub(super) fn run_writer(
         plugin.set_timeout(cfg_snap.relay.write_policy_timeout_secs);
         if maintenance_requested {
             run_maintenance(&env, &cfg_snap, &mut maintenance_cursor);
+            tag_kind.recheck(&env, &metrics);
         }
         let vanish_policy = cfg_snap.vanish_policy();
         // A valid vanish request and an ephemeral gift wrap can arrive in the
@@ -461,6 +497,200 @@ pub(super) fn run_writer(
     }
 }
 
+/// Builds `wok_Event__tagKind` in the background, one bounded write
+/// transaction at a time: by a key-ordered pass for a database from before
+/// the index, and in local-id order for the events an earlier release
+/// inserted.
+pub(super) struct TagKindBackfill {
+    step: TagKindStep,
+    pending: bool,
+    paused_for_disk: bool,
+    run: Option<TagKindBackfillRun>,
+}
+
+struct TagKindBackfillRun {
+    started: std::time::Instant,
+    last_log: std::time::Instant,
+    entries: u64,
+    slowest: Duration,
+}
+
+impl TagKindBackfill {
+    pub(super) fn new(step: TagKindStep) -> Self {
+        Self {
+            step,
+            pending: false,
+            paused_for_disk: false,
+            run: None,
+        }
+    }
+
+    pub(super) fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Read where the index stands and start a backfill if it is behind.
+    /// The writer does this at start and on every maintenance tick: another
+    /// process, such as an earlier release's `wok import`, may have stored
+    /// events without entries.
+    pub(super) fn recheck(&mut self, env: &Env, metrics: &Metrics) {
+        let state = env.begin_ro().and_then(|txn| {
+            let tag_entries = txn.entries(txn.env().dbis().event_tag)? as u64;
+            Ok(wok_db::tag_kind_index_state_ro(&txn)?.map(|state| (state, tag_entries)))
+        });
+        match state {
+            Ok(Some((state, tag_entries))) => {
+                publish_tag_kind_state(metrics, state, tag_entries);
+                if state.schema == Some(wok_db::TAG_KIND_SCHEMA_VERSION) && !state.complete() {
+                    self.pending = true;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "could not read the tag-kind index state"),
+        }
+    }
+
+    /// Index one bounded step in its own write transaction, unless free disk
+    /// space is below `min_free_disk_bytes`, the reserve that also refuses
+    /// publications: the build then waits for a maintenance tick that finds
+    /// the space.
+    pub(super) fn step(&mut self, env: &Env, metrics: &Metrics, min_free_disk_bytes: u64) {
+        if min_free_disk_bytes != 0 {
+            let available = env.available_disk_bytes();
+            if !matches!(available, Ok(bytes) if bytes >= min_free_disk_bytes) {
+                if !self.paused_for_disk {
+                    match available {
+                        Ok(bytes) => tracing::warn!(
+                            available = bytes,
+                            reserve = min_free_disk_bytes,
+                            "pausing the (tag, kind, created_at) index build: free disk space is below database.min_free_disk_bytes"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "pausing the (tag, kind, created_at) index build: free disk space could not be checked"
+                        ),
+                    }
+                }
+                self.paused_for_disk = true;
+                self.pending = false;
+                return;
+            }
+            if std::mem::take(&mut self.paused_for_disk) {
+                tracing::info!("resuming the (tag, kind, created_at) index build");
+            }
+        }
+        let started = std::time::Instant::now();
+        let result = (|| {
+            let mut txn = env.begin_rw()?;
+            let step =
+                wok_db::backfill_tag_kind_index(&mut txn, self.step.max_entries, self.step.budget)?;
+            txn.commit()?;
+            Ok::<_, wok_db::DbError>(step)
+        })();
+        let elapsed = started.elapsed();
+        let step = match result {
+            Ok(Some(step)) => step,
+            Ok(None) => {
+                self.pending = false;
+                return;
+            }
+            Err(error) => {
+                // The next maintenance tick retries, rather than a tight loop.
+                tracing::error!(%error, "tag-kind index backfill transaction aborted");
+                self.pending = false;
+                self.run = None;
+                return;
+            }
+        };
+        let state = step.state;
+        tracing::debug!(
+            entries = step.entries,
+            prepared = step.prepared,
+            ms = elapsed.as_secs_f64() * 1000.0,
+            "tag-kind index backfill step"
+        );
+        publish_tag_kind_state(metrics, state, step.tag_entries);
+        metrics
+            .tag_kind_backfill_entries_total
+            .fetch_add(step.entries, Ordering::Relaxed);
+        metrics.tag_kind_backfill_micros_total.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let complete = state.complete();
+        if self.run.is_none() && !(complete && step.entries == 0) {
+            match state.bulk_pass {
+                Some(_) => tracing::info!(
+                    tag_entries = step.tag_entries,
+                    high_water = state.high_water,
+                    "building the (tag, kind, created_at) index in the background, in key order"
+                ),
+                None => tracing::info!(
+                    indexed_through = state.indexed_through,
+                    high_water = state.high_water,
+                    "indexing stored events missing from the (tag, kind, created_at) index in the background"
+                ),
+            }
+            self.run = Some(TagKindBackfillRun {
+                started,
+                last_log: started,
+                entries: 0,
+                slowest: Duration::ZERO,
+            });
+        }
+        if let Some(run) = self.run.as_mut() {
+            run.entries += step.entries;
+            run.slowest = run.slowest.max(elapsed);
+            if complete {
+                tracing::info!(
+                    entries = run.entries,
+                    seconds = run.started.elapsed().as_secs_f64(),
+                    slowest_step_ms = run.slowest.as_secs_f64() * 1000.0,
+                    high_water = state.high_water,
+                    "the (tag, kind, created_at) index is complete"
+                );
+                self.run = None;
+            } else if run.last_log.elapsed() >= TAG_KIND_PROGRESS_INTERVAL {
+                run.last_log = std::time::Instant::now();
+                match state.bulk_pass {
+                    Some(pass) => tracing::info!(
+                        visited = pass.visited,
+                        tag_entries = step.tag_entries,
+                        entries = run.entries,
+                        "tag-kind index build progress"
+                    ),
+                    None => tracing::info!(
+                        indexed_through = state.indexed_through,
+                        high_water = state.high_water,
+                        entries = run.entries,
+                        "tag-kind index backfill progress"
+                    ),
+                }
+            }
+        }
+        self.pending = !complete;
+    }
+}
+
+fn publish_tag_kind_state(metrics: &Metrics, state: wok_db::TagKindIndexState, tag_entries: u64) {
+    metrics
+        .tag_kind_index_complete
+        .store(u64::from(state.complete()), Ordering::Relaxed);
+    metrics
+        .tag_kind_indexed_through
+        .store(state.indexed_through, Ordering::Relaxed);
+    metrics
+        .tag_kind_high_water
+        .store(state.high_water, Ordering::Relaxed);
+    metrics.tag_kind_pass_visited.store(
+        state.bulk_pass.map_or(0, |pass| pass.visited),
+        Ordering::Relaxed,
+    );
+    metrics
+        .tag_kind_tag_entries
+        .store(tag_entries, Ordering::Relaxed);
+}
+
 /// NIP-56 report kind; accepted reports feed the NIP-86 moderation queue.
 pub(super) const REPORT_KIND: u64 = 1984;
 /// Most `e` tags harvested from one report event.
@@ -739,9 +969,241 @@ mod tests {
             writer_rx,
             Vec::new(),
             moderation,
+            TAG_KIND_STEP,
         );
 
         let txn = env.begin_ro().unwrap();
         assert_eq!(txn.entries(env.dbis().event).unwrap(), PUBLISHERS as usize);
+    }
+
+    /// An unsigned gift wrap to Alice; the writer does not check signatures.
+    fn gift_wrap(n: u64) -> (Vec<u8>, String) {
+        let id = {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            id
+        };
+        let (author, recipient) = ([0x51; 32], [0xa1; 32]);
+        let mut tags = PackedEventTagBuilder::default();
+        tags.add('p', &recipient).unwrap();
+        let packed =
+            PackedEventBuilder::build(&id, &author, 1_700_000_000 + n, 1059, 0, &tags).unwrap();
+        let json = json!({
+            "id": to_hex(&id),
+            "pubkey": to_hex(&author),
+            "created_at": 1_700_000_000 + n,
+            "kind": 1059,
+            "tags": [["p", to_hex(&recipient)]],
+            "content": "",
+            "sig": "00".repeat(64),
+        })
+        .to_string();
+        (packed.into_bytes(), json)
+    }
+
+    /// A database of `events` gift wraps whose tag-kind index starts over,
+    /// as one from before the index does.
+    fn unindexed_database(events: u64) -> (tempfile::TempDir, Env) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut stored: Vec<_> = (0..events)
+            .map(|n| {
+                let (packed, json) = gift_wrap(n);
+                EventToWrite::new(packed, json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut stored, false).unwrap();
+        wok_db::reset_tag_kind_index(&mut txn).unwrap();
+        txn.commit().unwrap();
+        (dir, env)
+    }
+
+    fn tag_kind_state(env: &Env) -> wok_db::TagKindIndexState {
+        wok_db::tag_kind_index_state_ro(&env.begin_ro().unwrap())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn moderation(env: &Env) -> Arc<parking_lot::RwLock<ModerationSnapshot>> {
+        Arc::new(parking_lot::RwLock::new(
+            env.begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                .unwrap(),
+        ))
+    }
+
+    fn add_event(n: u64) -> WriterMsg {
+        let (packed, json) = gift_wrap(n);
+        WriterMsg::AddEvent {
+            conn_id: 1,
+            source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+            packed,
+            json,
+            authed: None,
+        }
+    }
+
+    const TEN_ENTRIES: TagKindStep = TagKindStep {
+        max_entries: 10,
+        budget: Duration::MAX,
+    };
+
+    #[test]
+    fn backfill_steps_are_bounded_and_interleave_with_writes() {
+        let (dir, env) = unindexed_database(50);
+        let config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let metrics = Arc::new(Metrics::default());
+        // The publication is queued before the writer starts, and the channel
+        // closes behind it.
+        let (writer_tx, writer_rx) = bounded(4);
+        writer_tx.send(add_event(50)).unwrap();
+        drop(writer_tx);
+
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config)),
+            Arc::new(ConnTable::new()),
+            metrics.clone(),
+            writer_rx,
+            Vec::new(),
+            moderation(&env),
+            TEN_ENTRIES,
+        );
+
+        // One step of the key-ordered pass ran before the publication's
+        // batch and one after it; the publication did not wait for the
+        // other 30 entries.
+        let state = tag_kind_state(&env);
+        assert_eq!((state.indexed_through, state.high_water), (0, 51));
+        assert_eq!(state.bulk_pass.map(|pass| pass.visited), Some(20));
+        assert_eq!(
+            metrics
+                .tag_kind_backfill_entries_total
+                .load(Ordering::Relaxed),
+            20
+        );
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event).unwrap(), 51);
+        // The writer indexed the publication itself.
+        let key = wok_db::tag_kind_key(b'p', &[0xa1; 32], 1059, 1_700_000_050);
+        let lev = 51u64.to_ne_bytes();
+        let mut indexed = false;
+        txn.foreach_full(
+            env.dbis().event_tag_kind.unwrap(),
+            &key,
+            &lev,
+            false,
+            |found_key, found_lev| {
+                indexed = found_key == key && found_lev == lev;
+                false
+            },
+        )
+        .unwrap();
+        assert!(indexed);
+    }
+
+    #[test]
+    fn backfill_waits_while_free_disk_space_is_below_the_reserve() {
+        let (dir, env) = unindexed_database(50);
+        let mut config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.db_min_free_disk_bytes = u64::MAX;
+        let metrics = Arc::new(Metrics::default());
+        let (writer_tx, writer_rx) = bounded(4);
+        writer_tx.send(add_event(50)).unwrap();
+        drop(writer_tx);
+
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config)),
+            Arc::new(ConnTable::new()),
+            metrics.clone(),
+            writer_rx,
+            Vec::new(),
+            moderation(&env),
+            TEN_ENTRIES,
+        );
+
+        // Neither the publication nor the build wrote anything.
+        let state = tag_kind_state(&env);
+        assert_eq!((state.indexed_through, state.bulk_pass), (0, None));
+        assert_eq!(
+            metrics
+                .tag_kind_backfill_entries_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event).unwrap(), 50);
+        assert_eq!(txn.entries(env.dbis().event_tag_kind.unwrap()).unwrap(), 2);
+    }
+
+    #[test]
+    fn backfill_completes_in_the_background_and_resumes_after_maintenance_finds_a_gap() {
+        let (dir, env) = unindexed_database(50);
+        let config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let metrics = Arc::new(Metrics::default());
+        let (writer_tx, writer_rx) = bounded(4);
+        let writer = {
+            let (env, metrics, moderation) = (env.clone(), metrics.clone(), moderation(&env));
+            std::thread::spawn(move || {
+                run_writer(
+                    env,
+                    Arc::new(parking_lot::RwLock::new(config)),
+                    Arc::new(ConnTable::new()),
+                    metrics,
+                    writer_rx,
+                    Vec::new(),
+                    moderation,
+                    TEN_ENTRIES,
+                )
+            })
+        };
+        let wait_until_complete = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while metrics.tag_kind_index_complete.load(Ordering::Relaxed) == 0 {
+                assert!(std::time::Instant::now() < deadline, "backfill stalled");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_until_complete();
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert!(tag_kind.complete && tag_kind.missing_entries == 0);
+        assert_eq!(tag_kind.actual_entries, 50);
+        assert!(metrics
+            .render()
+            .contains("\nwok_tag_kind_index_complete 1\n"));
+        assert!(metrics
+            .render()
+            .contains("\nwok_tag_kind_index_indexed_through 50\n"));
+
+        // Another process leaves the index behind; the next maintenance tick
+        // notices and the writer indexes the events again.
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::reset_tag_kind_index(&mut txn).unwrap();
+        txn.commit().unwrap();
+        metrics.tag_kind_index_complete.store(0, Ordering::Relaxed);
+        writer_tx.send(WriterMsg::Maintenance).unwrap();
+        wait_until_complete();
+        writer_tx.send(WriterMsg::Stop).unwrap();
+        writer.join().unwrap();
+        assert!(tag_kind_state(&env).complete());
+        assert_eq!(
+            metrics
+                .tag_kind_backfill_entries_total
+                .load(Ordering::Relaxed),
+            100
+        );
     }
 }

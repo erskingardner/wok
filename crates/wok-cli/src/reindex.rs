@@ -246,6 +246,7 @@ fn ensure_reindexable(report: &wok_db::IntegrityReport) -> Result<()> {
         "event_kind",
         "event_expiration",
         "event_tag_kind",
+        "event_tag_kind_build",
         "negentropy",
     ];
     if report
@@ -709,6 +710,50 @@ mod tests {
         )
         .unwrap();
         assert!(!check_integrity(&original.begin_ro().unwrap()).unwrap().ok());
+    }
+
+    #[test]
+    fn completes_a_tag_kind_index_the_relay_was_still_building() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("db");
+        let env = Env::open(&database, EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut events: Vec<_> = ["one", "two", "three"]
+            .into_iter()
+            .map(|content| {
+                let (packed, json) = signed(json!([["t", "reindex"]]), content);
+                EventToWrite::new(packed, json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        wok_db::reset_tag_kind_index(&mut txn).unwrap();
+        wok_db::backfill_tag_kind_index(&mut txn, 1, std::time::Duration::MAX).unwrap();
+        txn.commit().unwrap();
+        let state = wok_db::tag_kind_index_state_ro(&env.begin_ro().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(state.bulk_pass.is_some());
+        drop(env);
+
+        let cfg = Config {
+            db: database.clone(),
+            ..Config::default()
+        };
+        run(&cfg, Some(&root.path().join("backup")), true).unwrap();
+        let repaired = open_existing(&database);
+        let txn = repaired.begin_ro().unwrap();
+        let report = check_integrity(&txn).unwrap();
+        assert!(report.ok(), "{:#?}", report.issues);
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert!(tag_kind.complete);
+        assert_eq!(tag_kind.state.bulk_pass, None);
+        assert_eq!((tag_kind.expected_entries, tag_kind.actual_entries), (3, 3));
+        assert_eq!(
+            txn.entries(repaired.dbis().event_tag_kind_build.unwrap())
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

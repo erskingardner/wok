@@ -75,7 +75,9 @@ pub use search::{
     MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TERMS,
 };
 pub use tag_kind::{
-    tag_kind_index_state_ro, tag_kind_key, TagKindIndexState, TAG_KIND_SCHEMA_VERSION,
+    backfill_tag_kind_index, reset_tag_kind_index, tag_kind_index_complete_ro,
+    tag_kind_index_state_ro, tag_kind_key, TagKindBackfillStep, TagKindBulkPass, TagKindIndexState,
+    TAG_KIND_SCHEMA_VERSION,
 };
 pub use txn::{RoTxn, RwTxn};
 pub use vanish::{

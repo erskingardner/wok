@@ -32,6 +32,10 @@ pub const DBI_MODERATION: &str = "wok_Moderation";
 /// `tagName || tagVal || kind || created_at`. This DBI is optional when
 /// opening a read-only strfry v3 migration source.
 pub const DBI_EVENT_TAG_KIND: &str = "wok_Event__tagKind";
+/// Wok-owned progress of the key-ordered pass that builds
+/// `wok_Event__tagKind`, empty when none runs. This DBI is optional when
+/// opening a read-only strfry v3 migration source.
+pub const DBI_EVENT_TAG_KIND_BUILD: &str = "wok_Event__tagKindBuild";
 
 pub const DBI_NAMES: &[&str] = &[
     DBI_META,
@@ -55,6 +59,7 @@ pub const DBI_NAMES: &[&str] = &[
     DBI_MODERATION,
     DBI_STATE,
     DBI_EVENT_TAG_KIND,
+    DBI_EVENT_TAG_KIND_BUILD,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -182,6 +187,11 @@ pub fn dbi_specs() -> &'static [DbiSpec] {
             name: DBI_EVENT_TAG_KIND,
             flags: DUP,
             comparator: ComparatorKind::StringUint64Uint64,
+        },
+        DbiSpec {
+            name: DBI_EVENT_TAG_KIND_BUILD,
+            flags: MDB_CREATE,
+            comparator: ComparatorKind::Default,
         },
     ]
 }

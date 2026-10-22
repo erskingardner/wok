@@ -17,8 +17,8 @@ use crate::comparators::{
 use crate::error::check;
 use crate::fbs::{decode_meta, encode_meta, encode_negentropy_filter, Meta};
 use crate::schema::{
-    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_EVENT_TAG_KIND, DBI_META,
-    DBI_MODERATION, DBI_STATE, DBI_VANISH_PUBKEY,
+    dbi_specs, ComparatorKind, DBI_EVENT, DBI_EVENT_SEARCH, DBI_EVENT_TAG_KIND,
+    DBI_EVENT_TAG_KIND_BUILD, DBI_META, DBI_MODERATION, DBI_STATE, DBI_VANISH_PUBKEY,
 };
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
@@ -96,6 +96,8 @@ pub struct Dbis {
     /// Absent while inspecting an unmodified strfry v3 source, or read-only
     /// before the first writable open by a release that has it.
     pub event_tag_kind: Option<MDB_dbi>,
+    /// Absent where `event_tag_kind` is.
+    pub event_tag_kind_build: Option<MDB_dbi>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -261,6 +263,7 @@ impl Env {
                     | DBI_MODERATION
                     | DBI_STATE
                     | DBI_EVENT_TAG_KIND
+                    | DBI_EVENT_TAG_KIND_BUILD
             );
             let foreign_source = wok_only && !opened.is_empty() && {
                 let version = match meta_version_in_open_txn(txn, opened[0]) {
@@ -347,6 +350,7 @@ impl Env {
             moderation: (opened[18] != 0).then_some(opened[18]),
             state: (opened[19] != 0).then_some(opened[19]),
             event_tag_kind: (opened[20] != 0).then_some(opened[20]),
+            event_tag_kind_build: (opened[21] != 0).then_some(opened[21]),
         };
 
         #[cfg(test)]

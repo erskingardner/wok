@@ -371,7 +371,7 @@ fn check_tag_kind_index(tag_kind: Option<&TagKindIndexReport>, report: &mut Doct
         report.add(
             NAME,
             CheckStatus::Warn,
-            format!("the (tag, kind, created_at) index is absent; the next writable open creates it, and {REINDEX} indexes the stored events"),
+            format!("the (tag, kind, created_at) index is absent; the relay creates it on its next start and builds it in the background, or {REINDEX} builds it now"),
         );
         return;
     };
@@ -415,10 +415,16 @@ fn check_tag_kind_index(tag_kind: Option<&TagKindIndexReport>, report: &mut Doct
         if status == CheckStatus::Pass {
             status = CheckStatus::Warn;
         }
-        details.push(format!(
-            "indexed through local ID {} of {}; {REINDEX} indexes the rest",
-            state.indexed_through, state.high_water
-        ));
+        details.push(match state.bulk_pass {
+            Some(pass) => format!(
+                "being built in key order: {} of {} tag entries visited; the relay continues in the background, or {REINDEX} builds it now",
+                pass.visited, tag_kind.tag_entries
+            ),
+            None => format!(
+                "indexed through local ID {} of {}; the relay indexes the rest in the background, or {REINDEX} does now",
+                state.indexed_through, state.high_water
+            ),
+        });
     }
     if tag_kind.stale_entries != 0 {
         if status == CheckStatus::Pass {
@@ -837,6 +843,25 @@ mod tests {
             tag_kind
                 .detail
                 .starts_with("1 missing and 0 mismatched entry"),
+            "{}",
+            tag_kind.detail
+        );
+
+        // The relay starts over: a key-ordered pass, one entry in.
+        let env = reopen();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::reset_tag_kind_index(&mut txn).unwrap();
+        wok_db::backfill_tag_kind_index(&mut txn, 1, std::time::Duration::MAX).unwrap();
+        txn.commit().unwrap();
+        drop(env);
+        let report = run(&cfg, Path::new("missing-test-config.toml"));
+        assert_eq!(check(&report, "integrity").status, CheckStatus::Pass);
+        let tag_kind = check(&report, "tag-kind-index");
+        assert_eq!(tag_kind.status, CheckStatus::Warn);
+        assert!(
+            tag_kind
+                .detail
+                .starts_with("being built in key order: 1 of 1 tag entries visited"),
             "{}",
             tag_kind.detail
         );

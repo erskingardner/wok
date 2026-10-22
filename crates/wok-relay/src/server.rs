@@ -1323,6 +1323,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
                     writer_rx,
                     mon_data_txs,
                     moderation,
+                    TAG_KIND_STEP,
                 )
             })
             .map(worker)
@@ -4315,6 +4316,7 @@ mod tests {
             writer_rx,
             Vec::new(),
             moderation,
+            TAG_KIND_STEP,
         );
 
         assert!(reply_rx.blocking_recv().unwrap().is_ok());
@@ -4406,6 +4408,7 @@ mod tests {
                 writer_rx,
                 Vec::new(),
                 moderation,
+                TAG_KIND_STEP,
             );
             out_rx.try_recv().unwrap().into_text()
         };

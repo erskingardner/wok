@@ -2,7 +2,7 @@
 
 use crate::visibility::{ReadSnapshot, ReadVisibility};
 
-use crate::filter::NostrFilter;
+use crate::filter::{FilterSetBytes, FilterSetUint, NostrFilter};
 use crate::subid::Subscription;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -83,12 +83,16 @@ fn plans_pubkey_kind(f: &NostrFilter) -> bool {
 /// that tags its values and checking its kind. A popular value has thousands
 /// of events, of which a DM inbox or a zap list wants one kind.
 ///
-/// The index must hold every event in this snapshot; until the writer's
-/// background build completes it, the Tag plan stands. The pair bounds are
-/// the PubkeyKind plan's, for the same reason: past 1000 pairs, the seeks
-/// this plan adds must fit the limit. The Tag plan checks each candidate's
-/// event as well, so both plans return the same events in the same order.
-fn plans_tag_kind(f: &NostrFilter, txn: &RoTxn<'_>) -> bool {
+/// The index must also hold every event in the snapshot (see
+/// [`ScanPlan::choose`]). The pair bounds are the PubkeyKind plan's, for the
+/// same reason: past 1000 pairs, the seeks this plan adds must fit the limit.
+/// The Tag plan checks each candidate's event as well, so both plans return
+/// the same events in the same order.
+fn plans_tag_kind(f: &NostrFilter) -> bool {
+    // A filter that reads no index needs no readiness check.
+    if f.limit == 0 || f.never_match {
+        return false;
+    }
     if f.ids.is_some() || !f.and_tags.is_empty() || f.tags.len() != 1 {
         return false;
     }
@@ -96,11 +100,91 @@ fn plans_tag_kind(f: &NostrFilter, txn: &RoTxn<'_>) -> bool {
         return false;
     };
     let pairs = values.size().saturating_mul(kinds.size());
-    let bounded = pairs < 1000
+    pairs < 1000
         || (pairs <= MAX_PUBKEY_KIND_CURSORS
-            && pairs - values.size() <= usize::try_from(f.limit).unwrap_or(usize::MAX));
-    // A read failure keeps the established plan.
-    bounded && wok_db::tag_kind_index_complete_ro(txn).unwrap_or(false)
+            && pairs - values.size() <= usize::try_from(f.limit).unwrap_or(usize::MAX))
+}
+
+/// The index a filter's history scan reads, as [`DbScan`] picks it before
+/// its author probe. The query-cost gate prices the same plan
+/// ([`NostrFilterGroup::estimated_cost`](crate::NostrFilterGroup::estimated_cost)),
+/// so a planner change reaches both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPlan {
+    /// `ids`: one cursor per id.
+    Id,
+    /// One OR tag with `kinds`, once the (tag, kind, created_at) index is
+    /// complete: one cursor per (value, kind) pair.
+    TagKind,
+    /// Other tag filters: one cursor for a NIP-91 `&` seed, otherwise one
+    /// per value of the smallest OR tag.
+    Tag,
+    /// `authors` with `kinds`: one cursor per (author, kind) pair.
+    PubkeyKind,
+    /// `authors`, and `authors` with `kinds` past the PubkeyKind bounds: one
+    /// cursor per author.
+    Pubkey,
+    /// `kinds` alone: one cursor per kind.
+    Kind,
+    /// No indexed field: one cursor.
+    CreatedAt,
+}
+
+impl ScanPlan {
+    /// The plan for `f`. `tag_kind_index` says whether the (tag, kind,
+    /// created_at) index holds every stored event; it is asked only for a
+    /// filter that index could serve. Until the writer's background build
+    /// completes the index, the Tag plan stands.
+    pub fn choose(f: &NostrFilter, tag_kind_index: impl FnOnce() -> bool) -> Self {
+        if f.ids.is_some() {
+            Self::Id
+        } else if plans_tag_kind(f) && tag_kind_index() {
+            Self::TagKind
+        } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
+            Self::Tag
+        } else if plans_pubkey_kind(f) {
+            Self::PubkeyKind
+        } else if f.authors.is_some() {
+            Self::Pubkey
+        } else if f.kinds.is_some() {
+            Self::Kind
+        } else {
+            Self::CreatedAt
+        }
+    }
+
+    /// The cursors this plan opens for `f`. A filter that can return no
+    /// stored event opens none.
+    pub fn cursors(self, f: &NostrFilter) -> usize {
+        if f.limit == 0 || f.never_match {
+            return 0;
+        }
+        let size = |set: Option<&FilterSetBytes>| set.map_or(0, FilterSetBytes::size);
+        let kinds = f.kinds.as_ref().map_or(0, FilterSetUint::size);
+        match self {
+            Self::Id => size(f.ids.as_ref()),
+            Self::TagKind => size(f.tags.values().next()).saturating_mul(kinds),
+            Self::Tag if !f.and_tags.is_empty() => 1,
+            Self::Tag => f.tags.values().map(FilterSetBytes::size).min().unwrap_or(0),
+            Self::PubkeyKind => size(f.authors.as_ref()).saturating_mul(kinds),
+            Self::Pubkey => size(f.authors.as_ref()),
+            Self::Kind => kinds,
+            Self::CreatedAt => 1,
+        }
+    }
+
+    /// The name `DbScan::desc` reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Id => "ID",
+            Self::TagKind => "TagKind",
+            Self::Tag => "Tag",
+            Self::PubkeyKind => "PubkeyKind",
+            Self::Pubkey => "Pubkey",
+            Self::Kind => "Kind",
+            Self::CreatedAt => "CreatedAt",
+        }
+    }
 }
 
 fn cmp_cand(a: &CandidateEvent, b: &CandidateEvent) -> std::cmp::Ordering {
@@ -665,30 +749,31 @@ impl DbScan {
         let dbis = txn.env().dbis();
         let mut index_only = f.index_only_scans;
         let mut cursors = Vec::new();
-        let tag_kind = match dbis.event_tag_kind {
-            Some(dbi) if f.limit != 0 && !f.never_match && plans_tag_kind(f, txn) => Some(dbi),
-            _ => None,
-        };
-        let (index_dbi, desc) = if f.ids.is_some() {
-            (dbis.event_id, "ID")
-        } else if let Some(dbi) = tag_kind {
-            // An entry can outlive its event when an earlier release deleted
-            // it, so every candidate is checked against its stored event.
-            index_only = false;
-            (dbi, "TagKind")
-        } else if !f.tags.is_empty() || !f.and_tags.is_empty() {
-            (dbis.event_tag, "Tag")
-        } else if plans_pubkey_kind(f) {
-            (dbis.event_pubkey_kind, "PubkeyKind")
-        } else if f.authors.is_some() {
-            if f.kinds.is_some() {
+        let plan = ScanPlan::choose(f, || {
+            // A read failure keeps the established plan.
+            dbis.event_tag_kind.is_some()
+                && wok_db::tag_kind_index_complete_ro(txn).unwrap_or(false)
+        });
+        let index_dbi = match plan {
+            ScanPlan::Id => dbis.event_id,
+            ScanPlan::TagKind => {
+                // An entry can outlive its event when an earlier release
+                // deleted it, so every candidate is checked against its
+                // stored event.
                 index_only = false;
+                // `choose` asked for this plan only with the table open.
+                dbis.event_tag_kind.unwrap()
             }
-            (dbis.event_pubkey, "Pubkey")
-        } else if f.kinds.is_some() {
-            (dbis.event_kind, "Kind")
-        } else {
-            (dbis.event_created_at, "CreatedAt")
+            ScanPlan::Tag => dbis.event_tag,
+            ScanPlan::PubkeyKind => dbis.event_pubkey_kind,
+            ScanPlan::Pubkey => {
+                if f.kinds.is_some() {
+                    index_only = false;
+                }
+                dbis.event_pubkey
+            }
+            ScanPlan::Kind => dbis.event_kind,
+            ScanPlan::CreatedAt => dbis.event_created_at,
         };
 
         if f.limit == 0 || f.never_match {
@@ -707,7 +792,7 @@ impl DbScan {
                     outstanding: 0,
                 });
             }
-        } else if tag_kind.is_some() {
+        } else if plan == ScanPlan::TagKind {
             // A TagKind key is the Tag key with the kind before the time, so
             // the cursors read it the same way.
             let (tag_name, values) = f.tags.iter().next().unwrap();
@@ -758,7 +843,7 @@ impl DbScan {
                     outstanding: 0,
                 });
             }
-        } else if plans_pubkey_kind(f) {
+        } else if plan == ScanPlan::PubkeyKind {
             let authors = f.authors.as_ref().unwrap();
             let kinds = f.kinds.as_ref().unwrap();
             for i in 0..authors.size() {
@@ -817,7 +902,7 @@ impl DbScan {
         Self {
             index_only,
             index_dbi,
-            desc,
+            desc: plan.name(),
             cursors,
             event_queue: VecDeque::new(),
             initial_scan_depth: initial,

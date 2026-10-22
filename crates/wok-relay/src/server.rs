@@ -46,8 +46,8 @@ use wok_negentropy::{DeferredSink, NegentropyFilterCache};
 mod negentropy;
 use negentropy::run_negentropy;
 use wok_query::{
-    ActiveMonitors, FilterValidator, HeldEvent, NostrFilterGroup, PendingBuffer, PendingEvent,
-    QueryScheduler, SubId, Subscription,
+    ActiveMonitors, CostedRequest, FilterValidator, HeldEvent, NostrFilterGroup, PendingBuffer,
+    PendingEvent, QueryScheduler, SubId, Subscription,
 };
 
 const AUTH_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -2833,17 +2833,27 @@ fn admit_req(
     if let Err(e) = filter_validator(cfg).validate(&fg) {
         return Err(bad_req("blocked", format!("filter validation failed: {e}")));
     }
-    let query_cost = fg.estimated_cost(count_only);
+    let costed = if count_only {
+        CostedRequest::Count
+    } else {
+        CostedRequest::Req {
+            max_total_events: cfg.relay.max_total_events_per_req,
+        }
+    };
+    // The writer's gauge can trail its last backfill step; the scan itself
+    // checks its own snapshot, and either plan's seeks are bounded.
+    let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
+    let query_cost = fg.estimated_cost(costed, tag_kind_index);
     if cfg.relay.abuse.enabled
-        && cfg.relay.abuse.max_query_cost != 0
-        && query_cost > cfg.relay.abuse.max_query_cost
+        && cfg.relay.abuse.max_query_work != 0
+        && query_cost > cfg.relay.abuse.max_query_work
     {
         metrics
             .abuse_query_cost_rejections
             .fetch_add(1, Ordering::Relaxed);
         return Err(format!(
             "rate-limited: estimated query cost {query_cost} exceeds {}",
-            cfg.relay.abuse.max_query_cost
+            cfg.relay.abuse.max_query_work
         ));
     }
 
@@ -3164,17 +3174,18 @@ fn ingest_neg(
         cfg.relay.max_and_entries,
     )
     .map_err(|e| format!("{}: {e}", e.reason_prefix()))?;
-    let query_cost = fg.estimated_cost(false);
+    let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
+    let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
     if cfg.relay.abuse.enabled
-        && cfg.relay.abuse.max_query_cost != 0
-        && query_cost > cfg.relay.abuse.max_query_cost
+        && cfg.relay.abuse.max_query_work != 0
+        && query_cost > cfg.relay.abuse.max_query_work
     {
         metrics
             .abuse_query_cost_rejections
             .fetch_add(1, Ordering::Relaxed);
         return Err(format!(
             "rate-limited: estimated query cost {query_cost} exceeds {}",
-            cfg.relay.abuse.max_query_cost
+            cfg.relay.abuse.max_query_work
         ));
     }
     let r = restrictor(cfg);
@@ -5315,7 +5326,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.db = dir.path().to_path_buf();
         cfg.relay.auth.enabled = false;
-        cfg.relay.abuse.max_query_cost = 10;
+        cfg.relay.abuse.max_query_work = 10;
         let handle = start(env, cfg).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
@@ -5328,7 +5339,7 @@ mod tests {
             )
             .await;
         let response = recv_outbound(&mut rx).await;
-        assert!(response.contains("\"CLOSED\"") && response.contains("query cost 1000"));
+        assert!(response.contains("\"CLOSED\"") && response.contains("query cost 2001"));
         assert_eq!(
             handle
                 .metrics

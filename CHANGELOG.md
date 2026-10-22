@@ -234,6 +234,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (was 3), now that the section has no `enabled` switch. Otherwise the
   switch's removal would have turned on a three-kind cap that refuses MDK's
   six-kind directory batches.
+- `public`: `relay.abuse.max_query_work` is `20000`, NIP-11
+  `max_query_work`, in the units described under Changed. It replaces
+  `relay.abuse.max_query_cost = 1000`, which is ignored (see Removed).
 
 ### Changed
 
@@ -299,8 +302,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moderation or vanish records, a scan does about a quarter less work per
   event.
 
+- The query-cost gate (`relay.abuse.max_query_work`, which replaces
+  `max_query_cost`) estimates the index entries a REQ, COUNT or NEG-OPEN
+  would touch, on the plan its scan will run. A REQ costs the cursors its plan opens plus the rows its filters'
+  `limit`s allow, up to `max_total_events_per_req`. A COUNT costs twice its
+  cursors and a NEG-OPEN its cursors, because their rows are bounded only
+  while they run. Before, the estimate ignored `limit` and the plan. It
+  refused `{"authors":[150 keys],"limit":20}` (1,500), an 11-kind feed
+  (1,100) and NDK's 45 `{"#e":[id],"kinds":[7]}` filters (1,125), while
+  `{"authors":[2000 keys],"kinds":[50 kinds]}` cost 5 and opened 100,000
+  cursors. Those now cost 170, 61, 10,045 and 102,000, against a ceiling of
+  20,000. `docs/config.md` lists how each filter is priced.
+
 ### Removed
 
+- `relay.abuse.max_query_cost`. `relay.abuse.max_query_work` replaces it,
+  in units in which old values mean something else: 1,000, the default
+  through 0.7, would refuse every filter without a `limit`, including MDK's
+  `{"kinds":[445],"#h":[group]}` subscriptions and DM inboxes. A file that
+  still sets `max_query_cost` loads with any value ignored and a
+  deprecation warning, at startup, on reload and in `wok doctor`'s
+  `config-deprecations` check, and gets the preset's `max_query_work`.
+  **Upgrading:** copies of the 0.7 `docs/wok.toml` set it, so they warn
+  until it is removed; `wok config minimize` or a dashboard save removes it.
+  An operator who had raised or lowered it should set `max_query_work`
+  instead, choosing a value in the new units (`docs/config.md`, Query
+  work). NIP-11 advertises `max_query_work` in place of `max_query_cost`.
 - `relay.filter_validation.enabled`, `max_filters_per_req` and
   `min_filters_per_req`. Each remaining filter rule (`max_kinds_per_filter`,
   `allowed_kinds`, `require_author_or_tag`) applies when it is set, and

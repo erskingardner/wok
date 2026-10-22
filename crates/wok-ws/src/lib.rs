@@ -377,7 +377,7 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "created_at_upper_limit": cfg.events.reject_newer_than_secs,
             "default_limit": cfg.relay.max_filter_limit,
             "min_pow_difficulty": min_pow_difficulty,
-            "max_query_cost": cfg.relay.abuse.max_query_cost,
+            "max_query_work": cfg.relay.abuse.max_query_work,
             "max_concurrent_historical_queries": cfg.relay.abuse.max_concurrent_historical_queries,
         }
     });

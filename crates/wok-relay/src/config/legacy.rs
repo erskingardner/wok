@@ -26,6 +26,13 @@ pub(super) fn zero_kind_cap_warning(key: &str) -> String {
     )
 }
 
+/// Through 0.7, `relay.abuse.max_query_cost` capped an estimate that ignored
+/// `limit` and the query plan. `max_query_work` replaced it, counting the
+/// index entries a request touches (#97 §3.4). Its values mean something
+/// else in those units (1,000 would refuse every filter without a `limit`),
+/// so an old value is ignored rather than carried over.
+const QUERY_COST: [&str; 3] = ["relay", "abuse", "max_query_cost"];
+
 /// The rules that remain, each off at its zero or empty value.
 const RULES: [&str; 3] = [
     "max_kinds_per_filter",
@@ -88,6 +95,23 @@ impl Translation {
 /// `preset` is the configuration its preset gives, for the values the file
 /// leaves out.
 pub(super) fn translate(file: &toml::Value, preset: &toml::Value) -> Result<Translation, String> {
+    let mut translation = filter_validation(file, preset)?;
+    if leaf(file, &QUERY_COST).is_some() {
+        translation
+            .changes
+            .push(Change::Remove(QUERY_COST.to_vec()));
+        translation.warnings.push(
+            "relay.abuse.max_query_cost is deprecated and ignored: it capped an estimate that \
+             ignored `limit` and the query plan. relay.abuse.max_query_work now bounds the \
+             index entries a query may touch (20000 in the public preset). `wok config \
+             minimize` removes the old key."
+                .to_string(),
+        );
+    }
+    Ok(translation)
+}
+
+fn filter_validation(file: &toml::Value, preset: &toml::Value) -> Result<Translation, String> {
     let mut translation = Translation::default();
     let Some(section) = file
         .get(FILTER_VALIDATION[0])
@@ -321,6 +345,40 @@ mod tests {
     }
 
     #[test]
+    fn an_old_query_cost_ceiling_is_ignored() {
+        let (translation, file) =
+            translated("[relay.abuse]\nmax_query_cost = 1000\nreq_burst = 80\n");
+        let abuse = &file["relay"]["abuse"];
+        assert!(abuse.get("max_query_cost").is_none());
+        assert_eq!(abuse["req_burst"].as_integer(), Some(80));
+        assert_eq!(translation.warnings.len(), 1);
+        assert!(
+            translation.warnings[0].contains("relay.abuse.max_query_work"),
+            "{:?}",
+            translation.warnings
+        );
+        // Whatever its value, and next to the key that replaced it.
+        let (_, file) = translated("[relay.abuse]\nmax_query_cost = 0\nmax_query_work = 500\n");
+        assert!(file["relay"]["abuse"].get("max_query_cost").is_none());
+        assert_eq!(
+            file["relay"]["abuse"]["max_query_work"].as_integer(),
+            Some(500)
+        );
+
+        let config = crate::Config::parse_toml("[relay.abuse]\nmax_query_cost = 1000\n").unwrap();
+        assert_eq!(config.relay.abuse.max_query_work, 20_000);
+        assert_eq!(config.deprecations.len(), 1);
+        let minimized =
+            crate::Config::minimize_toml("[relay.abuse]\nmax_query_cost = 1000\n").unwrap();
+        assert_eq!(minimized.rewritten, ["relay.abuse.max_query_cost"]);
+        assert!(
+            !minimized.text.contains("max_query_cost"),
+            "{}",
+            minimized.text
+        );
+    }
+
+    #[test]
     fn malformed_legacy_keys_are_errors() {
         let file: toml::Value = toml::from_str("[relay.filter_validation]\nenabled = 1\n").unwrap();
         assert!(translate(&file, &file).is_err());
@@ -345,16 +403,19 @@ mod tests {
 
     #[test]
     fn the_0_7_0_sample_upgrades_with_its_rules_unchanged() {
-        // 0.7 applied the sample's disabled section not at all.
+        // 0.7 applied the sample's disabled section not at all. Its query
+        // cost ceiling is ignored, in favor of the preset's in new units.
         let upgraded = crate::Config::parse_toml(SAMPLE_0_7_0).unwrap();
         assert_eq!(rules(&upgraded), (200, 0, String::new(), false));
+        assert_eq!(upgraded.relay.abuse.max_query_work, 20_000);
         assert_eq!(
             upgraded.deprecations.len(),
-            1,
+            2,
             "{:?}",
             upgraded.deprecations
         );
         assert!(upgraded.deprecations[0].contains("enabled = false is deprecated"));
+        assert!(upgraded.deprecations[1].starts_with("relay.abuse.max_query_cost is deprecated"));
 
         // Enabled, 0.7 refused more than three filters or three kinds per
         // filter, which the upgrade keeps.
@@ -367,7 +428,7 @@ mod tests {
         assert_eq!(rules(&upgraded), (3, 3, String::new(), false));
         assert_eq!(
             upgraded.deprecations.len(),
-            3,
+            4,
             "{:?}",
             upgraded.deprecations
         );
@@ -386,6 +447,7 @@ mod tests {
                     minimized.text
                 );
             }
+            assert!(file["relay"]["abuse"].get("max_query_cost").is_none());
             let rewritten = crate::Config::parse_toml(&minimized.text).unwrap();
             assert!(
                 rewritten.deprecations.is_empty(),

@@ -265,7 +265,9 @@ pub struct AbuseConfig {
     pub invalid_rate_per_second: u32,
     pub invalid_burst: u32,
     pub max_concurrent_historical_queries: usize,
-    pub max_query_cost: u64,
+    /// Most index entries a REQ, COUNT or NEG-OPEN may touch, estimated
+    /// before its scan. Replaces `max_query_cost` (see `legacy`).
+    pub max_query_work: u64,
     pub max_stored_events: u64,
     pub max_stored_events_per_pubkey: u64,
     pub min_pow_difficulty: u8,
@@ -448,7 +450,7 @@ impl Default for Config {
                     invalid_rate_per_second: 5,
                     invalid_burst: 20,
                     max_concurrent_historical_queries: 8,
-                    max_query_cost: 1_000,
+                    max_query_work: 20_000,
                     max_stored_events: 0,
                     max_stored_events_per_pubkey: 1_000_000,
                     min_pow_difficulty: 0,
@@ -1103,7 +1105,7 @@ impl Config {
                     a.invalid_rate_per_second,
                     a.invalid_burst,
                     a.max_concurrent_historical_queries,
-                    a.max_query_cost,
+                    a.max_query_work,
                     a.max_stored_events,
                     a.max_stored_events_per_pubkey,
                     a.min_pow_difficulty,
@@ -1240,8 +1242,8 @@ impl Config {
                     ));
                 }
             }
-            if zeroed(a.max_query_cost, p.max_query_cost) {
-                warnings.push("relay.abuse.max_query_cost is zero — unlimited".to_string());
+            if zeroed(a.max_query_work, p.max_query_work) {
+                warnings.push("relay.abuse.max_query_work is zero — unlimited".to_string());
             }
             if zeroed(a.max_stored_events, p.max_stored_events) {
                 warnings.push("relay.abuse.max_stored_events is zero — unlimited".to_string());
@@ -2238,7 +2240,7 @@ mod tests {
             "count_burst",
             "invalid_rate_per_second",
             "invalid_burst",
-            "max_query_cost",
+            "max_query_work",
             "max_stored_events_per_pubkey",
         ] {
             let cfg = Config::parse_toml(&format!("[relay.abuse]\n{field} = 0\n")).unwrap();

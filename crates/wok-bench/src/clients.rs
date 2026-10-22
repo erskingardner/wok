@@ -1030,7 +1030,7 @@ fn setting_for(reason: &str) -> &'static str {
     } else if r.contains("invalid messages") {
         "relay.abuse.invalid_rate_per_second / invalid_burst"
     } else if r.contains("query cost") {
-        "relay.abuse.max_query_cost"
+        "relay.abuse.max_query_work"
     } else if r.contains("synchronization memory") {
         "relay.sync_memory_per_connection / sync_memory_total"
     } else if r.contains("concurrent historical") {
@@ -2841,7 +2841,7 @@ fn effective_limits(cfg: &wok_relay::Config) -> BTreeMap<String, String> {
             "relay.abuse.connection_rate_per_second / connection_burst",
             format!("{} / {}", a.connection_rate_per_second, a.connection_burst),
         ),
-        ("relay.abuse.max_query_cost", a.max_query_cost.to_string()),
+        ("relay.abuse.max_query_work", a.max_query_work.to_string()),
         (
             "relay.abuse.max_concurrent_historical_queries",
             a.max_concurrent_historical_queries.to_string(),
@@ -3627,7 +3627,7 @@ mod tests {
             ),
             (
                 "rate-limited: estimated query cost N exceeds N",
-                "relay.abuse.max_query_cost",
+                "relay.abuse.max_query_work",
             ),
             (
                 "rate-limited: too many concurrent historical queries",
@@ -3974,17 +3974,23 @@ mod tests {
             report.deflate_negotiated, report.connections,
             "every connection negotiates deflate"
         );
-        // Today's cost model refuses the audit's C4 shapes.
-        let cost = report
-            .refusals
-            .iter()
-            .find(|r| r.reason.contains("estimated query cost"))
-            .expect("cost refusals");
+        // The cost model counts `limit` and the planner's work, so the
+        // audit's C4 shapes are served (#97 §3.4).
         assert!(
-            cost.classes.contains_key("w4.reaction_batch")
-                && cost.classes.contains_key("w3.global_kinds"),
-            "{cost:?}"
+            !report
+                .refusals
+                .iter()
+                .any(|r| r.reason.contains("query cost")),
+            "{:#?}",
+            report.refusals
         );
+        for class in [
+            "w3.authors_no_kinds",
+            "w3.global_kinds",
+            "w4.reaction_batch",
+        ] {
+            assert_eq!(row(class).completed, row(class).sent, "{class}");
+        }
         // AUTH works: the Marmot inbox and both DM subscriptions complete.
         assert_eq!(row("auth").completed, row("auth").sent);
         assert_eq!(row("marmot.inbox").completed, opts.marmot_clients as u64);
@@ -4007,7 +4013,7 @@ mod tests {
         );
         let md = render_markdown(&report, "wok", 1);
         assert!(
-            md.contains("| marmot.neg |") && md.contains("estimated query cost"),
+            md.contains("| marmot.neg |") && md.contains("| w4.reaction_batch |"),
             "{md}"
         );
     }

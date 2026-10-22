@@ -107,12 +107,20 @@ async fn cpp_error_routing() {
     )
     .await;
 
-    // REQ with no filters -> NOTICE (sub id not yet known in C++).
+    // REQ or COUNT with no filters -> CLOSED (NIP-01: a refused REQ gets
+    // CLOSED). C++ sends NOTICE "ERROR: bad req: arr too small".
     send_and_expect(
         &rig,
         r#"["REQ","s"]"#.into(),
-        |t| t == r#"["NOTICE","ERROR: bad req: arr too small"]"#,
-        "arr too small",
+        |t| t == r#"["CLOSED","s","invalid: bad req: arr too small"]"#,
+        "REQ arr too small",
+    )
+    .await;
+    send_and_expect(
+        &rig,
+        r#"["COUNT","c"]"#.into(),
+        |t| t == r#"["CLOSED","c","invalid: bad req: arr too small"]"#,
+        "COUNT arr too small",
     )
     .await;
     // The CLOSED reasons C++ sends as `error: bad req:` get the NIP-01 prefix

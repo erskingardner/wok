@@ -329,6 +329,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A REQ or COUNT with no filters is refused with `CLOSED` (`invalid: bad req:
+  arr too small`), as NIP-01 requires for a refused REQ, instead of a NOTICE
+  that did not say which subscription was refused. A NEG-OPEN with an
+  invalid subscription id gets NIP-77 `NEG-ERR` (`invalid:`) instead of a
+  NOTICE.
 - REQ and COUNT refusals use NIP-01's machine-readable prefixes instead of
   `error:`, which NIP-01 keeps for when none of the others fits. The text
   after the prefix is unchanged:

@@ -281,8 +281,8 @@ impl ConnTable {
         });
     }
 
-    /// CLOSE, or a REQ that names the id and fails before refusal (no CLOSED
-    /// owed). Returns the generation it closed, for the workers' cleanup.
+    /// CLOSE (no CLOSED owed). Returns the generation it closed, for the
+    /// workers' cleanup.
     fn close_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> Option<u64> {
         self.with(conn_id, |_, state| state.subs.close(ns, sub_id))
             .flatten()
@@ -2717,16 +2717,10 @@ fn ingest_req(
 ) {
     let ns = if count_only { Ns::Count } else { Ns::Req };
     if filters.is_empty() {
-        // C++ RelayIngester raises "arr too small" as a NOTICE, before the
-        // sub id is known. The request still replaces the one it names.
-        if let Ok(sid) = SubId::new(&sub_id) {
-            close_req(conns, dispatch, conn_id, ns, sid);
-        }
-        conns.send(
-            conn_id,
-            RelayMessage::notice_error("bad req: arr too small"),
-            metrics,
-        );
+        // NIP-01: a refused REQ gets CLOSED. C++ RelayIngester raises
+        // "arr too small" as a NOTICE, before it reads the sub id.
+        let reason = "invalid: bad req: arr too small".to_string();
+        refuse_req(conns, metrics, dispatch, conn_id, ns, &sub_id, reason);
         return;
     }
     let admitted = admit_req(
@@ -3048,7 +3042,8 @@ fn neg_err(
 }
 
 /// NEG-OPEN (`filter` is `Some`) or NEG-MSG. Every refusal that can name the
-/// subscription is a NEG-ERR; only an unaddressable sub id falls back to NOTICE.
+/// subscription is a NEG-ERR, as is a NEG-OPEN whose sub id is invalid; only
+/// a NEG-MSG with an invalid sub id falls back to NOTICE.
 #[allow(clippy::too_many_arguments)]
 fn ingest_neg_command(
     cfg: &Config,
@@ -3086,6 +3081,13 @@ fn ingest_neg_command(
     }
     let sid = match SubId::new(&sub_id) {
         Ok(sid) => sid,
+        // A NEG-OPEN is refused like a REQ, with a reply naming its id. No
+        // session can have an invalid id, so there is none to close.
+        Err(e) if filter.is_some() => {
+            let reason = format!("invalid: {e}");
+            neg_err(conns, metrics, dispatch, conn_id, &sub_id, reason);
+            return;
+        }
         Err(e) => {
             conns.send(
                 conn_id,

@@ -160,6 +160,8 @@ async fn req_refusals_use_the_prefix_that_fits() {
     let (conn, mut rx) = relay.connection().await;
     let hex = "ab".repeat(32);
     let cases = [
+        (json!(["REQ", "s"]), "invalid: bad req: arr too small"),
+        (json!(["COUNT", "s"]), "invalid: bad req: arr too small"),
         (
             json!(["REQ", "s", {}, {}, {}]),
             "invalid: bad req: arr too big",
@@ -347,7 +349,8 @@ async fn auth_challenge_is_sent_on_connect() {
 }
 
 /// Every NEG-OPEN / NEG-MSG refusal that can name its subscription is a
-/// NEG-ERR, so sync clients stop waiting; only an unusable sub id is a NOTICE.
+/// NEG-ERR, so sync clients stop waiting. A NEG-OPEN is refused like a REQ
+/// even when its sub id is invalid; only a NEG-MSG with one is a NOTICE.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn negentropy_refusals_are_neg_err() {
     let relay = Relay::new(|_| {});
@@ -391,11 +394,13 @@ async fn negentropy_refusals_are_neg_err() {
         assert_reply(&recv(&mut rx).await, "NEG-ERR", sid, "invalid: ");
     }
 
-    send(
-        &conn,
-        json!(["NEG-OPEN", "x".repeat(65), {}, neg_initial()]),
-    )
-    .await;
+    let long = "x".repeat(65);
+    send(&conn, json!(["NEG-OPEN", long, {}, neg_initial()])).await;
+    assert_eq!(
+        recv(&mut rx).await,
+        json!(["NEG-ERR", long, "invalid: invalid subscription id length"])
+    );
+    send(&conn, json!(["NEG-MSG", long, neg_initial()])).await;
     let reply = recv(&mut rx).await;
     assert_eq!(reply[0], "NOTICE", "{reply}");
     assert!(

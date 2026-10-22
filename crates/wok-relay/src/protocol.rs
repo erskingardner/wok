@@ -110,7 +110,7 @@ impl EoseHints {
 pub enum ParseFailure {
     /// `bad msg: ...` -> NOTICE (envelope-level failures, unknown commands)
     BadMsg(String),
-    /// `bad req: ...` -> NOTICE (REQ/COUNT failures before the sub id is known)
+    /// `bad req: ...` -> NOTICE (REQ/COUNT whose sub id is not a string)
     BadReq(String),
     /// `bad close: ...` -> NOTICE
     BadClose(String),

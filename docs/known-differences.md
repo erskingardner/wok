@@ -154,8 +154,14 @@ regression test. Differential parity alone is not a reason to retain it.
   it is refused, authenticated, and re-sent.
 - NIP-77: NEG-OPEN and NEG-MSG refusals (malformed envelope, hex, or filter;
   negentropy disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, and
-  every NEG-ERR closes the session. Only an unusable subscription id still
-  produces a NOTICE.
+  every NEG-ERR closes the session. A NEG-OPEN with an invalid subscription
+  id is refused with NEG-ERR too. Only a sub id that is not a string, or a
+  NEG-MSG or NEG-CLOSE with an invalid one, still produces a NOTICE.
+- NIP-01: a REQ or COUNT with no filters gets `CLOSED` with
+  `invalid: bad req: arr too small`, and like any refused REQ it ends an open
+  subscription with its id. Pinned strfry sends only a NOTICE,
+  `ERROR: bad req: arr too small`, though NIP-01 says CLOSED MUST be sent
+  when a REQ is refused.
 - NIP-01: REQ and COUNT refusals that pinned strfry sends as `CLOSED` with
   `error: bad req: ...` keep strfry's text, such as `arr too big`, under the
   NIP-01 prefix that fits. `invalid:` is for malformed filters and requests

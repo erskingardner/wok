@@ -266,6 +266,9 @@ pub fn reset_tag_kind_index(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
 pub struct TagKindBackfillStep {
     /// Postings the step put.
     pub entries: u64,
+    /// `Event__tag` entries or events the step read to prepare postings. It
+    /// reads ahead of the time budget by at most a small chunk.
+    pub prepared: u64,
     /// `Event__tag` entries stored, which a key-ordered pass visits once.
     pub tag_entries: u64,
     /// The table's state once the step commits.
@@ -276,8 +279,9 @@ pub struct TagKindBackfillStep {
 /// events stored is built by a key-ordered pass over `Event__tag`; anything
 /// else above the marker is indexed in local-id order. A step stops after
 /// `max_entries` postings, or once it has run for `budget`, whichever comes
-/// first, and always makes some progress. `None` when the table is absent or
-/// not in this release's layout.
+/// first, and always makes some progress. It reads ahead in chunks of
+/// [`STEP_CHUNK`], so the budget bounds preparing postings too. `None` when
+/// the table is absent or not in this release's layout.
 pub fn backfill_tag_kind_index(
     txn: &mut RwTxn<'_>,
     max_entries: usize,
@@ -321,15 +325,16 @@ pub fn backfill_tag_kind_index(
             pass = Some(start);
         }
     }
-    let (entries, indexed_through, pass) = match (pass, dbis.event_tag_kind_build) {
+    let (work, indexed_through, pass) = match (pass, dbis.event_tag_kind_build) {
         (Some(pass), Some(build)) => key_ordered_step(txn, dbi, build, pass, through, limits)?,
         _ => {
-            let (entries, indexed_through) = local_id_step(txn, dbi, through, high_water, limits)?;
-            (entries, indexed_through, None)
+            let (work, indexed_through) = local_id_step(txn, dbi, through, high_water, limits)?;
+            (work, indexed_through, None)
         }
     };
     Ok(Some(TagKindBackfillStep {
-        entries,
+        entries: work.entries,
+        prepared: work.prepared,
         tag_entries,
         state: TagKindIndexState {
             schema: Some(TAG_KIND_SCHEMA_VERSION),
@@ -339,6 +344,10 @@ pub fn backfill_tag_kind_index(
         },
     }))
 }
+
+/// Entries or events a step reads ahead of indexing them, so that what it
+/// prepares and then leaves for the next step stays this small.
+const STEP_CHUNK: usize = 64;
 
 #[derive(Clone, Copy)]
 struct StepLimits {
@@ -354,6 +363,50 @@ impl StepLimits {
     }
 }
 
+/// What a step got through: postings put, and entries or events read to
+/// prepare them, used or not.
+#[derive(Default)]
+struct StepWork {
+    entries: u64,
+    prepared: u64,
+}
+
+/// An `Event__tag` key and the local id it lists.
+type TagEntry = (Vec<u8>, u64);
+
+/// Up to `limit` `Event__tag` entries after `after`, and whether they run
+/// to the end of the table.
+fn tag_entries_after(
+    txn: &RwTxn<'_>,
+    after: Option<&TagEntry>,
+    limit: usize,
+) -> Result<(Vec<TagEntry>, bool), DbError> {
+    let (start_key, start_dup) = match after {
+        // Resume after the last entry visited, whether or not it remains.
+        Some((key, lev_id)) => (key.clone(), lev_id.saturating_add(1).to_ne_bytes().to_vec()),
+        None => (Vec::new(), Vec::new()),
+    };
+    let mut chunk = Vec::new();
+    let mut error = None;
+    let at_end = txn.foreach_full(
+        txn.env().dbis().event_tag,
+        &start_key,
+        &start_dup,
+        false,
+        |key, value| {
+            match crate::keys::u64_from_ne_checked(value) {
+                Ok(lev_id) => chunk.push((key.to_vec(), lev_id)),
+                Err(err) => error = Some(err),
+            }
+            error.is_none() && chunk.len() < limit
+        },
+    )?;
+    match error {
+        Some(error) => Err(error),
+        None => Ok((chunk, at_end)),
+    }
+}
+
 /// Continue the key-ordered pass from its cursor. Postings for one tag value
 /// sit next to each other, so a step dirties few pages, where local-id order
 /// would dirty about one page per posting. The marker moves to the pass's
@@ -365,69 +418,57 @@ fn key_ordered_step(
     mut pass: TagKindBulkPass,
     through: u64,
     limits: StepLimits,
-) -> Result<(u64, u64, Option<TagKindBulkPass>), DbError> {
-    let cursor = txn.get(build, PASS_CURSOR_KEY)?.and_then(read_cursor);
-    let (start_key, start_dup) = match &cursor {
-        // Resume after the last entry visited, whether or not it remains.
-        Some((key, lev_id)) => (key.clone(), lev_id.saturating_add(1).to_ne_bytes().to_vec()),
-        None => (Vec::new(), Vec::new()),
-    };
-    let mut batch = Vec::new();
-    let mut error = None;
-    let walked_to_end = txn.foreach_full(
-        txn.env().dbis().event_tag,
-        &start_key,
-        &start_dup,
-        false,
-        |key, value| {
-            match crate::keys::u64_from_ne_checked(value) {
-                Ok(lev_id) => batch.push((key.to_vec(), lev_id)),
-                Err(err) => error = Some(err),
-            }
-            error.is_none() && batch.len() < limits.max_entries
-        },
-    )?;
-    if let Some(error) = error {
-        return Err(error);
-    }
+) -> Result<(StepWork, u64, Option<TagKindBulkPass>), DbError> {
+    let mut position = txn.get(build, PASS_CURSOR_KEY)?.and_then(read_cursor);
+    let mut work = StepWork::default();
     let mut visited = 0;
-    let mut entries = 0u64;
-    for (key, lev_id) in &batch {
-        visited += 1;
-        let (tag, created_at) = crate::keys::parse_key_string_u64(key)?;
-        // A tag entry whose event is gone gets no posting; integrity
-        // reports it in `Event__tag`.
-        let kind = match txn.get_u64(txn.env().dbis().event, *lev_id)? {
-            Some(raw) => Some(PackedEventView::new(raw)?.kind()),
-            None => None,
-        };
-        if let (Some(kind), Some((&name, value))) = (kind, tag.split_first()) {
-            txn.put(
-                dbi,
-                &tag_kind_key(name, value, kind, created_at),
-                &lev_id.to_ne_bytes(),
-                0,
-            )?;
-            entries += 1;
+    let mut walked_to_end = false;
+    'step: loop {
+        let (chunk, at_end) = tag_entries_after(txn, position.as_ref(), STEP_CHUNK)?;
+        work.prepared += chunk.len() as u64;
+        for (key, lev_id) in chunk {
+            let (tag, created_at) = crate::keys::parse_key_string_u64(&key)?;
+            // A tag entry whose event is gone gets no posting; integrity
+            // reports it in `Event__tag`.
+            let kind = match txn.get_u64(txn.env().dbis().event, lev_id)? {
+                Some(raw) => Some(PackedEventView::new(raw)?.kind()),
+                None => None,
+            };
+            if let (Some(kind), Some((&name, value))) = (kind, tag.split_first()) {
+                txn.put(
+                    dbi,
+                    &tag_kind_key(name, value, kind, created_at),
+                    &lev_id.to_ne_bytes(),
+                    0,
+                )?;
+                work.entries += 1;
+            }
+            visited += 1;
+            position = Some((key, lev_id));
+            if limits.reached(visited) {
+                break 'step;
+            }
         }
-        if limits.reached(visited) {
+        if at_end {
+            walked_to_end = true;
             break;
         }
     }
     pass.visited += visited as u64;
-    if walked_to_end && visited == batch.len() {
+    if walked_to_end {
         // Every event at or below the target has its postings.
         let indexed_through = pass.target.max(through);
         txn.clear(build)?;
         set_marker(txn, dbi, INDEXED_THROUGH_KEY, indexed_through)?;
-        return Ok((entries, indexed_through, None));
+        return Ok((work, indexed_through, None));
     }
-    let (key, lev_id) = &batch[visited - 1];
-    let mut cursor = key.clone();
-    cursor.extend_from_slice(&lev_id.to_ne_bytes());
-    txn.put(build, PASS_CURSOR_KEY, &cursor, 0)?;
+    if let Some((key, lev_id)) = &position {
+        let mut cursor = key.clone();
+        cursor.extend_from_slice(&lev_id.to_ne_bytes());
+        txn.put(build, PASS_CURSOR_KEY, &cursor, 0)?;
+    }
     write_pass(txn, build, pass)?;
-    Ok((entries, through, Some(pass)))
+    Ok((work, through, Some(pass)))
 }
 
 /// Index the stored events above the marker in local-id order and move the
@@ -441,50 +482,47 @@ fn local_id_step(
     through: u64,
     high_water: u64,
     limits: StepLimits,
-) -> Result<(u64, u64), DbError> {
-    let mut batch = Vec::new();
-    let mut error = None;
-    let mut walked_to_end = true;
-    if through < high_water {
-        walked_to_end = txn.foreach_full(
+) -> Result<(StepWork, u64), DbError> {
+    let mut work = StepWork::default();
+    let mut done = through;
+    let mut walked_to_end = through >= high_water;
+    'step: while !walked_to_end {
+        let mut chunk = Vec::new();
+        let mut error = None;
+        let at_end = txn.foreach_full(
             txn.env().dbis().event,
-            &through.saturating_add(1).to_ne_bytes(),
+            &done.saturating_add(1).to_ne_bytes(),
             &[],
             false,
             |key, value| {
                 let event = crate::keys::u64_from_ne_checked(key)
                     .and_then(|lev_id| Ok((lev_id, tag_kind_keys(PackedEventView::new(value)?))));
                 match event {
-                    Ok(event) => batch.push(event),
+                    Ok(event) => chunk.push(event),
                     Err(err) => error = Some(err),
                 }
-                error.is_none() && batch.len() < limits.max_entries
+                error.is_none() && chunk.len() < STEP_CHUNK
             },
         )?;
-    }
-    if let Some(error) = error {
-        return Err(error);
-    }
-    let mut done = 0;
-    let mut entries = 0;
-    for (lev_id, keys) in &batch {
-        put_tag_kind_entries(txn, *lev_id, keys)?;
-        done += 1;
-        entries += keys.len();
-        if limits.reached(entries) {
-            break;
+        if let Some(error) = error {
+            return Err(error);
         }
+        work.prepared += chunk.len() as u64;
+        for (lev_id, keys) in chunk {
+            put_tag_kind_entries(txn, lev_id, &keys)?;
+            work.entries += keys.len() as u64;
+            done = lev_id;
+            if limits.reached(usize::try_from(work.entries).unwrap_or(usize::MAX)) {
+                break 'step;
+            }
+        }
+        walked_to_end = at_end;
     }
-    let indexed_through = if walked_to_end && done == batch.len() {
-        high_water
-    } else {
-        batch[done - 1].0
-    }
-    .max(through);
+    let indexed_through = if walked_to_end { high_water } else { done }.max(through);
     if indexed_through != through {
         set_marker(txn, dbi, INDEXED_THROUGH_KEY, indexed_through)?;
     }
-    Ok((entries as u64, indexed_through))
+    Ok((work, indexed_through))
 }
 
 fn read_pass(target: Option<&[u8]>, visited: Option<&[u8]>) -> Option<TagKindBulkPass> {
@@ -769,11 +807,40 @@ mod tests {
         let steps: Vec<_> = (0..4)
             .map(|_| progress(step_within(&env, 10, Duration::ZERO)))
             .collect();
-        // The third step reaches the last entry and ends the pass.
         assert_eq!(
             steps,
-            [(1, 0, Some(1)), (1, 0, Some(2)), (1, 3, None), (0, 3, None)]
+            [
+                (1, 0, Some(1)),
+                (1, 0, Some(2)),
+                (1, 0, Some(3)),
+                (0, 3, None)
+            ]
         );
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn a_step_out_of_time_reads_ahead_by_at_most_a_chunk() {
+        let (_dir, env) = unindexed(200);
+        let pass = step_within(&env, 5_000, Duration::ZERO);
+        assert_eq!(pass.entries, 1);
+        assert!(pass.prepared <= STEP_CHUNK as u64, "{pass:?}");
+
+        // The same in local-id order, behind an earlier release's inserts.
+        while state(&env).bulk_pass.is_some() {
+            step(&env, 5_000);
+        }
+        let through = state(&env).indexed_through;
+        let events: Vec<_> = (0..200).map(|time| write(&env, 1_000 + time)).collect();
+        for event in &events {
+            as_if_inserted_by_an_earlier_release(&env, event, through);
+        }
+        let catch_up = step_within(&env, 5_000, Duration::ZERO);
+        assert_eq!((catch_up.entries, catch_up.state.bulk_pass), (1, None));
+        assert!(catch_up.prepared <= STEP_CHUNK as u64, "{catch_up:?}");
+        while !state(&env).complete() {
+            step(&env, 5_000);
+        }
         assert_complete_and_consistent(&env);
     }
 

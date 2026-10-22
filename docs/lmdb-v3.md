@@ -177,7 +177,11 @@ drops them.
 The writer runs one backfill step before each batch of messages it takes,
 and keeps going while it is idle, until the index is complete. A step ends
 after 5,000 postings or 10 ms of indexing, whichever comes first, then
-commits. Steps come in two kinds:
+commits; it reads entries ahead 64 at a time, so the time limit covers
+preparing them too. While free disk space is below
+`database.min_free_disk_bytes`, the reserve that also refuses publications,
+the build waits, and each maintenance tick checks again. Steps come in two
+kinds:
 
 - **Key order**, for a table at marker 0 with events stored. The step walks
   `Event__tag` from a cursor, reads each entry's event for its kind and puts

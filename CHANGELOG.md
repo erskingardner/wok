@@ -84,7 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relay builds the index for the stored events in the background, without
   delaying startup: a key-ordered pass over the tag index, in steps of at
   most 10 ms of indexing between writer batches, resumed after a restart.
-  A 1M-event database took about 12 s and wrote about 3 GB to disk, and
+  It pauses while free disk space is below `database.min_free_disk_bytes`.
+  A 1M-event database took about 13 s and wrote about 3 GB to disk, and
   publication acknowledgements stayed within a few milliseconds of their
   usual latency. Progress is logged every 10 s and exported as
   `wok_tag_kind_index_*` and `wok_tag_kind_backfill_*` metrics.

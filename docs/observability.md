@@ -137,8 +137,12 @@ events an earlier release inserted), its progress every 10 seconds (`visited`
 and `tag_entries`, or `indexed_through` and `high_water`), and its end (`the
 (tag, kind, created_at) index is complete`, with `entries`, `seconds` and
 `slowest_step_ms`). Each step logs at `debug` on the
-`wok_relay::server::writer` target with its `entries` and `ms`. A step that
-fails logs at `error`; the writer retries on its next maintenance tick.
+`wok_relay::server::writer` target with its `entries`, `prepared` and `ms`.
+A step that fails logs at `error`; the writer retries on its next
+maintenance tick. While free disk space is below
+`database.min_free_disk_bytes`, the build pauses with one `warn` (`pausing
+the (tag, kind, created_at) index build`) and logs `resuming ...` once a
+maintenance tick finds the space.
 
 ## Bounded dashboard history
 

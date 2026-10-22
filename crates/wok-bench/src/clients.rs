@@ -1029,7 +1029,7 @@ fn setting_for(reason: &str) -> &'static str {
         "relay.abuse.connection_rate_per_second / connection_burst"
     } else if r.contains("invalid messages") {
         "relay.abuse.invalid_rate_per_second / invalid_burst"
-    } else if r.contains("query cost") {
+    } else if r.contains("query too broad") {
         "relay.abuse.max_query_work"
     } else if r.contains("synchronization memory") {
         "relay.sync_memory_per_connection / sync_memory_total"
@@ -3605,8 +3605,11 @@ mod tests {
     #[test]
     fn refusals_group_by_reason_and_name_their_setting() {
         assert_eq!(
-            normalize_reason("rate-limited: estimated query cost 1125 exceeds 1000"),
-            "rate-limited: estimated query cost N exceeds N"
+            normalize_reason(
+                "blocked: query too broad (cost 102000 > 20000); split the REQ or narrow \
+                 authors/kinds"
+            ),
+            "blocked: query too broad (cost N > N); split the REQ or narrow authors/kinds"
         );
         for (reason, setting) in [
             (
@@ -3626,7 +3629,7 @@ mod tests {
                 "relay.abuse.event_rate_per_second / event_burst",
             ),
             (
-                "rate-limited: estimated query cost N exceeds N",
+                "blocked: query too broad (cost N > N); split the REQ or narrow authors/kinds",
                 "relay.abuse.max_query_work",
             ),
             (
@@ -3980,7 +3983,7 @@ mod tests {
             !report
                 .refusals
                 .iter()
-                .any(|r| r.reason.contains("query cost")),
+                .any(|r| setting_for(&r.reason) == "relay.abuse.max_query_work"),
             "{:#?}",
             report.refusals
         );

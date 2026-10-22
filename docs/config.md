@@ -472,10 +472,13 @@ off, such as `max_stored_events` in the public preset, is not warned about.
 
 Before a REQ, COUNT or NEG-OPEN opens a cursor, the relay estimates how many
 index entries it would touch and refuses it if the estimate is over
-`max_query_work`. A REQ gets `CLOSED rate-limited: estimated query cost
-<n> exceeds <max>`, a COUNT the same, and a NEG-OPEN `NEG-ERR` with that
-reason. `wok_abuse_rejections_total{reason="query_cost"}` counts them, and
-NIP-11 advertises the ceiling as `limitation.max_query_work`.
+`max_query_work`. A REQ gets `CLOSED blocked: query too broad (cost <n> >
+<max>); split the REQ or narrow authors/kinds`, a COUNT the same naming the
+COUNT, and a NEG-OPEN `NEG-ERR` naming the NEG-OPEN. `blocked:` tells the
+client that sending the same request again won't help.
+`wok_abuse_rejections_total{reason="query_cost"}` counts the refusals. NIP-11
+advertises the ceiling as `limitation.max_query_work` while
+`relay.abuse.enabled` is on and the ceiling is not zero.
 
 A filter's estimate follows the plan its scan will run. It counts the
 cursors the plan opens:

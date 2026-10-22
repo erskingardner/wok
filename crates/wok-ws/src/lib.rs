@@ -377,10 +377,14 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "created_at_upper_limit": cfg.events.reject_newer_than_secs,
             "default_limit": cfg.relay.max_filter_limit,
             "min_pow_difficulty": min_pow_difficulty,
-            "max_query_work": cfg.relay.abuse.max_query_work,
             "max_concurrent_historical_queries": cfg.relay.abuse.max_concurrent_historical_queries,
         }
     });
+    // The ceiling applies only while abuse controls are on, and zero is no
+    // ceiling.
+    if cfg.relay.abuse.enabled && cfg.relay.abuse.max_query_work != 0 {
+        v["limitation"]["max_query_work"] = serde_json::json!(cfg.relay.abuse.max_query_work);
+    }
     // NIP-11 has no value for "no lower bound", so the field is omitted.
     if cfg.events.reject_older_than_secs != 0 {
         v["limitation"]["created_at_lower_limit"] =

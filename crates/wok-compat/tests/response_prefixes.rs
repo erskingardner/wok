@@ -263,6 +263,7 @@ async fn req_refusals_use_the_prefix_that_fits() {
         cfg.relay.max_filter_limit_count = 0;
         cfg.relay.filter_validation.allowed_kinds = "1".into();
         cfg.relay.filter_validation.require_author_or_tag = true;
+        cfg.relay.abuse.max_query_work = 10;
     });
     let (conn, mut rx) = relay.connection().await;
     let author = "ab".repeat(32);
@@ -278,6 +279,11 @@ async fn req_refusals_use_the_prefix_that_fits() {
         (
             json!(["REQ", "s", {"kinds": [1]}]),
             "blocked: bad req: filter validation failed: filter must have exactly one author, p tag, or e tag",
+        ),
+        // Resending a request over the query-work ceiling cannot help.
+        (
+            json!(["REQ", "s", {"authors": [author], "kinds": [1], "limit": 20}]),
+            "blocked: query too broad (cost 21 > 10); split the REQ or narrow authors/kinds",
         ),
     ];
     for (req, reason) in cases {

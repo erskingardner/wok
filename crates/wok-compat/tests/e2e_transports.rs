@@ -1180,6 +1180,37 @@ async fn nip11_omits_created_at_lower_limit_without_a_bound() {
     handle.request_shutdown();
 }
 
+/// The query-work ceiling is advertised only while it refuses something:
+/// with abuse controls on and a nonzero value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip11_advertises_max_query_work_only_while_it_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let handle = wok_relay::start(env, test_cfg(dir.path())).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let advertised = |limitation: &serde_json::Value| limitation.get("max_query_work").cloned();
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(advertised(limitation), Some(json!(20_000)), "{limitation}");
+    handle.config.write().relay.abuse.max_query_work = 0;
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(advertised(limitation), None, "{limitation}");
+    {
+        let mut cfg = handle.config.write();
+        cfg.relay.abuse.max_query_work = 20_000;
+        cfg.relay.abuse.enabled = false;
+    }
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(advertised(limitation), None, "{limitation}");
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip11_and_nip86_accept_cors_requests() {
     let dir = tempfile::tempdir().unwrap();

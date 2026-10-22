@@ -5694,12 +5694,16 @@ mod tests {
             "created_at": now_secs(), "kind": 1, "tags": [], "content": "precheck"
         }));
         let id = event["id"].as_str().unwrap().to_string();
-        fault::fail_reads(env.path(), 1);
+        // Every read fails until the reply: the req monitor reads through
+        // `begin_read` too, and could take a single injected failure first.
+        fault::fail_reads(env.path(), usize::MAX);
         handle
             .client_message(conn, local_source(), json!(["EVENT", event]).to_string())
             .await;
+        let reply = recv_outbound(&mut rx).await;
+        fault::fail_reads(env.path(), 0);
         assert_eq!(
-            recv_outbound(&mut rx).await,
+            reply,
             json!(["OK", id, false, "error: injected read failure"]).to_string()
         );
         handle

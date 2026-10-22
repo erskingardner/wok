@@ -5,11 +5,28 @@ use wok_event::MAX_SUBID_SIZE;
 pub enum QueryError {
     #[error("{0}")]
     Message(String),
+    /// The request uses something this relay does not implement, such as a
+    /// filter key NIP-01 does not define: NIP-01's `unsupported:` rather
+    /// than `invalid:`.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 impl QueryError {
     pub fn msg(m: impl Into<String>) -> Self {
         Self::Message(m.into())
+    }
+
+    pub fn unsupported(m: impl Into<String>) -> Self {
+        Self::Unsupported(m.into())
+    }
+
+    /// NIP-01 machine-readable prefix for refusing a request with this error.
+    pub fn reason_prefix(&self) -> &'static str {
+        match self {
+            Self::Message(_) => "invalid",
+            Self::Unsupported(_) => "unsupported",
+        }
     }
 }
 

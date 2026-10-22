@@ -110,7 +110,7 @@ impl EoseHints {
 pub enum ParseFailure {
     /// `bad msg: ...` -> NOTICE (envelope-level failures, unknown commands)
     BadMsg(String),
-    /// `bad req: ...` -> NOTICE (REQ/COUNT failures before the sub id is known)
+    /// `bad req: ...` -> NOTICE (REQ/COUNT whose sub id is not a string)
     BadReq(String),
     /// `bad close: ...` -> NOTICE
     BadClose(String),
@@ -324,8 +324,9 @@ impl RelayMessage {
     }
 }
 
-/// Machine-readable prefixes defined by NIP-01 (plus NIP-42's `auth-required`)
-/// for OK, CLOSED and NEG-ERR reasons.
+/// Machine-readable prefixes defined by NIP-01 (plus NIP-42's `auth-required`,
+/// and `unsupported`, which NIP-01's CLOSED example uses) for OK, CLOSED and
+/// NEG-ERR reasons.
 const REASON_PREFIXES: &[&str] = &[
     "auth-required",
     "blocked",
@@ -336,6 +337,7 @@ const REASON_PREFIXES: &[&str] = &[
     "pow",
     "rate-limited",
     "restricted",
+    "unsupported",
 ];
 
 /// OK reason for a replaceable or addressable event older than the version
@@ -415,6 +417,9 @@ mod tests {
             "restricted: too many authenticated identities"
         ));
         assert!(has_reason_prefix("auth-required: authenticate first"));
+        assert!(has_reason_prefix(
+            "unsupported: filter contains unknown elements"
+        ));
         assert!(!has_reason_prefix("challenge string mismatch"));
         assert!(!has_reason_prefix("Write error: disk full"));
         assert!(!has_reason_prefix("restricted:no space"));

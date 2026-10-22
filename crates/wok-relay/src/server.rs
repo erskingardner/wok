@@ -281,8 +281,8 @@ impl ConnTable {
         });
     }
 
-    /// CLOSE, or a REQ that names the id and fails before refusal (no CLOSED
-    /// owed). Returns the generation it closed, for the workers' cleanup.
+    /// CLOSE (no CLOSED owed). Returns the generation it closed, for the
+    /// workers' cleanup.
     fn close_sub(&self, conn_id: u64, ns: Ns, sub_id: &SubId) -> Option<u64> {
         self.with(conn_id, |_, state| state.subs.close(ns, sub_id))
             .flatten()
@@ -2506,7 +2506,7 @@ fn ingest_event(
         // and the single writer. The writer still performs the authoritative
         // lookup inside its transaction to close the concurrent-insert race.
         let dup = (|| -> Result<bool, String> {
-            let txn = env.begin_ro().map_err(|e| e.to_string())?;
+            let txn = begin_read(env).map_err(|e| e.to_string())?;
             Ok(lookup_event_by_id_ro(&txn, packed.id())
                 .map_err(|e| e.to_string())?
                 .is_some())
@@ -2531,7 +2531,7 @@ fn ingest_event(
                     RelayMessage::Ok {
                         event_id: id_hex,
                         accepted: false,
-                        message: format!("invalid: {error}"),
+                        message: format!("error: {error}"),
                     },
                     metrics,
                 );
@@ -2717,16 +2717,10 @@ fn ingest_req(
 ) {
     let ns = if count_only { Ns::Count } else { Ns::Req };
     if filters.is_empty() {
-        // C++ RelayIngester raises "arr too small" as a NOTICE, before the
-        // sub id is known. The request still replaces the one it names.
-        if let Ok(sid) = SubId::new(&sub_id) {
-            close_req(conns, dispatch, conn_id, ns, sid);
-        }
-        conns.send(
-            conn_id,
-            RelayMessage::notice_error("bad req: arr too small"),
-            metrics,
-        );
+        // NIP-01: a refused REQ gets CLOSED. C++ RelayIngester raises
+        // "arr too small" as a NOTICE, before it reads the sub id.
+        let reason = "invalid: bad req: arr too small".to_string();
+        refuse_req(conns, metrics, dispatch, conn_id, ns, &sub_id, reason);
         return;
     }
     let admitted = admit_req(
@@ -2774,7 +2768,9 @@ fn ingest_req(
 
 /// Every check a REQ or COUNT passes before any worker sees it, returning
 /// the subscription and its serialized filter bytes. `Err` is the CLOSED
-/// reason.
+/// reason: `invalid:` for a malformed request or one over a size limit,
+/// `unsupported:` for filter elements the relay does not know, and
+/// `blocked:` for an operator rule that applies to every client.
 #[allow(clippy::too_many_arguments)]
 fn admit_req(
     cfg: &Config,
@@ -2786,26 +2782,29 @@ fn admit_req(
     filters: Vec<Value>,
     count_only: bool,
 ) -> Result<(Subscription, usize), String> {
-    // C++ RelayIngester: once the sub id is known, errors are a NIP-01
-    // CLOSED with an `error:` machine-readable prefix.
-    let bad_req = |e: String| format!("error: bad req: {e}");
+    // C++ RelayIngester sends `error: bad req: ...` for all of these. The
+    // text after the prefix is kept.
+    let bad_req = |prefix: &str, e: String| format!("{prefix}: bad req: {e}");
     if filters.len() > cfg.relay.max_filters_per_req {
-        // Preserve strfry's wire error for its legacy filter-count ceiling.
-        return Err(bad_req("arr too big".into()));
+        // Keep strfry's wording for its legacy filter-count ceiling.
+        return Err(bad_req("invalid", "arr too big".into()));
     }
     let serialized_filter_bytes = filters.iter().fold(0usize, |total, filter| {
         total.saturating_add(filter.to_string().len())
     });
     if serialized_filter_bytes > cfg.relay.max_req_filter_size {
-        return Err(bad_req(format!(
-            "filters exceed {} serialized bytes",
-            cfg.relay.max_req_filter_size
-        )));
+        return Err(bad_req(
+            "invalid",
+            format!(
+                "filters exceed {} serialized bytes",
+                cfg.relay.max_req_filter_size
+            ),
+        ));
     }
     let max_limit = if count_only {
         let m = cfg.relay.max_filter_limit_count + 1;
         if m == 1 {
-            return Err(bad_req("COUNT disabled".into()));
+            return Err(bad_req("blocked", "COUNT disabled".into()));
         }
         m
     } else {
@@ -2819,9 +2818,9 @@ fn admit_req(
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
     )
-    .map_err(|e| bad_req(e.to_string()))?;
+    .map_err(|e| bad_req(e.reason_prefix(), e.to_string()))?;
     if let Err(e) = filter_validator(cfg).validate(&fg) {
-        return Err(bad_req(format!("filter validation failed: {e}")));
+        return Err(bad_req("blocked", format!("filter validation failed: {e}")));
     }
     let query_cost = fg.estimated_cost(count_only);
     if cfg.relay.abuse.enabled
@@ -2852,7 +2851,7 @@ fn admit_req(
     if requires_auth {
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
-    let sid = SubId::new(sub_id).map_err(|e| bad_req(e.to_string()))?;
+    let sid = SubId::new(sub_id).map_err(|e| bad_req("invalid", e.to_string()))?;
     // Pending and live subscriptions both count. Over a lowered cap an open
     // id can still be replaced; new ids wait until the count drops.
     if !count_only
@@ -3043,7 +3042,8 @@ fn neg_err(
 }
 
 /// NEG-OPEN (`filter` is `Some`) or NEG-MSG. Every refusal that can name the
-/// subscription is a NEG-ERR; only an unaddressable sub id falls back to NOTICE.
+/// subscription is a NEG-ERR, as is a NEG-OPEN whose sub id is invalid; only
+/// a NEG-MSG with an invalid sub id falls back to NOTICE.
 #[allow(clippy::too_many_arguments)]
 fn ingest_neg_command(
     cfg: &Config,
@@ -3081,6 +3081,13 @@ fn ingest_neg_command(
     }
     let sid = match SubId::new(&sub_id) {
         Ok(sid) => sid,
+        // A NEG-OPEN is refused like a REQ, with a reply naming its id. No
+        // session can have an invalid id, so there is none to close.
+        Err(e) if filter.is_some() => {
+            let reason = format!("invalid: {e}");
+            neg_err(conns, metrics, dispatch, conn_id, &sub_id, reason);
+            return;
+        }
         Err(e) => {
             conns.send(
                 conn_id,
@@ -3146,7 +3153,7 @@ fn ingest_neg(
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
     )
-    .map_err(|e| format!("invalid: {e}"))?;
+    .map_err(|e| format!("{}: {e}", e.reason_prefix()))?;
     let query_cost = fg.estimated_cost(false);
     if cfg.relay.abuse.enabled
         && cfg.relay.abuse.max_query_cost != 0
@@ -3189,8 +3196,9 @@ fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::
     }
 }
 
-/// A read transaction for the req worker and monitor. Tests can make the
-/// next few fail for one database (`fault::fail_reads`).
+/// A read transaction for the req worker, the monitor and the ingester's
+/// duplicate pre-check. Tests can make the next few fail for one database
+/// (`fault::fail_reads`).
 fn begin_read(env: &Env) -> Result<wok_db::RoTxn<'_>, wok_db::DbError> {
     #[cfg(test)]
     if fault::read_fails(env.path()) {
@@ -5161,7 +5169,7 @@ mod tests {
             .await;
         assert_eq!(
             recv_outbound(&mut rx).await,
-            r#"["CLOSED","a","error: bad req: arr too big"]"#
+            r#"["CLOSED","a","invalid: bad req: arr too big"]"#
         );
         let four_kinds = json!(["REQ", "b", {"kinds": [0, 1, 3, 7]}]);
         handle
@@ -5169,7 +5177,7 @@ mod tests {
             .await;
         assert_eq!(
             recv_outbound(&mut rx).await,
-            r#"["CLOSED","b","error: bad req: filter validation failed: too many kinds in filter: 4"]"#
+            r#"["CLOSED","b","blocked: bad req: filter validation failed: too many kinds in filter: 4"]"#
         );
         let within = json!(["REQ", "c", filter, filter, {"kinds": [0, 3, 10002]}]);
         assert_eq!(history_len(&handle, conn, &mut rx, within).await, 0);
@@ -5665,6 +5673,45 @@ mod tests {
                 .abuse_disk_reserve_rejections
                 .load(Ordering::Relaxed),
             1
+        );
+        handle.request_shutdown();
+    }
+
+    /// The duplicate pre-check failing to read is the relay's failure, not
+    /// the event's, so the OK is `error:` (NIP-01: "for when none of that
+    /// fits"), not `invalid:`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_precheck_read_failures_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.enabled = false;
+        let handle = start(env.clone(), cfg).unwrap();
+        let (conn, mut rx) = live_conn(&handle).await;
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "precheck"
+        }));
+        let id = event["id"].as_str().unwrap().to_string();
+        // Every read fails until the reply: the req monitor reads through
+        // `begin_read` too, and could take a single injected failure first.
+        fault::fail_reads(env.path(), usize::MAX);
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", event]).to_string())
+            .await;
+        let reply = recv_outbound(&mut rx).await;
+        fault::fail_reads(env.path(), 0);
+        assert_eq!(
+            reply,
+            json!(["OK", id, false, "error: injected read failure"]).to_string()
+        );
+        handle
+            .client_message(conn, local_source(), json!(["EVENT", event]).to_string())
+            .await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            json!(["OK", id, true, ""]).to_string()
         );
         handle.request_shutdown();
     }
@@ -6839,7 +6886,7 @@ mod tests {
         assert!(frame(&mut relay).starts_with(r#"["EVENT","x""#));
 
         relay.send(2, json!(["REQ", "x", {"kinds": [1], "nope": true}]));
-        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","error: "#));
+        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","unsupported: "#));
         assert!(matches!(
             next(&relay),
             ReqMsg::Cancel { generation, count_only: false, .. } if generation == first.generation
@@ -6857,7 +6904,7 @@ mod tests {
             .send_sub(2, &x, first.generation, eose, &metrics);
         // A refusal again, with nothing open: answered as directly.
         relay.send(2, json!(["REQ", "x", {"kinds": [1], "nope": true}]));
-        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","error: "#));
+        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","unsupported: "#));
 
         relay.send(2, json!(["REQ", "x", {"kinds": [1]}]));
         let ReqMsg::Scan(second) = next(&relay) else {

@@ -313,7 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `enabled = true`: its rules still apply, with 0.7's default of 3 for a
     `max_kinds_per_filter` it leaves out. Its `max_filters_per_req` (or the
     old default, 3) becomes `relay.max_filters_per_req` when that is
-    lower, so such a REQ is now refused with `error: bad req: arr too big`
+    lower, so such a REQ is now refused with `invalid: bad req: arr too big`
     instead of `filter validation failed: invalid number of filters`.
     `min_filters_per_req` is dropped with a warning, because nothing
     equivalent remains and a REQ needs only one filter.
@@ -335,6 +335,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A REQ or COUNT with no filters is refused with `CLOSED` (`invalid: bad req:
+  arr too small`), as NIP-01 requires for a refused REQ, instead of a NOTICE
+  that did not say which subscription was refused. A NEG-OPEN with an
+  invalid subscription id gets NIP-77 `NEG-ERR` (`invalid:`) instead of a
+  NOTICE.
+- REQ and COUNT refusals use NIP-01's machine-readable prefixes instead of
+  `error:`, which NIP-01 keeps for when none of the others fits. The text
+  after the prefix is unchanged:
+  - `invalid:` for malformed filters and for requests over a size limit, as
+    in `invalid: bad req: arr too big`;
+  - `unsupported:` for filter elements NIP-01 does not define, such as an
+    unknown key or a tag key that is not a single letter; NEG-OPEN filters
+    get it too;
+  - `blocked:` for the `relay.filter_validation` rules and for COUNT
+    disabled by `relay.max_filter_limit_count = 0`.
+  A write-policy plugin's reason that starts with `unsupported:` is now sent
+  as is, rather than as `blocked: unsupported: ...`.
+- An EVENT whose duplicate check could not read the database was refused
+  with `invalid:`. It now gets `error:`, because the failure is the relay's.
 - A REQ with many filters could hold a req worker well past its time slice
   (`relay.query_timeslice_budget_us`), and every query behind it waited.
   Each filter restarted the slice's clock, and a filter that followed a long

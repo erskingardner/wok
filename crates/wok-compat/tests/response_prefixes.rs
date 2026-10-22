@@ -1,6 +1,7 @@
 //! Pins the machine-readable prefixes on refusals that clients act on:
 //! `auth-required:` only while AUTH can still help, a final `restricted:` or
-//! `blocked:` otherwise, and NIP-77 refusals as NEG-ERR (which closes the
+//! `blocked:` otherwise, `invalid:` and `unsupported:` for requests the relay
+//! cannot serve as sent, and NIP-77 refusals as NEG-ERR (which closes the
 //! session) rather than NOTICE.
 #![allow(clippy::field_reassign_with_default)]
 
@@ -144,6 +145,148 @@ async fn disk_reserve_refusals_are_errors() {
     conn.close().await;
 }
 
+/// NIP-01: a refused REQ or COUNT gets CLOSED with the prefix that fits, and
+/// `error:` only "for when none of that fits". Malformed filters and requests
+/// over a size limit are `invalid:`, filter elements NIP-01 does not define
+/// are `unsupported:` (NIP-01's own example), and operator rules that apply
+/// to every client are `blocked:`. The text after the prefix is strfry's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn req_refusals_use_the_prefix_that_fits() {
+    let relay = Relay::new(|cfg| {
+        cfg.relay.max_filters_per_req = 2;
+        cfg.relay.max_tags_per_filter = 1;
+        cfg.relay.max_and_entries = 1;
+    });
+    let (conn, mut rx) = relay.connection().await;
+    let hex = "ab".repeat(32);
+    let cases = [
+        (json!(["REQ", "s"]), "invalid: bad req: arr too small"),
+        (json!(["COUNT", "s"]), "invalid: bad req: arr too small"),
+        (
+            json!(["REQ", "s", {}, {}, {}]),
+            "invalid: bad req: arr too big",
+        ),
+        (
+            json!(["REQ", "s", "kinds"]),
+            "invalid: bad req: provided filter is not an object",
+        ),
+        (
+            json!(["REQ", "s", {"kinds": "1"}]),
+            "invalid: bad req: kinds not an array",
+        ),
+        (
+            json!(["REQ", "s", {"kinds": [70000]}]),
+            "invalid: bad req: error parsing kinds: kind must be between 0 and 65535",
+        ),
+        (
+            json!(["REQ", "s", {"ids": ["zz".repeat(32)]}]),
+            "invalid: bad req: error parsing ids: hex must be lowercase ASCII",
+        ),
+        (
+            json!(["REQ", "s", {"authors": ["abcd"]}]),
+            "invalid: bad req: error parsing authors: filter item too small",
+        ),
+        (
+            json!(["REQ", "s", {"#p": [7]}]),
+            "invalid: bad req: error parsing #p: filter item not a string",
+        ),
+        (
+            json!(["REQ", "s", {"limit": -1}]),
+            "invalid: bad req: error parsing limit",
+        ),
+        (
+            json!(["REQ", "s", {"#e": [hex], "#p": [hex]}]),
+            "invalid: bad req: too many tags in filter",
+        ),
+        (
+            json!(["REQ", "s", {"&t": ["a", "b"]}]),
+            "invalid: bad req: too many AND entries in filter",
+        ),
+        (
+            json!(["REQ", "x".repeat(65), {}]),
+            "invalid: bad req: invalid subscription id length",
+        ),
+        (
+            json!(["REQ", "s", {"colour": ["red"]}]),
+            "unsupported: bad req: unrecognised filter item: colour",
+        ),
+        (
+            json!(["COUNT", "s", {"colour": ["red"]}]),
+            "unsupported: bad req: unrecognised filter item: colour",
+        ),
+        (
+            json!(["REQ", "s", {"#tt": ["x"]}]),
+            "unsupported: bad req: unindexed tag filter",
+        ),
+        (
+            json!(["REQ", "s", {"#1": ["x"]}]),
+            "unsupported: bad req: unindexed tag filter",
+        ),
+        (
+            json!(["REQ", "s", {"&tt": ["x"]}]),
+            "unsupported: bad req: unindexed AND tag filter",
+        ),
+        // An undefined key is unsupported whatever its value.
+        (
+            json!(["REQ", "s", {"#tt": "x"}]),
+            "unsupported: bad req: unindexed tag filter",
+        ),
+        (
+            json!(["REQ", "s", {"#1": 1}]),
+            "unsupported: bad req: unindexed tag filter",
+        ),
+        (
+            json!(["REQ", "s", {"&tt": []}]),
+            "unsupported: bad req: unindexed AND tag filter",
+        ),
+        (
+            json!(["REQ", "s", {"#t": "x"}]),
+            "invalid: bad req: #t not an array",
+        ),
+        (
+            json!(["REQ", "s", {"&t": []}]),
+            "invalid: bad req: &t array must not be empty",
+        ),
+    ];
+    for (req, reason) in cases {
+        send(&conn, req.clone()).await;
+        let sub_id = req[1].as_str().unwrap();
+        assert_eq!(
+            recv(&mut rx).await,
+            json!(["CLOSED", sub_id, reason]),
+            "{req}"
+        );
+    }
+    conn.close().await;
+
+    let relay = Relay::new(|cfg| {
+        cfg.relay.max_filter_limit_count = 0;
+        cfg.relay.filter_validation.allowed_kinds = "1".into();
+        cfg.relay.filter_validation.require_author_or_tag = true;
+    });
+    let (conn, mut rx) = relay.connection().await;
+    let author = "ab".repeat(32);
+    let cases = [
+        (
+            json!(["COUNT", "s", {"kinds": [1]}]),
+            "blocked: bad req: COUNT disabled",
+        ),
+        (
+            json!(["REQ", "s", {"authors": [author], "kinds": [7]}]),
+            "blocked: bad req: filter validation failed: kind not allowed: 7",
+        ),
+        (
+            json!(["REQ", "s", {"kinds": [1]}]),
+            "blocked: bad req: filter validation failed: filter must have exactly one author, p tag, or e tag",
+        ),
+    ];
+    for (req, reason) in cases {
+        send(&conn, req.clone()).await;
+        assert_eq!(recv(&mut rx).await, json!(["CLOSED", "s", reason]), "{req}");
+    }
+    conn.close().await;
+}
+
 /// NIP-42 flow: `auth-required:` and a challenge, AUTH, then the same REQ id
 /// is re-sent and served. Once authenticated, a COUNT not scoped to an
 /// authenticated key is `restricted:` rather than another `auth-required:`, so
@@ -227,7 +370,8 @@ async fn auth_challenge_is_sent_on_connect() {
 }
 
 /// Every NEG-OPEN / NEG-MSG refusal that can name its subscription is a
-/// NEG-ERR, so sync clients stop waiting; only an unusable sub id is a NOTICE.
+/// NEG-ERR, so sync clients stop waiting. A NEG-OPEN is refused like a REQ
+/// even when its sub id is invalid; only a NEG-MSG with one is a NOTICE.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn negentropy_refusals_are_neg_err() {
     let relay = Relay::new(|_| {});
@@ -243,6 +387,20 @@ async fn negentropy_refusals_are_neg_err() {
     .await;
     assert_reply(&recv(&mut rx).await, "NEG-ERR", "filter", "invalid: ");
 
+    send(
+        &conn,
+        json!(["NEG-OPEN", "unknown", {"colour":["red"]}, neg_initial()]),
+    )
+    .await;
+    assert_eq!(
+        recv(&mut rx).await,
+        json!([
+            "NEG-ERR",
+            "unknown",
+            "unsupported: unrecognised filter item: colour"
+        ])
+    );
+
     send(&conn, json!(["NEG-MSG", "msg", "zz"])).await;
     assert_reply(&recv(&mut rx).await, "NEG-ERR", "msg", "invalid: ");
 
@@ -257,11 +415,13 @@ async fn negentropy_refusals_are_neg_err() {
         assert_reply(&recv(&mut rx).await, "NEG-ERR", sid, "invalid: ");
     }
 
-    send(
-        &conn,
-        json!(["NEG-OPEN", "x".repeat(65), {}, neg_initial()]),
-    )
-    .await;
+    let long = "x".repeat(65);
+    send(&conn, json!(["NEG-OPEN", long, {}, neg_initial()])).await;
+    assert_eq!(
+        recv(&mut rx).await,
+        json!(["NEG-ERR", long, "invalid: invalid subscription id length"])
+    );
+    send(&conn, json!(["NEG-MSG", long, neg_initial()])).await;
     let reply = recv(&mut rx).await;
     assert_eq!(reply[0], "NOTICE", "{reply}");
     assert!(

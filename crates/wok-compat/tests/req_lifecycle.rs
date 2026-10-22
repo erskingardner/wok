@@ -473,55 +473,59 @@ async fn replacing_a_live_subscription_switches_filters_cleanly() {
 
 /// A refused REQ still replaces the subscription it names (NIP-01): the old
 /// one stops, whether it was live or still sending history, and nothing for
-/// the id follows the CLOSED.
+/// the id follows the CLOSED. A REQ with no filters is refused like any other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_replacement_closes_the_old_subscription() {
     let relay = Relay::new(true, |_| {});
-    let mut client = relay.client().await;
-    let bad = json!(["REQ", "x", {"kinds": [1], "nope": true}]);
-    client
-        .send(json!(["REQ", "sentinel", {"kinds": [20001]}]))
-        .await;
+    for bad in [
+        json!(["REQ", "x", {"kinds": [1], "nope": true}]),
+        json!(["REQ", "x"]),
+    ] {
+        let mut client = relay.client().await;
+        client
+            .send(json!(["REQ", "sentinel", {"kinds": [20001]}]))
+            .await;
 
-    // A live subscription.
-    client.send(json!(["REQ", "x", {"kinds": [20001]}])).await;
-    client
-        .recv_until(|c| c.has("EOSE", "x") && c.has("EOSE", "sentinel"))
-        .await;
-    client.send(bad.clone()).await;
-    client.recv_until(|c| c.has("CLOSED", "x")).await;
-    let probe = client.publish(20001, "probe", "after the refusal").await;
-    client.recv_until(|c| c.got("sentinel", &probe)).await;
-    client.settle(Duration::from_millis(200)).await;
-    let closed = client.position(|f| is(f, "CLOSED", "x"));
-    assert!(
-        !client.frames[closed..]
-            .iter()
-            .any(|f| f[1] == "x" && f[0] != "CLOSED"),
-        "{:?}",
-        &client.frames[closed..]
-    );
+        // A live subscription.
+        client.send(json!(["REQ", "x", {"kinds": [20001]}])).await;
+        client
+            .recv_until(|c| c.has("EOSE", "x") && c.has("EOSE", "sentinel"))
+            .await;
+        client.send(bad.clone()).await;
+        client.recv_until(|c| c.has("CLOSED", "x")).await;
+        let probe = client.publish(20001, "probe", "after the refusal").await;
+        client.recv_until(|c| c.got("sentinel", &probe)).await;
+        client.settle(Duration::from_millis(200)).await;
+        let closed = client.position(|f| is(f, "CLOSED", "x"));
+        assert!(
+            !client.frames[closed..]
+                .iter()
+                .any(|f| f[1] == "x" && f[0] != "CLOSED"),
+            "{bad}: {:?}",
+            &client.frames[closed..]
+        );
 
-    // One still sending its history, refused twice in a row: the second
-    // refusal must wait for the teardown the first one started.
-    client.clear();
-    client
-        .send(history_and(json!({"kinds": [20001], "#t": ["live"]})))
-        .await;
-    client.send(bad.clone()).await;
-    client.send(bad).await;
-    client.recv_until(|c| c.replies("CLOSED", "x") == 2).await;
-    let probe = client.publish(20001, "live", "after the refusal").await;
-    client.recv_until(|c| c.got("sentinel", &probe)).await;
-    client.settle(Duration::from_millis(500)).await;
-    let closed = client.position(|f| is(f, "CLOSED", "x"));
-    assert!(
-        !client.frames[closed + 1..]
-            .iter()
-            .any(|f| f[1] == "x" && f[0] != "CLOSED"),
-        "the old subscription outlived its refused replacement"
-    );
-    assert!(!client.has("EOSE", "x"));
+        // One still sending its history, refused twice in a row: the second
+        // refusal must wait for the teardown the first one started.
+        client.clear();
+        client
+            .send(history_and(json!({"kinds": [20001], "#t": ["live"]})))
+            .await;
+        client.send(bad.clone()).await;
+        client.send(bad.clone()).await;
+        client.recv_until(|c| c.replies("CLOSED", "x") == 2).await;
+        let probe = client.publish(20001, "live", "after the refusal").await;
+        client.recv_until(|c| c.got("sentinel", &probe)).await;
+        client.settle(Duration::from_millis(500)).await;
+        let closed = client.position(|f| is(f, "CLOSED", "x"));
+        assert!(
+            !client.frames[closed + 1..]
+                .iter()
+                .any(|f| f[1] == "x" && f[0] != "CLOSED"),
+            "{bad}: the old subscription outlived its refused replacement"
+        );
+        assert!(!client.has("EOSE", "x"), "{bad}");
+    }
 }
 
 /// The subscription cap is checked when the REQ arrives: the REQ over it

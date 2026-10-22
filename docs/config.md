@@ -394,7 +394,7 @@ continues in bounded batches.
 
 Optional rules for REQ and COUNT filters. Each applies when it is set and is
 off at its zero or empty value, which is the public preset's. A filter that
-breaks one is refused with `CLOSED` and `error: bad req: filter validation
+breaks one is refused with `CLOSED` and `blocked: bad req: filter validation
 failed: ...`.
 
 | Key | Default | Reload | Dashboard | Meaning |
@@ -418,7 +418,7 @@ deprecation warning:
   of 3 for a `max_kinds_per_filter` it leaves out.
   - Its `max_filters_per_req`, or 0.7's default of 3, becomes
     `relay.max_filters_per_req` when it is lower. Such a REQ is now refused
-    with `error: bad req: arr too big`.
+    with `invalid: bad req: arr too big`.
   - `min_filters_per_req` is dropped. A REQ needs only one filter.
   - `max_kinds_per_filter = 0` refused every filter that lists kinds. Zero
     now means no limit, so those filters are accepted, with a warning at

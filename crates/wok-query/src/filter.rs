@@ -245,7 +245,7 @@ impl NostrFilter {
                     .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
                     f.tags.insert(tag, set);
                 } else {
-                    return Err(QueryError::msg("unindexed tag filter"));
+                    return Err(QueryError::unsupported("unindexed tag filter"));
                 }
             } else if k.starts_with('&') {
                 if !v.is_array() {
@@ -264,7 +264,7 @@ impl NostrFilter {
                     .map_err(|e| QueryError::msg(format!("error parsing {k}: {e}")))?;
                     f.and_tags.insert(tag, set);
                 } else {
-                    return Err(QueryError::msg("unindexed AND tag filter"));
+                    return Err(QueryError::unsupported("unindexed AND tag filter"));
                 }
             } else if k == "since" {
                 f.since = v
@@ -288,7 +288,9 @@ impl NostrFilter {
                     })?);
                 num_major_non_tag += 1;
             } else {
-                return Err(QueryError::msg(format!("unrecognised filter item: {k}")));
+                return Err(QueryError::unsupported(format!(
+                    "unrecognised filter item: {k}"
+                )));
             }
         }
         for (tag, required) in &f.and_tags {

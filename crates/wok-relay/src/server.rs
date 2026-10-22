@@ -2774,7 +2774,9 @@ fn ingest_req(
 
 /// Every check a REQ or COUNT passes before any worker sees it, returning
 /// the subscription and its serialized filter bytes. `Err` is the CLOSED
-/// reason.
+/// reason: `invalid:` for a malformed request or one over a size limit,
+/// `unsupported:` for filter elements the relay does not know, and
+/// `blocked:` for an operator rule that applies to every client.
 #[allow(clippy::too_many_arguments)]
 fn admit_req(
     cfg: &Config,
@@ -2786,26 +2788,29 @@ fn admit_req(
     filters: Vec<Value>,
     count_only: bool,
 ) -> Result<(Subscription, usize), String> {
-    // C++ RelayIngester: once the sub id is known, errors are a NIP-01
-    // CLOSED with an `error:` machine-readable prefix.
-    let bad_req = |e: String| format!("error: bad req: {e}");
+    // C++ RelayIngester sends `error: bad req: ...` for all of these. The
+    // text after the prefix is kept.
+    let bad_req = |prefix: &str, e: String| format!("{prefix}: bad req: {e}");
     if filters.len() > cfg.relay.max_filters_per_req {
-        // Preserve strfry's wire error for its legacy filter-count ceiling.
-        return Err(bad_req("arr too big".into()));
+        // Keep strfry's wording for its legacy filter-count ceiling.
+        return Err(bad_req("invalid", "arr too big".into()));
     }
     let serialized_filter_bytes = filters.iter().fold(0usize, |total, filter| {
         total.saturating_add(filter.to_string().len())
     });
     if serialized_filter_bytes > cfg.relay.max_req_filter_size {
-        return Err(bad_req(format!(
-            "filters exceed {} serialized bytes",
-            cfg.relay.max_req_filter_size
-        )));
+        return Err(bad_req(
+            "invalid",
+            format!(
+                "filters exceed {} serialized bytes",
+                cfg.relay.max_req_filter_size
+            ),
+        ));
     }
     let max_limit = if count_only {
         let m = cfg.relay.max_filter_limit_count + 1;
         if m == 1 {
-            return Err(bad_req("COUNT disabled".into()));
+            return Err(bad_req("blocked", "COUNT disabled".into()));
         }
         m
     } else {
@@ -2819,9 +2824,9 @@ fn admit_req(
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
     )
-    .map_err(|e| bad_req(e.to_string()))?;
+    .map_err(|e| bad_req(e.reason_prefix(), e.to_string()))?;
     if let Err(e) = filter_validator(cfg).validate(&fg) {
-        return Err(bad_req(format!("filter validation failed: {e}")));
+        return Err(bad_req("blocked", format!("filter validation failed: {e}")));
     }
     let query_cost = fg.estimated_cost(count_only);
     if cfg.relay.abuse.enabled
@@ -2852,7 +2857,7 @@ fn admit_req(
     if requires_auth {
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
-    let sid = SubId::new(sub_id).map_err(|e| bad_req(e.to_string()))?;
+    let sid = SubId::new(sub_id).map_err(|e| bad_req("invalid", e.to_string()))?;
     // Pending and live subscriptions both count. Over a lowered cap an open
     // id can still be replaced; new ids wait until the count drops.
     if !count_only
@@ -3146,7 +3151,7 @@ fn ingest_neg(
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
     )
-    .map_err(|e| format!("invalid: {e}"))?;
+    .map_err(|e| format!("{}: {e}", e.reason_prefix()))?;
     let query_cost = fg.estimated_cost(false);
     if cfg.relay.abuse.enabled
         && cfg.relay.abuse.max_query_cost != 0
@@ -5161,7 +5166,7 @@ mod tests {
             .await;
         assert_eq!(
             recv_outbound(&mut rx).await,
-            r#"["CLOSED","a","error: bad req: arr too big"]"#
+            r#"["CLOSED","a","invalid: bad req: arr too big"]"#
         );
         let four_kinds = json!(["REQ", "b", {"kinds": [0, 1, 3, 7]}]);
         handle
@@ -5169,7 +5174,7 @@ mod tests {
             .await;
         assert_eq!(
             recv_outbound(&mut rx).await,
-            r#"["CLOSED","b","error: bad req: filter validation failed: too many kinds in filter: 4"]"#
+            r#"["CLOSED","b","blocked: bad req: filter validation failed: too many kinds in filter: 4"]"#
         );
         let within = json!(["REQ", "c", filter, filter, {"kinds": [0, 3, 10002]}]);
         assert_eq!(history_len(&handle, conn, &mut rx, within).await, 0);
@@ -6839,7 +6844,7 @@ mod tests {
         assert!(frame(&mut relay).starts_with(r#"["EVENT","x""#));
 
         relay.send(2, json!(["REQ", "x", {"kinds": [1], "nope": true}]));
-        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","error: "#));
+        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","unsupported: "#));
         assert!(matches!(
             next(&relay),
             ReqMsg::Cancel { generation, count_only: false, .. } if generation == first.generation
@@ -6857,7 +6862,7 @@ mod tests {
             .send_sub(2, &x, first.generation, eose, &metrics);
         // A refusal again, with nothing open: answered as directly.
         relay.send(2, json!(["REQ", "x", {"kinds": [1], "nope": true}]));
-        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","error: "#));
+        assert!(frame(&mut relay).starts_with(r#"["CLOSED","x","unsupported: "#));
 
         relay.send(2, json!(["REQ", "x", {"kinds": [1]}]));
         let ReqMsg::Scan(second) = next(&relay) else {

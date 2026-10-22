@@ -156,6 +156,15 @@ regression test. Differential parity alone is not a reason to retain it.
   negentropy disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, and
   every NEG-ERR closes the session. Only an unusable subscription id still
   produces a NOTICE.
+- NIP-01: REQ and COUNT refusals that pinned strfry sends as `CLOSED` with
+  `error: bad req: ...` keep strfry's text, such as `arr too big`, under the
+  NIP-01 prefix that fits. `invalid:` is for malformed filters and requests
+  over a size limit, and `unsupported:` for filter elements NIP-01 does not
+  define, such as an unknown key or a tag key that is not a single letter
+  (NIP-01's own example is `unsupported: filter contains unknown elements`).
+  `blocked:` is for `relay.filter_validation` rules and a disabled COUNT.
+  NIP-01 keeps `error:` "for when none of that fits", so a REQ or COUNT gets
+  it only for the relay's own failures, such as a database read that fails.
 - OK reasons for storage failures use `error:` instead of `Write error:`, and
   AUTH failures that already carry a NIP-01 prefix are not wrapped in a second
   `error:`. Events refused because free disk space is below

@@ -115,11 +115,12 @@ async fn cpp_error_routing() {
         "arr too small",
     )
     .await;
-    // REQ with too many filters -> CLOSED.
+    // The CLOSED reasons C++ sends as `error: bad req:` get the NIP-01 prefix
+    // that fits, with the same text. Too many filters -> `invalid:`.
     send_and_expect(
         &rig,
         r#"["REQ","s",{},{},{}]"#.into(),
-        |t| t == r#"["CLOSED","s","error: bad req: arr too big"]"#,
+        |t| t == r#"["CLOSED","s","invalid: bad req: arr too big"]"#,
         "arr too big",
     )
     .await;
@@ -128,17 +129,25 @@ async fn cpp_error_routing() {
     send_and_expect(
         &rig,
         r#"["REQ","s",{"authors":["abcdef"]}]"#.into(),
-        |t| t == r#"["CLOSED","s","error: bad req: filters exceed 10 serialized bytes"]"#,
+        |t| t == r#"["CLOSED","s","invalid: bad req: filters exceed 10 serialized bytes"]"#,
         "filter byte limit",
     )
     .await;
     rig.handle.config.write().relay.max_req_filter_size = 65_536;
-    // REQ with an invalid filter -> CLOSED.
+    // REQ with an invalid filter -> CLOSED `invalid:`.
     send_and_expect(
         &rig,
         r#"["REQ","s",{"kinds":"nope"}]"#.into(),
-        |t| t.starts_with(r#"["CLOSED","s","error: bad req:"#),
+        |t| t == r#"["CLOSED","s","invalid: bad req: kinds not an array"]"#,
         "bad filter",
+    )
+    .await;
+    // A filter element NIP-01 does not define -> CLOSED `unsupported:`.
+    send_and_expect(
+        &rig,
+        r#"["REQ","s",{"colour":["red"]}]"#.into(),
+        |t| t == r#"["CLOSED","s","unsupported: bad req: unrecognised filter item: colour"]"#,
+        "unknown filter key",
     )
     .await;
 

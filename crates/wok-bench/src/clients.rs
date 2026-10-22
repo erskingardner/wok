@@ -3634,7 +3634,7 @@ mod tests {
                 "relay.abuse.max_concurrent_historical_queries",
             ),
             (
-                "error: bad req: filters exceed N serialized bytes",
+                "invalid: bad req: filters exceed N serialized bytes",
                 "relay.max_req_filter_size",
             ),
             (

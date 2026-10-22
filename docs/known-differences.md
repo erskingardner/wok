@@ -153,8 +153,9 @@ regression test. Differential parity alone is not a reason to retain it.
   as a NIP-46 kind-24133 response feed does not miss ephemeral replies while
   it is refused, authenticated, and re-sent.
 - NIP-77: NEG-OPEN and NEG-MSG refusals (malformed envelope, hex, or filter;
-  negentropy disabled) are NEG-ERR with `invalid:` or `blocked:` instead of NOTICE, and
-  every NEG-ERR closes the session. A NEG-OPEN with an invalid subscription
+  a filter element NIP-01 does not define; negentropy disabled) are NEG-ERR
+  with `invalid:`, `unsupported:` or `blocked:` instead of NOTICE, and every
+  NEG-ERR closes the session. A NEG-OPEN with an invalid subscription
   id is refused with NEG-ERR too. Only a sub id that is not a string, or a
   NEG-MSG or NEG-CLOSE with an invalid one, still produces a NOTICE.
 - NIP-01: a REQ or COUNT with no filters gets `CLOSED` with

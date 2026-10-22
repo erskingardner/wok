@@ -335,6 +335,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- NIP-70: a repost (kind 6 or 16) is refused as embedding a protected event
+  only when its content is an event whose tags include one named `-`. Before,
+  any content containing the text `["-"]` was refused, so a repost of an
+  ordinary note that merely mentioned it was refused, while a protected
+  event written with other spacing, such as `[ "-" ]`, or with a tag like
+  `["-",""]`, got through.
 - A subscription id may be any non-empty string of up to 64 characters, as
   NIP-01 says. Before, an id containing a control character, `"`, `\` or any
   character outside ASCII was refused, so every non-ASCII id failed, and the

@@ -575,6 +575,105 @@ fn nip70_protected_tag_constant() {
     assert_eq!(wok_event::PROTECTED_TAG, '-');
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip70_reposts_that_embed_a_protected_event_are_refused() {
+    // "Reposts of protected events MUST NOT embed the reposted event. If a
+    // repost of a protected event embeds the event anyway, relays SHOULD
+    // summarily reject it." The content is parsed: a protected event is
+    // found however its JSON is spaced, and nothing else is mistaken for one.
+    let relay = Relay::new(|_| {});
+    let mut conn = relay.connect().await;
+    let note = |tags: Value, content: String| {
+        sign_event(json!({"created_at": now(), "kind": 1, "tags": tags, "content": content}))
+    };
+    let protected = note(json!([["-"]]), "members only".into());
+    let protected_text = protected.to_string();
+    let mut repeated_key = protected_text.clone();
+    repeated_key.insert_str(1, &format!(r#""id":{},"#, protected["id"]));
+    let embedded = [
+        ("compact", protected_text.clone()),
+        ("pretty", serde_json::to_string_pretty(&protected).unwrap()),
+        ("leading whitespace", format!("\n  {protected_text}")),
+        (
+            "spaced tag",
+            protected_text.replace(r#"[["-"]]"#, r#"[ [ "-" ] ]"#),
+        ),
+        (
+            "tag with a value",
+            note(json!([["-", ""]]), "members only".into()).to_string(),
+        ),
+        (
+            "not the first tag",
+            note(json!([["t", "x"], ["-"]]), "members only".into()).to_string(),
+        ),
+        // Clients' parsers keep the last of a repeated key, so this is the
+        // protected event to them; the relay's strict parser refuses it.
+        ("repeated key", repeated_key),
+        (
+            "huge",
+            note(json!([["-"]]), "x".repeat(600_000)).to_string(),
+        ),
+    ];
+    let not_embedded = [
+        (
+            "text",
+            r#"not an event, though it mentions ["-"]"#.to_string(),
+        ),
+        ("empty", String::new()),
+        ("array", r#"[["-"]]"#.to_string()),
+        (
+            "unprotected",
+            note(json!([["t", "x"]]), "public".into()).to_string(),
+        ),
+        (
+            "\"-\" only in the content",
+            note(json!([]), r#"[["-"]]"#.into()).to_string(),
+        ),
+        (
+            "\"-\" only as a value",
+            note(json!([["t", "-"]]), "public".into()).to_string(),
+        ),
+        (
+            "object without tags",
+            r#"{"content":"[\"-\"]"}"#.to_string(),
+        ),
+        ("malformed", format!("{{{protected_text}")),
+        (
+            "huge unprotected",
+            note(json!([["t", "x"]]), "x".repeat(600_000)).to_string(),
+        ),
+        ("huge text", r#"["-"] "#.repeat(100_000)),
+    ];
+    for kind in wok_event::REPOST_KINDS {
+        let repost = |content: &str| {
+            sign_event(json!({
+                "created_at": now(), "kind": kind, "tags": [["e", protected["id"]]],
+                "content": content,
+            }))
+        };
+        for (label, content) in &embedded {
+            let event = repost(content);
+            assert_eq!(
+                conn.publish(&event).await,
+                json!([
+                    "OK",
+                    event["id"],
+                    false,
+                    "blocked: reposts can't embed protected events"
+                ]),
+                "kind {kind}, {label}"
+            );
+        }
+        for (label, content) in &not_embedded {
+            let reply = conn.publish(&repost(content)).await;
+            assert_eq!(reply[2], true, "kind {kind}, {label}: {reply}");
+        }
+    }
+    // Only reposts are checked.
+    let quote = note(json!([]), protected_text);
+    assert_eq!(conn.publish(&quote).await[2], true);
+}
+
 #[test]
 fn nip42_auth_kind() {
     assert_eq!(wok_event::AUTH_KIND, 22242);

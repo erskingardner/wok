@@ -2251,6 +2251,35 @@ fn handle_client(
     }
 }
 
+/// NIP-70: "Reposts of protected events MUST NOT embed the reposted event.
+/// If a repost of a protected event embeds the event anyway, relays SHOULD
+/// summarily reject it." True when a repost's `content` is an event object
+/// with a tag named `-`, whatever the JSON's spacing or the tag's other
+/// elements.
+fn embeds_protected_event(content: &str) -> bool {
+    // An embedded event is a JSON object; anything else needs no parse.
+    if !content.trim_start().starts_with('{') {
+        return false;
+    }
+    // The content is no longer than its event, which `max_event_size`
+    // bounds, and both parsers limit nesting. The strict parser refuses a
+    // repeated key, which clients' parsers accept, keeping the last value, so
+    // content it refuses is read that way too.
+    let parsed = wok_event::json::parse_strict(content)
+        .ok()
+        .or_else(|| serde_json::from_str::<Value>(content).ok());
+    let Some(Value::Object(event)) = parsed else {
+        return false;
+    };
+    event
+        .get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| tag.get(0).and_then(Value::as_str) == Some("-"))
+        })
+}
+
 fn ingest_event(
     env: &Env,
     cfg: &Config,
@@ -2419,9 +2448,8 @@ fn ingest_event(
     if REPOST_KINDS.contains(&packed.kind())
         && orig
             .get("content")
-            .and_then(|c| c.as_str())
-            .map(|s| s.contains("[\"-\"]"))
-            .unwrap_or(false)
+            .and_then(Value::as_str)
+            .is_some_and(embeds_protected_event)
     {
         conns.send(
             conn_id,

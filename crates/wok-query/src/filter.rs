@@ -550,11 +550,10 @@ impl NostrFilterGroup {
     }
 }
 
+/// Optional rules for a REQ's filters. Each is off at its zero or empty
+/// value, so the default validator accepts every filter.
 #[derive(Debug, Clone, Default)]
 pub struct FilterValidator {
-    pub enabled: bool,
-    pub min_filters_per_req: u64,
-    pub max_filters_per_req: u64,
     pub max_kinds_per_filter: u64,
     pub allowed_kinds: HashSet<u64>,
     pub require_author_or_tag: bool,
@@ -562,16 +561,10 @@ pub struct FilterValidator {
 
 impl FilterValidator {
     pub fn validate(&self, fg: &NostrFilterGroup) -> Result<(), QueryError> {
-        if !self.enabled {
-            return Ok(());
-        }
-        let n = (fg.filters.len() + fg.never_matching) as u64;
-        if n < self.min_filters_per_req || n > self.max_filters_per_req {
-            return Err(QueryError::msg(format!("invalid number of filters: {n}")));
-        }
         for filter in &fg.filters {
             if let Some(kinds) = &filter.kinds {
-                if kinds.size() as u64 > self.max_kinds_per_filter {
+                if self.max_kinds_per_filter != 0 && kinds.size() as u64 > self.max_kinds_per_filter
+                {
                     return Err(QueryError::msg(format!(
                         "too many kinds in filter: {}",
                         kinds.size()
@@ -679,25 +672,32 @@ mod tests {
     }
 
     #[test]
-    fn never_matching_filters_count_toward_the_filter_limits() {
-        let validator = FilterValidator {
-            enabled: true,
-            min_filters_per_req: 1,
-            max_filters_per_req: 2,
-            max_kinds_per_filter: 10,
+    fn each_validation_rule_applies_when_set() {
+        let group = |filters: Value| NostrFilterGroup::from_value(&filters, 500, 3, 16).unwrap();
+        // MDK's directory batch names six kinds.
+        let six_kinds = group(json!([{"kinds": [0, 1, 3, 10002, 10050, 30443]}]));
+        assert!(FilterValidator::default().validate(&six_kinds).is_ok());
+        let capped = FilterValidator {
+            max_kinds_per_filter: 3,
+            ..Default::default()
+        };
+        assert!(capped.validate(&six_kinds).is_err());
+        let allowed = FilterValidator {
+            allowed_kinds: [0, 3].into(),
+            ..Default::default()
+        };
+        assert!(allowed.validate(&six_kinds).is_err());
+        assert!(allowed.validate(&group(json!([{"kinds": [3]}]))).is_ok());
+        let scoped = FilterValidator {
             require_author_or_tag: true,
             ..Default::default()
         };
-        let empty = NostrFilterGroup::from_value(&json!([{"authors": []}]), 500, 3, 16).unwrap();
-        assert!(validator.validate(&empty).is_ok());
-        let three = NostrFilterGroup::from_value(
-            &json!([{"authors": []}, {"kinds": []}, {"authors": ["11".repeat(32)]}]),
-            500,
-            3,
-            16,
-        )
-        .unwrap();
-        assert!(validator.validate(&three).is_err());
+        assert!(scoped.validate(&six_kinds).is_err());
+        assert!(scoped
+            .validate(&group(json!([{"authors": ["11".repeat(32)]}])))
+            .is_ok());
+        // A filter that matches nothing is not checked.
+        assert!(scoped.validate(&group(json!([{"authors": []}]))).is_ok());
     }
 
     #[test]

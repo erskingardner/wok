@@ -39,3 +39,5 @@
 #   and database.min_free_disk_bytes bound storage.
 #   max_stored_events_per_pubkey = 1000000 (was 100000): active users and
 #   bots keep posting.
+# - [relay.filter_validation] max_kinds_per_filter = 0 (was 3): no rule
+#   applies until it is set, now that the section has no enabled switch.

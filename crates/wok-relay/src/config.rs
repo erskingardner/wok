@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 mod edit;
 mod history;
+mod legacy;
 mod preset;
 mod provenance;
 
@@ -29,6 +30,10 @@ pub struct Config {
     pub events: EventsConfig,
     pub observability: ObservabilityConfig,
     pub relay: RelayConfig,
+    /// Warnings for the deprecated keys the file set, which loaded as their
+    /// translation. Logged at startup and on reload.
+    #[serde(skip)]
+    pub deprecations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +68,6 @@ const STRFRY_TRANSLATED_KEYS: &[&str] = &[
     "relay.filterValidation.enabled",
     "relay.filterValidation.maxFiltersPerReq",
     "relay.filterValidation.maxKindsPerFilter",
-    "relay.filterValidation.minFiltersPerReq",
     "relay.filterValidation.requireAuthorOrTag",
     "relay.info.banner",
     "relay.info.contact",
@@ -301,12 +305,11 @@ pub struct InfoConfig {
     pub terms: String,
 }
 
+/// Optional rules for REQ and COUNT filters, each off at its zero or empty
+/// value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterValidationConfig {
-    pub enabled: bool,
-    pub max_filters_per_req: u64,
-    pub min_filters_per_req: u64,
     pub max_kinds_per_filter: u64,
     pub allowed_kinds: String,
     pub require_author_or_tag: bool,
@@ -426,10 +429,7 @@ impl Default for Config {
                     deletion_batch_size: 1_000,
                 },
                 filter_validation: FilterValidationConfig {
-                    enabled: false,
-                    max_filters_per_req: 3,
-                    min_filters_per_req: 1,
-                    max_kinds_per_filter: 3,
+                    max_kinds_per_filter: 0,
                     allowed_kinds: String::new(),
                     require_author_or_tag: false,
                 },
@@ -465,6 +465,7 @@ impl Default for Config {
                     max_pending_outbound_bytes: 33_554_432,
                 },
             },
+            deprecations: Vec::new(),
         }
     }
 }
@@ -509,6 +510,7 @@ impl From<TomlConfig> for Config {
             events: config.events,
             observability: config.observability,
             relay: config.relay,
+            deprecations: Vec::new(),
         }
     }
 }
@@ -521,7 +523,10 @@ type OverlayFn = fn(Preset) -> &'static str;
 struct Layers {
     preset: Preset,
     overlay: toml::Value,
+    /// The file, with its deprecated keys translated.
     file: toml::Value,
+    /// How the file's deprecated keys were translated.
+    legacy: legacy::Translation,
 }
 
 impl Layers {
@@ -530,11 +535,15 @@ impl Layers {
         let preset = Preset::select(&file)?;
         let overlay =
             toml::from_str(overlay_of(preset)).map_err(|e| format!("preset {preset}: {e}"))?;
-        Ok(Self {
+        let mut layers = Self {
             preset,
             overlay,
             file,
-        })
+            legacy: legacy::Translation::default(),
+        };
+        layers.legacy = legacy::translate(&layers.file, &layers.preset_value()?)?;
+        layers.legacy.apply(&mut layers.file);
+        Ok(layers)
     }
 
     /// The built-in defaults with the preset's overlay: the configuration a
@@ -565,7 +574,9 @@ impl Layers {
         let parsed: TomlConfig = merged
             .try_into()
             .map_err(|e: toml::de::Error| e.to_string())?;
-        validate(parsed)
+        let mut config = validate(parsed)?;
+        config.deprecations = self.legacy.warnings.clone();
+        Ok(config)
     }
 }
 
@@ -934,27 +945,52 @@ impl Config {
             cfg.relay.max_sync_events = n;
             Ok(())
         })?;
-        assign_bool(&map, "relay.filterValidation.enabled", |b| {
-            cfg.relay.filter_validation.enabled = b
-        })?;
+        // strfry applies its filterValidation section only with
+        // `enabled = true`, while Wok applies each rule that is set, so a
+        // disabled section translates to no rules. An enabled one keeps its
+        // rules, with strfry's defaults for those it leaves out, and its
+        // filter-count cap folds into relay.max_filters_per_req.
+        // minFiltersPerReq has no equivalent and is ignored.
+        let mut validation = (
+            false,
+            legacy::LEGACY_MAX_FILTERS_PER_REQ,
+            legacy::LEGACY_MAX_KINDS_PER_FILTER,
+            String::new(),
+            false,
+        );
+        assign_bool(&map, "relay.filterValidation.enabled", |b| validation.0 = b)?;
         assign_u64(&map, "relay.filterValidation.maxFiltersPerReq", |n| {
-            cfg.relay.filter_validation.max_filters_per_req = n;
+            validation.1 = n;
             Ok(())
         })?;
-        assign_u64(&map, "relay.filterValidation.minFiltersPerReq", |n| {
-            cfg.relay.filter_validation.min_filters_per_req = n;
-            Ok(())
-        })?;
+        assign_u64(&map, "relay.filterValidation.minFiltersPerReq", |_| Ok(()))?;
         assign_u64(&map, "relay.filterValidation.maxKindsPerFilter", |n| {
-            cfg.relay.filter_validation.max_kinds_per_filter = n;
+            validation.2 = n;
             Ok(())
         })?;
         if let Some(v) = map.get("relay.filterValidation.allowedKinds") {
-            cfg.relay.filter_validation.allowed_kinds = v.clone();
+            validation.3 = v.clone();
         }
         assign_bool(&map, "relay.filterValidation.requireAuthorOrTag", |b| {
-            cfg.relay.filter_validation.require_author_or_tag = b
+            validation.4 = b
         })?;
+        let (enabled, max_filters, max_kinds, allowed_kinds, require_author_or_tag) = validation;
+        if enabled {
+            cfg.relay.max_filters_per_req = cfg
+                .relay
+                .max_filters_per_req
+                .min(usize::try_from(max_filters).unwrap_or(usize::MAX));
+            if max_kinds == 0 {
+                cfg.deprecations.push(legacy::zero_kind_cap_warning(
+                    "relay.filterValidation.maxKindsPerFilter",
+                ));
+            }
+            cfg.relay.filter_validation = FilterValidationConfig {
+                max_kinds_per_filter: max_kinds,
+                allowed_kinds,
+                require_author_or_tag,
+            };
+        }
         assign_bool(&map, "relay.unix.enabled", |b| cfg.relay.unix.enabled = b)?;
         if let Some(v) = map.get("relay.unix.path") {
             cfg.relay.unix.path = PathBuf::from(v);
@@ -1036,23 +1072,15 @@ impl Config {
         let fv = |c: &Config| {
             let f = &c.relay.filter_validation;
             (
-                f.enabled,
-                f.max_filters_per_req,
-                f.min_filters_per_req,
                 f.max_kinds_per_filter,
+                f.allowed_kinds.clone(),
                 f.require_author_or_tag,
             )
         };
-        if fv(self) != fv(new)
-            || self.relay.filter_validation.allowed_kinds
-                != new.relay.filter_validation.allowed_kinds
-        {
+        if fv(self) != fv(new) {
             changes.push(format!(
-                "relay.filter_validation changed (enabled {} -> {}): {:?} -> {:?}",
-                self.relay.filter_validation.enabled,
-                new.relay.filter_validation.enabled,
-                self.relay.filter_validation,
-                new.relay.filter_validation,
+                "relay.filter_validation changed: {:?} -> {:?}",
+                self.relay.filter_validation, new.relay.filter_validation,
             ));
         }
         let ab = |c: &Config| {
@@ -1276,6 +1304,9 @@ impl Config {
         }
         for warning in new.zero_guard_warnings() {
             tracing::warn!("config reload: {warning}");
+        }
+        for deprecation in &new.deprecations {
+            tracing::warn!("config reload: {deprecation}");
         }
         let old = std::mem::replace(self, new);
         self.db = old.db;
@@ -1988,9 +2019,8 @@ mod tests {
         assert_eq!(c.relay.negentropy_threads, 7);
         assert!(!c.relay.negentropy_enabled);
         assert_eq!(c.relay.max_sync_events, 42);
-        assert!(c.relay.filter_validation.enabled);
-        assert_eq!(c.relay.filter_validation.max_filters_per_req, 11);
-        assert_eq!(c.relay.filter_validation.min_filters_per_req, 2);
+        // The enabled filterValidation section keeps its rules; its cap of 11
+        // filters is above maxReqFilterSize's 7.
         assert_eq!(c.relay.filter_validation.max_kinds_per_filter, 12);
         assert_eq!(c.relay.filter_validation.allowed_kinds, "1,6");
         assert!(c.relay.filter_validation.require_author_or_tag);
@@ -1999,6 +2029,41 @@ mod tests {
         assert_eq!(c.relay.unix.auth_uids, vec![501, 502]);
         assert_eq!(c.relay.unix.auth_gids, vec![20]);
         assert_eq!(c.relay.unix.max_pending_outbound_bytes, 2048);
+    }
+
+    #[test]
+    fn strfry_filter_validation_applies_only_when_enabled() {
+        // strfry's stock section is disabled: no rules, whatever it pins.
+        let stock = Config::translate_strfry(
+            "relay { filterValidation { enabled = false\n maxFiltersPerReq = 3\n \
+             minFiltersPerReq = 1\n maxKindsPerFilter = 3\n requireAuthorOrTag = true } }",
+        )
+        .unwrap();
+        assert_eq!(stock.config.relay.max_filters_per_req, 200);
+        let rules = &stock.config.relay.filter_validation;
+        assert_eq!(rules.max_kinds_per_filter, 0);
+        assert!(!rules.require_author_or_tag);
+        assert!(stock
+            .ignored_keys
+            .contains(&"relay.filterValidation.minFiltersPerReq".to_string()));
+        // Enabled, it keeps strfry's defaults for what it leaves out, and its
+        // filter cap becomes the relay's.
+        let enabled = Config::translate_strfry("relay { filterValidation { enabled = true } }")
+            .unwrap()
+            .config;
+        assert_eq!(enabled.relay.max_filters_per_req, 3);
+        assert_eq!(enabled.relay.filter_validation.max_kinds_per_filter, 3);
+        assert!(enabled.deprecations.is_empty());
+        // Its zero kind cap no longer refuses kind filters, with a warning.
+        let zero = Config::translate_strfry(
+            "relay { filterValidation { enabled = true\n maxKindsPerFilter = 0 } }",
+        )
+        .unwrap()
+        .config;
+        assert_eq!(zero.relay.filter_validation.max_kinds_per_filter, 0);
+        assert_eq!(zero.deprecations.len(), 1);
+        assert!(zero.deprecations[0]
+            .starts_with("relay.filterValidation.maxKindsPerFilter = 0 in an enabled section"));
     }
 
     #[test]

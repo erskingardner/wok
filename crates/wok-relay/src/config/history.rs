@@ -28,6 +28,7 @@ const PAST_DEFAULTS: &[(&str, &str, &str)] = &[
         "100000",
         "0.7.0",
     ),
+    ("relay.filter_validation.max_kinds_per_filter", "3", "0.7.0"),
 ];
 
 /// A key the operator's file pins to a built-in default that a later release

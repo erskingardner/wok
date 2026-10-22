@@ -1519,9 +1519,6 @@ fn filter_validator(cfg: &Config) -> FilterValidator {
         }
     }
     FilterValidator {
-        enabled: cfg.relay.filter_validation.enabled,
-        min_filters_per_req: cfg.relay.filter_validation.min_filters_per_req,
-        max_filters_per_req: cfg.relay.filter_validation.max_filters_per_req,
         max_kinds_per_filter: cfg.relay.filter_validation.max_kinds_per_filter,
         allowed_kinds: allowed,
         require_author_or_tag: cfg.relay.filter_validation.require_author_or_tag,
@@ -5141,6 +5138,45 @@ mod tests {
             "#P": ["cd".repeat(32)], "#k": ["1"],
         }]);
         assert_eq!(history_len(&handle, conn, &mut rx, comments).await, 0);
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_0_7_filter_validation_section_keeps_refusing_what_it_refused() {
+        // `enabled = true` enforced 0.7's defaults of three filters per REQ
+        // and three kinds per filter; the cap is now the relay's own.
+        let legacy = Config::parse_toml("[relay.filter_validation]\nenabled = true\n").unwrap();
+        let (_dir, handle) = live_reload_relay(|cfg, _| {
+            cfg.relay.max_filters_per_req = legacy.relay.max_filters_per_req;
+            cfg.relay.filter_validation = legacy.relay.filter_validation.clone();
+        });
+        let (conn, mut rx) = live_conn(&handle).await;
+        let filter = json!({"kinds": [1]});
+        let four_filters = json!(["REQ", "a", filter, filter, filter, filter]);
+        handle
+            .client_message(conn, local_source(), four_filters.to_string())
+            .await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            r#"["CLOSED","a","error: bad req: arr too big"]"#
+        );
+        let four_kinds = json!(["REQ", "b", {"kinds": [0, 1, 3, 7]}]);
+        handle
+            .client_message(conn, local_source(), four_kinds.to_string())
+            .await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            r#"["CLOSED","b","error: bad req: filter validation failed: too many kinds in filter: 4"]"#
+        );
+        let within = json!(["REQ", "c", filter, filter, {"kinds": [0, 3, 10002]}]);
+        assert_eq!(history_len(&handle, conn, &mut rx, within).await, 0);
+        handle.request_shutdown();
+
+        // By default no rule applies: MDK's six-kind directory batch passes.
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        let (conn, mut rx) = live_conn(&handle).await;
+        let directory = json!(["REQ", "d", {"kinds": [0, 1, 3, 10002, 10050, 30443]}]);
+        assert_eq!(history_len(&handle, conn, &mut rx, directory).await, 0);
         handle.request_shutdown();
     }
 

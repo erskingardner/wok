@@ -7,7 +7,7 @@ Transports (`wok-ws`, `wok-unix`) hold a `RelayHandle` and send owned strings ov
 ## Layout
 
 - `Cargo.toml`
-- `src/` — server and supporting modules (`config/` holds presets, `wok config show` provenance, in-place file edits for dashboard saves and `wok config minimize`, and the past defaults `wok doctor` checks for)
+- `src/` — server and supporting modules (`config/` holds presets, `wok config show` provenance, in-place file edits for dashboard saves and `wok config minimize`, the past defaults `wok doctor` checks for, and the translation of deprecated keys)
 - `presets/` — preset overlays compiled in with `include_str!`; mirror each in `docs/presets/`
 - `tests/` — protocol property tests
 - `examples/` — empty; not used

@@ -92,6 +92,12 @@ keeps it. Set only what the relay needs and leave the rest to the preset.
   preset's value, or keep it if you chose that value; `minimize` leaves such
   settings alone because removing them changes behavior. The check also
   counts the settings that `minimize` would remove.
+- **Deprecated settings** that a release replaced still load, as their
+  translation, so the relay behaves as before. Each is warned about at
+  startup and on reload, and in `wok doctor`'s `config-deprecations` check.
+  `wok config minimize` and dashboard saves rewrite them as their
+  translation. The [filter validation](#filter-validation) switch is the
+  only one so far.
 
 ## Admin
 
@@ -386,14 +392,43 @@ continues in bounded batches.
 
 ## Filter validation
 
+Optional rules for REQ and COUNT filters. Each applies when it is set and is
+off at its zero or empty value, which is the public preset's. A filter that
+breaks one is refused with `CLOSED` and `error: bad req: filter validation
+failed: ...`.
+
 | Key | Default | Reload | Dashboard | Meaning |
 |---|---:|---|---|---|
-| `relay.filter_validation.enabled` | `false` | Live | Yes | Apply the rules in this section. |
-| `relay.filter_validation.max_filters_per_req` | `3` | Live | Yes | Maximum filter objects in a REQ. |
-| `relay.filter_validation.min_filters_per_req` | `1` | Live | Yes | Minimum filter objects in a REQ. |
-| `relay.filter_validation.max_kinds_per_filter` | `3` | Live | Yes | Maximum kinds listed by one filter. |
-| `relay.filter_validation.allowed_kinds` | empty | Live | Yes | Comma-separated allowed kinds; empty permits all. |
-| `relay.filter_validation.require_author_or_tag` | `false` | Live | Yes | Require an author or tag constraint in each filter. |
+| `relay.filter_validation.max_kinds_per_filter` | `0` | Live | Yes | Maximum kinds listed by one filter; zero is unlimited. MDK's directory batches list six. |
+| `relay.filter_validation.allowed_kinds` | empty | Live | Yes | Comma-separated kinds a filter may list; empty permits all. A filter without `kinds` is not checked. |
+| `relay.filter_validation.require_author_or_tag` | `false` | Live | Yes | Require each filter to name exactly one author, `#p` or `#e` value. This refuses Marmot's `#h` group filters, `ids` fetches and multi-author outbox and directory batches. |
+
+The filters in one REQ are bounded by `relay.max_filters_per_req` alone.
+
+### Files from 0.7 and earlier
+
+Through 0.7 the section applied its rules only with `enabled = true`, and had
+its own filter counts, `max_filters_per_req` and `min_filters_per_req`. Those
+three keys are gone. A file that still sets them loads as follows, with a
+deprecation warning:
+
+- **`enabled = false`**: every rule in the section is ignored, as before.
+  This is what copies of the 0.7 `docs/wok.toml` set.
+- **`enabled = true`**: the section's rules still apply, with 0.7's default
+  of 3 for a `max_kinds_per_filter` it leaves out.
+  - Its `max_filters_per_req`, or 0.7's default of 3, becomes
+    `relay.max_filters_per_req` when it is lower. Such a REQ is now refused
+    with `error: bad req: arr too big`.
+  - `min_filters_per_req` is dropped. A REQ needs only one filter.
+  - `max_kinds_per_filter = 0` refused every filter that lists kinds. Zero
+    now means no limit, so those filters are accepted, with a warning at
+    startup and in `wok doctor`. To restrict kinds, set `allowed_kinds`.
+- **No `enabled`**: the section is read as a current one, so each rule it
+  sets applies. Under 0.7 a section without `enabled` was off.
+
+`wok config minimize`, or a dashboard save, rewrites the section this way.
+`wok migrate strfry` translates strfry's `relay.filterValidation` the same
+way; strfry's section is off unless `enabled = true`.
 
 ## Abuse protection
 

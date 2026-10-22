@@ -45,6 +45,18 @@ or protect it at the reverse proxy. The endpoint is unauthenticated and sends
 | `wok_abuse_rejections_total` | counter | `reason` | Requests or events rejected by an abuse guard. |
 | `wok_client_messages_total` | counter | `type` | Inbound Nostr protocol messages by type. |
 | `wok_relay_messages_total` | counter | `type` | Outbound Nostr protocol messages by type. |
+| `wok_tag_kind_index_complete` | gauge | none | 1 once every stored event is in the `(tag, kind, created_at)` index, 0 while the writer still builds it. |
+| `wok_tag_kind_index_indexed_through` | gauge | none | The index's progress marker: every event at or below this local ID has its entries. |
+| `wok_tag_kind_index_high_water` | gauge | none | The greatest local ID allocated; the index is complete once the marker reaches it. |
+| `wok_tag_kind_index_pass_visited` | gauge | none | Tag-index entries a key-ordered build has visited, 0 when none runs. |
+| `wok_tag_kind_index_tag_entries` | gauge | none | Tag-index entries stored, which a key-ordered build visits once. |
+| `wok_tag_kind_backfill_entries_total` | counter | none | Postings the writer's background build put. |
+| `wok_tag_kind_backfill_seconds_total` | counter | none | Time the writer spent in background build transactions, commits included. |
+
+The `wok_tag_kind_*` gauges are updated after each build step and on the
+writer's maintenance tick (every 2 seconds). While a key-ordered build runs,
+`pass_visited / tag_entries` is its progress; after it, while events an
+earlier release inserted are indexed, `indexed_through / high_water` is.
 
 `wok_abuse_rejections_total` has these `reason` values:
 
@@ -117,6 +129,16 @@ RUST_LOG=wok=debug,wok_db=trace wok --config wok.toml relay
 
 Log format and filter require restart because the tracing subscriber is
 process-global.
+
+The background build of the `(tag, kind, created_at)` index logs at `info`
+when it starts (`building the (tag, kind, created_at) index in the
+background, in key order`, or `indexing stored events missing from ...` for
+events an earlier release inserted), its progress every 10 seconds (`visited`
+and `tag_entries`, or `indexed_through` and `high_water`), and its end (`the
+(tag, kind, created_at) index is complete`, with `entries`, `seconds` and
+`slowest_step_ms`). Each step logs at `debug` on the
+`wok_relay::server::writer` target with its `entries` and `ms`. A step that
+fails logs at `error`; the writer retries on its next maintenance tick.
 
 ## Bounded dashboard history
 

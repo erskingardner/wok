@@ -80,6 +80,11 @@ yet. It costs one entry per single-letter tag, about 14% more disk. A marker
 records which events it covers, so a database that predates it, or events an
 earlier release inserted, are known to be missing; entries an earlier
 release left when it deleted their events name events no longer stored.
+The writer fills a gap in the background: before each batch of messages, and
+while idle, it runs one step bounded to 10 ms of indexing, so publications
+are not held up. A table that starts from nothing is built in key order by
+walking the tag index; the writer resumes that walk from a cursor after a
+restart.
 
 ## REQ lifecycle
 

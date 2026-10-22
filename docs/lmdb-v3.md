@@ -161,13 +161,50 @@ their values are native-endian u64s:
 
 A new database is complete from its first open. One written before this
 table existed, or migrated from strfry, gets an empty table at marker 0 on
-its first writable open, and `wok reindex` builds it complete. The database
-version is unchanged. An earlier Wok release does not open the table: the
-events it inserts take IDs above the marker, which stops there until they
-are indexed, and the events it deletes leave their entries. Local IDs are
-never reused, so a leftover entry names an event that is no longer stored;
-readers must check the event exists, `wok integrity` counts these entries as
-stale, and `wok reindex` drops them.
+its first writable open. The relay's writer then builds it in the background,
+one bounded transaction at a time (see
+[Building in the background](#building-in-the-background)), or
+`wok reindex` builds it complete. The database version is unchanged. An
+earlier Wok release opens neither table: the events it inserts take IDs
+above the marker, which stops there until they are indexed, and the events
+it deletes leave their entries. Local IDs are never reused, so a leftover
+entry names an event that is no longer stored; readers must check the event
+exists, `wok integrity` counts these entries as stale, and `wok reindex`
+drops them.
+
+### Building in the background
+
+The writer runs one backfill step before each batch of messages it takes,
+and keeps going while it is idle, until the index is complete. A step ends
+after 5,000 postings or 10 ms of indexing, whichever comes first, then
+commits. Steps come in two kinds:
+
+- **Key order**, for a table at marker 0 with events stored. The step walks
+  `Event__tag` from a cursor, reads each entry's event for its kind and puts
+  the posting. The postings of one tag value sit next to each other, so a
+  step rewrites few pages. Building in local-ID order would rewrite about one
+  16 KiB page per posting: for 1M events it wrote 20.6 GB, against 1.35 GB in
+  key order. The pass covers every event stored when it began, so when the
+  walk reaches the end the marker takes the high-water mark from that moment.
+  Events inserted since are indexed by this release's writer, and by the
+  local-ID steps when an earlier release inserted them.
+- **Local-ID order**, for any other gap above the marker. The step indexes
+  the next stored events above it and moves the marker past them, to the
+  high-water mark once it reaches the newest.
+
+A key-ordered pass keeps its progress in `wok_Event__tagKindBuild`, a Wok
+table with the default comparator and no flags, empty when no pass runs:
+
+| key | value |
+|---|---|
+| `target` | u64 local ID: the high-water mark when the pass began |
+| `visited` | u64: `Event__tag` entries visited so far |
+| `cursor` | the last `Event__tag` key visited, then its local ID as a u64 |
+
+Values are native-endian. The pass resumes after the cursor, so a restart
+loses at most the step it interrupted. Emptying `wok_Event__tagKind` (a new
+layout, `wok reindex`) empties this table too. A record that does not decode
+is a malformed record in integrity, and the next step starts the pass again.
 
 ## EventPayload
 
@@ -180,9 +217,10 @@ stale, and `wok reindex` drops them.
 expected event-derived secondary-index entry with the actual indexes in both
 directions. For `wok_Event__tagKind` it expects entries only of the events at
 or below `\0through`, and reports under `tag_kind_index` the markers, whether
-the index is complete, and entries missing, stale (the event is no longer
-stored) or unexpected (the stored event does not derive them, or a malformed
-record). Missing and unexpected entries fail the check; stale entries do not.
+the index is complete, any key-ordered pass in progress, and entries
+missing, stale (the event is no longer stored) or unexpected (the stored event
+does not derive them, or a malformed record). Missing and unexpected entries
+fail the check; stale entries do not.
 It also validates `wok_State` encodings, compares each stored author
 count against primary events (not the derived author index), and checks that a
 stored sequence is at least the greatest surviving local ID. Author-count

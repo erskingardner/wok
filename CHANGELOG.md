@@ -79,14 +79,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Queries do not use it yet. The writer keeps an entry for every
   single-letter tag of every event it stores, so the database grows by about
   14% once every event is indexed, and imports and writes take about 18%
-  longer (measured at 5M events). A new database is complete from the start;
-  `wok reindex --confirm-relay-stopped` builds the index for an existing one.
-  The database version stays 5, and earlier releases ignore the table: events
-  they insert are left for the index to catch up on, and the entries of
-  events they delete stay behind until a reindex. `wok integrity` reports the
-  table under `tag_kind_index`, and `wok doctor` adds a `tag-kind-index`
-  check: those leftover entries and an incomplete index are warnings, and
-  entries missing below the index's progress marker are a failure.
+  longer (measured at 5M events). A new database is complete from the start.
+  On the first start after the upgrade, and after a strfry migration, the
+  relay builds the index for the stored events in the background, without
+  delaying startup: a key-ordered pass over the tag index, in steps of at
+  most 10 ms of indexing between writer batches, resumed after a restart.
+  A 1M-event database took about 12 s and wrote about 3 GB to disk, and
+  publication acknowledgements stayed within a few milliseconds of their
+  usual latency. Progress is logged every 10 s and exported as
+  `wok_tag_kind_index_*` and `wok_tag_kind_backfill_*` metrics.
+  `wok reindex --confirm-relay-stopped` builds the index offline instead.
+  The database version stays 5, and earlier releases ignore the tables:
+  events they insert are indexed in the background once this release runs
+  again, and the entries of events they delete stay behind until a reindex.
+  `wok integrity` reports the table under `tag_kind_index`, and `wok doctor`
+  adds a `tag-kind-index` check: those leftover entries and a build in
+  progress are warnings, and entries missing below the index's progress
+  marker are a failure.
 - `relay.max_filter_bytes_per_connection` (default 2097152, 2 MiB) bounds the
   filter bytes of the REQ subscriptions open on one connection. Live filters
   stay in memory until closed, so without it a larger

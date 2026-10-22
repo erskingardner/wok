@@ -50,16 +50,21 @@ for lazy-initialization limits and process-kill test coverage.
 The `(tag, kind, created_at)` index, `wok_Event__tagKind`, records how far it
 covers the stored events. Integrity JSON reports it as `tag_kind_index`:
 `schema`, `indexed_through` and `high_water` (the greatest local ID
-allocated), `complete`, and its expected, actual, missing, unexpected and
-stale entries. Doctor's `tag-kind-index` check passes when the index is
-complete and every entry matches its event. It warns while the index is
-incomplete (a database from before the index, or events an earlier Wok
-release inserted), and when stale entries remain: entries an earlier release
-left behind when it deleted their events. Readers skip those. It fails on
-missing entries, which a query using the index would miss, and on entries
-their event does not derive. Reindex rebuilds the table from every stored
-event, so the result is complete and holds no stale entries, and verifies
-that before promoting it. See [lmdb-v3.md](lmdb-v3.md#wok_event__tagkind).
+allocated), `complete`, `bulk_pass` (the `target` and `visited` entries of a
+key-ordered build in progress), `tag_entries` (the `Event__tag` entries such a
+build visits), and its expected, actual, missing, unexpected and stale
+entries. Doctor's `tag-kind-index` check passes when the index is complete
+and every entry matches its event. It warns while the index is incomplete,
+with the build's progress: a database from before the index, which the relay
+builds in key order on its first start, or events an earlier Wok release
+inserted, which it indexes in local-ID order. It also warns when stale
+entries remain: entries an earlier release left behind when it deleted their
+events. Readers skip those. It fails on missing entries, which a query using
+the index would miss, and on entries their event does not derive. Reindex
+rebuilds the table from every stored event, so the result is complete and
+holds no stale entries, and verifies that before promoting it; it also
+finishes a build the relay had not. See
+[lmdb-v3.md](lmdb-v3.md#wok_event__tagkind).
 
 Reindex also repairs records that lack single-letter tag values longer than
 255 bytes. strfry and Wok 0.7.0 and earlier dropped such values from the packed

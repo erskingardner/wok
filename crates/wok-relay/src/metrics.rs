@@ -117,9 +117,13 @@ pub struct Metrics {
     pub tag_kind_index_complete: AtomicU64,
     pub tag_kind_indexed_through: AtomicU64,
     pub tag_kind_high_water: AtomicU64,
-    /// Events the writer's background backfill indexed, and the time its
+    /// `Event__tag` entries the key-ordered build has visited, 0 when none
+    /// runs, and the entries stored.
+    pub tag_kind_pass_visited: AtomicU64,
+    pub tag_kind_tag_entries: AtomicU64,
+    /// Postings the writer's background backfill put, and the time its
     /// transactions took.
-    pub tag_kind_backfill_events_total: AtomicU64,
+    pub tag_kind_backfill_entries_total: AtomicU64,
     pub tag_kind_backfill_micros_total: AtomicU64,
     pub history: MetricsHistory,
 }
@@ -237,8 +241,12 @@ impl Metrics {
                 "wok_tag_kind_index_indexed_through {}\n",
                 "# TYPE wok_tag_kind_index_high_water gauge\n",
                 "wok_tag_kind_index_high_water {}\n",
-                "# TYPE wok_tag_kind_backfill_events_total counter\n",
-                "wok_tag_kind_backfill_events_total {}\n",
+                "# TYPE wok_tag_kind_index_pass_visited gauge\n",
+                "wok_tag_kind_index_pass_visited {}\n",
+                "# TYPE wok_tag_kind_index_tag_entries gauge\n",
+                "wok_tag_kind_index_tag_entries {}\n",
+                "# TYPE wok_tag_kind_backfill_entries_total counter\n",
+                "wok_tag_kind_backfill_entries_total {}\n",
                 "# TYPE wok_tag_kind_backfill_seconds_total counter\n",
                 "wok_tag_kind_backfill_seconds_total {}\n",
             ),
@@ -282,7 +290,9 @@ impl Metrics {
             g(&self.tag_kind_index_complete),
             g(&self.tag_kind_indexed_through),
             g(&self.tag_kind_high_water),
-            g(&self.tag_kind_backfill_events_total),
+            g(&self.tag_kind_pass_visited),
+            g(&self.tag_kind_tag_entries),
+            g(&self.tag_kind_backfill_entries_total),
             g(&self.tag_kind_backfill_micros_total) as f64 / 1e6,
         )
     }

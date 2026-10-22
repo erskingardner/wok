@@ -2,10 +2,22 @@
 use super::*;
 use crate::protocol::SUPERSEDED_OK_REASON;
 
-/// Events one `(tag, kind, created_at)` backfill transaction indexes. The
-/// writer runs one before each batch of messages it takes, so a publication
-/// waits behind at most one.
-pub(super) const TAG_KIND_BACKFILL_BATCH: usize = 2_000;
+/// Bounds on one `(tag, kind, created_at)` backfill transaction. The writer
+/// runs one before each batch of messages it takes, so a publication waits
+/// behind at most one.
+#[derive(Clone, Copy)]
+pub(super) struct TagKindStep {
+    pub(super) max_entries: usize,
+    pub(super) budget: Duration,
+}
+
+/// A step stops after 10 ms of indexing, plus its commit, so publications
+/// during a backfill are acknowledged about as fast as without one. An
+/// entry cap alone let a step that hit cold pages run for most of a second.
+pub(super) const TAG_KIND_STEP: TagKindStep = TagKindStep {
+    max_entries: 5_000,
+    budget: Duration::from_millis(10),
+};
 /// How often a running backfill logs its progress.
 const TAG_KIND_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -17,7 +29,7 @@ pub(super) fn run_writer(
     rx: Receiver<WriterMsg>,
     mon_txs: Vec<Sender<MonitorData>>,
     moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
-    tag_kind_batch: usize,
+    tag_kind_step: TagKindStep,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
     let mut negentropy_max_tags = cfg.read().relay.max_tags_per_filter;
@@ -29,7 +41,7 @@ pub(super) fn run_writer(
     let mut events: Vec<EventToWrite<u64>> = Vec::with_capacity(256);
     // Bytes of committed events the req monitors still hold.
     let stored_in_flight = Arc::new(AtomicUsize::new(0));
-    let mut tag_kind = TagKindBackfill::new(tag_kind_batch);
+    let mut tag_kind = TagKindBackfill::new(tag_kind_step);
     tag_kind.recheck(&env, &metrics);
     let mut stop = false;
     while !stop {
@@ -484,11 +496,12 @@ pub(super) fn run_writer(
     }
 }
 
-/// Indexes, one bounded write transaction at a time, the stored events that
-/// `wok_Event__tagKind` lacks: every event of a database from before the
-/// index, and the events an earlier release inserted.
+/// Builds `wok_Event__tagKind` in the background, one bounded write
+/// transaction at a time: by a key-ordered pass for a database from before
+/// the index, and in local-id order for the events an earlier release
+/// inserted.
 pub(super) struct TagKindBackfill {
-    batch: usize,
+    step: TagKindStep,
     pending: bool,
     run: Option<TagKindBackfillRun>,
 }
@@ -496,14 +509,14 @@ pub(super) struct TagKindBackfill {
 struct TagKindBackfillRun {
     started: std::time::Instant,
     last_log: std::time::Instant,
-    events: u64,
+    entries: u64,
     slowest: Duration,
 }
 
 impl TagKindBackfill {
-    pub(super) fn new(batch: usize) -> Self {
+    pub(super) fn new(step: TagKindStep) -> Self {
         Self {
-            batch,
+            step,
             pending: false,
             run: None,
         }
@@ -518,12 +531,13 @@ impl TagKindBackfill {
     /// process, such as an earlier release's `wok import`, may have stored
     /// events without entries.
     pub(super) fn recheck(&mut self, env: &Env, metrics: &Metrics) {
-        match env
-            .begin_ro()
-            .and_then(|txn| wok_db::tag_kind_index_state_ro(&txn))
-        {
-            Ok(Some(state)) => {
-                publish_tag_kind_state(metrics, state);
+        let state = env.begin_ro().and_then(|txn| {
+            let tag_entries = txn.entries(txn.env().dbis().event_tag)? as u64;
+            Ok(wok_db::tag_kind_index_state_ro(&txn)?.map(|state| (state, tag_entries)))
+        });
+        match state {
+            Ok(Some((state, tag_entries))) => {
+                publish_tag_kind_state(metrics, state, tag_entries);
                 if state.schema == Some(wok_db::TAG_KIND_SCHEMA_VERSION) && !state.complete() {
                     self.pending = true;
                 }
@@ -533,12 +547,13 @@ impl TagKindBackfill {
         }
     }
 
-    /// Index one batch in its own write transaction.
+    /// Index one bounded step in its own write transaction.
     pub(super) fn step(&mut self, env: &Env, metrics: &Metrics) {
         let started = std::time::Instant::now();
         let result = (|| {
             let mut txn = env.begin_rw()?;
-            let step = wok_db::backfill_tag_kind_index(&mut txn, self.batch)?;
+            let step =
+                wok_db::backfill_tag_kind_index(&mut txn, self.step.max_entries, self.step.budget)?;
             txn.commit()?;
             Ok::<_, wok_db::DbError>(step)
         })();
@@ -557,55 +572,76 @@ impl TagKindBackfill {
                 return;
             }
         };
-        publish_tag_kind_state(metrics, step.state);
+        let state = step.state;
+        tracing::debug!(
+            entries = step.entries,
+            ms = elapsed.as_secs_f64() * 1000.0,
+            "tag-kind index backfill step"
+        );
+        publish_tag_kind_state(metrics, state, step.tag_entries);
         metrics
-            .tag_kind_backfill_events_total
-            .fetch_add(step.events, Ordering::Relaxed);
+            .tag_kind_backfill_entries_total
+            .fetch_add(step.entries, Ordering::Relaxed);
         metrics.tag_kind_backfill_micros_total.fetch_add(
             u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        let complete = step.state.complete();
-        if self.run.is_none() && !(complete && step.events == 0) {
-            tracing::info!(
-                indexed_through = step.state.indexed_through,
-                high_water = step.state.high_water,
-                "backfilling the (tag, kind, created_at) index in the background"
-            );
+        let complete = state.complete();
+        if self.run.is_none() && !(complete && step.entries == 0) {
+            match state.bulk_pass {
+                Some(_) => tracing::info!(
+                    tag_entries = step.tag_entries,
+                    high_water = state.high_water,
+                    "building the (tag, kind, created_at) index in the background, in key order"
+                ),
+                None => tracing::info!(
+                    indexed_through = state.indexed_through,
+                    high_water = state.high_water,
+                    "indexing stored events missing from the (tag, kind, created_at) index in the background"
+                ),
+            }
             self.run = Some(TagKindBackfillRun {
                 started,
                 last_log: started,
-                events: 0,
+                entries: 0,
                 slowest: Duration::ZERO,
             });
         }
         if let Some(run) = self.run.as_mut() {
-            run.events += step.events;
+            run.entries += step.entries;
             run.slowest = run.slowest.max(elapsed);
             if complete {
                 tracing::info!(
-                    events = run.events,
+                    entries = run.entries,
                     seconds = run.started.elapsed().as_secs_f64(),
                     slowest_step_ms = run.slowest.as_secs_f64() * 1000.0,
-                    high_water = step.state.high_water,
+                    high_water = state.high_water,
                     "the (tag, kind, created_at) index is complete"
                 );
                 self.run = None;
             } else if run.last_log.elapsed() >= TAG_KIND_PROGRESS_INTERVAL {
                 run.last_log = std::time::Instant::now();
-                tracing::info!(
-                    indexed_through = step.state.indexed_through,
-                    high_water = step.state.high_water,
-                    events = run.events,
-                    "tag-kind index backfill progress"
-                );
+                match state.bulk_pass {
+                    Some(pass) => tracing::info!(
+                        visited = pass.visited,
+                        tag_entries = step.tag_entries,
+                        entries = run.entries,
+                        "tag-kind index build progress"
+                    ),
+                    None => tracing::info!(
+                        indexed_through = state.indexed_through,
+                        high_water = state.high_water,
+                        entries = run.entries,
+                        "tag-kind index backfill progress"
+                    ),
+                }
             }
         }
         self.pending = !complete;
     }
 }
 
-fn publish_tag_kind_state(metrics: &Metrics, state: wok_db::TagKindIndexState) {
+fn publish_tag_kind_state(metrics: &Metrics, state: wok_db::TagKindIndexState, tag_entries: u64) {
     metrics
         .tag_kind_index_complete
         .store(u64::from(state.complete()), Ordering::Relaxed);
@@ -615,6 +651,13 @@ fn publish_tag_kind_state(metrics: &Metrics, state: wok_db::TagKindIndexState) {
     metrics
         .tag_kind_high_water
         .store(state.high_water, Ordering::Relaxed);
+    metrics.tag_kind_pass_visited.store(
+        state.bulk_pass.map_or(0, |pass| pass.visited),
+        Ordering::Relaxed,
+    );
+    metrics
+        .tag_kind_tag_entries
+        .store(tag_entries, Ordering::Relaxed);
 }
 
 /// NIP-56 report kind; accepted reports feed the NIP-86 moderation queue.
@@ -895,7 +938,7 @@ mod tests {
             writer_rx,
             Vec::new(),
             moderation,
-            TAG_KIND_BACKFILL_BATCH,
+            TAG_KIND_STEP,
         );
 
         let txn = env.begin_ro().unwrap();
@@ -971,6 +1014,11 @@ mod tests {
         }
     }
 
+    const TEN_ENTRIES: TagKindStep = TagKindStep {
+        max_entries: 10,
+        budget: Duration::MAX,
+    };
+
     #[test]
     fn backfill_steps_are_bounded_and_interleave_with_writes() {
         let (dir, env) = unindexed_database(50);
@@ -993,16 +1041,18 @@ mod tests {
             writer_rx,
             Vec::new(),
             moderation(&env),
-            10,
+            TEN_ENTRIES,
         );
 
-        // One step ran before the publication's batch and one after it; the
-        // publication did not wait for the other 30 events.
+        // One step of the key-ordered pass ran before the publication's
+        // batch and one after it; the publication did not wait for the
+        // other 30 entries.
         let state = tag_kind_state(&env);
-        assert_eq!((state.indexed_through, state.high_water), (20, 51));
+        assert_eq!((state.indexed_through, state.high_water), (0, 51));
+        assert_eq!(state.bulk_pass.map(|pass| pass.visited), Some(20));
         assert_eq!(
             metrics
-                .tag_kind_backfill_events_total
+                .tag_kind_backfill_entries_total
                 .load(Ordering::Relaxed),
             20
         );
@@ -1046,7 +1096,7 @@ mod tests {
                     writer_rx,
                     Vec::new(),
                     moderation,
-                    10,
+                    TEN_ENTRIES,
                 )
             })
         };
@@ -1082,7 +1132,7 @@ mod tests {
         assert!(tag_kind_state(&env).complete());
         assert_eq!(
             metrics
-                .tag_kind_backfill_events_total
+                .tag_kind_backfill_entries_total
                 .load(Ordering::Relaxed),
             100
         );

@@ -53,8 +53,9 @@ fn tag(rng: &mut StdRng) -> (char, Vec<u8>, String) {
             ('a', a.as_bytes().to_vec(), a)
         }
         _ => {
-            let pk = key(rng.gen_range(0..6));
-            ('P', pk.to_vec(), to_hex(&pk))
+            // Only lowercase `e` and `p` values are packed as raw bytes.
+            let pk = to_hex(&key(rng.gen_range(0..6)));
+            ('P', pk.clone().into_bytes(), pk)
         }
     }
 }
@@ -247,6 +248,25 @@ proptest! {
             prop_assert!(["TagKind", "Pubkey", "PubkeyKind"].contains(&plan(&indexed, filter)));
             prop_assert_eq!(results(&indexed, filter), results(&unindexed, filter), "{}", filter);
         }
+    }
+}
+
+#[test]
+fn every_tag_the_corpus_uses_matches_events_on_both_plans() {
+    let (_a, indexed, _b, unindexed) = corpus(7);
+    let pubkeys: Vec<_> = (0..6).map(|n| to_hex(&key(n))).collect();
+    for filter in [
+        json!({"#p": pubkeys, "kinds": KINDS}),
+        json!({"#P": pubkeys, "kinds": KINDS}),
+        json!({"#e": (0..4).map(|n| to_hex(&ref_id(n))).collect::<Vec<_>>(), "kinds": KINDS}),
+        json!({"#t": TOPICS, "kinds": KINDS}),
+        json!({"#a": (0..4).map(address).collect::<Vec<_>>(), "kinds": KINDS}),
+        json!({"#d": D_TAGS, "kinds": KINDS}),
+    ] {
+        assert_eq!(plan(&indexed, &filter), "TagKind", "{filter}");
+        let found = results(&indexed, &filter);
+        assert!(!found.is_empty(), "{filter}");
+        assert_eq!(found, results(&unindexed, &filter), "{filter}");
     }
 }
 

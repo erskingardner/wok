@@ -118,9 +118,16 @@ impl ReadRestrictor {
     /// Whether this rule can hide any event `fg` matches from a reader that
     /// has not authenticated.
     pub fn may_hide_matches(&self, fg: &NostrFilterGroup) -> bool {
+        self.strictest_group_class(fg) != ReadClass::Open
+    }
+
+    /// The strictest class of the kinds any filter in `fg` can match.
+    pub fn strictest_group_class(&self, fg: &NostrFilterGroup) -> ReadClass {
         fg.filters
             .iter()
-            .any(|f| self.strictest_class(f) != ReadClass::Open)
+            .map(|f| self.strictest_class(f))
+            .max()
+            .unwrap_or(ReadClass::Open)
     }
 
     pub fn is_filter_group_fully_restricted(&self, fg: &NostrFilterGroup) -> bool {

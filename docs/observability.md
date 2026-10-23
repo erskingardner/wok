@@ -43,7 +43,9 @@ or protect it at the reverse proxy. The endpoint is unauthenticated and sends
 | `wok_auth_failure_total` | counter | none | Failed NIP-42 authentication attempts. |
 | `wok_slow_client_terminations_total` | counter | none | Connections closed after exceeding their pending-output byte budget. |
 | `wok_real_ip_header_unparsed_total` | counter | none | Requests whose `relay.real_ip_header` ended in an entry that is not an IP address, so the connecting address stood in for the client's. Any increase means the proxy does not write the client's address last in that header. |
-| `wok_abuse_rejections_total` | counter | `reason` | Requests or events rejected by an abuse guard. |
+| `wok_refusals_total` | counter | `setting` | Requests and events refused, by the config key that refused them. See [Refusals by setting](#refusals-by-setting). |
+| `wok_abuse_rejections_total` | counter | `reason` | Deprecated: removed in the release after 0.8. Requests or events rejected by an abuse guard. |
+| `wok_moderation_rejections_total` | counter | `reason` | Events refused by a NIP-86 ban (`banned_event`, `banned_author`), by the write policy (`restricted_writes`), or by `relay.auth.accepted_kinds` or the NIP-86 kind policy (`kind_not_allowed`). |
 | `wok_client_messages_total` | counter | `type` | Inbound Nostr protocol messages by type. |
 | `wok_relay_messages_total` | counter | `type` | Outbound Nostr protocol messages by type. |
 | `wok_tag_kind_index_complete` | gauge | none | 1 once every stored event is in the `(tag, kind, created_at)` index, 0 while the writer still builds it. |
@@ -59,21 +61,69 @@ writer's maintenance tick (every 2 seconds). While a key-ordered build runs,
 `pass_visited / tag_entries` is its progress; after it, while events an
 earlier release inserted are indexed, `indexed_through / high_water` is.
 
-`wok_abuse_rejections_total` has these `reason` values:
+### Refusals by setting
 
-| Value | Trigger |
+`wok_refusals_total{setting="<config key>"}` counts each refused request or
+event once, under the key to change if the refusal should not have
+happened. Every label is listed from startup, at 0 until it refuses
+something. A token bucket's refusals carry its `_burst` key; raising its
+`_rate_per_second` helps too.
+
+| `setting` | Counts |
 |---|---|
-| `connection_rate` | Network-address connection bucket exhausted. |
-| `event_rate` | Per-address EVENT/AUTH or per-author EVENT budget exhausted. |
-| `req_rate` | A connection's REQ or NEG-MSG budget, or its address's REQ backstop, exhausted (REQ, NEG-OPEN, NEG-MSG). |
-| `count_rate` | A connection's COUNT budget, or its address's COUNT backstop, exhausted. |
-| `invalid_rate` | Malformed-message budget exhausted. |
-| `pow` | Event did not meet the configured NIP-13 difficulty. |
-| `query_cost` | Estimated historical-query cost exceeded its ceiling. |
-| `query_concurrency` | A connection's queue of historical queries waiting for its concurrency cap was full, or the cap is zero. |
-| `pubkey_storage_quota` | Author storage quota reached. |
-| `global_storage_quota` | Global durable event quota would be exceeded. |
-| `disk_reserve` | Durable writes stopped to preserve configured free disk space. |
+| `relay.abuse.connection_burst` | Connections and HTTP requests over an address's connection budget. |
+| `relay.abuse.event_burst` | EVENTs and AUTHs over an address's budget. |
+| `relay.abuse.pubkey_event_burst` | EVENTs over their author's budget, or over the AUTHed identity's for events from other keys. |
+| `events.max_event_size`, `events.max_num_tags`, `events.max_tag_val_size` | Events over the size, tag count or tag value limit. |
+| `events.reject_older_than_secs`, `events.reject_newer_than_secs`, `events.reject_ephemeral_older_than_secs` | Events outside the `created_at` window. AUTH's ±600 s window and a 21059's 3-day allowance are NIP constants and are not counted. |
+| `relay.abuse.min_pow_difficulty` | Events short of the NIP-13 difficulty. |
+| `relay.auth.accepted_kinds` | Events of a kind outside it. The NIP-86 kind policy is counted only by `wok_moderation_rejections_total`. |
+| `relay.auth.write_policy` | Events the write policy does not admit. |
+| `relay.auth.owner_only_kinds` | Events of an owner-only kind not sent as their author, and reads of one not scoped to the reader. |
+| `relay.nip62.enabled` | Vanish requests while NIP-62 is off. |
+| `relay.write_policy_plugin` | Events the plugin rejected or shadow-rejected. |
+| `relay.abuse.max_stored_events`, `relay.abuse.max_stored_events_per_pubkey`, `database.min_free_disk_bytes` | Events not written because of a storage quota or the disk reserve. |
+| `relay.abuse.per_connection.req_burst`, `neg_msg_burst`, `count_burst` | REQs and NEG-OPENs, NEG-MSGs, and COUNTs over a connection's own budget. |
+| `relay.abuse.req_burst`, `relay.abuse.count_burst` | The same over the address's backstop (REQ, NEG-OPEN and NEG-MSG; COUNT). |
+| `relay.abuse.invalid_burst` | Malformed messages whose reply was suppressed. |
+| `relay.max_filters_per_req`, `relay.max_req_filter_size` | REQs and COUNTs with too many filters or filter bytes. |
+| `relay.max_tags_per_filter`, `relay.max_and_entries` | Filters over the tag-letter or NIP-91 `&` limit (REQ, COUNT, NEG-OPEN). |
+| `relay.max_filter_limit_count` | COUNTs while it is 0. |
+| `relay.filter_validation.max_kinds_per_filter`, `allowed_kinds`, `require_author_or_tag`, `require_scoped_filters` | Filters a rule refuses (REQ, COUNT, NEG-OPEN). |
+| `relay.abuse.max_query_work` | Requests whose estimated work is over the ceiling. |
+| `relay.auth.read_policy` | REQs, COUNTs and NEG-OPENs from a connection the read policy does not admit. |
+| `relay.auth.recipient_only_kinds`, `relay.auth.authenticated_kinds` | Reads of those kinds not scoped to the reader, by the strictest class the filters can match. |
+| `relay.max_subs_per_connection` | New subscriptions or sync sessions over the cap, and queries refused because the connection's queue of waiting scans is full. |
+| `relay.max_filter_bytes_per_connection` | Subscriptions and COUNTs over the connection's filter bytes. |
+| `relay.abuse.max_concurrent_historical_queries` | Queries while it is 0. |
+| `relay.negentropy_enabled` | NEG-OPENs and NEG-MSGs while NIP-77 is off. |
+| `relay.max_sync_events`, `relay.sync_memory_per_connection`, `relay.sync_memory_total` | Sync sessions over the size or memory budget. |
+
+Refusals that no setting makes are not counted here: malformed messages
+(beyond the invalid budget), bad signatures, NIP-70 protected events,
+NIP-86 bans and blocked addresses, duplicate events, and relay errors.
+Truncation by `relay.max_filter_limit` or `relay.max_total_events_per_req`
+is not a refusal.
+
+### Deprecated: `wok_abuse_rejections_total`
+
+`wok_abuse_rejections_total{reason}` still counts as before for this
+release and will be removed in the next. Each `reason` is the sum of these
+`wok_refusals_total` settings:
+
+| `reason` | Trigger | `setting` |
+|---|---|---|
+| `connection_rate` | Network-address connection bucket exhausted, or a NIP-86 blocked address. | `relay.abuse.connection_burst` (blocked addresses are not counted) |
+| `event_rate` | Per-address EVENT/AUTH or per-author EVENT budget exhausted. | `relay.abuse.event_burst`, `relay.abuse.pubkey_event_burst` |
+| `req_rate` | A connection's REQ or NEG-MSG budget, or its address's REQ backstop, exhausted (REQ, NEG-OPEN, NEG-MSG). | `relay.abuse.per_connection.req_burst`, `relay.abuse.per_connection.neg_msg_burst`, `relay.abuse.req_burst` |
+| `count_rate` | A connection's COUNT budget, or its address's COUNT backstop, exhausted. | `relay.abuse.per_connection.count_burst`, `relay.abuse.count_burst` |
+| `invalid_rate` | Malformed-message budget exhausted. | `relay.abuse.invalid_burst` |
+| `pow` | Event did not meet the configured NIP-13 difficulty. | `relay.abuse.min_pow_difficulty` |
+| `query_cost` | Estimated historical-query cost exceeded its ceiling. | `relay.abuse.max_query_work` |
+| `query_concurrency` | A connection's queue of historical queries waiting for its concurrency cap was full, or the cap is zero. | `relay.max_subs_per_connection` (also counts other refusals), `relay.abuse.max_concurrent_historical_queries` |
+| `pubkey_storage_quota` | Author storage quota reached. | `relay.abuse.max_stored_events_per_pubkey` |
+| `global_storage_quota` | Global durable event quota would be exceeded. | `relay.abuse.max_stored_events` |
+| `disk_reserve` | Durable writes stopped to preserve configured free disk space. | `database.min_free_disk_bytes` |
 
 `wok_client_messages_total{type=...}` uses `EVENT`, `REQ`, `COUNT`,
 `CLOSE`, and `AUTH`. `wok_relay_messages_total{type=...}` uses `EVENT`,
@@ -98,8 +148,8 @@ clamp_min(
   1
 )
 
-# Abuse rejections per minute, grouped by cause
-sum by (reason) (increase(wok_abuse_rejections_total[1m]))
+# Refusals over the last hour, by the setting that refused them
+sort_desc(increase(wok_refusals_total[1h]) > 0)
 
 # Slow-client disconnects over the last hour
 increase(wok_slow_client_terminations_total[1h])

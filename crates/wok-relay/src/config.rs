@@ -1,5 +1,6 @@
 //! Native TOML configuration plus the legacy strfry HOCON migration parser.
 
+use crate::metrics::Setting;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -768,6 +769,24 @@ impl Config {
                 self.events.reject_ephemeral_older_than_secs
             },
         )
+    }
+
+    /// The setting behind `limit` when it refused an event of `kind`, or
+    /// `None` for a bound [`Self::timestamp_policy_for_kind`] takes from a
+    /// NIP instead: AUTH's window and a 21059's backdating allowance.
+    pub fn event_limit_setting(kind: u64, limit: wok_event::EventLimit) -> Option<Setting> {
+        use wok_event::EventLimit;
+        let constant_window =
+            kind == wok_event::AUTH_KIND || (kind == 21059 && limit == EventLimit::EphemeralTooOld);
+        match limit {
+            EventLimit::EventSize => Some(Setting::MaxEventSize),
+            EventLimit::NumTags => Some(Setting::MaxNumTags),
+            EventLimit::TagValSize => Some(Setting::MaxTagValSize),
+            _ if constant_window => None,
+            EventLimit::TooOld => Some(Setting::RejectOlderThan),
+            EventLimit::TooNew => Some(Setting::RejectNewerThan),
+            EventLimit::EphemeralTooOld => Some(Setting::RejectEphemeralOlderThan),
+        }
     }
 
     pub fn vanish_policy(&self) -> wok_db::VanishPolicy {

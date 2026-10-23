@@ -6,6 +6,153 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_HISTORY_POINTS: usize = 100_000;
 
+/// Declares [`Setting`] from its variants and config keys, so the two
+/// cannot drift apart.
+macro_rules! settings {
+    ($($(#[$doc:meta])* $variant:ident => $key:literal,)+) => {
+        /// A setting that refuses requests or events, named in
+        /// `wok_refusals_total{setting}` by its config key. A token bucket's
+        /// refusals are labelled with its burst, how much may be sent at
+        /// once, as rate and burst run out together.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Setting {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl Setting {
+            /// Every setting, in the order `/metrics` lists them.
+            pub const ALL: &'static [Setting] = &[$(Setting::$variant,)+];
+
+            /// The config key, such as `relay.abuse.event_burst`.
+            pub fn key(self) -> &'static str {
+                match self {
+                    $(Setting::$variant => $key,)+
+                }
+            }
+        }
+    };
+}
+
+settings! {
+    // Connections.
+    ConnectionBurst => "relay.abuse.connection_burst",
+    // Events.
+    /// Per-address EVENT and AUTH budget.
+    EventBurst => "relay.abuse.event_burst",
+    /// Per-author EVENT budget, charged to the AUTHed identity for events
+    /// from other keys.
+    PubkeyEventBurst => "relay.abuse.pubkey_event_burst",
+    MaxEventSize => "events.max_event_size",
+    MaxNumTags => "events.max_num_tags",
+    MaxTagValSize => "events.max_tag_val_size",
+    RejectOlderThan => "events.reject_older_than_secs",
+    RejectNewerThan => "events.reject_newer_than_secs",
+    RejectEphemeralOlderThan => "events.reject_ephemeral_older_than_secs",
+    MinPowDifficulty => "relay.abuse.min_pow_difficulty",
+    AcceptedKinds => "relay.auth.accepted_kinds",
+    WritePolicy => "relay.auth.write_policy",
+    /// Writes of an owner-only kind from anyone but its author, and reads of
+    /// one not scoped to the reader.
+    OwnerOnlyKinds => "relay.auth.owner_only_kinds",
+    /// A vanish request while NIP-62 is off.
+    Nip62Enabled => "relay.nip62.enabled",
+    /// The write-policy plugin's rejections, shadow rejections included.
+    WritePolicyPlugin => "relay.write_policy_plugin",
+    MaxStoredEvents => "relay.abuse.max_stored_events",
+    MaxStoredEventsPerPubkey => "relay.abuse.max_stored_events_per_pubkey",
+    MinFreeDiskBytes => "database.min_free_disk_bytes",
+    // Requests.
+    /// A connection's REQ and NEG-OPEN budget.
+    PerConnectionReqBurst => "relay.abuse.per_connection.req_burst",
+    PerConnectionNegMsgBurst => "relay.abuse.per_connection.neg_msg_burst",
+    PerConnectionCountBurst => "relay.abuse.per_connection.count_burst",
+    /// The per-address backstop for REQ, NEG-OPEN and NEG-MSG.
+    ReqBurst => "relay.abuse.req_burst",
+    /// The per-address backstop for COUNT.
+    CountBurst => "relay.abuse.count_burst",
+    /// Malformed messages whose reply was suppressed.
+    InvalidBurst => "relay.abuse.invalid_burst",
+    MaxFiltersPerReq => "relay.max_filters_per_req",
+    MaxReqFilterSize => "relay.max_req_filter_size",
+    /// COUNT while `max_filter_limit_count = 0` turns it off.
+    MaxFilterLimitCount => "relay.max_filter_limit_count",
+    MaxTagsPerFilter => "relay.max_tags_per_filter",
+    MaxAndEntries => "relay.max_and_entries",
+    MaxKindsPerFilter => "relay.filter_validation.max_kinds_per_filter",
+    AllowedKinds => "relay.filter_validation.allowed_kinds",
+    RequireAuthorOrTag => "relay.filter_validation.require_author_or_tag",
+    RequireScopedFilters => "relay.filter_validation.require_scoped_filters",
+    MaxQueryWork => "relay.abuse.max_query_work",
+    ReadPolicy => "relay.auth.read_policy",
+    /// Reads of a recipient-only kind not scoped to the reader.
+    RecipientOnlyKinds => "relay.auth.recipient_only_kinds",
+    /// Reads of an authenticated-only kind before AUTH.
+    AuthenticatedKinds => "relay.auth.authenticated_kinds",
+    /// New subscriptions over the cap, and queries or sync sessions over the
+    /// queue it bounds.
+    MaxSubsPerConnection => "relay.max_subs_per_connection",
+    MaxFilterBytesPerConnection => "relay.max_filter_bytes_per_connection",
+    /// Queries while `max_concurrent_historical_queries = 0` runs none.
+    MaxConcurrentHistoricalQueries => "relay.abuse.max_concurrent_historical_queries",
+    NegentropyEnabled => "relay.negentropy_enabled",
+    MaxSyncEvents => "relay.max_sync_events",
+    SyncMemoryPerConnection => "relay.sync_memory_per_connection",
+    SyncMemoryTotal => "relay.sync_memory_total",
+}
+
+impl Setting {
+    /// The setting behind a [`wok_query::FilterLimit`].
+    pub fn of_filter_limit(limit: wok_query::FilterLimit) -> Self {
+        use wok_query::FilterLimit;
+        match limit {
+            FilterLimit::TagsPerFilter => Self::MaxTagsPerFilter,
+            FilterLimit::AndEntries => Self::MaxAndEntries,
+            FilterLimit::KindsPerFilter => Self::MaxKindsPerFilter,
+            FilterLimit::AllowedKinds => Self::AllowedKinds,
+            FilterLimit::AuthorOrTag => Self::RequireAuthorOrTag,
+            FilterLimit::ScopedFilters => Self::RequireScopedFilters,
+        }
+    }
+
+    /// The read class setting behind a read refused to a reader the filters
+    /// are not scoped to.
+    pub fn of_read_class(class: crate::restrict::ReadClass) -> Option<Self> {
+        use crate::restrict::ReadClass;
+        match class {
+            ReadClass::Open => None,
+            ReadClass::Authenticated => Some(Self::AuthenticatedKinds),
+            ReadClass::Recipient => Some(Self::RecipientOnlyKinds),
+            ReadClass::Owner => Some(Self::OwnerOnlyKinds),
+        }
+    }
+}
+
+/// `wok_refusals_total`: what each [`Setting`] refused since start.
+pub struct Refusals([AtomicU64; Setting::ALL.len()]);
+
+impl Default for Refusals {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+}
+
+impl Refusals {
+    pub fn add(&self, setting: Setting, n: u64) {
+        self.0[setting as usize].fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn get(&self, setting: Setting) -> u64 {
+        self.0[setting as usize].load(Ordering::Relaxed)
+    }
+
+    /// Every setting's count, in [`Setting::ALL`] order.
+    pub fn counts(&self) -> impl Iterator<Item = (Setting, u64)> + '_ {
+        Setting::ALL
+            .iter()
+            .map(|&setting| (setting, self.get(setting)))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricsSnapshot {
     pub timestamp: u64,
@@ -105,6 +252,9 @@ pub struct Metrics {
     pub moderation_banned_author_rejections: AtomicU64,
     pub moderation_restricted_write_rejections: AtomicU64,
     pub moderation_kind_rejections: AtomicU64,
+    /// Refusals by the setting that made them. The `abuse_*_rejections`
+    /// counters above count some of the same refusals for one more release.
+    pub refusals: Refusals,
     pub client_event: AtomicU64,
     pub client_req: AtomicU64,
     pub client_count: AtomicU64,
@@ -168,6 +318,11 @@ impl Metrics {
         }
     }
 
+    /// Count one refusal by `setting`.
+    pub fn refused(&self, setting: Setting) {
+        self.refusals.add(setting, 1);
+    }
+
     pub fn record_history(&self) {
         self.history.push(self.snapshot());
     }
@@ -181,7 +336,7 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let g = |n: &AtomicU64| n.load(Ordering::Relaxed);
-        format!(
+        let mut out = format!(
             concat!(
                 "# HELP wok_active_connections Current WebSocket/Unix connections\n",
                 "# TYPE wok_active_connections gauge\n",
@@ -300,13 +455,53 @@ impl Metrics {
             g(&self.tag_kind_tag_entries),
             g(&self.tag_kind_backfill_entries_total),
             g(&self.tag_kind_backfill_micros_total) as f64 / 1e6,
-        )
+        );
+        out.push_str(concat!(
+            "# HELP wok_refusals_total Requests and events refused, by the config key that refused them\n",
+            "# TYPE wok_refusals_total counter\n",
+        ));
+        for (setting, count) in self.refusals.counts() {
+            out.push_str(&format!(
+                "wok_refusals_total{{setting=\"{}\"}} {count}\n",
+                setting.key()
+            ));
+        }
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusals_are_labelled_by_real_config_keys() {
+        let keys: std::collections::HashSet<String> = crate::Config::explain_toml("")
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect();
+        let metrics = Metrics::default();
+        metrics.refused(Setting::MaxQueryWork);
+        metrics.refusals.add(Setting::MinFreeDiskBytes, 3);
+        let rendered = metrics.render();
+        let mut seen = std::collections::HashSet::new();
+        for &setting in Setting::ALL {
+            assert!(keys.contains(setting.key()), "{}", setting.key());
+            assert!(seen.insert(setting.key()), "{} twice", setting.key());
+            let count = match setting {
+                Setting::MaxQueryWork => 1,
+                Setting::MinFreeDiskBytes => 3,
+                _ => 0,
+            };
+            let line = format!(
+                "\nwok_refusals_total{{setting=\"{}\"}} {count}\n",
+                setting.key()
+            );
+            assert!(rendered.contains(&line), "{line}");
+        }
+    }
 
     #[test]
     fn history_is_fifo_and_hard_bounded() {

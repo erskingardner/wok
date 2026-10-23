@@ -14,7 +14,7 @@
 | `abuse.rs` | Per-IP / per-pubkey token buckets, query cost, PoW bits |
 | `restrict.rs` | Read classes: who may read each kind (recipient-only, owner-only, authenticated) |
 | `plugin.rs` | Write-policy child process (JSONL stdin/stdout, timeout) |
-| `metrics.rs` | Counters + bounded in-process chart history |
+| `metrics.rs` | Counters, `wok_refusals_total` by `Setting` (config key), and bounded in-process chart history |
 | `rlimit.rs` | `relay.nofiles` (`unsafe` isolated here) |
 
 `start()` in `server.rs` is the entry the CLI uses for `wok relay`. Config hot-reload and graceful shutdown (SIGUSR1/SIGINT) are handled at this layer.

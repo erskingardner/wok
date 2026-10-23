@@ -20,17 +20,25 @@ struct Reservation {
     bytes: u64,
 }
 impl MemoryPool {
-    fn reserve(self: &Arc<Self>, conn: u64, bytes: u64, cfg: &Config) -> Option<Reservation> {
+    /// Reserve `bytes` for `conn`, or name the budget that refuses them.
+    fn reserve(
+        self: &Arc<Self>,
+        conn: u64,
+        bytes: u64,
+        cfg: &Config,
+    ) -> Result<Reservation, Setting> {
         let mut usage = self.0.lock();
         let per_conn = usage.connections.get(&conn).copied().unwrap_or(0);
-        if usage.total.checked_add(bytes)? > cfg.relay.sync_memory_total
-            || per_conn.checked_add(bytes)? > cfg.relay.sync_memory_per_connection
-        {
-            return None;
+        let fits = |used: u64, budget: u64| used.checked_add(bytes).is_some_and(|n| n <= budget);
+        if !fits(usage.total, cfg.relay.sync_memory_total) {
+            return Err(Setting::SyncMemoryTotal);
+        }
+        if !fits(per_conn, cfg.relay.sync_memory_per_connection) {
+            return Err(Setting::SyncMemoryPerConnection);
         }
         usage.total += bytes;
         usage.connections.insert(conn, per_conn + bytes);
-        Some(Reservation {
+        Ok(Reservation {
             pool: self.clone(),
             conn,
             bytes,
@@ -247,6 +255,7 @@ pub(super) fn run_negentropy(
                     if sessions.keys().filter(|k| k.0 == conn).count()
                         >= cfg.relay.max_subs_per_connection
                     {
+                        metrics.refused(Setting::MaxSubsPerConnection);
                         fail(
                             &conns,
                             &metrics,
@@ -304,15 +313,20 @@ pub(super) fn run_negentropy(
                     } else {
                         ROUND_BYTES.saturating_add(limit.saturating_mul(per_item))
                     };
-                    let Some(reservation) = pool.reserve(conn, bytes, &cfg) else {
-                        fail(
-                            &conns,
-                            &metrics,
-                            conn,
-                            &sid,
-                            "blocked: synchronization memory budget exceeded; narrow the filter",
-                        );
-                        continue;
+                    let reservation = match pool.reserve(conn, bytes, &cfg) {
+                        Ok(reservation) => reservation,
+                        Err(setting) => {
+                            metrics.refused(setting);
+                            fail(
+                                &conns,
+                                &metrics,
+                                conn,
+                                &sid,
+                                "blocked: synchronization memory budget exceeded; narrow the \
+                                 filter",
+                            );
+                            continue;
+                        }
                     };
                     let view = if let Some(tree_id) = tree_id {
                         View::Tree { sub, tree_id }
@@ -324,7 +338,10 @@ pub(super) fn run_negentropy(
                                 initial: payload.clone(),
                                 items: Vector::new(),
                             },
-                            _ => {
+                            refused => {
+                                if let Ok(Scheduled::Refused) = refused {
+                                    metrics.refused(scheduler_refusal(&cfg));
+                                }
                                 fail(
                                     &conns,
                                     &metrics,
@@ -513,6 +530,7 @@ pub(super) fn run_negentropy(
         for (sub, total) in done {
             let key = (sub.conn_id, sub.sub_id.to_string());
             if total > cfg.relay.max_sync_events {
+                metrics.refused(Setting::MaxSyncEvents);
                 sessions.remove(&key);
                 fail(
                     &conns,
@@ -716,8 +734,10 @@ mod tests {
         cfg.relay.sync_memory_per_connection = 10;
         cfg.relay.sync_memory_total = 15;
         let mut first = pool.reserve(1, 10, &cfg).unwrap();
-        assert!(pool.reserve(1, 1, &cfg).is_none());
-        assert!(pool.reserve(2, 6, &cfg).is_none());
+        // A refusal names the budget it would exceed.
+        let refused = |conn, bytes| pool.reserve(conn, bytes, &cfg).err();
+        assert_eq!(refused(1, 1), Some(Setting::SyncMemoryPerConnection));
+        assert_eq!(refused(2, 6), Some(Setting::SyncMemoryTotal));
         let second = pool.reserve(2, 5, &cfg).unwrap();
         first.shrink(4);
         assert_eq!(pool.0.lock().total, 9);
@@ -725,6 +745,6 @@ mod tests {
         drop(second);
         assert_eq!(pool.0.lock().total, 0);
         assert!(pool.0.lock().connections.is_empty());
-        assert!(pool.reserve(1, u64::MAX, &cfg).is_none());
+        assert_eq!(refused(1, u64::MAX), Some(Setting::SyncMemoryTotal));
     }
 }

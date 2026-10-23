@@ -10,6 +10,30 @@ pub enum QueryError {
     /// than `invalid:`.
     #[error("{0}")]
     Unsupported(String),
+    /// The request is over a limit the caller chose, such as the tag
+    /// letters a filter may use or a [`FilterValidator`] rule, so a relay
+    /// can say which of its settings refused it.
+    ///
+    /// [`FilterValidator`]: crate::FilterValidator
+    #[error("{1}")]
+    Limit(FilterLimit, String),
+}
+
+/// The bound a [`QueryError::Limit`] broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterLimit {
+    /// The `max_tags_per_filter` a filter was parsed with.
+    TagsPerFilter,
+    /// The `max_and_entries` a filter was parsed with.
+    AndEntries,
+    /// `FilterValidator::max_kinds_per_filter`.
+    KindsPerFilter,
+    /// `FilterValidator::allowed_kinds`.
+    AllowedKinds,
+    /// `FilterValidator::require_author_or_tag`.
+    AuthorOrTag,
+    /// `FilterValidator::require_scoped_filters`.
+    ScopedFilters,
 }
 
 impl QueryError {
@@ -21,10 +45,22 @@ impl QueryError {
         Self::Unsupported(m.into())
     }
 
+    pub fn limit(limit: FilterLimit, m: impl Into<String>) -> Self {
+        Self::Limit(limit, m.into())
+    }
+
+    /// The limit this error reports, when it is one.
+    pub fn broken_limit(&self) -> Option<FilterLimit> {
+        match self {
+            Self::Limit(limit, _) => Some(*limit),
+            Self::Message(_) | Self::Unsupported(_) => None,
+        }
+    }
+
     /// NIP-01 machine-readable prefix for refusing a request with this error.
     pub fn reason_prefix(&self) -> &'static str {
         match self {
-            Self::Message(_) => "invalid",
+            Self::Message(_) | Self::Limit(..) => "invalid",
             Self::Unsupported(_) => "unsupported",
         }
     }

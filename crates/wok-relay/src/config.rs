@@ -372,14 +372,16 @@ pub struct InfoConfig {
     pub terms: String,
 }
 
-/// Optional rules for REQ and COUNT filters, each off at its zero or empty
-/// value.
+/// Optional rules for REQ, COUNT and NEG-OPEN filters, each off at its zero
+/// or empty value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterValidationConfig {
     pub max_kinds_per_filter: u64,
     pub allowed_kinds: String,
     pub require_author_or_tag: bool,
+    /// Refuse a filter that names none of `ids`, `authors` or a tag.
+    pub require_scoped_filters: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -503,6 +505,7 @@ impl Default for Config {
                     max_kinds_per_filter: 0,
                     allowed_kinds: String::new(),
                     require_author_or_tag: false,
+                    require_scoped_filters: false,
                 },
                 abuse: AbuseConfig {
                     enabled: true,
@@ -1173,6 +1176,7 @@ impl Config {
                 max_kinds_per_filter: max_kinds,
                 allowed_kinds,
                 require_author_or_tag,
+                require_scoped_filters: false,
             };
         }
         assign_bool(&map, "relay.unix.enabled", |b| cfg.relay.unix.enabled = b)?;
@@ -1259,6 +1263,7 @@ impl Config {
                 f.max_kinds_per_filter,
                 f.allowed_kinds.clone(),
                 f.require_author_or_tag,
+                f.require_scoped_filters,
             )
         };
         if fv(self) != fv(new) {

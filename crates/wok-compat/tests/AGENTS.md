@@ -7,6 +7,7 @@
 | `support/wire.rs` | Shared framed Unix / WebSocket test and soak client |
 | `e2e_transports.rs` | WebSocket + Unix end-to-end |
 | `access_model.rs` | Read classes (recipient-only, owner-only, authenticated) and how 0.7's access keys translate |
+| `filter_validation.rs` | `[relay.filter_validation]` on REQ, COUNT and NEG-OPEN, and `require_scoped_filters` against Marmot's filters |
 | `query_cost.rs` | Query-cost gate at the default ceiling: client filters served, fan-outs refused as REQ, COUNT and NEG-OPEN |
 | `rate_keying.rs` | What each rate budget is keyed on: per-connection budgets under an address backstop, the AUTH multiplier, NEG-MSG's own bucket, IPv6 networks, and throwaway-key events charged to the AUTHed identity |
 | `req_lifecycle.rs` | Live-before-history REQs: no loss, exactly once, replacement, cap, COUNT ids, scans queued over the concurrency cap |

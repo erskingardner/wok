@@ -514,6 +514,11 @@ pub struct FilterValidator {
     pub max_kinds_per_filter: u64,
     pub allowed_kinds: HashSet<u64>,
     pub require_author_or_tag: bool,
+    /// Every filter must name what it wants: `ids`, `authors` or a tag
+    /// filter, with any number of values. This refuses enumeration such as
+    /// `{"kinds":[445]}` and keeps group, inbox, `ids` and directory
+    /// filters (#97 F13).
+    pub require_scoped_filters: bool,
 }
 
 impl FilterValidator {
@@ -534,6 +539,14 @@ impl FilterValidator {
                         }
                     }
                 }
+            }
+            if self.require_scoped_filters
+                && filter.ids.is_none()
+                && filter.authors.is_none()
+                && filter.tags.is_empty()
+                && filter.and_tags.is_empty()
+            {
+                return Err(QueryError::msg("filter must name ids, authors or a tag"));
             }
             if self.require_author_or_tag {
                 let has_author = filter
@@ -655,6 +668,43 @@ mod tests {
             .is_ok());
         // A filter that matches nothing is not checked.
         assert!(scoped.validate(&group(json!([{"authors": []}]))).is_ok());
+
+        // Scoped filters accept any scope, with any number of values: what
+        // Marmot clients send.
+        let scoped = FilterValidator {
+            require_scoped_filters: true,
+            ..Default::default()
+        };
+        let (id, pk) = ("11".repeat(32), "22".repeat(32));
+        for filter in [
+            json!({"kinds": [445], "#h": ["g1", "g2"], "since": 1}),
+            json!({"kinds": [1059], "#p": [pk]}),
+            json!({"kinds": [1], "&p": [pk]}),
+            json!({"ids": [id]}),
+            json!({"authors": [pk, id], "kinds": [0, 3, 10002, 10050, 30443]}),
+            json!({"#d": ["x"]}),
+        ] {
+            assert!(scoped.validate(&group(json!([filter]))).is_ok(), "{filter}");
+        }
+        for filter in [
+            json!({"kinds": [445]}),
+            json!({"since": 1}),
+            json!({}),
+            json!({"search": "nostr"}),
+        ] {
+            assert_eq!(
+                scoped
+                    .validate(&group(json!([filter])))
+                    .unwrap_err()
+                    .to_string(),
+                "filter must name ids, authors or a tag",
+                "{filter}"
+            );
+        }
+        // Every filter of the request.
+        assert!(scoped
+            .validate(&group(json!([{"ids": [id]}, {"kinds": [445]}])))
+            .is_err());
     }
 
     #[test]

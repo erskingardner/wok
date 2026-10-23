@@ -43,10 +43,11 @@ const QUERY_COST: [&str; 3] = ["relay", "abuse", "max_query_cost"];
 const AUTH: [&str; 2] = ["relay", "auth"];
 
 /// The rules that remain, each off at its zero or empty value.
-const RULES: [&str; 3] = [
+const RULES: [&str; 4] = [
     "max_kinds_per_filter",
     "allowed_kinds",
     "require_author_or_tag",
+    "require_scoped_filters",
 ];
 
 /// One change to the operator's file.
@@ -490,7 +491,8 @@ mod tests {
              min_filters_per_req = 1\n\
              max_kinds_per_filter = 3\n\
              allowed_kinds = \"1\"\n\
-             require_author_or_tag = true\n",
+             require_author_or_tag = true\n\
+             require_scoped_filters = true\n",
         );
         assert_eq!(
             file["relay"]["filter_validation"],

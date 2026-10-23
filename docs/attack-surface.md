@@ -77,9 +77,12 @@ WebSocket upgrade on any path but `/`.
 ## Metrics listener
 
 With `observability.metrics_listen` set, Wok binds a second listener at that
-address when it starts. It is meant for a private address, so it sends no CORS
-headers and charges no per-address budget. Hyper reads the request head within
-`relay.handshake_timeout_secs`, and any path or method but these gets 404.
+address when it starts, and warns when the address is reachable beyond
+loopback and private networks. It is meant for a private address, so it sends
+no CORS headers. Hyper reads the request head within
+`relay.handshake_timeout_secs`. Like the relay listener, every request then
+passes NIP-86 IP blocks and the per-address connection budget, keyed on the
+connecting address, and any path or method but these gets 404.
 
 | Path | Party | Gate | What runs |
 | --- | --- | --- | --- |

@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   turns them on, and reloads live. `observability.metrics_listen` (restart)
   serves them on a listener of their own, which answers only `GET /metrics`,
   without CORS headers, while the relay listener answers `/metrics` with 404.
-  The relay warns at startup when metrics are on a relay listener reachable
-  beyond loopback and private addresses, and turning them on or off is logged
-  as a security-scope change. **Upgrading:** a relay scraped at `/metrics`
+  That listener applies NIP-86 IP blocks and the per-address connection
+  budget like the relay listener. The relay warns, at startup and on a reload
+  that causes it, when metrics are served on a relay listener or a
+  `metrics_listen` address reachable beyond loopback and private addresses,
+  and turning them on or off is logged as a security-scope change. **Upgrading:** a relay scraped at `/metrics`
   must set `metrics_enabled = true`, preferably with `metrics_listen` on a
   private address, and point Prometheus there.
 - With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`

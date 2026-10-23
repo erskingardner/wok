@@ -89,7 +89,7 @@ same ingester. Before Wok reads a message's verb:
 
 | Message | Party | Gate | Checks, in order |
 | --- | --- | --- | --- |
-| `EVENT` | anonymous | none | Per-address EVENT budget; event parse, size and tag limits, timestamp window, id and signature verification; `relay.auth.accepted_kinds` and the NIP-86 kind policy, event-id ban, author ban and `relay.auth.write_policy`; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH. The writer then runs the write-policy plugin; only an event it accepts is checked again against vanish requests, the bans, the kind policy, `accepted_kinds` and the write policy, then against the storage quotas. NIP-62 vanish requests skip the plugin, the author ban and the write policy. |
+| `EVENT` | anonymous | none | Per-address EVENT budget; event parse, size and tag limits, timestamp window, id and signature verification; an AUTH event (22242) is refused; `relay.auth.accepted_kinds` (kind 62 is exempt while NIP-62 is on) and the NIP-86 kind policy, event-id ban, author ban and `relay.auth.write_policy`; a NIP-62 vanish request must name this relay; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; a repost may not embed a protected event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH; an event already stored is answered `duplicate:` and goes no further. The writer then runs the write-policy plugin; only an event it accepts is checked again against stored vanish requests, the bans, the kind policy, `accepted_kinds` and the write policy, then against the storage quotas. A vanish request skips the author ban, the write policy, the plugin, the NIP-70 and owner-only checks and the stored vanish markers, but not the event-id ban, the kind policy, proof of work or the per-author budget. |
 | `AUTH` | anonymous | `relay.auth.enabled` and `relay.auth.service_url` | Per-address EVENT budget; the gate; the connection must hold a challenge; event parse and signature verification; kind 22242, `challenge` and `relay` tags. |
 | `REQ` | anonymous | none | The connection's REQ budget, which is larger once authenticated, then the address's REQ backstop (see [rates](config.md#rates)); a connection over its own budget does not spend the backstop; subscription id; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; `relay.auth.read_policy`; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
 | `COUNT` | anonymous | `relay.max_filter_limit_count` above 0 | As `REQ`, with the COUNT budgets, and a COUNT that may count restricted kinds must name only what the connection may read. The gate is checked after the filter count and bytes. |
@@ -105,9 +105,10 @@ NIP-86 requests are a `POST` to `/` with
 `admin.enabled` is set. Each request reads the body (at most 64 KiB) and checks
 NIP-98 as the dashboard API does, with a required `payload` tag and the `u` tag
 compared with `admin.public_url`. Then Wok looks up the signer's management
-level and refuses a signer with none. It parses the request body, and
-refuses a method that is not in its method table or is above the signer's
-level before it reads the method's parameters.
+level and refuses a signer with none. It parses the request body, which
+must name a `method` and a `params` array, refuses a method that is not in
+its method table or is above the signer's level, and only then reads the
+method's parameters.
 [nip86.md](nip86.md#supported-methods) lists every method with the level it
 needs. With `relay.auth.accepted_kinds` set, the kind-policy methods work
 under that ceiling: `allowkind` cannot make the relay accept a kind the file

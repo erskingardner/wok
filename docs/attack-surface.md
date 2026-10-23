@@ -274,8 +274,12 @@ CI does not run it. Run `--check` on a change that adds a path, a message or a
 setting, or moves a check. A function the anonymous phase newly reaches is
 code an unauthenticated client can now run: it belongs after the cheapest
 check that can refuse the request, or the baseline is rewritten with the
-reason in the pull request. A phase that reached functions and now reaches
-none also fails, since that is a broken probe, not a smaller surface. A
+reason in the pull request. A phase whose baseline lists functions and that
+now reaches none also fails, and so does a profile with no baseline. An
+emptied phase is intended when the profile now closes that caller, since the
+probe skips a closed caller, or when what that caller added was removed or
+now runs for anonymous callers: rewrite the baseline with the reason. When
+the caller is still open and the probe did not send, the probe is broken. A
 function no longer reached is listed but does not fail. Some functions run on
 some runs and not others, such as a query path that depends on timing, so
 `--bless` keeps the union of three runs, and the database watcher, which runs
@@ -322,5 +326,5 @@ serves `/metrics` on the metrics listener.
 | `wok-ws` `nip86` tests | A NIP-86 method is missing from the [nip86.md](nip86.md#supported-methods) table, or its level there differs from the code's. |
 | `wok-cli` tests | A `wok` command has no row in [Commands](#commands), or a row names a command that does not exist. |
 | `wok-compat` `tests/golden_transcripts.rs` | A profile's relay answers the script differently from its file in `tests/transcripts/`, or a transcript has no profile. |
-| `scripts/attack-surface-reach.py --check`, run by hand | A phase of the [reachability](#reachability) probe reaches a relay function that its profile's file in `tests/reachability/` does not list. |
+| `scripts/attack-surface-reach.py --check`, run by hand | A phase of the [reachability](#reachability) probe reaches a relay function that its profile's file in `tests/reachability/` does not list, a phase whose file lists functions reaches none, or a profile has no file. |
 | `wok-compat` `tests/setting_combinations.rs` | With two settings on, a step that one refuses for a reason of its own, or that each refuses, is served, and `OPENS` does not list it; or a setting changes nothing but NIP-11 and is not in `UNPROBED`. |

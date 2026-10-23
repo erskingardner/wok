@@ -77,3 +77,4 @@ cargo test -p wok-compat --test cpp_export --test cpp_negentropy
 - Config sample: `docs/wok.toml`
 - Non-goals: `docs/architecture.md`
 - Contributor workflow and PR expectations: `CONTRIBUTING.md`; vulnerability reporting: `SECURITY.md`
+- Attack surface: `docs/attack-surface.md`; the audit method, as a skill: `.claude/skills/attack-surface-audit/SKILL.md`

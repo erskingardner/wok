@@ -1853,7 +1853,7 @@ async fn nip86_restrict_writes_allowlist_e2e() {
     cfg.admin.enabled = true;
     cfg.admin.public_url = format!("http://{addr}");
     cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
-    cfg.relay.auth.restrict_writes = true;
+    cfg.relay.auth.write_policy = wok_relay::AccessPolicy::Members;
     let handle = wok_relay::start(env, cfg).unwrap();
     let h = handle.clone();
     tokio::spawn(async move {

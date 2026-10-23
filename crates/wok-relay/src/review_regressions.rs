@@ -50,6 +50,7 @@ fn check_routing(author_quota: u64, global_quota: u64, first_ok: bool, second_ok
             packed: packed.into_bytes(),
             json: json!({"id":hex::encode(id),"pubkey":hex::encode([7;32]),"created_at":timestamp,"kind":1,"tags":[],"content":"batch","sig":"00".repeat(64)}).to_string(),
             authed: None,
+            grant: Default::default(),
         }).unwrap();
     }
     drop(tx);

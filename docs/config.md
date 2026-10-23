@@ -96,8 +96,9 @@ keeps it. Set only what the relay needs and leave the rest to the preset.
   translation, so the relay behaves as before. Each is warned about at
   startup and on reload, and in `wok doctor`'s `config-deprecations` check.
   `wok config minimize` and dashboard saves rewrite them as their
-  translation. The [filter validation](#filter-validation) switch and the
-  [read keys](#read-keys-from-07-and-earlier) are. The other,
+  translation. The [filter validation](#filter-validation) switch, the
+  [read keys](#read-keys-from-07-and-earlier) and
+  [`restrict_writes`](#write-key-from-07-and-earlier) are. The other,
   `relay.abuse.max_query_cost`, is ignored instead: its values
   mean something else in the units of
   [`max_query_work`](#query-work), which replaced it.
@@ -333,7 +334,8 @@ the same REQ.
 ## Authentication and private reads
 
 These settings reload live but stay file-only because they define an access
-control boundary.
+control boundary. A reload that changes `read_policy` or `write_policy` is
+logged as a warning naming the old and the new policy.
 
 | Key | Default | Meaning |
 |---|---:|---|
@@ -342,7 +344,9 @@ control boundary.
 | `relay.auth.recipient_only_kinds` | `[4, 1059, 21059]` | Kinds only the author and the event's first `p`-tag recipient may read: DMs and gift wraps, including NIP-59's ephemeral 21059. |
 | `relay.auth.owner_only_kinds` | `[78, 30078]` | Kinds only the author may read, and only a connection authenticated as the author may publish: NIP-78 app data. |
 | `relay.auth.authenticated_kinds` | `[]` | Kinds any authenticated connection may read, whichever pubkey it authenticated as. |
-| `relay.auth.restrict_writes` | `false` | Only NIP-86 allowlisted or role-holding pubkeys (and operator admins) may write. NIP-62 vanish requests are exempt. See [nip86.md](nip86.md). |
+| `relay.auth.read_policy` | `open` | Who may send REQ, COUNT and NEG-OPEN: `open`, `authenticated` or `members`. See [read and write policies](#read-and-write-policies). |
+| `relay.auth.write_policy` | `open` | Who may publish: `open`, `authenticated` or `members`. NIP-62 vanish requests are always accepted. |
+| `relay.auth.inbox_kinds` | `[1059, 21059]` | Under `write_policy = "members"`, events of these kinds are also accepted when their first `p` tag is a member, so anyone can deliver gift wraps to members. |
 
 While AUTH is usable (`enabled` with a `service_url`), every connection
 receives its NIP-42 challenge as soon as it opens.
@@ -384,6 +388,55 @@ that cannot succeed; with `enabled = false` the relay refuses AUTH outright.
 Wok advertises NIP-59 only while both gift-wrap kinds are recipient-only, and
 NIP-78 only while both app-data kinds are owner-only.
 
+### Read and write policies
+
+`read_policy` and `write_policy` say who may use the relay at all; the read
+classes then apply on top. Each is one of:
+
+| Policy | Who may read | Who may write |
+|---|---|---|
+| `open` | anyone | anyone |
+| `authenticated` | a connection authenticated with NIP-42, as any pubkey | the same, with an event signed by any key |
+| `members` | a connection authenticated as a member | an event a member signed, any event on a connection authenticated as a member, or an `inbox_kinds` event addressed to a member, as below |
+
+A member is a pubkey that is not banned and is NIP-86 allowlisted
+(`allowpubkey`), holds any role (`assignrole`, built-in or custom), or is in
+`admin.pubkeys`; see [nip86.md](nip86.md).
+
+- **`read_policy`** applies to every REQ, COUNT and NEG-OPEN. One the policy
+  does not admit is refused with `auth-required:` and a challenge while
+  authenticating could help, and with `restricted:` once the connection has
+  authenticated as no member, or while AUTH is unusable. A connection the
+  policy stops admitting, such as a member removed, or one that has not
+  authenticated after a reload to `authenticated`, gets nothing more on its
+  open subscriptions. A REQ or COUNT whose scan is waiting or running is
+  refused with CLOSED, and the reason above, at its next time slice, and its
+  sync sessions end with `closed: visibility changed; reopen
+  synchronization`, as does a NEG-OPEN still queued.
+- **`write_policy = "authenticated"`** accepts an event only on an
+  authenticated connection, signed by any key.
+- **`write_policy = "members"`** accepts an event when one of these is a
+  member:
+  - its author, so members' events can be published by anyone;
+  - a pubkey the connection authenticated as, so a member's events signed
+    by throwaway keys, such as Marmot group messages (445), are accepted on
+    the member's connection;
+  - for one of `inbox_kinds`, its first `p`-tag recipient, so outsiders can
+    deliver NIP-17 DMs and Marmot Welcomes to members.
+
+  The relay then learns which member sent each such event, which is inherent
+  to a members-only relay.
+
+A refused EVENT gets `auth-required:` and a challenge while the connection
+has not authenticated, else `restricted: this relay accepts events only from
+members` (or `authenticated users`). Bans and the kind policy apply under
+every policy, and NIP-62 vanish requests are accepted under all of them. The
+writer checks the event again against the policy, the member against the
+moderation state it commits under, and an inbox recipient's kind against
+`inbox_kinds`, all as they are when it stores the event, so an event whose
+member was removed, or whose policy a reload tightened, in the meantime is
+refused.
+
 ### Read keys from 0.7 and earlier
 
 Through 0.7, `relay.auth.restricted_read_kinds` listed the restricted kinds,
@@ -401,6 +454,9 @@ deprecation warning at startup, on reload and in `wok doctor`:
   preset, become `authenticated_kinds`, which any authenticated connection
   may read and no other can, and `recipient_only_kinds` becomes empty.
 
+A kind the old list shares with `owner_only_kinds`, such as 30078 listed to
+hide app data, keeps the stricter owner-only class, and the warning names it.
+
 `wok config minimize`, or a dashboard save, rewrites the file this way, and
 `wok migrate strfry` translates strfry's `relay.auth.restrictedReadKinds` and
 `restrictReadToInvolvedPubkey` the same way.
@@ -408,6 +464,22 @@ deprecation warning at startup, on reload and in `wok doctor`:
 Kinds 78 and 30078 were readable by anyone through 0.7. Apps that publish
 public data in them can no longer be read by other users; set
 `owner_only_kinds = []` to serve them as before.
+
+### Write key from 0.7 and earlier
+
+Through 0.7, `relay.auth.restrict_writes = true` accepted only events whose
+author was a member, so an allowlisted relay refused every Marmot group
+message and gift wrap, which are signed by throwaway keys. The key is
+deprecated, and loads with a warning:
+- **`restrict_writes = true`** becomes `write_policy = "members"`. Members'
+  own events are accepted as before; so are events a member sends on a
+  connection authenticated as them, and gift wraps addressed to a member
+  (`inbox_kinds`; set it to `[]` to refuse them). A file that also sets
+  `write_policy` is refused.
+- **`restrict_writes = false`** is dropped: `write_policy = "open"` is the
+  default.
+
+`wok config minimize`, or a dashboard save, rewrites it.
 
 ## Relay information
 

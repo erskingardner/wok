@@ -1,11 +1,14 @@
 //! The access model (tracking issue #97 §3.6): who may read each kind, by
-//! its read class, and how the access keys of earlier releases translate.
+//! its read class; who may read and write at all, by the read and write
+//! policies; and how the access keys of earlier releases translate.
 
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::time::Duration;
-use wok_relay::{Config, ConnectionGuard, Outbound, OutboundFrame, RelayHandle, TransportSource};
+use wok_relay::{
+    Config, ConnectionGuard, ManagementCmd, Outbound, OutboundFrame, RelayHandle, TransportSource,
+};
 
 const AUTH_RELAY: &str = "wss://access.test";
 
@@ -42,6 +45,22 @@ impl Relay {
             rx,
             challenge: None,
         }
+    }
+
+    /// Make `key` a member, as NIP-86 `allowpubkey` does.
+    async fn allow(&self, key: &Keypair) {
+        let pubkey = key.x_only_public_key().0.serialize();
+        let cmd = ManagementCmd::AllowPubkey {
+            pubkey,
+            reason: String::new(),
+        };
+        self.handle.manage(cmd).await.unwrap();
+    }
+
+    async fn unallow(&self, key: &Keypair) {
+        let pubkey = key.x_only_public_key().0.serialize();
+        let cmd = ManagementCmd::UnallowPubkey { pubkey };
+        self.handle.manage(cmd).await.unwrap();
     }
 
     /// A connection authenticated as `key`, or an anonymous one.
@@ -117,6 +136,26 @@ impl Client {
     async fn publish(&mut self, event: &Value) -> Value {
         self.send(json!(["EVENT", event])).await;
         self.reply(event["id"].as_str().unwrap(), &["OK"]).await
+    }
+
+    /// Publish `event`, and return the OK's reason when it was refused.
+    async fn refusal(&mut self, event: &Value) -> Option<String> {
+        let ok = self.publish(event).await;
+        (ok[2] == false).then(|| ok[3].as_str().unwrap().to_string())
+    }
+
+    /// The next frame for subscription `sub_id`, if one arrives soon.
+    async fn try_event(&mut self, sub_id: &str) -> Option<Value> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, self.rx.recv())
+                .await
+                .ok()??;
+            let msg: Value = serde_json::from_str(&frame.into_text()).unwrap();
+            if msg[0] == "EVENT" && msg[1] == sub_id {
+                return Some(msg[2].clone());
+            }
+        }
     }
 
     /// The stored events a REQ of `filters` returns, or the reason it was
@@ -259,5 +298,215 @@ async fn authenticated_kinds_need_auth_as_anyone() {
     assert_eq!(
         stranger.history(json!([{"kinds": [7]}])).await.unwrap(),
         [shared]
+    );
+}
+
+/// A Marmot group message (445), signed by a fresh key as MDK signs them.
+fn group_message(group: &str) -> Value {
+    wok_compat::sign_event_with_key(
+        json!({
+            "created_at": now(),
+            "kind": 445,
+            "tags": [["h", group]],
+            "content": "mls ciphertext",
+        }),
+        &key(),
+    )
+}
+
+/// A gift wrap of `kind` (1059 or 21059) addressed to `recipient`, signed by
+/// a random key.
+fn gift_wrap(kind: u64, recipient: &Keypair) -> Value {
+    event(&key(), kind, recipient)
+}
+
+const GROUP: &str = "8c3f1aa20a9b5fd8e4f5c7bb86e2b9e5d3a1c7d10f6a2e4b5c8d9e0f1a2b3c4d";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_members_relay_accepts_members_and_their_inboxes() {
+    let relay = Relay::with_auth("read_policy = \"members\"\nwrite_policy = \"members\"");
+    let (member, outsider) = (key(), key());
+    relay.allow(&member).await;
+
+    // C7: a member's 445 from a throwaway key, on the member's connection.
+    let mut member_conn = relay.reader(Some(&member)).await;
+    let message = group_message(GROUP);
+    assert_eq!(member_conn.refusal(&message).await, None);
+    // Gift wraps from random keys, addressed to a member, from anyone.
+    let mut anonymous = relay.reader(None).await;
+    let wrap = gift_wrap(1059, &member);
+    assert_eq!(anonymous.refusal(&wrap).await, None);
+    assert_eq!(anonymous.refusal(&gift_wrap(21059, &member)).await, None);
+
+    // A non-member's 445, anonymous or authenticated, is refused.
+    let refused = anonymous.refusal(&group_message(GROUP)).await.unwrap();
+    assert_eq!(
+        refused,
+        "auth-required: this relay accepts events only from members"
+    );
+    let mut outsider_conn = relay.reader(Some(&outsider)).await;
+    let refused = outsider_conn.refusal(&group_message(GROUP)).await.unwrap();
+    assert_eq!(
+        refused,
+        "restricted: this relay accepts events only from members"
+    );
+    // A gift wrap for a non-member is too.
+    let refused = outsider_conn.refusal(&gift_wrap(1059, &outsider)).await;
+    assert!(refused.is_some_and(|r| r.starts_with("restricted:")));
+
+    // Only members read.
+    let group = json!([{"kinds": [445], "#h": [GROUP]}]);
+    let refused = anonymous.history(group.clone()).await.unwrap_err();
+    assert_eq!(refused, "auth-required: this relay serves only members");
+    let refused = outsider_conn.history(group.clone()).await.unwrap_err();
+    assert_eq!(refused, "restricted: this relay serves only members");
+    assert_eq!(member_conn.history(group).await.unwrap(), [message]);
+    let inbox = json!([{"kinds": [1059], "#p": [hex(&member)]}]);
+    assert_eq!(member_conn.history(inbox).await.unwrap(), [wrap]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_member_stops_its_writes_and_live_reads() {
+    let relay = Relay::with_auth("read_policy = \"members\"\nwrite_policy = \"members\"");
+    let (member, other) = (key(), key());
+    relay.allow(&member).await;
+    relay.allow(&other).await;
+    let mut reader = relay.reader(Some(&member)).await;
+    reader
+        .send(json!(["REQ", "group", {"kinds": [445], "#h": [GROUP]}]))
+        .await;
+    reader.reply("group", &["EOSE"]).await;
+    let mut writer = relay.reader(Some(&other)).await;
+    let before = group_message(GROUP);
+    assert_eq!(writer.refusal(&before).await, None);
+    assert_eq!(reader.try_event("group").await, Some(before));
+
+    relay.unallow(&member).await;
+    assert_eq!(writer.refusal(&group_message(GROUP)).await, None);
+    assert_eq!(reader.try_event("group").await, None);
+    let refused = reader.refusal(&group_message(GROUP)).await.unwrap();
+    assert_eq!(
+        refused,
+        "restricted: this relay accepts events only from members"
+    );
+    let refused = reader
+        .history(json!([{"kinds": [445], "#h": [GROUP]}]))
+        .await
+        .unwrap_err();
+    assert_eq!(refused, "restricted: this relay serves only members");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restrict_writes_translates_to_the_members_write_policy() {
+    for auth in ["restrict_writes = true", "write_policy = \"members\""] {
+        let relay = Relay::with_auth(auth);
+        assert_eq!(
+            relay.config.relay.auth.write_policy,
+            wok_relay::AccessPolicy::Members,
+            "{auth}"
+        );
+        let (member, outsider) = (key(), key());
+        relay.allow(&member).await;
+        // Members' own events, from any connection, as restrict_writes did.
+        let mut anonymous = relay.reader(None).await;
+        let note = |author: &Keypair| event(author, 1, author);
+        assert_eq!(anonymous.refusal(&note(&member)).await, None, "{auth}");
+        let refused = anonymous.refusal(&note(&outsider)).await;
+        assert!(
+            refused.is_some_and(|r| r.starts_with("auth-required:")),
+            "{auth}"
+        );
+        // Reads stay open.
+        assert_eq!(
+            anonymous
+                .history(json!([{"authors": [hex(&member)]}]))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "{auth}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_policies_need_auth_as_anyone() {
+    let relay =
+        Relay::with_auth("read_policy = \"authenticated\"\nwrite_policy = \"authenticated\"");
+    let mut anonymous = relay.reader(None).await;
+    let message = group_message(GROUP);
+    assert_eq!(
+        anonymous.refusal(&message).await.unwrap(),
+        "auth-required: this relay accepts events only from authenticated users"
+    );
+    let refused = anonymous
+        .history(json!([{"kinds": [445]}]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        "auth-required: this relay serves only authenticated users"
+    );
+    // Any key will do, and it need not sign the event.
+    let mut stranger = relay.reader(Some(&key())).await;
+    assert_eq!(stranger.refusal(&message).await, None);
+    assert_eq!(
+        stranger.history(json!([{"kinds": [445]}])).await.unwrap(),
+        [message]
+    );
+}
+
+/// An empty client's first negentropy message.
+fn neg_init() -> String {
+    let mut store = wok_negentropy::Vector::new();
+    store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+    hex::encode(client.initiate().unwrap())
+}
+
+/// Open a sync of the group's messages and return its first reply.
+async fn neg_open(client: &mut Client) -> Value {
+    let filter = json!({"kinds": [445], "#h": [GROUP]});
+    client
+        .send(json!(["NEG-OPEN", "sync", filter, neg_init()]))
+        .await;
+    client.reply("sync", &["NEG-MSG", "NEG-ERR"]).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tightening_the_read_policy_closes_open_syncs() {
+    let relay = Relay::with_auth("");
+    let admin = key();
+    relay.handle.config.write().admin.pubkeys = vec![hex(&admin)];
+    let mut publisher = relay.connect().await;
+    assert_eq!(publisher.refusal(&group_message(GROUP)).await, None);
+    let closed = json!([
+        "NEG-ERR",
+        "sync",
+        "closed: visibility changed; reopen synchronization"
+    ]);
+
+    // A reload to members ends the anonymous sync, and it may not reopen.
+    let mut anonymous = relay.reader(None).await;
+    assert_eq!(neg_open(&mut anonymous).await[0], "NEG-MSG");
+    relay.handle.config.write().relay.auth.read_policy = wok_relay::AccessPolicy::Members;
+    assert_eq!(anonymous.reply("sync", &["NEG-ERR"]).await, closed);
+    assert_eq!(
+        neg_open(&mut anonymous).await,
+        json!([
+            "NEG-ERR",
+            "sync",
+            "auth-required: this relay serves only members"
+        ])
+    );
+
+    // An admin is a member by configuration, which a reload can end too.
+    let mut admin_conn = relay.reader(Some(&admin)).await;
+    assert_eq!(neg_open(&mut admin_conn).await[0], "NEG-MSG");
+    relay.handle.config.write().admin.pubkeys.clear();
+    assert_eq!(admin_conn.reply("sync", &["NEG-ERR"]).await, closed);
+    assert_eq!(
+        neg_open(&mut admin_conn).await[2],
+        "restricted: this relay serves only members"
     );
 }

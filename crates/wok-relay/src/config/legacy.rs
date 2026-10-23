@@ -37,7 +37,9 @@ const QUERY_COST: [&str; 3] = ["relay", "abuse", "max_query_cost"];
 /// to the author and first `p`-tag recipient, unless
 /// `restrict_read_to_involved_pubkey = false` let any authenticated
 /// connection read them, and any REQ that mixed in another kind read them
-/// without AUTH. Read classes replaced both (#97 §3.6).
+/// without AUTH. Read classes replaced both (#97 §3.6). Likewise
+/// `restrict_writes = true` accepted only events whose author was a member;
+/// `write_policy = "members"` replaced it.
 const AUTH: [&str; 2] = ["relay", "auth"];
 
 /// The rules that remain, each off at its zero or empty value.
@@ -140,6 +142,50 @@ pub(super) fn translate(file: &toml::Value, preset: &toml::Value) -> Result<Tran
         );
     }
     translation.extend(read_classes(file, preset)?);
+    translation.extend(restrict_writes(file)?);
+    Ok(translation)
+}
+
+fn restrict_writes(file: &toml::Value) -> Result<Translation, String> {
+    let mut translation = Translation::default();
+    let key = |name: &'static str| [AUTH[0], AUTH[1], name].to_vec();
+    let Some(value) = leaf(file, &key("restrict_writes")) else {
+        return Ok(translation);
+    };
+    let restrict = value
+        .as_bool()
+        .ok_or("relay.auth.restrict_writes: expected a boolean")?;
+    if leaf(file, &key("write_policy")).is_some() {
+        return Err(
+            "relay.auth.restrict_writes was replaced by relay.auth.write_policy; set only \
+             the new key"
+                .into(),
+        );
+    }
+    if restrict {
+        translation.replace(
+            key("restrict_writes"),
+            key("write_policy"),
+            toml::Value::String("members".into()),
+        );
+        translation.warnings.push(
+            "relay.auth.restrict_writes = true is deprecated: it is now relay.auth.write_policy \
+             = \"members\", which accepts members' events as before, and also events a member \
+             sends on a connection authenticated as them, such as Marmot group messages from \
+             throwaway keys, and gift wraps addressed to a member (relay.auth.inbox_kinds). \
+             `wok config minimize` rewrites it."
+                .to_string(),
+        );
+    } else {
+        translation
+            .changes
+            .push(Change::Remove(key("restrict_writes")));
+        translation.warnings.push(
+            "relay.auth.restrict_writes = false is deprecated: relay.auth.write_policy = \
+             \"open\" is the default. `wok config minimize` removes it."
+                .to_string(),
+        );
+    }
     Ok(translation)
 }
 
@@ -156,6 +202,24 @@ fn kinds(value: &toml::Value, dotted: &str) -> Result<Vec<u64>, String> {
                 .ok_or_else(expected)
         })
         .collect()
+}
+
+/// What a warning about kinds moved to a read class adds for those that
+/// `owner_only` also lists: the strictest class applies, so only their author
+/// may still read them.
+pub(super) fn owner_only_note(kinds: &[u64], owner_only: &[u64]) -> String {
+    let covered: Vec<u64> = kinds
+        .iter()
+        .copied()
+        .filter(|kind| owner_only.contains(kind))
+        .collect();
+    if covered.is_empty() {
+        return String::new();
+    }
+    format!(
+        " Kinds {covered:?} are also in relay.auth.owner_only_kinds, the strictest class, so \
+         only their author may read them."
+    )
 }
 
 fn read_classes(file: &toml::Value, preset: &toml::Value) -> Result<Translation, String> {
@@ -191,15 +255,17 @@ fn read_classes(file: &toml::Value, preset: &toml::Value) -> Result<Translation,
             })
         })
         .transpose()?;
+    // A class as the file, or else the preset, sets it.
+    let class_kinds = |name: &'static str| -> Result<Vec<u64>, String> {
+        section
+            .get(name)
+            .or_else(|| leaf(preset, &key(name)))
+            .map_or(Ok(Vec::new()), |value| kinds(value, &dotted(name)))
+    };
+    let owner_only = class_kinds("owner_only_kinds")?;
     if involved == Some(false) {
         // The nearest meaning that never shows the kinds to a connection
         // that has not authenticated.
-        let class_kinds = |name: &'static str| -> Result<Vec<u64>, String> {
-            section
-                .get(name)
-                .or_else(|| leaf(preset, &key(name)))
-                .map_or(Ok(Vec::new()), |value| kinds(value, &dotted(name)))
-        };
         let moved = match old_kinds {
             Some(value) => kinds(value, &dotted("restricted_read_kinds"))?,
             None => class_kinds("recipient_only_kinds")?,
@@ -238,9 +304,10 @@ fn read_classes(file: &toml::Value, preset: &toml::Value) -> Result<Translation,
         translation.warnings.push(format!(
             "{} = false is no longer supported: it let a REQ that mixed in another kind read \
              kinds {moved:?} without AUTH. They are now {}, which any authenticated connection \
-             may read and no other can. `wok config minimize` rewrites the file.",
+             may read and no other can.{} `wok config minimize` rewrites the file.",
             dotted("restrict_read_to_involved_pubkey"),
-            dotted("authenticated_kinds")
+            dotted("authenticated_kinds"),
+            owner_only_note(&moved, &owner_only)
         ));
         return Ok(translation);
     }
@@ -252,9 +319,13 @@ fn read_classes(file: &toml::Value, preset: &toml::Value) -> Result<Translation,
         );
         translation.warnings.push(format!(
             "{} is deprecated: it is now {}, which only the author and first p-tag recipient \
-             may read, as before. `wok config minimize` renames it.",
+             may read, as before.{} `wok config minimize` renames it.",
             dotted("restricted_read_kinds"),
-            dotted("recipient_only_kinds")
+            dotted("recipient_only_kinds"),
+            owner_only_note(
+                &kinds(value, &dotted("restricted_read_kinds"))?,
+                &owner_only
+            )
         ));
     }
     if involved == Some(true) {
@@ -577,6 +648,34 @@ mod tests {
                 (30078, Owner),
             ]
         );
+        // A kind the owner-only class also lists stays readable by its
+        // author alone, and the warning says so.
+        let config =
+            crate::Config::parse_toml("[relay.auth]\nrestricted_read_kinds = [4, 30078]\n")
+                .unwrap();
+        assert_eq!(config.read_restrictor().class(30078), Owner);
+        assert!(
+            config.deprecations[0]
+                .contains("Kinds [30078] are also in relay.auth.owner_only_kinds"),
+            "{:?}",
+            config.deprecations
+        );
+        let config = crate::Config::parse_toml(
+            "[relay.auth]\nrestricted_read_kinds = [4, 78]\nrestrict_read_to_involved_pubkey = false\n",
+        )
+        .unwrap();
+        assert_eq!(config.read_restrictor().class(78), Owner);
+        assert!(
+            config.deprecations[0].contains("Kinds [78] are also"),
+            "{:?}",
+            config.deprecations
+        );
+        // Not when the file empties that class.
+        let config = crate::Config::parse_toml(
+            "[relay.auth]\nrestricted_read_kinds = [30078]\nowner_only_kinds = []\n",
+        )
+        .unwrap();
+        assert!(!config.deprecations[0].contains("owner_only_kinds"));
         // Both names at once are ambiguous.
         let both = "[relay.auth]\nrestricted_read_kinds = [4]\nrecipient_only_kinds = [4]\n";
         assert!(crate::Config::parse_toml(both)
@@ -638,6 +737,45 @@ mod tests {
     }
 
     #[test]
+    fn restrict_writes_is_the_members_write_policy() {
+        use crate::config::AccessPolicy;
+        let (translation, file) = translated("[relay.auth]\nrestrict_writes = true\n");
+        let auth = &file["relay"]["auth"];
+        assert!(auth.get("restrict_writes").is_none());
+        assert_eq!(auth["write_policy"].as_str(), Some("members"));
+        assert_eq!(translation.warnings.len(), 1);
+        assert!(translation.warnings[0].contains("write_policy = \"members\""));
+        assert_eq!(
+            translation.source(&["relay", "auth", "write_policy"]),
+            Some(&["relay", "auth", "restrict_writes"][..])
+        );
+        let members = crate::Config::parse_toml("[relay.auth]\nrestrict_writes = true\n").unwrap();
+        assert_eq!(members.relay.auth.write_policy, AccessPolicy::Members);
+        assert_eq!(members.relay.auth.read_policy, AccessPolicy::Open);
+        let open = crate::Config::parse_toml("[relay.auth]\nrestrict_writes = false\n").unwrap();
+        assert_eq!(open.relay.auth.write_policy, AccessPolicy::Open);
+        assert_eq!(open.deprecations.len(), 1);
+
+        // Rewritten, the file loads the same without the deprecated key.
+        let minimized =
+            crate::Config::minimize_toml("[relay.auth]\nrestrict_writes = true\n").unwrap();
+        assert_eq!(minimized.text, "[relay.auth]\nwrite_policy = \"members\"\n");
+        assert_eq!(
+            crate::Config::parse_toml(&minimized.text)
+                .unwrap()
+                .relay
+                .auth
+                .write_policy,
+            AccessPolicy::Members
+        );
+        // Both keys at once are ambiguous.
+        let both = "[relay.auth]\nrestrict_writes = true\nwrite_policy = \"open\"\n";
+        assert!(crate::Config::parse_toml(both)
+            .unwrap_err()
+            .contains("set only the new key"));
+    }
+
+    #[test]
     fn malformed_legacy_keys_are_errors() {
         let file: toml::Value = toml::from_str("[relay.filter_validation]\nenabled = 1\n").unwrap();
         assert!(translate(&file, &file).is_err());
@@ -648,6 +786,7 @@ mod tests {
             "restricted_read_kinds = [-4]",
             "restricted_read_kinds = 4",
             "restrict_read_to_involved_pubkey = 0",
+            "restrict_writes = \"yes\"",
         ] {
             let file: toml::Value = toml::from_str(&format!("[relay.auth]\n{auth}\n")).unwrap();
             assert!(translate(&file, &file).is_err(), "{auth}");
@@ -675,10 +814,10 @@ mod tests {
         let upgraded = crate::Config::parse_toml(SAMPLE_0_7_0).unwrap();
         assert_eq!(rules(&upgraded), (200, 0, String::new(), false));
         assert_eq!(upgraded.relay.abuse.max_query_work, 20_000);
-        // Its read keys are renamed, and keep their meaning.
+        // Its access keys are renamed, and keep their meaning.
         assert_eq!(
             upgraded.deprecations.len(),
-            4,
+            5,
             "{:?}",
             upgraded.deprecations
         );
@@ -686,7 +825,12 @@ mod tests {
         assert!(upgraded.deprecations[1].starts_with("relay.abuse.max_query_cost is deprecated"));
         assert!(upgraded.deprecations[2].starts_with("relay.auth.restricted_read_kinds"));
         assert!(upgraded.deprecations[3].starts_with("relay.auth.restrict_read_to_involved"));
+        assert!(upgraded.deprecations[4].starts_with("relay.auth.restrict_writes = false"));
         assert_eq!(upgraded.relay.auth.recipient_only_kinds, [4, 1059]);
+        assert_eq!(
+            upgraded.relay.auth.write_policy,
+            crate::config::AccessPolicy::Open
+        );
 
         // Enabled, 0.7 refused more than three filters or three kinds per
         // filter, which the upgrade keeps.
@@ -699,7 +843,7 @@ mod tests {
         assert_eq!(rules(&upgraded), (3, 3, String::new(), false));
         assert_eq!(
             upgraded.deprecations.len(),
-            6,
+            7,
             "{:?}",
             upgraded.deprecations
         );

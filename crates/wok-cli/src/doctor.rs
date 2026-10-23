@@ -95,7 +95,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         None => report.add(
             "relay-auth",
             CheckStatus::Pass,
-            "restricted reads have usable NIP-42 authentication or are disabled",
+            "NIP-42 authentication is usable, or nothing needs it",
         ),
     }
 

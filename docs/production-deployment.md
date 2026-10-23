@@ -132,7 +132,7 @@ child still runs as the `wok` user inside the relay's systemd sandbox.
 
 NIP-62 requires relays that restrict who can post to honor vanish requests
 regardless of the user's status. The plugin is not consulted for them, and
-neither pubkey bans nor `relay.auth.restrict_writes` refuse them, so an author
+neither pubkey bans nor `relay.auth.write_policy` refuse them, so an author
 who was rejected by the plugin, dropped from the allowlist, or banned can still
 erase what they published. Vanish requests still pay proof of work and the
 per-author EVENT budget, and event-id bans, the kind allowlist, and

@@ -340,6 +340,12 @@ regression test. Differential parity alone is not a reason to retain it.
   AUTH. Wok has no such mode: a file or strfry config that sets it gets its
   kinds as `authenticated_kinds`, readable after AUTH as any key and never
   without.
+- `relay.auth.write_policy` and `read_policy` (`open`, `authenticated` or
+  `members`) replace `restrict_writes`, which the pinned strfry does not
+  have. Under `write_policy = "members"` an event is accepted when its author,
+  a pubkey its connection authenticated as, or, for `inbox_kinds`, its first
+  `p`-tag recipient is a member, so members' Marmot group messages and gift
+  wraps from throwaway keys are accepted (#97 C7).
 - NIP-42: kind 22242 events reach no client. One sent as EVENT is refused
   with `invalid: AUTH events must be sent with AUTH`. `wok import` refuses
   one, as do `wok sync` and `wok router` downloads, in either ephemeral mode.

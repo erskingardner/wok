@@ -2,6 +2,7 @@
 //! counted once, by the config key that refused it, and refusals no setting
 //! makes (a NIP's fixed window, a NIP-86 decision) are not counted.
 
+use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -70,7 +71,11 @@ impl Relay {
             .handle
             .register_connection(source, Outbound::new(tx, 0))
             .await;
-        Client { conn, rx }
+        Client {
+            conn,
+            rx,
+            challenge: None,
+        }
     }
 
     fn counts(&self) -> HashMap<&'static str, u64> {
@@ -114,6 +119,8 @@ impl Relay {
 struct Client {
     conn: ConnectionGuard,
     rx: tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+    /// The NIP-42 challenge, once the relay has sent it.
+    challenge: Option<Value>,
 }
 
 impl Client {
@@ -126,7 +133,11 @@ impl Client {
             .await
             .expect("a frame from the relay")
             .unwrap();
-        serde_json::from_str(&frame.into_text()).unwrap()
+        let msg: Value = serde_json::from_str(&frame.into_text()).unwrap();
+        if msg[0] == "AUTH" {
+            self.challenge = Some(msg[1].clone());
+        }
+        msg
     }
 
     /// The next frame for `id` that is one of `types`.
@@ -174,6 +185,30 @@ impl Client {
             }
         }
         panic!("no {verb} was refused");
+    }
+
+    /// An AUTH event for this connection's challenge, with `extra` tags.
+    async fn auth_event(&mut self, key: &Keypair, created_at: u64, extra: &[Value]) -> Value {
+        while self.challenge.is_none() {
+            self.recv().await;
+        }
+        let challenge = self.challenge.clone();
+        let mut tags = vec![
+            json!(["relay", AUTH_RELAY]),
+            json!(["challenge", challenge]),
+        ];
+        tags.extend_from_slice(extra);
+        wok_compat::sign_event_with_key(
+            json!({"created_at": created_at, "kind": 22242, "tags": tags, "content": ""}),
+            key,
+        )
+    }
+
+    /// Send an AUTH and return whether it was accepted.
+    async fn auth(&mut self, event: &Value) -> bool {
+        self.send(json!(["AUTH", event])).await;
+        let ok = self.reply(event["id"].as_str().unwrap(), &["OK"]).await;
+        ok[2] == true
     }
 
     async fn neg_open(&mut self, sub: &str, filter: Value) -> Value {
@@ -273,6 +308,22 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
                 client
                     .refused(&note(21059, t - 4 * 86_400, json!([]), ""))
                     .await;
+                let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+                let stale = client.auth_event(&key, t - 2000, &[]).await;
+                assert!(!client.auth(&stale).await);
+            },
+        )
+        .await;
+    // An AUTH meets the event limits.
+    relay
+        .expect(
+            Some(Setting::MaxNumTags),
+            |c| c.events.max_num_tags = 2,
+            async |r| {
+                let mut client = r.client().await;
+                let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+                let tagged = client.auth_event(&key, t, &[json!(["t", "x"])]).await;
+                assert!(!client.auth(&tagged).await);
             },
         )
         .await;
@@ -318,16 +369,16 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
             },
         )
         .await;
-    // NIP-70 is not a setting.
+    // NIP-70 is not a setting, whatever the kind.
     relay
         .expect(
             None,
             |_| {},
             async |r| {
-                r.client()
-                    .await
-                    .refused(&note(1, t, json!([["-"]]), ""))
-                    .await
+                let mut client = r.client().await;
+                client.refused(&note(1, t, json!([["-"]]), "")).await;
+                let tags = json!([["d", "app"], ["-"]]);
+                client.refused(&note(30078, t, tags, "")).await;
             },
         )
         .await;
@@ -374,7 +425,7 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
                 c.relay.abuse.pubkey_event_burst = 1;
             },
             async |r| {
-                let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+                let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
                 for i in 0..20 {
                     let event = wok_compat::sign_event_with_key(
                         json!({"created_at": t, "kind": 1, "tags": [], "content": i.to_string()}),
@@ -393,7 +444,7 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
             Some(Setting::MaxStoredEventsPerPubkey),
             |c| c.relay.abuse.max_stored_events_per_pubkey = 1,
             async |r| {
-                let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+                let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
                 let mut client = r.client().await;
                 for (i, accepted) in [(0, true), (1, false)] {
                     let event = wok_compat::sign_event_with_key(
@@ -558,6 +609,22 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
             async |r| {
                 let filter = json!({"kinds": [30078]});
                 r.client().await.closed("COUNT", "c", &[filter]).await
+            },
+        )
+        .await;
+    // A COUNT is refused for the filter its reader is not scoped to.
+    relay
+        .expect(
+            Some(Setting::RecipientOnlyKinds),
+            |_| {},
+            async |r| {
+                let mut client = r.client().await;
+                let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+                let auth = client.auth_event(&key, t, &[]).await;
+                assert!(client.auth(&auth).await);
+                let own = json!({"kinds": [30078], "authors": [auth["pubkey"]]});
+                let dms = json!({"kinds": [4]});
+                client.closed("COUNT", "c", &[own, dms]).await
             },
         )
         .await;

@@ -242,7 +242,11 @@ pub(super) fn run_negentropy(
                     // admitted again, by the state this view is read from;
                     // a retry is then refused with the reason.
                     let identities = authed.get(&conn).map_or(&[][..], Vec::as_slice);
-                    if !stored_reader_admitted(&txn, &cfg, identities).unwrap_or(false) {
+                    let admitted = stored_reader_admitted(&txn, &cfg, identities);
+                    if matches!(admitted, Ok(false)) {
+                        metrics.refused(Setting::ReadPolicy);
+                    }
+                    if !admitted.unwrap_or(false) {
                         fail(
                             &conns,
                             &metrics,
@@ -681,9 +685,9 @@ mod tests {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
         conns.insert(1, Outbound::new(out_tx, 0));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let metrics = Arc::new(Metrics::default());
         let worker = {
-            let conns = conns.clone();
-            let metrics = Arc::new(Metrics::default());
+            let (conns, metrics) = (conns.clone(), metrics.clone());
             let pool = Arc::new(MemoryPool::default());
             thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
         };
@@ -712,6 +716,8 @@ mod tests {
                 "closed: visibility changed; reopen synchronization"
             ])
         );
+        // The read policy refused it.
+        assert_eq!(metrics.refusals.get(Setting::ReadPolicy), 1);
         tx.send(NegMsg::SetAuth {
             conn_id: 1,
             authed: member,
@@ -723,6 +729,7 @@ mod tests {
             (&reply[0], &reply[1]),
             (&json!("NEG-MSG"), &json!("member"))
         );
+        assert_eq!(metrics.refusals.get(Setting::ReadPolicy), 1);
         drop(tx);
         worker.join().unwrap();
     }

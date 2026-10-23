@@ -74,25 +74,25 @@ something. A token bucket's refusals carry its `_burst` key; raising its
 | `relay.abuse.connection_burst` | Connections and HTTP requests over an address's connection budget. |
 | `relay.abuse.event_burst` | EVENTs and AUTHs over an address's budget. |
 | `relay.abuse.pubkey_event_burst` | EVENTs over their author's budget, or over the AUTHed identity's for events from other keys. |
-| `events.max_event_size`, `events.max_num_tags`, `events.max_tag_val_size` | Events over the size, tag count or tag value limit. |
+| `events.max_event_size`, `events.max_num_tags`, `events.max_tag_val_size` | Events, and AUTH events, over the size, tag count or tag value limit. |
 | `events.reject_older_than_secs`, `events.reject_newer_than_secs`, `events.reject_ephemeral_older_than_secs` | Events outside the `created_at` window. AUTH's ±600 s window and a 21059's 3-day allowance are NIP constants and are not counted. |
 | `relay.abuse.min_pow_difficulty` | Events short of the NIP-13 difficulty. |
 | `relay.auth.accepted_kinds` | Events of a kind outside it. The NIP-86 kind policy is counted only by `wok_moderation_rejections_total`. |
 | `relay.auth.write_policy` | Events the write policy does not admit. |
-| `relay.auth.owner_only_kinds` | Events of an owner-only kind not sent as their author, and reads of one not scoped to the reader. |
+| `relay.auth.owner_only_kinds` | Events of an owner-only kind not sent as their author (a NIP-70 protected one is NIP-70's), and reads of one not scoped to the reader. |
 | `relay.nip62.enabled` | Vanish requests while NIP-62 is off. |
 | `relay.write_policy_plugin` | Events the plugin rejected or shadow-rejected. |
 | `relay.abuse.max_stored_events`, `relay.abuse.max_stored_events_per_pubkey`, `database.min_free_disk_bytes` | Events not written because of a storage quota or the disk reserve. |
 | `relay.abuse.per_connection.req_burst`, `neg_msg_burst`, `count_burst` | REQs and NEG-OPENs, NEG-MSGs, and COUNTs over a connection's own budget. |
 | `relay.abuse.req_burst`, `relay.abuse.count_burst` | The same over the address's backstop (REQ, NEG-OPEN and NEG-MSG; COUNT). |
-| `relay.abuse.invalid_burst` | Malformed messages whose reply was suppressed. |
+| `relay.abuse.invalid_burst` | Malformed messages past the address's budget. The first gets one `rate-limited:` NOTICE, the rest no reply. |
 | `relay.max_filters_per_req`, `relay.max_req_filter_size` | REQs and COUNTs with too many filters or filter bytes. |
 | `relay.max_tags_per_filter`, `relay.max_and_entries` | Filters over the tag-letter or NIP-91 `&` limit (REQ, COUNT, NEG-OPEN). |
 | `relay.max_filter_limit_count` | COUNTs while it is 0. |
 | `relay.filter_validation.max_kinds_per_filter`, `allowed_kinds`, `require_author_or_tag`, `require_scoped_filters` | Filters a rule refuses (REQ, COUNT, NEG-OPEN). |
 | `relay.abuse.max_query_work` | Requests whose estimated work is over the ceiling. |
-| `relay.auth.read_policy` | REQs, COUNTs and NEG-OPENs from a connection the read policy does not admit. |
-| `relay.auth.recipient_only_kinds`, `relay.auth.authenticated_kinds` | Reads of those kinds not scoped to the reader, by the strictest class the filters can match. |
+| `relay.auth.read_policy` | REQs, COUNTs and NEG-OPENs from a connection the read policy does not admit, when they arrive or, for one still waiting for a scan or sync after a reload or a member's removal, when it would start. |
+| `relay.auth.recipient_only_kinds`, `relay.auth.authenticated_kinds` | Reads of those kinds not scoped to the reader. A REQ or NEG-OPEN is counted under the strictest class its filters can match, a COUNT under the strictest class of the filters its reader may not count. |
 | `relay.max_subs_per_connection` | New subscriptions or sync sessions over the cap, and queries refused because the connection's queue of waiting scans is full. |
 | `relay.max_filter_bytes_per_connection` | Subscriptions and COUNTs over the connection's filter bytes. |
 | `relay.abuse.max_concurrent_historical_queries` | Queries while it is 0. |

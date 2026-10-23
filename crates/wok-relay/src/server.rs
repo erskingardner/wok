@@ -2302,12 +2302,7 @@ fn ingest_event(
     {
         Ok(p) => p,
         Err(e) => {
-            if let Some(setting) = e
-                .broken_limit()
-                .and_then(|limit| Config::event_limit_setting(requested_kind, limit))
-            {
-                metrics.refused(setting);
-            }
+            count_event_limit(metrics, requested_kind, &e);
             let id = orig
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -2563,7 +2558,8 @@ fn ingest_event(
             }
         };
         if let Some(message) = refusal {
-            if owner_only {
+            // A protected event is refused by NIP-70 whatever its kind.
+            if owner_only && !found_protected {
                 metrics.refused(Setting::OwnerOnlyKinds);
             }
             conns.send(
@@ -2645,7 +2641,7 @@ fn ingest_auth(
         .and_then(|v| v.as_str())
         .unwrap_or("?")
         .to_string();
-    match ingest_auth_inner(cfg, auth, conn_id, &event_json, dispatch) {
+    match ingest_auth_inner(cfg, metrics, auth, conn_id, &event_json, dispatch) {
         Ok(packed_id) => {
             metrics.auth_success_total.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -2682,6 +2678,7 @@ fn ingest_auth(
 
 fn ingest_auth_inner(
     cfg: &Config,
+    metrics: &Metrics,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     event_json: &Value,
@@ -2707,7 +2704,10 @@ fn ingest_auth_inner(
     // `invalid:`, as it would be if sent as EVENT.
     let policy = cfg.timestamp_policy_for_kind(AUTH_KIND);
     let parsed = parse_and_verify_event(event_json, &cfg.event_limits(), Some(&policy), true, true)
-        .map_err(|e| format!("invalid: {e}"))?;
+        .map_err(|e| {
+            count_event_limit(metrics, AUTH_KIND, &e);
+            format!("invalid: {e}")
+        })?;
     let packed = parsed.packed.view();
     if packed.kind() != AUTH_KIND {
         return Err("wrong event kind, expected 22242".into());
@@ -2984,7 +2984,17 @@ fn admit_req(
         r.is_filter_group_fully_restricted(&fg) && authed.is_none()
     };
     if requires_auth {
-        count_read_class(metrics, &r, &fg);
+        // A COUNT is refused for the filters its reader is not scoped to,
+        // a REQ for all of them.
+        let class = if count_only {
+            let identities = auth
+                .get(&conn_id)
+                .map_or(&[][..], |session| session.identities.as_slice());
+            r.count_refusal_class(&fg, identities)
+        } else {
+            r.strictest_group_class(&fg)
+        };
+        count_read_class(metrics, class);
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
     // Pending and live subscriptions both count. Over a lowered cap an open
@@ -3148,6 +3158,16 @@ fn read_policy_refusal(cfg: &Config, authenticated: bool) -> String {
     }
 }
 
+/// Count an event of `kind` refused by a limit its settings chose.
+fn count_event_limit(metrics: &Metrics, kind: u64, error: &wok_event::EventError) {
+    if let Some(setting) = error
+        .broken_limit()
+        .and_then(|limit| Config::event_limit_setting(kind, limit))
+    {
+        metrics.refused(setting);
+    }
+}
+
 /// Count a filter refused by a limit its settings chose.
 fn count_filter_limit(metrics: &Metrics, error: &wok_query::QueryError) {
     if let Some(limit) = error.broken_limit() {
@@ -3155,14 +3175,10 @@ fn count_filter_limit(metrics: &Metrics, error: &wok_query::QueryError) {
     }
 }
 
-/// Count a read the restricted-kind gate refuses, by the strictest class of
-/// the kinds its filters can match.
-fn count_read_class(
-    metrics: &Metrics,
-    restrictor: &crate::restrict::ReadRestrictor,
-    fg: &NostrFilterGroup,
-) {
-    if let Some(setting) = Setting::of_read_class(restrictor.strictest_group_class(fg)) {
+/// Count a read the restricted-kind gate refuses, by the class that
+/// refused it.
+fn count_read_class(metrics: &Metrics, class: crate::restrict::ReadClass) {
+    if let Some(setting) = Setting::of_read_class(class) {
         metrics.refused(setting);
     }
 }
@@ -3450,7 +3466,7 @@ fn ingest_neg(
     if r.is_filter_group_fully_restricted(&fg)
         && auth.get(&conn_id).and_then(|a| a.authed).is_none()
     {
-        count_read_class(metrics, &r, &fg);
+        count_read_class(metrics, r.strictest_group_class(&fg));
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
     if let Some(obj) = filter.as_object_mut() {
@@ -3844,7 +3860,11 @@ impl ReqWorker<'_> {
         // slice.
         if let Some(sub) = queries.next_query() {
             let identities = authed.get(&sub.conn_id).map_or(&[][..], Vec::as_slice);
-            if !stored_reader_admitted(txn, cfg, identities).unwrap_or(false) {
+            let admitted = stored_reader_admitted(txn, cfg, identities);
+            if matches!(admitted, Ok(false)) {
+                self.metrics.refused(Setting::ReadPolicy);
+            }
+            if !admitted.unwrap_or(false) {
                 let refusal = read_policy_refusal(cfg, !identities.is_empty());
                 let (conn_id, sub_id, generation, count_only) = (
                     sub.conn_id,
@@ -7082,6 +7102,8 @@ mod tests {
                 json!(["CLOSED", "waiting", refusal])
             ]
         );
+        // Each is the read policy's refusal.
+        assert_eq!(metrics.refusals.get(Setting::ReadPolicy), 2);
         assert!(!queries.has_running());
         assert_eq!(queries.waiting(), 0);
     }

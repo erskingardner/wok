@@ -70,7 +70,8 @@ settings! {
     ReqBurst => "relay.abuse.req_burst",
     /// The per-address backstop for COUNT.
     CountBurst => "relay.abuse.count_burst",
-    /// Malformed messages whose reply was suppressed.
+    /// Malformed messages past the budget: the first gets one NOTICE, the
+    /// rest no reply.
     InvalidBurst => "relay.abuse.invalid_burst",
     MaxFiltersPerReq => "relay.max_filters_per_req",
     MaxReqFilterSize => "relay.max_req_filter_size",

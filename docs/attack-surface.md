@@ -205,13 +205,16 @@ of every profile:
   gate, and REQs, COUNTs and NEG-* messages that are served or refused;
 - malformed messages, and AUTH with right and wrong challenges and
   signatures;
-- HTTP requests to every listener path, unsigned, signed by a stranger and
-  forged.
+- HTTP requests for NIP-11, the landing page, `OPTIONS /`, `/metrics` and
+  `/admin`; the dashboard API and NIP-86 unsigned, signed by a stranger and
+  forged; and `/metrics` on the metrics listener when the profile has one.
 
 It saves what the relay answers in `tests/transcripts/<profile>.txt`. Ids,
 keys and signatures are numbered in order of first appearance, timestamps are
-offsets, and the AUTH challenge is a placeholder, so a transcript is the same
-on every run.
+offsets, and the AUTH challenge and the NIP-11 `version` are placeholders, so a
+transcript is the same on every run. HTML pages and the Prometheus text are
+recorded by status and content type only, so a change to those bodies, or to
+a path the script does not request, does not show here.
 
 A change that moves a check, such as refusing a request before its signature
 is verified, changes some answers. Rerun the test with

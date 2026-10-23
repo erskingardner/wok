@@ -17,7 +17,7 @@ use crate::abuse::{
 use crate::config::AccessPolicy;
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
-use crate::moderation::{is_member, ManagementCmd, WriteGrant};
+use crate::moderation::{is_member, stored_is_member, ManagementCmd, WriteGrant};
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{
     has_reason_prefix, push_json_str, ClientCommand, EoseHints, ParseFailure, RelayMessage,
@@ -3029,6 +3029,27 @@ fn reader_admitted(
         AccessPolicy::Members => {
             let snap = moderation.read();
             identities.iter().any(|pk| is_member(cfg, &snap, pk))
+        }
+    }
+}
+
+/// [`reader_admitted`] by the committed moderation state in `txn`, for a
+/// worker whose view must agree with the policy generation it read there.
+fn stored_reader_admitted(
+    txn: &wok_db::RoTxn<'_>,
+    cfg: &Config,
+    identities: &[[u8; 32]],
+) -> Result<bool, wok_db::DbError> {
+    match cfg.relay.auth.read_policy {
+        AccessPolicy::Open => Ok(true),
+        AccessPolicy::Authenticated => Ok(!identities.is_empty()),
+        AccessPolicy::Members => {
+            for pubkey in identities {
+                if stored_is_member(txn, cfg, pubkey)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
     }
 }

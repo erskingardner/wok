@@ -393,11 +393,11 @@ NIP-78 only while both app-data kinds are owner-only.
 `read_policy` and `write_policy` say who may use the relay at all; the read
 classes then apply on top. Each is one of:
 
-| Policy | Who |
-|---|---|
-| `open` | anyone |
-| `authenticated` | a connection authenticated with NIP-42, as any pubkey |
-| `members` | a connection authenticated as a member |
+| Policy | Who may read | Who may write |
+|---|---|---|
+| `open` | anyone | anyone |
+| `authenticated` | a connection authenticated with NIP-42, as any pubkey | the same, with an event signed by any key |
+| `members` | a connection authenticated as a member | an event a member signed, any event on a connection authenticated as a member, or an `inbox_kinds` event addressed to a member, as below |
 
 A member is a pubkey that is not banned and is NIP-86 allowlisted
 (`allowpubkey`), holds any role (`assignrole`, built-in or custom), or is in

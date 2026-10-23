@@ -228,6 +228,22 @@ pub(super) fn run_negentropy(
                     let key = (conn, sid.clone());
                     sessions.remove(&key);
                     queries.remove_sub(conn, &sub.sub_id);
+                    // The ingester admitted this NEG-OPEN by the read policy
+                    // of its time. One still queued when the access above
+                    // changed would open a session nothing closes, so it is
+                    // admitted again, by the state this view is read from;
+                    // a retry is then refused with the reason.
+                    let identities = authed.get(&conn).map_or(&[][..], Vec::as_slice);
+                    if !stored_reader_admitted(&txn, &cfg, identities).unwrap_or(false) {
+                        fail(
+                            &conns,
+                            &metrics,
+                            conn,
+                            &sid,
+                            "closed: visibility changed; reopen synchronization",
+                        );
+                        continue;
+                    }
                     if sessions.keys().filter(|k| k.0 == conn).count()
                         >= cfg.relay.max_subs_per_connection
                     {
@@ -614,6 +630,85 @@ fn reconcile_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The next frame `rx` receives.
+    fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(frame) = rx.try_recv() {
+                return serde_json::from_str(&frame.into_text()).unwrap();
+            }
+            assert!(Instant::now() < deadline, "no frame");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A NEG-OPEN the ingester admitted under an earlier read policy, still
+    /// queued when access tightened, gets no session: the worker admits it
+    /// again by the state it reads.
+    #[test]
+    fn queued_opens_are_admitted_again_by_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let member = [7u8; 32];
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::allow_pubkey(&mut txn, &member, "").unwrap();
+        txn.commit().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.read_policy = AccessPolicy::Members;
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let conns = conns.clone();
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let open = |sub_id: &str| {
+            let filter = json!({"kinds": [1]});
+            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+
+        tx.send(open("anonymous")).unwrap();
+        assert_eq!(
+            next(&mut out_rx),
+            json!([
+                "NEG-ERR",
+                "anonymous",
+                "closed: visibility changed; reopen synchronization"
+            ])
+        );
+        tx.send(NegMsg::SetAuth {
+            conn_id: 1,
+            authed: member,
+        })
+        .unwrap();
+        tx.send(open("member")).unwrap();
+        let reply = next(&mut out_rx);
+        assert_eq!(
+            (&reply[0], &reply[1]),
+            (&json!("NEG-MSG"), &json!("member"))
+        );
+        drop(tx);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn memory_pool_enforces_global_and_connection_limits_and_reclaims_on_drop() {
         let pool = Arc::new(MemoryPool::default());

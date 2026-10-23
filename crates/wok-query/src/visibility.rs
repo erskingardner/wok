@@ -118,9 +118,16 @@ impl ReadRestrictor {
     /// Whether this rule can hide any event `fg` matches from a reader that
     /// has not authenticated.
     pub fn may_hide_matches(&self, fg: &NostrFilterGroup) -> bool {
+        self.strictest_group_class(fg) != ReadClass::Open
+    }
+
+    /// The strictest class of the kinds any filter in `fg` can match.
+    pub fn strictest_group_class(&self, fg: &NostrFilterGroup) -> ReadClass {
         fg.filters
             .iter()
-            .any(|f| self.strictest_class(f) != ReadClass::Open)
+            .map(|f| self.strictest_class(f))
+            .max()
+            .unwrap_or(ReadClass::Open)
     }
 
     pub fn is_filter_group_fully_restricted(&self, fg: &NostrFilterGroup) -> bool {
@@ -133,42 +140,73 @@ impl ReadRestrictor {
     }
 
     pub fn is_filter_allowed_to_count(&self, fg: &NostrFilterGroup, authed: Option<&[u8]>) -> bool {
-        for f in &fg.filters {
-            // Admission requires a filter scoped to what `authed` may read.
-            // The shared per-event check additionally enforces
-            // first-recipient semantics before counting.
-            let class = self.strictest_class(f);
-            if class == ReadClass::Open {
-                continue;
-            }
-            let Some(pk) = authed else {
-                return false;
-            };
-            let author_scoped = f
-                .authors
-                .as_ref()
-                .map(|a| a.size() > 0 && (0..a.size()).all(|i| a.at(i) == pk))
-                .unwrap_or(false);
-            let p_scoped = f
-                .tags
-                .get(&'p')
-                .map(|t| t.size() > 0 && (0..t.size()).all(|i| t.at(i) == pk))
-                .unwrap_or(false);
-            let and_p_scoped = f
-                .and_tags
-                .get(&'p')
-                .map(|t| t.size() > 0 && (0..t.size()).all(|i| t.at(i) == pk))
-                .unwrap_or(false);
-            let scoped = match class {
-                ReadClass::Open | ReadClass::Authenticated => true,
-                ReadClass::Recipient => author_scoped || p_scoped || and_p_scoped,
-                ReadClass::Owner => author_scoped,
-            };
-            if !scoped {
-                return false;
-            }
+        fg.filters
+            .iter()
+            .all(|f| self.count_refusal(f, authed).is_none())
+    }
+
+    /// The class that keeps `authed` from counting `f`, if one does.
+    fn count_refusal(&self, f: &NostrFilter, authed: Option<&[u8]>) -> Option<ReadClass> {
+        // Admission requires a filter scoped to what `authed` may read.
+        // The shared per-event check additionally enforces first-recipient
+        // semantics before counting.
+        let class = self.strictest_class(f);
+        if class == ReadClass::Open {
+            return None;
         }
-        true
+        let Some(pk) = authed else {
+            return Some(class);
+        };
+        let author_scoped = f
+            .authors
+            .as_ref()
+            .map(|a| a.size() > 0 && (0..a.size()).all(|i| a.at(i) == pk))
+            .unwrap_or(false);
+        let p_scoped = f
+            .tags
+            .get(&'p')
+            .map(|t| t.size() > 0 && (0..t.size()).all(|i| t.at(i) == pk))
+            .unwrap_or(false);
+        let and_p_scoped = f
+            .and_tags
+            .get(&'p')
+            .map(|t| t.size() > 0 && (0..t.size()).all(|i| t.at(i) == pk))
+            .unwrap_or(false);
+        let scoped = match class {
+            ReadClass::Open | ReadClass::Authenticated => true,
+            ReadClass::Recipient => author_scoped || p_scoped || and_p_scoped,
+            ReadClass::Owner => author_scoped,
+        };
+        (!scoped).then_some(class)
+    }
+
+    /// The strictest class that keeps a reader authenticated as
+    /// `identities` (none, for an anonymous one) from counting `fg`: of the
+    /// filters no identity may count, else, when each is counted by one
+    /// identity but none counts them all, of those the first may not.
+    pub fn count_refusal_class(&self, fg: &NostrFilterGroup, identities: &[[u8; 32]]) -> ReadClass {
+        let refused_to_all = fg
+            .filters
+            .iter()
+            .filter_map(|f| {
+                let classes = identities
+                    .iter()
+                    .map(|pk| self.count_refusal(f, Some(pk)))
+                    .chain(identities.is_empty().then(|| self.count_refusal(f, None)));
+                classes
+                    .collect::<Option<Vec<_>>>()
+                    .map(|_| self.strictest_class(f))
+            })
+            .max();
+        refused_to_all
+            .or_else(|| {
+                let first = identities.first().map(|pk| &pk[..]);
+                fg.filters
+                    .iter()
+                    .filter_map(|f| self.count_refusal(f, first))
+                    .max()
+            })
+            .unwrap_or(ReadClass::Open)
     }
 
     pub fn should_send_to_subscriber(

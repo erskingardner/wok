@@ -31,29 +31,63 @@ and never receives the administrator's private key. Refresh and save are
 explicit actions because each API call needs a new signature. **Sign out**
 clears the dashboard state in that browser and returns to the signed-out view.
 
+## Posture and access
+
+The top of the dashboard says what the relay lets clients do:
+
+- the active preset, with what it is for;
+- how many settings the config file overrides, relative to that preset;
+- a few generated sentences: who can read and write, which kinds the relay
+  accepts, which kinds it shows only to their recipient or author, whether
+  filters must be scoped, and each connection's query budget.
+
+When the file on disk cannot be parsed, or its preset cannot serve it (a
+`marmot` file without a usable `relay.auth.service_url`), the card says so:
+the relay refused that file and kept its last configuration.
+
+**Access** comes first among the settings and is read-only: the read and
+write policies with what each means, the three read classes and the kinds in
+each, `inbox_kinds`, the kinds the relay accepts, whether login (NIP-42) is
+available, and the NIP-11 `auth_required` and `restricted_writes` flags they
+imply. Edit these in `wok.toml`; a remote save cannot change who may use the
+relay or lock its operator out.
+
 ## Configuration writes
 
 Writes require both `allow_config_writes = true` and a relay started with an
-existing TOML file. The dashboard exposes these safe live-reload groups:
+existing TOML file. The settings follow in the order an operator decides
+them:
 
-- relay identity and NIP-11 metadata;
-- event size, timestamp, tag, and ephemeral persistence policy;
-- REQ, COUNT, subscription, queue, plugin-timeout, and Negentropy limits;
-- abuse rates, bursts, concurrency, cost, quota, and proof-of-work controls;
-- structural filter validation;
-- NIP-62 behavior and deletion batch size;
-- bounded in-memory dashboard history.
+- **Events accepted**: size, tags, timestamp windows, ephemeral storage,
+  proof of work and NIP-62;
+- **Queries**: filter and result sizes, subscriptions, the query work
+  ceiling, concurrency and the `filter_validation` rules;
+- **Rates**: every token bucket, per connection and per address, and the
+  IPv6 network size;
+- **Storage**: the per-author and global quotas;
+- **Sync**: NIP-77 and its memory and size budgets;
+- **Relay information**: NIP-11 metadata;
+- **Advanced**: the query time slice, the outbound queue, the write-policy
+  plugin's timeout, vanish deletion batches and this dashboard's history.
 
-Every control includes a subtitle describing its behavior. When writes are
-disabled, values remain visible but inputs and the save button are disabled.
+Each field shows what it does and, for limits, what breaks when it is set too
+low and too high. Sizes take B, KiB, MiB or GiB, and durations seconds to
+years. A limit that zero turns off has an **Off** switch. A token bucket
+shows its rate per second and its burst together. A few values set only in
+the file are shown with their running value and marked `wok.toml`: the
+client address header (`relay.real_ip_header`), which every per-address
+budget trusts, and three restart-only values, the largest WebSocket message,
+the disk reserve and the database size limit.
+When writes are disabled, values remain visible but inputs and the save
+button are disabled.
 
 The dashboard deliberately excludes database, bind/port, worker, compression,
-and Unix-socket settings because they require restart. It also excludes admin
-keys and URLs, reverse-proxy trust, read-auth policy, plugin executable paths,
-and diagnostic logging switches because changing them remotely can create a
-self-lockout, trust-boundary change, or process-execution risk. Edit those in
-`wok.toml`; the full inventory and reload behavior are in
-[Configuration](config.md).
+and Unix-socket settings because they require restart. It also excludes the
+access settings above, admin keys and URLs, reverse-proxy trust, plugin
+executable paths, and diagnostic logging switches because changing them
+remotely can create a self-lockout, trust-boundary change, or
+process-execution risk. Edit those in `wok.toml`; the full inventory and
+reload behavior are in [Configuration](config.md).
 
 A save edits the file on disk in place, so hand-written comments and layout
 survive. The page sends only the fields changed since it loaded, so a save
@@ -68,8 +102,10 @@ writes it to a temporary file in the same directory with the same
 permissions, syncs it, atomically renames it over the configuration, syncs
 the directory, and applies normal live-reload rules. A save that changes
 nothing leaves the file untouched, and a file that no longer parses is
-refused rather than overwritten. Keep writes disabled if the dashboard is
-needed only for visibility.
+refused rather than overwritten. A save the relay could not serve, such as
+one to a `marmot` file without a usable `relay.auth.service_url`, is refused
+with nothing written, and the page shows the reason under **Not saved**.
+Keep writes disabled if the dashboard is needed only for visibility.
 
 Terminate TLS at the reverse proxy and keep the relay clock synchronized;
 NIP-98 freshness depends on both. Serve the dashboard from the same origin set

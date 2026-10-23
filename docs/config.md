@@ -24,9 +24,10 @@ created after reload. Dashboard editing additionally requires
 `admin.allow_config_writes = true` and a relay started from an existing TOML
 file.
 
-The dashboard exposes nearly all safe live operator settings: relay metadata,
-event acceptance, query/protocol limits, abuse controls, filter validation,
-NIP-62, and local history. Database/listener/thread/socket settings are omitted
+The dashboard exposes nearly all safe live operator settings, grouped as
+events accepted, queries, rates, storage, sync, relay information and
+advanced, and shows the access settings read-only; see
+[Operator dashboard](admin-dashboard.md). Database/listener/thread/socket settings are omitted
 because they require restart. Admin credentials, proxy trust, authentication
 policy, external plugin paths, and diagnostic logging switches remain
 file-only to avoid remote self-lockout or security-boundary changes.
@@ -45,9 +46,49 @@ the keys it changes; [presets/](presets/) has a copy of each.
 | Preset | Use |
 |---|---|
 | `public` | A general public relay. Its values are the built-in defaults, so its overlay is empty. |
+| `marmot` | A relay dedicated to [Marmot](#the-marmot-preset) group messaging, such as one a Marmot app ships as a default. |
 
-Further presets, starting with `marmot`, are planned; see
+Further presets, such as an allowlisted `private` one, are planned; see
 [#97](https://github.com/erskingardner/wok/issues/97).
+
+### The `marmot` preset
+
+[presets/marmot.toml](presets/marmot.toml) carries the reason for each
+value. In short, against the public preset:
+
+| Setting | `marmot` | Why |
+|---|---|---|
+| `relay.auth.accepted_kinds` | `[0, 3, 5, 62, 445, 1059, 10000, 10002, 10050, 30443]` | Group messages (445), Welcomes in gift wraps (1059), KeyPackages (30443), the profile and relay-list kinds MDK publishes, KeyPackage deletions (5) and vanish requests (62). Other kinds are refused, and NIP-11 advertises `restricted_writes`. |
+| `relay.filter_validation.require_scoped_filters` | `true` | Refuses `{"kinds":[445]}`, which would list every group's messages; MDK's `#h`, `#p`, `ids` and directory filters name their scope. |
+| `events.max_event_size` | 4 MiB | Welcomes and Add commits grow with the group; MDK accepts events up to 5 MiB. Provisional. |
+| `relay.max_websocket_payload_size`, `relay.unix.max_frame_bytes` | 8 MiB | Room for those events on either transport. |
+| `relay.max_filter_limit` | `5000` | Directory batches with KeyPackage slots. |
+| `relay.abuse.event_burst` | `300` | One inviter's commit plus up to about 250 Welcomes from one address. |
+| `relay.abuse.per_connection.req_rate_per_second`, `req_burst` | `50`, `300` | About two REQs or NEG-OPENs per group at startup, plus `ids` fetches. |
+| `relay.abuse.per_connection.neg_msg_burst` | `500` | A NIP-77 pass per group and per inbox. |
+
+Writes stay open (`write_policy = "open"`). Marmot signs each 445 with a
+fresh key, so the relay cannot link a message to its sender, and MDK
+publishes 445s on an anonymous connection; requiring AUTH to write would
+reveal which account posts to which group. Abuse control relies on the
+per-connection and per-address budgets instead. Reads keep the public read
+classes: a gift wrap only to its recipient after AUTH, 445s to anyone who
+names the group, and KeyPackages and relay lists to anyone, since an inviter
+must fetch them.
+
+A `marmot` relay needs NIP-42: it refuses to start without usable AUTH, that
+is unless `relay.auth.service_url` is set (and `relay.auth.enabled` left on).
+A reload that would leave it without, from the file watcher, a dashboard save
+or a NIP-86 relay-info method, is refused and the running configuration kept;
+a save then answers 409 and writes nothing. `wok doctor` reports this as a
+failed `preset` check.
+
+```toml
+preset = "marmot"
+
+[relay.auth]
+service_url = "wss://relay.example.com"
+```
 
 `wok config show` prints the effective configuration, one dotted key per line,
 with the origin of each value: `default`, `preset <name>`, or the file and
@@ -554,7 +595,7 @@ matches nothing, is not checked.
 | `relay.filter_validation.max_kinds_per_filter` | `0` | Live | Yes | Maximum kinds listed by one filter; zero is unlimited. MDK's directory batches list six. |
 | `relay.filter_validation.allowed_kinds` | empty | Live | Yes | Comma-separated kinds a filter may list; empty permits all. A filter without `kinds` is not checked. |
 | `relay.filter_validation.require_author_or_tag` | `false` | Live | Yes | Require each filter to name exactly one author, `#p` or `#e` value. This refuses Marmot's `#h` group filters, `ids` fetches and multi-author outbox and directory batches; prefer `require_scoped_filters`. |
-| `relay.filter_validation.require_scoped_filters` | `false` | Live | No | Require each filter to name what it wants: `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. This refuses enumeration such as `{"kinds":[445]}`, `{"since":...}` or a bare `search`, and accepts Marmot's `#h` group filters, `#p` inbox filters, `ids` fetches and directory batches. |
+| `relay.filter_validation.require_scoped_filters` | `false` | Live | Yes | Require each filter to name what it wants: `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. This refuses enumeration such as `{"kinds":[445]}`, `{"since":...}` or a bare `search`, and accepts Marmot's `#h` group filters, `#p` inbox filters, `ids` fetches and directory batches. |
 
 The filters in one REQ are bounded by `relay.max_filters_per_req` alone.
 
@@ -585,9 +626,8 @@ way; strfry's section is off unless `enabled = true`.
 
 ## Abuse protection
 
-All abuse settings reload live. All but `ipv6_prefix_len` and the
-`per_connection` table are dashboard-editable. See [Rates](#rates) for how
-the per-connection and per-address budgets combine.
+All abuse settings reload live and are dashboard-editable. See
+[Rates](#rates) for how the per-connection and per-address budgets combine.
 
 | Key | Default | Meaning |
 |---|---:|---|

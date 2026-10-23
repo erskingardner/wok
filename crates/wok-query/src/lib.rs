@@ -20,6 +20,6 @@ pub use scan::{
     foreach_by_filter, foreach_visible_by_filter, Completeness, DbQuery, DbScan, ScanPlan,
 };
 pub use scheduler::{QueryFailure, QueryScheduler, Scheduled};
-pub use subid::{QueryError, SubId, Subscription};
+pub use subid::{FilterLimit, QueryError, SubId, Subscription};
 
 pub mod visibility;

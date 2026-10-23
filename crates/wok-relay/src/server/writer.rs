@@ -198,12 +198,17 @@ pub(super) fn run_writer(
                         });
                         let (vanished, moderated, write_allowed) = match stored_checks {
                             // `accepted_kinds` as the writer's configuration
-                            // has it, like the stored kind policy.
+                            // has it, like the stored kind policy. Only the
+                            // first is a setting.
                             Ok((vanished, moderated, write_allowed)) => (
                                 vanished
                                     || event_matches_vanish_markers(packed_view, &batch_vanish),
-                                moderated.or((!cfg_snap.accepts_kind(packed_view.kind()))
-                                    .then_some(wok_db::ModerationReason::KindNotAllowed)),
+                                moderated.map(|reason| (reason, None)).or((!cfg_snap
+                                    .accepts_kind(packed_view.kind()))
+                                .then_some((
+                                    wok_db::ModerationReason::KindNotAllowed,
+                                    Some(Setting::AcceptedKinds),
+                                ))),
                                 write_allowed,
                             ),
                             Err(error) => {
@@ -234,7 +239,10 @@ pub(super) fn run_writer(
                             );
                             continue;
                         }
-                        if let Some(reason) = moderated {
+                        if let Some((reason, setting)) = moderated {
+                            if let Some(setting) = setting {
+                                metrics.refused(setting);
+                            }
                             let (counter, message) = match reason {
                                 wok_db::ModerationReason::BannedEvent => (
                                     &metrics.moderation_banned_event_rejections,
@@ -272,6 +280,7 @@ pub(super) fn run_writer(
                             metrics
                                 .moderation_restricted_write_rejections
                                 .fetch_add(1, Ordering::Relaxed);
+                            metrics.refused(Setting::WritePolicy);
                             let id_hex = PackedEventView::new(&packed)
                                 .map(|event| to_hex(event.id()))
                                 .unwrap_or_else(|_| "?".into());
@@ -313,6 +322,7 @@ pub(super) fn run_writer(
                         events.push(EventToWrite::new(packed, json).with_context(conn_id));
                     }
                 } else {
+                    metrics.refused(Setting::WritePolicyPlugin);
                     let id_hex = PackedEventView::new(&packed)
                         .map(|p| to_hex(p.id()))
                         .unwrap_or_else(|_| "?".into());
@@ -337,6 +347,9 @@ pub(super) fn run_writer(
                     metrics
                         .abuse_disk_reserve_rejections
                         .fetch_add(events.len() as u64, Ordering::Relaxed);
+                    metrics
+                        .refusals
+                        .add(Setting::MinFreeDiskBytes, events.len() as u64);
                     for event in &events {
                         let conn_id = &event.context;
                         let id_hex = PackedEventView::new(&event.packed)
@@ -408,6 +421,9 @@ pub(super) fn run_writer(
                     metrics
                         .abuse_global_quota_rejections
                         .fetch_add(events.len() as u64, Ordering::Relaxed);
+                    metrics
+                        .refusals
+                        .add(Setting::MaxStoredEvents, events.len() as u64);
                     return Err(wok_db::DbError::msg(format!(
                         "global storage quota of {} events exceeded",
                         cfg_snap.relay.abuse.max_stored_events
@@ -479,6 +495,7 @@ pub(super) fn run_writer(
                     metrics
                         .abuse_pubkey_quota_rejections
                         .fetch_add(1, Ordering::Relaxed);
+                    metrics.refused(Setting::MaxStoredEventsPerPubkey);
                     (false, "blocked: author storage quota exceeded".into())
                 }
                 EventWriteStatus::Pending => (false, "error: write still pending".into()),

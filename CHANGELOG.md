@@ -108,6 +108,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The operator dashboard explains the relay it configures (#97 §5.1). A
+  posture card at the top names the preset and what it is for, counts the
+  settings the config file overrides, says in a few sentences who can read
+  and write and which kinds are private, and warns when the file on disk
+  cannot be served. The access settings are shown read-only first, with what
+  each policy and read class means. The other settings follow in operator
+  order (events accepted, queries, rates, storage, sync, relay information,
+  advanced), each with what it does and what breaks when it is set too low or
+  too high. Sizes and durations take units (KiB to GiB, seconds to years),
+  limits that zero turns off have an **Off** switch, and a token bucket's
+  rate and burst sit together. The dashboard can now also edit
+  `relay.filter_validation.require_scoped_filters`, the
+  `[relay.abuse.per_connection]` budgets, `relay.abuse.ipv6_prefix_len`, and
+  the sync memory budgets and idle timeout, and shows the client address
+  header (`relay.real_ip_header`), the largest message, the disk reserve and
+  the database size limit read-only.
+- `wok_refusals_total{setting}`, one counter of refused requests and
+  events, labelled by the config key that refused them, such as
+  `relay.abuse.per_connection.req_burst` or `events.max_num_tags` (#97
+  §5.1). A token bucket's refusals carry its `_burst` key. Refusals that had
+  no counter are now counted too: event validation (`created_at` bounds,
+  size, tags), filter limits (`max_filters_per_req`, `max_req_filter_size`,
+  `max_tags_per_filter`, `max_and_entries`), each `filter_validation` rule,
+  `accepted_kinds`, the read classes, the read and write policies, the
+  per-connection filter and subscription caps, the write-policy plugin, and
+  sync's memory and size budgets. Refusals no setting makes, such as a
+  NIP-86 ban or AUTH's fixed timestamp window, are not. **Deprecated:**
+  `wok_abuse_rejections_total{reason}` still counts as before for this
+  release and will be removed in the next; `docs/observability.md` maps
+  each `reason` to its settings.
+- The `marmot` preset, for a relay dedicated to Marmot group messaging
+  (`preset = "marmot"`): only the Marmot kinds, scoped filters, 4 MiB events,
+  room for an inviter's Welcome burst and a NIP-77 pass per group, and open
+  writes so group membership stays unlinkable at the relay. It refuses to
+  start without `relay.auth.service_url`, and a reload or a dashboard or
+  NIP-86 save that would remove it is refused. See `docs/config.md`,
+  The `marmot` preset (#97 §4.2).
 - `relay.auth.accepted_kinds`, the kinds a relay accepts (empty, the
   default, accepts every kind). Events of other kinds are refused with
   `restricted: kind N is not allowed by this relay`, and NIP-11 advertises
@@ -275,6 +312,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Preset changes
 
+- `marmot` (new): over the public preset, `relay.auth.accepted_kinds =
+  [0, 3, 5, 62, 445, 1059, 10000, 10002, 10050, 30443]`,
+  `relay.filter_validation.require_scoped_filters = true`,
+  `events.max_event_size = 4194304`, `relay.max_websocket_payload_size` and
+  `relay.unix.max_frame_bytes = 8388608`, `relay.max_filter_limit = 5000`,
+  `relay.abuse.event_burst = 300`, and `[relay.abuse.per_connection]`
+  `req_rate_per_second = 50`, `req_burst = 300`, `neg_msg_burst = 500`.
 - `public`: `relay.auth.owner_only_kinds` is `[78, 30078]` (new), so NIP-78
   app data is read and published only by its author (see Security). Apps
   that publish public data in these kinds can no longer be read by other

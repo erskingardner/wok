@@ -4,7 +4,7 @@ use crate::kinds::{
     is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_a_tag,
 };
 use crate::packed::{indexed_tag_value, PackedEvent, PackedEventBuilder, PackedEventTagBuilder};
-use crate::{EventError, MAX_INDEXED_TAG_VAL_SIZE};
+use crate::{EventError, EventLimit, MAX_INDEXED_TAG_VAL_SIZE};
 
 /// Default ceiling for normalized event JSON. This is intentionally far below
 /// NIP-44's protocol maximum while leaving room for extended-length encrypted
@@ -204,7 +204,10 @@ pub(crate) fn pack_event(
         "tags field not an array",
     )?;
     if tags.len() > limits.max_num_tags {
-        return Err(EventError::msg(format!("too many tags: {}", tags.len())));
+        return Err(EventError::limit(
+            EventLimit::NumTags,
+            format!("too many tags: {}", tags.len()),
+        ));
     }
 
     for tag_arr in tags {
@@ -224,10 +227,10 @@ pub(crate) fn pack_event(
 
         if tag_name.len() == 1 {
             if tag_val.len() > limits.max_tag_val_size {
-                return Err(EventError::msg(format!(
-                    "tag val too large: {}",
-                    tag_val.len()
-                )));
+                return Err(EventError::limit(
+                    EventLimit::TagValSize,
+                    format!("tag val too large: {}", tag_val.len()),
+                ));
             }
             // An address must fit the a tag that names it, `kind:pubkey:d`,
             // under the same limit, or no event could reference or delete it.
@@ -235,9 +238,10 @@ pub(crate) fn pack_event(
                 address_d_seen = true;
                 let a_tag_len = kind.to_string().len() + 1 + 64 + 1 + tag_val.len();
                 if a_tag_len > limits.max_tag_val_size {
-                    return Err(EventError::msg(format!(
-                        "d tag too large: its a tag would be {a_tag_len} bytes"
-                    )));
+                    return Err(EventError::limit(
+                        EventLimit::TagValSize,
+                        format!("d tag too large: its a tag would be {a_tag_len} bytes"),
+                    ));
                 }
             }
             if tag_name == "e" || tag_name == "p" {

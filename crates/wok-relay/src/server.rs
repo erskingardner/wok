@@ -2420,18 +2420,32 @@ fn ingest_event(
             );
             return;
         }
-        let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(packed.pubkey());
-        if !abuse.admit_author(&pubkey, &cfg.relay.abuse) {
+        // An event signed by a key that is not one of the connection's AUTHed
+        // identities, such as a Marmot 445 from a fresh key per event or a
+        // 1059 from a random one, is charged to the connection's first
+        // identity: its author's budget would be new every time (#97 F11).
+        let mut author = [0u8; 32];
+        author.copy_from_slice(packed.pubkey());
+        let charged = auth
+            .get(&conn_id)
+            .filter(|session| !session.identities.contains(&author))
+            .and_then(|session| session.authed)
+            .unwrap_or(author);
+        if !abuse.admit_pubkey_event(&charged, &cfg.relay.abuse) {
             metrics
                 .abuse_event_rate_rejections
                 .fetch_add(1, Ordering::Relaxed);
+            let message = if charged == author {
+                "rate-limited: author EVENT budget exhausted"
+            } else {
+                "rate-limited: EVENT budget exhausted for the authenticated pubkey"
+            };
             conns.send(
                 conn_id,
                 RelayMessage::Ok {
                     event_id: id_hex,
                     accepted: false,
-                    message: "rate-limited: author EVENT budget exhausted".into(),
+                    message: message.into(),
                 },
                 metrics,
             );

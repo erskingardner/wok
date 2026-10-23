@@ -251,7 +251,9 @@ regression test. Differential parity alone is not a reason to retain it.
 - All read paths, including COUNT/HLL and NIP-77 ID reconciliation, enforce
   the same first-recipient/author policy, moderation, vanish and expiry checks.
   Multiple successfully authenticated identities remain valid on one connection
-  (up to 64); the first identity remains the connection's rate-limit identity.
+  (up to 64); the first identity is the one charged the per-author EVENT
+  budget for events the connection publishes from other keys, such as
+  Marmot's per-message 445 keys.
 - A validated EVENT is committed even when its connection closes before the
   writer reaches it; only the OK is lost. The pinned strfry writer drops events
   whose connection closed within the same write batch, which lost posts from

@@ -446,7 +446,7 @@ the per-connection and per-address budgets combine.
 | `relay.abuse.connection_burst` | `50` | Connection token-bucket capacity. |
 | `relay.abuse.event_rate_per_second` | `50` | Refilled EVENT and AUTH tokens per network address each second. |
 | `relay.abuse.event_burst` | `100` | Per-address EVENT and AUTH bucket capacity. |
-| `relay.abuse.pubkey_event_rate_per_second` | `25` | Refilled publication tokens per event author each second. |
+| `relay.abuse.pubkey_event_rate_per_second` | `25` | Refilled publication tokens per event author each second. An event whose author is not one of its connection's AUTHed identities is charged to the connection's first identity instead; see [Throwaway keys](#throwaway-keys). |
 | `relay.abuse.pubkey_event_burst` | `50` | Per-author publication bucket capacity. |
 | `relay.abuse.req_rate_per_second` | `200` | Backstop: refilled REQ, NEG-OPEN, and NEG-MSG tokens per network address each second, shared by all of its connections. |
 | `relay.abuse.req_burst` | `1000` | Per-address REQ, NEG-OPEN, and NEG-MSG bucket capacity. |
@@ -516,6 +516,27 @@ Copies of the 0.7 `docs/wok.toml` pin `req_rate_per_second = 20`,
 keys keep their meaning, a per-address budget, so such a file keeps the old
 per-address limits under the new per-connection ones, and `wok doctor`
 lists them.
+
+### Throwaway keys
+
+Marmot signs each group message (kind 445) with a fresh key, and a gift
+wrap (1059) is signed by a random one, so a budget keyed on the author would
+be full for every event. When a connection has authenticated and publishes
+an event whose author is not one of its identities, the per-author EVENT
+budget (`pubkey_event_*`) of the connection's first identity is charged
+instead, and a refusal reads `rate-limited: EVENT budget exhausted for the
+authenticated pubkey`. Events the identity signs itself draw on the same
+budget, from any connection.
+
+An unauthenticated connection's events are charged to their authors, so
+throwaway keys are bounded there only by the per-address EVENT budget.
+MDK publishes 445s anonymously until a relay asks it to authenticate, which
+keeps group membership unlinkable at the relay.
+
+Storage is not charged this way: `max_stored_events_per_pubkey` counts
+stored events by their author, so throwaway-key events count against no
+per-author quota. Per-group (`#h`) and per-recipient quotas are a planned
+follow-up ([#97](https://github.com/erskingardner/wok/issues/97) step 9).
 
 ### Addresses
 
@@ -626,7 +647,9 @@ top of those.
     their events is refused, since it would add an event and free none.
   - If too high: one key can fill the disk.
   - The quota is charged to the event's author, so throwaway keys such as
-    Marmot's kind 445 and gift-wrap 1059 authors never reach it.
+    Marmot's kind 445 and gift-wrap 1059 authors never reach it, even on
+    an AUTHed connection whose identity pays their EVENT budget (see
+    [Throwaway keys](#throwaway-keys)).
 
 A write over a quota is refused with `OK false`: `blocked: author storage
 quota exceeded`, or `error: global storage quota of <n> events exceeded` for

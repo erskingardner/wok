@@ -1,7 +1,8 @@
 //! What each rate budget is keyed on (tracking issue #97 §3.3): a
 //! connection has REQ, NEG-MSG and COUNT budgets of its own, larger once it
-//! has authenticated, under a backstop its address shares; and per-address
-//! budgets group an IPv6 client by its network, not its full address.
+//! has authenticated, under a backstop its address shares; per-address
+//! budgets group an IPv6 client by its network, not its full address; and an
+//! event from a throwaway key is charged to the AUTHed identity that sent it.
 
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
@@ -92,17 +93,19 @@ impl Client {
         (max, String::new())
     }
 
+    /// Send an EVENT and return its OK.
+    async fn publish(&mut self, event: &Value) -> Value {
+        self.send(json!(["EVENT", event])).await;
+        self.reply(event["id"].as_str().unwrap(), &["OK"]).await
+    }
+
     async fn auth(&mut self, key: &Keypair) {
         while self.challenge.is_none() {
             self.recv().await;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let event = wok_compat::sign_event_with_key(
             json!({
-                "created_at": now,
+                "created_at": now(),
                 "kind": 22242,
                 "tags": [["relay", AUTH_RELAY], ["challenge", self.challenge]],
                 "content": "",
@@ -125,6 +128,23 @@ fn assert_admitted(got: usize, expected: usize, since: Instant, rate: u32, what:
         (expected..=expected + refilled).contains(&got),
         "{what}: {got} admitted, expected {expected} (+{refilled} refilled)"
     );
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A Marmot group message: kind 445, signed by a fresh key.
+fn group_message(group: &str) -> Value {
+    wok_compat::sign_event(json!({
+        "created_at": now(),
+        "kind": 445,
+        "tags": [["h", group]],
+        "content": "ciphertext",
+    }))
 }
 
 fn neg_initial() -> String {
@@ -243,6 +263,68 @@ async fn a_nip77_pass_per_group_does_not_spend_the_req_budget() {
         client.send(json!(["REQ", live, filter])).await;
         let reply = client.reply(&live, &["EOSE", "CLOSED"]).await;
         assert_eq!(reply[0], "EOSE", "{reply}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_throwaway_key_event_on_an_authenticated_connection_charges_that_identity() {
+    let (_dir, handle) = start(|cfg| {
+        cfg.relay.auth.service_url = AUTH_RELAY.into();
+        cfg.relay.abuse.pubkey_event_rate_per_second = 1;
+        cfg.relay.abuse.pubkey_event_burst = 3;
+    });
+    let group = "ab".repeat(32);
+    let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let started = Instant::now();
+    let mut member = Client::connect(&handle, "192.0.2.1").await;
+    member.auth(&key).await;
+    // F11: every 445 has a fresh author, whose own budget would always be
+    // full. On an AUTHed connection they are charged to its identity.
+    let mut accepted = 0;
+    let refusal = loop {
+        let ok = member.publish(&group_message(&group)).await;
+        if ok[2] != true {
+            break ok[3].as_str().unwrap().to_string();
+        }
+        accepted += 1;
+        assert!(accepted < 50, "throwaway keys were never charged");
+    };
+    assert_admitted(accepted, 3, started, 1, "445s from fresh keys");
+    assert_eq!(
+        refusal,
+        "rate-limited: EVENT budget exhausted for the authenticated pubkey"
+    );
+    // It is the identity's own budget, which its events signed with its key
+    // draw on too, from any connection.
+    let mut elsewhere = Client::connect(&handle, "198.51.100.1").await;
+    elsewhere.auth(&key).await;
+    let mut own_accepted = 0;
+    let refusal = loop {
+        let own = wok_compat::sign_event_with_key(
+            json!({"created_at": now(), "kind": 1, "tags": [], "content": own_accepted.to_string()}),
+            &key,
+        );
+        let ok = elsewhere.publish(&own).await;
+        if ok[2] != true {
+            break ok[3].as_str().unwrap().to_string();
+        }
+        own_accepted += 1;
+        assert!(own_accepted < 50, "the identity's budget was not shared");
+    };
+    assert_admitted(
+        accepted + own_accepted,
+        3,
+        started,
+        1,
+        "the identity's budget",
+    );
+    assert_eq!(refusal, "rate-limited: author EVENT budget exhausted");
+    // An anonymous connection's events are charged to their authors, so the
+    // relay cannot tie throwaway keys to anyone.
+    let mut anonymous = Client::connect(&handle, "203.0.113.1").await;
+    for _ in 0..5 {
+        let ok = anonymous.publish(&group_message(&group)).await;
+        assert_eq!(ok[2], true, "{ok}");
     }
 }
 

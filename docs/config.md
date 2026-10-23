@@ -24,9 +24,10 @@ created after reload. Dashboard editing additionally requires
 `admin.allow_config_writes = true` and a relay started from an existing TOML
 file.
 
-The dashboard exposes nearly all safe live operator settings: relay metadata,
-event acceptance, query/protocol limits, abuse controls, filter validation,
-NIP-62, and local history. Database/listener/thread/socket settings are omitted
+The dashboard exposes nearly all safe live operator settings, grouped as
+events accepted, queries, rates, storage, sync, relay information and
+advanced, and shows the access settings read-only; see
+[Operator dashboard](admin-dashboard.md). Database/listener/thread/socket settings are omitted
 because they require restart. Admin credentials, proxy trust, authentication
 policy, external plugin paths, and diagnostic logging switches remain
 file-only to avoid remote self-lockout or security-boundary changes.
@@ -594,7 +595,7 @@ matches nothing, is not checked.
 | `relay.filter_validation.max_kinds_per_filter` | `0` | Live | Yes | Maximum kinds listed by one filter; zero is unlimited. MDK's directory batches list six. |
 | `relay.filter_validation.allowed_kinds` | empty | Live | Yes | Comma-separated kinds a filter may list; empty permits all. A filter without `kinds` is not checked. |
 | `relay.filter_validation.require_author_or_tag` | `false` | Live | Yes | Require each filter to name exactly one author, `#p` or `#e` value. This refuses Marmot's `#h` group filters, `ids` fetches and multi-author outbox and directory batches; prefer `require_scoped_filters`. |
-| `relay.filter_validation.require_scoped_filters` | `false` | Live | No | Require each filter to name what it wants: `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. This refuses enumeration such as `{"kinds":[445]}`, `{"since":...}` or a bare `search`, and accepts Marmot's `#h` group filters, `#p` inbox filters, `ids` fetches and directory batches. |
+| `relay.filter_validation.require_scoped_filters` | `false` | Live | Yes | Require each filter to name what it wants: `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. This refuses enumeration such as `{"kinds":[445]}`, `{"since":...}` or a bare `search`, and accepts Marmot's `#h` group filters, `#p` inbox filters, `ids` fetches and directory batches. |
 
 The filters in one REQ are bounded by `relay.max_filters_per_req` alone.
 
@@ -625,9 +626,8 @@ way; strfry's section is off unless `enabled = true`.
 
 ## Abuse protection
 
-All abuse settings reload live. All but `ipv6_prefix_len` and the
-`per_connection` table are dashboard-editable. See [Rates](#rates) for how
-the per-connection and per-address budgets combine.
+All abuse settings reload live and are dashboard-editable. See
+[Rates](#rates) for how the per-connection and per-address budgets combine.
 
 | Key | Default | Meaning |
 |---|---:|---|

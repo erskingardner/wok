@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wok_relay::{Config, EphemeralPersistence, RelayHandle};
 
+mod fields;
+mod posture;
+
 const MAX_ADMIN_BODY: usize = 64 * 1024;
 pub(crate) const MAX_REPLAY_IDS: usize = 4096;
 
@@ -26,6 +29,7 @@ struct ConfigPatch {
     events: Option<EventsPatch>,
     limits: Option<LimitsPatch>,
     abuse: Option<AbusePatch>,
+    per_connection: Option<PerConnectionPatch>,
     filters: Option<FiltersPatch>,
     nip62: Option<Nip62Patch>,
     history: Option<HistoryPatch>,
@@ -75,12 +79,16 @@ struct LimitsPatch {
     write_policy_timeout_secs: Option<u64>,
     negentropy_enabled: Option<bool>,
     max_sync_events: Option<u64>,
+    sync_memory_per_connection: Option<u64>,
+    sync_memory_total: Option<u64>,
+    sync_idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AbusePatch {
     enabled: Option<bool>,
+    ipv6_prefix_len: Option<u8>,
     connection_rate_per_second: Option<u32>,
     connection_burst: Option<u32>,
     event_rate_per_second: Option<u32>,
@@ -102,10 +110,23 @@ struct AbusePatch {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PerConnectionPatch {
+    req_rate_per_second: Option<u32>,
+    req_burst: Option<u32>,
+    neg_msg_rate_per_second: Option<u32>,
+    neg_msg_burst: Option<u32>,
+    count_rate_per_second: Option<u32>,
+    count_burst: Option<u32>,
+    authenticated_multiplier: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FiltersPatch {
     max_kinds_per_filter: Option<u64>,
     allowed_kinds: Option<String>,
     require_author_or_tag: Option<bool>,
+    require_scoped_filters: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,16 +357,44 @@ fn single_tag<'a>(event: &'a serde_json::Value, name: &str) -> Result<&'a str, S
 }
 
 fn overview(handle: &RelayHandle) -> Response<Full<Bytes>> {
-    let cfg = handle.config.read();
+    let cfg = handle.config.read().clone();
+    let file = handle.config_path().map(|path| file_state(&path));
     json(
         StatusCode::OK,
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "history": handle.metrics.history_json(),
             "can_write_config": cfg.admin.allow_config_writes && handle.config_path().is_some(),
+            "preset": {"name": cfg.preset.name(), "summary": cfg.preset.summary()},
+            "file": file,
+            "posture": posture::posture(&cfg),
+            "access": posture::access(&cfg),
+            "sections": fields::SECTIONS,
             "config": dashboard_config(&cfg),
         }),
     )
+}
+
+/// What the config file on disk says: how many settings it overrides, or
+/// why the relay cannot serve it, which a reload of it then refused.
+fn file_state(path: &std::path::Path) -> serde_json::Value {
+    let explained = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+        .and_then(|text| Config::explain_toml(&text));
+    match explained {
+        Ok(explained) => serde_json::json!({
+            "path": path.display().to_string(),
+            "overrides": explained.entries.iter().filter(|entry| entry.is_override()).count(),
+            "problem": explained.config.serving_error().map(|error| {
+                format!("{} cannot be served, so the relay kept its last configuration: {error}", path.display())
+            }),
+        }),
+        Err(error) => serde_json::json!({
+            "path": path.display().to_string(),
+            "overrides": null,
+            "problem": format!("{error}; the relay kept its last configuration"),
+        }),
+    }
 }
 
 /// The settings the dashboard shows and sends back on save, by form group.
@@ -387,9 +436,13 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
             "write_policy_timeout_secs": cfg.relay.write_policy_timeout_secs,
             "negentropy_enabled": cfg.relay.negentropy_enabled,
             "max_sync_events": cfg.relay.max_sync_events,
+            "sync_memory_per_connection": cfg.relay.sync_memory_per_connection,
+            "sync_memory_total": cfg.relay.sync_memory_total,
+            "sync_idle_timeout_secs": cfg.relay.sync_idle_timeout_secs,
         },
         "abuse": {
             "enabled": cfg.relay.abuse.enabled,
+            "ipv6_prefix_len": cfg.relay.abuse.ipv6_prefix_len,
             "connection_rate_per_second": cfg.relay.abuse.connection_rate_per_second,
             "connection_burst": cfg.relay.abuse.connection_burst,
             "event_rate_per_second": cfg.relay.abuse.event_rate_per_second,
@@ -408,10 +461,20 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
             "max_stored_events_per_pubkey": cfg.relay.abuse.max_stored_events_per_pubkey,
             "min_pow_difficulty": cfg.relay.abuse.min_pow_difficulty,
         },
+        "per_connection": {
+            "req_rate_per_second": cfg.relay.abuse.per_connection.req_rate_per_second,
+            "req_burst": cfg.relay.abuse.per_connection.req_burst,
+            "neg_msg_rate_per_second": cfg.relay.abuse.per_connection.neg_msg_rate_per_second,
+            "neg_msg_burst": cfg.relay.abuse.per_connection.neg_msg_burst,
+            "count_rate_per_second": cfg.relay.abuse.per_connection.count_rate_per_second,
+            "count_burst": cfg.relay.abuse.per_connection.count_burst,
+            "authenticated_multiplier": cfg.relay.abuse.per_connection.authenticated_multiplier,
+        },
         "filters": {
             "max_kinds_per_filter": cfg.relay.filter_validation.max_kinds_per_filter,
             "allowed_kinds": cfg.relay.filter_validation.allowed_kinds,
             "require_author_or_tag": cfg.relay.filter_validation.require_author_or_tag,
+            "require_scoped_filters": cfg.relay.filter_validation.require_scoped_filters,
         },
         "nip62": {
             "enabled": cfg.relay.nip62.enabled,
@@ -422,7 +485,15 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
             "enabled": cfg.observability.history_enabled,
             "interval_secs": cfg.observability.history_interval_secs,
             "max_points": cfg.observability.history_max_points,
-        }
+        },
+        // Shown but not editable: the patch has no such group. Restart
+        // settings show the running value.
+        "file": {
+            "real_ip_header": cfg.relay.real_ip_header,
+            "max_websocket_payload_size": cfg.relay.max_websocket_payload_size,
+            "min_free_disk_bytes": cfg.db_min_free_disk_bytes,
+            "map_size": cfg.db_mapsize,
+        },
     })
 }
 
@@ -598,10 +669,22 @@ fn apply_patch(config: &mut Config, patch: ConfigPatch) {
         if let Some(value) = limits.max_sync_events {
             config.relay.max_sync_events = value;
         }
+        if let Some(value) = limits.sync_memory_per_connection {
+            config.relay.sync_memory_per_connection = value;
+        }
+        if let Some(value) = limits.sync_memory_total {
+            config.relay.sync_memory_total = value;
+        }
+        if let Some(value) = limits.sync_idle_timeout_secs {
+            config.relay.sync_idle_timeout_secs = value;
+        }
     }
     if let Some(abuse) = patch.abuse {
         if let Some(value) = abuse.enabled {
             config.relay.abuse.enabled = value;
+        }
+        if let Some(value) = abuse.ipv6_prefix_len {
+            config.relay.abuse.ipv6_prefix_len = value;
         }
         if let Some(value) = abuse.connection_rate_per_second {
             config.relay.abuse.connection_rate_per_second = value;
@@ -655,6 +738,30 @@ fn apply_patch(config: &mut Config, patch: ConfigPatch) {
             config.relay.abuse.min_pow_difficulty = value;
         }
     }
+    if let Some(own) = patch.per_connection {
+        let config = &mut config.relay.abuse.per_connection;
+        if let Some(value) = own.req_rate_per_second {
+            config.req_rate_per_second = value;
+        }
+        if let Some(value) = own.req_burst {
+            config.req_burst = value;
+        }
+        if let Some(value) = own.neg_msg_rate_per_second {
+            config.neg_msg_rate_per_second = value;
+        }
+        if let Some(value) = own.neg_msg_burst {
+            config.neg_msg_burst = value;
+        }
+        if let Some(value) = own.count_rate_per_second {
+            config.count_rate_per_second = value;
+        }
+        if let Some(value) = own.count_burst {
+            config.count_burst = value;
+        }
+        if let Some(value) = own.authenticated_multiplier {
+            config.authenticated_multiplier = value;
+        }
+    }
     if let Some(filters) = patch.filters {
         if let Some(value) = filters.max_kinds_per_filter {
             config.relay.filter_validation.max_kinds_per_filter = value;
@@ -664,6 +771,9 @@ fn apply_patch(config: &mut Config, patch: ConfigPatch) {
         }
         if let Some(value) = filters.require_author_or_tag {
             config.relay.filter_validation.require_author_or_tag = value;
+        }
+        if let Some(value) = filters.require_scoped_filters {
+            config.relay.filter_validation.require_scoped_filters = value;
         }
     }
     if let Some(nip62) = patch.nip62 {
@@ -756,10 +866,14 @@ const ADMIN_HTML_V2: &str = r##"<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Wok operator</title>
 <style>
-:root{color-scheme:dark;--bg:#090b0f;--panel:#11151c;--panel2:#151b24;--line:#28303c;--text:#f7f4ed;--muted:#99a4b5;--hot:#ff8a3d;--green:#5bd6a2;--red:#ff7373}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;min-height:100vh;background:radial-gradient(circle at 78% -8%,#1b120f 0,transparent 32rem),var(--bg);color:var(--text);font:15px/1.45 Inter,"SF Pro Text",system-ui,-apple-system,sans-serif}button,input,select{font:inherit}button{border:0;border-radius:10px;padding:10px 14px;background:var(--hot);color:#1e0c02;font-weight:760;cursor:pointer}button.secondary{background:#1c2330;color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.45;cursor:not-allowed}.mark{display:grid;place-items:center;width:46px;height:46px;background:#090b0f;color:#ff8a3d;box-shadow:0 10px 28px #0006}.mark svg{display:block;width:100%;height:100%}.muted{color:var(--muted)}.ok{color:var(--green)}.bad{color:var(--red)}
+:root{color-scheme:dark;--bg:#090b0f;--panel:#11151c;--panel2:#151b24;--line:#28303c;--text:#f7f4ed;--muted:#99a4b5;--hot:#ff8a3d;--green:#5bd6a2;--red:#ff7373;--amber:#f3c15f}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;min-height:100vh;background:radial-gradient(circle at 78% -8%,#1b120f 0,transparent 32rem),var(--bg);color:var(--text);font:15px/1.45 Inter,"SF Pro Text",system-ui,-apple-system,sans-serif}button,input,select{font:inherit}button{border:0;border-radius:10px;padding:10px 14px;background:var(--hot);color:#1e0c02;font-weight:760;cursor:pointer}button.secondary{background:#1c2330;color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.45;cursor:not-allowed}a{color:var(--hot)}.mark{display:grid;place-items:center;width:46px;height:46px;background:#090b0f;color:#ff8a3d;box-shadow:0 10px 28px #0006}.mark svg{display:block;width:100%;height:100%}.muted{color:var(--muted)}.ok{color:var(--green)}.bad{color:var(--red)}
 .login{display:grid;place-items:center;min-height:100vh;padding:24px}.login-card{width:min(470px,100%);padding:34px;background:linear-gradient(180deg,#131820,#11151c);border:1px solid var(--line);border-radius:12px;box-shadow:0 24px 70px #0006}.login-card .mark{margin-bottom:28px}.eyebrow{margin:0 0 8px;color:var(--hot);font-size:12px;font-weight:780;letter-spacing:.1em;text-transform:uppercase}.login h1{margin:0;font-size:34px;letter-spacing:-.04em}.login-copy{margin:14px 0 24px;color:var(--muted);font-size:16px;line-height:1.6}.login button{width:100%;padding:13px}.login-note{margin:18px 0 0;color:#7f8998;font-size:12px}.login-status{min-height:22px;margin-top:15px;font-size:13px}
-.dashboard{max-width:1200px;margin:auto;padding:34px 24px 70px}.dashboard>header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:28px}.brand{display:flex;align-items:center;gap:14px}.brand h1{font-size:24px;margin:0}.toolbar{display:flex;gap:9px;align-items:center}.status{padding:9px 12px;border:1px solid var(--line);border-radius:8px;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card,.panel,.config-group{background:linear-gradient(180deg,#131820,#11151c);border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 32px #0003}.card{padding:18px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:29px;font-weight:780;margin-top:8px}.panels{display:grid;grid-template-columns:1.55fr 1fr;gap:16px;margin-top:16px}.panel{padding:20px}.panel h2,.config-header h2{font-size:16px;margin:0}.chart{height:245px;width:100%;margin-top:15px;background:#0b0e13;border-radius:8px;border:1px solid #1e2530}.config{margin-top:16px}.config-intro{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:16px}.config-intro h2{margin:0 0 4px;font-size:20px}.config-intro p{margin:0}.config-groups{display:grid;gap:12px}.config-group{overflow:hidden}.config-group summary{list-style:none;cursor:pointer;padding:18px 20px}.config-group summary::-webkit-details-marker{display:none}.config-header{display:flex;align-items:center;justify-content:space-between;gap:15px}.config-header h2:after{content:"+";display:inline-block;margin-left:9px;color:var(--hot)}details[open] .config-header h2:after{content:"−"}.config-header p{max-width:650px;margin:3px 0 0;color:var(--muted);font-size:13px}.config-fields{display:grid;grid-template-columns:1fr;gap:0;padding:0 20px 4px;border-top:1px solid var(--line)}.field{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,360px);align-items:center;gap:32px;padding:16px 0;border-bottom:1px solid #222a34}.field:last-child{border-bottom:0}.field.wide{grid-column:auto}.field>span{min-width:0}.field-title,.field-help{display:block}.field-title{font-weight:680}.field-help{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.45}.field input,.field select{width:100%;height:42px;justify-self:end;background:#0a0d12;border:1px solid var(--line);border-radius:7px;padding:9px 10px;color:var(--text)}.field input:focus,.field select:focus{outline:2px solid #ff8a3d55;border-color:var(--hot)}.field.checkbox{grid-template-columns:minmax(0,1fr) minmax(220px,360px)}.field.checkbox input{width:20px;height:20px;justify-self:end;accent-color:var(--hot)}.actions{position:sticky;bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:16px;padding:14px 16px;background:#11161ef2;border:1px solid var(--line);border-radius:10px;backdrop-filter:blur(12px)}
-@media(max-width:820px){.grid{grid-template-columns:1fr 1fr}.panels{grid-template-columns:1fr}}@media(max-width:620px){.field:not(.checkbox){grid-template-columns:1fr;gap:10px}.field:not(.checkbox) input,.field:not(.checkbox) select{grid-column:1}.field.checkbox{grid-template-columns:minmax(0,1fr) auto;gap:20px}}@media(max-width:560px){.dashboard{padding:22px 14px}.dashboard>header,.config-intro{align-items:flex-start;flex-direction:column}.toolbar{width:100%;flex-wrap:wrap}.grid{grid-template-columns:1fr}.login-card{padding:27px}.actions{align-items:flex-start;flex-direction:column}.actions button{width:100%}}
+.dashboard{max-width:1200px;margin:auto;padding:34px 24px 70px}.dashboard>header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:28px}.brand{display:flex;align-items:center;gap:14px}.brand h1{font-size:24px;margin:0}.toolbar{display:flex;gap:9px;align-items:center}.status{padding:9px 12px;border:1px solid var(--line);border-radius:8px;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:16px}.card,.panel,.config-group,.posture{background:linear-gradient(180deg,#131820,#11151c);border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 32px #0003}.card{padding:18px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:29px;font-weight:780;margin-top:8px}.panels{display:grid;grid-template-columns:1.55fr 1fr;gap:16px;margin-top:16px}.panel{padding:20px}.panel h2,.config-header h2{font-size:16px;margin:0}.chart{height:245px;width:100%;margin-top:15px;background:#0b0e13;border-radius:8px;border:1px solid #1e2530}
+.posture{padding:22px}.posture-head{display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px}.posture-head h2{margin:0;font-size:20px}.badge{display:inline-block;padding:2px 9px;border:1px solid var(--line);border-radius:999px;font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap}.badge.preset{border-color:#ff8a3d88;color:var(--hot)}.posture-summary{margin:12px 0 0;color:var(--muted)}.posture ul{margin:12px 0 0;padding-left:20px}.posture li{margin:4px 0}.warning{margin-top:14px;padding:11px 13px;border:1px solid #f3c15f66;border-radius:8px;background:#f3c15f12;color:var(--amber);font-size:13px}
+.config{margin-top:16px}.config-intro{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:16px}.config-intro h2{margin:0 0 4px;font-size:20px}.config-intro p{margin:0}.config-groups{display:grid;gap:12px}.config-group{overflow:hidden}.config-group summary{list-style:none;cursor:pointer;padding:18px 20px}.config-group summary::-webkit-details-marker{display:none}.config-header{display:flex;align-items:center;justify-content:space-between;gap:15px}.config-header h2:after{content:"+";display:inline-block;margin-left:9px;color:var(--hot)}details[open] .config-header h2:after{content:"−"}.config-header p{max-width:650px;margin:3px 0 0;color:var(--muted);font-size:13px}.config-fields{display:grid;grid-template-columns:1fr;gap:0;padding:0 20px 4px;border-top:1px solid var(--line)}
+.field{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,360px);align-items:center;gap:32px;padding:16px 0;border-bottom:1px solid #222a34}.field:last-child{border-bottom:0}.field-copy{min-width:0}.field-title,.field-help,.field-trade{display:block}.field-title{font-weight:680}.field-help{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.45}.field-trade{margin-top:3px;color:#c3cad6;font-size:12px;line-height:1.45}.field-trade b{color:var(--muted);font-weight:700}.field-inputs{display:grid;gap:8px;min-width:0}.unit-input{display:flex;align-items:center;gap:8px;min-width:0}.unit-input>span{color:var(--muted);font-size:13px;white-space:nowrap}.unit-input>.bucket-label{flex:0 0 74px}.unit-input input[type=number],.unit-input input[type=text],.unit-input input[type=url],.unit-input select{flex:1 1 auto;min-width:0;height:42px;background:#0a0d12;border:1px solid var(--line);border-radius:7px;padding:9px 10px;color:var(--text)}.unit-input select.unit{flex:0 0 auto;width:auto}.unit-input input:focus,.unit-input select:focus{outline:2px solid #ff8a3d55;border-color:var(--hot)}.unit-input input[type=checkbox]{width:20px;height:20px;accent-color:var(--hot)}.off{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;white-space:nowrap}.read-only{font-weight:680}.access-rows{display:grid;gap:0;padding:0 20px 8px;border-top:1px solid var(--line)}.access-row{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:20px;padding:13px 0;border-bottom:1px solid #222a34}.access-row:last-child{border-bottom:0}.access-row>span:first-child{color:var(--muted);font-size:13px}
+.actions{position:sticky;bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:16px;padding:14px 16px;background:#11161ef2;border:1px solid var(--line);border-radius:10px;backdrop-filter:blur(12px)}
+@media(max-width:820px){.grid{grid-template-columns:1fr 1fr}.panels{grid-template-columns:1fr}}@media(max-width:620px){.field{grid-template-columns:1fr;gap:10px}.access-row{grid-template-columns:1fr;gap:4px}}@media(max-width:560px){.dashboard{padding:22px 14px}.dashboard>header,.config-intro{align-items:flex-start;flex-direction:column}.toolbar{width:100%;flex-wrap:wrap}.grid{grid-template-columns:1fr}.login-card{padding:27px}.actions{align-items:flex-start;flex-direction:column}.actions button{width:100%}.posture{padding:18px}}
 </style>
 </head>
 <body>
@@ -779,6 +893,12 @@ const ADMIN_HTML_V2: &str = r##"<!doctype html>
     <div class="brand"><div class="mark">__WOK_MARK__</div><div><h1>Wok operator</h1><span class="muted">Authenticated relay control surface</span></div></div>
     <div class="toolbar"><span id="status" class="status ok">Authenticated</span><button id="refresh" class="secondary">Refresh</button><button id="logout" class="secondary">Sign out</button></div>
   </header>
+  <section class="posture" aria-labelledby="postureTitle">
+    <div class="posture-head"><h2 id="postureTitle">Posture</h2><span id="presetName" class="badge preset">—</span><span id="overrides" class="badge">—</span></div>
+    <p id="presetSummary" class="posture-summary"></p>
+    <ul id="postureSentences"></ul>
+    <div id="fileProblem" class="warning" hidden></div>
+  </section>
   <section class="grid">
     <div class="card"><div class="label">Connections</div><div id="connections" class="value">—</div></div>
     <div class="card"><div class="label">Events written</div><div id="written" class="value">—</div></div>
@@ -790,68 +910,105 @@ const ADMIN_HTML_V2: &str = r##"<!doctype html>
     <div class="panel"><h2>Runtime snapshot</h2><p class="muted">Version</p><p id="version">—</p><p class="muted">Configuration mode</p><p id="mode">—</p><p class="muted">Last refreshed</p><p id="refreshed">—</p></div>
   </section>
   <section class="config">
-    <div class="config-intro"><div><h2>Relay configuration</h2><p class="muted">Live-reloadable operator settings. Restart-only infrastructure and sensitive access controls stay in wok.toml.</p></div></div>
+    <div class="config-intro"><div><h2>Relay configuration</h2><p class="muted">Live-reloadable operator settings, in the order an operator decides them. Access, restart-only infrastructure and other sensitive settings stay in wok.toml.</p></div></div>
     <div id="configGroups" class="config-groups"></div>
     <div class="actions"><span id="saveStatus" class="muted">Load configuration to begin.</span><button id="save" disabled>Save configuration</button></div>
   </section>
 </main>
 <script>
 const PUBLIC_BASE=__PUBLIC_URL__;
+const DOCS='https://github.com/erskingardner/wok/blob/master/docs/config.md';
 const $=id=>document.getElementById(id);
 const fmt=n=>new Intl.NumberFormat().format(n??0);
-let data=null;
-const GROUPS=[
- {key:'info',title:'Relay identity',help:'Public metadata returned by NIP-11 and shown on the landing page.',open:true,fields:[
-  ['name','Name','The public display name for this relay.','text','wide'],['description','Description','A concise explanation of the relay and its purpose.','text','wide'],['pubkey','Operator pubkey','Public key advertised as the relay operator identity.','text','wide'],['self_pk','Relay pubkey','The relay own public key, advertised in the NIP-11 self field.','text','wide'],['contact','Contact','Operator contact, commonly an email address or Nostr identifier.','text','wide'],['icon','Icon URL','Square icon URL published in relay metadata.','url','wide'],['banner','Banner URL','Wide banner image URL published in relay metadata.','url','wide'],['privacy','Privacy policy URL','Link to the relay privacy policy.','url','wide'],['terms','Terms of service URL','Link to the relay terms of service.','url','wide']
- ]},
- {key:'events',title:'Event acceptance',help:'Size, timestamp, tag, and ephemeral-event policies applied before storage.',fields:[
-  ['max_event_size','Maximum event bytes','Largest serialized event accepted by the relay.','number'],['max_num_tags','Maximum tags','Largest number of tags accepted on one event.','number'],['max_tag_val_size','Maximum tag value bytes','Largest individual tag value accepted.','number'],['reject_newer_than_secs','Future timestamp tolerance','Reject events this many seconds newer than the relay clock.','number'],['reject_older_than_secs','Maximum event age','Reject regular events older than this many seconds; 0 means no limit. Replaceable, addressable, deletion and vanish events are exempt.','number'],['reject_ephemeral_older_than_secs','Maximum ephemeral age','Reject ephemeral events older than this many seconds. AUTH and kind 21059 gift wraps use the windows NIP-42 and NIP-59 call for.','number'],['ephemeral_lifetime_secs','Ephemeral TTL','How long TTL-persisted ephemeral events remain available.','number'],['ephemeral_persistence','Ephemeral persistence','Keep ephemeral events live-only or persist them until their TTL.','select',null,[['live_only','Live only'],['ttl','TTL persistence']]]
- ]},
- {key:'limits',title:'Queries and protocol limits',help:'Bounds for subscriptions, filters, result sets, queues, plugins, and Negentropy.',fields:[
-  ['max_req_filter_size','Maximum REQ filter bytes','Combined compact-JSON bytes allowed across all filter objects in one REQ or COUNT.','number'],['max_filter_bytes_per_connection','Filter bytes per connection','Combined compact-JSON filter bytes of the subscriptions open on one connection; zero is unlimited.','number'],['max_filters_per_req','Maximum filters per request','Unconditional ceiling for filter objects in one REQ or COUNT.','number'],['query_timeslice_budget_us','Query time slice (microseconds)','CPU time a query may use before yielding to other work.','number'],['max_filter_limit','REQ result ceiling','Maximum event limit accepted for a normal subscription filter.','number'],['max_filter_limit_count','COUNT result ceiling','Maximum event limit used while answering COUNT.','number'],['max_tags_per_filter','Tag constraints per filter','Maximum number of distinct tag names allowed across # and & filters.','number'],['max_and_entries','AND entries per filter','Maximum distinct values allowed across all NIP-91 & filters.','number'],['max_total_events_per_req','Events per REQ','Maximum total historical events emitted for one REQ; zero is unlimited.','number'],['max_subs_per_connection','Subscriptions per connection','Maximum simultaneous subscriptions on one WebSocket.','number'],['max_pending_outbound_bytes','Outbound queue bytes','Disconnect a slow client after its pending output exceeds this bound; zero is unlimited (never disconnects).','number'],['write_policy_timeout_secs','Write-policy timeout','Seconds to wait for the configured write-policy plugin.','number'],['negentropy_enabled','Negentropy enabled','Advertise and accept NIP-77 synchronization requests.','checkbox'],['max_sync_events','Negentropy event ceiling','Maximum events reconciled by one synchronization session.','number']
- ]},
- {key:'abuse',title:'Abuse protection',help:'Token-bucket rates, bursts, query budgets, quotas, and proof-of-work requirements.',fields:[
-  ['enabled','Abuse protection enabled','Apply all configured connection, message, query, quota, and PoW guards.','checkbox'],['connection_rate_per_second','Connection rate','New connections allowed per second before burst capacity is consumed; zero disables this bucket (unlimited).','number'],['connection_burst','Connection burst','Maximum accumulated burst capacity for new connections; zero disables this bucket (unlimited).','number'],['event_rate_per_second','Address EVENT/AUTH rate','EVENT and AUTH messages allowed per second from one network address; zero disables this bucket (unlimited).','number'],['event_burst','Address EVENT/AUTH burst','Maximum accumulated EVENT and AUTH burst per network address; zero disables this bucket (unlimited).','number'],['pubkey_event_rate_per_second','Pubkey EVENT rate','Accepted events per second across connections for one author; zero disables this bucket (unlimited).','number'],['pubkey_event_burst','Pubkey EVENT burst','Maximum accumulated EVENT burst for one author; zero disables this bucket (unlimited).','number'],['req_rate_per_second','REQ rate','REQ, NEG-OPEN, and NEG-MSG messages allowed per second from one network address; zero disables this bucket (unlimited).','number'],['req_burst','REQ burst','Maximum accumulated REQ, NEG-OPEN, and NEG-MSG burst per network address; zero disables this bucket (unlimited).','number'],['count_rate_per_second','COUNT rate','COUNT messages allowed per second from one network address; zero disables this bucket (unlimited).','number'],['count_burst','COUNT burst','Maximum accumulated COUNT burst per network address; zero disables this bucket (unlimited).','number'],['invalid_rate_per_second','Malformed message rate','Malformed messages answered per second from one network address; zero disables this bucket (unlimited).','number'],['invalid_burst','Malformed message burst','Maximum accumulated malformed-message burst per network address; zero disables this bucket (unlimited).','number'],['max_concurrent_historical_queries','Concurrent historical queries','Maximum historical scans running at once per connection; zero rejects new scans.','number'],['max_query_work','Query work ceiling','Refuse a REQ, COUNT or NEG-OPEN whose estimated index entries exceed this value; zero is unlimited.','number'],['max_stored_events','Stored events globally','Total durable event ceiling across every author; zero means unlimited.','number'],['max_stored_events_per_pubkey','Stored events per pubkey','Per-author durable event ceiling; zero means unlimited.','number'],['min_pow_difficulty','Minimum proof of work','Required NIP-13 difficulty; zero disables the requirement.','number']
- ]},
- {key:'filters',title:'Filter validation',help:'Optional structural rules that reject overly broad or unexpected subscription filters. Each applies when set.',fields:[
-  ['max_kinds_per_filter','Kinds per filter','Largest number of event kinds allowed in one filter; zero is unlimited.','number'],['allowed_kinds','Allowed kinds','Comma-separated event kinds; empty allows every kind.','text','wide'],['require_author_or_tag','Require author or tag','Require each filter to constrain an author or a tag.','checkbox']
- ]},
- {key:'nip62',title:'NIP-62 deletion',help:'Controls Request to Vanish support and the size of durable deletion batches.',fields:[
-  ['enabled','NIP-62 enabled','Advertise and process Request to Vanish events.','checkbox'],['service_url','Relay service URL','Public relay URL used to validate targeted vanish requests.','url','wide'],['deletion_batch_size','Deletion batch size','Maximum records removed in one transaction while processing a vanish request.','number']
- ]},
- {key:'history',title:'Dashboard history',help:'Bounded in-memory samples used by this dashboard; these do not affect Prometheus metrics.',fields:[
-  ['enabled','History enabled','Collect in-memory samples for dashboard charts.','checkbox'],['interval_secs','Sampling interval','Seconds between in-memory metric snapshots.','number'],['max_points','Maximum points','Maximum retained snapshots; capped at 100,000.','number']
- ]}
-];
-function createForm(){
- const root=$('configGroups');
- for(const group of GROUPS){
-  const details=document.createElement('details');details.className='config-group';details.open=!!group.open;
-  const summary=document.createElement('summary');summary.innerHTML='<div class="config-header"><div><h2>'+group.title+'</h2><p>'+group.help+'</p></div></div>';details.append(summary);
-  const fields=document.createElement('div');fields.className='config-fields';
-  for(const f of group.fields){
-   const [key,label,help,type,width,options]=f,id=group.key+'_'+key;
-   const wrap=document.createElement('label');wrap.className='field '+(width||'')+(type==='checkbox'?' checkbox':'');
-   const copy=document.createElement('span');copy.innerHTML='<span class="field-title">'+label+'</span><span class="field-help">'+help+'</span>';wrap.append(copy);
-   let input;
-   if(type==='select'){input=document.createElement('select');for(const [value,text] of options){const option=document.createElement('option');option.value=value;option.textContent=text;input.append(option)}}
-   else{input=document.createElement('input');input.type=type;if(type==='number'){input.min='0';input.step='1';if(key==='min_pow_difficulty')input.max='255';if(key==='max_points')input.max='100000'}}
-   input.id=id;input.className='config-input';input.dataset.group=group.key;input.dataset.key=key;wrap.append(input);fields.append(wrap);
-  }
-  details.append(fields);root.append(details);
- }
-}
+const UNITS={bytes:[[1073741824,'GiB'],[1048576,'MiB'],[1024,'KiB'],[1,'B']],seconds:[[31536000,'years'],[86400,'days'],[3600,'hours'],[60,'minutes'],[1,'seconds']],micros:[[1000,'ms'],[1,'µs']]};
+let data=null,formBuilt=false;
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+function bestUnit(units,value){for(const [factor,name] of units)if(value&&value%factor===0)return [factor,name];return units[units.length-1]}
+function describe(input,value){if(input.unit==='switch')return value?'On':'Off';if(input.zero_off&&value===0)return 'Off';const units=UNITS[input.unit];if(units){const [factor,name]=bestUnit(units,value);return fmt(value/factor)+' '+name}if(input.unit==='per_second')return fmt(value)+' /s';return typeof value==='number'?fmt(value):String(value||'Not set')}
+function buildInput(input){
+ const wrap=el('div','unit-input');wrap.dataset.group=input.group;wrap.dataset.name=input.name;
+ if(input.file_only){wrap.append(el('span','read-only'));return wrap}
+ const bucketLabel=input.unit==='per_second'?'Per second':input.name.endsWith('_burst')?'Burst':null;if(bucketLabel)wrap.append(el('span','bucket-label',bucketLabel));
+ let field;
+ if(input.unit==='switch'){field=el('input');field.type='checkbox'}
+ else if(input.unit==='persistence'){field=el('select');for(const [value,text] of [['live_only','Live only'],['ttl','Keep for their lifetime']]){const option=el('option',null,text);option.value=value;field.append(option)}}
+ else if(input.unit==='text'||input.unit==='url'){field=el('input');field.type=input.unit==='url'?'url':'text'}
+ else{field=el('input');field.type='number';field.min='0';field.step=UNITS[input.unit]?'any':'1'}
+ field.className='config-input';field.setAttribute('aria-label',input.key);wrap.append(field);
+ const units=UNITS[input.unit];if(units){const select=el('select','unit');for(const [factor,name] of units){const option=el('option',null,name);option.value=factor;select.append(option)}select.setAttribute('aria-label',input.key+' unit');wrap.append(select)}
+ if(input.zero_off){const label=el('label','off'),off=el('input');off.type='checkbox';off.className='off-switch';off.setAttribute('aria-label',input.key+' off');off.onchange=()=>{for(const part of wrap.querySelectorAll('.config-input,select.unit'))part.disabled=off.checked||!data.can_write_config;if(off.checked)field.value=''};label.append(off,document.createTextNode('Off'));wrap.append(label)}
+ return wrap}
+function setValue(input,wrap,value){
+ if(input.file_only){wrap.querySelector('.read-only').textContent=describe(input,value)+' · wok.toml';return}
+ const field=wrap.querySelector('.config-input'),unit=wrap.querySelector('select.unit'),off=wrap.querySelector('.off-switch');
+ if(input.unit==='switch'){field.checked=!!value;return}
+ if(off){off.checked=value===0}
+ const units=UNITS[input.unit];
+ if(units){const [factor]=bestUnit(units,value);unit.value=factor;field.value=input.zero_off&&value===0?'':value/factor;return}
+ field.value=input.zero_off&&value===0?'':(value??'')}
+function getValue(input,wrap){
+ const field=wrap.querySelector('.config-input'),unit=wrap.querySelector('select.unit'),off=wrap.querySelector('.off-switch');
+ if(input.unit==='switch')return field.checked;
+ if(input.unit==='persistence'||input.unit==='text'||input.unit==='url')return field.value;
+ if(off&&off.checked)return 0;
+ if(field.value==='')throw Error(input.key+' needs a value');
+ // A whole number of the setting's own unit, or a save could round 0.2 a
+ // second down to 0, which turns a bucket off.
+ const exact=Number(field.value)*(unit?Number(unit.value):1),value=Math.round(exact),base={bytes:'bytes',seconds:'seconds',micros:'microseconds',per_second:'per second'}[input.unit];
+ if(!Number.isFinite(exact)||exact<0||Math.abs(exact-value)>1e-9*Math.max(1,exact))throw Error(input.key+' must be a whole number'+(base?' ('+base+')':'')+', not '+field.value+(unit?' '+unit.selectedOptions[0].textContent:''));
+ return value}
+function accessRows(a){
+ const kinds=list=>list.length?list.map(k=>String(k.kind)+(k.name?' ('+k.name+')':'')+(k.stricter?' (governed by '+k.stricter+', which is stricter)':'')).join(', '):'None';
+ return [
+  ['Reads',a.read_policy+': '+a.read_policy_means],
+  ['Writes',a.write_policy+': '+a.write_policy_means],
+  ['Only to author and recipient',kinds(a.recipient_only_kinds)],
+  ['Only to their author',kinds(a.owner_only_kinds)+(a.owner_only_kinds.length?'; accepted only from a connection logged in as their author':'')],
+  ['To any logged-in user',kinds(a.authenticated_kinds)],
+  ['Deliverable to members',kinds(a.inbox_kinds)+(a.write_policy==='members'?'':' (used only with write_policy = members)')],
+  ['Accepted kinds',a.accepted_kinds?a.accepted_kinds.join(', '):'Every kind'],
+  ['Login (NIP-42)',a.auth_usable?'Available at '+a.service_url:a.auth_enabled?'Unavailable: relay.auth.service_url is not set':'Off: relay.auth.enabled is false'],
+  ['NIP-11','auth_required: '+a.auth_required+' · restricted_writes: '+a.restricted_writes]]}
+function buildAccess(root){
+ const details=el('details','config-group');details.open=true;
+ const summary=el('summary'),header=el('div','config-header'),copy=el('div');copy.append(el('h2',null,'Access'),el('p',null,'Who can read and write, and which kinds are private. Set in wok.toml: the dashboard shows these settings but cannot change them, so a remote save cannot lock anyone out.'));header.append(copy);summary.append(header);details.append(summary);
+ const rows=el('div','access-rows');rows.id='accessRows';details.append(rows);root.append(details)}
+function renderAccess(a){
+ const rows=$('accessRows');rows.replaceChildren();
+ for(const [label,text] of accessRows(a)){const row=el('div','access-row');row.append(el('span',null,label),el('span',null,text));rows.append(row)}
+ if(a.warning){const row=el('div','access-row'),warning=el('div','warning',a.warning);row.append(el('span',null,'Warning'),warning);rows.append(row)}
+ const row=el('div','access-row'),link=el('a',null,'Read and write policies, read classes and accepted kinds');link.href=DOCS;link.rel='noreferrer';link.target='_blank';row.append(el('span',null,'Reference'),link);rows.append(row)}
+function createForm(sections){
+ const root=$('configGroups');buildAccess(root);
+ for(const section of sections){
+  const details=el('details','config-group');details.dataset.section=section.id;
+  const summary=el('summary'),header=el('div','config-header'),copy=el('div');copy.append(el('h2',null,section.title),el('p',null,section.help));header.append(copy);summary.append(header);details.append(summary);
+  const fields=el('div','config-fields');
+  for(const f of section.fields){
+   const row=el('div','field'),text=el('div','field-copy');text.append(el('span','field-title',f.label),el('span','field-help',f.help));
+   for(const [label,copy] of [['If too low: ',f.too_low],['If too high: ',f.too_high]])if(copy){const line=el('span','field-trade');line.append(el('b',null,label),document.createTextNode(copy));text.append(line)}
+   const inputs=el('div','field-inputs');for(const input of f.inputs)inputs.append(buildInput(input));
+   row.append(text,inputs);fields.append(row)}
+  details.append(fields);root.append(details)}
+ formBuilt=true}
+function eachInput(fn){for(const section of data.sections)for(const f of section.fields)for(const input of f.inputs)fn(input,document.querySelector('.unit-input[data-group="'+input.group+'"][data-name="'+input.name+'"]'))}
 async function sha256(text){const bytes=new TextEncoder().encode(text),hash=await crypto.subtle.digest('SHA-256',bytes);return [...new Uint8Array(hash)].map(x=>x.toString(16).padStart(2,'0')).join('')}
 function authNonce(){const bytes=crypto.getRandomValues(new Uint8Array(16));return [...bytes].map(x=>x.toString(16).padStart(2,'0')).join('')}
 async function authFetch(path,method='GET',body=''){if(!window.nostr)throw Error('No NIP-07 signer was found in this browser');const url=PUBLIC_BASE+path,tags=[['u',url],['method',method],['nonce',authNonce()]];if(body)tags.push(['payload',await sha256(body)]);const ev=await window.nostr.signEvent({kind:27235,created_at:Math.floor(Date.now()/1000),content:'',tags});const headers={Authorization:'Nostr '+btoa(JSON.stringify(ev))};if(body)headers['Content-Type']='application/json';const res=await fetch(path,{method,body:body||undefined,headers});if(!res.ok)throw Error((await res.text())||res.statusText);return res.json()}
-function setInput(input,value){if(input.type==='checkbox')input.checked=!!value;else input.value=value??''}
-function getInput(input){if(input.type==='checkbox')return input.checked;if(input.type==='number'){if(!input.value)throw Error('Every numeric setting needs a value');return Number(input.value)}return input.value}
+function renderPosture(d){
+ $('presetName').textContent='preset: '+d.preset.name;$('presetSummary').textContent=d.preset.summary;
+ $('overrides').textContent=!d.file?'no config file':d.file.overrides===null?'overrides unknown':d.file.overrides===1?'1 override':d.file.overrides+' overrides';
+ if(d.file)$('overrides').title=d.file.path;
+ const list=$('postureSentences');list.replaceChildren(...d.posture.map(s=>el('li',null,s)));
+ const problem=d.file&&d.file.problem;$('fileProblem').hidden=!problem;$('fileProblem').textContent=problem||''}
 function render(d){
  data=d;const c=d.history.current||{};
+ if(!formBuilt)createForm(d.sections);
+ renderPosture(d);renderAccess(d.access);
  $('connections').textContent=fmt(c.active_connections);$('written').textContent=fmt(c.written_events_total);$('rejected').textContent=fmt(c.rejected_events_total);$('messages').textContent=fmt((c.client_messages_total||0)+(c.relay_messages_total||0));
- for(const input of document.querySelectorAll('.config-input'))setInput(input,d.config[input.dataset.group][input.dataset.key]);
- for(const input of document.querySelectorAll('.config-input'))input.disabled=!d.can_write_config;
- $('save').disabled=!d.can_write_config;$('saveStatus').textContent=d.can_write_config?'Changes are validated, atomically persisted, and live-reloaded.':'Configuration writes are disabled in wok.toml.';
+ eachInput((input,wrap)=>setValue(input,wrap,d.config[input.group][input.name]));
+ for(const field of document.querySelectorAll('.config-input,.off-switch,select.unit')){const off=field.closest('.unit-input').querySelector('.off-switch');field.disabled=!d.can_write_config||(field!==off&&!!off&&off.checked)}
+ $('save').disabled=!d.can_write_config;$('saveStatus').textContent=d.can_write_config?'Changes are validated, atomically persisted, and live-reloaded.':'Configuration writes are disabled in wok.toml.';$('saveStatus').className='muted';
  const chartPoints=d.history.points?.length?d.history.points:[{active_connections:c.active_connections||0},{active_connections:c.active_connections||0}];
  $('version').textContent=d.version;$('mode').textContent=d.can_write_config?'Editable':'Read only';$('refreshed').textContent=new Date().toLocaleTimeString();draw(chartPoints);
 }
@@ -868,10 +1025,9 @@ function draw(points){
 }
 async function load(first=false){try{$('status').textContent='Signing…';const next=await authFetch('/admin/api/overview');$('loginView').hidden=true;$('dashboard').hidden=false;render(next);$('status').textContent='Authenticated';$('status').className='status ok';$('loginStatus').textContent=''}catch(error){if(first){$('loginStatus').textContent=error.message;$('loginStatus').className='login-status bad'}else{$('status').textContent=error.message;$('status').className='status bad'}}}
 function signOut(){data=null;$('dashboard').hidden=true;$('loginView').hidden=false;$('loginStatus').textContent='Signed out. A fresh signature is required to return.';$('loginStatus').className='login-status muted'}
-function configBody(){const body={};for(const group of GROUPS){const loaded=data.config[group.key];for(const input of document.querySelectorAll('[data-group="'+group.key+'"]')){const value=getInput(input);if(value!==loaded[input.dataset.key])(body[group.key]=body[group.key]||{})[input.dataset.key]=value}}return body}
-createForm();
+function configBody(){const body={};eachInput((input,wrap)=>{if(input.file_only)return;const value=getValue(input,wrap);if(value!==data.config[input.group][input.name])(body[input.group]=body[input.group]||{})[input.name]=value});return body}
 $('login').onclick=()=>load(true);$('refresh').onclick=()=>load(false);$('logout').onclick=signOut;
-$('save').onclick=async()=>{try{const changes=configBody();if(!Object.keys(changes).length){$('saveStatus').textContent='No changes to save.';$('saveStatus').className='muted';return}$('saveStatus').textContent='Signing and saving…';await authFetch('/admin/api/config','PUT',JSON.stringify(changes));$('saveStatus').textContent='Saved. Refreshing…';await load(false)}catch(error){$('saveStatus').textContent=error.message;$('saveStatus').className='bad'}};
+$('save').onclick=async()=>{try{const changes=configBody();if(!Object.keys(changes).length){$('saveStatus').textContent='No changes to save.';$('saveStatus').className='muted';return}$('saveStatus').textContent='Signing and saving…';await authFetch('/admin/api/config','PUT',JSON.stringify(changes));$('saveStatus').textContent='Saved. Refreshing…';await load(false)}catch(error){$('saveStatus').textContent='Not saved: '+error.message;$('saveStatus').className='bad'}};
 addEventListener('resize',()=>data&&draw(data.history.points||[]));
 </script>
 </body>
@@ -1204,9 +1360,11 @@ event_burst = 500
         assert_eq!(verified.relay.abuse.event_burst, 900);
         // The page sends only the fields that differ from what it loaded.
         assert!(ADMIN_HTML_V2.contains(
-            "if(value!==loaded[input.dataset.key])(body[group.key]=body[group.key]||{})"
+            "if(value!==data.config[input.group][input.name])(body[input.group]=body[input.group]||{})"
         ));
         assert!(ADMIN_HTML_V2.contains("No changes to save."));
+        // A fraction of a setting's own unit is refused, not rounded to 0.
+        assert!(ADMIN_HTML_V2.contains("Math.abs(exact-value)>1e-9*Math.max(1,exact)"));
     }
 
     #[test]
@@ -1292,14 +1450,116 @@ event_burst = 500
         assert!(ADMIN_HTML_V2.contains("field-help"));
         assert!(ADMIN_HTML_V2.contains("grid-template-columns:1fr;gap:0"));
         assert!(ADMIN_HTML_V2.contains("minmax(220px,360px)"));
-        assert!(ADMIN_HTML_V2.contains("Restart-only infrastructure"));
+        assert!(ADMIN_HTML_V2.contains("Access, restart-only infrastructure"));
         assert!(ADMIN_HTML_V2.contains("fillText(fmt(value)"));
         assert!(ADMIN_HTML_V2.contains("Y axis ranges from 0"));
         assert!(ADMIN_HTML_V2.contains("chartPoints=d.history.points?.length"));
         assert!(ADMIN_HTML_V2.contains("$('dashboard').hidden=false;render(next)"));
         assert!(ADMIN_HTML_V2.contains(
-            ".card,.panel,.config-group{background:linear-gradient(180deg,#131820,#11151c)"
+            ".card,.panel,.config-group,.posture{background:linear-gradient(180deg,#131820,#11151c)"
         ));
+    }
+
+    #[test]
+    fn each_field_edits_the_config_key_it_names() {
+        let defaults = dashboard_config(&Config::default());
+        let mut covered = std::collections::HashSet::new();
+        for field in fields::SECTIONS.iter().flat_map(|section| section.fields) {
+            for input in field.inputs {
+                let at = format!("{}.{} ({})", input.group, input.name, input.key);
+                assert!(covered.insert((input.group, input.name)), "{at} twice");
+                let value = &defaults[input.group][input.name];
+                assert!(!value.is_null(), "{at} is not in the overview");
+                let edit = |value: &serde_json::Value| {
+                    serde_json::from_value::<ConfigPatch>(
+                        json!({ input.group: { input.name: value } }),
+                    )
+                };
+                if input.file_only {
+                    assert!(edit(value).is_err(), "{at} is editable");
+                    continue;
+                }
+                // Another valid value, as the page would send it.
+                let changed = match value {
+                    serde_json::Value::Bool(on) => json!(!on),
+                    serde_json::Value::Number(_) => json!(7),
+                    _ => match input.unit {
+                        fields::Unit::Url => json!("wss://relay.test"),
+                        fields::Unit::Persistence => json!("ttl"),
+                        _ => json!("7"),
+                    },
+                };
+                let (text, verified) = patched_file("", edit(&changed).unwrap()).unwrap();
+                let set: Vec<_> = Config::explain_toml(&text)
+                    .unwrap()
+                    .entries
+                    .into_iter()
+                    .filter(|entry| matches!(entry.origin, wok_relay::config::Origin::File { .. }))
+                    .map(|entry| entry.key)
+                    .collect();
+                assert_eq!(set, [input.key], "{at}");
+                assert_eq!(
+                    dashboard_config(&verified)[input.group][input.name],
+                    changed,
+                    "{at}"
+                );
+            }
+        }
+        // Every value the overview sends is on the page.
+        for (group, values) in defaults.as_object().unwrap() {
+            for name in values.as_object().unwrap().keys() {
+                assert!(
+                    covered.contains(&(group.as_str(), name.as_str())),
+                    "{group}.{name} has no field"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_that_disables_a_guard_is_shown_as_off() {
+        // The relay warns about every zero that turns a guard off; each such
+        // input must say Off rather than look like the strictest limit.
+        for input in fields::SECTIONS
+            .iter()
+            .flat_map(|section| section.fields)
+            .flat_map(|field| field.inputs)
+            .filter(|input| !input.file_only)
+        {
+            if !dashboard_config(&Config::default())[input.group][input.name].is_number() {
+                continue;
+            }
+            let patch = serde_json::from_value(json!({ input.group: { input.name: 0 } })).unwrap();
+            let Ok((_, verified)) = patched_file("", patch) else {
+                continue;
+            };
+            if !verified.zero_guard_warnings().is_empty() {
+                assert!(input.zero_off, "{} = 0 disables a guard", input.key);
+            }
+        }
+    }
+
+    #[test]
+    fn the_overview_reports_the_files_overrides_and_problems() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wok.toml");
+        std::fs::write(
+            &path,
+            "preset = \"marmot\"\n\n[relay.abuse]\nevent_burst = 500\nreq_burst = 1000\n",
+        )
+        .unwrap();
+        let state = file_state(&path);
+        // req_burst repeats the preset, so only event_burst overrides it.
+        assert_eq!(state["overrides"], 1);
+        // The marmot preset needs AUTH, which this file leaves unusable.
+        let problem = state["problem"].as_str().unwrap();
+        assert!(problem.contains("cannot be served"), "{problem}");
+        assert!(problem.contains("relay.auth.service_url"), "{problem}");
+
+        std::fs::write(&path, "[relay]\nno_such_key = 1\n").unwrap();
+        let state = file_state(&path);
+        assert_eq!(state["overrides"], serde_json::Value::Null);
+        assert!(state["problem"].as_str().unwrap().contains("no_such_key"));
     }
 
     #[test]

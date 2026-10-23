@@ -108,6 +108,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The operator dashboard explains the relay it configures (#97 §5.1). A
+  posture card at the top names the preset and what it is for, counts the
+  settings the config file overrides, says in a few sentences who can read
+  and write and which kinds are private, and warns when the file on disk
+  cannot be served. The access settings are shown read-only first, with what
+  each policy and read class means. The other settings follow in operator
+  order (events accepted, queries, rates, storage, sync, relay information,
+  advanced), each with what it does and what breaks when it is set too low or
+  too high. Sizes and durations take units (KiB to GiB, seconds to years),
+  limits that zero turns off have an **Off** switch, and a token bucket's
+  rate and burst sit together. The dashboard can now also edit
+  `relay.filter_validation.require_scoped_filters`, the
+  `[relay.abuse.per_connection]` budgets, `relay.abuse.ipv6_prefix_len`, and
+  the sync memory budgets and idle timeout, and shows the client address
+  header (`relay.real_ip_header`), the largest message, the disk reserve and
+  the database size limit read-only.
 - `wok_refusals_total{setting}`, one counter of refused requests and
   events, labelled by the config key that refused them, such as
   `relay.abuse.per_connection.req_burst` or `events.max_num_tags` (#97

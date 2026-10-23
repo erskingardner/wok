@@ -48,8 +48,10 @@ Every request on the listener passes these steps before Wok looks at its path:
 
 1. Hyper reads the request head, within `relay.handshake_timeout_secs`.
 2. With `relay.real_ip_header` set, the client's address is that header's
-   value when it parses as one IP address. Any other value, or no header,
-   leaves the connecting address.
+   last entry, across all of its lines: the one the proxy in front of Wok
+   wrote. An entry may carry a port. A last entry that is not an IP address
+   leaves the connecting address and is counted in
+   `wok_real_ip_header_unparsed_total`; no header leaves it too.
 3. An address blocked with NIP-86 `blockip` gets 429, and so does one whose
    per-address connection budget (`relay.abuse.connection_*`) is spent.
 
@@ -85,7 +87,7 @@ same ingester. Before Wok reads a message's verb:
 
 | Message | Party | Gate | Checks, in order |
 | --- | --- | --- | --- |
-| `EVENT` | anonymous | none | Per-address EVENT budget; event parse, size and tag limits, timestamp window, id and signature verification; NIP-86 kind policy, event-id ban, author ban and `relay.auth.write_policy`; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH. The writer then checks the write policy again and applies storage quotas and the write-policy plugin. NIP-62 vanish requests skip the author ban, the write policy and the plugin. |
+| `EVENT` | anonymous | none | Per-address EVENT budget; event parse, size and tag limits, timestamp window, id and signature verification; `relay.auth.accepted_kinds` and the NIP-86 kind policy, event-id ban, author ban and `relay.auth.write_policy`; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH. The writer then checks the write policy and `accepted_kinds` again and applies storage quotas and the write-policy plugin. NIP-62 vanish requests skip the author ban, the write policy and the plugin. |
 | `AUTH` | anonymous | `relay.auth.enabled` and `relay.auth.service_url` | Per-address EVENT budget; the gate; the connection must hold a challenge; event parse and signature verification; kind 22242, `challenge` and `relay` tags. |
 | `REQ` | anonymous | none | The address's REQ backstop, then the connection's REQ budget, which is larger once authenticated (see [rates](config.md#rates)); subscription id; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; `relay.auth.read_policy`; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
 | `COUNT` | anonymous | `relay.max_filter_limit_count` above 0 | As `REQ`, with the COUNT budgets, and a COUNT that may count restricted kinds must name only what the connection may read. The gate is checked after the filter count and bytes. |

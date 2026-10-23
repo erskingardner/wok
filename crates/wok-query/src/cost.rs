@@ -69,7 +69,7 @@ fn filter_seeks(filter: &NostrFilter, tag_kind_index: bool) -> u64 {
     let plan = ScanPlan::choose(filter, || tag_kind_index);
     let cursors = plan.cursors(filter) as u64;
     match (plan, &filter.authors, &filter.kinds) {
-        // Past the PubkeyKind bounds the Pubkey plan reads the authors'
+        // Past the PubkeyKind cap of pairs the Pubkey plan reads the authors'
         // events until it finds the kinds, so it costs at least the
         // (author, kind) pairs it declined to seek, and their whole history
         // for kinds they rarely publish (C6).
@@ -225,6 +225,13 @@ mod tests {
             notifications.estimated_cost(CostedRequest::NegOpen, true),
             5
         );
+        // Past 1000 pairs under a small limit, as up to it.
+        let pictures = group(
+            &[json!({"#p": keys(600), "kinds": [20, 21], "limit": 50})],
+            MAX_FILTER_LIMIT,
+        );
+        assert_eq!(pictures.estimated_cost(REQ, false), 600 + 50);
+        assert_eq!(pictures.estimated_cost(REQ, true), 1_200 + 50);
         // A second tag keeps the Tag plan, seeded from the smaller value set.
         let two_tags = group(
             &[json!({"#p": keys(3), "#t": ["a", "b"], "kinds": [1], "limit": 50})],
@@ -235,19 +242,25 @@ mod tests {
 
     #[test]
     fn author_kind_pairs_cost_the_same_on_either_plan() {
-        // PubkeyKind: 334 authors x 3 kinds, limit 1000 pays for the seeks.
-        let seeks = group(
-            &[json!({"authors": keys(334), "kinds": [1, 6, 7], "limit": 1000})],
+        // PubkeyKind: a home feed and a picture feed of 600 follows.
+        let feed = group(
+            &[json!({"authors": keys(600), "kinds": [1, 6], "limit": 50})],
             MAX_FILTER_LIMIT,
         );
-        assert_eq!(seeks.estimated_cost(REQ, false), 1_002 + 1_000);
-        // Pubkey: the same pairs under a small limit.
+        assert_eq!(feed.estimated_cost(REQ, false), 1_200 + 50);
+        let pictures = group(
+            &[json!({"authors": keys(600), "kinds": [20, 21], "limit": 50})],
+            MAX_FILTER_LIMIT,
+        );
+        assert_eq!(pictures.estimated_cost(REQ, false), 1_200 + 50);
+        assert_eq!(pictures.estimated_cost(CostedRequest::Count, false), 2_400);
+        // Pubkey: past the cap of pairs.
+        let nine_kinds: Vec<u64> = (1..=9).collect();
         let fallback = group(
-            &[json!({"authors": keys(334), "kinds": [1, 6, 7], "limit": 50})],
+            &[json!({"authors": keys(2000), "kinds": nine_kinds, "limit": 50})],
             MAX_FILTER_LIMIT,
         );
-        assert_eq!(fallback.estimated_cost(REQ, false), 1_002 + 50);
-        assert_eq!(fallback.estimated_cost(CostedRequest::Count, false), 2_004);
+        assert_eq!(fallback.estimated_cost(REQ, false), 18_000 + 50);
         let authors = group(
             &[json!({"authors": keys(334), "limit": 50})],
             MAX_FILTER_LIMIT,

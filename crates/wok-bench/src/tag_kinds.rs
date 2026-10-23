@@ -158,6 +158,7 @@ pub struct Row {
     pub warm_runs: usize,
     pub p50_ms: f64,
     pub p95_ms: f64,
+    pub p99_ms: f64,
     pub max_ms: f64,
 }
 
@@ -821,6 +822,7 @@ fn measure(
         warm_runs: warm.len(),
         p50_ms: percentile(&warm, 50.0),
         p95_ms: percentile(&warm, 95.0),
+        p99_ms: percentile(&warm, 99.0),
         max_ms: warm.last().copied().unwrap_or(0.0),
     })
 }
@@ -968,13 +970,13 @@ pub fn render_markdown(report: &Report) -> String {
         })
     };
     if report.baseline.is_some() {
-        s.push_str("| target | shape | limit | postings | matching | events | reads | baseline cold p50 | baseline p50 | baseline p95 | baseline max | wok cold p50 | wok p50 | wok p95 | wok max | p50 speedup | same results |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        s.push_str("| target | shape | limit | postings | matching | events | reads | baseline cold p50 | baseline p50 | baseline p95 | baseline p99 | baseline max | wok cold p50 | wok p50 | wok p95 | wok p99 | wok max | p50 speedup | same results |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
         for row in report.rows.iter().filter(|row| row.relay == "wok") {
             let Some(base) = find("baseline", row) else {
                 continue;
             };
             s.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.1}× | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.1}× | {} |\n",
                 row.target,
                 row.shape,
                 row.limit,
@@ -985,10 +987,12 @@ pub fn render_markdown(report: &Report) -> String {
                 base.cold_p50_ms,
                 base.p50_ms,
                 base.p95_ms,
+                base.p99_ms,
                 base.max_ms,
                 row.cold_p50_ms,
                 row.p50_ms,
                 row.p95_ms,
+                row.p99_ms,
                 row.max_ms,
                 base.p50_ms / row.p50_ms.max(0.001),
                 if base.result_sha256 == row.result_sha256 {
@@ -999,10 +1003,10 @@ pub fn render_markdown(report: &Report) -> String {
             ));
         }
     } else {
-        s.push_str("| target | shape | limit | postings | matching | events | reads | cold p50 | cold p95 | cold max | p50 | p95 | max | cold / warm runs |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        s.push_str("| target | shape | limit | postings | matching | events | reads | cold p50 | cold p95 | cold max | p50 | p95 | p99 | max | cold / warm runs |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
         for row in &report.rows {
             s.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {} / {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {} / {} |\n",
                 row.target,
                 row.shape,
                 row.limit,
@@ -1015,6 +1019,7 @@ pub fn render_markdown(report: &Report) -> String {
                 row.cold_max_ms,
                 row.p50_ms,
                 row.p95_ms,
+                row.p99_ms,
                 row.max_ms,
                 row.cold_runs,
                 row.warm_runs,

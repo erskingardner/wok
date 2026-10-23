@@ -110,6 +110,7 @@ pub struct Row {
     pub warm_runs: usize,
     pub p50_ms: f64,
     pub p95_ms: f64,
+    pub p99_ms: f64,
     pub max_ms: f64,
 }
 
@@ -485,11 +486,14 @@ fn shapes(dataset: &Dataset, seed: u64) -> Vec<Shape> {
         )
     };
     let mut shapes = Vec::new();
-    let kind_sets: [(&str, Value, Option<u64>); 4] = [
+    let kind_sets: [(&str, Value, Option<u64>); 6] = [
         ("outbox", json!([0, 3, 10002]), None),
         ("outbox", json!([0, 3, 10002, 10050]), None),
         ("feed", json!([1]), Some(50)),
+        ("feed", json!([1, 6]), Some(50)),
         ("feed", json!([1, 6, 7]), Some(100)),
+        // A picture and video feed: kinds the authors never publish.
+        ("media", json!([20, 21]), Some(50)),
     ];
     for (group, kinds, limit) in &kind_sets {
         for n in FOLLOWS {
@@ -760,6 +764,7 @@ fn measure(
         warm_runs: warm.len(),
         p50_ms: percentile(&warm, 50.0),
         p95_ms: percentile(&warm, 95.0),
+        p99_ms: percentile(&warm, 99.0),
         max_ms: warm.last().copied().unwrap_or(0.0),
     })
 }
@@ -810,7 +815,7 @@ pub fn run(rt: &tokio::runtime::Runtime, opts: &Options) -> Result<Report> {
 
 pub fn render_markdown(report: &Report) -> String {
     let mut s = format!(
-        "\n## author_kinds: {} events, {} authors\n\nTime to EOSE in ms. Cold is the first run after the relay starts on a fresh clone of the dataset; p50, p95 and max are over the warm runs. Author events counts what the named authors hold.\n\n",
+        "\n## author_kinds: {} events, {} authors\n\nTime to EOSE in ms. Cold is the first run after the relay starts on a fresh clone of the dataset; p50, p95, p99 and max are over the warm runs. Author events counts what the named authors hold.\n\n",
         report.events, report.authors
     );
     let find = |relay: &str, shape: &str, authors: usize| {
@@ -820,13 +825,13 @@ pub fn render_markdown(report: &Report) -> String {
             .find(|row| row.relay == relay && row.shape == shape && row.authors == authors)
     };
     if report.baseline.is_some() {
-        s.push_str("| shape | N | author events | events | baseline cold | baseline p50 | baseline p95 | baseline max | wok cold | wok p50 | wok p95 | wok max | p50 speedup | same results |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        s.push_str("| shape | N | author events | events | baseline cold | baseline p50 | baseline p95 | baseline p99 | baseline max | wok cold | wok p50 | wok p95 | wok p99 | wok max | p50 speedup | same results |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
         for row in report.rows.iter().filter(|row| row.relay == "wok") {
             let Some(base) = find("baseline", &row.shape, row.authors) else {
                 continue;
             };
             s.push_str(&format!(
-                "| {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.1}× | {} |\n",
+                "| {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.1}× | {} |\n",
                 row.shape,
                 row.authors,
                 row.author_events,
@@ -834,10 +839,12 @@ pub fn render_markdown(report: &Report) -> String {
                 base.cold_ms,
                 base.p50_ms,
                 base.p95_ms,
+                base.p99_ms,
                 base.max_ms,
                 row.cold_ms,
                 row.p50_ms,
                 row.p95_ms,
+                row.p99_ms,
                 row.max_ms,
                 base.p50_ms / row.p50_ms.max(0.001),
                 if base.result_sha256 == row.result_sha256 {
@@ -848,10 +855,10 @@ pub fn render_markdown(report: &Report) -> String {
             ));
         }
     } else {
-        s.push_str("| shape | N | author events | events | cold | p50 | p95 | max | warm runs |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        s.push_str("| shape | N | author events | events | cold | p50 | p95 | p99 | max | warm runs |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
         for row in &report.rows {
             s.push_str(&format!(
-                "| {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
+                "| {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
                 row.shape,
                 row.authors,
                 row.author_events,
@@ -859,6 +866,7 @@ pub fn render_markdown(report: &Report) -> String {
                 row.cold_ms,
                 row.p50_ms,
                 row.p95_ms,
+                row.p99_ms,
                 row.max_ms,
                 row.warm_runs
             ));

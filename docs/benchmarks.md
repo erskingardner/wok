@@ -291,8 +291,9 @@ binaries reuse its database. Delete the directory to rebuild it.
 The query shapes:
 
 - `authors` with kinds `[0,3,10002]` or `[0,3,10002,10050]` and no limit, so
-  the relay's `max_filter_limit` applies. Also kinds `[1]` with limit 50 and
-  `[1,6,7]` with limit 100.
+  the relay's `max_filter_limit` applies. Also feeds of kinds `[1]` and
+  `[1,6]` with limit 50 and `[1,6,7]` with limit 100, and a media feed of
+  kinds `[20,21]` with limit 50, which no author in the dataset publishes.
 - Each of those for 50, 100, 300, 333, 334, 500, 1,000 and 2,000 authors.
   Author lists sample authors in proportion to their activity, and each list
   extends the smaller ones. So 333 and 334 differ by one author, at strfry's
@@ -339,8 +340,8 @@ cargo build --release -p wok-cli -p wok-bench
 - `author events`: the events those authors hold, which is what reading the
   Pubkey index for them costs;
 - `events`: the events returned;
-- cold, p50, p95 and max time to EOSE for each binary, in milliseconds, and
-  the p50 speedup;
+- cold, p50, p95, p99 and max time to EOSE for each binary, in milliseconds,
+  and the p50 speedup;
 - `same results`: whether the SHA-256 of the sorted returned ids matches.
   Any difference is a mismatch and fails the trial.
 
@@ -446,9 +447,9 @@ binary on that database.
   is every posting until `limit` match, or all of them; without, only the
   events returned. A plan on the `(tag, kind, created_at)` index reads about
   as many entries and events as it returns;
-- cold p50, p95 and max, and warm p50, p95 and max time to EOSE, in
+- cold p50, p95 and max, and warm p50, p95, p99 and max time to EOSE, in
   milliseconds. With `--wok-baseline` the table shows cold p50 and warm p50,
-  p95 and max for each binary, the warm p50 speedup, and `same results`.
+  p95, p99 and max for each binary, the warm p50 speedup, and `same results`.
 
 `results.jsonl` holds every row in the trial's `tag_kinds` field.
 

@@ -527,10 +527,10 @@ With the public preset's limits:
   - If too high: one request can hold a query worker for longer.
   - The estimate cannot see how many entries a cursor reads before it finds
     a match. `{"#t":["nostr"],"authors":[key]}` costs 2,001, but reads the
-    `nostr` tag's entries until the author's events turn up. Past 1,000
-    (author, kind) pairs under a small `limit`, `authors` with regular kinds
-    read the authors' whole history, which takes seconds for kinds they
-    rarely publish.
+    `nostr` tag's entries until the author's events turn up. Past 16,384
+    (author, kind) pairs, `authors` with `kinds` read the authors' history
+    until they find those kinds, which takes seconds for kinds they rarely
+    publish.
 
 `relay.abuse.max_query_cost`, which copies of the 0.7 `docs/wok.toml` set to
 1000, is deprecated and ignored, with a warning at startup, on reload and in

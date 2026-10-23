@@ -3,14 +3,18 @@
 
 Builds the `reachability` probe in `crates/wok-compat/tests/` once with
 coverage instrumentation, then runs each of its phases (startup, anonymous,
-authenticated, admin) against a relay of each profile in
+authenticated, admin, local) against a relay of each profile in
 `crates/wok-compat/tests/profiles/`, in a process of its own. From each run it
 keeps the functions of the relay crates that ran at least once, and writes,
 per profile:
 
 - anonymous: what an unauthenticated client reaches beyond startup;
 - authenticated: what NIP-42 AUTH adds to that;
-- admin: what an admin's NIP-98 requests add to that.
+- admin: what an admin's NIP-98 requests add to that;
+- local: what a peer the Unix socket admits adds to that.
+
+Closures are named by the function that holds them, without their number,
+so adding a closure to a function already reached changes nothing.
 
     scripts/attack-surface-reach.py            # print the report
     scripts/attack-surface-reach.py --check    # fail on functions newly reached
@@ -18,8 +22,9 @@ per profile:
 
 The baseline is `crates/wok-compat/tests/reachability/<profile>.txt`. `--check`
 fails when a phase reaches a function its baseline does not list, so code that
-becomes reachable before authentication is reviewed before it lands; a function
-no longer reached is reported but does not fail. Needs `cargo-llvm-cov` and the
+becomes reachable before authentication is reviewed before it lands, and when a
+phase that reached functions reaches none, so a broken phase is not mistaken for
+a smaller surface; a function no longer reached is reported but does not fail. Needs `cargo-llvm-cov` and the
 `llvm-tools-preview` rustup component.
 """
 
@@ -37,11 +42,12 @@ PROFILES = ROOT / "crates/wok-compat/tests/profiles"
 BASELINE = ROOT / "crates/wok-compat/tests/reachability"
 TARGET = ROOT / "target/reachability"
 RELAY_CRATES = re.compile(r"crates/wok-(relay|ws|unix|event|query|negentropy|db)/src/")
-PHASES = ["startup", "anonymous", "authenticated", "admin"]
+PHASES = ["startup", "anonymous", "authenticated", "admin", "local"]
 # Background code that timers and file watchers run whenever they fire, not
 # because of anything a client sent; whether it lands in a phase is timing.
 BACKGROUND = re.compile(r"::run_db_watch\b")
 HASH = re.compile(r"::h[0-9a-f]{16}$")
+CLOSURE = re.compile(r"\{closure#\d+\}")
 
 
 def run(cmd, **kwargs):
@@ -105,7 +111,7 @@ def demangler():
         if name not in cache:
             out = run(["cargo", "llvm-cov", "demangle"], input=name + "\n",
                       capture_output=True, text=True).stdout.strip()
-            cache[name] = HASH.sub("", out or name)
+            cache[name] = CLOSURE.sub("{closure}", HASH.sub("", out or name))
         return cache[name]
 
     def batch(names):
@@ -114,7 +120,7 @@ def demangler():
             out = run(["cargo", "llvm-cov", "demangle"], input="\n".join(missing) + "\n",
                       capture_output=True, text=True).stdout.splitlines()
             for name, plain in zip(missing, out):
-                cache[name] = HASH.sub("", plain.strip() or name)
+                cache[name] = CLOSURE.sub("{closure}", HASH.sub("", plain.strip() or name))
 
     demangle.batch = batch
     return demangle
@@ -192,14 +198,18 @@ def main():
         baseline = parse(path.read_text())
         for phase in PHASES[1:]:
             now, then = set(sets[phase]), baseline.get(phase, set())
+            if then and not now:
+                print(f"  {phase}: reached nothing; its baseline lists {len(then)}")
+                new_reach = True
+                continue
             for name in sorted(now - then):
                 print(f"  + {phase}: {name}")
                 new_reach = True
             for name in sorted(then - now):
                 print(f"  - {phase}: {name}")
     if args.check and new_reach:
-        sys.exit("\nNewly reached functions are listed with +. If that is intended, review them "
-                 "and rerun with --bless.")
+        sys.exit("\nNewly reached functions are listed with +, and phases that reached nothing are "
+                 "named. If that is intended, review them and rerun with --bless.")
 
 
 if __name__ == "__main__":

@@ -234,23 +234,32 @@ caller reaches. It builds the `wok-compat` `tests/reachability.rs` probe with
 coverage instrumentation and runs its phases against a relay of every
 profile, each phase in a process of its own:
 
-- **startup** starts the relay and stops it;
+- **startup** starts the relay, and its Unix socket when the profile
+  enables it, and stops it;
 - **anonymous** sends what a client that never authenticates can: every
   message verb, well formed and malformed, every method on each path of the
-  listeners, and NIP-98 requests unsigned, signed by a stranger and forged;
+  listeners, and NIP-98 requests unsigned, signed by a stranger, and forged
+  in a stranger's name and in an admin's; and it connects to the Unix socket
+  as a peer the socket refuses;
 - **authenticated** authenticates with NIP-42 and sends what AUTH unlocks;
-- **admin** sends dashboard API and NIP-86 requests an admin signed.
+- **admin** calls the dashboard API and every NIP-86 method as an admin;
+- **local** sends the anonymous messages over the Unix socket as a peer it
+  admits.
 
 A phase the profile closes, such as admin without `admin.enabled`, sends
-nothing.
+nothing. The probe shares its process with the relay, so it signs events,
+frames Unix messages and builds its NIP-77 message without the relay's
+crates: every function counted is one the relay ran.
 
 From each run it keeps the functions of the relay crates (`wok-relay`,
 `wok-ws`, `wok-unix`, `wok-event`, `wok-query`, `wok-negentropy` and
 `wok-db`) that ran at least once. The anonymous set is what an
 unauthenticated client reaches beyond startup, the authenticated set is what
-AUTH adds to that, and the admin set is what an admin's requests add to that.
+AUTH adds to that, the admin set is what an admin's requests add to that,
+and the local set is what an admitted Unix peer adds to that.
 `crates/wok-compat/tests/reachability/<profile>.txt` lists each set by
-function name, with its size in the phase's heading.
+function name, with its size in the phase's heading. A closure is named by
+the function that holds it, without its number.
 
 ```bash
 scripts/attack-surface-reach.py            # print the sizes and what changed
@@ -263,8 +272,9 @@ CI does not run it. Run `--check` on a change that adds a path, a message or a
 setting, or moves a check. A function the anonymous phase newly reaches is
 code an unauthenticated client can now run: it belongs after the cheapest
 check that can refuse the request, or the baseline is rewritten with the
-reason in the pull request. A function no longer reached is listed but does
-not fail. Some functions run on some runs and not others, such as a query
+reason in the pull request. A phase that reached functions and now reaches
+none also fails, since that is a broken probe, not a smaller surface. A
+function no longer reached is listed but does not fail. Some functions run on some runs and not others, such as a query
 path that depends on timing, so `--bless` keeps the union of three runs, and
 the database watcher, which runs on a timer, is left out.
 

@@ -1,9 +1,9 @@
 # Relay functions reached in the `unix` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 727
+## anonymous: 688
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
-<&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure#1}>
+<&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
@@ -11,19 +11,19 @@
 <wok_db::payload::Decompressor>::decode
 <wok_db::txn::Cursor>::count
 <wok_db::txn::RoTxn>::cursor
-<wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure#0}>
-<wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure#0}>
-<wok_db::txn::RoTxn>::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure#2}>::{closure#0}>
-<wok_db::txn::RoTxn>::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure#1}>
-<wok_db::txn::RwTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure#1}>::{closure#0}>
-<wok_db::txn::RwTxn>::foreach_full::<wok_db::state::author_count::{closure#1}>
-<wok_db::txn::RwTxn>::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#4}>::{closure#0}>
-<wok_db::txn::RwTxn>::foreach_full::<wok_db::write::lookup_event_by_id::{closure#0}>
-<wok_db::txn::RwTxn>::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#5}>
+<wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
+<wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
+<wok_db::txn::RoTxn>::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
+<wok_db::txn::RoTxn>::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
+<wok_db::txn::RwTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
+<wok_db::txn::RwTxn>::foreach_full::<wok_db::state::author_count::{closure}>
+<wok_db::txn::RwTxn>::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
+<wok_db::txn::RwTxn>::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
+<wok_db::txn::RwTxn>::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
 <wok_db::txn::RwTxn>::largest_integer_key
 <wok_db::vanish::VanishPolicy>::targets_this_relay_json
-<wok_db::vanish::VanishPolicy>::targets_this_relay_json::{closure#0}
-<wok_db::vanish::VanishPolicy>::targets_this_relay_json::{closure#0}::{closure#0}
+<wok_db::vanish::VanishPolicy>::targets_this_relay_json::{closure}
+<wok_db::vanish::VanishPolicy>::targets_this_relay_json::{closure}::{closure}
 <wok_db::write::EventToWrite>::new
 <wok_db::write::EventToWrite>::with_context::<u64>
 <wok_event::error::EventError>::broken_limit
@@ -46,17 +46,15 @@
 <wok_event::packed::PackedEventView>::created_at
 <wok_event::packed::PackedEventView>::expiration
 <wok_event::packed::PackedEventView>::first_d_tag
-<wok_event::packed::PackedEventView>::first_d_tag::{closure#0}
-<wok_event::packed::PackedEventView>::foreach_tag::<<wok_event::packed::PackedEventView>::first_d_tag::{closure#0}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::tag_kind::tag_kind_keys::{closure#0}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_ro::{closure#1}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_rw::{closure#1}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::index_event::{closure#0}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#3}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#6}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#7}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::ingest_event::{closure#5}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::writer::event_matches_vanish_markers::{closure#1}>
+<wok_event::packed::PackedEventView>::first_d_tag::{closure}
+<wok_event::packed::PackedEventView>::foreach_tag::<<wok_event::packed::PackedEventView>::first_d_tag::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::tag_kind::tag_kind_keys::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_ro::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_rw::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::index_event::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::ingest_event::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::writer::event_matches_vanish_markers::{closure}>
 <wok_event::packed::PackedEventView>::id
 <wok_event::packed::PackedEventView>::kind
 <wok_event::packed::PackedEventView>::new
@@ -70,12 +68,12 @@
 <wok_negentropy::btree::Node as core::default::Default>::default
 <wok_negentropy::btree::Node>::encode_bytes
 <wok_negentropy::btree::Node>::from_bytes
-<wok_negentropy::btree::Node>::from_bytes::{closure#0}
+<wok_negentropy::btree::Node>::from_bytes::{closure}
 <wok_negentropy::cache::BatchSink as wok_db::write::NegentropySink>::update
 <wok_negentropy::cache::BatchSink>::flush
 <wok_negentropy::cache::NegentropyFilterCache>::batch
 <wok_negentropy::cache::NegentropyFilterCache>::freshen_rw
-<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure#1}
+<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}
 <wok_negentropy::lmdb_store::LmdbRwBackend as core::ops::drop::Drop>::drop
 <wok_negentropy::lmdb_store::LmdbRwBackend as wok_negentropy::btree::BTreeBackend>::get_node_read
 <wok_negentropy::lmdb_store::LmdbRwBackend as wok_negentropy::btree::BTreeBackend>::get_node_write
@@ -95,12 +93,6 @@
 <wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::new
 <wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile
 <wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux
-<wok_negentropy::protocol::Negentropy<wok_negentropy::vector::Vector>>::encode_bound
-<wok_negentropy::protocol::Negentropy<wok_negentropy::vector::Vector>>::encode_timestamp_out
-<wok_negentropy::protocol::Negentropy<wok_negentropy::vector::Vector>>::initiate
-<wok_negentropy::protocol::Negentropy<wok_negentropy::vector::Vector>>::new
-<wok_negentropy::protocol::Negentropy<wok_negentropy::vector::Vector>>::split_range
-<wok_negentropy::protocol::Negentropy<wok_negentropy::vector::Vector>>::split_range::{closure#0}
 <wok_negentropy::types::Accumulator as core::default::Default>::default
 <wok_negentropy::types::Accumulator>::add_bytes
 <wok_negentropy::types::Accumulator>::add_item
@@ -108,15 +100,14 @@
 <wok_negentropy::types::Bound>::timestamp
 <wok_negentropy::types::Bound>::with_id_prefix
 <wok_negentropy::types::Item as core::cmp::Ord>::cmp
-<wok_negentropy::types::Item as core::cmp::Ord>::cmp::{closure#0}
+<wok_negentropy::types::Item as core::cmp::Ord>::cmp::{closure}
 <wok_negentropy::types::Item as core::cmp::PartialEq>::eq
 <wok_negentropy::types::Item as core::cmp::PartialOrd>::partial_cmp
 <wok_negentropy::types::Item as core::default::Default>::default
 <wok_negentropy::types::Item>::new
 <wok_negentropy::types::Mode as core::convert::TryFrom<u64>>::try_from
 <wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
-<wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure#1}>
-<wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<wok_negentropy::vector::Vector>>::split_range::{closure#1}>
+<wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
 <wok_negentropy::vector::Vector>::allocated_bytes
 <wok_negentropy::vector::Vector>::check_bounds
@@ -126,9 +117,9 @@
 <wok_negentropy::vector::Vector>::seal
 <wok_query::filter::FilterSetBytes>::at
 <wok_query::filter::FilterSetBytes>::iter
-<wok_query::filter::FilterSetBytes>::iter::{closure#0}
+<wok_query::filter::FilterSetBytes>::iter::{closure}
 <wok_query::filter::FilterSetBytes>::parse
-<wok_query::filter::FilterSetBytes>::parse::{closure#3}
+<wok_query::filter::FilterSetBytes>::parse::{closure}
 <wok_query::filter::FilterSetBytes>::parse_tag_values
 <wok_query::filter::FilterSetBytes>::size
 <wok_query::filter::FilterSetUint>::at
@@ -141,27 +132,28 @@
 <wok_query::filter::NostrFilter>::does_match_times
 <wok_query::filter::NostrFilter>::does_match_without_search
 <wok_query::filter::NostrFilter>::parse
-<wok_query::filter::NostrFilter>::parse::{closure#10}
+<wok_query::filter::NostrFilter>::parse::{closure}
 <wok_query::filter::NostrFilterGroup>::add_filter
 <wok_query::filter::NostrFilterGroup>::estimated_cost
 <wok_query::filter::NostrFilterGroup>::from_req
 <wok_query::filter::NostrFilterGroup>::from_value
 <wok_query::filter::NostrFilterGroup>::requires_content
-<wok_query::filter::NostrFilterGroup>::requires_content::{closure#0}
+<wok_query::filter::NostrFilterGroup>::requires_content::{closure}
 <wok_query::hll::HyperLogLog>::for_filter
 <wok_query::monitor::ActiveMonitors>::add_pending
 <wok_query::monitor::ActiveMonitors>::allocate
-<wok_query::monitor::ActiveMonitors>::allocate::{closure#0}
+<wok_query::monitor::ActiveMonitors>::allocate::{closure}
 <wok_query::monitor::ActiveMonitors>::close_conn
 <wok_query::monitor::ActiveMonitors>::collect
-<wok_query::monitor::ActiveMonitors>::collect::{closure#0}
+<wok_query::monitor::ActiveMonitors>::collect::{closure}
 <wok_query::monitor::ActiveMonitors>::entry
 <wok_query::monitor::ActiveMonitors>::entry_mut
 <wok_query::monitor::ActiveMonitors>::event_requires_content
 <wok_query::monitor::ActiveMonitors>::finish_pending
 <wok_query::monitor::ActiveMonitors>::insert
+<wok_query::monitor::ActiveMonitors>::insert::{closure}
 <wok_query::monitor::ActiveMonitors>::install
-<wok_query::monitor::ActiveMonitors>::install::{closure#0}
+<wok_query::monitor::ActiveMonitors>::install::{closure}
 <wok_query::monitor::ActiveMonitors>::pending_generation
 <wok_query::monitor::ActiveMonitors>::pending_mut
 <wok_query::monitor::ActiveMonitors>::process
@@ -171,9 +163,9 @@
 <wok_query::monitor::ActiveMonitors>::requires_content
 <wok_query::monitor::ActiveMonitors>::subscription
 <wok_query::monitor::ActiveMonitors>::uninstall
-<wok_query::monitor::ActiveMonitors>::uninstall::{closure#0}
-<wok_query::monitor::Index>::lookup::<&mut <wok_query::monitor::ActiveMonitors>::collect::{closure#0}>
-<wok_query::monitor::Index>::lookup::<&mut <wok_query::monitor::ActiveMonitors>::collect::{closure#0}>::{closure#0}
+<wok_query::monitor::ActiveMonitors>::uninstall::{closure}
+<wok_query::monitor::Index>::lookup::<&mut <wok_query::monitor::ActiveMonitors>::collect::{closure}>
+<wok_query::monitor::Index>::lookup::<&mut <wok_query::monitor::ActiveMonitors>::collect::{closure}>::{closure}
 <wok_query::monitor::Index>::push
 <wok_query::monitor::Index>::remove
 <wok_query::pending::PendingBuffer>::into_events
@@ -188,55 +180,50 @@
 <wok_query::scan::DbQuery>::count_dedup_limited
 <wok_query::scan::DbQuery>::hll_hex
 <wok_query::scan::DbQuery>::new
-<wok_query::scan::DbQuery>::new::{closure#0}
+<wok_query::scan::DbQuery>::new::{closure}
 <wok_query::scan::DbQuery>::note
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}>
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}>::{closure#0}
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}>::{closure#1}
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}>::{closure#4}
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}>::{closure#5}
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure#10}, wok_relay::server::negentropy::run_negentropy::{closure#11}, wok_relay::server::negentropy::run_negentropy::{closure#9}>::{closure#2}>
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure#10}, wok_relay::server::negentropy::run_negentropy::{closure#11}, wok_relay::server::negentropy::run_negentropy::{closure#9}>::{closure#2}>::{closure#5}
+<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>
+<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}
+<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
+<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}
 <wok_query::scan::DbQuery>::sent_count
 <wok_query::scan::DbQuery>::set_visibility
 <wok_query::scan::DbQuery>::track_completeness
 <wok_query::scan::DbQuery>::visible_event_pubkey
 <wok_query::scan::DbScan>::new
 <wok_query::scan::DbScan>::new_unplanned
-<wok_query::scan::DbScan>::new_unplanned::{closure#1}
-<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}>::{closure#4}, <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}>::{closure#5}>
-<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure#10}, wok_relay::server::negentropy::run_negentropy::{closure#11}, wok_relay::server::negentropy::run_negentropy::{closure#9}>::{closure#2}>::{closure#4}, <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure#10}, wok_relay::server::negentropy::run_negentropy::{closure#11}, wok_relay::server::negentropy::run_negentropy::{closure#9}>::{closure#2}>::{closure#5}>
+<wok_query::scan::DbScan>::new_unplanned::{closure}
+<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}, <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
+<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}, <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}>
 <wok_query::scan::DbScan>::settle
 <wok_query::scan::ScanCursor>::active
 <wok_query::scan::ScanCursor>::collect
-<wok_query::scan::ScanCursor>::collect::{closure#0}
+<wok_query::scan::ScanCursor>::collect::{closure}
 <wok_query::scan::ScanCursor>::key_match
-<wok_query::scan::ScanPlan>::choose::<<wok_query::scan::DbScan>::new_unplanned::{closure#0}>
-<wok_query::scan::ScanPlan>::choose::<wok_query::cost::filter_seeks::{closure#0}>
+<wok_query::scan::ScanPlan>::choose::<<wok_query::scan::DbScan>::new_unplanned::{closure}>
+<wok_query::scan::ScanPlan>::choose::<wok_query::cost::filter_seeks::{closure}>
 <wok_query::scan::ScanPlan>::cursors
-<wok_query::scan::ScanPlan>::cursors::{closure#0}
+<wok_query::scan::ScanPlan>::cursors::{closure}
 <wok_query::scan::ScanPlan>::name
 <wok_query::scan::SearchGroupScan>::new
-<wok_query::scan::SearchGroupScan>::new::{closure#0}
-<wok_query::scan::SearchGroupScan>::process::<<wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}>::{closure#0}>
+<wok_query::scan::SearchGroupScan>::new::{closure}
+<wok_query::scan::SearchGroupScan>::process::<<wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
 <wok_query::scan::SearchScan>::base_score
 <wok_query::scan::SearchScan>::gather
-<wok_query::scan::SearchScan>::gather::{closure#0}
-<wok_query::scan::SearchScan>::gather::{closure#2}
+<wok_query::scan::SearchScan>::gather::{closure}
 <wok_query::scan::SearchScan>::new
-<wok_query::scan::SearchScan>::new::{closure#1}
+<wok_query::scan::SearchScan>::new::{closure}
 <wok_query::scan::SearchScan>::remaining
 <wok_query::scheduler::QueryScheduler>::add_sub
 <wok_query::scheduler::QueryScheduler>::close_conn
 <wok_query::scheduler::QueryScheduler>::next_query
-<wok_query::scheduler::QueryScheduler>::process_visible::<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>
-<wok_query::scheduler::QueryScheduler>::process_visible::<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#0}
-<wok_query::scheduler::QueryScheduler>::process_visible::<<wok_relay::server::ReqWorker>::slice::{closure#1}, <wok_relay::server::ReqWorker>::slice::{closure#2}, <wok_relay::server::ReqWorker>::slice::{closure#0}>::{closure#2}
-<wok_query::scheduler::QueryScheduler>::process_visible::<wok_relay::server::negentropy::run_negentropy::{closure#10}, wok_relay::server::negentropy::run_negentropy::{closure#11}, wok_relay::server::negentropy::run_negentropy::{closure#9}>
-<wok_query::scheduler::QueryScheduler>::process_visible::<wok_relay::server::negentropy::run_negentropy::{closure#10}, wok_relay::server::negentropy::run_negentropy::{closure#11}, wok_relay::server::negentropy::run_negentropy::{closure#9}>::{closure#0}
+<wok_query::scheduler::QueryScheduler>::process_visible::<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>
+<wok_query::scheduler::QueryScheduler>::process_visible::<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}
+<wok_query::scheduler::QueryScheduler>::process_visible::<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>
+<wok_query::scheduler::QueryScheduler>::process_visible::<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}
 <wok_query::scheduler::QueryScheduler>::promote
 <wok_query::scheduler::QueryScheduler>::remove_generation
-<wok_query::scheduler::QueryScheduler>::remove_generation::{closure#3}
+<wok_query::scheduler::QueryScheduler>::remove_generation::{closure}
 <wok_query::scheduler::QueryScheduler>::remove_query
 <wok_query::scheduler::QueryScheduler>::remove_sub
 <wok_query::scheduler::QueryScheduler>::running_for
@@ -257,33 +244,31 @@
 <wok_query::visibility::ReadRestrictor>::class
 <wok_query::visibility::ReadRestrictor>::count_refusal
 <wok_query::visibility::ReadRestrictor>::count_refusal_class
-<wok_query::visibility::ReadRestrictor>::count_refusal_class::{closure#0}
-<wok_query::visibility::ReadRestrictor>::count_refusal_class::{closure#0}::{closure#1}
-<wok_query::visibility::ReadRestrictor>::count_refusal_class::{closure#0}::{closure#2}
+<wok_query::visibility::ReadRestrictor>::count_refusal_class::{closure}
+<wok_query::visibility::ReadRestrictor>::count_refusal_class::{closure}::{closure}
 <wok_query::visibility::ReadRestrictor>::is_filter_allowed_to_count
-<wok_query::visibility::ReadRestrictor>::is_filter_allowed_to_count::{closure#0}
+<wok_query::visibility::ReadRestrictor>::is_filter_allowed_to_count::{closure}
 <wok_query::visibility::ReadRestrictor>::is_filter_fully_restricted
-<wok_query::visibility::ReadRestrictor>::is_filter_fully_restricted::{closure#0}
+<wok_query::visibility::ReadRestrictor>::is_filter_fully_restricted::{closure}
 <wok_query::visibility::ReadRestrictor>::is_filter_group_fully_restricted
-<wok_query::visibility::ReadRestrictor>::is_filter_group_fully_restricted::{closure#0}
+<wok_query::visibility::ReadRestrictor>::is_filter_group_fully_restricted::{closure}
 <wok_query::visibility::ReadRestrictor>::is_restricted_kind
 <wok_query::visibility::ReadRestrictor>::restricted_kinds
 <wok_query::visibility::ReadRestrictor>::restricts_nothing
 <wok_query::visibility::ReadRestrictor>::should_send_to_identities
 <wok_query::visibility::ReadRestrictor>::strictest_class
-<wok_query::visibility::ReadRestrictor>::strictest_class::{closure#0}
+<wok_query::visibility::ReadRestrictor>::strictest_class::{closure}
 <wok_query::visibility::ReadRestrictor>::strictest_group_class
-<wok_query::visibility::ReadRestrictor>::strictest_group_class::{closure#0}
+<wok_query::visibility::ReadRestrictor>::strictest_group_class::{closure}
 <wok_query::visibility::ReadSnapshot>::txn
 <wok_query::visibility::ReadVisibility>::allows_noting_restricted
 <wok_query::visibility::ReadVisibility>::globally_visible
 <wok_relay::abuse::AbuseController>::admit
-<wok_relay::abuse::AbuseController>::admit::{closure#1}
+<wok_relay::abuse::AbuseController>::admit::{closure}
 <wok_relay::abuse::AbuseController>::admit_pubkey_event
 <wok_relay::abuse::AbuseController>::admit_request
-<wok_relay::abuse::AbuseController>::admit_request::{closure#0}
-<wok_relay::abuse::AbuseController>::admit_request::{closure#0}::{closure#0}
-<wok_relay::abuse::AbuseController>::admit_request::{closure#1}
+<wok_relay::abuse::AbuseController>::admit_request::{closure}
+<wok_relay::abuse::AbuseController>::admit_request::{closure}::{closure}
 <wok_relay::abuse::AbuseController>::admit_source
 <wok_relay::abuse::AbuseController>::admit_source_reporting
 <wok_relay::abuse::Bucket>::admit
@@ -307,10 +292,9 @@
 <wok_relay::moderation::WriteGrant>::new
 <wok_relay::moderation::WriteGrant>::stored_admits
 <wok_relay::protocol::ClientCommand>::parse
-<wok_relay::protocol::ClientCommand>::parse::{closure#0}
-<wok_relay::protocol::ClientCommand>::parse::{closure#3}
+<wok_relay::protocol::ClientCommand>::parse::{closure}
 <wok_relay::protocol::EoseHints>::names
-<wok_relay::protocol::EoseHints>::names::{closure#0}
+<wok_relay::protocol::EoseHints>::names::{closure}
 <wok_relay::protocol::ParseFailure>::into_message
 <wok_relay::protocol::RelayMessage>::closed_error::<&str, alloc::string::String>
 <wok_relay::protocol::RelayMessage>::notice_error::<alloc::string::String>
@@ -321,55 +305,55 @@
 <wok_relay::protocol::RelayMessage>::to_json::encode::<(&str, &alloc::string::String, alloc::vec::Vec<&str>)>
 <wok_relay::server::ConnState>::push
 <wok_relay::server::ConnTable>::close_sub
-<wok_relay::server::ConnTable>::close_sub::{closure#0}
+<wok_relay::server::ConnTable>::close_sub::{closure}
 <wok_relay::server::ConnTable>::deliver
-<wok_relay::server::ConnTable>::deliver::{closure#0}
+<wok_relay::server::ConnTable>::deliver::{closure}
 <wok_relay::server::ConnTable>::entry
 <wok_relay::server::ConnTable>::filter_bytes
-<wok_relay::server::ConnTable>::filter_bytes::{closure#0}
+<wok_relay::server::ConnTable>::filter_bytes::{closure}
 <wok_relay::server::ConnTable>::insert
 <wok_relay::server::ConnTable>::is_open
-<wok_relay::server::ConnTable>::is_open::{closure#0}
+<wok_relay::server::ConnTable>::is_open::{closure}
 <wok_relay::server::ConnTable>::open_count
-<wok_relay::server::ConnTable>::open_count::{closure#0}
+<wok_relay::server::ConnTable>::open_count::{closure}
 <wok_relay::server::ConnTable>::open_sub
-<wok_relay::server::ConnTable>::open_sub::{closure#0}
+<wok_relay::server::ConnTable>::open_sub::{closure}
 <wok_relay::server::ConnTable>::push_sub
-<wok_relay::server::ConnTable>::push_sub::{closure#0}
+<wok_relay::server::ConnTable>::push_sub::{closure}
 <wok_relay::server::ConnTable>::queue_event
 <wok_relay::server::ConnTable>::refuse
-<wok_relay::server::ConnTable>::refuse::{closure#0}
-<wok_relay::server::ConnTable>::refuse::{closure#0}::{closure#0}
+<wok_relay::server::ConnTable>::refuse::{closure}
+<wok_relay::server::ConnTable>::refuse::{closure}::{closure}
 <wok_relay::server::ConnTable>::remove
 <wok_relay::server::ConnTable>::send
 <wok_relay::server::ConnTable>::send_event
 <wok_relay::server::ConnTable>::send_last
-<wok_relay::server::ConnTable>::send_last::{closure#0}
+<wok_relay::server::ConnTable>::send_last::{closure}
 <wok_relay::server::ConnTable>::send_sub
 <wok_relay::server::ConnTable>::shard
-<wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::deliver::{closure#0}>
-<wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::send_last::{closure#0}>
-<wok_relay::server::ConnTable>::with::<(usize, usize), <wok_relay::server::ConnTable>::filter_bytes::{closure#0}>
-<wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::is_open::{closure#0}>
-<wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::push_sub::{closure#0}>
-<wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::close_sub::{closure#0}>
-<wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::open_sub::{closure#0}>
-<wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::refuse::{closure#0}>
-<wok_relay::server::ConnTable>::with::<usize, <wok_relay::server::ConnTable>::open_count::{closure#0}>
+<wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::deliver::{closure}>
+<wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::send_last::{closure}>
+<wok_relay::server::ConnTable>::with::<(usize, usize), <wok_relay::server::ConnTable>::filter_bytes::{closure}>
+<wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::is_open::{closure}>
+<wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::push_sub::{closure}>
+<wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::close_sub::{closure}>
+<wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::open_sub::{closure}>
+<wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::refuse::{closure}>
+<wok_relay::server::ConnTable>::with::<usize, <wok_relay::server::ConnTable>::open_count::{closure}>
 <wok_relay::server::ConnectionGuard as core::ops::drop::Drop>::drop
 <wok_relay::server::ConnectionGuard>::client_message
-<wok_relay::server::ConnectionGuard>::client_message::{closure#0}
+<wok_relay::server::ConnectionGuard>::client_message::{closure}
 <wok_relay::server::ConnectionGuard>::close
-<wok_relay::server::ConnectionGuard>::close::{closure#0}
+<wok_relay::server::ConnectionGuard>::close::{closure}
 <wok_relay::server::ConnectionGuard>::conn_id
 <wok_relay::server::ConnectionGuard>::draining
 <wok_relay::server::ConnectionGuard>::ingress_paused
 <wok_relay::server::ConnectionGuard>::ingress_pauses
 <wok_relay::server::ConnectionGuard>::ingress_resumed
 <wok_relay::server::ConnectionGuard>::receive
-<wok_relay::server::ConnectionGuard>::receive::{closure#0}
-<wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_ws::handle_ws<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure#0}::{closure#3}>
-<wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_ws::handle_ws<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure#0}::{closure#3}>::{closure#0}
+<wok_relay::server::ConnectionGuard>::receive::{closure}
+<wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_ws::handle_ws<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}>
+<wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_ws::handle_ws<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}>::{closure}
 <wok_relay::server::Dispatch>::close
 <wok_relay::server::Dispatch>::monitor_then
 <wok_relay::server::Dispatch>::neg
@@ -401,39 +385,37 @@
 <wok_relay::server::Outbound>::try_send
 <wok_relay::server::OutboundFrame as core::ops::drop::Drop>::drop
 <wok_relay::server::OutboundFrame>::is_stale
-<wok_relay::server::OutboundFrame>::is_stale::{closure#0}
+<wok_relay::server::OutboundFrame>::is_stale::{closure}
 <wok_relay::server::RelayHandle>::admit_connection
 <wok_relay::server::RelayHandle>::client_message
-<wok_relay::server::RelayHandle>::client_message::{closure#0}
+<wok_relay::server::RelayHandle>::client_message::{closure}
 <wok_relay::server::RelayHandle>::close
-<wok_relay::server::RelayHandle>::close::{closure#0}
+<wok_relay::server::RelayHandle>::close::{closure}
 <wok_relay::server::RelayHandle>::finish_connection
-<wok_relay::server::RelayHandle>::finish_connection::{closure#0}
+<wok_relay::server::RelayHandle>::finish_connection::{closure}
 <wok_relay::server::RelayHandle>::ingest_route
 <wok_relay::server::RelayHandle>::is_shutdown
 <wok_relay::server::RelayHandle>::next_conn_id
 <wok_relay::server::RelayHandle>::register_connection
-<wok_relay::server::RelayHandle>::register_connection::{closure#0}
+<wok_relay::server::RelayHandle>::register_connection::{closure}
 <wok_relay::server::RelayHandle>::supported_nips
 <wok_relay::server::ReqMsg as wok_relay::server::Routed>::conn_id
 <wok_relay::server::ReqMsg as wok_relay::server::Routed>::is_close
 <wok_relay::server::ReqWorker>::slice
-<wok_relay::server::ReqWorker>::slice::{closure#0}
-<wok_relay::server::ReqWorker>::slice::{closure#1}
-<wok_relay::server::ReqWorker>::slice::{closure#1}::{closure#0}
-<wok_relay::server::ReqWorker>::slice::{closure#2}
+<wok_relay::server::ReqWorker>::slice::{closure}
+<wok_relay::server::ReqWorker>::slice::{closure}::{closure}
 <wok_relay::server::RunningShare>::ran
-<wok_relay::server::RunningShare>::slice::<wok_relay::server::run_req_worker::{closure#2}>
+<wok_relay::server::RunningShare>::slice::<wok_relay::server::run_req_worker::{closure}>
 <wok_relay::server::StoredBatch as core::ops::drop::Drop>::drop
 <wok_relay::server::WriterMsg as wok_relay::server::Routed>::conn_id
 <wok_relay::server::WriterMsg as wok_relay::server::Routed>::is_close
 <wok_relay::server::negentropy::MemoryPool>::reserve
-<wok_relay::server::negentropy::MemoryPool>::reserve::{closure#0}
-<wok_relay::server::negentropy::MemoryPool>::reserve::{closure#0}::{closure#0}
+<wok_relay::server::negentropy::MemoryPool>::reserve::{closure}
+<wok_relay::server::negentropy::MemoryPool>::reserve::{closure}::{closure}
 <wok_relay::server::negentropy::Reservation as core::ops::drop::Drop>::drop
 <wok_relay::server::negentropy::Reservation>::shrink
 <wok_relay::server::sub_gate::SubGate>::admit
-<wok_relay::server::sub_gate::SubGate>::admit::{closure#1}
+<wok_relay::server::sub_gate::SubGate>::admit::{closure}
 <wok_relay::server::sub_gate::SubGate>::close
 <wok_relay::server::sub_gate::SubGate>::filter_bytes
 <wok_relay::server::sub_gate::SubGate>::ids
@@ -443,6 +425,12 @@
 <wok_relay::server::sub_gate::SubGate>::open
 <wok_relay::source::TransportSource>::ip
 <wok_relay::source::TransportSource>::ip_address
+<wok_ws::frame::DeflateCtx>::compress
+<wok_ws::frame::DeflateCtx>::new
+<wok_ws::frame::DeflateCtx>::with_level
+<wok_ws::frame::InflateCtx>::decompress
+<wok_ws::frame::InflateCtx>::new
+<wok_ws::frame::InflateCtx>::remember
 <wok_ws::frame::WsEncoder>::encode_frame
 <wok_ws::frame::WsEncoder>::encode_message_into
 <wok_ws::frame::WsEncoder>::new
@@ -467,17 +455,17 @@ wok_db::env::statvfs_u64::<u64>
 wok_db::fbs::decode_negentropy_filter
 wok_db::fbs::get_bytes
 wok_db::fbs::get_string
-wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure#1}>
-wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure#1}>::{closure#0}
+wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>
+wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}
 wok_db::lookup::lookup_event_by_id_ro
-wok_db::lookup::lookup_event_by_id_ro::{closure#0}
+wok_db::lookup::lookup_event_by_id_ro::{closure}
 wok_db::moderation::moderation_reason_inner
 wok_db::moderation::moderation_reason_ro
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
 wok_db::payload::parse_payload
 wok_db::search::bounded_index_keys
-wok_db::search::bounded_index_keys::{closure#0}
+wok_db::search::bounded_index_keys::{closure}
 wok_db::search::event_content
 wok_db::search::finish_term
 wok_db::search::index_event_search
@@ -485,13 +473,13 @@ wok_db::search::normalize_search_terms_with_overflow
 wok_db::search::note_search_indexed_through
 wok_db::search::parse_event_content
 wok_db::search::parse_search_query
-wok_db::search::parse_search_query::{closure#0}
+wok_db::search::parse_search_query::{closure}
 wok_db::search::search_dbi_ro
 wok_db::search::search_index_entries
-wok_db::search::search_index_entries::{closure#0}
+wok_db::search::search_index_entries::{closure}
 wok_db::search::search_posting_count
-wok_db::search::search_postings::<<wok_query::scan::SearchScan>::gather::{closure#2}>
-wok_db::search::search_postings::<<wok_query::scan::SearchScan>::gather::{closure#2}>::{closure#0}
+wok_db::search::search_postings::<<wok_query::scan::SearchScan>::gather::{closure}>
+wok_db::search::search_postings::<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}
 wok_db::search::term_key
 wok_db::state::allocate_event_id
 wok_db::state::author_count
@@ -499,45 +487,42 @@ wok_db::state::author_key
 wok_db::state::change_author_count
 wok_db::state::change_replacement_count
 wok_db::state::policy_generation
-wok_db::state::policy_generation::{closure#0}
+wok_db::state::policy_generation::{closure}
 wok_db::state::preserve_high_water
 wok_db::tag_kind::note_tag_kind_indexed
 wok_db::tag_kind::put_tag_kind_entries
 wok_db::tag_kind::tag_kind_key
 wok_db::tag_kind::tag_kind_keys
-wok_db::tag_kind::tag_kind_keys::{closure#0}
-wok_db::txn::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure#0}>
-wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure#1}>::{closure#0}>
-wok_db::txn::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure#0}>
-wok_db::txn::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure#2}>::{closure#0}>
-wok_db::txn::foreach_full::<wok_db::state::author_count::{closure#1}>
-wok_db::txn::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#4}>::{closure#0}>
-wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure#0}>
-wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#5}>
-wok_db::txn::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure#1}>
+wok_db::tag_kind::tag_kind_keys::{closure}
+wok_db::txn::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
+wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
+wok_db::txn::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
+wok_db::txn::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
+wok_db::txn::foreach_full::<wok_db::state::author_count::{closure}>
+wok_db::txn::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
+wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
+wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
+wok_db::txn::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
 wok_db::txn::position_reverse_dup
 wok_db::vanish::is_event_vanished_ro
-wok_db::vanish::is_event_vanished_ro::{closure#1}
+wok_db::vanish::is_event_vanished_ro::{closure}
 wok_db::vanish::is_event_vanished_rw
-wok_db::vanish::is_event_vanished_rw::{closure#1}
+wok_db::vanish::is_event_vanished_rw::{closure}
 wok_db::vanish::normalize_relay_url
 wok_db::vanish::vanish_timestamp_ro
 wok_db::vanish::vanish_timestamp_rw
 wok_db::write::deletion_exists
-wok_db::write::foreach_replacement::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#4}>
-wok_db::write::foreach_replacement::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure#4}>::{closure#0}
+wok_db::write::foreach_replacement::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
+wok_db::write::foreach_replacement::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}
 wok_db::write::index_event
-wok_db::write::index_event::{closure#0}
+wok_db::write::index_event::{closure}
 wok_db::write::insert_event
 wok_db::write::lookup_event_by_id
-wok_db::write::lookup_event_by_id::{closure#0}
+wok_db::write::lookup_event_by_id::{closure}
 wok_db::write::original_tag_value
 wok_db::write::put_indices
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
-wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure#3}
-wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure#6}
-wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure#7}
-wok_event::hash::event_id_hash
+wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
 wok_event::hash::id_preimage
 wok_event::hash::sha256
 wok_event::hash::verify_id
@@ -554,19 +539,19 @@ wok_event::kinds::is_replaceable_kind
 wok_event::packed::hashed_tag_value_digest
 wok_event::packed::indexed_tag_value
 wok_event::parse::from_hex_strict
-wok_event::parse::from_hex_strict::{closure#0}
+wok_event::parse::from_hex_strict::{closure}
 wok_event::parse::from_lower_hex_array::<32>
-wok_event::parse::from_lower_hex_array::<32>::{closure#0}
+wok_event::parse::from_lower_hex_array::<32>::{closure}
 wok_event::parse::from_lower_hex_array::<64>
-wok_event::parse::from_lower_hex_array::<64>::{closure#0}
+wok_event::parse::from_lower_hex_array::<64>::{closure}
 wok_event::parse::from_lower_hex_exact
-wok_event::parse::from_lower_hex_exact::{closure#0}
+wok_event::parse::from_lower_hex_exact::{closure}
 wok_event::parse::json_get_array
 wok_event::parse::json_get_string
 wok_event::parse::json_get_unsigned
 wok_event::parse::normalize_event_json
 wok_event::parse::pack_event
-wok_event::parse::pack_event::{closure#6}
+wok_event::parse::pack_event::{closure}
 wok_event::parse::to_hex
 wok_event::validate::json_string
 wok_event::validate::parse_and_verify_event
@@ -585,17 +570,15 @@ wok_negentropy::lmdb_store::tree_key
 wok_negentropy::memory_view_item_bytes
 wok_query::cost::filter_seeks
 wok_query::hll::offset_for_filter
-wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::install::{closure#0}>
-wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::install::{closure#0}>::{closure#0}
-wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::install::{closure#0}>::{closure#4}
-wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::uninstall::{closure#0}>
-wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::uninstall::{closure#0}>::{closure#0}
-wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::uninstall::{closure#0}>::{closure#4}
+wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::install::{closure}>
+wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::install::{closure}>::{closure}
+wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::uninstall::{closure}>
+wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::uninstall::{closure}>::{closure}
 wok_query::monitor::key32
 wok_query::monitor::kind_bit
 wok_query::monitor::kind_mask
-wok_query::monitor::kind_mask::{closure#0}
-wok_query::monitor::kind_mask::{closure#0}::{closure#0}
+wok_query::monitor::kind_mask::{closure}
+wok_query::monitor::kind_mask::{closure}::{closure}
 wok_query::monitor::position
 wok_query::monitor::remove_from::<[u8; 32], [u8]>
 wok_query::monitor::remove_from::<alloc::boxed::Box<[u8]>, [u8]>
@@ -607,23 +590,19 @@ wok_query::visibility::physical_tree_is_globally_visible
 wok_relay::abuse::leading_zero_bits
 wok_relay::abuse::spec
 wok_relay::capabilities::relay_capabilities
-wok_relay::capabilities::relay_capabilities::{closure#0}
+wok_relay::capabilities::relay_capabilities::{closure}
 wok_relay::capabilities::supported_nips
 wok_relay::protocol::has_reason_prefix
-wok_relay::protocol::has_reason_prefix::{closure#0}
+wok_relay::protocol::has_reason_prefix::{closure}
 wok_relay::protocol::push_json_str
-wok_relay::protocol::push_json_str::{closure#0}
+wok_relay::protocol::push_json_str::{closure}
 wok_relay::server::admit_invalid
 wok_relay::server::admit_reader
 wok_relay::server::admit_req
-wok_relay::server::admit_req::{closure#0}
-wok_relay::server::admit_req::{closure#2}
-wok_relay::server::admit_req::{closure#3}
+wok_relay::server::admit_req::{closure}
 wok_relay::server::admit_request
 wok_relay::server::broadcast_stored::<u64>
-wok_relay::server::broadcast_stored::<u64>::{closure#0}
-wok_relay::server::broadcast_stored::<u64>::{closure#1}
-wok_relay::server::broadcast_stored::<u64>::{closure#2}
+wok_relay::server::broadcast_stored::<u64>::{closure}
 wok_relay::server::bump_relay_metrics
 wok_relay::server::check_query_work
 wok_relay::server::close_req
@@ -633,90 +612,73 @@ wok_relay::server::count_read_class
 wok_relay::server::filter_validator
 wok_relay::server::handle_client
 wok_relay::server::ingest_auth
-wok_relay::server::ingest_auth::{closure#0}
+wok_relay::server::ingest_auth::{closure}
 wok_relay::server::ingest_auth_inner
 wok_relay::server::ingest_event
-wok_relay::server::ingest_event::{closure#0}
-wok_relay::server::ingest_event::{closure#1}
-wok_relay::server::ingest_event::{closure#5}
-wok_relay::server::ingest_event::{closure#7}
+wok_relay::server::ingest_event::{closure}
 wok_relay::server::ingest_neg
-wok_relay::server::ingest_neg::{closure#0}
+wok_relay::server::ingest_neg::{closure}
 wok_relay::server::ingest_neg_command
 wok_relay::server::ingest_req
-wok_relay::server::ingest_req::{closure#0}
+wok_relay::server::ingest_req::{closure}
 wok_relay::server::kind_refusal
 wok_relay::server::neg_err
 wok_relay::server::negentropy::fail
 wok_relay::server::negentropy::public_tree_allowed
-wok_relay::server::negentropy::public_tree_allowed::{closure#1}
-wok_relay::server::negentropy::run_negentropy::{closure#0}
-wok_relay::server::negentropy::run_negentropy::{closure#0}::{closure#0}
-wok_relay::server::negentropy::run_negentropy::{closure#11}
-wok_relay::server::negentropy::run_negentropy::{closure#6}
-wok_relay::server::negentropy::run_negentropy::{closure#9}
+wok_relay::server::negentropy::public_tree_allowed::{closure}
+wok_relay::server::negentropy::run_negentropy::{closure}
+wok_relay::server::negentropy::run_negentropy::{closure}::{closure}
 wok_relay::server::negentropy::send_vector
-wok_relay::server::negentropy::send_vector::{closure#0}
+wok_relay::server::negentropy::send_vector::{closure}
 wok_relay::server::read_gate_refusal
 wok_relay::server::reader_admitted
 wok_relay::server::refuse_req
 wok_relay::server::route_tx::<wok_relay::server::MonitorMsg>
-wok_relay::server::run_req_monitor::{closure#1}
-wok_relay::server::run_req_monitor::{closure#2}
-wok_relay::server::run_req_monitor::{closure#3}
-wok_relay::server::run_req_monitor::{closure#8}
-wok_relay::server::run_req_monitor::{closure#9}
-wok_relay::server::run_req_worker::{closure#2}
+wok_relay::server::run_req_monitor::{closure}
+wok_relay::server::run_req_worker::{closure}
 wok_relay::server::stop_sub
-wok_relay::server::stop_sub::{closure#0}
+wok_relay::server::stop_sub::{closure}
 wok_relay::server::stored_reader_admitted
 wok_relay::server::writer::event_matches_vanish_markers
-wok_relay::server::writer::event_matches_vanish_markers::{closure#1}
+wok_relay::server::writer::event_matches_vanish_markers::{closure}
 wok_relay::server::writer::record_reports::<u64>
-wok_relay::server::writer::run_writer::{closure#11}
-wok_relay::server::writer::run_writer::{closure#1}
-wok_relay::server::writer::run_writer::{closure#20}
-wok_relay::server::writer::run_writer::{closure#23}
-wok_relay::server::writer::run_writer::{closure#3}
-wok_ws::accept_loop::{closure#0}::{closure#0}
-wok_ws::accept_loop::{closure#0}::{closure#0}::{closure#0}
-wok_ws::accept_loop::{closure#0}::{closure#0}::{closure#0}::{closure#0}
-wok_ws::accept_loop::{closure#0}::{closure#0}::{closure#1}
+wok_relay::server::writer::run_writer::{closure}
+wok_unix::handle_conn
+wok_unix::handle_conn::{closure}
+wok_unix::peer_allowed
+wok_unix::peer_creds
+wok_unix::serve::{closure}::{closure}
+wok_ws::accept_loop::{closure}::{closure}
+wok_ws::accept_loop::{closure}::{closure}::{closure}
+wok_ws::accept_loop::{closure}::{closure}::{closure}::{closure}
 wok_ws::accepts_nip11
-wok_ws::accepts_nip11::{closure#0}
-wok_ws::accepts_nip11::{closure#1}
-wok_ws::accepts_nip11::{closure#2}
+wok_ws::accepts_nip11::{closure}
 wok_ws::admin::dispatch
-wok_ws::admin::dispatch::{closure#0}
+wok_ws::admin::dispatch::{closure}
 wok_ws::admin::response
 wok_ws::configure_accepted_stream
 wok_ws::dispatch
-wok_ws::dispatch::{closure#0}
-wok_ws::dispatch::{closure#0}::{closure#0}
-wok_ws::dispatch::{closure#0}::{closure#1}
-wok_ws::dispatch::{closure#0}::{closure#2}
-wok_ws::dispatch::{closure#0}::{closure#3}
-wok_ws::dispatch::{closure#0}::{closure#4}
+wok_ws::dispatch::{closure}
+wok_ws::dispatch::{closure}::{closure}
 wok_ws::empty
 wok_ws::frame::apply_mask
+wok_ws::frame::inflate_into
 wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>
-wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>::{closure#0}
+wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>::{closure}
 wok_ws::frame::write_bytes::<tokio::io::split::WriteHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>
-wok_ws::frame::write_bytes::<tokio::io::split::WriteHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>::{closure#0}
+wok_ws::frame::write_bytes::<tokio::io::split::WriteHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>::{closure}
 wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>
-wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure#0}
-wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure#0}::{closure#0}
-wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure#0}::{closure#3}
+wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}
+wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}
 wok_ws::html_escape
 wok_ws::html_response
 wok_ws::json_response
 wok_ws::landing
-wok_ws::landing::{closure#0}
-wok_ws::landing::{closure#0}::{closure#0}
-wok_ws::landing::{closure#3}
+wok_ws::landing::{closure}
+wok_ws::landing::{closure}::{closure}
 wok_ws::nip11
 wok_ws::nip86::dispatch
-wok_ws::nip86::dispatch::{closure#0}
+wok_ws::nip86::dispatch::{closure}
 wok_ws::nip_description
 wok_ws::not_found
 wok_ws::preflight_response
@@ -724,12 +686,17 @@ wok_ws::public_response
 wok_ws::safe_http_url
 wok_ws::text_status_response
 wok_ws::upgrade_ws
-wok_ws::upgrade_ws::{closure#0}
-wok_ws::upgrade_ws::{closure#0}::{closure#0}
-wok_ws::upgrade_ws::{closure#0}::{closure#4}
+wok_ws::upgrade_ws::{closure}
+wok_ws::upgrade_ws::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
 ## authenticated: 0
 
 ## admin: 0
+
+## local: 4
+<wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_unix::handle_conn::{closure}::{closure}>
+<wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_unix::handle_conn::{closure}::{closure}>::{closure}
+wok_unix::handle_conn::{closure}::{closure}
+wok_unix::next_frame

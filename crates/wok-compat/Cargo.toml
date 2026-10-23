@@ -22,6 +22,7 @@ wok-relay = { path = "../wok-relay" }
 anyhow.workspace = true
 hdrhistogram.workspace = true
 base64.workspace = true
+flate2.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 tokio.workspace = true

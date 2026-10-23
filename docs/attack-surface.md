@@ -229,6 +229,58 @@ pull request: lines that change should be the requests the change is meant to
 refuse differently, and nothing in the `default` or `public` transcripts
 should change unless that is the point of the change.
 
+## Reachability
+
+`scripts/attack-surface-reach.py` measures which relay functions each kind of
+caller reaches. It builds the `wok-compat` `tests/reachability.rs` probe with
+coverage instrumentation and runs its phases against a relay of every
+profile, each phase in a process of its own:
+
+- **startup** starts the relay, and its Unix socket when the profile
+  enables it, and stops it;
+- **anonymous** sends what a client that never authenticates can: every
+  message verb, well formed and malformed, every method on each path of the
+  listeners, and NIP-98 requests unsigned, signed by a stranger, and forged
+  in a stranger's name and in an admin's; and it connects to the Unix socket
+  as a peer the socket refuses;
+- **authenticated** authenticates with NIP-42 and sends what AUTH unlocks;
+- **admin** calls the dashboard API and every NIP-86 method as an admin;
+- **local** sends the anonymous messages over the Unix socket as a peer it
+  admits.
+
+A phase the profile closes, such as admin without `admin.enabled`, sends
+nothing. The probe shares its process with the relay, so it signs events,
+frames Unix messages and builds its NIP-77 message without the relay's
+crates: every function counted is one the relay ran.
+
+From each run it keeps the functions of the relay crates (`wok-relay`,
+`wok-ws`, `wok-unix`, `wok-event`, `wok-query`, `wok-negentropy` and
+`wok-db`) that ran at least once. The anonymous set is what an
+unauthenticated client reaches beyond startup, the authenticated set is what
+AUTH adds to that, the admin set is what an admin's requests add to that,
+and the local set is what an admitted Unix peer adds to that.
+`crates/wok-compat/tests/reachability/<profile>.txt` lists each set by
+function name, with its size in the phase's heading. A closure is named by
+the function that holds it, without its number.
+
+```bash
+scripts/attack-surface-reach.py            # print the sizes and what changed
+scripts/attack-surface-reach.py --check    # fail on a function newly reached
+scripts/attack-surface-reach.py --bless    # rewrite the baseline
+```
+
+It needs `cargo-llvm-cov` and the `llvm-tools-preview` rustup component, and
+CI does not run it. Run `--check` on a change that adds a path, a message or a
+setting, or moves a check. A function the anonymous phase newly reaches is
+code an unauthenticated client can now run: it belongs after the cheapest
+check that can refuse the request, or the baseline is rewritten with the
+reason in the pull request. A phase that reached functions and now reaches
+none also fails, since that is a broken probe, not a smaller surface. A
+function no longer reached is listed but does not fail. Some functions run on
+some runs and not others, such as a query path that depends on timing, so
+`--bless` keeps the union of three runs, and the database watcher, which runs
+on a timer, is left out.
+
 ## Setting combinations
 
 `wok-compat` `tests/setting_combinations.rs` turns on each security setting
@@ -270,4 +322,5 @@ serves `/metrics` on the metrics listener.
 | `wok-ws` `nip86` tests | A NIP-86 method is missing from the [nip86.md](nip86.md#supported-methods) table, or its level there differs from the code's. |
 | `wok-cli` tests | A `wok` command has no row in [Commands](#commands), or a row names a command that does not exist. |
 | `wok-compat` `tests/golden_transcripts.rs` | A profile's relay answers the script differently from its file in `tests/transcripts/`, or a transcript has no profile. |
+| `scripts/attack-surface-reach.py --check`, run by hand | A phase of the [reachability](#reachability) probe reaches a relay function that its profile's file in `tests/reachability/` does not list. |
 | `wok-compat` `tests/setting_combinations.rs` | With two settings on, a step that one refuses for a reason of its own, or that each refuses, is served, and `OPENS` does not list it; or a setting changes nothing but NIP-11 and is not in `UNPROBED`. |

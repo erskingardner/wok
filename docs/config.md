@@ -229,7 +229,7 @@ interface or protect the path at the reverse proxy.
 | `relay.bind` | `127.0.0.1` | Restart | TCP listen address: an IPv4 or IPv6 literal (`::1` or `[::1]`), or a hostname. A hostname listens on every address it resolves to (`localhost` → `127.0.0.1` and `::1`), skipping resolved addresses that are not assigned on this host or whose family it lacks, as long as one binds. |
 | `relay.port` | `7777` | Restart | TCP listen port. |
 | `relay.nofiles` | `524288` | Restart | Requested process file-descriptor limit. |
-| `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-IP budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. |
+| `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-address budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. Left empty behind a proxy, every client has the proxy's address and shares its budgets, so a startup warning is also logged when it is empty and the relay listens only on loopback or private addresses. |
 | `relay.max_websocket_payload_size` | `2097152` | Restart | Maximum reassembled WebSocket payload bytes. |
 | `relay.max_req_filter_size` | `262144` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. See [Filter size](#filter-size). |
 | `relay.max_filter_bytes_per_connection` | `2097152` | Live | Yes | Maximum combined compact-JSON filter bytes of the REQ subscriptions open on one connection; zero is unlimited. See [Filter size](#filter-size). |
@@ -434,11 +434,13 @@ way; strfry's section is off unless `enabled = true`.
 
 ## Abuse protection
 
-All abuse settings reload live and are dashboard-editable.
+All abuse settings reload live. All but `ipv6_prefix_len` are
+dashboard-editable.
 
 | Key | Default | Meaning |
 |---|---:|---|
 | `relay.abuse.enabled` | `true` | Enable this protection layer. |
+| `relay.abuse.ipv6_prefix_len` | `64` | Leading bits of an IPv6 address that key its per-address budgets, from 1 to 128. One host is usually given a whole /64, so keying each address (128) lets it take a fresh budget with every address it picks. IPv4 addresses are keyed one by one. See [Addresses](#addresses). |
 | `relay.abuse.connection_rate_per_second` | `10` | Refilled connection tokens per network address each second. |
 | `relay.abuse.connection_burst` | `50` | Connection token-bucket capacity. |
 | `relay.abuse.event_rate_per_second` | `50` | Refilled EVENT and AUTH tokens per network address each second. |
@@ -463,6 +465,20 @@ every per-IP token bucket — connection, EVENT, REQ, and COUNT. Per-author
 publication, storage quotas, query-cost gates, and proof-of-work policies
 still apply to them. Keep the socket on a trusted host with tight
 `mode`/`auth_uids`/`auth_gids`.
+
+### Addresses
+
+A per-address budget is keyed by the client's IPv4 address, or by the
+`ipv6_prefix_len` leading bits of its IPv6 address: by default every address
+in one /64 shares a budget, as addresses on one host or home network
+usually do. An IPv4-mapped IPv6 peer (`::ffff:192.0.2.1`) is its IPv4
+address. NIP-86 IP bans and the write-policy plugin's `sourceInfo` still
+see the exact address.
+
+Behind a reverse proxy the client's address is the proxy's unless
+`relay.real_ip_header` names the header the proxy overwrites with it. The
+relay warns at startup when that header is set, and when it is empty while
+the relay listens only on loopback or private addresses, as behind a proxy.
 
 On reload, the relay logs a warning for each guard the file sets to zero
 (unlimited) while its preset does not. A guard that the preset itself turns

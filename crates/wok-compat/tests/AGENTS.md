@@ -7,6 +7,7 @@
 | `support/wire.rs` | Shared framed Unix / WebSocket test and soak client |
 | `e2e_transports.rs` | WebSocket + Unix end-to-end |
 | `query_cost.rs` | Query-cost gate at the default ceiling: client filters served, fan-outs refused as REQ, COUNT and NEG-OPEN |
+| `rate_keying.rs` | What each rate budget is keyed on: IPv6 networks share a per-address budget |
 | `req_lifecycle.rs` | Live-before-history REQs: no loss, exactly once, replacement, cap, COUNT ids |
 | `eose_latency.rs` | Ignored benchmark: REQ→EOSE latency under monitor fan-out |
 | `ws_deflate.rs` | permessage-deflate negotiation/frames |

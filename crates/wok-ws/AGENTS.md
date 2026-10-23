@@ -2,7 +2,7 @@
 
 HTTP + WebSocket transport. In-house RFC 6455 + RFC 7692 codec so the server can offer permessage-deflate (no Rust WS library does). `#![forbid(unsafe_code)]`.
 
-Plain HTTP serves NIP-11 (`Accept: application/nostr+json`), the landing page, `/metrics`, nodeinfo, and `/admin`. WebSocket upgrades share `RelayHandle` with Unix.
+Plain HTTP serves NIP-11 (`Accept: application/nostr+json`), the landing page, nodeinfo, and `/admin`, plus `/metrics` when `observability.metrics_enabled` is set and `observability.metrics_listen` is not (`serve_metrics` serves it there otherwise). WebSocket upgrades share `RelayHandle` with Unix.
 
 ## Layout
 

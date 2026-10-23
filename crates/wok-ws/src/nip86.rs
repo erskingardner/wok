@@ -114,10 +114,15 @@ pub async fn dispatch(
         .get(hyper::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    // Decoded before the body is read: nothing can authorize a request whose
-    // header fails here.
+    // Checked before the body is read: nothing can authorize a request whose
+    // header fails here, so it is refused without waiting for its body.
     let event = match admin::decode_authorization(authorization.as_deref()) {
         Ok(event) => event,
+        Err(error) => return admin::unauthorized(&error),
+    };
+    let level_of = |signer: &[u8; 32]| management_level(&cfg, &handle.moderation.read(), signer);
+    let verified = match verify_manager(&event, &cfg, level_of) {
+        Ok(verified) => verified,
         Err(error) => return admin::unauthorized(&error),
     };
     let body = match admin::read_body(req.into_body(), MAX_RPC_BODY).await {
@@ -125,9 +130,7 @@ pub async fn dispatch(
         Err(error) => return admin::response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
     };
     let (signer_hex, level, replay) =
-        match authorize_manager(&event, &body, &cfg, &state, |signer| {
-            management_level(&cfg, &handle.moderation.read(), signer)
-        }) {
+        match authorize_manager(verified, &body, &cfg, &state, level_of) {
             Ok(ok) => ok,
             Err(error) => return admin::unauthorized(&error),
         };
@@ -152,22 +155,17 @@ pub async fn dispatch(
     }
 }
 
-/// Verify a NIP-86 request's NIP-98 authorization and that its signer holds a
-/// management role, returning the signer, its level and the replay
-/// reservation.
-fn authorize_manager<'a>(
-    event: &Value,
-    body: &[u8],
+/// Check the parts of a NIP-86 request's NIP-98 authorization that do not
+/// need its body, including that its signer holds a management role.
+fn verify_manager<'e>(
+    event: &'e Value,
     cfg: &Config,
-    state: &'a AdminState,
     level_of: impl Fn(&[u8; 32]) -> ManagementLevel,
-) -> Result<(String, ManagementLevel, admin::ReplayReservation<'a>), String> {
-    let (signer_hex, replay) = admin::authorize(
+) -> Result<admin::Verified<'e>, String> {
+    admin::verify(
         event,
         &Method::POST,
-        body,
         cfg,
-        state,
         &admin::AuthzPolicy {
             url_ok: &|signed| relay_url_matches(&cfg.admin.public_url, signed),
             // A signer with no management level is refused before its
@@ -178,9 +176,23 @@ fn authorize_manager<'a>(
             // Pinned NIP-86 makes the NIP-98 payload tag unconditional.
             require_payload: true,
         },
-    )?;
-    // A rejected signer ran nothing, so release its slot: otherwise any key
-    // could fill the shared replay cache and lock out real managers.
+    )
+}
+
+/// Finish a [`verify_manager`]ed authorization with the request body, and
+/// confirm the signer still holds a management role, returning the signer,
+/// its level and the replay reservation.
+fn authorize_manager<'a>(
+    verified: admin::Verified<'_>,
+    body: &[u8],
+    cfg: &Config,
+    state: &'a AdminState,
+    level_of: impl Fn(&[u8; 32]) -> ManagementLevel,
+) -> Result<(String, ManagementLevel, admin::ReplayReservation<'a>), String> {
+    let (signer_hex, replay) = admin::authorize(verified, body, cfg, state)?;
+    // The role may have been revoked while the body arrived. A rejected
+    // signer ran nothing, so release its slot: otherwise any key could fill
+    // the shared replay cache and lock out real managers.
     let level = match parse_hex32(&signer_hex) {
         Ok(signer) => level_of(&signer),
         Err(error) => {
@@ -516,6 +528,25 @@ mod tests {
         )
     }
 
+    /// Both halves of a NIP-86 authorization, as dispatch runs them around
+    /// reading the body.
+    fn check<'a>(
+        header: &str,
+        body: &[u8],
+        cfg: &Config,
+        state: &'a AdminState,
+        level_of: impl Fn(&[u8; 32]) -> ManagementLevel + Copy,
+    ) -> Result<(String, ManagementLevel, admin::ReplayReservation<'a>), String> {
+        let event = admin::decode_authorization(Some(header)).unwrap();
+        authorize_manager(
+            verify_manager(&event, cfg, level_of)?,
+            body,
+            cfg,
+            state,
+            level_of,
+        )
+    }
+
     #[test]
     fn rejected_non_managers_do_not_fill_the_replay_cache() {
         // A validly signed request from a key with no management role must
@@ -542,25 +573,11 @@ mod tests {
         for nonce in 0..=admin::MAX_REPLAY_IDS {
             let header = signed_rpc_auth(&stranger, url, body, nonce);
             // Refused before its signature is checked or a slot claimed.
-            let error = authorize_manager(
-                &admin::decode_authorization(Some(&header)).unwrap(),
-                body,
-                &cfg,
-                &state,
-                level_of,
-            )
-            .unwrap_err();
+            let error = check(&header, body, &cfg, &state, level_of).unwrap_err();
             assert_eq!(error, admin::REFUSED_SIGNER);
         }
         let header = signed_rpc_auth(&admin_key, url, body, 0);
-        let (_, level, _) = authorize_manager(
-            &admin::decode_authorization(Some(&header)).unwrap(),
-            body,
-            &cfg,
-            &state,
-            level_of,
-        )
-        .unwrap();
+        let (_, level, _) = check(&header, body, &cfg, &state, level_of).unwrap();
         assert_eq!(level, ManagementLevel::Admin);
     }
 

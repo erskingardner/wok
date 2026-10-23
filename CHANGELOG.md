@@ -96,6 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- NIP-11 `limitation.auth_required` (`true` while `relay.auth.read_policy`
+  is not `open`), `restricted_writes` (`true` while `write_policy` is not
+  `open`, or proof of work is required) and `max_subid_length` (64) (#97
+  B12).
 - `relay.filter_validation.require_scoped_filters`: every filter must name
   `ids`, `authors` or a tag filter, with any number of values. It refuses
   enumeration such as `{"kinds":[445]}`, which would list every group message

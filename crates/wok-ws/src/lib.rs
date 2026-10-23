@@ -378,6 +378,9 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
             "default_limit": cfg.relay.max_filter_limit,
             "min_pow_difficulty": min_pow_difficulty,
             "max_concurrent_historical_queries": cfg.relay.abuse.max_concurrent_historical_queries,
+            "max_subid_length": wok_event::MAX_SUBID_CHARS,
+            "auth_required": cfg.auth_required(),
+            "restricted_writes": cfg.restricted_writes(),
         }
     });
     // The ceiling applies only while abuse controls are on, and zero is no

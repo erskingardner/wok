@@ -13,7 +13,7 @@ own at a private address:
 ```toml
 [observability]
 metrics_enabled = true
-metrics_listen = "127.0.0.1:9100"
+metrics_listen = "127.0.0.1:9777"
 ```
 
 That listener serves only `GET /metrics`, and the relay listener answers
@@ -23,7 +23,7 @@ relay listener to anyone who can reach it, with
 see [config.md](config.md#observability).
 
 ```bash
-curl http://127.0.0.1:9100/metrics
+curl http://127.0.0.1:9777/metrics
 ```
 
 A minimal Prometheus job is:
@@ -32,7 +32,7 @@ A minimal Prometheus job is:
 scrape_configs:
   - job_name: wok
     static_configs:
-      - targets: ["127.0.0.1:9100"]
+      - targets: ["127.0.0.1:9777"]
 ```
 
 ## Metric reference

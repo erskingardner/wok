@@ -146,14 +146,15 @@ const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
 /// Serves `observability.metrics_listen`: `GET /metrics` while
 /// `observability.metrics_enabled` is on, and 404 for everything else. It
-/// is meant for a private address, so it sends no CORS headers and charges
-/// no per-address budget.
+/// is meant for a private address and a scraper, so it sends no CORS
+/// headers, but like the relay listener it refuses a NIP-86 `blockip`
+/// address and charges the per-address connection budget.
 pub async fn serve_metrics(handle: RelayHandle, listener: TcpListener) -> std::io::Result<()> {
     tracing::info!("Started metrics server on {}", listener.local_addr()?);
     let handle = Arc::new(handle);
     let shutdown = handle.shutdown_handle();
     loop {
-        let (stream, _) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             _ = shutdown.notified() => break,
             res = listener.accept() => match res {
                 Ok(x) => x,
@@ -170,6 +171,14 @@ pub async fn serve_metrics(handle: RelayHandle, listener: TcpListener) -> std::i
             let svc = service_fn(move |req: Request<Incoming>| {
                 let handle = handle.clone();
                 async move {
+                    // The scraper's own address: real_ip_header is for the
+                    // relay listener's proxy.
+                    if !handle.admit_connection(&TransportSource::ip_address(peer.ip())) {
+                        return Ok::<_, Infallible>(text_status_response(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "rate-limited: connection budget exhausted",
+                        ));
+                    }
                     let served = req.uri().path() == "/metrics"
                         && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD)
                         && handle.config.read().observability.metrics_enabled;
@@ -1546,7 +1555,7 @@ mod metrics_tests {
     async fn a_metrics_listener_takes_metrics_off_the_relay_listener() {
         let served = serve_both(|cfg| {
             cfg.observability.metrics_enabled = true;
-            cfg.observability.metrics_listen = "127.0.0.1:9100".into();
+            cfg.observability.metrics_listen = "127.0.0.1:9777".into();
         })
         .await;
         assert_eq!(request(served.relay, "GET", "/metrics").await.0, 404);
@@ -1565,9 +1574,27 @@ mod metrics_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_metrics_listener_refuses_a_blocked_address() {
+        let served = serve_both(|cfg| {
+            cfg.observability.metrics_enabled = true;
+            cfg.observability.metrics_listen = "127.0.0.1:9777".into();
+        })
+        .await;
+        served
+            .handle
+            .manage(wok_relay::ManagementCmd::BlockIp {
+                ip: "127.0.0.1".into(),
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 429);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_metrics_listener_follows_metrics_enabled_live() {
         let served = serve_both(|cfg| {
-            cfg.observability.metrics_listen = "127.0.0.1:9100".into();
+            cfg.observability.metrics_listen = "127.0.0.1:9777".into();
         })
         .await;
         assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 404);

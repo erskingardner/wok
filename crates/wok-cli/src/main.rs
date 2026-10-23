@@ -453,7 +453,13 @@ fn init_tracing(config: Option<&Config>) -> Result<()> {
 /// Watch the config file and live-reload the reloadable subset, like golpe
 /// (which watches the config file and applies non-`noReload` keys). Parse
 /// errors keep the old config.
-fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
+/// The addresses the relay bound at startup, which a reload cannot change.
+struct Bound {
+    relay: Vec<std::net::SocketAddr>,
+    metrics: Option<std::net::SocketAddr>,
+}
+
+fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle, bound: Bound) {
     tokio::spawn(async move {
         let mut last = std::fs::metadata(&path)
             .ok()
@@ -473,8 +479,14 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
             match Config::load(&path) {
                 Ok(new) => {
                     tracing::info!("config {} changed, reloading", path.display());
-                    if let Err(error) = handle.config.write().apply_reload(new) {
+                    let mut cfg = handle.config.write();
+                    let previous = cfg.clone();
+                    if let Err(error) = cfg.apply_reload(new) {
                         tracing::error!("config reload refused, keeping old config: {error}");
+                    } else if let Some(warning) =
+                        cfg.metrics_reload_warning(&previous, &bound.relay, bound.metrics)
+                    {
+                        tracing::warn!("config reload: {warning}");
                     }
                 }
                 Err(e) => {
@@ -507,9 +519,6 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     if let Some(warning) = cfg.real_ip_header_warning(&listening) {
         tracing::warn!("{warning}");
     }
-    if let Some(warning) = cfg.metrics_warning(&listening) {
-        tracing::warn!("{warning}");
-    }
     // Bound whenever an address is set, so turning metrics on or off is a
     // live reload; the listener answers 404 while they are off.
     let metrics_listener = match cfg.observability.metrics_listen.as_str() {
@@ -520,11 +529,20 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
                 .with_context(|| format!("bind observability.metrics_listen {listen}"))?,
         ),
     };
+    let bound = Bound {
+        relay: listening.clone(),
+        metrics: metrics_listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok()),
+    };
+    if let Some(warning) = cfg.metrics_warning(&bound.relay, bound.metrics) {
+        tracing::warn!("{warning}");
+    }
     let unix_cfg = cfg.clone();
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     if config_path.exists() {
         handle.set_config_path(config_path.clone());
-        spawn_config_reload(config_path, handle.clone());
+        spawn_config_reload(config_path, handle.clone(), bound);
     }
     let h2 = handle.clone();
     let h3 = handle.clone();

@@ -52,4 +52,4 @@ preset = "public"
 # the relay listener anyone who can reach the relay could read them.
 # [observability]
 # metrics_enabled = true
-# metrics_listen = "127.0.0.1:9100"
+# metrics_listen = "127.0.0.1:9777"

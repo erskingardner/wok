@@ -33,6 +33,25 @@ impl Preset {
         }
     }
 
+    /// Who the preset is for and what it does, in a few sentences.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Preset::Public => {
+                "A general public relay that any client can read from and write to: feeds, \
+                 outbox lookups, DMs and gift-wrap inboxes. Its values are Wok's built-in \
+                 defaults."
+            }
+            Preset::Marmot => {
+                "A relay dedicated to Marmot group messaging, such as one a Marmot app ships \
+                 as a default. It accepts only the Marmot kinds, needs every filter to name \
+                 ids, authors or a tag, takes 4 MiB events, and leaves writes open so the \
+                 relay cannot link group messages to their senders. It needs \
+                 relay.auth.service_url, because recipients read their gift wraps after \
+                 NIP-42 AUTH."
+            }
+        }
+    }
+
     /// The preset's overlay: only the keys it changes from the built-in
     /// defaults.
     pub fn overlay(self) -> &'static str {

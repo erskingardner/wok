@@ -1439,7 +1439,7 @@ impl Config {
                 "observability.metrics_listen changed: {running:?} -> {wanted:?}; the running \
                  value stays until restart{}",
                 if running.is_empty() {
-                    ", and metrics stay off until then rather than be served on the relay listener"
+                    ", and metrics are off until then rather than served on the relay listener"
                 } else {
                     ""
                 },
@@ -1747,10 +1747,26 @@ impl Config {
     /// only exists once at startup (documented as "restart required" in
     /// strfry.conf). A config the relay would refuse to start with is
     /// refused, and this one kept: every live reload goes through here.
+    /// The configuration a reload to `new` runs, before restart-only
+    /// settings are put back. The metrics listener is bound at startup, so a
+    /// file that now asks for one, on a relay started without, keeps metrics
+    /// off until a restart binds it, rather than serve them on the relay
+    /// listener.
+    pub fn reloaded(&self, mut new: Config) -> Config {
+        if self.observability.metrics_listen.is_empty()
+            && !new.observability.metrics_listen.is_empty()
+        {
+            new.observability.metrics_enabled = false;
+        }
+        new
+    }
+
     pub fn apply_reload(&mut self, new: Config) -> Result<(), String> {
         if let Some(error) = new.serving_error() {
             return Err(error);
         }
+        // Logged as it will run, not as the file says.
+        let new = self.reloaded(new);
         for change in self.security_scope_changes(&new) {
             tracing::warn!("config reload: {change}");
         }
@@ -1783,14 +1799,6 @@ impl Config {
         // changes take effect after restart, while history bounds reload live.
         self.observability.log_format = old.observability.log_format;
         self.observability.log_filter = old.observability.log_filter;
-        // The metrics listener is bound at startup. A file that now asks for
-        // one, on a relay started without, keeps metrics off until a
-        // restart binds it, rather than serve them on the relay listener.
-        if old.observability.metrics_listen.is_empty()
-            && !self.observability.metrics_listen.is_empty()
-        {
-            self.observability.metrics_enabled = false;
-        }
         self.observability.metrics_listen = old.observability.metrics_listen;
         Ok(())
     }
@@ -2869,36 +2877,51 @@ negentropy_enabled = true
         assert_eq!(running.observability.metrics_listen, "127.0.0.1:9777");
     }
 
+    /// The security-scope lines a reload of `running` to `file` logs, and
+    /// the configuration it leaves running.
+    fn reload(running: &str, file: &str) -> (Vec<String>, Config) {
+        let mut running = Config::parse_toml(running).unwrap();
+        let file = Config::parse_toml(file).unwrap();
+        let changes = running.security_scope_changes(&running.reloaded(file.clone()));
+        running.apply_reload(file).unwrap();
+        (changes, running)
+    }
+
     #[test]
     fn a_reload_that_asks_for_a_metrics_listener_keeps_metrics_off_until_restart() {
-        // Started without a listener of its own, serving the relay listener.
-        let mut running = Config::parse_toml("[observability]\nmetrics_enabled = true\n").unwrap();
-        assert!(running.metrics_on_relay_listener());
-        let reloaded = Config::parse_toml(
-            "[observability]\nmetrics_enabled = true\nmetrics_listen = \"127.0.0.1:9777\"\n",
-        )
-        .unwrap();
-        let changes = running.security_scope_changes(&reloaded);
+        let with_listener =
+            "[observability]\nmetrics_enabled = true\nmetrics_listen = \"127.0.0.1:9777\"\n";
+        // Off, and the file turns them on with a listener: they stay off,
+        // and nothing claims they were turned on.
+        let (changes, running) = reload("", with_listener);
+        assert!(!running.observability.metrics_enabled);
+        assert!(!running.metrics_on_relay_listener());
+        assert!(
+            !changes
+                .iter()
+                .any(|change| change.starts_with("observability.metrics_enabled")),
+            "{changes:?}"
+        );
         assert!(
             changes
                 .iter()
-                .any(|change| change.contains("metrics stay off until then")),
+                .any(|change| change.contains("metrics are off until then")),
             "{changes:?}"
         );
-        running.apply_reload(reloaded).unwrap();
+        // On along the relay listener: they are turned off, and the log says so.
+        let (changes, running) = reload("[observability]\nmetrics_enabled = true\n", with_listener);
         assert!(!running.observability.metrics_enabled);
-        assert!(!running.metrics_on_relay_listener());
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "observability.metrics_enabled changed: true -> false"),
+            "{changes:?}"
+        );
         // A listener bound at startup and moved back to the relay listener
         // keeps serving where it was bound.
-        let mut bound = Config::parse_toml(
-            "[observability]\nmetrics_enabled = true\nmetrics_listen = \"127.0.0.1:9777\"\n",
-        )
-        .unwrap();
-        bound
-            .apply_reload(Config::parse_toml("[observability]\nmetrics_enabled = true\n").unwrap())
-            .unwrap();
-        assert!(bound.observability.metrics_enabled);
-        assert!(!bound.metrics_on_relay_listener());
+        let (_, running) = reload(with_listener, "[observability]\nmetrics_enabled = true\n");
+        assert!(running.observability.metrics_enabled);
+        assert!(!running.metrics_on_relay_listener());
     }
 
     #[test]

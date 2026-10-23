@@ -230,20 +230,20 @@ async fn record(name: &str, relay: &Relay, cfg: &Config) -> String {
             "",
         )
     };
+    // One timestamp for all four: a forged signature keeps the event's id,
+    // so each forged attempt is the same event as its honest twin, and the
+    // transcript numbers them alike.
+    let at = now();
+    let wrong = auth(&author, "wrong", at);
+    let right = auth(&author, &challenge, at);
     let attempts: Vec<(&str, Value)> = vec![
-        (
-            "AUTH with the wrong challenge",
-            auth(&author, "wrong", now()),
-        ),
-        (
-            "AUTH with a forged signature",
-            forged(&auth(&author, &challenge, now()), "sig"),
-        ),
+        ("AUTH with the wrong challenge", wrong.clone()),
+        ("AUTH with a forged signature", forged(&right, "sig")),
         (
             "AUTH with the wrong challenge and a forged signature",
-            forged(&auth(&author, "wrong", now()), "sig"),
+            forged(&wrong, "sig"),
         ),
-        ("AUTH as the author", auth(&author, &challenge, now())),
+        ("AUTH as the author", right),
     ];
     for (label, attempt) in attempts {
         out.step(label);

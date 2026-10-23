@@ -96,6 +96,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `relay.auth.accepted_kinds`, the kinds a relay accepts (empty, the
+  default, accepts every kind). Events of other kinds are refused with
+  `restricted: kind N is not allowed by this relay`, and NIP-11 advertises
+  `restricted_writes`. It bounds the NIP-86 kind policy: `disallowkind`
+  narrows it, `allowkind` cannot widen it (it can still lift a kind's ban on
+  stored events), and `listallowedkinds` reports the effective set instead
+  of only the kinds named by `allowkind` (#97 B14). NIP-62 vanish requests
+  are accepted whatever it lists, and stored events of other kinds stay
+  readable.
 - NIP-11 `limitation.auth_required` (`true` while `relay.auth.read_policy`
   is not `open` and AUTH is usable), `restricted_writes` (`true` while `write_policy` is not
   `open`, or proof of work is required) and `max_subid_length` (64) (#97

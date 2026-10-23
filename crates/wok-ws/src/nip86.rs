@@ -351,6 +351,8 @@ async fn execute(
             let icon = string_param(params, 0, "relay icon URL")?;
             config_patch(handle, json!({ "info": { "icon": icon } }))
         }
+        // Allowing a kind outside `relay.auth.accepted_kinds` lifts its
+        // ban on stored events, but new ones are still refused.
         "allowkind" => {
             let kind = kind_param(params)?;
             manage(handle, ManagementCmd::AllowKind { kind }, reached_writer).await
@@ -359,9 +361,23 @@ async fn execute(
             let kind = kind_param(params)?;
             manage(handle, ManagementCmd::DisallowKind { kind }, reached_writer).await
         }
-        // Kinds are allowed unless disallowed. The allow list holds the
-        // kinds named by `allowkind`, not every kind that is allowed.
-        "listallowedkinds" => Ok(json!(handle.moderation.read().allowed_kinds)),
+        // With `relay.auth.accepted_kinds` set, the allow list is the
+        // effective set: the kinds it accepts that the stored policy allows.
+        // Without it kinds are allowed unless disallowed, so the allow list
+        // holds the kinds named by `allowkind`, not every kind allowed.
+        "listallowedkinds" => {
+            let accepted = handle.config.read().accepted_kind_list();
+            let snap = handle.moderation.read();
+            Ok(match accepted {
+                Some(mut kinds) => {
+                    kinds.retain(|&kind| snap.kind_allowed(kind));
+                    json!(kinds)
+                }
+                None => json!(snap.allowed_kinds),
+            })
+        }
+        // Every kind `disallowkind` refuses, whether or not the ceiling
+        // lists it: the ban also hides stored events of the kind.
         "listdisallowedkinds" => {
             let snap = handle.moderation.read();
             let kinds = snap

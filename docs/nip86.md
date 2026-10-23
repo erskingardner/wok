@@ -149,15 +149,24 @@ dashboard's error.
 `allowkind` / `disallowkind` maintain a dedicated kind policy in the
 moderation table (a 65536-bit map), not the query-filter validation config.
 Every kind is allowed until `disallowkind` disallows it, and `allowkind`
-allows it again. `listdisallowedkinds` lists the disallowed kinds.
-`listallowedkinds` lists the kinds named by `allowkind` since their last
-`disallowkind`, not every allowed kind; with no policy both lists are empty.
-`allowkind` therefore never restricts other kinds. A disallowed kind is:
+allows it again. `listdisallowedkinds` lists the disallowed kinds. While
+`relay.auth.accepted_kinds` is empty, `listallowedkinds` lists the kinds
+named by `allowkind` since their last `disallowkind`, not every allowed kind,
+and with no policy both lists are empty. `allowkind` therefore never
+restricts other kinds. A disallowed kind is:
 
 - rejected on write admission (`OK false "restricted: kind N is not allowed
   by this relay"`), and
 - hidden from query results like a ban — including REQs without a `kinds`
   field — until `allowkind` restores it.
+
+With `relay.auth.accepted_kinds` set, the policy works under that ceiling.
+The relay accepts a kind only if the configuration lists it (vanish requests
+aside) and the policy allows it, so `allowkind` of an unlisted kind lifts
+its ban on stored events but does not make the relay accept new ones.
+`listallowedkinds` returns the effective set, the kinds the relay accepts,
+sorted, and `listdisallowedkinds` every kind the policy disallows. See
+[accepted kinds](config.md#accepted-kinds).
 
 The all-zero map (no kinds allowed) is representable; `disallowkind` never
 refuses an exclusion. IPs given to `blockip` / `unblockip` are parsed and

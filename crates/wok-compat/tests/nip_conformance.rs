@@ -621,6 +621,10 @@ async fn nip70_reposts_that_embed_a_protected_event_are_refused() {
             with(&format!(r#""x":{}0{}"#, "[".repeat(130), "]".repeat(130))),
         ),
         ("lone surrogate", with(r#""x":"\ud800""#)),
+        (
+            "leading whitespace, lone surrogate",
+            format!(" \t\r\n{}", with(r#""x":"\ud800""#)),
+        ),
         ("huge number", with(r#""x":1e400"#)),
         ("malformed", format!("{{{protected_text}")),
         (

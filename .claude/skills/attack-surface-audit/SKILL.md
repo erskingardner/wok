@@ -17,10 +17,13 @@ through `SECURITY.md`, not a public issue or the docs.
 ## 1. Keep the inventory true
 
 Update the rows for every entry point, gate or check order the change touches,
-then run:
+then run the tests that keep the inventory in step with the code. The
+"Keeping this page current" table in `docs/attack-surface.md` lists them all:
 
 ```bash
 cargo test -p wok-compat --test attack_surface --test golden_transcripts --test setting_combinations
+cargo test -p wok-ws nip86      # NIP-86 methods and levels vs docs/nip86.md
+cargo test -p wok-cli           # `wok` commands vs the Commands table
 ```
 
 `attack_surface` fails when the listener answers a path the inventory does not
@@ -55,9 +58,13 @@ decompression, JSON, hex or base64 decoding, signature verification, database
 reads, locks, queueing on a worker. Move each after the cheapest check that
 refuses the same requests, under two rules Wok has decided:
 
-- **Identity gates stay after signature verification.** An author ban,
-  `write_policy` or membership checked on an unsigned event would let anyone
-  ask whether a key is a member. Kind, size and shape checks can go first.
+- **Identity gates on client events stay after signature verification.** An
+  author ban, `write_policy` or membership checked on an unsigned EVENT
+  would let anyone ask whether a key is a member. Kind, size and shape
+  checks can go first. NIP-98 is the exception, on purpose (#147): the
+  dashboard and NIP-86 check that the signer may use the endpoint before
+  verifying, so a stranger costs no verification, and keep it safe with the
+  next rule.
 - **Refusals that could name a key are one reply.** A signer that may not use
   an endpoint and a forged signature get the same message, at the same point
   relative to reading a request body.

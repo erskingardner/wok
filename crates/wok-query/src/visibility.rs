@@ -33,48 +33,98 @@ pub fn physical_tree_is_globally_visible(
     Ok(true)
 }
 
+/// Who may read events of a kind. Each class admits fewer readers than the
+/// one before it, and a kind listed in several classes takes the strictest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadClass {
+    /// Anyone.
+    Open,
+    /// Any reader that has authenticated, as any pubkey.
+    Authenticated,
+    /// The author and the event's first `p`-tag recipient.
+    Recipient,
+    /// The author only.
+    Owner,
+}
+
+/// The kinds of each restricted [`ReadClass`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadRestrictor {
-    pub restricted_kinds: Vec<u64>,
-    pub restrict_to_involved: bool,
+    /// Kinds only their author and first `p`-tag recipient may read, such as
+    /// DMs and gift wraps.
+    pub recipient_only: Vec<u64>,
+    /// Kinds only their author may read, such as NIP-78 app data.
+    pub owner_only: Vec<u64>,
+    /// Kinds any authenticated reader may read.
+    pub authenticated: Vec<u64>,
 }
 
 impl ReadRestrictor {
-    pub fn new(kinds: Vec<u64>, restrict_to_involved: bool) -> Self {
-        Self {
-            restricted_kinds: kinds,
-            restrict_to_involved,
+    pub fn class(&self, kind: u64) -> ReadClass {
+        if self.owner_only.contains(&kind) {
+            ReadClass::Owner
+        } else if self.recipient_only.contains(&kind) {
+            ReadClass::Recipient
+        } else if self.authenticated.contains(&kind) {
+            ReadClass::Authenticated
+        } else {
+            ReadClass::Open
         }
     }
 
+    /// Every kind in a restricted class.
+    pub fn restricted_kinds(&self) -> impl Iterator<Item = u64> + '_ {
+        self.owner_only
+            .iter()
+            .chain(&self.recipient_only)
+            .chain(&self.authenticated)
+            .copied()
+    }
+
     pub fn is_restricted_kind(&self, kind: u64) -> bool {
-        self.restricted_kinds.contains(&kind)
+        self.class(kind) != ReadClass::Open
+    }
+
+    fn restricts_nothing(&self) -> bool {
+        self.restricted_kinds().next().is_none()
+    }
+
+    /// The strictest class of the kinds `filter` can match. A filter that
+    /// names no kinds matches every class in use.
+    fn strictest_class(&self, filter: &NostrFilter) -> ReadClass {
+        match &filter.kinds {
+            Some(kinds) => kinds
+                .iter()
+                .map(|kind| self.class(kind))
+                .max()
+                .unwrap_or(ReadClass::Open),
+            None if !self.owner_only.is_empty() => ReadClass::Owner,
+            None if !self.recipient_only.is_empty() => ReadClass::Recipient,
+            None if !self.authenticated.is_empty() => ReadClass::Authenticated,
+            None => ReadClass::Open,
+        }
     }
 
     pub fn is_filter_fully_restricted(&self, filter: &NostrFilter) -> bool {
         let Some(kinds) = &filter.kinds else {
             return false;
         };
-        if self.restricted_kinds.is_empty() {
+        if self.restricts_nothing() {
             return false;
         }
-        kinds.iter().all(|k| self.restricted_kinds.contains(&k))
+        kinds.iter().all(|k| self.is_restricted_kind(k))
     }
 
     /// Whether this rule can hide any event `fg` matches from a reader that
     /// has not authenticated.
     pub fn may_hide_matches(&self, fg: &NostrFilterGroup) -> bool {
-        self.restrict_to_involved
-            && !self.restricted_kinds.is_empty()
-            && fg.filters.iter().any(|f| {
-                f.kinds
-                    .as_ref()
-                    .is_none_or(|kinds| kinds.iter().any(|k| self.is_restricted_kind(k)))
-            })
+        fg.filters
+            .iter()
+            .any(|f| self.strictest_class(f) != ReadClass::Open)
     }
 
     pub fn is_filter_group_fully_restricted(&self, fg: &NostrFilterGroup) -> bool {
-        if self.restricted_kinds.is_empty() || fg.filters.is_empty() {
+        if self.restricts_nothing() || fg.filters.is_empty() {
             return false;
         }
         fg.filters
@@ -83,18 +133,12 @@ impl ReadRestrictor {
     }
 
     pub fn is_filter_allowed_to_count(&self, fg: &NostrFilterGroup, authed: Option<&[u8]>) -> bool {
-        if self.restricted_kinds.is_empty() {
-            return true;
-        }
         for f in &fg.filters {
-            // Admission requires a scoped filter. The shared per-event check
-            // additionally enforces first-recipient semantics before counting.
-            let has_restricted = f
-                .kinds
-                .as_ref()
-                .map(|kinds| kinds.iter().any(|k| self.restricted_kinds.contains(&k)))
-                .unwrap_or(true);
-            if !has_restricted {
+            // Admission requires a filter scoped to what `authed` may read.
+            // The shared per-event check additionally enforces
+            // first-recipient semantics before counting.
+            let class = self.strictest_class(f);
+            if class == ReadClass::Open {
                 continue;
             }
             let Some(pk) = authed else {
@@ -115,7 +159,12 @@ impl ReadRestrictor {
                 .get(&'p')
                 .map(|t| t.size() > 0 && (0..t.size()).all(|i| t.at(i) == pk))
                 .unwrap_or(false);
-            if !author_scoped && !p_scoped && !and_p_scoped {
+            let scoped = match class {
+                ReadClass::Open | ReadClass::Authenticated => true,
+                ReadClass::Recipient => author_scoped || p_scoped || and_p_scoped,
+                ReadClass::Owner => author_scoped,
+            };
+            if !scoped {
                 return false;
             }
         }
@@ -127,16 +176,20 @@ impl ReadRestrictor {
         packed: PackedEventView<'_>,
         authed: Option<&[u8]>,
     ) -> bool {
-        if !(self.is_restricted_kind(packed.kind()) && self.restrict_to_involved) {
+        let class = self.class(packed.kind());
+        if class == ReadClass::Open {
             return true;
         }
         let Some(pk) = authed else {
             return false;
         };
         // Authors can always read their own events, including restricted
-        // kinds that carry no `p` tag (e.g. NIP-78 app data).
-        if pk == packed.pubkey() {
+        // kinds that carry no `p` tag.
+        if class == ReadClass::Authenticated || pk == packed.pubkey() {
             return true;
+        }
+        if class == ReadClass::Owner {
+            return false;
         }
         let mut recipient = false;
         packed.foreach_tag(|name, val| {
@@ -296,7 +349,7 @@ impl ReadRestrictor {
         event: PackedEventView<'_>,
         identities: &[[u8; 32]],
     ) -> bool {
-        if !self.is_restricted_kind(event.kind()) || !self.restrict_to_involved {
+        if !self.is_restricted_kind(event.kind()) {
             return true;
         }
         identities
@@ -308,12 +361,19 @@ impl ReadRestrictor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
+
+    fn recipient_only(kinds: Vec<u64>) -> ReadRestrictor {
+        ReadRestrictor {
+            recipient_only: kinds,
+            ..ReadRestrictor::default()
+        }
+    }
 
     #[test]
     fn fully_restricted_kinds() {
-        let r = ReadRestrictor::new(vec![4, 1059], true);
+        let r = recipient_only(vec![4, 1059]);
         let fg = NostrFilterGroup::from_value(&json!({"kinds":[4]}), 500, 3, 16).unwrap();
         assert!(r.is_filter_group_fully_restricted(&fg));
         let fg = NostrFilterGroup::from_value(&json!({"kinds":[1,4]}), 500, 3, 16).unwrap();
@@ -322,7 +382,7 @@ mod tests {
 
     #[test]
     fn send_restricted_to_p_tag() {
-        let r = ReadRestrictor::new(vec![4], true);
+        let r = recipient_only(vec![4]);
         let mut tags = PackedEventTagBuilder::default();
         tags.add('p', &[9u8; 32]).unwrap();
         let ev = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 1, 4, 0, &tags).unwrap();
@@ -403,7 +463,7 @@ mod tests {
 
     #[test]
     fn author_reads_restricted_event_without_p_tag() {
-        let r = ReadRestrictor::new(vec![30078], true);
+        let r = recipient_only(vec![30078]);
         let tags = PackedEventTagBuilder::default();
         let ev = PackedEventBuilder::build(&[1u8; 32], &[2u8; 32], 1, 30078, 0, &tags).unwrap();
         assert!(!r.should_send_to_subscriber(ev.view(), None));
@@ -412,8 +472,76 @@ mod tests {
     }
 
     #[test]
+    fn each_class_admits_its_readers() {
+        let r = ReadRestrictor {
+            recipient_only: vec![4, 30078],
+            owner_only: vec![30078],
+            authenticated: vec![7],
+        };
+        let (author, recipient, stranger) = ([2u8; 32], [9u8; 32], [3u8; 32]);
+        let mut tags = PackedEventTagBuilder::default();
+        tags.add('p', &recipient).unwrap();
+        // (kind, anonymous, author, first p-tag recipient, anyone else)
+        for (kind, readers) in [
+            (1, [true, true, true, true]),
+            (7, [false, true, true, true]),
+            (4, [false, true, true, false]),
+            // Listed as recipient-only too, but owner-only is stricter.
+            (30078, [false, true, false, false]),
+        ] {
+            let ev = PackedEventBuilder::build(&[1u8; 32], &author, 1, kind, 0, &tags).unwrap();
+            let read = [
+                None,
+                Some(&author[..]),
+                Some(&recipient[..]),
+                Some(&stranger[..]),
+            ]
+            .map(|pk| r.should_send_to_subscriber(ev.view(), pk));
+            assert_eq!(read, readers, "kind {kind}");
+            assert_eq!(
+                r.should_send_to_identities(ev.view(), &[stranger, recipient]),
+                readers[2],
+                "kind {kind}"
+            );
+        }
+        assert_eq!(r.class(30078), ReadClass::Owner);
+        assert_eq!(r.class(1), ReadClass::Open);
+    }
+
+    #[test]
+    fn counts_are_scoped_to_the_strictest_class() {
+        let r = ReadRestrictor {
+            recipient_only: vec![4],
+            owner_only: vec![30078],
+            authenticated: vec![7],
+        };
+        let me = [9u8; 32];
+        let count = |filter: Value, authed: Option<&[u8]>| {
+            let fg = NostrFilterGroup::from_value(&filter, 500, 3, 16).unwrap();
+            r.is_filter_allowed_to_count(&fg, authed)
+        };
+        let mine = hex::encode(me);
+        // Any authenticated reader may count kind 7.
+        assert!(!count(json!({"kinds":[7]}), None));
+        assert!(count(json!({"kinds":[7]}), Some(&me)));
+        // A recipient may count the DMs tagging them, but not app data.
+        assert!(count(json!({"kinds":[4],"#p":[mine]}), Some(&me)));
+        assert!(!count(json!({"kinds":[30078],"#p":[mine]}), Some(&me)));
+        assert!(count(json!({"kinds":[30078],"authors":[mine]}), Some(&me)));
+        // Without kinds a filter can match the owner-only kinds.
+        assert!(!count(json!({"#p":[mine]}), Some(&me)));
+        assert!(count(json!({"authors":[mine]}), Some(&me)));
+        // Nothing is restricted without a class.
+        let open = ReadRestrictor::default();
+        let fg = NostrFilterGroup::from_value(&json!({}), 500, 3, 16).unwrap();
+        assert!(open.is_filter_allowed_to_count(&fg, None));
+        assert!(!open.may_hide_matches(&fg));
+        assert!(r.may_hide_matches(&fg));
+    }
+
+    #[test]
     fn count_without_kinds_cannot_leak_restricted_population() {
-        let r = ReadRestrictor::new(vec![4, 1059], true);
+        let r = recipient_only(vec![4, 1059]);
         let broad = NostrFilterGroup::from_value(&json!({}), 500, 3, 16).unwrap();
         assert!(!r.is_filter_allowed_to_count(&broad, None));
         assert!(!r.is_filter_allowed_to_count(&broad, Some(&[9u8; 32])));
@@ -426,7 +554,7 @@ mod tests {
 
     #[test]
     fn nip91_required_p_tag_safely_scopes_restricted_count() {
-        let r = ReadRestrictor::new(vec![4], true);
+        let r = recipient_only(vec![4]);
         let authed = [9u8; 32];
         let other = [8u8; 32];
         let scoped = NostrFilterGroup::from_value(

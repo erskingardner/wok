@@ -920,7 +920,7 @@ mod tests {
             .contains("relay.abuse.req_burst = 40 (line 142,"));
         assert!(check
             .detail
-            .contains("relay.auth.restricted_read_kinds = [4, 1059] (line 101,"));
+            .contains("relay.auth.recipient_only_kinds = [4, 1059] (line 101,"));
         assert!(check
             .detail
             .contains("relay.max_req_filter_size = 65536 (line 54,"));

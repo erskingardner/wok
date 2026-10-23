@@ -310,8 +310,13 @@ pub struct Nip62Config {
 pub struct AuthConfig {
     pub enabled: bool,
     pub service_url: String,
-    pub restricted_read_kinds: Vec<u64>,
-    pub restrict_read_to_involved_pubkey: bool,
+    /// Kinds only their author and first `p`-tag recipient may read.
+    pub recipient_only_kinds: Vec<u64>,
+    /// Kinds only their author may read, and only their author may publish
+    /// (NIP-78).
+    pub owner_only_kinds: Vec<u64>,
+    /// Kinds any authenticated connection may read.
+    pub authenticated_kinds: Vec<u64>,
     /// When true, only NIP-86 allowlisted or role-holding pubkeys (and
     /// operator admin pubkeys) may write events.
     pub restrict_writes: bool,
@@ -397,10 +402,12 @@ impl Default for Config {
                     enabled: true,
                     service_url: String::new(),
                     // Private messages and gift wraps, including NIP-59's
-                    // ephemeral kind 21059, fail closed until the operator
-                    // configures the relay URL required by NIP-42.
-                    restricted_read_kinds: vec![4, 1059, 21059],
-                    restrict_read_to_involved_pubkey: true,
+                    // ephemeral kind 21059, and NIP-78 app data fail closed
+                    // until the operator configures the relay URL required
+                    // by NIP-42.
+                    recipient_only_kinds: vec![4, 1059, 21059],
+                    owner_only_kinds: wok_event::APP_DATA_KINDS.to_vec(),
+                    authenticated_kinds: Vec::new(),
                     restrict_writes: false,
                 },
                 info: InfoConfig {
@@ -761,22 +768,33 @@ impl Config {
         ))
     }
 
+    /// Who may read each kind: `relay.auth`'s read classes.
+    pub fn read_restrictor(&self) -> crate::restrict::ReadRestrictor {
+        let auth = &self.relay.auth;
+        crate::restrict::ReadRestrictor {
+            recipient_only: auth.recipient_only_kinds.clone(),
+            owner_only: auth.owner_only_kinds.clone(),
+            authenticated: auth.authenticated_kinds.clone(),
+        }
+    }
+
     /// Explain when restricted reads are deliberately failing closed because
     /// the relay cannot complete NIP-42 authentication.
     pub fn auth_configuration_warning(&self) -> Option<String> {
-        if self.relay.auth.restricted_read_kinds.is_empty() {
+        let mut kinds: Vec<u64> = self.read_restrictor().restricted_kinds().collect();
+        if kinds.is_empty() {
             return None;
         }
+        kinds.sort_unstable();
+        kinds.dedup();
         if !self.relay.auth.enabled {
             return Some(format!(
-                "restricted read kinds {:?} cannot be read because relay.auth.enabled is false",
-                self.relay.auth.restricted_read_kinds
+                "restricted read kinds {kinds:?} cannot be read because relay.auth.enabled is false"
             ));
         }
         if self.relay.auth.service_url.is_empty() {
             return Some(format!(
-                "restricted read kinds {:?} cannot be read until relay.auth.service_url is configured",
-                self.relay.auth.restricted_read_kinds
+                "restricted read kinds {kinds:?} cannot be read until relay.auth.service_url is configured"
             ));
         }
         None
@@ -898,11 +916,24 @@ impl Config {
             cfg.relay.auth.service_url = v.clone();
         }
         if let Some(v) = map.get("relay.auth.restrictedReadKinds") {
-            cfg.relay.auth.restricted_read_kinds = parse_kinds(v)?;
+            cfg.relay.auth.recipient_only_kinds = parse_kinds(v)?;
         }
+        let mut involved_only = true;
         assign_bool(&map, "relay.auth.restrictReadToInvolvedPubkey", |b| {
-            cfg.relay.auth.restrict_read_to_involved_pubkey = b
+            involved_only = b
         })?;
+        if !involved_only {
+            // Wok has no mode that lets a REQ mixing in another kind read
+            // them without AUTH: the nearest is any authenticated reader.
+            let auth = &mut cfg.relay.auth;
+            let moved = std::mem::take(&mut auth.recipient_only_kinds);
+            auth.authenticated_kinds = moved.clone();
+            cfg.deprecations.push(format!(
+                "relay.auth.restrictReadToInvolvedPubkey = false has no Wok equivalent: kinds \
+                 {moved:?} become relay.auth.authenticated_kinds, which any authenticated \
+                 connection may read and no other can"
+            ));
+        }
         if let Some(v) = map.get("relay.info.name") {
             cfg.relay.info.name = v.clone();
         }
@@ -1206,32 +1237,28 @@ impl Config {
                 new.relay.abuse,
             ));
         }
-        // NIP-42 read-restriction scope: silently narrowing (or emptying)
-        // restricted_read_kinds is fail-open, so call out dropped kinds
-        // explicitly — those kinds are readable unauthenticated from now on.
+        // NIP-42 read-restriction scope: silently narrowing (or emptying) a
+        // read class is fail-open, so name each kind that more readers can
+        // read from now on.
         let prev = &self.relay.auth;
         let new_auth = &new.relay.auth;
+        let (prev_reads, new_reads) = (self.read_restrictor(), new.read_restrictor());
         if prev.enabled != new_auth.enabled
             || prev.service_url != new_auth.service_url
-            || prev.restricted_read_kinds != new_auth.restricted_read_kinds
-            || prev.restrict_read_to_involved_pubkey != new_auth.restrict_read_to_involved_pubkey
+            || prev_reads != new_reads
         {
-            let dropped: Vec<u64> = prev
-                .restricted_read_kinds
-                .iter()
-                .filter(|k| !new_auth.restricted_read_kinds.contains(k))
-                .copied()
+            let mut widened: Vec<u64> = prev_reads
+                .restricted_kinds()
+                .filter(|&kind| new_reads.class(kind) < prev_reads.class(kind))
                 .collect();
-            let note = if !dropped.is_empty() {
-                format!(
-                    " (restricted kinds DROPPED: {dropped:?} — previously-restricted kinds are now publicly readable)"
-                )
-            } else if prev.restrict_read_to_involved_pubkey
-                && !new_auth.restrict_read_to_involved_pubkey
-            {
-                " (restrict_read_to_involved_pubkey DISABLED — the per-event filter is skipped; mixed-kind REQs can leak restricted kinds)".to_string()
-            } else {
+            widened.sort_unstable();
+            widened.dedup();
+            let note = if widened.is_empty() {
                 String::new()
+            } else {
+                format!(
+                    " (read access WIDENED for kinds {widened:?}: readers the old classes refused can read them now)"
+                )
             };
             changes.push(format!(
                 "relay.auth changed: {:?} -> {:?}{}",
@@ -2106,7 +2133,7 @@ mod tests {
         assert_eq!(c.relay.port, 7777);
         assert_eq!(c.relay.nofiles, 1000);
         assert_eq!(c.relay.real_ip_header, "x-real-ip");
-        assert_eq!(c.relay.auth.restricted_read_kinds, vec![4, 1059]);
+        assert_eq!(c.relay.auth.recipient_only_kinds, vec![4, 1059]);
         assert_eq!(c.relay.info.pubkey, "deadbeef");
         assert_eq!(c.relay.info.self_pk, "cafe");
         assert_eq!(c.relay.info.terms, "https://example.com/t");
@@ -2137,6 +2164,33 @@ mod tests {
         assert_eq!(c.relay.unix.auth_uids, vec![501, 502]);
         assert_eq!(c.relay.unix.auth_gids, vec![20]);
         assert_eq!(c.relay.unix.max_pending_outbound_bytes, 2048);
+    }
+
+    #[test]
+    fn strfry_read_restrictions_become_read_classes() {
+        let involved = Config::translate_strfry(
+            "relay { auth { restrictedReadKinds = \"4,1059\"\n \
+             restrictReadToInvolvedPubkey = true } }",
+        )
+        .unwrap()
+        .config;
+        assert_eq!(involved.relay.auth.recipient_only_kinds, [4, 1059]);
+        assert!(involved.relay.auth.authenticated_kinds.is_empty());
+        assert!(involved.deprecations.is_empty());
+        // Without the involved-pubkey rule, any authenticated reader, and
+        // never an anonymous one.
+        let any = Config::translate_strfry(
+            "relay { auth { restrictedReadKinds = \"4,1059\"\n \
+             restrictReadToInvolvedPubkey = false } }",
+        )
+        .unwrap()
+        .config;
+        assert!(any.relay.auth.recipient_only_kinds.is_empty());
+        assert_eq!(any.relay.auth.authenticated_kinds, [4, 1059]);
+        assert_eq!(any.deprecations.len(), 1);
+        assert!(any.deprecations[0].contains("authenticated_kinds"));
+        // Neither touches NIP-78's owner-only kinds.
+        assert_eq!(any.relay.auth.owner_only_kinds, [78, 30078]);
     }
 
     #[test]
@@ -2266,7 +2320,7 @@ mod tests {
 
             [relay.auth]
             enabled = true
-            restricted_read_kinds = [4]
+            recipient_only_kinds = [4]
 
             [relay.nip62]
             enabled = true
@@ -2281,7 +2335,7 @@ mod tests {
 
             [relay.auth]
             enabled = true
-            restricted_read_kinds = [4]
+            recipient_only_kinds = [4]
 
             [relay.nip62]
             enabled = true
@@ -2289,27 +2343,68 @@ mod tests {
         )
         .unwrap();
         assert!(base.security_scope_changes(&same).is_empty());
-        // Emptying restricted_read_kinds drops kind 4 (the access scope widens),
-        // and the note must pin the exact kind that is now publicly readable.
-        let widened = Config::parse_toml("[relay.auth]\nrestricted_read_kinds = []\n").unwrap();
+        // Emptying recipient_only_kinds makes kind 4 public (the access scope
+        // widens), and the note must pin the exact kind.
+        let widened = Config::parse_toml(
+            "[relay.auth]
+recipient_only_kinds = []
+",
+        )
+        .unwrap();
         let changes = base.security_scope_changes(&widened);
         assert!(
             changes
                 .iter()
-                .any(|c| c.contains("relay.auth changed") && c.contains("DROPPED: [4]")),
+                .any(|c| c.contains("relay.auth changed") && c.contains("WIDENED for kinds [4]")),
+            "{changes:?}"
+        );
+        // Moving a kind to a class with more readers widens it too, and a
+        // stricter class does not.
+        let authenticated = Config::parse_toml(
+            "[relay.auth]
+recipient_only_kinds = []
+authenticated_kinds = [4]
+",
+        )
+        .unwrap();
+        let changes = base.security_scope_changes(&authenticated);
+        assert!(
+            changes.iter().any(|c| c.contains("WIDENED for kinds [4]")),
+            "{changes:?}"
+        );
+        let owner = Config::parse_toml(
+            "[relay.auth]
+owner_only_kinds = [4, 78, 30078]
+",
+        )
+        .unwrap();
+        let changes = base.security_scope_changes(&owner);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("relay.auth changed") && !c.contains("WIDENED")),
             "{changes:?}"
         );
         // Omitting [relay.auth] merges factory defaults [4, 1059, 21059];
         // starting from a superset the defaults would drop ([4, 44, 1059]) is the
         // issue's omit-reverts-to-defaults fail-open path.
-        let superset =
-            Config::parse_toml("[relay.auth]\nrestricted_read_kinds = [4, 44, 1059]\n").unwrap();
-        let partial = Config::parse_toml("[relay]\nnegentropy_enabled = true\n").unwrap();
+        let superset = Config::parse_toml(
+            "[relay.auth]
+recipient_only_kinds = [4, 44, 1059]
+",
+        )
+        .unwrap();
+        let partial = Config::parse_toml(
+            "[relay]
+negentropy_enabled = true
+",
+        )
+        .unwrap();
         let changes = superset.security_scope_changes(&partial);
         assert!(
             changes
                 .iter()
-                .any(|c| c.contains("relay.auth changed") && c.contains("DROPPED: [44]")),
+                .any(|c| c.contains("relay.auth changed") && c.contains("WIDENED for kinds [44]")),
             "{changes:?}"
         );
         // Toggling nip62 or negentropy flags is reported too.
@@ -2524,13 +2619,19 @@ mod tests {
     }
 
     #[test]
-    fn restricted_read_kinds_are_private_by_default_but_can_be_disabled() {
-        let c = Config::parse_toml("[relay.auth]\nrestricted_read_kinds = []\n").unwrap();
-        assert!(c.relay.auth.restricted_read_kinds.is_empty());
+    fn read_classes_are_private_by_default_but_can_be_emptied() {
+        let auth = Config::default().relay.auth;
+        assert_eq!(auth.recipient_only_kinds, vec![4, 1059, 21059]);
+        assert_eq!(auth.owner_only_kinds, vec![78, 30078]);
+        assert!(auth.authenticated_kinds.is_empty());
+        let c =
+            Config::parse_toml("[relay.auth]\nrecipient_only_kinds = []\nowner_only_kinds = []\n")
+                .unwrap();
         assert_eq!(
-            Config::default().relay.auth.restricted_read_kinds,
-            vec![4, 1059, 21059]
+            c.read_restrictor(),
+            crate::restrict::ReadRestrictor::default()
         );
+        assert_eq!(c.auth_configuration_warning(), None);
     }
 
     #[test]
@@ -2571,10 +2672,9 @@ mod tests {
     #[test]
     fn restricted_reads_report_unusable_auth() {
         let mut c = Config::default();
-        assert!(c
-            .auth_configuration_warning()
-            .unwrap()
-            .contains("service_url"));
+        let warning = c.auth_configuration_warning().unwrap();
+        assert!(warning.contains("service_url"), "{warning}");
+        assert!(warning.contains("[4, 78, 1059, 21059, 30078]"), "{warning}");
         c.relay.auth.service_url = "wss://relay.example.com/".into();
         assert_eq!(c.auth_configuration_warning(), None);
         c.relay.auth.enabled = false;
@@ -2595,7 +2695,7 @@ mod tests {
             port = 9000
 
             [relay.auth]
-            restricted_read_kinds = [4, 1059]
+            recipient_only_kinds = [4, 1059]
 
             [relay.unix]
             mode = 0o640
@@ -2605,7 +2705,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.db, PathBuf::from("/tmp/wok-db"));
         assert_eq!(c.relay.port, 9000);
-        assert_eq!(c.relay.auth.restricted_read_kinds, vec![4, 1059]);
+        assert_eq!(c.relay.auth.recipient_only_kinds, vec![4, 1059]);
         assert_eq!(c.relay.unix.mode, 0o640);
         assert_eq!(c.relay.unix.auth_uids, vec![501, 502]);
         assert_eq!(
@@ -2665,7 +2765,7 @@ mod tests {
             port = 9000
 
             [relay.auth]
-            restricted_read_kinds = [4, 1059]
+            recipient_only_kinds = [4, 1059]
 
             [relay.abuse]
             event_burst = 500
@@ -2854,9 +2954,10 @@ max_event_size = 99999999999
         assert_eq!(line("relay.port"), Some(1));
         assert_eq!(line("admin.enabled"), Some(2));
         assert_eq!(line("admin.auth_window_secs"), Some(2));
-        assert_eq!(line("relay.auth.restricted_read_kinds"), Some(5));
+        // A deprecated key's translation is on its line.
+        assert_eq!(line("relay.auth.recipient_only_kinds"), Some(5));
         assert_eq!(
-            entry(&explained, "relay.auth.restricted_read_kinds").value,
+            entry(&explained, "relay.auth.recipient_only_kinds").value,
             "[4, 1059]"
         );
         // Normalized values are reported as the relay uses them.

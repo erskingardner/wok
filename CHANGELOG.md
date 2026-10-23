@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- NIP-78 app data (kinds 78 and 30078) is private to its author, as NIP-78
+  recommends. It is served only to a connection authenticated as the author
+  and accepted only from one: an EVENT without AUTH is refused with
+  `auth-required:` and a challenge, and one sent on a connection
+  authenticated as another key with `restricted:`. Before, anyone could read
+  or publish it (#97 B13). NIP-78 is now advertised while AUTH is usable.
 - Events from throwaway keys are charged to the AUTHed identity that sent
   them. On a connection that has authenticated, an event whose author is not
   one of its identities, such as a Marmot 445 signed by a fresh key or a
@@ -82,6 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Read classes in `[relay.auth]`: `recipient_only_kinds` (default
+  `[4, 1059, 21059]`, the author and first `p`-tag recipient),
+  `owner_only_kinds` (default `[78, 30078]`, the author alone) and
+  `authenticated_kinds` (default empty, any authenticated connection). A kind
+  in several classes gets the strictest. See `docs/config.md`, Read classes.
 - A `(tag, kind, created_at)` index, the LMDB table `wok_Event__tagKind`, for
   filters that combine one single-letter tag with `kinds`: DM inboxes
   (`{"#p":[me],"kinds":[1059]}`), zaps, reactions to a note, `#a` filters.
@@ -206,6 +217,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Preset changes
 
+- `public`: `relay.auth.owner_only_kinds` is `[78, 30078]` (new), so NIP-78
+  app data is read and published only by its author (see Security). Apps
+  that publish public data in these kinds can no longer be read by other
+  users; set `owner_only_kinds = []` to serve them as before.
 - `public`: `events.reject_older_than_secs` is `0`, no lower bound on
   `created_at` (was 94608000, three years), and NIP-11 omits
   `created_at_lower_limit`. A 2020 profile, follow list or deletion can be
@@ -379,6 +394,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `relay.auth.restricted_read_kinds` and
+  `relay.auth.restrict_read_to_involved_pubkey`. A file that still sets them
+  loads with a deprecation warning, at startup, on reload and in `wok
+  doctor`, and `wok config minimize` or a dashboard save rewrites it:
+  `restricted_read_kinds` becomes `recipient_only_kinds` with the same
+  meaning, and `restrict_read_to_involved_pubkey = true` is dropped.
+  `restrict_read_to_involved_pubkey = false` let a REQ that mixed in another
+  kind read the restricted kinds without AUTH; its kinds become
+  `authenticated_kinds`, which any authenticated connection may read and no
+  other can. `wok migrate strfry` translates strfry's keys the same way.
 - `relay.abuse.max_query_cost`. `relay.abuse.max_query_work` replaces it,
   in units in which old values mean something else: 1,000, the default
   through 0.7, would refuse every filter without a `limit`, including MDK's

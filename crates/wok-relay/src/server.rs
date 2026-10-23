@@ -21,7 +21,6 @@ use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{
     has_reason_prefix, push_json_str, ClientCommand, EoseHints, ParseFailure, RelayMessage,
 };
-use crate::restrict::ReadRestrictor;
 use crate::source::TransportSource;
 use crate::supported_nips;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
@@ -1509,13 +1508,6 @@ fn run_db_watch(env: Env, mon_txs: Vec<Sender<MonitorData>>, shutdown: Arc<Atomi
     }
 }
 
-fn restrictor(cfg: &Config) -> ReadRestrictor {
-    ReadRestrictor::new(
-        cfg.relay.auth.restricted_read_kinds.clone(),
-        cfg.relay.auth.restrict_read_to_involved_pubkey,
-    )
-}
-
 fn filter_validator(cfg: &Config) -> FilterValidator {
     let mut allowed = std::collections::HashSet::new();
     for p in cfg.relay.filter_validation.allowed_kinds.split(',') {
@@ -2480,62 +2472,60 @@ fn ingest_event(
         true
     });
 
+    // NIP-70 protected events, and kinds only their author may read, such as
+    // NIP-78 app data, are accepted only on a connection authenticated as
+    // their author.
+    let owner_only = cfg.relay.auth.owner_only_kinds.contains(&packed.kind());
     let mut authed = None;
-    if found_protected && !is_vanish_request {
-        if !cfg.auth_usable() {
+    if (found_protected || owner_only) && !is_vanish_request {
+        let refusal = if !cfg.auth_usable() {
+            Some(if found_protected {
+                "blocked: event marked as protected".to_string()
+            } else {
+                format!(
+                    "restricted: kind {} needs AUTH as its author, which this relay does not offer",
+                    packed.kind()
+                )
+            })
+        } else {
+            let auth_required = || {
+                if found_protected {
+                    "auth-required: event marked as protected".to_string()
+                } else {
+                    format!(
+                        "auth-required: kind {} is accepted only from its author",
+                        packed.kind()
+                    )
+                }
+            };
+            match auth.get(&conn_id) {
+                None => {
+                    issue_challenge(conns, metrics, auth, conn_id);
+                    Some(auth_required())
+                }
+                Some(asess) if asess.authed.is_none() => Some(auth_required()),
+                Some(asess) => {
+                    let pk: [u8; 32] = packed.pubkey().try_into().unwrap();
+                    if asess.identities.contains(&pk) {
+                        authed = Some(pk);
+                        None
+                    } else {
+                        Some("restricted: must be published by the author".to_string())
+                    }
+                }
+            }
+        };
+        if let Some(message) = refusal {
             conns.send(
                 conn_id,
                 RelayMessage::Ok {
                     event_id: id_hex,
                     accepted: false,
-                    message: "blocked: event marked as protected".into(),
+                    message,
                 },
                 metrics,
             );
             return;
-        }
-        match auth.get(&conn_id) {
-            None => {
-                issue_challenge(conns, metrics, auth, conn_id);
-                conns.send(
-                    conn_id,
-                    RelayMessage::Ok {
-                        event_id: id_hex,
-                        accepted: false,
-                        message: "auth-required: event marked as protected".into(),
-                    },
-                    metrics,
-                );
-                return;
-            }
-            Some(asess) if asess.authed.is_none() => {
-                conns.send(
-                    conn_id,
-                    RelayMessage::Ok {
-                        event_id: id_hex,
-                        accepted: false,
-                        message: "auth-required: event marked as protected".into(),
-                    },
-                    metrics,
-                );
-                return;
-            }
-            Some(asess) => {
-                let pk: [u8; 32] = packed.pubkey().try_into().unwrap();
-                if !asess.identities.contains(&pk) {
-                    conns.send(
-                        conn_id,
-                        RelayMessage::Ok {
-                            event_id: id_hex,
-                            accepted: false,
-                            message: "restricted: must be published by the author".into(),
-                        },
-                        metrics,
-                    );
-                    return;
-                }
-                authed = Some(pk);
-            }
         }
     }
 
@@ -2804,7 +2794,7 @@ fn ingest_req(
     // NIP-67 lets EOSE say that authenticating may reveal more, but only once
     // a challenge was sent. The connection normally got one on connect; one
     // that connected while AUTH was unusable gets it now, ahead of the EOSE.
-    if cfg.auth_usable() && restrictor(cfg).may_hide_matches(&sub.filter_group) {
+    if cfg.auth_usable() && cfg.read_restrictor().may_hide_matches(&sub.filter_group) {
         issue_challenge(conns, metrics, auth, conn_id);
         sub.auth_challenged = true;
     }
@@ -2910,7 +2900,7 @@ fn admit_req(
     )?;
 
     let authed = auth.get(&conn_id).and_then(|a| a.authed);
-    let r = restrictor(cfg);
+    let r = cfg.read_restrictor();
     let requires_auth = if count_only {
         !auth.get(&conn_id).is_some_and(|session| {
             session
@@ -3262,7 +3252,7 @@ fn ingest_neg(
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
     check_query_work(cfg, metrics, query_cost, "NEG-OPEN")?;
-    let r = restrictor(cfg);
+    let r = cfg.read_restrictor();
     if r.is_filter_group_fully_restricted(&fg)
         && auth.get(&conn_id).and_then(|a| a.authed).is_none()
     {
@@ -3284,7 +3274,7 @@ fn ingest_neg(
 
 fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::ReadVisibility {
     crate::restrict::ReadVisibility {
-        restrictor: restrictor(cfg),
+        restrictor: cfg.read_restrictor(),
         identities,
         ephemeral_lifetime_secs: Some(cfg.events.ephemeral_lifetime_secs),
         include_auth_events: false,
@@ -3949,7 +3939,7 @@ fn run_req_monitor(
             continue;
         }
         let cfg_snap = cfg.read();
-        let r = restrictor(&cfg_snap);
+        let r = cfg_snap.read_restrictor();
         let global_visibility = read_visibility(&cfg_snap, vec![]);
         let max_event_size = cfg_snap.events.max_event_size;
         let txn = match begin_read(&env) {
@@ -6644,7 +6634,7 @@ mod tests {
         h.register(2, json!({"kinds": [1, 20001]}), 0);
         h.ephemeral("restricted while held");
         h.store("restricted while held");
-        h.cfg.write().relay.auth.restricted_read_kinds = vec![1, 20001];
+        h.cfg.write().relay.auth.recipient_only_kinds = vec![1, 20001];
         assert_eq!(h.history_done(2, 0), [eose_frame()]);
     }
 

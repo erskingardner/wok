@@ -335,7 +335,7 @@ async fn auth_required_only_while_authenticating_can_help() {
 async fn auth_challenge_is_sent_on_connect() {
     let relay = Relay::new(|cfg| {
         cfg.relay.auth.service_url = SERVICE_URL.into();
-        cfg.relay.auth.restricted_read_kinds = vec![24133];
+        cfg.relay.auth.recipient_only_kinds = vec![24133];
     });
     let client_key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
     let client_pk = hex::encode(client_key.x_only_public_key().0.serialize());

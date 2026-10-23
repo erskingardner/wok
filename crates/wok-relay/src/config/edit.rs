@@ -333,7 +333,7 @@ max_num_tags = 8000
              max_total_events_per_req = 2000\n\
              \n\
              [relay.auth]\n\
-             restricted_read_kinds = [4, 1059]\n\
+             recipient_only_kinds = [4, 1059]\n\
              \n\
              [relay.abuse]\n\
              req_rate_per_second = 20\n\
@@ -344,9 +344,11 @@ max_num_tags = 8000
              max_stored_events = 10000000\n\
              max_stored_events_per_pubkey = 100000\n"
         );
-        // Every line left is one of the sample's, in its order.
+        // Every line left is one of the sample's, in its order, but for the
+        // deprecated key it renamed.
         let mut remaining = sample.lines();
         for line in minimized.text.lines() {
+            let line = line.replace("recipient_only_kinds", "restricted_read_kinds");
             assert!(remaining.any(|kept| kept == line), "{line:?} is new");
         }
     }

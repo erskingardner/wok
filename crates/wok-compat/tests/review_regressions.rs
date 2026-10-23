@@ -468,7 +468,9 @@ async fn sync_global_budget_spans_workers_and_close_releases_it() {
 async fn author_reads_own_restricted_event_without_p_tag() {
     let relay = Relay::new(|cfg| {
         cfg.relay.auth.service_url = "wss://review.example".into();
-        cfg.relay.auth.restricted_read_kinds = vec![30078];
+        // Recipient-only, so the author reads it although it has no `p` tag.
+        cfg.relay.auth.recipient_only_kinds = vec![30078];
+        cfg.relay.auth.owner_only_kinds.clear();
     });
     let (conn, mut rx) = relay.connection().await;
     conn.client_message(json!(["REQ","challenge",{"kinds":[30078]}]).to_string())

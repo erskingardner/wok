@@ -17,11 +17,12 @@ arbitrary list.
 | 42 | AUTH | ingest AUTH, multiple authenticated keys per connection, kind 22242 refused as EVENT and by CLI downloads/import, and hidden from every read | unit + multi-key e2e when serviceUrl set, `nip_conformance.rs`, `wok-cli/tests/sync.rs` | AUTH enabled and serviceUrl set |
 | 45 | COUNT + mergeable HyperLogLog | REQ worker + `wok-query` HLL | `nip_conformance.rs`, `e2e_transports.rs`, HLL unit vectors | `maxFilterLimitCount > 0` |
 | 50 | Search capability | transactional LMDB term/bigram index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs` | always |
-| 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, restricted kinds 1059 and 21059 with involved-pubkey enforcement, and `events.ephemeral_persistence = "live_only"` |
+| 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, kinds 1059 and 21059 in `relay.auth.recipient_only_kinds` and no stricter class, and `events.ephemeral_persistence = "live_only"` |
 | 62 | Request to Vanish | persistent maximum-timestamp markers, immediate query/rebroadcast suppression, gift-wrap recipient cleanup, and bounded physical deletion | `nip62_vanish.rs`, relay e2e | `relay.nip62.enabled` |
 | 67 | EOSE completeness hint | `wok-query` scan completeness and bounded peek, req worker, monitor EOSE | `nip_conformance.rs`, `completeness.rs`, `e2e_transports.rs` | always |
 | 70 | Protected events | `-` tag + AUTH | `nip_conformance.rs` | always |
 | 77 | Negentropy | `wok-negentropy` | protocol unit tests | `negentropy.enabled` |
+| 78 | Arbitrary custom app data | kinds 78 and 30078 served only to, and accepted only from, a connection authenticated as their author | `nip_conformance.rs`, `access_model.rs` | usable AUTH and kinds 78 and 30078 in `relay.auth.owner_only_kinds` |
 | 86 | Relay management API | `wok-ws` RPC + `wok-db` moderation tables + `wok-relay` enforcement | `e2e_transports.rs` | `admin.enabled` with operator pubkeys |
 | 91 | AND operator in filters | `wok-query` compiled AND tags + full-event verification | matcher property tests, historical/live/COUNT conformance | both tag-filter limits are nonzero |
 
@@ -60,9 +61,9 @@ it holds, and EOSE has two elements when none does.
   match left unsent. Filters with an empty list count, as they match nothing.
 - `more`: a peek past a cut found a readable match that is still unsent when
   the REQ ends (another filter may send it).
-- `auth`: the restricted-read rule (`relay.auth.restricted_read_kinds` with
-  `restrict_read_to_involved_pubkey`) hid a match from a connection that has
-  not authenticated, while AUTH is usable. The connection is sent its
+- `auth`: a [read class](config.md#read-classes) (`relay.auth`'s
+  `recipient_only_kinds`, `owner_only_kinds` and `authenticated_kinds`) hid a
+  match from a connection that has not authenticated, while AUTH is usable. The connection is sent its
   challenge first: on connect, or at admission if AUTH became usable later.
   Moderation, vanish, expiry and replacement never give `auth`, and neither
   does a match hidden for another pubkey once the connection has

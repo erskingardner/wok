@@ -94,6 +94,12 @@ impl Conn {
     async fn auth_at(&mut self, key: &Keypair, created_at: u64) -> Value {
         let challenge = self.recv().await;
         assert_eq!(challenge[0], "AUTH", "{challenge}");
+        self.answer(key, &challenge, created_at).await
+    }
+
+    /// Answer `challenge`, an AUTH frame already received, as `key`, and
+    /// return the OK reply.
+    async fn answer(&mut self, key: &Keypair, challenge: &Value, created_at: u64) -> Value {
         let event = sign_event_with_key(
             json!({
                 "created_at": created_at,
@@ -989,6 +995,66 @@ async fn nip59_ephemeral_gift_wraps_reach_only_their_recipient() {
     assert_eq!(inbox.try_recv().await, None);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip78_app_data_is_served_to_and_accepted_from_its_author_only() {
+    let relay = auth_relay();
+    assert!(wok_relay::supported_nips(&relay.handle.config.read()).contains(&78));
+    let (owner, stranger_key) = (key(), key());
+    for kind in wok_event::APP_DATA_KINDS {
+        let settings = |content: &str| {
+            sign_event_with_key(
+                json!({
+                    "created_at": now(),
+                    "kind": kind,
+                    "tags": [["d", "example-app/settings"]],
+                    "content": content,
+                }),
+                &owner,
+            )
+        };
+        // NIP-78: relays SHOULD require AUTH before accepting app data.
+        let mut app = relay.connect().await;
+        let challenge = app.recv().await;
+        assert_eq!(challenge[0], "AUTH", "{challenge}");
+        let early = settings("before AUTH");
+        let refused = app.publish(&early).await;
+        assert_eq!(refused[2], false, "{refused}");
+        assert_eq!(
+            refused[3],
+            format!("auth-required: kind {kind} is accepted only from its author")
+        );
+        assert_eq!(app.answer(&owner, &challenge, now()).await[2], true);
+        let data = settings("after AUTH");
+        assert_eq!(app.publish(&data).await[2], true);
+
+        // Authenticated as another key, the author's event is refused.
+        let mut stranger = relay.connect().await;
+        stranger.auth(&stranger_key).await;
+        let relayed = stranger.publish(&settings("relayed")).await;
+        assert_eq!(relayed[2], false, "{relayed}");
+        assert_eq!(relayed[3], "restricted: must be published by the author");
+
+        // ... and served only to the author.
+        let mine = json!({"kinds": [kind], "authors": [pubkey_hex(&owner)]});
+        assert_eq!(app.history(mine.clone()).await, std::slice::from_ref(&data));
+        assert_eq!(stranger.history(mine.clone()).await, Vec::<Value>::new());
+        let mut anonymous = relay.connect().await;
+        assert_eq!(anonymous.recv().await[0], "AUTH");
+        anonymous.send(json!(["REQ", "data", mine])).await;
+        let closed = anonymous.recv().await;
+        assert_eq!(closed[0], "CLOSED", "{closed}");
+        assert!(
+            closed[2].as_str().unwrap().starts_with("auth-required:"),
+            "{closed}"
+        );
+        // A REQ that mixes in an open kind is served without it.
+        let (events, _, _) = anonymous
+            .backfill("mixed", json!([{"authors": [pubkey_hex(&owner)]}]))
+            .await;
+        assert!(events.is_empty(), "{events:?}");
+    }
+}
+
 /// Kind-`kind` events, a second apart, the newest now.
 async fn publish_notes(conn: &mut Conn, kind: u64, count: u64) -> Vec<Value> {
     let mut events = Vec::new();
@@ -1238,7 +1304,9 @@ fn nip91_and_tags_take_precedence_over_compatibility_or_tags() {
 #[test]
 fn advertised_nips_are_subset_of_tested() {
     // NIP-86 coverage lives in e2e_transports.rs (management API e2e tests).
-    let tested = [1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 67, 70, 77, 86, 91];
+    let tested = [
+        1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 67, 70, 77, 78, 86, 91,
+    ];
     assert_eq!(
         wok_relay::RELAY_CAPABILITY_CATALOG
             .iter()

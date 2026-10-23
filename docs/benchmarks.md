@@ -394,7 +394,7 @@ a Tag-index plan reads before it has `limit` matches, and the relay must
 return the same events. Any difference is a mismatch and fails the trial.
 
 The relays run the harness's usual configuration, except that
-`relay.auth.restricted_read_kinds` is empty. AUTH is off in the bench relay,
+`relay.auth.recipient_only_kinds` is empty. AUTH is off in the bench relay,
 and by default gift wraps are readable only by their recipient after AUTH.
 The scan is the same either way; AUTH adds a recipient check for each event
 returned.

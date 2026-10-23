@@ -96,22 +96,19 @@ fn public_tree_allowed(
     if !wok_query::visibility::physical_tree_is_globally_visible(txn, filter)? {
         return Ok(false);
     }
-    let policy = restrictor(cfg);
-    if !policy.restrict_to_involved {
-        return Ok(true);
-    }
-    for kind in &policy.restricted_kinds {
+    let policy = cfg.read_restrictor();
+    for kind in policy.restricted_kinds() {
         if filter
             .kinds
             .as_ref()
-            .is_some_and(|kinds| !(0..kinds.size()).any(|i| kinds.at(i) == *kind))
+            .is_some_and(|kinds| !(0..kinds.size()).any(|i| kinds.at(i) == kind))
         {
             continue;
         }
         let mut present = false;
         txn.foreach_full(
             db.event_kind,
-            &wok_db::keys::make_key_u64_u64(*kind, 0),
+            &wok_db::keys::make_key_u64_u64(kind, 0),
             &[],
             false,
             |key, _| {

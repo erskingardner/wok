@@ -74,7 +74,7 @@ const BUSY_POSTINGS: u64 = 10_000;
 /// Gift wraps are readable only by their recipient after AUTH by default,
 /// and AUTH is off in the bench relay. Reading them unauthenticated runs the
 /// same plan; AUTH adds a recipient check for each event returned.
-const RELAY_OVERRIDES: &[(&str, &str)] = &[("[relay.auth]", "restricted_read_kinds = []")];
+const RELAY_OVERRIDES: &[(&str, &str)] = &[("[relay.auth]", "recipient_only_kinds = []")];
 const FORMAT: &str = "wok-bench tag_kinds v1";
 
 pub struct Options {

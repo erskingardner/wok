@@ -177,7 +177,7 @@ pub async fn serve_metrics(handle: RelayHandle, listener: TcpListener) -> std::i
                         return Ok::<_, Infallible>(empty(StatusCode::TOO_MANY_REQUESTS));
                     }
                     let served = req.uri().path() == "/metrics"
-                        && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD)
+                        && req.method() == hyper::Method::GET
                         && handle.config.read().observability.metrics_enabled;
                     Ok::<_, Infallible>(if served {
                         Response::builder()
@@ -1561,7 +1561,12 @@ mod metrics_tests {
         assert!(body.contains("wok_active_connections"), "{body}");
         assert!(!head.contains("access-control-allow-origin"), "{head}");
         // It serves nothing else.
-        for (method, path) in [("GET", "/"), ("POST", "/metrics"), ("GET", "/admin")] {
+        for (method, path) in [
+            ("GET", "/"),
+            ("POST", "/metrics"),
+            ("HEAD", "/metrics"),
+            ("GET", "/admin"),
+        ] {
             assert_eq!(
                 request(served.metrics, method, path).await.0,
                 404,

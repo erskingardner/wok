@@ -45,12 +45,20 @@ When the file on disk cannot be parsed, or its preset cannot serve it (a
 `marmot` file without a usable `relay.auth.service_url`), the card says so:
 the relay refused that file and kept its last configuration.
 
+The card also sums what the relay refused over the last 24 hours, by the
+setting that refused it (`wok_refusals_total{setting}`, see
+[Refusals by setting](observability.md#refusals-by-setting)), and names the
+three settings that refused most. The **Refused** tile beside the
+connection count shows the same total. Counts restart with the process: for
+its first day the window is the time since it started. Refusals that no
+setting makes, such as a NIP-86 ban, are not counted.
+
 **Access** comes first among the settings and is read-only: the read and
 write policies with what each means, the three read classes and the kinds in
 each, `inbox_kinds`, the kinds the relay accepts, whether login (NIP-42) is
 available, and the NIP-11 `auth_required` and `restricted_writes` flags they
-imply. Edit these in `wok.toml`; a remote save cannot change who may use the
-relay or lock its operator out.
+imply, with what each refused over the last day. Edit these in `wok.toml`;
+a remote save cannot change who may use the relay or lock its operator out.
 
 ## Configuration writes
 
@@ -80,6 +88,19 @@ budget trusts, and three restart-only values, the largest WebSocket message,
 the disk reserve and the database size limit.
 When writes are disabled, values remain visible but inputs and the save
 button are disabled.
+
+Below its copy, a field shows:
+
+- **Override**, when the value differs from the preset's, with the preset's
+  value and **Reset to preset**, which puts the preset's value back in the
+  form; saving then removes the setting from the file;
+- a `NIP-11: <field>` chip for each `limitation` field that advertises the
+  value right now, so a chip disappears while its limit is off;
+- what the setting refused over the last 24 hours, when it refused anything;
+- the warning the relay logs on reload when the file sets the guard to zero,
+  which turns it off, while its preset does not. A guard with no field of its
+  own, such as `relay.handshake_timeout_secs`, is warned about on the posture
+  card.
 
 The dashboard deliberately excludes database, bind/port, worker, compression,
 and Unix-socket settings because they require restart. It also excludes the

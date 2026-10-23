@@ -38,6 +38,24 @@ pub struct Config {
     pub deprecations: Vec<String>,
 }
 
+/// A guard the configuration sets to zero, which disables it, while its
+/// preset does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZeroGuard {
+    /// The keys it is about.
+    pub keys: Vec<String>,
+    pub warning: String,
+}
+
+impl ZeroGuard {
+    fn new(keys: &[&str], warning: impl Into<String>) -> Self {
+        Self {
+            keys: keys.iter().map(|key| key.to_string()).collect(),
+            warning: warning.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StrfryConfigTranslation {
     pub config: Config,
@@ -1478,6 +1496,15 @@ impl Config {
     /// itself turns off, such as `relay.abuse.max_stored_events` in the
     /// public preset, is not warned about.
     pub fn zero_guard_warnings(&self) -> Vec<String> {
+        self.zero_guards()
+            .into_iter()
+            .map(|guard| guard.warning)
+            .collect()
+    }
+
+    /// [`zero_guard_warnings`](Self::zero_guard_warnings), each with the
+    /// keys it is about, so the dashboard can show it beside them.
+    pub fn zero_guards(&self) -> Vec<ZeroGuard> {
         let preset = self.preset_defaults();
         // Zero here, but not in the preset.
         let zeroed = |value: u64, preset: u64| value == 0 && preset != 0;
@@ -1552,60 +1579,84 @@ impl Config {
                 if zeroed(rate.into(), preset_rate.into())
                     || zeroed(burst.into(), preset_burst.into())
                 {
-                    warnings.push(format!(
-                        "relay.abuse {name} budget is zero — that token bucket is disabled (unlimited)"
+                    let (rate, burst) = if let Some(own) = name.strip_prefix("per_connection.") {
+                        (
+                            format!("relay.abuse.per_connection.{own}_rate_per_second"),
+                            format!("relay.abuse.per_connection.{own}_burst"),
+                        )
+                    } else {
+                        (
+                            format!("relay.abuse.{name}_rate_per_second"),
+                            format!("relay.abuse.{name}_burst"),
+                        )
+                    };
+                    warnings.push(ZeroGuard::new(
+                        &[&rate, &burst],
+                        format!(
+                            "relay.abuse {name} budget is zero — that token bucket is disabled (unlimited)"
+                        ),
                     ));
                 }
             }
             if zeroed(a.max_query_work, p.max_query_work) {
-                warnings.push("relay.abuse.max_query_work is zero — unlimited".to_string());
+                warnings.push(ZeroGuard::new(
+                    &["relay.abuse.max_query_work"],
+                    "relay.abuse.max_query_work is zero — unlimited",
+                ));
             }
             if zeroed(a.max_stored_events, p.max_stored_events) {
-                warnings.push("relay.abuse.max_stored_events is zero — unlimited".to_string());
+                warnings.push(ZeroGuard::new(
+                    &["relay.abuse.max_stored_events"],
+                    "relay.abuse.max_stored_events is zero — unlimited",
+                ));
             }
             if zeroed(
                 a.max_stored_events_per_pubkey,
                 p.max_stored_events_per_pubkey,
             ) {
-                warnings.push(
-                    "relay.abuse.max_stored_events_per_pubkey is zero — unlimited".to_string(),
-                );
+                warnings.push(ZeroGuard::new(
+                    &["relay.abuse.max_stored_events_per_pubkey"],
+                    "relay.abuse.max_stored_events_per_pubkey is zero — unlimited",
+                ));
             }
         }
         let r = &self.relay;
         let pr = &preset.relay;
         if zeroed(r.max_total_events_per_req, pr.max_total_events_per_req) {
-            warnings.push("relay.max_total_events_per_req is zero — unlimited".to_string());
+            warnings.push(ZeroGuard::new(
+                &["relay.max_total_events_per_req"],
+                "relay.max_total_events_per_req is zero — unlimited",
+            ));
         }
         if zeroed(
             r.max_filter_bytes_per_connection as u64,
             pr.max_filter_bytes_per_connection as u64,
         ) {
-            warnings.push(
-                "relay.max_filter_bytes_per_connection is zero — live filter memory per connection is unlimited"
-                    .to_string(),
-            );
+            warnings.push(ZeroGuard::new(
+                &["relay.max_filter_bytes_per_connection"],
+                "relay.max_filter_bytes_per_connection is zero — live filter memory per connection is unlimited",
+            ));
         }
         if zeroed(
             r.max_pending_outbound_bytes as u64,
             pr.max_pending_outbound_bytes as u64,
         ) {
-            warnings.push(
-                "relay.max_pending_outbound_bytes is zero — slow-client queue is unlimited"
-                    .to_string(),
-            );
+            warnings.push(ZeroGuard::new(
+                &["relay.max_pending_outbound_bytes"],
+                "relay.max_pending_outbound_bytes is zero — slow-client queue is unlimited",
+            ));
         }
         if zeroed(r.handshake_timeout_secs, pr.handshake_timeout_secs) {
-            warnings.push(
-                "relay.handshake_timeout_secs is zero — pre-upgrade header read deadline disabled"
-                    .to_string(),
-            );
+            warnings.push(ZeroGuard::new(
+                &["relay.handshake_timeout_secs"],
+                "relay.handshake_timeout_secs is zero — pre-upgrade header read deadline disabled",
+            ));
         }
         if zeroed(r.frame_read_timeout_secs, pr.frame_read_timeout_secs) {
-            warnings.push(
-                "relay.frame_read_timeout_secs is zero — partial-frame trickle guard disabled"
-                    .to_string(),
-            );
+            warnings.push(ZeroGuard::new(
+                &["relay.frame_read_timeout_secs"],
+                "relay.frame_read_timeout_secs is zero — partial-frame trickle guard disabled",
+            ));
         }
         warnings
     }
@@ -2722,6 +2773,12 @@ negentropy_enabled = true
 
     #[test]
     fn zero_guard_warnings_cover_each_unlimited_zero() {
+        // A warning names the key it is about, as the dashboard shows it.
+        let warns_about = |cfg: &Config, key: &str| {
+            cfg.zero_guards()
+                .iter()
+                .any(|guard| guard.keys.iter().any(|k| k == key))
+        };
         // The defaults warn about nothing, though the public preset turns
         // the global storage cap off.
         assert_eq!(Config::default().relay.abuse.max_stored_events, 0);
@@ -2748,7 +2805,7 @@ negentropy_enabled = true
         ] {
             let cfg = Config::parse_toml(&format!("[relay.abuse]\n{field} = 0\n")).unwrap();
             assert!(
-                !cfg.zero_guard_warnings().is_empty(),
+                warns_about(&cfg, &format!("relay.abuse.{field}")),
                 "{field} = 0 should warn"
             );
         }
@@ -2767,6 +2824,10 @@ negentropy_enabled = true
                 warnings.iter().any(|w| w.contains("per_connection")),
                 "per_connection.{field} = 0 should warn: {warnings:?}"
             );
+            assert!(warns_about(
+                &cfg,
+                &format!("relay.abuse.per_connection.{field}")
+            ));
         }
         for field in [
             "max_total_events_per_req",
@@ -2777,7 +2838,7 @@ negentropy_enabled = true
         ] {
             let cfg = Config::parse_toml(&format!("[relay]\n{field} = 0\n")).unwrap();
             assert!(
-                !cfg.zero_guard_warnings().is_empty(),
+                warns_about(&cfg, &format!("relay.{field}")),
                 "{field} = 0 should warn"
             );
         }

@@ -12,8 +12,12 @@ use wok_compat::{sign_event, sign_event_with_key};
 use wok_db::{Env, EnvOptions};
 use wok_relay::Config;
 
-const WRITE_POLICY_TIMEOUT_SECS: u64 = 5;
-const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The relay's per-round-trip plugin deadline. The plugin is spawned lazily on
+/// the first event, so that round trip also covers Node's cold start, which
+/// has exceeded 5 s on a loaded Linux CI runner. A passing round trip returns
+/// as soon as the plugin answers, so the headroom only lengthens a failure.
+const WRITE_POLICY_TIMEOUT_SECS: u64 = 30;
+const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn now_secs() -> u64 {
     SystemTime::now()

@@ -124,6 +124,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sync memory budgets and idle timeout, and shows the client address
   header (`relay.real_ip_header`), the largest message, the disk reserve and
   the database size limit read-only.
+- The dashboard shows each setting's place against its preset and NIP-11,
+  and what it refused (#97 §5.1 items 3–5). A setting the file overrides is
+  marked, with the preset's value and **Reset to preset**. A value NIP-11
+  advertises carries a `NIP-11: <field>` chip, shown only while it is
+  advertised. Each field shows what its setting refused over the last 24
+  hours, from `wok_refusals_total`, and the posture card sums them and names
+  the settings that refused most. A guard the file sets to zero, while its
+  preset does not, shows the reload warning beside it. **Changed:** the
+  dashboard's **Rejected** tile, which counted only events superseded or
+  deleted on write, is now **Refused**, every refusal over the last 24
+  hours.
 - `wok_refusals_total{setting}`, one counter of refused requests and
   events, labelled by the config key that refused them, such as
   `relay.abuse.per_connection.req_burst` or `events.max_num_tags` (#97

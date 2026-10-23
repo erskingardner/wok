@@ -43,7 +43,7 @@ async fn reach_startup() {
 async fn reach_anonymous() {
     let (_, cfg) = profile();
     let relay = Relay::start(cfg.clone()).await;
-    let mut conn = Conn::Ws(Wire::connect(relay.addr).await);
+    let mut conn = Conn::Ws(Box::new(Wire::connect(relay.addr).await));
     anonymous_messages(&mut conn, &cfg).await;
     deflated_messages(&relay).await;
     anonymous_http(&relay, &cfg).await;
@@ -66,7 +66,7 @@ async fn reach_authenticated() {
         return;
     }
     let relay = Relay::start(cfg.clone()).await;
-    let mut wire = Conn::Ws(Wire::connect(relay.addr).await);
+    let mut wire = Conn::Ws(Box::new(Wire::connect(relay.addr).await));
     let challenge = wire.challenge().await;
     let author = key(1);
     let auth = event(
@@ -469,7 +469,7 @@ const NEG_INITIAL: &str = "6100000200";
 
 /// A client connection over either transport.
 enum Conn {
-    Ws(Wire),
+    Ws(Box<Wire>),
     /// A Unix socket, and every frame read from it.
     Unix(tokio::net::UnixStream, Vec<Value>),
 }

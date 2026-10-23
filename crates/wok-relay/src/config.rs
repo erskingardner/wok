@@ -922,17 +922,26 @@ impl Config {
         assign_bool(&map, "relay.auth.restrictReadToInvolvedPubkey", |b| {
             involved_only = b
         })?;
+        let auth = &mut cfg.relay.auth;
         if !involved_only {
             // Wok has no mode that lets a REQ mixing in another kind read
             // them without AUTH: the nearest is any authenticated reader.
-            let auth = &mut cfg.relay.auth;
             let moved = std::mem::take(&mut auth.recipient_only_kinds);
             auth.authenticated_kinds = moved.clone();
             cfg.deprecations.push(format!(
                 "relay.auth.restrictReadToInvolvedPubkey = false has no Wok equivalent: kinds \
                  {moved:?} become relay.auth.authenticated_kinds, which any authenticated \
-                 connection may read and no other can"
+                 connection may read and no other can.{}",
+                legacy::owner_only_note(&moved, &auth.owner_only_kinds)
             ));
+        } else {
+            let note = legacy::owner_only_note(&auth.recipient_only_kinds, &auth.owner_only_kinds);
+            if !note.is_empty() {
+                cfg.deprecations.push(format!(
+                    "relay.auth.restrictedReadKinds becomes relay.auth.recipient_only_kinds, \
+                     which the author and first p-tag recipient may read.{note}"
+                ));
+            }
         }
         if let Some(v) = map.get("relay.info.name") {
             cfg.relay.info.name = v.clone();
@@ -2189,8 +2198,29 @@ mod tests {
         assert_eq!(any.relay.auth.authenticated_kinds, [4, 1059]);
         assert_eq!(any.deprecations.len(), 1);
         assert!(any.deprecations[0].contains("authenticated_kinds"));
-        // Neither touches NIP-78's owner-only kinds.
+        // Neither touches NIP-78's owner-only kinds, which stay the stricter
+        // class for a kind listed in both, as the warning says.
         assert_eq!(any.relay.auth.owner_only_kinds, [78, 30078]);
+        assert!(!any.deprecations[0].contains("owner_only_kinds"));
+        for involved in [true, false] {
+            let app_data = Config::translate_strfry(&format!(
+                "relay {{ auth {{ restrictedReadKinds = \"4,30078\"\n \
+                 restrictReadToInvolvedPubkey = {involved} }} }}"
+            ))
+            .unwrap()
+            .config;
+            assert_eq!(app_data.deprecations.len(), 1, "{involved}");
+            assert!(
+                app_data.deprecations[0]
+                    .contains("Kinds [30078] are also in relay.auth.owner_only_kinds"),
+                "{:?}",
+                app_data.deprecations
+            );
+            assert_eq!(
+                app_data.read_restrictor().class(30078),
+                crate::restrict::ReadClass::Owner
+            );
+        }
     }
 
     #[test]

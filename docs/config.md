@@ -709,7 +709,10 @@ budget, and the relay warns when its address is reachable beyond loopback and
 private addresses. The listener is bound at startup whenever
 `metrics_listen` is set, and answers 404 while `metrics_enabled` is off, so
 metrics can be turned on and off with a reload. Turning them on or off is
-logged as a security-scope change.
+logged as a security-scope change. A reload that changes `metrics_listen` is
+logged too, and the running listener stays until restart; on a relay started
+without one, metrics stay off until that restart rather than be served on the
+relay listener.
 
 ```toml
 [observability]

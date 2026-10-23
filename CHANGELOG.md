@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     window and tags, then whether its signer may use the endpoint, and only
     then the signature (#147). Only the `payload` hash and the replay check
     wait for the body, so a request that could never be authorized is
-    refused without waiting for one. A signer that may not and a bad
+    refused without waiting for one; the time window is checked again once
+    the body has arrived. A signer that may not and a bad
     signature get the same 401, "NIP-98 authorization is not from a key
     allowed here, or its signature is invalid", so a forged event cannot ask
     which keys are admins or managers; the debug log records which. The

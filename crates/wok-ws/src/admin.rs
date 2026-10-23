@@ -370,21 +370,28 @@ pub(crate) fn verify<'e>(
     })
 }
 
-/// Finish a [`verify`]d authorization with the request body: check the
-/// `payload` tag against it, then claim the event in the replay cache.
+/// Finish a [`verify`]d authorization with the request body: check the time
+/// window again, check the `payload` tag against the body, then claim the
+/// event in the replay cache.
 pub(crate) fn authorize<'a>(
     verified: Verified<'_>,
     body: &[u8],
     cfg: &Config,
     state: &'a AdminState,
 ) -> Result<(String, ReplayReservation<'a>), String> {
+    // The body may arrive long after `verify`: an event that expired while
+    // it did is refused, or its replay entry, pruned as expired, could not
+    // stop a second copy.
+    let now = unix_now();
+    if verified.created_at.abs_diff(now) > cfg.admin.auth_window_secs {
+        return Err("NIP-98 authorization is outside the accepted time window".into());
+    }
     if !body.is_empty() || verified.require_payload {
         let payload = single_tag(verified.event, "payload")?;
         if payload != hex::encode(sha2::Sha256::digest(body)) {
             return Err("NIP-98 payload tag does not match the request body".into());
         }
     }
-    let now = unix_now();
     let mut used = state.used_auth.lock();
     used.retain(|_, created_at| created_at.abs_diff(now) <= cfg.admin.auth_window_secs);
     if used.contains_key(&verified.id) {
@@ -1370,6 +1377,35 @@ mod tests {
         assert!(single_tag(&malformed, "method")
             .unwrap_err()
             .contains("string value"));
+    }
+
+    #[test]
+    fn nip98_expiring_while_the_body_arrives_is_refused() {
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        cfg.admin.pubkeys = vec![hex::encode(key.x_only_public_key().0.serialize())];
+        cfg.admin.auth_window_secs = 1;
+        let state = AdminState::default();
+        let url = "https://relay.example/admin/api/config";
+        let body = br#"{"history":{"max_points":10}}"#;
+        let policy = AuthzPolicy {
+            url_ok: &|signed| signed == url,
+            signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
+            require_payload: false,
+        };
+        // Two copies of one signed request, both fresh when their headers
+        // are checked, whose bodies arrive after the window has closed.
+        let event = decode_authorization(Some(&signed_auth(&key, url, "PUT", body))).unwrap();
+        let first = verify(&event, &Method::PUT, &cfg, &policy).unwrap();
+        let second = verify(&event, &Method::PUT, &cfg, &policy).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2_200));
+        for verified in [first, second] {
+            assert!(authorize(verified, body, &cfg, &state)
+                .unwrap_err()
+                .contains("time window"));
+        }
     }
 
     #[test]

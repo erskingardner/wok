@@ -42,6 +42,7 @@ or protect it at the reverse proxy. The endpoint is unauthenticated and sends
 | `wok_auth_success_total` | counter | none | Successful NIP-42 authentications. |
 | `wok_auth_failure_total` | counter | none | Failed NIP-42 authentication attempts. |
 | `wok_slow_client_terminations_total` | counter | none | Connections closed after exceeding their pending-output byte budget. |
+| `wok_real_ip_header_unparsed_total` | counter | none | Requests whose `relay.real_ip_header` ended in an entry that is not an IP address, so the connecting address stood in for the client's. Any increase means the proxy does not write the client's address last in that header. |
 | `wok_abuse_rejections_total` | counter | `reason` | Requests or events rejected by an abuse guard. |
 | `wok_client_messages_total` | counter | `type` | Inbound Nostr protocol messages by type. |
 | `wok_relay_messages_total` | counter | `type` | Outbound Nostr protocol messages by type. |

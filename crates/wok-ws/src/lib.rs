@@ -25,6 +25,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use sha1::Digest as _;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -197,19 +198,38 @@ async fn dispatch(
     peer: SocketAddr,
     admin_state: Arc<admin::AdminState>,
 ) -> Response<Full<Bytes>> {
-    // Honor relay.realIpHeader for reverse-proxied deployments (C++ strfry
-    // uses the header value as the client IP).
+    // Honor relay.real_ip_header for reverse-proxied deployments. C++ strfry
+    // reads the whole value as one address; Wok reads the last entry, the
+    // one the proxy wrote.
     let peer = {
         let cfg = handle.config.read();
-        if cfg.relay.real_ip_header.is_empty() {
+        let header = cfg.relay.real_ip_header.as_str();
+        if header.is_empty() {
             peer
         } else {
-            req.headers()
-                .get(cfg.relay.real_ip_header.as_str())
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
-                .map(|ip| SocketAddr::new(ip, 0))
-                .unwrap_or(peer)
+            match forwarded_client(req.headers(), header) {
+                Forwarded::Client(ip) => SocketAddr::new(ip, 0),
+                Forwarded::Absent => peer,
+                Forwarded::Unparsed(entry) => {
+                    handle
+                        .metrics
+                        .real_ip_header_unparsed
+                        .fetch_add(1, Ordering::Relaxed);
+                    if warning_due(&UNPARSED_WARNED_AT, unix_now()) {
+                        let entry: String = entry.chars().take(64).collect();
+                        tracing::warn!(
+                            header,
+                            entry = ?entry,
+                            "relay.real_ip_header ends in an entry that is not an IP \
+                             address, so the connecting address stands in for the client's; \
+                             check that the proxy writes the client's address last (warned \
+                             at most once a minute, counted by \
+                             wok_real_ip_header_unparsed_total)"
+                        );
+                    }
+                    peer
+                }
+            }
         }
     };
     let is_ws_upgrade = req
@@ -321,6 +341,59 @@ async fn dispatch(
         hyper::header::HeaderValue::from_static("Accept"),
     );
     response
+}
+
+/// The client a request's `relay.real_ip_header` names.
+#[derive(Debug, PartialEq)]
+enum Forwarded {
+    /// The request has no such header.
+    Absent,
+    Client(IpAddr),
+    /// The header's last entry, which is not an address.
+    Unparsed(String),
+}
+
+/// The client in the last entry of a forwarded-address header, the one the
+/// proxy in front of Wok wrote: a proxy that appends to the client's own
+/// header, or adds its own line after it, leaves the client's entries in
+/// front. The header's lines form one comma-separated list (RFC 9110
+/// §5.3), and an entry may carry a port.
+fn forwarded_client(headers: &hyper::HeaderMap, name: &str) -> Forwarded {
+    let Some(line) = headers.get_all(name).iter().next_back() else {
+        return Forwarded::Absent;
+    };
+    let line = String::from_utf8_lossy(line.as_bytes());
+    let entry = line.rsplit(',').next().unwrap_or_default().trim();
+    entry
+        .parse::<IpAddr>()
+        .or_else(|_| entry.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .map_or_else(
+            |_| Forwarded::Unparsed(entry.to_string()),
+            Forwarded::Client,
+        )
+}
+
+/// When the relay last warned about an unparsed `relay.real_ip_header`, in
+/// seconds since the epoch, 0 for never. Every request from a misconfigured
+/// proxy would warn; one a minute shows it without flooding the log.
+static UNPARSED_WARNED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a warning last logged at `warned_at` is due again at `now`, at
+/// most once a minute. A due warning is claimed, so of several requests at
+/// once only one logs it.
+fn warning_due(warned_at: &AtomicU64, now: u64) -> bool {
+    let last = warned_at.load(Ordering::Relaxed);
+    (last == 0 || now >= last.saturating_add(60))
+        && warned_at
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Whether the `Accept` media-range list names `application/nostr+json` with
@@ -1072,6 +1145,75 @@ mod http_tests {
         assert!(!accept(&["application/nostr+json;q=0"]));
         assert!(!accept(&["application/nostr+json; q=0.000"]));
         assert!(!accept(&["application/nostr+jsonx"]));
+    }
+
+    fn forwarded(lines: &[&str]) -> Forwarded {
+        let mut headers = hyper::HeaderMap::new();
+        for line in lines {
+            headers.append(
+                "x-forwarded-for",
+                hyper::header::HeaderValue::from_str(line).unwrap(),
+            );
+        }
+        forwarded_client(&headers, "x-forwarded-for")
+    }
+
+    fn client(ip: &str) -> Forwarded {
+        Forwarded::Client(ip.parse().unwrap())
+    }
+
+    #[test]
+    fn the_forwarded_client_is_the_last_entry() {
+        assert_eq!(forwarded(&[]), Forwarded::Absent);
+        assert_eq!(forwarded(&["203.0.113.7"]), client("203.0.113.7"));
+        assert_eq!(forwarded(&[" 203.0.113.7 "]), client("203.0.113.7"));
+        // Appended to the client's own header.
+        assert_eq!(
+            forwarded(&["198.51.100.9, 203.0.113.7"]),
+            client("203.0.113.7")
+        );
+        assert_eq!(
+            forwarded(&["198.51.100.9,203.0.113.7"]),
+            client("203.0.113.7")
+        );
+        // A line of the proxy's own after the client's.
+        assert_eq!(
+            forwarded(&["198.51.100.9", "203.0.113.7"]),
+            client("203.0.113.7")
+        );
+        assert_eq!(
+            forwarded(&["192.0.2.1, 198.51.100.9", "203.0.113.7"]),
+            client("203.0.113.7")
+        );
+        // Entries with a port, and IPv6.
+        assert_eq!(forwarded(&["203.0.113.7:4711"]), client("203.0.113.7"));
+        assert_eq!(forwarded(&["2001:db8::1"]), client("2001:db8::1"));
+        assert_eq!(forwarded(&["[2001:db8::1]:4711"]), client("2001:db8::1"));
+    }
+
+    #[test]
+    fn a_last_entry_that_is_not_an_address_is_unparsed() {
+        let unparsed = |entry: &str| Forwarded::Unparsed(entry.to_string());
+        assert_eq!(forwarded(&["203.0.113.7, unknown"]), unparsed("unknown"));
+        assert_eq!(forwarded(&["203.0.113.7,"]), unparsed(""));
+        assert_eq!(forwarded(&["203.0.113.7", ""]), unparsed(""));
+        // RFC 7239 Forwarded syntax is not an address list.
+        assert_eq!(
+            forwarded(&["for=192.0.2.60;proto=https"]),
+            unparsed("for=192.0.2.60;proto=https")
+        );
+        // A client's address in front does not rescue the proxy's entry.
+        assert_eq!(forwarded(&["203.0.113.7", "_hidden"]), unparsed("_hidden"));
+    }
+
+    #[test]
+    fn the_unparsed_warning_is_due_at_most_once_a_minute() {
+        let warned_at = AtomicU64::new(0);
+        assert!(warning_due(&warned_at, 1_000));
+        assert!(!warning_due(&warned_at, 1_000));
+        assert!(!warning_due(&warned_at, 1_059));
+        assert!(warning_due(&warned_at, 1_060));
+        assert!(!warning_due(&warned_at, 1_061));
     }
 
     #[test]

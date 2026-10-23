@@ -87,6 +87,9 @@ pub struct Metrics {
     pub auth_success_total: AtomicU64,
     pub auth_failure_total: AtomicU64,
     pub slow_client_terminations: AtomicU64,
+    /// Requests whose `relay.real_ip_header` ended in an entry that is not
+    /// an address, so the connecting address stood in for the client's.
+    pub real_ip_header_unparsed: AtomicU64,
     pub abuse_connection_rejections: AtomicU64,
     pub abuse_event_rate_rejections: AtomicU64,
     pub abuse_req_rate_rejections: AtomicU64,
@@ -205,6 +208,8 @@ impl Metrics {
                 "wok_auth_failure_total {}\n",
                 "# TYPE wok_slow_client_terminations_total counter\n",
                 "wok_slow_client_terminations_total {}\n",
+                "# TYPE wok_real_ip_header_unparsed_total counter\n",
+                "wok_real_ip_header_unparsed_total {}\n",
                 "# TYPE wok_abuse_rejections_total counter\n",
                 "wok_abuse_rejections_total{{reason=\"connection_rate\"}} {}\n",
                 "wok_abuse_rejections_total{{reason=\"event_rate\"}} {}\n",
@@ -262,6 +267,7 @@ impl Metrics {
             g(&self.auth_success_total),
             g(&self.auth_failure_total),
             g(&self.slow_client_terminations),
+            g(&self.real_ip_header_unparsed),
             g(&self.abuse_connection_rejections),
             g(&self.abuse_event_rate_rejections),
             g(&self.abuse_req_rate_rejections),

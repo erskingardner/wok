@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`
+  by sending its own X-Forwarded-For. A proxy that appends the client's
+  address to that header (nginx's `$proxy_add_x_forwarded_for`) passed Wok a
+  list, which it could not parse, so the client got the proxy's address. One
+  that adds its own line after the client's (HAProxy's `option forwardfor`)
+  left the client's line first, which Wok read, so the client chose its
+  address and could spend another address's budgets. Wok now reads the
+  header's last entry, the address the proxy wrote, and accepts a port. A
+  last entry that is not an address still falls back to the connecting
+  address, but is counted by `wok_real_ip_header_unparsed_total` and warned
+  about at most once a minute. Relays without `real_ip_header`, the default,
+  and proxies that replace the header are unaffected.
 - A members-only relay accepts its members' events from throwaway keys.
   `relay.auth.restrict_writes` checked only the event's author, so an
   allowlisted relay refused every Marmot group message (445) and gift wrap

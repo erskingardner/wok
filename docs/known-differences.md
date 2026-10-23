@@ -45,6 +45,16 @@ it is not a promise to reproduce upstream bugs.
 
 ## Intentional protocol and operational differences
 
+- `relay.real_ip_header` (strfry's `relay.realIpHeader`) is read as a list:
+  Wok takes the last entry across all of the header's lines, the address
+  the proxy in front of it wrote, and accepts a port. Pinned strfry parses
+  the value as one address, as Wok did through 0.7, so behind a proxy that
+  appends to a client's own X-Forwarded-For the client gets the proxy's
+  address; in Wok, that let it escape a NIP-86 `blockip`. When the value is
+  not an address both fall back to the connecting address; strfry logs
+  every such request, and Wok counts them in
+  `wok_real_ip_header_unparsed_total` and warns at most once a minute.
+
 - Latest-only replaceable reads are enforced independently of physical
   cleanup. Retained source versions cannot reappear through historical REQ,
   COUNT, search, live catch-up, or NIP-77. This follows pinned NIP-01 and is

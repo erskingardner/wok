@@ -16,6 +16,7 @@
 | `ws_timeouts.rs` | Handshake/frame-read/pong liveness timeouts |
 | `negentropy_e2e.rs` | NEG-* sessions against a live relay |
 | `plugin_e2e.rs` | Write-policy plugin child process |
+| `proxied_client_address.rs` | A client behind a proxy is the last `relay.real_ip_header` address, so `blockip` holds; an unparsed last entry falls back and is counted |
 | `error_routing.rs` | CLOSED/NOTICE/OK error paths |
 | `db_watch.rs` | Config/DB watch / hot-reload related |
 | `non_ascii_event_id.rs` | Non-ASCII / invalid id handling |

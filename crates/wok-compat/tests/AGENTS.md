@@ -18,6 +18,7 @@
 | `plugin_e2e.rs` | Write-policy plugin child process |
 | `attack_surface.rs` | HTTP paths per profile, client verbs, and profiles vs `docs/attack-surface.md` |
 | `profiles/` | Configuration profiles the attack-surface tests start relays from |
+| `proxied_client_address.rs` | A client behind a proxy is the last `relay.real_ip_header` address, so `blockip` holds; an unparsed last entry falls back and is counted |
 | `error_routing.rs` | CLOSED/NOTICE/OK error paths |
 | `db_watch.rs` | Config/DB watch / hot-reload related |
 | `non_ascii_event_id.rs` | Non-ASCII / invalid id handling |

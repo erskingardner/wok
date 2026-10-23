@@ -325,6 +325,9 @@ pub struct AuthConfig {
     /// accepted when their first `p` tag is a member, so anyone can deliver
     /// gift wraps to members.
     pub inbox_kinds: Vec<u64>,
+    /// The kinds the relay accepts; empty accepts every kind. NIP-86
+    /// `disallowkind` can narrow it, and `allowkind` cannot widen it.
+    pub accepted_kinds: Vec<u64>,
 }
 
 /// Who may read or write (`relay.auth.read_policy`, `write_policy`).
@@ -449,6 +452,7 @@ impl Default for Config {
                     read_policy: AccessPolicy::Open,
                     write_policy: AccessPolicy::Open,
                     inbox_kinds: wok_event::GIFT_WRAP_KINDS.to_vec(),
+                    accepted_kinds: Vec::new(),
                 },
                 info: InfoConfig {
                     name: "wok default".into(),
@@ -690,6 +694,17 @@ fn validate(mut parsed: TomlConfig) -> Result<Config, String> {
             "relay.abuse.per_connection.authenticated_multiplier must be at least 1".into(),
         );
     }
+    if let Some(kind) = parsed
+        .relay
+        .auth
+        .accepted_kinds
+        .iter()
+        .find(|&&kind| kind > u64::from(u16::MAX))
+    {
+        return Err(format!(
+            "relay.auth.accepted_kinds: kind {kind} is out of range (0 to 65535)"
+        ));
+    }
     if !(1..=128).contains(&parsed.relay.abuse.ipv6_prefix_len) {
         return Err(
             "relay.abuse.ipv6_prefix_len must be from 1 to 128 (128 keys each IPv6 address \
@@ -773,6 +788,51 @@ impl Config {
         self.relay.auth.enabled && !self.relay.auth.service_url.is_empty()
     }
 
+    /// NIP-11 `limitation.auth_required`: every REQ, COUNT and NEG-OPEN
+    /// needs AUTH, under any `read_policy` but `open`. Particular kinds can
+    /// need AUTH whatever this says, as NIP-11 allows. While AUTH cannot
+    /// succeed it is not asked for, as NIP-42 is then not advertised.
+    pub fn auth_required(&self) -> bool {
+        self.relay.auth.read_policy != AccessPolicy::Open && self.auth_usable()
+    }
+
+    /// NIP-11 `limitation.restricted_writes`: an event must meet a condition
+    /// that clients are expected to know before writing, beyond ordinary
+    /// rate limits: a `write_policy` other than `open`, a list of
+    /// `accepted_kinds`, or proof of work.
+    pub fn restricted_writes(&self) -> bool {
+        self.relay.auth.write_policy != AccessPolicy::Open
+            || !self.relay.auth.accepted_kinds.is_empty()
+            || (self.relay.abuse.enabled && self.relay.abuse.min_pow_difficulty > 0)
+    }
+
+    /// Whether `relay.auth.accepted_kinds` lets the relay accept events of
+    /// `kind`. NIP-62 vanish requests are accepted whatever it lists while
+    /// NIP-62 is on: relays that restrict what they store must still honor
+    /// them. The NIP-86 kind policy may still refuse them.
+    pub fn accepts_kind(&self, kind: u64) -> bool {
+        let accepted = &self.relay.auth.accepted_kinds;
+        accepted.is_empty()
+            || accepted.contains(&kind)
+            || (kind == wok_db::VANISH_KIND && self.relay.nip62.enabled)
+    }
+
+    /// The kinds [`accepts_kind`](Self::accepts_kind) admits, sorted, or
+    /// `None` when it admits every kind.
+    pub fn accepted_kind_list(&self) -> Option<Vec<u64>> {
+        let accepted = &self.relay.auth.accepted_kinds;
+        if accepted.is_empty() {
+            return None;
+        }
+        let mut kinds = accepted.clone();
+        if self.relay.nip62.enabled {
+            kinds.push(wok_db::VANISH_KIND);
+        }
+        kinds.sort_unstable();
+        kinds.dedup();
+        Some(kinds)
+    }
+
     /// Explain how `relay.real_ip_header` keys the per-address budgets of a
     /// relay listening on `listening`. A set header is trusted as each
     /// client's address. With none, a client is the address that connected,
@@ -784,9 +844,10 @@ impl Config {
             return Some(format!(
                 "relay.real_ip_header = {header:?} is trusted as each client's address by \
                  every per-address budget. Set it only when every connection comes from a \
-                 proxy that overwrites the header: a client that reaches the relay directly \
-                 could send a new address with each connection to escape those budgets, or \
-                 send another client's address to spend that client's budgets"
+                 proxy that writes the client's address as the header's last entry: a client \
+                 that reaches the relay directly could send a new address with each \
+                 connection to escape those budgets, or send another client's address to \
+                 spend that client's budgets"
             ));
         }
         let local_only = |ip: IpAddr| match ip {
@@ -804,7 +865,7 @@ impl Config {
              relay.real_ip_header is unset. If a reverse proxy forwards connections, every \
              client has the proxy's address and they all share one set of per-address \
              budgets (connections, EVENT and AUTH, REQ, COUNT); set relay.real_ip_header to \
-             the header the proxy overwrites with the client's address",
+             the header in which the proxy passes the client's address",
             addrs.join(", ")
         ))
     }
@@ -1322,6 +1383,7 @@ impl Config {
             || prev.read_policy != new_auth.read_policy
             || prev.write_policy != new_auth.write_policy
             || prev.inbox_kinds != new_auth.inbox_kinds
+            || prev.accepted_kinds != new_auth.accepted_kinds
         {
             let mut widened: Vec<u64> = prev_reads
                 .restricted_kinds()
@@ -2788,6 +2850,51 @@ negentropy_enabled = true
             .auth_configuration_warning()
             .unwrap()
             .contains("enabled is false"));
+    }
+
+    #[test]
+    fn nip11_access_flags_follow_the_policies_and_proof_of_work() {
+        let mut c = Config::default();
+        c.relay.auth.service_url = "wss://relay.example.com".into();
+        assert!(!c.auth_required() && !c.restricted_writes());
+        c.relay.auth.read_policy = AccessPolicy::Authenticated;
+        assert!(c.auth_required() && !c.restricted_writes());
+        // Not while AUTH cannot succeed.
+        c.relay.auth.enabled = false;
+        assert!(!c.auth_required());
+        c.relay.auth.enabled = true;
+        c.relay.auth.read_policy = AccessPolicy::Open;
+        c.relay.auth.write_policy = AccessPolicy::Members;
+        assert!(!c.auth_required() && c.restricted_writes());
+        c.relay.auth.write_policy = AccessPolicy::Open;
+        c.relay.auth.accepted_kinds = vec![445];
+        assert!(c.restricted_writes());
+        c.relay.auth.accepted_kinds.clear();
+        c.relay.abuse.min_pow_difficulty = 20;
+        assert!(c.restricted_writes());
+        // Proof of work is checked only with abuse controls on.
+        c.relay.abuse.enabled = false;
+        assert!(!c.restricted_writes());
+    }
+
+    #[test]
+    fn accepted_kinds_are_a_ceiling_on_the_kinds_accepted() {
+        let every = Config::default();
+        assert!(every.accepts_kind(1) && every.accepts_kind(65_535));
+        let narrow = Config::parse_toml("[relay.auth]\naccepted_kinds = [1059, 0, 445]\n").unwrap();
+        assert!(narrow.accepts_kind(445) && !narrow.accepts_kind(1));
+        // NIP-62 vanish requests, while NIP-62 is on.
+        assert!(narrow.accepts_kind(62));
+        assert_eq!(narrow.accepted_kind_list(), Some(vec![0, 62, 445, 1059]));
+        assert_eq!(every.accepted_kind_list(), None);
+        let mut no_vanish = narrow.clone();
+        no_vanish.relay.nip62.enabled = false;
+        assert!(!no_vanish.accepts_kind(62));
+        assert_eq!(no_vanish.accepted_kind_list(), Some(vec![0, 445, 1059]));
+        let error = Config::parse_toml("[relay.auth]\naccepted_kinds = [65536]\n").unwrap_err();
+        assert!(error.contains("kind 65536 is out of range"), "{error}");
+        // Narrowing it on reload is called out with the other access keys.
+        assert_eq!(every.security_scope_changes(&narrow).len(), 1);
     }
 
     #[test]

@@ -231,7 +231,7 @@ interface or protect the path at the reverse proxy.
 | `relay.bind` | `127.0.0.1` | Restart | TCP listen address: an IPv4 or IPv6 literal (`::1` or `[::1]`), or a hostname. A hostname listens on every address it resolves to (`localhost` → `127.0.0.1` and `::1`), skipping resolved addresses that are not assigned on this host or whose family it lacks, as long as one binds. |
 | `relay.port` | `7777` | Restart | TCP listen port. |
 | `relay.nofiles` | `524288` | Restart | Requested process file-descriptor limit. |
-| `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-address budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. Left empty behind a proxy, every client has the proxy's address and shares its budgets, so a startup warning is also logged when it is empty and the relay listens only on loopback or private addresses. |
+| `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. Wok reads the header's last entry, the address the proxy in front of it wrote, so a proxy that replaces the header, appends the client's address to it (nginx's `$proxy_add_x_forwarded_for`), or adds a line of its own (HAProxy's `option forwardfor`) all work; an entry may carry a port. A last entry that is not an IP address leaves the connecting address, is counted by `wok_real_ip_header_unparsed_total`, and is warned about at most once a minute. **The header is fully trusted for every per-address budget** (connection, EVENT, REQ, COUNT): if the proxy passes a client's header on without adding the client's address last, or a client can reach the relay directly, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. Left empty behind a proxy, every client has the proxy's address and shares its budgets, so a startup warning is also logged when it is empty and the relay listens only on loopback or private addresses. |
 | `relay.max_websocket_payload_size` | `2097152` | Restart | Maximum reassembled WebSocket payload bytes. |
 | `relay.max_req_filter_size` | `262144` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. See [Filter size](#filter-size). |
 | `relay.max_filter_bytes_per_connection` | `2097152` | Live | Yes | Maximum combined compact-JSON filter bytes of the REQ subscriptions open on one connection, and separately of its COUNTs not yet answered; zero is unlimited. See [Filter size](#filter-size). |
@@ -347,6 +347,7 @@ logged as a warning naming the old and the new policy.
 | `relay.auth.read_policy` | `open` | Who may send REQ, COUNT and NEG-OPEN: `open`, `authenticated` or `members`. See [read and write policies](#read-and-write-policies). |
 | `relay.auth.write_policy` | `open` | Who may publish: `open`, `authenticated` or `members`. NIP-62 vanish requests are always accepted. |
 | `relay.auth.inbox_kinds` | `[1059, 21059]` | Under `write_policy = "members"`, events of these kinds are also accepted when their first `p` tag is a member, so anyone can deliver gift wraps to members. |
+| `relay.auth.accepted_kinds` | `[]` | The kinds the relay accepts; empty accepts every kind. A ceiling for the NIP-86 kind policy. See [accepted kinds](#accepted-kinds). |
 
 While AUTH is usable (`enabled` with a `service_url`), every connection
 receives its NIP-42 challenge as soon as it opens.
@@ -391,7 +392,10 @@ NIP-78 only while both app-data kinds are owner-only.
 ### Read and write policies
 
 `read_policy` and `write_policy` say who may use the relay at all; the read
-classes then apply on top. Each is one of:
+classes then apply on top. NIP-11 advertises `auth_required` while
+`read_policy` is not `open` and AUTH is usable, and `restricted_writes` while
+`write_policy` is not `open` (or `accepted_kinds` is set, or proof of work is
+required). Each is one of:
 
 | Policy | Who may read | Who may write |
 |---|---|---|
@@ -436,6 +440,26 @@ moderation state it commits under, and an inbox recipient's kind against
 `inbox_kinds`, all as they are when it stores the event, so an event whose
 member was removed, or whose policy a reload tightened, in the meantime is
 refused.
+
+### Accepted kinds
+
+`accepted_kinds` makes a relay that stores only the kinds it is for, such as
+a relay for one application's few kinds. An event of another kind is refused
+with `restricted: kind N is not allowed by this relay`, and NIP-11 then
+advertises `restricted_writes`. The writer checks the kind again under the
+configuration it stores with, so a reload that drops a kind also refuses
+events of it still queued. NIP-62 vanish requests (kind 62) are accepted
+whatever the list says while `relay.nip62.enabled`, because NIP-62 requires
+relays that restrict what they store to honor them.
+
+It is a ceiling for the NIP-86 kind policy (see [nip86.md](nip86.md#kind-policy)):
+`disallowkind` can refuse a kind it lists, and `allowkind` cannot make the
+relay accept a kind it leaves out. `listallowedkinds` reports the effective
+set, the kinds it accepts that the policy allows.
+
+Only writes are bounded. Events of other kinds stored earlier stay readable;
+`wok delete` removes them. A NIP-86 ban on such a kind still hides them, and
+`allowkind` still lifts it.
 
 ### Read keys from 0.7 and earlier
 
@@ -675,9 +699,12 @@ address. NIP-86 IP bans and the write-policy plugin's `sourceInfo` still
 see the exact address.
 
 Behind a reverse proxy the client's address is the proxy's unless
-`relay.real_ip_header` names the header the proxy overwrites with it. The
-relay warns at startup when that header is set, and when it is empty while
-the relay listens only on loopback or private addresses, as behind a proxy.
+`relay.real_ip_header` names the header in which the proxy passes it. Wok
+reads that header's last entry, the one the proxy wrote. Behind two proxies
+in a row, that entry is the first proxy's address, so every client of that
+proxy shares one set of budgets. The relay warns at startup when the header
+is set, and when it is empty while the relay listens only on loopback or
+private addresses, as behind a proxy.
 
 On reload, the relay logs a warning for each guard the file sets to zero
 (unlimited) while its preset does not. A guard that the preset itself turns

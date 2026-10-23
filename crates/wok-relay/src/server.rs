@@ -2347,7 +2347,7 @@ fn ingest_event(
         id.copy_from_slice(packed.id());
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(packed.pubkey());
-        let rejected = if !snap.kind_allowed(packed.kind()) {
+        let rejected = if !cfg.accepts_kind(packed.kind()) || !snap.kind_allowed(packed.kind()) {
             Some((
                 &metrics.moderation_kind_rejections,
                 format!(
@@ -4671,6 +4671,67 @@ mod tests {
             } else {
                 assert!(response.contains("true"), "{response}");
                 assert_eq!(stored, 1);
+            }
+        }
+    }
+
+    /// An event the ingester admitted is refused when a reload has dropped
+    /// its kind from `accepted_kinds` before the writer takes it, but a
+    /// vanish request is still honored (NIP-62).
+    #[test]
+    fn the_writer_applies_its_own_accepted_kinds() {
+        for (kind, stored) in [(7, false), (VANISH_KIND, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.auth.accepted_kinds = vec![1];
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let (id, author) = ([9u8; 32], [8u8; 32]);
+            let tags = PackedEventTagBuilder::default();
+            let packed = PackedEventBuilder::build(&id, &author, 1, kind, 0, &tags).unwrap();
+            let json = json!({
+                "id": to_hex(&id), "pubkey": to_hex(&author), "created_at": 1, "kind": kind,
+                "tags": [["relay", "ALL_RELAYS"]], "content": "", "sig": "00".repeat(64),
+            })
+            .to_string();
+            let (writer_tx, writer_rx) = bounded(4);
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: None,
+                    grant: Default::default(),
+                })
+                .unwrap();
+            drop(writer_tx);
+            let moderation = Arc::new(parking_lot::RwLock::new(Default::default()));
+            run_writer(
+                env.clone(),
+                Arc::new(parking_lot::RwLock::new(config)),
+                conns,
+                Arc::new(Metrics::default()),
+                writer_rx,
+                Vec::new(),
+                moderation,
+                TAG_KIND_STEP,
+            );
+            let response = out_rx.try_recv().unwrap().into_text();
+            let entries = env.begin_ro().unwrap().entries(env.dbis().event).unwrap();
+            if stored {
+                assert!(response.contains("true"), "kind {kind}: {response}");
+                assert_eq!(entries, 1);
+            } else {
+                assert!(
+                    response.contains("restricted: kind 7 is not allowed by this relay"),
+                    "{response}"
+                );
+                assert_eq!(entries, 0);
             }
         }
     }

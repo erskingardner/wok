@@ -26,6 +26,20 @@ arbitrary list.
 | 86 | Relay management API | `wok-ws` RPC + `wok-db` moderation tables + `wok-relay` enforcement | `e2e_transports.rs` | `admin.enabled` with operator pubkeys |
 | 91 | AND operator in filters | `wok-query` compiled AND tags + full-event verification | matcher property tests, historical/live/COUNT conformance | both tag-filter limits are nonzero |
 
+NIP-11 `limitation` also says what a client must do before it reads or writes,
+as each is enforced:
+- `auth_required` is `true` while `relay.auth.read_policy` is not `open` and
+  AUTH can succeed, so every REQ, COUNT and NEG-OPEN needs AUTH. While AUTH is
+  unusable, NIP-42 is not advertised either, and those reads are refused with
+  `restricted:` rather than asking for an AUTH that cannot succeed. With
+  `open`, the read classes can still need AUTH for particular kinds, as
+  NIP-11 allows.
+- `restricted_writes` is `true` while `relay.auth.write_policy` is not `open`,
+  `relay.auth.accepted_kinds` lists the only kinds accepted, or proof of work
+  is required (`min_pow_difficulty`, with abuse controls on). Rate limits,
+  the NIP-86 kind blocklist and the per-kind rule for NIP-78 app data do not
+  set it.
+
 NIP-02, NIP-04, and NIP-28 event kinds are accepted and stored, but those
 client/application semantics are deliberately not advertised as relay
 capabilities.
@@ -34,7 +48,8 @@ ID and author filter values must be exactly 64 lowercase hexadecimal
 characters, as required by current NIP-01. Prefix filters are rejected.
 
 A subscription id is any non-empty string of at most 64 characters, as NIP-01
-says, counted in Unicode characters rather than bytes. Frames JSON-escape it.
+says, counted in Unicode characters rather than bytes, and NIP-11 advertises
+it as `limitation.max_subid_length`. Frames JSON-escape it.
 Subscriptions are told apart by the exact id, so two ids that look alike but
 differ in code points, such as a precomposed and a decomposed `é`, are two
 subscriptions.

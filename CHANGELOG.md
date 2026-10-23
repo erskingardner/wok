@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`
+  by sending its own X-Forwarded-For. A proxy that appends the client's
+  address to that header (nginx's `$proxy_add_x_forwarded_for`) passed Wok a
+  list, which it could not parse, so the client got the proxy's address. One
+  that adds its own line after the client's (HAProxy's `option forwardfor`)
+  left the client's line first, which Wok read, so the client chose its
+  address and could spend another address's budgets. Wok now reads the
+  header's last entry, the address the proxy wrote, and accepts a port. A
+  last entry that is not an address still falls back to the connecting
+  address, but is counted by `wok_real_ip_header_unparsed_total` and warned
+  about at most once a minute. Relays without `real_ip_header`, the default,
+  and proxies that replace the header are unaffected.
 - A members-only relay accepts its members' events from throwaway keys.
   `relay.auth.restrict_writes` checked only the event's author, so an
   allowlisted relay refused every Marmot group message (445) and gift wrap
@@ -96,6 +108,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `relay.auth.accepted_kinds`, the kinds a relay accepts (empty, the
+  default, accepts every kind). Events of other kinds are refused with
+  `restricted: kind N is not allowed by this relay`, and NIP-11 advertises
+  `restricted_writes`. It bounds the NIP-86 kind policy: `disallowkind`
+  narrows it, `allowkind` cannot widen it (it can still lift a kind's ban on
+  stored events), and `listallowedkinds` reports the effective set instead
+  of only the kinds named by `allowkind` (#97 B14). NIP-62 vanish requests
+  are accepted whatever it lists, and stored events of other kinds stay
+  readable.
+- NIP-11 `limitation.auth_required` (`true` while `relay.auth.read_policy`
+  is not `open` and AUTH is usable), `restricted_writes` (`true` while `write_policy` is not
+  `open`, or proof of work is required) and `max_subid_length` (64) (#97
+  B12).
 - `relay.filter_validation.require_scoped_filters`: every filter must name
   `ids`, `authors` or a tag filter, with any number of values. It refuses
   enumeration such as `{"kinds":[445]}`, which would list every group message

@@ -807,10 +807,30 @@ impl Config {
     }
 
     /// Whether `relay.auth.accepted_kinds` lets the relay accept events of
-    /// `kind`. The NIP-86 kind policy may still refuse them.
+    /// `kind`. NIP-62 vanish requests are accepted whatever it lists while
+    /// NIP-62 is on: relays that restrict what they store must still honor
+    /// them. The NIP-86 kind policy may still refuse them.
     pub fn accepts_kind(&self, kind: u64) -> bool {
         let accepted = &self.relay.auth.accepted_kinds;
-        accepted.is_empty() || accepted.contains(&kind)
+        accepted.is_empty()
+            || accepted.contains(&kind)
+            || (kind == wok_db::VANISH_KIND && self.relay.nip62.enabled)
+    }
+
+    /// The kinds [`accepts_kind`](Self::accepts_kind) admits, sorted, or
+    /// `None` when it admits every kind.
+    pub fn accepted_kind_list(&self) -> Option<Vec<u64>> {
+        let accepted = &self.relay.auth.accepted_kinds;
+        if accepted.is_empty() {
+            return None;
+        }
+        let mut kinds = accepted.clone();
+        if self.relay.nip62.enabled {
+            kinds.push(wok_db::VANISH_KIND);
+        }
+        kinds.sort_unstable();
+        kinds.dedup();
+        Some(kinds)
     }
 
     /// Explain how `relay.real_ip_header` keys the per-address budgets of a
@@ -2860,8 +2880,16 @@ negentropy_enabled = true
     fn accepted_kinds_are_a_ceiling_on_the_kinds_accepted() {
         let every = Config::default();
         assert!(every.accepts_kind(1) && every.accepts_kind(65_535));
-        let narrow = Config::parse_toml("[relay.auth]\naccepted_kinds = [0, 445, 1059]\n").unwrap();
+        let narrow = Config::parse_toml("[relay.auth]\naccepted_kinds = [1059, 0, 445]\n").unwrap();
         assert!(narrow.accepts_kind(445) && !narrow.accepts_kind(1));
+        // NIP-62 vanish requests, while NIP-62 is on.
+        assert!(narrow.accepts_kind(62));
+        assert_eq!(narrow.accepted_kind_list(), Some(vec![0, 62, 445, 1059]));
+        assert_eq!(every.accepted_kind_list(), None);
+        let mut no_vanish = narrow.clone();
+        no_vanish.relay.nip62.enabled = false;
+        assert!(!no_vanish.accepts_kind(62));
+        assert_eq!(no_vanish.accepted_kind_list(), Some(vec![0, 445, 1059]));
         let error = Config::parse_toml("[relay.auth]\naccepted_kinds = [65536]\n").unwrap_err();
         assert!(error.contains("kind 65536 is out of range"), "{error}");
         // Narrowing it on reload is called out with the other access keys.

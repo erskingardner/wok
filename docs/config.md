@@ -444,20 +444,22 @@ refused.
 ### Accepted kinds
 
 `accepted_kinds` makes a relay that stores only the kinds it is for, such as
-the Marmot set in the `marmot` preset. An event of another kind is refused
+a relay for one application's few kinds. An event of another kind is refused
 with `restricted: kind N is not allowed by this relay`, and NIP-11 then
 advertises `restricted_writes`. The writer checks the kind again under the
 configuration it stores with, so a reload that drops a kind also refuses
-events of it still queued.
+events of it still queued. NIP-62 vanish requests (kind 62) are accepted
+whatever the list says while `relay.nip62.enabled`, because NIP-62 requires
+relays that restrict what they store to honor them.
 
 It is a ceiling for the NIP-86 kind policy (see [nip86.md](nip86.md#kind-policy)):
-`disallowkind` can refuse a kind it lists, `allowkind` cannot accept a kind it
-leaves out, and `listallowedkinds` and `listdisallowedkinds` report the
-listed kinds the policy accepts and refuses.
+`disallowkind` can refuse a kind it lists, and `allowkind` cannot make the
+relay accept a kind it leaves out. `listallowedkinds` reports the effective
+set, the kinds it accepts that the policy allows.
 
 Only writes are bounded. Events of other kinds stored earlier stay readable;
-`wok delete` removes them. NIP-62 vanish requests are kind 62, so a relay
-that sets `accepted_kinds` honors them only if it lists 62.
+`wok delete` removes them. A NIP-86 ban on such a kind still hides them, and
+`allowkind` still lifts it.
 
 ### Read keys from 0.7 and earlier
 

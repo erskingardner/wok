@@ -1983,10 +1983,11 @@ async fn nip86_restrict_writes_allowlist_e2e() {
     handle.request_shutdown();
 }
 
-/// `relay.auth.accepted_kinds` is a ceiling: events of other kinds are
-/// refused, NIP-86 `allowkind` cannot raise it, `disallowkind` lowers it, the
-/// kind lists report the effective set, and NIP-11 says writes are
-/// restricted.
+/// `relay.auth.accepted_kinds` is a ceiling on what the relay accepts:
+/// events of other kinds are refused, NIP-86 `disallowkind` narrows it and
+/// `allowkind` cannot widen it, `listallowedkinds` reports the effective set,
+/// NIP-11 says writes are restricted, and NIP-62 vanish requests are still
+/// honored. A ban on a kind outside it stays reversible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_kinds_bound_the_nip86_kind_policy() {
     let dir = tempfile::tempdir().unwrap();
@@ -2004,12 +2005,12 @@ async fn accepted_kinds_bound_the_nip86_kind_policy() {
     let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
     let (admin_pubkey, _) = admin_key.x_only_public_key();
     let alice_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let alice = hex::encode(alice_key.x_only_public_key().0.serialize());
 
     let mut cfg = test_cfg(dir.path());
     cfg.admin.enabled = true;
     cfg.admin.public_url = format!("http://{addr}");
     cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
-    cfg.relay.auth.accepted_kinds = vec![7, 1];
     let handle = wok_relay::start(env, cfg).unwrap();
     let h = handle.clone();
     tokio::spawn(async move {
@@ -2019,15 +2020,21 @@ async fn accepted_kinds_bound_the_nip86_kind_policy() {
 
     let url = format!("ws://{addr}/");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-    let publish = |kind: u64| {
+    let publish = |kind: u64, tags: serde_json::Value| {
         sign_event_with_key(
-            json!({"created_at": now_secs(), "kind": kind, "tags": [], "content": format!("{kind}")}),
+            json!({"created_at": now_secs(), "kind": kind, "tags": tags, "content": format!("{kind}")}),
             &alice_key,
         )
     };
     let accepted = |msgs: &[String]| msgs.iter().any(|t| t.contains("true"));
-    assert!(accepted(&ws_publish(&mut ws, publish(1)).await));
-    let msgs = ws_publish(&mut ws, publish(30023)).await;
+    // An archived event of a kind the relay will stop accepting.
+    let archived = publish(30023, json!([["d", "post"]]));
+    assert!(accepted(&ws_publish(&mut ws, archived.clone()).await));
+    handle.config.write().relay.auth.accepted_kinds = vec![7, 1];
+
+    let note = publish(1, json!([]));
+    assert!(accepted(&ws_publish(&mut ws, note.clone()).await));
+    let msgs = ws_publish(&mut ws, publish(30023, json!([["d", "post"]]))).await;
     assert!(
         msgs.iter()
             .any(|t| t.contains("false") && t.contains("restricted: kind 30023 is not allowed")),
@@ -2038,34 +2045,74 @@ async fn accepted_kinds_bound_the_nip86_kind_policy() {
         true
     );
 
-    // The effective set: the ceiling, sorted, as the stored policy allows.
-    let list = |method: &'static str| {
+    // The effective set: the ceiling, with vanish requests, as the stored
+    // policy allows; disallowkind narrows it and allowkind restores it.
+    let rpc = |method: &'static str, kind: Option<u64>| {
         let key = &admin_key;
-        async move { nip86_rpc(addr, key, method, json!([])).await.1["result"].clone() }
+        let params = kind.map_or(json!([]), |kind| json!([kind]));
+        async move { nip86_rpc(addr, key, method, params).await.1 }
     };
-    assert_eq!(list("listallowedkinds").await, json!([1, 7]));
-    assert_eq!(list("listdisallowedkinds").await, json!([]));
-
-    // allowkind cannot raise the ceiling.
-    let (_, result) = nip86_rpc(addr, &admin_key, "allowkind", json!([30023])).await;
-    assert!(
-        result["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("not in relay.auth.accepted_kinds")),
-        "{result}"
+    assert_eq!(
+        rpc("listallowedkinds", None).await["result"],
+        json!([1, 7, 62])
     );
-    assert_eq!(list("listallowedkinds").await, json!([1, 7]));
+    assert_eq!(rpc("listdisallowedkinds", None).await["result"], json!([]));
+    assert_eq!(rpc("disallowkind", Some(7)).await["result"], json!(true));
+    assert_eq!(
+        rpc("listallowedkinds", None).await["result"],
+        json!([1, 62])
+    );
+    assert_eq!(rpc("listdisallowedkinds", None).await["result"], json!([7]));
+    assert!(!accepted(&ws_publish(&mut ws, publish(7, json!([]))).await));
+    assert_eq!(rpc("allowkind", Some(7)).await["result"], json!(true));
+    assert!(accepted(&ws_publish(&mut ws, publish(7, json!([]))).await));
 
-    // disallowkind lowers it, and allowkind restores a kind under it.
-    let (_, result) = nip86_rpc(addr, &admin_key, "disallowkind", json!([7])).await;
-    assert_eq!(result["result"], json!(true), "{result}");
-    assert_eq!(list("listallowedkinds").await, json!([1]));
-    assert_eq!(list("listdisallowedkinds").await, json!([7]));
-    assert!(!accepted(&ws_publish(&mut ws, publish(7)).await));
-    let (_, result) = nip86_rpc(addr, &admin_key, "allowkind", json!([7])).await;
-    assert_eq!(result["result"], json!(true), "{result}");
-    assert_eq!(list("listallowedkinds").await, json!([1, 7]));
-    assert!(accepted(&ws_publish(&mut ws, publish(7)).await));
+    // A ban on the archived kind hides it and stays reversible; allowkind
+    // does not make the relay accept the kind again.
+    let archive = json!(["REQ", "archive", {"kinds": [30023]}]).to_string();
+    assert_eq!(
+        rpc("disallowkind", Some(30023)).await["result"],
+        json!(true)
+    );
+    assert_eq!(
+        rpc("listdisallowedkinds", None).await["result"],
+        json!([30023])
+    );
+    ws.send(Message::Text(archive.clone().into()))
+        .await
+        .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(!msgs.iter().any(|t| t.contains("\"EVENT\"")), "{msgs:?}");
+    assert_eq!(rpc("allowkind", Some(30023)).await["result"], json!(true));
+    assert_eq!(rpc("listdisallowedkinds", None).await["result"], json!([]));
+    ws.send(Message::Text(archive.into())).await.unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains(archived["id"].as_str().unwrap())),
+        "{msgs:?}"
+    );
+    assert!(!accepted(
+        &ws_publish(&mut ws, publish(30023, json!([["d", "post"]]))).await
+    ));
+
+    // NIP-62: a vanish request is honored though 62 is not listed.
+    let vanish = publish(62, json!([["relay", "ALL_RELAYS"]]));
+    assert!(accepted(&ws_publish(&mut ws, vanish).await));
+    ws.send(Message::Text(
+        json!(["REQ", "notes", {"kinds": [1], "authors": [alice]}])
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let msgs = recv_until(&mut ws, |t| t.contains("EOSE")).await;
+    assert!(
+        !msgs
+            .iter()
+            .any(|t| t.contains(note["id"].as_str().unwrap())),
+        "{msgs:?}"
+    );
     handle.request_shutdown();
 }
 

@@ -40,8 +40,9 @@ questions:
 | operator | Whoever writes the config file, runs `wok` commands, or sets the write-policy plugin | Filesystem permissions |
 | remote relay | A relay that `wok sync`, `router`, `upload` or `download` dials | The operator chose its URL |
 
-Unix-socket peers have no network address and bypass every rate budget, per
-address and per connection.
+Unix-socket peers have no network address, so no per-address or
+per-connection budget applies to them. The per-author EVENT budget still
+does.
 
 ## Network listener
 
@@ -68,7 +69,7 @@ gets 404, and so does a WebSocket upgrade on any path but `/`.
 | `/nodeinfo/2.1` | anonymous | none | The NodeInfo document. |
 | `/favicon.ico` | anonymous | none | A fixed empty icon. |
 | `/admin`, `/admin/` | anonymous | `admin.enabled` | `GET` returns the signed-out [dashboard](admin-dashboard.md) shell, which holds no relay data. Other methods get 404. |
-| `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix reads the body (at most 64 KiB) and checks NIP-98: it decodes the `Authorization` header, parses the event and verifies its signature, checks its kind, time window and `u` and `method` tags, and its `payload` tag when the request has a body, then checks that the signer is in `admin.pubkeys`, then claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
+| `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix reads the body (at most 64 KiB) and checks NIP-98: it decodes the `Authorization` header, parses the event and verifies its signature, checks its kind, empty content, time window and `u` and `method` tags, and its `payload` tag when the request has a body, then checks that the signer is in `admin.pubkeys`, then claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
 
 ## Messages
 
@@ -88,7 +89,7 @@ same ingester. Before Wok reads a message's verb:
 
 | Message | Party | Gate | Checks, in order |
 | --- | --- | --- | --- |
-| `EVENT` | anonymous | none | Per-address EVENT budget; event parse, size and tag limits, timestamp window, id and signature verification; `relay.auth.accepted_kinds` and the NIP-86 kind policy, event-id ban, author ban and `relay.auth.write_policy`; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH. The writer then checks the write policy and `accepted_kinds` again and applies storage quotas and the write-policy plugin. NIP-62 vanish requests skip the author ban, the write policy and the plugin. |
+| `EVENT` | anonymous | none | Per-address EVENT budget; event parse, size and tag limits, timestamp window, id and signature verification; `relay.auth.accepted_kinds` and the NIP-86 kind policy, event-id ban, author ban and `relay.auth.write_policy`; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH. The writer then runs the write-policy plugin; only an event it accepts is checked again against vanish requests, the bans, the kind policy, `accepted_kinds` and the write policy, then against the storage quotas. NIP-62 vanish requests skip the plugin, the author ban and the write policy. |
 | `AUTH` | anonymous | `relay.auth.enabled` and `relay.auth.service_url` | Per-address EVENT budget; the gate; the connection must hold a challenge; event parse and signature verification; kind 22242, `challenge` and `relay` tags. |
 | `REQ` | anonymous | none | The connection's REQ budget, which is larger once authenticated, then the address's REQ backstop (see [rates](config.md#rates)); a connection over its own budget does not spend the backstop; subscription id; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; `relay.auth.read_policy`; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
 | `COUNT` | anonymous | `relay.max_filter_limit_count` above 0 | As `REQ`, with the COUNT budgets, and a COUNT that may count restricted kinds must name only what the connection may read. The gate is checked after the filter count and bytes. |

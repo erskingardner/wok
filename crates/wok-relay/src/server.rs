@@ -1406,20 +1406,53 @@ fn run_metrics_history(
     metrics: Arc<Metrics>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let mut last_sample: Option<std::time::Instant> = None;
     while !shutdown.load(Ordering::Relaxed) {
         let observability = cfg.read().observability.clone();
         metrics.history.configure(
             observability.history_enabled,
             observability.history_max_points,
         );
-        if observability.history_enabled && observability.history_max_points > 0 {
-            metrics.record_history();
+        let interval = Duration::from_secs(observability.history_interval_secs.max(1));
+        let now = std::time::Instant::now();
+        if last_sample.is_none_or(|last| now >= last + interval) {
+            if observability.history_enabled && observability.history_max_points > 0 {
+                metrics.record_history();
+            }
+            last_sample = Some(now);
         }
-        let seconds = observability.history_interval_secs.max(1);
-        if !sleep_unless_shutdown(&shutdown, Duration::from_secs(seconds)) {
+        // The dashboard's refusal counts cover the last day whatever the
+        // history keeps or how far apart its samples are.
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        metrics.refusals.mark(unix);
+        let wait = history_wait(
+            last_sample.unwrap_or(now),
+            interval,
+            std::time::Instant::now(),
+        );
+        if !sleep_unless_shutdown(&shutdown, wait) {
             return;
         }
     }
+}
+
+/// The history thread wakes at least this often, so refusal marks stay
+/// hourly whatever `observability.history_interval_secs` is.
+const REFUSAL_MARK_TICK: Duration = Duration::from_secs(60);
+
+/// How long the history thread sleeps: until its next sample, at most
+/// [`REFUSAL_MARK_TICK`].
+fn history_wait(
+    last_sample: std::time::Instant,
+    interval: Duration,
+    now: std::time::Instant,
+) -> Duration {
+    (last_sample + interval)
+        .saturating_duration_since(now)
+        .min(REFUSAL_MARK_TICK)
 }
 
 /// Broadcast a database-change notification to every req-monitor thread.
@@ -5333,6 +5366,24 @@ mod tests {
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
         (conn, rx)
+    }
+
+    #[test]
+    fn the_history_thread_marks_refusals_whatever_its_interval() {
+        let now = std::time::Instant::now();
+        // A sample every two days still wakes the thread each minute.
+        let two_days = Duration::from_secs(2 * 86_400);
+        assert_eq!(history_wait(now, two_days, now), REFUSAL_MARK_TICK);
+        // A short interval sleeps until the next sample.
+        let fifteen = Duration::from_secs(15);
+        assert_eq!(
+            history_wait(now, fifteen, now + Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            history_wait(now, fifteen, now + fifteen * 2),
+            Duration::ZERO
+        );
     }
 
     fn local_source() -> TransportSource {

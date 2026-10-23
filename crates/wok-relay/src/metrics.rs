@@ -132,22 +132,35 @@ impl Setting {
     }
 }
 
-/// `wok_refusals_total`: what each [`Setting`] refused since start.
-pub struct Refusals([AtomicU64; Setting::ALL.len()]);
+/// How far back [`Refusals::recent`] reaches, and how often it keeps a mark.
+pub const REFUSAL_WINDOW_SECS: u64 = 24 * 3600;
+const REFUSAL_MARK_SECS: u64 = 3600;
+
+type RefusalCounts = [u64; Setting::ALL.len()];
+
+/// `wok_refusals_total`: what each [`Setting`] refused since start, and
+/// hourly marks of those counts for the dashboard's last day.
+pub struct Refusals {
+    counts: [AtomicU64; Setting::ALL.len()],
+    marks: Mutex<VecDeque<(u64, RefusalCounts)>>,
+}
 
 impl Default for Refusals {
     fn default() -> Self {
-        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+        Self {
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            marks: Mutex::default(),
+        }
     }
 }
 
 impl Refusals {
     pub fn add(&self, setting: Setting, n: u64) {
-        self.0[setting as usize].fetch_add(n, Ordering::Relaxed);
+        self.counts[setting as usize].fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn get(&self, setting: Setting) -> u64 {
-        self.0[setting as usize].load(Ordering::Relaxed)
+        self.counts[setting as usize].load(Ordering::Relaxed)
     }
 
     /// Every setting's count, in [`Setting::ALL`] order.
@@ -155,6 +168,41 @@ impl Refusals {
         Setting::ALL
             .iter()
             .map(|&setting| (setting, self.get(setting)))
+    }
+
+    /// Drop the marks older than [`REFUSAL_WINDOW_SECS`], and keep one of
+    /// the counts at `now` if the last is an hour old. Called at least once
+    /// a minute, so the oldest mark is 23 to 24 hours old once the relay has
+    /// run a day.
+    pub fn mark(&self, now: u64) {
+        let mut marks = self.marks.lock();
+        while marks
+            .front()
+            .is_some_and(|(at, _)| at.saturating_add(REFUSAL_WINDOW_SECS) < now)
+        {
+            marks.pop_front();
+        }
+        if marks
+            .back()
+            .is_some_and(|(at, _)| now < at.saturating_add(REFUSAL_MARK_SECS))
+        {
+            return;
+        }
+        marks.push_back((now, std::array::from_fn(|i| self.get(Setting::ALL[i]))));
+    }
+
+    /// What each setting refused since the oldest mark of the last day, and
+    /// when that mark was kept: the last day, less up to an hour, once the
+    /// relay has run that long. `None` before the first mark.
+    pub fn recent(&self) -> Option<(u64, Vec<(Setting, u64)>)> {
+        let marks = self.marks.lock();
+        let (since, base) = marks.front()?;
+        let counts = self
+            .counts()
+            .zip(base)
+            .map(|((setting, count), base)| (setting, count.saturating_sub(*base)))
+            .collect();
+        Some((*since, counts))
     }
 }
 
@@ -506,6 +554,65 @@ mod tests {
             );
             assert!(rendered.contains(&line), "{line}");
         }
+    }
+
+    #[test]
+    fn recent_refusals_cover_the_last_day() {
+        let refusals = Refusals::default();
+        assert_eq!(refusals.recent(), None);
+        let count = |recent: Option<(u64, Vec<(Setting, u64)>)>| {
+            let (since, counts) = recent.unwrap();
+            let (_, n) = counts
+                .into_iter()
+                .find(|(setting, _)| *setting == Setting::MaxQueryWork)
+                .unwrap();
+            (since, n)
+        };
+        let start = 1_000_000;
+        refusals.add(Setting::MaxQueryWork, 5);
+        refusals.mark(start);
+        refusals.add(Setting::MaxQueryWork, 2);
+        assert_eq!(count(refusals.recent()), (start, 2));
+        // Marks are hourly.
+        refusals.mark(start + 60);
+        assert_eq!(refusals.marks.lock().len(), 1);
+        for hour in 1..=24 {
+            refusals.add(Setting::MaxQueryWork, 1);
+            refusals.mark(start + hour * 3600);
+        }
+        // The first mark is a day old and kept; the next hour drops it.
+        assert_eq!(count(refusals.recent()), (start, 26));
+        refusals.mark(start + 25 * 3600);
+        assert_eq!(count(refusals.recent()), (start + 3600, 23));
+    }
+
+    #[test]
+    fn the_refusal_window_stays_within_the_last_day() {
+        // Marked each minute, as the history thread does whatever its
+        // chart interval, for 30 hours.
+        let refusals = Refusals::default();
+        let start = 1_000_000;
+        for minute in 0..30 * 60 {
+            let now = start + minute * 60;
+            refusals.add(Setting::MaxQueryWork, 1);
+            refusals.mark(now);
+            let (since, counts) = refusals.recent().unwrap();
+            let age = now - since;
+            if now - start >= REFUSAL_WINDOW_SECS {
+                assert!(
+                    (REFUSAL_WINDOW_SECS - 3600..=REFUSAL_WINDOW_SECS).contains(&age),
+                    "minute {minute}: window {age} s"
+                );
+            } else {
+                assert_eq!(since, start);
+            }
+            // One refusal a minute since the mark.
+            let (_, count) = counts[Setting::MaxQueryWork as usize];
+            assert_eq!(count, age / 60, "minute {minute}");
+        }
+        // After a gap longer than the window, counting starts afresh.
+        refusals.mark(start + 60 * 3600);
+        assert_eq!(refusals.recent().unwrap().0, start + 60 * 3600);
     }
 
     #[test]

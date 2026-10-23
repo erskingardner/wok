@@ -371,8 +371,28 @@ fn overview(handle: &RelayHandle) -> Response<Full<Bytes>> {
             "access": posture::access(&cfg),
             "sections": fields::SECTIONS,
             "config": dashboard_config(&cfg),
+            "preset_config": dashboard_config(&cfg.preset_defaults()),
+            "nip11": crate::nip11(&cfg)["limitation"],
+            "refusals": refusals(&handle.metrics),
+            "warnings": cfg.zero_guards().into_iter().map(|guard| {
+                serde_json::json!({"keys": guard.keys, "warning": guard.warning})
+            }).collect::<Vec<_>>(),
         }),
     )
+}
+
+/// What each setting refused over the last day, by config key, and since
+/// when: `since` is null until the relay keeps its first mark.
+fn refusals(metrics: &wok_relay::metrics::Metrics) -> serde_json::Value {
+    let (since, counts) = match metrics.refusals.recent() {
+        Some((since, counts)) => (Some(since), counts),
+        None => (None, metrics.refusals.counts().collect()),
+    };
+    let counts: serde_json::Map<String, serde_json::Value> = counts
+        .into_iter()
+        .map(|(setting, count)| (setting.key().to_string(), count.into()))
+        .collect();
+    serde_json::json!({"since": since, "counts": counts})
 }
 
 /// What the config file on disk says: how many settings it overrides, or
@@ -871,7 +891,7 @@ const ADMIN_HTML_V2: &str = r##"<!doctype html>
 .dashboard{max-width:1200px;margin:auto;padding:34px 24px 70px}.dashboard>header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:28px}.brand{display:flex;align-items:center;gap:14px}.brand h1{font-size:24px;margin:0}.toolbar{display:flex;gap:9px;align-items:center}.status{padding:9px 12px;border:1px solid var(--line);border-radius:8px;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:16px}.card,.panel,.config-group,.posture{background:linear-gradient(180deg,#131820,#11151c);border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 32px #0003}.card{padding:18px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:29px;font-weight:780;margin-top:8px}.panels{display:grid;grid-template-columns:1.55fr 1fr;gap:16px;margin-top:16px}.panel{padding:20px}.panel h2,.config-header h2{font-size:16px;margin:0}.chart{height:245px;width:100%;margin-top:15px;background:#0b0e13;border-radius:8px;border:1px solid #1e2530}
 .posture{padding:22px}.posture-head{display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px}.posture-head h2{margin:0;font-size:20px}.badge{display:inline-block;padding:2px 9px;border:1px solid var(--line);border-radius:999px;font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap}.badge.preset{border-color:#ff8a3d88;color:var(--hot)}.posture-summary{margin:12px 0 0;color:var(--muted)}.posture ul{margin:12px 0 0;padding-left:20px}.posture li{margin:4px 0}.warning{margin-top:14px;padding:11px 13px;border:1px solid #f3c15f66;border-radius:8px;background:#f3c15f12;color:var(--amber);font-size:13px}
 .config{margin-top:16px}.config-intro{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:16px}.config-intro h2{margin:0 0 4px;font-size:20px}.config-intro p{margin:0}.config-groups{display:grid;gap:12px}.config-group{overflow:hidden}.config-group summary{list-style:none;cursor:pointer;padding:18px 20px}.config-group summary::-webkit-details-marker{display:none}.config-header{display:flex;align-items:center;justify-content:space-between;gap:15px}.config-header h2:after{content:"+";display:inline-block;margin-left:9px;color:var(--hot)}details[open] .config-header h2:after{content:"−"}.config-header p{max-width:650px;margin:3px 0 0;color:var(--muted);font-size:13px}.config-fields{display:grid;grid-template-columns:1fr;gap:0;padding:0 20px 4px;border-top:1px solid var(--line)}
-.field{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,360px);align-items:center;gap:32px;padding:16px 0;border-bottom:1px solid #222a34}.field:last-child{border-bottom:0}.field-copy{min-width:0}.field-title,.field-help,.field-trade{display:block}.field-title{font-weight:680}.field-help{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.45}.field-trade{margin-top:3px;color:#c3cad6;font-size:12px;line-height:1.45}.field-trade b{color:var(--muted);font-weight:700}.field-inputs{display:grid;gap:8px;min-width:0}.unit-input{display:flex;align-items:center;gap:8px;min-width:0}.unit-input>span{color:var(--muted);font-size:13px;white-space:nowrap}.unit-input>.bucket-label{flex:0 0 74px}.unit-input input[type=number],.unit-input input[type=text],.unit-input input[type=url],.unit-input select{flex:1 1 auto;min-width:0;height:42px;background:#0a0d12;border:1px solid var(--line);border-radius:7px;padding:9px 10px;color:var(--text)}.unit-input select.unit{flex:0 0 auto;width:auto}.unit-input input:focus,.unit-input select:focus{outline:2px solid #ff8a3d55;border-color:var(--hot)}.unit-input input[type=checkbox]{width:20px;height:20px;accent-color:var(--hot)}.off{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;white-space:nowrap}.read-only{font-weight:680}.access-rows{display:grid;gap:0;padding:0 20px 8px;border-top:1px solid var(--line)}.access-row{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:20px;padding:13px 0;border-bottom:1px solid #222a34}.access-row:last-child{border-bottom:0}.access-row>span:first-child{color:var(--muted);font-size:13px}
+.field{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,360px);align-items:center;gap:32px;padding:16px 0;border-bottom:1px solid #222a34}.field:last-child{border-bottom:0}.field-copy{min-width:0}.field-title,.field-help,.field-trade{display:block}.field-title{font-weight:680}.field-help{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.45}.field-trade{margin-top:3px;color:#c3cad6;font-size:12px;line-height:1.45}.field-trade b{color:var(--muted);font-weight:700}.field-inputs{display:grid;gap:8px;min-width:0}.unit-input{display:flex;align-items:center;gap:8px;min-width:0}.unit-input>span{color:var(--muted);font-size:13px;white-space:nowrap}.unit-input>.bucket-label{flex:0 0 74px}.unit-input input[type=number],.unit-input input[type=text],.unit-input input[type=url],.unit-input select{flex:1 1 auto;min-width:0;height:42px;background:#0a0d12;border:1px solid var(--line);border-radius:7px;padding:9px 10px;color:var(--text)}.unit-input select.unit{flex:0 0 auto;width:auto}.unit-input input:focus,.unit-input select:focus{outline:2px solid #ff8a3d55;border-color:var(--hot)}.unit-input input[type=checkbox]{width:20px;height:20px;accent-color:var(--hot)}.off{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;white-space:nowrap}.read-only{font-weight:680}.field-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin-top:8px}.field-meta:empty{display:none}.field-meta .warning{flex-basis:100%;margin-top:2px}.badge.override{border-color:#f3c15f88;color:var(--amber)}.preset-value{color:var(--muted);font-size:12px}.refused{color:var(--hot);font-size:12px;font-weight:700}button.link{padding:0;background:none;border:0;border-radius:0;color:var(--hot);font-size:12px;font-weight:700;text-decoration:underline}.access-rows{display:grid;gap:0;padding:0 20px 8px;border-top:1px solid var(--line)}.access-row{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:20px;padding:13px 0;border-bottom:1px solid #222a34}.access-row:last-child{border-bottom:0}.access-row>span:first-child{color:var(--muted);font-size:13px}
 .actions{position:sticky;bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:16px;padding:14px 16px;background:#11161ef2;border:1px solid var(--line);border-radius:10px;backdrop-filter:blur(12px)}
 @media(max-width:820px){.grid{grid-template-columns:1fr 1fr}.panels{grid-template-columns:1fr}}@media(max-width:620px){.field{grid-template-columns:1fr;gap:10px}.access-row{grid-template-columns:1fr;gap:4px}}@media(max-width:560px){.dashboard{padding:22px 14px}.dashboard>header,.config-intro{align-items:flex-start;flex-direction:column}.toolbar{width:100%;flex-wrap:wrap}.grid{grid-template-columns:1fr}.login-card{padding:27px}.actions{align-items:flex-start;flex-direction:column}.actions button{width:100%}.posture{padding:18px}}
 </style>
@@ -897,12 +917,14 @@ const ADMIN_HTML_V2: &str = r##"<!doctype html>
     <div class="posture-head"><h2 id="postureTitle">Posture</h2><span id="presetName" class="badge preset">—</span><span id="overrides" class="badge">—</span></div>
     <p id="presetSummary" class="posture-summary"></p>
     <ul id="postureSentences"></ul>
+    <p id="refusalSummary" class="posture-summary"></p>
     <div id="fileProblem" class="warning" hidden></div>
+    <div id="postureWarnings"></div>
   </section>
   <section class="grid">
     <div class="card"><div class="label">Connections</div><div id="connections" class="value">—</div></div>
     <div class="card"><div class="label">Events written</div><div id="written" class="value">—</div></div>
-    <div class="card"><div class="label">Rejected</div><div id="rejected" class="value">—</div></div>
+    <div class="card"><div id="refusedLabel" class="label">Refused</div><div id="refused" class="value">—</div></div>
     <div class="card"><div class="label">Protocol messages</div><div id="messages" class="value">—</div></div>
   </section>
   <section class="panels">
@@ -957,25 +979,30 @@ function getValue(input,wrap){
  const exact=Number(field.value)*(unit?Number(unit.value):1),value=Math.round(exact),base={bytes:'bytes',seconds:'seconds',micros:'microseconds',per_second:'per second'}[input.unit];
  if(!Number.isFinite(exact)||exact<0||Math.abs(exact-value)>1e-9*Math.max(1,exact))throw Error(input.key+' must be a whole number'+(base?' ('+base+')':'')+', not '+field.value+(unit?' '+unit.selectedOptions[0].textContent:''));
  return value}
+// Settings the refusal counter names that have no field of their own.
+const ACCESS_LABELS={'relay.auth.read_policy':'Reads','relay.auth.write_policy':'Writes','relay.auth.recipient_only_kinds':'Only to author and recipient','relay.auth.owner_only_kinds':'Only to their author','relay.auth.authenticated_kinds':'To any logged-in user','relay.auth.accepted_kinds':'Accepted kinds','relay.auth.enabled':'Login (NIP-42)','relay.auth.service_url':'Login (NIP-42)','relay.write_policy_plugin':'Write-policy plugin','relay.nip62.enabled':'Vanish requests (NIP-62)'};
 function accessRows(a){
  const kinds=list=>list.length?list.map(k=>String(k.kind)+(k.name?' ('+k.name+')':'')+(k.stricter?' (governed by '+k.stricter+', which is stricter)':'')).join(', '):'None';
  return [
-  ['Reads',a.read_policy+': '+a.read_policy_means],
-  ['Writes',a.write_policy+': '+a.write_policy_means],
-  ['Only to author and recipient',kinds(a.recipient_only_kinds)],
-  ['Only to their author',kinds(a.owner_only_kinds)+(a.owner_only_kinds.length?'; accepted only from a connection logged in as their author':'')],
-  ['To any logged-in user',kinds(a.authenticated_kinds)],
-  ['Deliverable to members',kinds(a.inbox_kinds)+(a.write_policy==='members'?'':' (used only with write_policy = members)')],
-  ['Accepted kinds',a.accepted_kinds?a.accepted_kinds.join(', '):'Every kind'],
-  ['Login (NIP-42)',a.auth_usable?'Available at '+a.service_url:a.auth_enabled?'Unavailable: relay.auth.service_url is not set':'Off: relay.auth.enabled is false'],
-  ['NIP-11','auth_required: '+a.auth_required+' · restricted_writes: '+a.restricted_writes]]}
+  ['Reads',a.read_policy+': '+a.read_policy_means,['relay.auth.read_policy']],
+  ['Writes',a.write_policy+': '+a.write_policy_means,['relay.auth.write_policy']],
+  ['Only to author and recipient',kinds(a.recipient_only_kinds),['relay.auth.recipient_only_kinds']],
+  ['Only to their author',kinds(a.owner_only_kinds)+(a.owner_only_kinds.length?'; accepted only from a connection logged in as their author':''),['relay.auth.owner_only_kinds']],
+  ['To any logged-in user',kinds(a.authenticated_kinds),['relay.auth.authenticated_kinds']],
+  ['Deliverable to members',kinds(a.inbox_kinds)+(a.write_policy==='members'?'':' (used only with write_policy = members)'),[]],
+  ['Accepted kinds',a.accepted_kinds?a.accepted_kinds.join(', '):'Every kind',['relay.auth.accepted_kinds']],
+  ['Login (NIP-42)',a.auth_usable?'Available at '+a.service_url:a.auth_enabled?'Unavailable: relay.auth.service_url is not set':'Off: relay.auth.enabled is false',['relay.auth.enabled','relay.auth.service_url']],
+  ['NIP-11','auth_required: '+a.auth_required+' · restricted_writes: '+a.restricted_writes,[]]]}
 function buildAccess(root){
  const details=el('details','config-group');details.open=true;
  const summary=el('summary'),header=el('div','config-header'),copy=el('div');copy.append(el('h2',null,'Access'),el('p',null,'Who can read and write, and which kinds are private. Set in wok.toml: the dashboard shows these settings but cannot change them, so a remote save cannot lock anyone out.'));header.append(copy);summary.append(header);details.append(summary);
  const rows=el('div','access-rows');rows.id='accessRows';details.append(rows);root.append(details)}
-function renderAccess(a){
- const rows=$('accessRows');rows.replaceChildren();
- for(const [label,text] of accessRows(a)){const row=el('div','access-row');row.append(el('span',null,label),el('span',null,text));rows.append(row)}
+function renderAccess(d){
+ const a=d.access,rows=$('accessRows');rows.replaceChildren();
+ for(const [label,text,keys] of accessRows(a)){
+  const row=el('div','access-row'),value=el('span',null,text),refused=keys.reduce((n,key)=>n+(d.refusals.counts[key]||0),0);
+  if(refused){value.append(document.createElement('br'),el('span','refused','Refused '+fmt(refused)+' '+windowPhrase(d.refusals.since)))}
+  row.append(el('span',null,label),value);rows.append(row)}
  if(a.warning){const row=el('div','access-row'),warning=el('div','warning',a.warning);row.append(el('span',null,'Warning'),warning);rows.append(row)}
  const row=el('div','access-row'),link=el('a',null,'Read and write policies, read classes and accepted kinds');link.href=DOCS;link.rel='noreferrer';link.target='_blank';row.append(el('span',null,'Reference'),link);rows.append(row)}
 function createForm(sections){
@@ -987,11 +1014,35 @@ function createForm(sections){
   for(const f of section.fields){
    const row=el('div','field'),text=el('div','field-copy');text.append(el('span','field-title',f.label),el('span','field-help',f.help));
    for(const [label,copy] of [['If too low: ',f.too_low],['If too high: ',f.too_high]])if(copy){const line=el('span','field-trade');line.append(el('b',null,label),document.createTextNode(copy));text.append(line)}
+   const meta=el('div','field-meta');meta.dataset.field=section.id+':'+section.fields.indexOf(f);text.append(meta);
    const inputs=el('div','field-inputs');for(const input of f.inputs)inputs.append(buildInput(input));
    row.append(text,inputs);fields.append(row)}
   details.append(fields);root.append(details)}
  formBuilt=true}
-function eachInput(fn){for(const section of data.sections)for(const f of section.fields)for(const input of f.inputs)fn(input,document.querySelector('.unit-input[data-group="'+input.group+'"][data-name="'+input.name+'"]'))}
+function wrapOf(input){return document.querySelector('.unit-input[data-group="'+input.group+'"][data-name="'+input.name+'"]')}
+function syncDisabled(){for(const field of document.querySelectorAll('.config-input,.off-switch,select.unit')){const off=field.closest('.unit-input').querySelector('.off-switch');field.disabled=!data.can_write_config||(field!==off&&!!off&&off.checked)}}
+function windowPhrase(since){if(since==null)return 'since the relay started';const secs=Date.now()/1000-since;if(secs>=23*3600)return 'in the last 24 h';if(secs>=3600)return 'in the last '+Math.round(secs/3600)+' h';return 'in the last '+Math.max(1,Math.round(secs/60))+' min'}
+function renderMeta(d){
+ for(const section of d.sections)section.fields.forEach((f,i)=>{
+  const meta=document.querySelector('[data-field="'+section.id+':'+i+'"]');meta.replaceChildren();
+  const preset=input=>d.preset_config[input.group][input.name],overridden=f.inputs.filter(input=>d.config[input.group][input.name]!==preset(input));
+  if(overridden.length){
+   meta.append(el('span','badge override','Override'),el('span','preset-value','Preset: '+overridden.map(input=>describe(input,preset(input))).join(', ')));
+   if(d.can_write_config&&!f.inputs.some(input=>input.file_only)){const reset=el('button','link','Reset to preset');reset.type='button';reset.onclick=()=>{for(const input of f.inputs)setValue(input,wrapOf(input),preset(input));syncDisabled();$('saveStatus').textContent='Reset '+f.label+' to the preset; save to apply.';$('saveStatus').className='muted'};meta.append(reset)}}
+  for(const input of f.inputs)for(const name of input.nip11)if(name in d.nip11)meta.append(el('span','badge','NIP-11: '+name));
+  const refused=f.inputs.reduce((n,input)=>n+(d.refusals.counts[input.key]||0),0);
+  if(refused)meta.append(el('span','refused','Refused '+fmt(refused)+' '+windowPhrase(d.refusals.since)));
+  for(const w of d.warnings)if(w.keys.some(key=>f.inputs.some(input=>input.key===key)))meta.append(el('div','warning',w.warning));
+ });
+ // A guard with no field of its own is warned about on the posture card.
+ const keys=new Set(d.sections.flatMap(section=>section.fields.flatMap(f=>f.inputs.map(input=>input.key))));
+ $('postureWarnings').replaceChildren(...d.warnings.filter(w=>!w.keys.some(key=>keys.has(key))).map(w=>el('div','warning',w.warning)))}
+function renderRefusals(d){
+ const labels={...ACCESS_LABELS};for(const section of d.sections)for(const f of section.fields)for(const input of f.inputs)labels[input.key]=f.label;
+ const refused=Object.entries(d.refusals.counts).filter(([,n])=>n>0).sort((a,b)=>b[1]-a[1]),total=refused.reduce((n,[,count])=>n+count,0),when=windowPhrase(d.refusals.since);
+ $('refused').textContent=fmt(total);$('refusedLabel').textContent='Refused '+when;
+ $('refusalSummary').textContent=total?'Refused '+fmt(total)+' requests and events '+when+', most by '+refused.slice(0,3).map(([key,n])=>(labels[key]||key)+' ('+fmt(n)+')').join(', ')+'.':'Nothing refused '+when+'.'}
+function eachInput(fn){for(const section of data.sections)for(const f of section.fields)for(const input of f.inputs)fn(input,wrapOf(input))}
 async function sha256(text){const bytes=new TextEncoder().encode(text),hash=await crypto.subtle.digest('SHA-256',bytes);return [...new Uint8Array(hash)].map(x=>x.toString(16).padStart(2,'0')).join('')}
 function authNonce(){const bytes=crypto.getRandomValues(new Uint8Array(16));return [...bytes].map(x=>x.toString(16).padStart(2,'0')).join('')}
 async function authFetch(path,method='GET',body=''){if(!window.nostr)throw Error('No NIP-07 signer was found in this browser');const url=PUBLIC_BASE+path,tags=[['u',url],['method',method],['nonce',authNonce()]];if(body)tags.push(['payload',await sha256(body)]);const ev=await window.nostr.signEvent({kind:27235,created_at:Math.floor(Date.now()/1000),content:'',tags});const headers={Authorization:'Nostr '+btoa(JSON.stringify(ev))};if(body)headers['Content-Type']='application/json';const res=await fetch(path,{method,body:body||undefined,headers});if(!res.ok)throw Error((await res.text())||res.statusText);return res.json()}
@@ -1004,10 +1055,10 @@ function renderPosture(d){
 function render(d){
  data=d;const c=d.history.current||{};
  if(!formBuilt)createForm(d.sections);
- renderPosture(d);renderAccess(d.access);
- $('connections').textContent=fmt(c.active_connections);$('written').textContent=fmt(c.written_events_total);$('rejected').textContent=fmt(c.rejected_events_total);$('messages').textContent=fmt((c.client_messages_total||0)+(c.relay_messages_total||0));
+ renderPosture(d);renderAccess(d);renderRefusals(d);
+ $('connections').textContent=fmt(c.active_connections);$('written').textContent=fmt(c.written_events_total);$('messages').textContent=fmt((c.client_messages_total||0)+(c.relay_messages_total||0));
  eachInput((input,wrap)=>setValue(input,wrap,d.config[input.group][input.name]));
- for(const field of document.querySelectorAll('.config-input,.off-switch,select.unit')){const off=field.closest('.unit-input').querySelector('.off-switch');field.disabled=!d.can_write_config||(field!==off&&!!off&&off.checked)}
+ syncDisabled();renderMeta(d);
  $('save').disabled=!d.can_write_config;$('saveStatus').textContent=d.can_write_config?'Changes are validated, atomically persisted, and live-reloaded.':'Configuration writes are disabled in wok.toml.';$('saveStatus').className='muted';
  const chartPoints=d.history.points?.length?d.history.points:[{active_connections:c.active_connections||0},{active_connections:c.active_connections||0}];
  $('version').textContent=d.version;$('mode').textContent=d.can_write_config?'Editable':'Read only';$('refreshed').textContent=new Date().toLocaleTimeString();draw(chartPoints);
@@ -1533,10 +1584,78 @@ event_burst = 500
             let Ok((_, verified)) = patched_file("", patch) else {
                 continue;
             };
-            if !verified.zero_guard_warnings().is_empty() {
+            let guards = verified.zero_guards();
+            if !guards.is_empty() {
                 assert!(input.zero_off, "{} = 0 disables a guard", input.key);
+                // The warning names the key, so the page shows it here.
+                assert!(
+                    guards
+                        .iter()
+                        .any(|guard| guard.keys.iter().any(|key| key == input.key)),
+                    "{} = 0 warns about other keys: {guards:?}",
+                    input.key
+                );
             }
         }
+    }
+
+    #[test]
+    fn nip11_chips_name_what_nip11_advertises() {
+        // Every field NIP-11 can advertise: a lower bound set, abuse on.
+        let mut cfg = Config::default();
+        cfg.events.reject_older_than_secs = 3600;
+        let advertised = crate::nip11(&cfg)["limitation"]
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut chips: Vec<&str> = fields::SECTIONS
+            .iter()
+            .flat_map(|section| section.fields)
+            .flat_map(|field| field.inputs)
+            .flat_map(|input| input.nip11.iter().copied())
+            .collect();
+        chips.sort_unstable();
+        // Constants and the access flags the Access panel shows have no
+        // field of their own.
+        let mut expected: Vec<&str> = advertised
+            .keys()
+            .map(String::as_str)
+            .filter(|name| {
+                !["max_subid_length", "auth_required", "restricted_writes"].contains(name)
+            })
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(chips, expected);
+        // Each chip's value is its input's.
+        let values = dashboard_config(&cfg);
+        for input in fields::SECTIONS
+            .iter()
+            .flat_map(|section| section.fields)
+            .flat_map(|field| field.inputs)
+        {
+            for name in input.nip11 {
+                assert_eq!(advertised[*name], values[input.group][input.name], "{name}");
+            }
+        }
+        // A limit that is off is not advertised, so its chip is not shown.
+        let limitation = crate::nip11(&Config::default())["limitation"].clone();
+        assert!(limitation.get("created_at_lower_limit").is_none());
+    }
+
+    #[test]
+    fn the_overview_counts_refusals_by_key() {
+        let metrics = wok_relay::metrics::Metrics::default();
+        metrics.refused(wok_relay::metrics::Setting::MaxQueryWork);
+        // Before the first mark, counts are since start.
+        let before = refusals(&metrics);
+        assert_eq!(before["since"], serde_json::Value::Null);
+        assert_eq!(before["counts"]["relay.abuse.max_query_work"], 1);
+        metrics.refusals.mark(1_000);
+        metrics.refused(wok_relay::metrics::Setting::MaxQueryWork);
+        let after = refusals(&metrics);
+        assert_eq!(after["since"], 1_000);
+        assert_eq!(after["counts"]["relay.abuse.max_query_work"], 1);
+        assert_eq!(after["counts"]["events.max_num_tags"], 0);
     }
 
     #[test]

@@ -331,7 +331,7 @@ async fn dispatch(
         );
     }
     let mut response = if wants_nip11 {
-        json_response(&nip11(&cfg, &handle))
+        json_response(&nip11(&cfg))
     } else {
         html_response(&landing(&cfg, &handle.supported_nips()))
     };
@@ -428,7 +428,7 @@ fn maybe_npub(s: &str) -> String {
     s.to_string()
 }
 
-fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
+pub(crate) fn nip11(cfg: &Config) -> serde_json::Value {
     let min_pow_difficulty = if cfg.relay.abuse.enabled {
         cfg.relay.abuse.min_pow_difficulty
     } else {
@@ -494,7 +494,6 @@ fn nip11(cfg: &Config, handle: &RelayHandle) -> serde_json::Value {
     if !info.terms.is_empty() {
         v["terms_of_service"] = serde_json::json!(info.terms);
     }
-    let _ = handle;
     v
 }
 

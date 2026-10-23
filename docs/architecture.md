@@ -164,16 +164,19 @@ a REQ reusing an open id is charged only for the difference.
      negentropy worker queues NEG-OPEN scans the same way.
    - Each pass, the worker takes what is queued for it, up to 64 messages,
      and applies it in order under one read transaction. Cancels, AUTH and
-     disconnects take no query time. Each new REQ or COUNT gets its first
-     time slice (`relay.query_timeslice_budget_us`) as it is taken, so a
-     small one is answered before the messages behind it. A slice covers
+     disconnects take no query time. Each new REQ or COUNT that can start
+     gets its first time slice (`relay.query_timeslice_budget_us`) as it is
+     taken, so a small one is answered before the messages behind it. One
+     that has to wait for its connection's running scans gets no slice until
+     it starts. A slice covers
      all of a query's filters: one that ends after the budget is spent
      leaves the next filter to the next slice.
    - The running query that has waited longest gets a slice ahead of the
      next new query once the new queries' first slices since its last slice
      have taken as long as that slice did, and at the end of a pass when no
-     more messages are waiting. So new queries go first, a REQ queued during
-     a pass does not wait for another slice of a long scan. However many REQs
+     more messages are waiting. So new queries go first: a REQ taken in a
+     pass, and free to start, does not wait for another slice of a long
+     scan. However many REQs
      come, each stretch of new work as long as the running queries' last
      slice, overrun by at most one first slice, is followed by a slice of
      theirs: about half the worker when the two take similar time.

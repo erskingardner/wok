@@ -6,6 +6,9 @@ For a least-privilege systemd unit, filesystem layout, reverse-proxy boundary,
 plugin isolation guidance, and logging policy, see
 [Production deployment security](production-deployment.md).
 
+[Attack surface](attack-surface.md) lists every entry point, who can reach
+it, the gate in front of it, and the work done before that gate.
+
 - Treat every EVENT as untrusted. IDs and Schnorr signatures are verified unless `--no-verify` import is explicitly used.
 - Input limits: `max_event_size`, tag counts, WebSocket/Unix frame sizes, and
   `max_pending_outbound_bytes`.

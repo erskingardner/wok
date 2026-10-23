@@ -1,0 +1,4 @@
+# A public relay configured as docs/wok.toml asks: anyone may publish and
+# read, and AUTH works, so DMs and gift wraps reach their recipients.
+[relay.auth]
+service_url = "wss://relay.example.com"

@@ -113,22 +113,33 @@ async fn default_cost_ceiling_serves_client_filters_and_refuses_fan_outs() {
 
     let fifty_kinds: Vec<u64> = (1..=50).collect();
     let fan_out = json!({"authors": keys(2000), "kinds": fifty_kinds});
-    for (msg, refusal, cost) in [
-        (json!(["REQ", "wide", fan_out]), "CLOSED", 102_000),
-        (json!(["COUNT", "wide", fan_out]), "CLOSED", 200_000),
+    // `blocked:`: the same request would be refused again (#97 §8).
+    for (msg, refusal, cost, request) in [
+        (json!(["REQ", "wide", fan_out]), "CLOSED", 102_000, "REQ"),
+        (
+            json!(["COUNT", "wide", fan_out]),
+            "CLOSED",
+            200_000,
+            "COUNT",
+        ),
         (
             json!(["NEG-OPEN", "wide", fan_out, neg_initial()]),
             "NEG-ERR",
             100_000,
+            "NEG-OPEN",
         ),
     ] {
         let refused = reply(&conn, &mut rx, msg).await;
-        assert_eq!(refused[0], refusal, "{refused}");
-        assert_eq!(refused[1], "wide", "{refused}");
-        let reason = refused[2].as_str().unwrap();
-        assert!(
-            reason.contains(&format!("query cost {cost} ")) && reason.ends_with(" 20000"),
-            "{reason}"
+        assert_eq!(
+            refused,
+            json!([
+                refusal,
+                "wide",
+                format!(
+                    "blocked: query too broad (cost {cost} > 20000); split the {request} or \
+                     narrow authors/kinds"
+                )
+            ])
         );
     }
     assert_eq!(

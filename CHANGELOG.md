@@ -391,6 +391,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     disabled by `relay.max_filter_limit_count = 0`.
   A write-policy plugin's reason that starts with `unsupported:` is now sent
   as is, rather than as `blocked: unsupported: ...`.
+- A REQ, COUNT or NEG-OPEN over the query-work ceiling is refused with
+  `blocked: query too broad (cost <n> > <max>); split the REQ or narrow
+  authors/kinds`, naming the request. Before, it got `rate-limited:`, which
+  tells a client to retry a request that will be refused again. NIP-11
+  advertises `max_query_work` only while `relay.abuse.enabled` is on and the
+  ceiling is not zero; before, it advertised a ceiling that refused nothing.
 - An EVENT whose duplicate check could not read the database was refused
   with `invalid:`. It now gets `error:`, because the failure is the relay's.
 - A REQ with many filters could hold a req worker well past its time slice

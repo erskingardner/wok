@@ -2807,6 +2807,28 @@ fn ingest_req(
     dispatch.subscription(MonitorMsg::Register(sub.clone()), ReqMsg::Scan(sub));
 }
 
+/// Refuse a request whose estimated index work is over
+/// `relay.abuse.max_query_work`. The same request would be refused again, so
+/// the reason is `blocked:`, not `rate-limited:` (#97 §8).
+fn check_query_work(
+    cfg: &Config,
+    metrics: &Metrics,
+    work: u64,
+    request: &str,
+) -> Result<(), String> {
+    let max = cfg.relay.abuse.max_query_work;
+    if !cfg.relay.abuse.enabled || max == 0 || work <= max {
+        return Ok(());
+    }
+    metrics
+        .abuse_query_cost_rejections
+        .fetch_add(1, Ordering::Relaxed);
+    Err(format!(
+        "blocked: query too broad (cost {work} > {max}); split the {request} or narrow \
+         authors/kinds"
+    ))
+}
+
 /// Every check a REQ or COUNT passes before any worker sees it, returning
 /// the subscription and its serialized filter bytes. `Err` is the CLOSED
 /// reason: `invalid:` for a malformed request or one over a size limit,
@@ -2874,18 +2896,12 @@ fn admit_req(
     // checks its own snapshot, and either plan's seeks are bounded.
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(costed, tag_kind_index);
-    if cfg.relay.abuse.enabled
-        && cfg.relay.abuse.max_query_work != 0
-        && query_cost > cfg.relay.abuse.max_query_work
-    {
-        metrics
-            .abuse_query_cost_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        return Err(format!(
-            "rate-limited: estimated query cost {query_cost} exceeds {}",
-            cfg.relay.abuse.max_query_work
-        ));
-    }
+    check_query_work(
+        cfg,
+        metrics,
+        query_cost,
+        if count_only { "COUNT" } else { "REQ" },
+    )?;
 
     let authed = auth.get(&conn_id).and_then(|a| a.authed);
     let r = restrictor(cfg);
@@ -3206,18 +3222,7 @@ fn ingest_neg(
     .map_err(|e| format!("{}: {e}", e.reason_prefix()))?;
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
-    if cfg.relay.abuse.enabled
-        && cfg.relay.abuse.max_query_work != 0
-        && query_cost > cfg.relay.abuse.max_query_work
-    {
-        metrics
-            .abuse_query_cost_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        return Err(format!(
-            "rate-limited: estimated query cost {query_cost} exceeds {}",
-            cfg.relay.abuse.max_query_work
-        ));
-    }
+    check_query_work(cfg, metrics, query_cost, "NEG-OPEN")?;
     let r = restrictor(cfg);
     if r.is_filter_group_fully_restricted(&fg)
         && auth.get(&conn_id).and_then(|a| a.authed).is_none()
@@ -5369,7 +5374,9 @@ mod tests {
             )
             .await;
         let response = recv_outbound(&mut rx).await;
-        assert!(response.contains("\"CLOSED\"") && response.contains("query cost 2001"));
+        assert!(response.contains(
+            "\"CLOSED\",\"broad\",\"blocked: query too broad (cost 2001 > 10); split the REQ"
+        ));
         assert_eq!(
             handle
                 .metrics

@@ -158,6 +158,15 @@ regression test. Differential parity alone is not a reason to retain it.
   NEG-ERR closes the session. A NEG-OPEN with an invalid subscription
   id is refused with NEG-ERR too. Only a sub id that is not a string, or a
   NEG-MSG or NEG-CLOSE with an invalid one, still produces a NOTICE.
+- NIP-70: a repost (kind 6 or 16) is refused with `blocked: reposts can't
+  embed protected events` when its content parses as an event object with a
+  tag named `-`. Content that starts as a JSON object but that the strict
+  parser refuses is refused too, since clients' parsers accept some of it (a
+  repeated key, deep nesting, a lone surrogate, a number too large for a
+  double) and could read a protected event there. Pinned strfry refuses any
+  repost whose content contains the text `["-"]`, so it refuses reposts of
+  notes that only mention it and accepts protected events written with other
+  spacing or a tag such as `["-",""]`.
 - NIP-01: a subscription id may be any non-empty string of at most 64
   characters, counted in Unicode characters. Every frame JSON-escapes it,
   and subscriptions are keyed by the exact id. Pinned strfry splices the id

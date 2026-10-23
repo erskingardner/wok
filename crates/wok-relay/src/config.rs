@@ -3418,6 +3418,128 @@ max_event_size = 99999999999
     }
 
     #[test]
+    fn links_into_config_md_name_its_headings() {
+        // GitHub's anchors: lowercase, punctuation dropped, spaces as dashes.
+        let reference = include_str!("../../../docs/config.md");
+        let anchors: std::collections::HashSet<String> = reference
+            .lines()
+            .filter_map(|line| line.strip_prefix("## ").or(line.strip_prefix("### ")))
+            .map(|heading| {
+                heading
+                    .to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-')
+                    .map(|c| if c == ' ' { '-' } else { c })
+                    .collect()
+            })
+            .collect();
+        let mut pages = Vec::new();
+        let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "md") {
+                    pages.push(path);
+                }
+            }
+        }
+        assert!(pages.iter().any(|page| page.ends_with("presets/marmot.md")));
+        let mut checked = 0;
+        for path in pages {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let links = text
+                .match_indices("config.md#")
+                .map(|(at, link)| &text[at + link.len()..]);
+            for link in links {
+                let anchor: String = link
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '-')
+                    .collect();
+                assert!(
+                    anchors.contains(&anchor),
+                    "{} links to config.md#{anchor}, which is no heading",
+                    path.display()
+                );
+                checked += 1;
+            }
+            // In-page links of config.md itself.
+            if path.ends_with("config.md") {
+                for (at, _) in text.match_indices("](#") {
+                    let anchor: String = text[at + 3..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '-')
+                        .collect();
+                    assert!(anchors.contains(&anchor), "config.md links to #{anchor}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10, "found only {checked} links");
+    }
+
+    #[test]
+    fn each_preset_has_a_page_naming_what_it_changes() {
+        for &preset in Preset::ALL {
+            let page = match preset {
+                Preset::Public => include_str!("../../../docs/presets/public.md"),
+                Preset::Marmot => include_str!("../../../docs/presets/marmot.md"),
+            };
+            assert!(
+                page.starts_with(&format!("# The `{preset}` preset")),
+                "{preset}"
+            );
+            let overlay: toml::Value = toml::from_str(preset.overlay()).unwrap();
+            let mut leaves = Vec::new();
+            provenance::flatten(&overlay, &mut Vec::new(), &mut leaves);
+            for (path, _) in leaves {
+                let key = path.join(".");
+                assert!(
+                    page.contains(&format!("`{key}`")),
+                    "docs/presets/{preset}.md does not name {key}, which its overlay sets"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_md_states_each_default() {
+        // Each setting's Default cell is the public preset's value as TOML,
+        // or "empty" for an empty string or list.
+        let reference = include_str!("../../../docs/config.md");
+        let defaults = encode(&Config::default()).unwrap();
+        let mut leaves = Vec::new();
+        provenance::flatten(&defaults, &mut Vec::new(), &mut leaves);
+        for (path, value) in leaves {
+            let key = path.join(".");
+            let row = format!("| `{key}` |");
+            let Some(line) = reference.lines().find(|line| line.starts_with(&row)) else {
+                continue; // every_setting_is_documented_in_config_md
+            };
+            let cell = line.split('|').nth(2).unwrap().trim();
+            let documented = match (cell, value) {
+                ("empty", toml::Value::String(_)) => toml::Value::String(String::new()),
+                ("empty", toml::Value::Array(_)) => toml::Value::Array(Vec::new()),
+                _ => {
+                    let toml = cell
+                        .strip_prefix('`')
+                        .and_then(|cell| cell.strip_suffix('`'))
+                        .unwrap_or_else(|| panic!("{key}: default {cell:?} is not `toml`"));
+                    toml::from_str::<toml::Table>(&format!("v = {toml}"))
+                        .unwrap_or_else(|error| panic!("{key}: {error}"))
+                        .remove("v")
+                        .unwrap()
+                }
+            };
+            assert_eq!(
+                &documented, value,
+                "docs/config.md states the wrong default for {key}"
+            );
+        }
+    }
+
+    #[test]
     fn every_setting_is_documented_in_config_md() {
         let reference = include_str!("../../../docs/config.md");
         let mut leaves = Vec::new();

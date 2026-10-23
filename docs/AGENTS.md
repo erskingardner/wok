@@ -11,7 +11,7 @@ Operator and design documentation. Code remains the authority for current behavi
 | `compatibility-policy.md` | NIPs-first vs strfry; what migration promises |
 | `known-differences.md` | Intentional divergences from C++ |
 | `config.md` + `wok.toml` | Native TOML settings and sample |
-| `presets/` | Copies of the preset overlays in `crates/wok-relay/presets/` |
+| `presets/` | A page per preset (who it is for, what it changes, what it refuses) and copies of the overlays in `crates/wok-relay/presets/` |
 | `lmdb-v3.md` | strfry v3 import contract |
 
 ## Operations

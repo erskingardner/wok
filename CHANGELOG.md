@@ -44,7 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget like the relay listener. The relay warns, at startup and on a reload
   that causes it, when metrics are served on a relay listener or a
   `metrics_listen` address reachable beyond loopback and private addresses,
-  and turning them on or off is logged as a security-scope change. **Upgrading:** a relay scraped at `/metrics`
+  and turning them on or off is logged as a security-scope change. A reload
+  that changes `metrics_listen` is logged and applies at restart; a relay
+  started without one keeps metrics off until then. **Upgrading:** a relay scraped at `/metrics`
   must set `metrics_enabled = true`, preferably with `metrics_listen` on a
   private address, and point Prometheus there.
 - With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`

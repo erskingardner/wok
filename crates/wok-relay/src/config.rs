@@ -973,7 +973,8 @@ impl Config {
         Some(
             "observability.metrics_enabled serves /metrics on the relay listener, which \
              clients can reach, and any web page can read it cross-origin; set \
-             observability.metrics_listen to a private address to serve it there instead"
+             observability.metrics_listen to a private address and restart to serve it there \
+             instead"
                 .into(),
         )
     }
@@ -1429,6 +1430,21 @@ impl Config {
                 self.observability.metrics_enabled, new.observability.metrics_enabled,
             ));
         }
+        let (running, wanted) = (
+            &self.observability.metrics_listen,
+            &new.observability.metrics_listen,
+        );
+        if running != wanted {
+            changes.push(format!(
+                "observability.metrics_listen changed: {running:?} -> {wanted:?}; the running \
+                 value stays until restart{}",
+                if running.is_empty() {
+                    ", and metrics stay off until then rather than be served on the relay listener"
+                } else {
+                    ""
+                },
+            ));
+        }
         if self.relay.write_policy_timeout_secs != new.relay.write_policy_timeout_secs {
             changes.push(format!(
                 "relay.write_policy_timeout_secs changed: {} -> {}",
@@ -1767,7 +1783,14 @@ impl Config {
         // changes take effect after restart, while history bounds reload live.
         self.observability.log_format = old.observability.log_format;
         self.observability.log_filter = old.observability.log_filter;
-        // The metrics listener is bound at startup.
+        // The metrics listener is bound at startup. A file that now asks for
+        // one, on a relay started without, keeps metrics off until a
+        // restart binds it, rather than serve them on the relay listener.
+        if old.observability.metrics_listen.is_empty()
+            && !self.observability.metrics_listen.is_empty()
+        {
+            self.observability.metrics_enabled = false;
+        }
         self.observability.metrics_listen = old.observability.metrics_listen;
         Ok(())
     }
@@ -2834,9 +2857,48 @@ negentropy_enabled = true
                 .any(|change| change == "observability.metrics_enabled changed: true -> false"),
             "{changes:?}"
         );
+        assert!(
+            changes.iter().any(|change| change.starts_with(
+                "observability.metrics_listen changed: \"127.0.0.1:9777\" -> \"127.0.0.1:9778\"; \
+                 the running value stays until restart"
+            )),
+            "{changes:?}"
+        );
         running.apply_reload(reloaded).unwrap();
         assert!(!running.observability.metrics_enabled);
         assert_eq!(running.observability.metrics_listen, "127.0.0.1:9777");
+    }
+
+    #[test]
+    fn a_reload_that_asks_for_a_metrics_listener_keeps_metrics_off_until_restart() {
+        // Started without a listener of its own, serving the relay listener.
+        let mut running = Config::parse_toml("[observability]\nmetrics_enabled = true\n").unwrap();
+        assert!(running.metrics_on_relay_listener());
+        let reloaded = Config::parse_toml(
+            "[observability]\nmetrics_enabled = true\nmetrics_listen = \"127.0.0.1:9777\"\n",
+        )
+        .unwrap();
+        let changes = running.security_scope_changes(&reloaded);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.contains("metrics stay off until then")),
+            "{changes:?}"
+        );
+        running.apply_reload(reloaded).unwrap();
+        assert!(!running.observability.metrics_enabled);
+        assert!(!running.metrics_on_relay_listener());
+        // A listener bound at startup and moved back to the relay listener
+        // keeps serving where it was bound.
+        let mut bound = Config::parse_toml(
+            "[observability]\nmetrics_enabled = true\nmetrics_listen = \"127.0.0.1:9777\"\n",
+        )
+        .unwrap();
+        bound
+            .apply_reload(Config::parse_toml("[observability]\nmetrics_enabled = true\n").unwrap())
+            .unwrap();
+        assert!(bound.observability.metrics_enabled);
+        assert!(!bound.metrics_on_relay_listener());
     }
 
     #[test]

@@ -72,7 +72,7 @@ WebSocket upgrade on any path but `/`.
 | `/nodeinfo/2.1` | anonymous | none | The NodeInfo document. |
 | `/favicon.ico` | anonymous | none | A fixed empty icon. |
 | `/admin`, `/admin/` | anonymous | `admin.enabled` | `GET` returns the signed-out [dashboard](admin-dashboard.md) shell, which holds no relay data. Other methods get 404. |
-| `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix checks its NIP-98 `Authorization: Nostr` header before reading the body: it decodes the header and parses its event strictly; checks its kind, empty content, time window and `u` and `method` tags; checks that the signer it names is in `admin.pubkeys`; and verifies the event and its signature. A request that fails any of these is refused without its body being read. A signer not in the list and a bad signature get the same 401, so a forged event cannot ask which keys are admins. It then reads the body (at most 64 KiB), checks the `payload` tag when the request has a body, and claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
+| `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix checks its NIP-98 `Authorization: Nostr` header before reading the body: it decodes the header and parses its event strictly; checks its kind, empty content, time window and `u` and `method` tags; checks that the signer it names is in `admin.pubkeys`; and verifies the event and its signature. A request that fails any of these is refused without its body being read. A signer not in the list and a bad signature get the same 401, so a forged event cannot ask which keys are admins. It then reads the body (at most 64 KiB), checks the time window again and the `payload` tag when the request has a body, and claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
 
 ## Metrics listener
 
@@ -125,8 +125,9 @@ NIP-86 requests are a `POST` to `/` with
 request that fails. In place of `admin.pubkeys`, the signer the event names
 must hold a management level, checked before the signature is verified; a
 signer with none and a bad signature get the same 401, and neither claims a
-replay slot. Wok then reads the body (at most 64 KiB), checks it against the
-`payload` tag and the signer's level again, and parses it. The body
+replay slot. Wok then reads the body (at most 64 KiB), checks the time window
+and the signer's level again and the body against the `payload` tag, and
+parses it. The body
 must name a `method` and a `params` array, refuses a method that is not in
 its method table or is above the signer's level, and only then reads the
 method's parameters.

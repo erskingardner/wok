@@ -198,7 +198,8 @@ pub struct RelayConfig {
     /// REQ or COUNT command.
     pub max_req_filter_size: usize,
     /// Maximum combined compact-JSON filter bytes of the REQ subscriptions
-    /// open on one connection; zero is unlimited.
+    /// open on one connection, and separately of its unanswered COUNTs;
+    /// zero is unlimited.
     pub max_filter_bytes_per_connection: usize,
     /// Unconditional protocol ceiling for filter objects in one REQ/COUNT.
     pub max_filters_per_req: usize,

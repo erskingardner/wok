@@ -1042,7 +1042,7 @@ fn setting_for(reason: &str) -> &'static str {
         "relay.sync_memory_per_connection / sync_memory_total"
     } else if r.contains("concurrent historical") {
         "relay.abuse.max_concurrent_historical_queries"
-    } else if r.contains("too many concurrent reqs") {
+    } else if r.contains("historical queries waiting") || r.contains("too many concurrent reqs") {
         "relay.max_subs_per_connection"
     } else if r.contains("connection's filters exceed") {
         "relay.max_filter_bytes_per_connection"
@@ -3684,6 +3684,10 @@ mod tests {
             (
                 "rate-limited: too many concurrent historical queries",
                 "relay.abuse.max_concurrent_historical_queries",
+            ),
+            (
+                "rate-limited: too many historical queries waiting on this connection",
+                "relay.max_subs_per_connection",
             ),
             (
                 "invalid: bad req: filters exceed N serialized bytes",

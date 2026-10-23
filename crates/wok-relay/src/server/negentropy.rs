@@ -199,6 +199,9 @@ pub(super) fn run_negentropy(
         policy = next_policy;
         generation = current_generation;
         queries.set_max_subs_per_connection(cfg.relay.abuse.max_concurrent_historical_queries);
+        // A NEG-OPEN over the concurrency cap waits, as a REQ does (#97 F2).
+        // Sessions per connection are capped at this already.
+        queries.set_max_waiting_per_connection(cfg.relay.max_subs_per_connection);
         queries.set_max_total_events_per_req(cfg.relay.max_sync_events.saturating_add(1));
         if let Some(msg) = msg {
             match msg {
@@ -285,8 +288,10 @@ pub(super) fn run_negentropy(
                     let view = if let Some(tree_id) = tree_id {
                         View::Tree { sub, tree_id }
                     } else {
+                        // A view that waits for a scan slot is built, and
+                        // answered, once its scan runs.
                         match queries.add_sub(&txn, sub) {
-                            Ok(true) => View::Memory {
+                            Ok(Scheduled::Running | Scheduled::Waiting) => View::Memory {
                                 initial: payload.clone(),
                                 items: Vector::new(),
                             },

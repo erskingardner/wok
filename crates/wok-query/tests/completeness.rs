@@ -6,7 +6,9 @@ use tempfile::TempDir;
 use wok_db::{write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
 use wok_event::{parse_and_verify_event, EventLimits};
 use wok_query::visibility::{ReadRestrictor, ReadVisibility};
-use wok_query::{Completeness, DbQuery, NostrFilterGroup, QueryScheduler, SubId, Subscription};
+use wok_query::{
+    Completeness, DbQuery, NostrFilterGroup, QueryScheduler, Scheduled, SubId, Subscription,
+};
 
 const FINISH: Completeness = Completeness {
     finish: true,
@@ -347,7 +349,7 @@ fn the_scheduler_reports_completeness_for_reqs_only() {
         let group =
             NostrFilterGroup::from_value(&json!({"kinds": [1], "limit": 2}), 500, 3, 16).unwrap();
         let sub = Subscription::new(1, SubId::new(sub_id).unwrap(), group, count_only);
-        assert!(scheduler.add_sub(&txn, sub).unwrap());
+        assert_eq!(scheduler.add_sub(&txn, sub).unwrap(), Scheduled::Running);
     }
     let mut done = Vec::new();
     while scheduler.has_running() {
@@ -379,7 +381,7 @@ fn an_event_that_did_not_reach_the_reader_gives_up_finish() {
         scheduler.set_completeness(true);
         let group = NostrFilterGroup::from_value(&json!({"kinds": [1]}), 500, 3, 16).unwrap();
         let sub = Subscription::new(1, SubId::new("s").unwrap(), group, false);
-        assert!(scheduler.add_sub(&txn, sub).unwrap());
+        assert_eq!(scheduler.add_sub(&txn, sub).unwrap(), Scheduled::Running);
         // The relay could not decode this many of the payloads.
         let mut to_lose = lost;
         let mut done = None;

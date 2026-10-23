@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use wok_db::{write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
 use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
-use wok_query::{DbQuery, NostrFilterGroup, QueryScheduler, SubId, Subscription};
+use wok_query::{DbQuery, NostrFilterGroup, QueryScheduler, Scheduled, SubId, Subscription};
 
 /// A database of kind-1 events, a second apart, oldest first: one for each
 /// entry of `tags`, which lists the event's single-letter tags.
@@ -177,7 +177,10 @@ fn many_filter_req_slices() {
         .collect();
     for round in 0..3 {
         let mut scheduler = QueryScheduler::new(100_000, 0, 0);
-        assert!(scheduler.add_sub(&txn, sub("many", many.clone())).unwrap());
+        assert_eq!(
+            scheduler.add_sub(&txn, sub("many", many.clone())).unwrap(),
+            Scheduled::Running
+        );
         let started = Instant::now();
         let mut next_arrival = started + arrival;
         let mut arrivals = HashMap::new();
@@ -191,7 +194,7 @@ fn many_filter_req_slices() {
             while next_arrival <= until {
                 let sub_id = format!("small{}", arrivals.len());
                 let small = sub(&sub_id, vec![json!({"kinds": [1], "limit": 5})]);
-                assert!(scheduler.add_sub(&txn, small).unwrap());
+                assert_eq!(scheduler.add_sub(&txn, small).unwrap(), Scheduled::Running);
                 arrivals.insert(sub_id, next_arrival);
                 next_arrival += arrival;
             }

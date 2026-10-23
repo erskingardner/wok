@@ -69,7 +69,7 @@ earlier release inserted are indexed, `indexed_through / high_water` is.
 | `invalid_rate` | Malformed-message budget exhausted. |
 | `pow` | Event did not meet the configured NIP-13 difficulty. |
 | `query_cost` | Estimated historical-query cost exceeded its ceiling. |
-| `query_concurrency` | Historical-query concurrency ceiling reached. |
+| `query_concurrency` | A connection's queue of historical queries waiting for its concurrency cap was full, or the cap is zero. |
 | `pubkey_storage_quota` | Author storage quota reached. |
 | `global_storage_quota` | Global durable event quota would be exceeded. |
 | `disk_reserve` | Durable writes stopped to preserve configured free disk space. |

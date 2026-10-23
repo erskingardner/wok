@@ -5,7 +5,7 @@ use wok_db::{write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
 use wok_event::{parse_and_verify_event, EventLimits};
 use wok_query::{
     foreach_by_filter, foreach_visible_by_filter, visibility::ReadVisibility, DbQuery, DbScan,
-    NostrFilterGroup, QueryScheduler, SubId, Subscription,
+    NostrFilterGroup, QueryScheduler, Scheduled, SubId, Subscription,
 };
 
 fn sign(kind: u64, content: &str, created: u64) -> (Vec<u8>, String, String) {
@@ -311,12 +311,15 @@ fn deep_author_kind_pages_are_complete_and_non_overlapping() {
     }]);
     let group = NostrFilterGroup::from_req(request.as_array().unwrap(), 500, 3, 16).unwrap();
     let mut scheduler = QueryScheduler::new(8, 2_000, 0);
-    assert!(scheduler
-        .add_sub(
-            &txn,
-            Subscription::new(7, SubId::new("scheduled").unwrap(), group, false),
-        )
-        .unwrap());
+    assert_eq!(
+        scheduler
+            .add_sub(
+                &txn,
+                Subscription::new(7, SubId::new("scheduled").unwrap(), group, false),
+            )
+            .unwrap(),
+        Scheduled::Running
+    );
     let mut scheduled = Vec::new();
     let mut completions = Vec::new();
     for _ in 0..100 {
@@ -411,12 +414,24 @@ fn count_and_req_ids_are_separate_namespaces() {
     };
 
     let mut scheduler = QueryScheduler::new(8, 2_000, 0);
-    assert!(scheduler.add_sub(&txn, sub(false)).unwrap());
-    assert!(scheduler.add_sub(&txn, sub(true)).unwrap());
+    assert_eq!(
+        scheduler.add_sub(&txn, sub(false)).unwrap(),
+        Scheduled::Running
+    );
+    assert_eq!(
+        scheduler.add_sub(&txn, sub(true)).unwrap(),
+        Scheduled::Running
+    );
     assert_eq!(run(&mut scheduler), vec![(false, 3), (true, 3)]);
 
-    assert!(scheduler.add_sub(&txn, sub(false)).unwrap());
-    assert!(scheduler.add_sub(&txn, sub(true)).unwrap());
+    assert_eq!(
+        scheduler.add_sub(&txn, sub(false)).unwrap(),
+        Scheduled::Running
+    );
+    assert_eq!(
+        scheduler.add_sub(&txn, sub(true)).unwrap(),
+        Scheduled::Running
+    );
     scheduler.remove_sub(1, &SubId::new("x").unwrap());
     assert_eq!(run(&mut scheduler), vec![(true, 3)]);
 }

@@ -49,7 +49,7 @@ mod negentropy;
 use negentropy::run_negentropy;
 use wok_query::{
     ActiveMonitors, CostedRequest, FilterValidator, HeldEvent, NostrFilterGroup, PendingBuffer,
-    PendingEvent, QueryScheduler, SubId, Subscription,
+    PendingEvent, QueryScheduler, Scheduled, SubId, Subscription,
 };
 
 const AUTH_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -2932,12 +2932,14 @@ fn admit_req(
     {
         return Err("blocked: too many concurrent REQs".into());
     }
-    // Live filters stay in memory until closed, so their bytes are budgeted
-    // per connection. Like the subscription cap, a lowered budget still lets
-    // an open id be replaced by filters no larger than its own.
+    // Live filters stay in memory until closed, and a COUNT's until it is
+    // answered, which may wait for a scan slot, so each namespace's bytes are
+    // budgeted per connection. Like the subscription cap, a lowered budget
+    // still lets an open id be replaced by filters no larger than its own.
     let filter_budget = cfg.relay.max_filter_bytes_per_connection;
-    if !count_only && filter_budget != 0 {
-        let (held, replaced) = conns.filter_bytes(conn_id, Ns::Req, sid);
+    if filter_budget != 0 {
+        let ns = if count_only { Ns::Count } else { Ns::Req };
+        let (held, replaced) = conns.filter_bytes(conn_id, ns, sid);
         if serialized_filter_bytes > replaced
             && held - replaced + serialized_filter_bytes > filter_budget
         {
@@ -3484,6 +3486,10 @@ fn run_req_worker(
             queries.set_max_subs_per_connection(
                 cfg_snap.relay.abuse.max_concurrent_historical_queries,
             );
+            // REQs and COUNTs over the concurrency cap wait their turn (#97
+            // F2). Open REQs are capped at this already, so the bound is
+            // reached only with COUNTs.
+            queries.set_max_waiting_per_connection(cfg_snap.relay.max_subs_per_connection);
             queries.set_max_total_events_per_req(cfg_snap.relay.max_total_events_per_req);
             queries.set_count_dedup_budget(cfg_snap.relay.max_filter_limit_count.saturating_add(1));
         }
@@ -3514,7 +3520,7 @@ fn run_req_worker(
                             // With nothing running, this slice starts the share.
                             let idle = !queries.has_running();
                             match queries.add_sub(txn, sub) {
-                                Ok(true) => {
+                                Ok(Scheduled::Running) => {
                                     // The new query is first in the run queue.
                                     let cfg_snap = cfg.read();
                                     let mut first = || {
@@ -3533,11 +3539,24 @@ fn run_req_worker(
                                     }
                                     None
                                 }
-                                Ok(false) => {
+                                // Its scan starts when one of the connection's
+                                // running ones ends.
+                                Ok(Scheduled::Waiting) => None,
+                                Ok(Scheduled::Refused) => {
                                     metrics
                                         .abuse_query_concurrency_rejections
                                         .fetch_add(1, Ordering::Relaxed);
-                                    Some("rate-limited: too many concurrent historical queries")
+                                    let cfg_snap = cfg.read();
+                                    Some(
+                                        if cfg_snap.relay.abuse.max_concurrent_historical_queries
+                                            == 0
+                                        {
+                                            "rate-limited: too many concurrent historical queries"
+                                        } else {
+                                            "rate-limited: too many historical queries waiting on \
+                                             this connection"
+                                        },
+                                    )
                                 }
                                 Err(_) => Some("error: history scan could not start"),
                             }

@@ -268,6 +268,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A REQ, COUNT or NEG-OPEN over `relay.abuse.max_concurrent_historical_queries`
+  (8) waits for one of its connection's running scans to end, in arrival
+  order, instead of being refused. Before, a startup burst on a busy relay
+  lost every scan past the eighth, `CLOSED rate-limited: too many concurrent
+  historical queries` (or a NEG-ERR, `blocked: synchronization query
+  unavailable`), even within its rate budget. At most
+  `relay.max_subs_per_connection` queries wait per connection; past that a
+  REQ or COUNT is refused with `rate-limited: too many historical queries
+  waiting on this connection`. A CLOSE or a replacing REQ removes a waiting
+  query, so it never answers (#97 F2). Since a waiting COUNT holds its
+  filters, `relay.max_filter_bytes_per_connection` now also bounds a
+  connection's unanswered COUNTs, separately from its REQs.
 - REQ, COUNT, NEG-OPEN and NEG-MSG are charged to a budget of the
   connection's own (`[relay.abuse.per_connection]`) and to its address's
   backstop (`relay.abuse.req_*`, `count_*`), and are refused when either is

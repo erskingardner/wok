@@ -19,7 +19,7 @@ pub use pending::{HeldEvent, PendingBuffer, PendingEvent};
 pub use scan::{
     foreach_by_filter, foreach_visible_by_filter, Completeness, DbQuery, DbScan, ScanPlan,
 };
-pub use scheduler::{QueryFailure, QueryScheduler};
+pub use scheduler::{QueryFailure, QueryScheduler, Scheduled};
 pub use subid::{QueryError, SubId, Subscription};
 
 pub mod visibility;

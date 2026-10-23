@@ -152,21 +152,31 @@ a REQ reusing an open id is charged only for the difference.
    yet, since it may AUTH before EOSE.
 3. **History, on the req worker.** The worker scans up to the snapshot, then
    posts `HistoryDone{generation, snapshot, hints}` to the monitor and moves
-   on. It never waits for a reply. A REQ or COUNT it cannot start (a read failure,
-   `relay.abuse.max_concurrent_historical_queries`) or whose scan fails gets
-   CLOSED through the gate.
+   on. It never waits for a reply. A REQ or COUNT it cannot start (a read
+   failure, or a full queue, below) or whose scan fails gets CLOSED through
+   the gate.
+   - A connection runs at most `relay.abuse.max_concurrent_historical_queries`
+     scans at once. Past that, a REQ or COUNT waits in the connection's
+     queue, in arrival order, and starts at the back of the run queue when
+     one of its running scans ends. The queue holds at most
+     `relay.max_subs_per_connection`. A CLOSE, a replacing REQ or a
+     disconnect removes a waiting query as it would a running one. The
+     negentropy worker queues NEG-OPEN scans the same way.
    - Each pass, the worker takes what is queued for it, up to 64 messages,
      and applies it in order under one read transaction. Cancels, AUTH and
-     disconnects take no query time. Each new REQ or COUNT gets its first
-     time slice (`relay.query_timeslice_budget_us`) as it is taken, so a
-     small one is answered before the messages behind it. A slice covers
+     disconnects take no query time. Each new REQ or COUNT that can start
+     gets its first time slice (`relay.query_timeslice_budget_us`) as it is
+     taken, so a small one is answered before the messages behind it. One
+     that has to wait for its connection's running scans gets no slice until
+     it starts. A slice covers
      all of a query's filters: one that ends after the budget is spent
      leaves the next filter to the next slice.
    - The running query that has waited longest gets a slice ahead of the
      next new query once the new queries' first slices since its last slice
      have taken as long as that slice did, and at the end of a pass when no
-     more messages are waiting. So new queries go first, a REQ queued during
-     a pass does not wait for another slice of a long scan. However many REQs
+     more messages are waiting. So new queries go first: a REQ taken in a
+     pass, and free to start, does not wait for another slice of a long
+     scan. However many REQs
      come, each stretch of new work as long as the running queries' last
      slice, overrun by at most one first slice, is followed by a slice of
      theirs: about half the worker when the two take similar time.

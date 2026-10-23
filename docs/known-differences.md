@@ -81,7 +81,8 @@ it is not a promise to reproduce upstream bugs.
 - Wok has native, reloadable abuse controls rather than delegating every
   admission decision to a write-policy plugin: per-connection, per-address
   and per-author token buckets,
-  pre-scan query costing, historical-query concurrency, author storage quotas,
+  pre-scan query costing, historical-query concurrency (excess scans wait
+  their turn), author storage quotas,
   and optional NIP-13 proof of work. Migrated configs receive the documented
   Wok defaults and the preflight prints them for review. Per-address buckets
   key an IPv6 client by its /64 (`relay.abuse.ipv6_prefix_len`), so a host

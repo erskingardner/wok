@@ -362,6 +362,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An `authors` and `kinds` filter past 1,000 (author, kind) pairs under a
+  small `limit` no longer reads every event the authors wrote when they
+  rarely publish those kinds. A picture feed (`kinds [20,21]`, `limit 50`) of
+  1,000 follows took 6.8 s on a 5-million-event database, and 19 s cold; it
+  now takes 2.2 ms, and 0.28 s cold. Such a filter now seeks each pair, up
+  to 16,384 pairs, whatever its kinds and limit, so its work stays within
+  the pairs the query-work ceiling prices. One tag with `kinds` does the
+  same on the `(tag, kind, created_at)` index, and now costs its pairs.
+  Where most of the authors' events match, the seeks cost more than the old
+  plan: a home feed (`kinds [1,6]`) of 1,000 follows takes 3.5 ms instead
+  of 2.2 ms.
 - NIP-70: a repost (kind 6 or 16) is refused as embedding a protected event
   when its content is an event whose tags include one named `-`, or is a
   JSON object the relay's strict parser refuses. Before, any content

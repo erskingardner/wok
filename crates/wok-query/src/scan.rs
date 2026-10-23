@@ -39,43 +39,32 @@ impl CandidateEvent {
     }
 }
 
-/// Most (author, kind) cursors a PubkeyKind plan opens past strfry's 1000:
-/// about 4 MiB of cursor state, enough for every author a filter can name
-/// (2047 fit its 65535 bytes) across eight kinds.
+/// Most (author, kind) or (value, kind) cursors a PubkeyKind or TagKind plan
+/// opens: about 4 MiB of cursor state, enough for every author a filter can
+/// name (2047 fit its 65535 bytes) across eight kinds.
 const MAX_PUBKEY_KIND_CURSORS: usize = 16_384;
 
 /// Whether an `authors` and `kinds` filter seeks each (author, kind) pair in
 /// the PubkeyKind index instead of reading every event the authors wrote from
 /// the Pubkey index and checking its kind.
+///
+/// Every entry a seek reads matches, so this plan's work is bounded by its
+/// pairs whatever the kinds. The Pubkey plan reads each candidate's event to
+/// check its kind, and reads the authors' whole history when they rarely
+/// publish those kinds: 7 s for a picture feed (`kinds [20,21]`) of 1000
+/// follows at 5M events, where this plan takes 2 ms. The Pubkey plan wins
+/// only when most of the authors' events match and a small limit stops it
+/// early, and then by milliseconds warm (4 against 18 for 2047 authors and
+/// eight kinds). A probe of a few authors could tell the two apart, but the
+/// client picks the authors, so the work would no longer stay within the
+/// pairs the query-work ceiling prices. strfry seeks below 1000 pairs
+/// (DBQuery.h); past [`MAX_PUBKEY_KIND_CURSORS`] the cursor state is too
+/// large.
 fn plans_pubkey_kind(f: &NostrFilter) -> bool {
     let (Some(authors), Some(kinds)) = (&f.authors, &f.kinds) else {
         return false;
     };
-    let pairs = authors.size().saturating_mul(kinds.size());
-    // strfry's bound (DBQuery.h).
-    if pairs < 1000 {
-        return true;
-    }
-    if pairs > MAX_PUBKEY_KIND_CURSORS {
-        return false;
-    }
-    // A replaceable kind holds one live version per author and an addressable
-    // kind one per address, so every seek reads few entries, all of them
-    // matches, while the Pubkey index would read the authors' whole history.
-    if kinds.iter().all(|kind| {
-        wok_event::is_replaceable_kind(kind) || wok_event::is_param_replaceable_kind(kind)
-    }) {
-        return true;
-    }
-    // Otherwise the Pubkey plan wins only when `limit` stops it early on kinds
-    // most of the authors' events have, and it reads each candidate's event
-    // to check the kind. While the seeks this plan adds stay within `limit`,
-    // it costs at most about twice as much even then, and far less when few
-    // events match or the limit is not reached. That holds for one kind and
-    // for COUNT and NEG-OPEN, whose limits are their caps. Sparse kinds under
-    // a small limit still read the authors' history: telling them apart
-    // needs statistics.
-    pairs - authors.size() <= usize::try_from(f.limit).unwrap_or(usize::MAX)
+    authors.size().saturating_mul(kinds.size()) <= MAX_PUBKEY_KIND_CURSORS
 }
 
 /// Whether a filter with one OR tag and `kinds` seeks each (value, kind) pair
@@ -84,10 +73,10 @@ fn plans_pubkey_kind(f: &NostrFilter) -> bool {
 /// of events, of which a DM inbox or a zap list wants one kind.
 ///
 /// The index must also hold every event in the snapshot (see
-/// [`ScanPlan::choose`]). The pair bounds are the PubkeyKind plan's, for the
-/// same reason: past 1000 pairs, the seeks this plan adds must fit the limit.
-/// The Tag plan checks each candidate's event as well, so both plans return
-/// the same events in the same order.
+/// [`ScanPlan::choose`]). The pair bound is the PubkeyKind plan's, for the
+/// same reason: the Tag plan reads every event that tags the values when
+/// few have the kinds. The Tag plan checks each candidate's event as well,
+/// so both plans return the same events in the same order.
 fn plans_tag_kind(f: &NostrFilter) -> bool {
     // A filter that reads no index needs no readiness check.
     if f.limit == 0 || f.never_match {
@@ -99,10 +88,7 @@ fn plans_tag_kind(f: &NostrFilter) -> bool {
     let (Some(kinds), Some((_, values))) = (&f.kinds, f.tags.iter().next()) else {
         return false;
     };
-    let pairs = values.size().saturating_mul(kinds.size());
-    pairs < 1000
-        || (pairs <= MAX_PUBKEY_KIND_CURSORS
-            && pairs - values.size() <= usize::try_from(f.limit).unwrap_or(usize::MAX))
+    values.size().saturating_mul(kinds.size()) <= MAX_PUBKEY_KIND_CURSORS
 }
 
 /// The index a filter's history scan reads, as [`DbScan`] picks it before

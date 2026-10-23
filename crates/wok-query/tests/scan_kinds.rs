@@ -506,13 +506,12 @@ fn limit_zero_and_until_zero_read_no_history() {
     }
 }
 
-/// An outbox fetch (kinds 0, 3 and 10002 for a follow list) seeks each
-/// (author, kind) pair however many authors it names: those kinds hold few
-/// versions per pair, while the Pubkey index would read every event the
-/// authors wrote. Other kinds keep strfry's 1000-pair bound unless the seeks
-/// that adds over one per author fit the limit.
+/// An `authors` and `kinds` filter seeks each (author, kind) pair up to the
+/// cap of cursor state, past strfry's 1000, whatever its kinds and limit: the
+/// Pubkey index would read every event the authors wrote when they rarely
+/// publish those kinds.
 #[test]
-fn author_kind_plans_seek_past_a_thousand_pairs_when_seeks_read_less() {
+fn author_kind_plans_seek_every_pair_up_to_the_cursor_cap() {
     let tmp = TempDir::new().unwrap();
     let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
@@ -535,19 +534,83 @@ fn author_kind_plans_seek_past_a_thousand_pairs_when_seeks_read_less() {
     // Past the cap of cursor state, every kind falls back.
     let many: Vec<_> = (10000..10009).collect();
     assert_eq!(plan(2047, json!(many), u64::MAX), ("Pubkey", 2047));
+    let sixteen: Vec<_> = (1..=16).collect();
+    assert_eq!(plan(1024, json!(sixteen), 50), ("PubkeyKind", 16_384));
+    let seventeen: Vec<_> = (1..=17).collect();
+    assert_eq!(plan(1024, json!(seventeen), 50), ("Pubkey", 1024));
 
+    // A picture feed of a long follow list, under a small limit: the
+    // Pubkey plan read the authors' whole history to find no pictures.
+    assert_eq!(plan(600, json!([20, 21]), 50), ("PubkeyKind", 1200));
+    let unused: Vec<_> = (40_000..40_008).collect();
+    assert_eq!(plan(2000, json!(unused), 20), ("PubkeyKind", 16_000));
+    // Regular kinds, as many as the limit or more.
     assert_eq!(plan(333, json!([1, 6, 7]), 500), ("PubkeyKind", 999));
-    assert_eq!(plan(334, json!([1, 6, 7]), 500), ("Pubkey", 334));
-    assert_eq!(plan(334, json!([0, 1, 3]), 500), ("Pubkey", 334));
-    // One kind adds no seeks over the Pubkey plan.
+    assert_eq!(plan(334, json!([1, 6, 7]), 500), ("PubkeyKind", 1002));
+    assert_eq!(plan(334, json!([0, 1, 3]), 1), ("PubkeyKind", 1002));
     assert_eq!(plan(2047, json!([1]), 1), ("PubkeyKind", 2047));
-    // A limit (COUNT and NEG-OPEN use their caps) pays for the extra seeks.
-    assert_eq!(plan(1000, json!([1, 6, 7]), 2000), ("PubkeyKind", 3000));
-    assert_eq!(plan(1000, json!([1, 6, 7]), 1999), ("Pubkey", 1000));
+    assert_eq!(plan(1000, json!([1, 6, 7]), 1999), ("PubkeyKind", 3000));
     assert_eq!(
         plan(2047, json!([7, 9735]), 1_000_001),
         ("PubkeyKind", 4094)
     );
+}
+
+/// A picture feed of 500 follows under a small limit reads one index entry
+/// per match. The Pubkey plan read and checked every note the authors wrote,
+/// about 25,000 units of work here, to find the one picture.
+#[test]
+fn a_sparse_feed_past_a_thousand_pairs_reads_no_author_history() {
+    let tmp = TempDir::new().unwrap();
+    let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut rng = rand::thread_rng();
+    let keys: Vec<_> = (0..500)
+        .map(|_| Keypair::new(SECP256K1, &mut rng))
+        .collect();
+    let mut events = Vec::new();
+    for (a, key) in keys.iter().enumerate() {
+        for n in 0..4 {
+            let created = 1_700_000_000 + (a * 4 + n) as u64;
+            let (packed, json, _) = sign_with_key(key, 1, "note", created);
+            events.push(EventToWrite::new(packed, json));
+        }
+    }
+    let (packed, json, picture) = sign_with_key(&keys[0], 20, "picture", 1_600_000_000);
+    events.push(EventToWrite::new(packed, json));
+    let mut write = env.begin_rw().unwrap();
+    write_events(&mut write, &mut NoopNegentropy, &mut events, false).unwrap();
+    write.commit().unwrap();
+
+    let txn = env.begin_ro().unwrap();
+    let authors: Vec<_> = keys
+        .iter()
+        .map(|kp| hex::encode(kp.x_only_public_key().0.serialize()))
+        .collect();
+    let filter = json!({"authors": authors, "kinds": [20, 21], "limit": 50});
+    let group = NostrFilterGroup::from_value(&filter, 500, 3, 16).unwrap();
+    let f = &group.filters[0];
+    let mut scan = DbScan::new(f, &txn);
+    assert_eq!((scan.desc, scan.cursor_count()), ("PubkeyKind", 1000));
+    let mut got = Vec::new();
+    assert!(scan
+        .scan(
+            &txn,
+            f,
+            |lev| {
+                got.push(lev);
+                false
+            },
+            |_| false
+        )
+        .unwrap());
+    let raw = txn
+        .get_u64(txn.env().dbis().event, got[0])
+        .unwrap()
+        .unwrap();
+    let id = wok_event::PackedEventView::new(raw).unwrap().id().to_vec();
+    assert_eq!((got.len(), hex::encode(id)), (1, picture));
+    assert!(scan.approx_work < 1_100, "{}", scan.approx_work);
 }
 
 #[test]
@@ -600,8 +663,8 @@ fn outbox_fetch_past_a_thousand_pairs_returns_the_newest_versions() {
 }
 
 /// One OR tag with `kinds` seeks each (value, kind) pair in the TagKind index
-/// once it holds every stored event, within the PubkeyKind plan's pair
-/// bounds. Other shapes, and an index the writer is still building, keep
+/// once it holds every stored event, up to the PubkeyKind plan's cap of
+/// pairs. Other shapes, and an index the writer is still building, keep
 /// their plans.
 #[test]
 fn one_tag_and_kinds_plan_the_tag_kind_index_once_it_is_complete() {
@@ -639,19 +702,22 @@ fn one_tag_and_kinds_plan_the_tag_kind_index_once_it_is_complete() {
         plan(json!({"ids": pubkeys(1), "#p": pubkeys(1), "kinds": [1]})),
         ("ID", 1)
     );
-    // Past 1000 pairs, the seeks this plan adds must fit the limit.
-    let kinds: Vec<_> = (1..=10).collect();
+    // Past 1000 pairs under a small limit: the Tag plan read every event
+    // that tags the values to find none of those kinds.
     assert_eq!(
-        plan(json!({"#p": pubkeys(99), "kinds": kinds})),
-        ("TagKind", 990)
+        plan(json!({"#p": pubkeys(600), "kinds": [20, 21], "limit": 50})),
+        ("TagKind", 1200)
     );
+    // Up to the PubkeyKind plan's cap of cursor state.
+    let sixteen: Vec<_> = (1..=16).collect();
     assert_eq!(
-        plan(json!({"#p": pubkeys(100), "kinds": kinds, "limit": 899})),
-        ("Tag", 100)
+        plan(json!({"#p": pubkeys(1024), "kinds": sixteen, "limit": 50})),
+        ("TagKind", 16_384)
     );
+    let seventeen: Vec<_> = (1..=17).collect();
     assert_eq!(
-        plan(json!({"#p": pubkeys(100), "kinds": kinds, "limit": 900})),
-        ("TagKind", 1000)
+        plan(json!({"#p": pubkeys(1024), "kinds": seventeen, "limit": 50})),
+        ("Tag", 1024)
     );
 
     // While the writer builds the index, the Tag plan stands.

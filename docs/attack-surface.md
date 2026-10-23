@@ -25,7 +25,8 @@ questions:
 - **Setting combinations.** Can another setting make this gate fail open or
   be ignored, without an error at load or a warning? Refuse such a
   combination when the configuration loads, or warn about it there and in
-  `wok doctor`.
+  `wok doctor`, and add the setting to the
+  [combinations test](#setting-combinations).
 
 ## Who can reach Wok
 
@@ -275,9 +276,40 @@ code an unauthenticated client can now run: it belongs after the cheapest
 check that can refuse the request, or the baseline is rewritten with the
 reason in the pull request. A phase that reached functions and now reaches
 none also fails, since that is a broken probe, not a smaller surface. A
-function no longer reached is listed but does not fail. Some functions run on some runs and not others, such as a query
-path that depends on timing, so `--bless` keeps the union of three runs, and
-the database watcher, which runs on a timer, is left out.
+function no longer reached is listed but does not fail. Some functions run on
+some runs and not others, such as a query path that depends on timing, so
+`--bless` keeps the union of three runs, and the database watcher, which runs
+on a timer, is left out.
+
+## Setting combinations
+
+`wok-compat` `tests/setting_combinations.rs` turns on each security setting
+in its `SETTINGS` list over the `public` profile, alone and with each other
+setting of a different key, and sends every combination the
+[golden transcript](#golden-transcripts) script, with the same events in
+every run. A reply refuses its step when it carries a refusal (an `OK` that is
+false, a `CLOSED`, `NEG-ERR` or `NOTICE`, or an HTTP status of 400 or more)
+and no data (no `EVENT`, `COUNT` or `NEG-MSG`). The test fails when:
+
+- a step that one setting refuses for a reason of its own, where `public`
+  serves it or refuses it differently, is served with another setting on;
+- a step that each of two settings refuses is served with both on;
+- a setting changes none of the script's answers other than what NIP-11
+  advertises, so a setting that is advertised but not enforced, or that does
+  nothing, is noticed.
+
+`OPENS` lists, step by step, where the first rule or the second is meant not
+to hold, and why; `UNPROBED` lists the settings the script cannot see, and
+why. A combination Wok refuses to load or start is printed and does not fail:
+refusing it is the safe outcome. Add a setting to `SETTINGS` when it restricts
+or opens an entry point.
+
+`OPENS` records that `relay.abuse.enabled = false` turns
+`relay.abuse.min_pow_difficulty` off with the other abuse limits, as
+[config.md](config.md) says; that without AUTH, gift wraps and kind 30078
+are refused only because they are recipient-only and owner-only, so emptying
+those lists serves them; and that `observability.metrics_enabled` is what
+serves `/metrics` on the metrics listener.
 
 ## Keeping this page current
 
@@ -291,3 +323,4 @@ the database watcher, which runs on a timer, is left out.
 | `wok-cli` tests | A `wok` command has no row in [Commands](#commands), or a row names a command that does not exist. |
 | `wok-compat` `tests/golden_transcripts.rs` | A profile's relay answers the script differently from its file in `tests/transcripts/`, or a transcript has no profile. |
 | `scripts/attack-surface-reach.py --check`, run by hand | A phase of the [reachability](#reachability) probe reaches a relay function that its profile's file in `tests/reachability/` does not list. |
+| `wok-compat` `tests/setting_combinations.rs` | With two settings on, a step that one refuses for a reason of its own, or that each refuses, is served, and `OPENS` does not list it; or a setting changes nothing but NIP-11 and is not in `UNPROBED`. |

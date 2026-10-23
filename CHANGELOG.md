@@ -108,6 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Operator documentation in the dashboard's order (#97 §5). `docs/config.md`
+  now runs preset, access, events accepted, queries, rates, storage, sync,
+  relay information and advanced, then the restart-only infrastructure, and
+  says for each limit what it protects, what breaks when it is set too low,
+  and the NIP-11 field that advertises it. The keys that 0.7 files may still
+  set are gathered under "Files from 0.7 and earlier", and the limits that are
+  not settings are listed. `docs/presets/public.md` and `marmot.md` say who
+  each preset is for, what it changes and what it deliberately refuses.
+  Tests hold each documented default to the code and each preset page to the
+  keys its overlay sets.
 - The operator dashboard explains the relay it configures (#97 §5.1). A
   posture card at the top names the preset and what it is for, counts the
   settings the config file overrides, says in a few sentences who can read

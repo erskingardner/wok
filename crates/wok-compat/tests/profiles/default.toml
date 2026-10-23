@@ -1,0 +1,3 @@
+# No settings: what a relay runs before its operator configures it. Every
+# value comes from the public preset, so AUTH is unusable and the dashboard,
+# NIP-86 and the Unix socket are off.

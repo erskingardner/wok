@@ -1571,6 +1571,38 @@ mod main_tests {
     use wok_negentropy::Storage;
 
     #[test]
+    fn every_command_is_in_the_attack_surface_inventory() {
+        use clap::CommandFactory;
+        use std::collections::BTreeSet;
+
+        fn leaves(command: &clap::Command, path: String, out: &mut BTreeSet<String>) {
+            let mut children = command
+                .get_subcommands()
+                .filter(|child| child.get_name() != "help")
+                .peekable();
+            if children.peek().is_none() {
+                out.insert(path);
+                return;
+            }
+            for child in children {
+                leaves(child, format!("{path} {}", child.get_name()), out);
+            }
+        }
+        let mut commands = BTreeSet::new();
+        leaves(&Cli::command(), "wok".into(), &mut commands);
+        let documented: BTreeSet<String> = include_str!("../../../docs/attack-surface.md")
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `wok "))
+            .filter_map(|rest| rest.split_once('`'))
+            .map(|(command, _)| format!("wok {command}"))
+            .collect();
+        assert_eq!(
+            commands, documented,
+            "the wok commands and the Commands table of docs/attack-surface.md differ"
+        );
+    }
+
+    #[test]
     fn imported_events_update_legacy_zero_counter_trees() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {

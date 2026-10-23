@@ -1,0 +1,7 @@
+# Behind a reverse proxy that overwrites X-Real-IP with the client's address,
+# so per-address budgets and NIP-86 IP blocks key on that header.
+[relay]
+real_ip_header = "x-real-ip"
+
+[relay.auth]
+service_url = "wss://relay.example.com"

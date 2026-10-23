@@ -1,0 +1,5 @@
+# Local clients over the Unix socket, limited to one UID. A test points
+# relay.unix.path at its own directory.
+[relay.unix]
+enabled = true
+auth_uids = [1000]

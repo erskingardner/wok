@@ -1,0 +1,17 @@
+# Every optional capability off, so tests can check that the code behind a
+# disabled feature cannot be reached. Restricted reads stay restricted: with
+# AUTH off they fail closed.
+[relay]
+negentropy_enabled = false
+# COUNT (NIP-45).
+max_filter_limit_count = 0
+# NIP-91 AND filters.
+max_and_entries = 0
+# permessage-deflate.
+compression_enabled = false
+
+[relay.auth]
+enabled = false
+
+[relay.nip62]
+enabled = false

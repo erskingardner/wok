@@ -1,0 +1,9 @@
+# A public relay scraped by Prometheus on a private address: metrics are on,
+# on a listener of their own, and the relay listener does not serve them. A
+# test points the metrics listener at a port of its own.
+[relay.auth]
+service_url = "wss://relay.example.com"
+
+[observability]
+metrics_enabled = true
+metrics_listen = "127.0.0.1:9100"

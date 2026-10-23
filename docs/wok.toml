@@ -47,3 +47,9 @@ preset = "public"
 # enabled = true
 # public_url = "https://relay.example.com"
 # pubkeys = ["npub1..."]
+
+# Prometheus metrics are off by default. Serve them on a private address; on
+# the relay listener anyone who can reach the relay could read them.
+# [observability]
+# metrics_enabled = true
+# metrics_listen = "127.0.0.1:9100"

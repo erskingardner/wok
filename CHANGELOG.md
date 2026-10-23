@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Prometheus metrics are off by default (#151). `/metrics` was served on the
+  relay listener in every configuration, with `Access-Control-Allow-Origin: *`,
+  so anyone who could reach the relay, and any web page, could read its
+  connection, AUTH, abuse and refusal counters. `observability.metrics_enabled`
+  turns them on, and reloads live. `observability.metrics_listen` (restart)
+  serves them on a listener of their own, which answers only `GET /metrics`,
+  without CORS headers, while the relay listener answers `/metrics` with 404.
+  The relay warns at startup when metrics are on a relay listener reachable
+  beyond loopback and private addresses, and turning them on or off is logged
+  as a security-scope change. **Upgrading:** a relay scraped at `/metrics`
+  must set `metrics_enabled = true`, preferably with `metrics_listen` on a
+  private address, and point Prometheus there.
 - With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`
   by sending its own X-Forwarded-For. A proxy that appends the client's
   address to that header (nginx's `$proxy_add_x_forwarded_for`) passed Wok a

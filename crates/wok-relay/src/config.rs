@@ -187,6 +187,12 @@ pub struct ObservabilityConfig {
     pub history_enabled: bool,
     pub history_interval_secs: u64,
     pub history_max_points: usize,
+    /// Serve Prometheus metrics at `/metrics`. Off by default: the counters
+    /// describe the relay's traffic and defenses, and no client needs them.
+    pub metrics_enabled: bool,
+    /// The address of a listener that serves only `/metrics`; empty serves
+    /// it on the relay listener instead.
+    pub metrics_listen: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +458,8 @@ impl Default for Config {
                 history_enabled: true,
                 history_interval_secs: 15,
                 history_max_points: 5_760,
+                metrics_enabled: false,
+                metrics_listen: String::new(),
             },
             relay: RelayConfig {
                 bind: "127.0.0.1".into(),
@@ -708,6 +716,13 @@ fn validate(mut parsed: TomlConfig) -> Result<Config, String> {
         ));
     }
     tracing_subscriber_filter_syntax(&parsed.observability.log_filter)?;
+    let listen = &parsed.observability.metrics_listen;
+    if !listen.is_empty() && listen.parse::<SocketAddr>().is_err() {
+        return Err(format!(
+            "observability.metrics_listen = {listen:?} must be an IP address and port, \
+             such as \"127.0.0.1:9100\""
+        ));
+    }
     if parsed.relay.abuse.per_connection.authenticated_multiplier == 0 {
         return Err(
             "relay.abuse.per_connection.authenticated_multiplier must be at least 1".into(),
@@ -931,6 +946,33 @@ impl Config {
             owner_only: auth.owner_only_kinds.clone(),
             authenticated: auth.authenticated_kinds.clone(),
         }
+    }
+
+    /// Whether the relay listener answers `/metrics`: metrics are on and no
+    /// separate `observability.metrics_listen` takes them.
+    pub fn metrics_on_relay_listener(&self) -> bool {
+        self.observability.metrics_enabled && self.observability.metrics_listen.is_empty()
+    }
+
+    /// Warn when the relay listener serves `/metrics` to addresses beyond
+    /// this host and private networks: anyone who can reach the relay, and
+    /// any web page, can then read its counters.
+    pub fn metrics_warning(&self, listening: &[SocketAddr]) -> Option<String> {
+        let local_only = |ip: IpAddr| match ip {
+            IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+            }
+        };
+        if !self.metrics_on_relay_listener() || listening.iter().all(|addr| local_only(addr.ip())) {
+            return None;
+        }
+        Some(
+            "observability.metrics_enabled serves /metrics on the relay listener, which \
+             clients can reach, and any web page can read it cross-origin; set \
+             observability.metrics_listen to a private address to serve it there instead"
+                .into(),
+        )
     }
 
     /// Explain what is deliberately failing closed because the relay cannot
@@ -1365,6 +1407,12 @@ impl Config {
                 },
             ));
         }
+        if self.observability.metrics_enabled != new.observability.metrics_enabled {
+            changes.push(format!(
+                "observability.metrics_enabled changed: {} -> {}",
+                self.observability.metrics_enabled, new.observability.metrics_enabled,
+            ));
+        }
         if self.relay.write_policy_timeout_secs != new.relay.write_policy_timeout_secs {
             changes.push(format!(
                 "relay.write_policy_timeout_secs changed: {} -> {}",
@@ -1703,6 +1751,8 @@ impl Config {
         // changes take effect after restart, while history bounds reload live.
         self.observability.log_format = old.observability.log_format;
         self.observability.log_filter = old.observability.log_filter;
+        // The metrics listener is bound at startup.
+        self.observability.metrics_listen = old.observability.metrics_listen;
         Ok(())
     }
 }
@@ -2719,6 +2769,77 @@ negentropy_enabled = true
         assert!(zero.contains("from 1 to 128"), "{zero}");
         let wide = Config::parse_toml("[relay.abuse]\nipv6_prefix_len = 129\n").unwrap_err();
         assert!(wide.contains("from 1 to 128"), "{wide}");
+    }
+
+    #[test]
+    fn metrics_are_off_by_default_and_their_listener_is_an_address() {
+        let defaults = Config::default();
+        assert!(!defaults.observability.metrics_enabled);
+        assert!(!defaults.metrics_on_relay_listener());
+
+        let relay = Config::parse_toml("[observability]\nmetrics_enabled = true\n").unwrap();
+        assert!(relay.metrics_on_relay_listener());
+        let separate = Config::parse_toml(
+            "[observability]\nmetrics_enabled = true\nmetrics_listen = \"[::1]:9100\"\n",
+        )
+        .unwrap();
+        assert!(!separate.metrics_on_relay_listener());
+
+        for bad in ["localhost:9100", "127.0.0.1", ":9100"] {
+            let error =
+                Config::parse_toml(&format!("[observability]\nmetrics_listen = \"{bad}\"\n"))
+                    .unwrap_err();
+            assert!(error.contains("must be an IP address and port"), "{error}");
+        }
+    }
+
+    #[test]
+    fn metrics_toggle_live_and_their_listener_at_restart() {
+        let mut running = Config::parse_toml(
+            "[observability]\nmetrics_enabled = true\nmetrics_listen = \"127.0.0.1:9100\"\n",
+        )
+        .unwrap();
+        let reloaded = Config::parse_toml(
+            "[observability]\nmetrics_enabled = false\nmetrics_listen = \"127.0.0.1:9200\"\n",
+        )
+        .unwrap();
+        let changes = running.security_scope_changes(&reloaded);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "observability.metrics_enabled changed: true -> false"),
+            "{changes:?}"
+        );
+        running.apply_reload(reloaded).unwrap();
+        assert!(!running.observability.metrics_enabled);
+        assert_eq!(running.observability.metrics_listen, "127.0.0.1:9100");
+    }
+
+    #[test]
+    fn metrics_warning_names_a_relay_listener_clients_can_reach() {
+        let addrs = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter().map(|addr| addr.parse().unwrap()).collect()
+        };
+        let on = Config::parse_toml("[observability]\nmetrics_enabled = true\n").unwrap();
+        let warning = on.metrics_warning(&addrs(&["0.0.0.0:7777"])).unwrap();
+        assert!(
+            warning.contains("observability.metrics_listen"),
+            "{warning}"
+        );
+        assert!(on.metrics_warning(&addrs(&["203.0.113.9:7777"])).is_some());
+        // Only this host or a private network can reach it.
+        assert_eq!(on.metrics_warning(&addrs(&["127.0.0.1:7777"])), None);
+        assert_eq!(on.metrics_warning(&addrs(&["10.0.0.5:7777"])), None);
+        // Off, or on a listener of its own.
+        assert_eq!(
+            Config::default().metrics_warning(&addrs(&["0.0.0.0:7777"])),
+            None
+        );
+        let separate = Config::parse_toml(
+            "[observability]\nmetrics_enabled = true\nmetrics_listen = \"127.0.0.1:9100\"\n",
+        )
+        .unwrap();
+        assert_eq!(separate.metrics_warning(&addrs(&["0.0.0.0:7777"])), None);
     }
 
     #[test]

@@ -37,6 +37,7 @@ questions:
 | manager | A NIP-98 signer holding the NIP-86 `admin` or `moderator` [role](nip86.md#management-levels) | `admin.enabled` |
 | admin | A NIP-98 signer listed in `admin.pubkeys` | `admin.enabled` |
 | local peer | A process that can connect to `relay.unix.path` | `relay.unix.enabled`, the socket's file mode, `relay.unix.auth_uids` and `auth_gids` |
+| metrics scraper | Whatever can reach `observability.metrics_listen` | The address the operator binds it to |
 | operator | Whoever writes the config file, runs `wok` commands, or sets the write-policy plugin | Filesystem permissions |
 | remote relay | A relay that `wok sync`, `router`, `upload` or `download` dials | The operator chose its URL |
 
@@ -66,12 +67,23 @@ WebSocket upgrade on any path but `/`.
 | Path | Party | Gate | What runs |
 | --- | --- | --- | --- |
 | `/` | anonymous | none | A WebSocket upgrade starts a [message](#messages) connection. A `POST` with `Content-Type: application/nostr+json+rpc` goes to the [management API](#management-api). Anything else gets the NIP-11 document when `Accept` names `application/nostr+json`, and the landing page otherwise. |
-| `/metrics` | anonymous | none | Prometheus metrics, with `Access-Control-Allow-Origin: *`. See [observability](observability.md). |
+| `/metrics` | anonymous | `observability.metrics_enabled` and no `observability.metrics_listen` | Prometheus metrics, with `Access-Control-Allow-Origin: *`. With `metrics_listen` set they move to the [metrics listener](#metrics-listener). See [observability](observability.md). |
 | `/.well-known/nodeinfo` | anonymous | none | NodeInfo discovery. The link's host is the request's `Host` header. |
 | `/nodeinfo/2.1` | anonymous | none | The NodeInfo document. |
 | `/favicon.ico` | anonymous | none | A fixed empty icon. |
 | `/admin`, `/admin/` | anonymous | `admin.enabled` | `GET` returns the signed-out [dashboard](admin-dashboard.md) shell, which holds no relay data. Other methods get 404. |
 | `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix reads the body (at most 64 KiB) and checks NIP-98: it decodes the `Authorization` header, parses the event and verifies its signature, checks its kind, empty content, time window and `u` and `method` tags, and its `payload` tag when the request has a body, then checks that the signer is in `admin.pubkeys`, then claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
+
+## Metrics listener
+
+With `observability.metrics_listen` set, Wok binds a second listener at that
+address when it starts. It is meant for a private address, so it sends no CORS
+headers and charges no per-address budget. Hyper reads the request head within
+`relay.handshake_timeout_secs`, and any path or method but these gets 404.
+
+| Path | Party | Gate | What runs |
+| --- | --- | --- | --- |
+| `/metrics` | metrics scraper | `observability.metrics_enabled` | `GET` returns the Prometheus metrics; 404 while metrics are off, which a reload can change. |
 
 ## Messages
 
@@ -176,6 +188,7 @@ of running Wok. A test only points it at a temporary database and port.
 | `minimal` | Every optional capability off: negentropy, COUNT, NIP-91, NIP-62, AUTH and compression. |
 | `proxied` | Behind a reverse proxy that passes the client's address in `X-Real-IP`. |
 | `unix` | The Unix socket on, limited to one UID. |
+| `monitored` | A public relay scraped by Prometheus on a private address: metrics on, on a listener of their own. |
 
 A test checks that each profile still has the properties in this table, so a
 change of default cannot quietly make a profile stand for something else.
@@ -185,7 +198,7 @@ change of default cannot quietly make a profile stand for something else.
 
 | Test | Fails when |
 | --- | --- |
-| `wok-compat` `tests/attack_surface.rs` | A path the listener answers, in any profile, has no row in [Network listener](#network-listener), or a row's path is unreachable while its gate is open, or reachable while it is closed. Candidate paths are the table's own, every path literal in `wok-ws`, and a few decoys. |
+| `wok-compat` `tests/attack_surface.rs` | A path the listener answers, in any profile, has no row in [Network listener](#network-listener), or a row's path is unreachable while its gate is open, or reachable while it is closed. The same holds for the [metrics listener](#metrics-listener) in profiles that set one. Candidate paths are the tables' own, every path literal in `wok-ws`, and a few decoys. |
 | `wok-compat` `tests/attack_surface.rs` | A verb that `ClientCommand::parse` accepts has no row in [Messages](#messages), or a row names a verb it rejects. |
 | `wok-compat` `tests/attack_surface.rs` | A message whose [Messages](#messages) row names a gate is served while some profile closes that gate, or refused by it while the profile opens it. Each is sent as a valid message over a WebSocket, and only the gate's own refusal counts. |
 | `wok-compat` `tests/attack_surface.rs` | A profile file is added, removed or loses one of its properties, or is missing from [Profiles](#profiles). |

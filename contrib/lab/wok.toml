@@ -12,3 +12,5 @@ nofiles = 0
 enabled = false
 [observability]
 log_format = "json"
+# The lab collects /metrics after each run.
+metrics_enabled = true

@@ -142,6 +142,60 @@ pub async fn serve_listener(
     serve(handle, vec![listener]).await
 }
 
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
+
+/// Serves `observability.metrics_listen`: `GET /metrics` while
+/// `observability.metrics_enabled` is on, and 404 for everything else. It
+/// is meant for a private address, so it sends no CORS headers and charges
+/// no per-address budget.
+pub async fn serve_metrics(handle: RelayHandle, listener: TcpListener) -> std::io::Result<()> {
+    tracing::info!("Started metrics server on {}", listener.local_addr()?);
+    let handle = Arc::new(handle);
+    let shutdown = handle.shutdown_handle();
+    loop {
+        let (stream, _) = tokio::select! {
+            _ = shutdown.notified() => break,
+            res = listener.accept() => match res {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::warn!("metrics accept error: {e}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+        };
+        let handshake_timeout = handle.config.read().relay.handshake_timeout_secs;
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let handle = handle.clone();
+                async move {
+                    let served = req.uri().path() == "/metrics"
+                        && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD)
+                        && handle.config.read().observability.metrics_enabled;
+                    Ok::<_, Infallible>(if served {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", METRICS_CONTENT_TYPE)
+                            .body(Full::new(Bytes::from(handle.metrics.render())))
+                            .unwrap_or_else(|_| empty(StatusCode::OK))
+                    } else {
+                        empty(StatusCode::NOT_FOUND)
+                    })
+                }
+            });
+            let mut builder = http1::Builder::new();
+            builder.timer(TokioTimer::new());
+            builder.header_read_timeout(
+                (handshake_timeout > 0).then(|| Duration::from_secs(handshake_timeout)),
+            );
+            let _ = builder.serve_connection(TokioIo::new(stream), svc).await;
+        });
+    }
+    tracing::info!("Metrics listener stopped");
+    Ok(())
+}
+
 async fn accept_loop(
     handle: Arc<RelayHandle>,
     listener: TcpListener,
@@ -261,10 +315,15 @@ async fn dispatch(
     if matches!(path.as_str(), "/admin" | "/admin/") || path.starts_with("/admin/api/") {
         return admin::dispatch(req, handle, admin_state).await;
     }
-    if !matches!(
-        path.as_str(),
-        "/" | "/metrics" | "/.well-known/nodeinfo" | "/nodeinfo/2.1" | "/favicon.ico"
-    ) {
+    // `/metrics` is a route only while the relay listener serves it, so a
+    // relay without metrics answers it, preflight included, like any path.
+    let metrics_here = path == "/metrics" && handle.config.read().metrics_on_relay_listener();
+    if !metrics_here
+        && !matches!(
+            path.as_str(),
+            "/" | "/.well-known/nodeinfo" | "/nodeinfo/2.1" | "/favicon.ico"
+        )
+    {
         return not_found();
     }
     if req.method() == hyper::Method::OPTIONS {
@@ -291,8 +350,8 @@ async fn dispatch(
         .to_string();
     let wants_nip11 = accepts_nip11(req.headers());
     let cfg = handle.config.read().clone();
-    if path == "/metrics" {
-        return text_response("text/plain; version=0.0.4", handle.metrics.render());
+    if metrics_here {
+        return text_response(METRICS_CONTENT_TYPE, handle.metrics.render());
     }
     if path == "/.well-known/nodeinfo" {
         let body = serde_json::json!({
@@ -1411,5 +1470,108 @@ mod stalled_write_tests {
             elapsed < Duration::from_secs(10),
             "pong liveness never fired: {elapsed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct Served {
+        handle: RelayHandle,
+        relay: SocketAddr,
+        metrics: SocketAddr,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A relay with `tweak` applied, its relay listener and a metrics
+    /// listener on ephemeral loopback ports.
+    async fn serve_both(tweak: impl FnOnce(&mut Config)) -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let mut cfg = Config::default();
+        tweak(&mut cfg);
+        let handle = wok_relay::start(env, cfg).unwrap();
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let served = Served {
+            handle: handle.clone(),
+            relay: relay_listener.local_addr().unwrap(),
+            metrics: metrics_listener.local_addr().unwrap(),
+            _dir: dir,
+        };
+        tokio::spawn(serve_listener(handle.clone(), relay_listener));
+        tokio::spawn(serve_metrics(handle, metrics_listener));
+        served
+    }
+
+    /// The status line and headers, lower-cased, and the body of `method
+    /// path` sent to `addr`.
+    async fn request(addr: SocketAddr, method: &str, path: &str) -> (u16, String, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        (status, head.to_ascii_lowercase(), body.to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_are_off_by_default() {
+        let served = serve_both(|_| {}).await;
+        for method in ["GET", "OPTIONS"] {
+            assert_eq!(request(served.relay, method, "/metrics").await.0, 404);
+        }
+        assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enabled_metrics_are_served_on_the_relay_listener() {
+        let served = serve_both(|cfg| cfg.observability.metrics_enabled = true).await;
+        let (status, _, body) = request(served.relay, "GET", "/metrics").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("wok_active_connections"), "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_metrics_listener_takes_metrics_off_the_relay_listener() {
+        let served = serve_both(|cfg| {
+            cfg.observability.metrics_enabled = true;
+            cfg.observability.metrics_listen = "127.0.0.1:9100".into();
+        })
+        .await;
+        assert_eq!(request(served.relay, "GET", "/metrics").await.0, 404);
+        let (status, head, body) = request(served.metrics, "GET", "/metrics").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("wok_active_connections"), "{body}");
+        assert!(!head.contains("access-control-allow-origin"), "{head}");
+        // It serves nothing else.
+        for (method, path) in [("GET", "/"), ("POST", "/metrics"), ("GET", "/admin")] {
+            assert_eq!(
+                request(served.metrics, method, path).await.0,
+                404,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_metrics_listener_follows_metrics_enabled_live() {
+        let served = serve_both(|cfg| {
+            cfg.observability.metrics_listen = "127.0.0.1:9100".into();
+        })
+        .await;
+        assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 404);
+        served.handle.config.write().observability.metrics_enabled = true;
+        assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 200);
     }
 }

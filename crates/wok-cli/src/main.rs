@@ -507,6 +507,19 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     if let Some(warning) = cfg.real_ip_header_warning(&listening) {
         tracing::warn!("{warning}");
     }
+    if let Some(warning) = cfg.metrics_warning(&listening) {
+        tracing::warn!("{warning}");
+    }
+    // Bound whenever an address is set, so turning metrics on or off is a
+    // live reload; the listener answers 404 while they are off.
+    let metrics_listener = match cfg.observability.metrics_listen.as_str() {
+        "" => None,
+        listen => Some(
+            tokio::net::TcpListener::bind(listen)
+                .await
+                .with_context(|| format!("bind observability.metrics_listen {listen}"))?,
+        ),
+    };
     let unix_cfg = cfg.clone();
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     if config_path.exists() {
@@ -525,6 +538,14 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
             tracing::error!("unix server: {e}");
         }
     });
+    let metrics = metrics_listener.map(|listener| {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = wok_ws::serve_metrics(handle, listener).await {
+                tracing::error!("metrics server: {e}");
+            }
+        })
+    });
     // Service managers use SIGTERM; preserve the interactive SIGINT and
     // historical strfry SIGUSR1 paths as equivalent graceful shutdowns.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -540,6 +561,9 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     // socket); existing connections drain naturally like C++.
     let _ = ws.await;
     let _ = unix.await;
+    if let Some(metrics) = metrics {
+        let _ = metrics.await;
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let n = handle

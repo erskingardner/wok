@@ -166,5 +166,6 @@ resulting records.
 
 Do not expose the admin page or metrics endpoint directly to the Internet.
 Apply authentication and network policy at the reverse proxy in addition to
-Wok's NIP-98 admin authorization, and scrape metrics over a private interface
-or authenticated proxy route.
+Wok's NIP-98 admin authorization. Metrics are off by default; to scrape them,
+set `observability.metrics_enabled` and serve them on a private address with
+`observability.metrics_listen` rather than on the relay listener.

@@ -1,6 +1,6 @@
 //! Filter compilation and matching matching `src/filters.h`.
 
-use crate::subid::QueryError;
+use crate::subid::{FilterLimit, QueryError};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use wok_db::{parse_search_query, search_term_set, SearchQuery, SearchTermSet};
@@ -307,11 +307,17 @@ impl NostrFilter {
             .collect::<HashSet<_>>()
             .len();
         if tag_key_count > max_tags_per_filter {
-            return Err(QueryError::msg("too many tags in filter"));
+            return Err(QueryError::limit(
+                FilterLimit::TagsPerFilter,
+                "too many tags in filter",
+            ));
         }
         let and_entry_count: usize = f.and_tags.values().map(FilterSetBytes::size).sum();
         if and_entry_count > max_and_entries {
-            return Err(QueryError::msg("too many AND entries in filter"));
+            return Err(QueryError::limit(
+                FilterLimit::AndEntries,
+                "too many AND entries in filter",
+            ));
         }
         if f.limit > max_filter_limit {
             f.limit = max_filter_limit;
@@ -527,15 +533,18 @@ impl FilterValidator {
             if let Some(kinds) = &filter.kinds {
                 if self.max_kinds_per_filter != 0 && kinds.size() as u64 > self.max_kinds_per_filter
                 {
-                    return Err(QueryError::msg(format!(
-                        "too many kinds in filter: {}",
-                        kinds.size()
-                    )));
+                    return Err(QueryError::limit(
+                        FilterLimit::KindsPerFilter,
+                        format!("too many kinds in filter: {}", kinds.size()),
+                    ));
                 }
                 if !self.allowed_kinds.is_empty() {
                     for k in kinds.iter() {
                         if !self.allowed_kinds.contains(&k) {
-                            return Err(QueryError::msg(format!("kind not allowed: {k}")));
+                            return Err(QueryError::limit(
+                                FilterLimit::AllowedKinds,
+                                format!("kind not allowed: {k}"),
+                            ));
                         }
                     }
                 }
@@ -546,7 +555,10 @@ impl FilterValidator {
                 && filter.tags.is_empty()
                 && filter.and_tags.is_empty()
             {
-                return Err(QueryError::msg("filter must name ids, authors or a tag"));
+                return Err(QueryError::limit(
+                    FilterLimit::ScopedFilters,
+                    "filter must name ids, authors or a tag",
+                ));
             }
             if self.require_author_or_tag {
                 let has_author = filter
@@ -575,7 +587,8 @@ impl FilterValidator {
                     .map(|t| t.size() == 1)
                     .unwrap_or(false);
                 if !has_author && !has_p && !has_e && !has_and_p && !has_and_e {
-                    return Err(QueryError::msg(
+                    return Err(QueryError::limit(
+                        FilterLimit::AuthorOrTag,
                         "filter must have exactly one author, p tag, or e tag",
                     ));
                 }
@@ -644,6 +657,10 @@ mod tests {
     #[test]
     fn each_validation_rule_applies_when_set() {
         let group = |filters: Value| NostrFilterGroup::from_value(&filters, 500, 3, 16).unwrap();
+        // Each refusal names the rule that made it.
+        let broken = |validator: &FilterValidator, fg: &NostrFilterGroup| {
+            validator.validate(fg).unwrap_err().broken_limit()
+        };
         // MDK's directory batch names six kinds.
         let six_kinds = group(json!([{"kinds": [0, 1, 3, 10002, 10050, 30443]}]));
         assert!(FilterValidator::default().validate(&six_kinds).is_ok());
@@ -651,18 +668,24 @@ mod tests {
             max_kinds_per_filter: 3,
             ..Default::default()
         };
-        assert!(capped.validate(&six_kinds).is_err());
+        assert_eq!(
+            broken(&capped, &six_kinds),
+            Some(FilterLimit::KindsPerFilter)
+        );
         let allowed = FilterValidator {
             allowed_kinds: [0, 3].into(),
             ..Default::default()
         };
-        assert!(allowed.validate(&six_kinds).is_err());
+        assert_eq!(
+            broken(&allowed, &six_kinds),
+            Some(FilterLimit::AllowedKinds)
+        );
         assert!(allowed.validate(&group(json!([{"kinds": [3]}]))).is_ok());
         let scoped = FilterValidator {
             require_author_or_tag: true,
             ..Default::default()
         };
-        assert!(scoped.validate(&six_kinds).is_err());
+        assert_eq!(broken(&scoped, &six_kinds), Some(FilterLimit::AuthorOrTag));
         assert!(scoped
             .validate(&group(json!([{"authors": ["11".repeat(32)]}])))
             .is_ok());
@@ -700,11 +723,35 @@ mod tests {
                 "filter must name ids, authors or a tag",
                 "{filter}"
             );
+            assert_eq!(
+                broken(&scoped, &group(json!([filter]))),
+                Some(FilterLimit::ScopedFilters),
+                "{filter}"
+            );
         }
         // Every filter of the request.
         assert!(scoped
             .validate(&group(json!([{"ids": [id]}, {"kinds": [445]}])))
             .is_err());
+    }
+
+    #[test]
+    fn parse_limits_name_the_limit_they_broke() {
+        let pk = "22".repeat(32);
+        let limit = |filter: Value| {
+            NostrFilter::parse(&filter, 500, 2, 1)
+                .unwrap_err()
+                .broken_limit()
+        };
+        assert_eq!(
+            limit(json!({"#t": ["a"], "#e": [pk], "#p": [pk]})),
+            Some(FilterLimit::TagsPerFilter)
+        );
+        assert_eq!(
+            limit(json!({"&t": ["a", "b"]})),
+            Some(FilterLimit::AndEntries)
+        );
+        assert_eq!(limit(json!({"ids": ["aa"]})), None);
     }
 
     #[test]

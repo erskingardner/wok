@@ -108,6 +108,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wok_refusals_total{setting}`, one counter of refused requests and
+  events, labelled by the config key that refused them, such as
+  `relay.abuse.per_connection.req_burst` or `events.max_num_tags` (#97
+  §5.1). A token bucket's refusals carry its `_burst` key. Refusals that had
+  no counter are now counted too: event validation (`created_at` bounds,
+  size, tags), filter limits (`max_filters_per_req`, `max_req_filter_size`,
+  `max_tags_per_filter`, `max_and_entries`), each `filter_validation` rule,
+  `accepted_kinds`, the read classes, the read and write policies, the
+  per-connection filter and subscription caps, the write-policy plugin, and
+  sync's memory and size budgets. Refusals no setting makes, such as a
+  NIP-86 ban or AUTH's fixed timestamp window, are not. **Deprecated:**
+  `wok_abuse_rejections_total{reason}` still counts as before for this
+  release and will be removed in the next; `docs/observability.md` maps
+  each `reason` to its settings.
 - The `marmot` preset, for a relay dedicated to Marmot group messaging
   (`preset = "marmot"`): only the Marmot kinds, scoped filters, 4 MiB events,
   room for an inviter's Welcome burst and a NIP-77 pass per group, and open

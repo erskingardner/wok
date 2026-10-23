@@ -16,7 +16,7 @@ use crate::abuse::{
 };
 use crate::config::AccessPolicy;
 use crate::config::{Config, EphemeralPersistence};
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, Setting};
 use crate::moderation::{is_member, stored_is_member, ManagementCmd, WriteGrant};
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{
@@ -1109,6 +1109,7 @@ impl RelayHandle {
             self.metrics
                 .abuse_connection_rejections
                 .fetch_add(1, Ordering::Relaxed);
+            self.metrics.refused(Setting::ConnectionBurst);
         }
         admitted
     }
@@ -2062,6 +2063,7 @@ fn handle_client(
                 metrics
                     .abuse_event_rate_rejections
                     .fetch_add(1, Ordering::Relaxed);
+                metrics.refused(Setting::EventBurst);
                 let id = v.get("id").and_then(Value::as_str).unwrap_or("?");
                 conns.send(
                     conn_id,
@@ -2086,6 +2088,7 @@ fn handle_client(
                 metrics
                     .abuse_event_rate_rejections
                     .fetch_add(1, Ordering::Relaxed);
+                metrics.refused(Setting::EventBurst);
                 let id = v.get("id").and_then(Value::as_str).unwrap_or("?");
                 conns.send(
                     conn_id,
@@ -2299,6 +2302,7 @@ fn ingest_event(
     {
         Ok(p) => p,
         Err(e) => {
+            count_event_limit(metrics, requested_kind, &e);
             let id = orig
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -2350,17 +2354,23 @@ fn ingest_event(
         id.copy_from_slice(packed.id());
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(packed.pubkey());
-        let rejected = if !cfg.accepts_kind(packed.kind()) || !snap.kind_allowed(packed.kind()) {
-            Some((
-                &metrics.moderation_kind_rejections,
-                format!(
-                    "restricted: kind {} is not allowed by this relay",
-                    packed.kind()
-                ),
-            ))
+        let kind_refusal = |setting| {
+            let message = format!(
+                "restricted: kind {} is not allowed by this relay",
+                packed.kind()
+            );
+            Some((&metrics.moderation_kind_rejections, setting, message))
+        };
+        // Only `accepted_kinds` is a setting; a NIP-86 kind policy is counted
+        // by the moderation counter alone.
+        let rejected = if !cfg.accepts_kind(packed.kind()) {
+            kind_refusal(Some(Setting::AcceptedKinds))
+        } else if !snap.kind_allowed(packed.kind()) {
+            kind_refusal(None)
         } else if snap.banned_events.contains_key(&id) {
             Some((
                 &metrics.moderation_banned_event_rejections,
+                None,
                 "restricted: event is banned by the relay operator".to_string(),
             ))
         } else if is_vanish_request {
@@ -2372,18 +2382,23 @@ fn ingest_event(
         } else if snap.banned_pubkeys.contains_key(&pubkey) {
             Some((
                 &metrics.moderation_banned_author_rejections,
+                None,
                 "restricted: author is banned by the relay operator".to_string(),
             ))
         } else if !grant.admits(cfg) {
             Some((
                 &metrics.moderation_restricted_write_rejections,
+                Some(Setting::WritePolicy),
                 grant.refusal(cfg),
             ))
         } else {
             None
         };
-        if let Some((counter, message)) = rejected {
+        if let Some((counter, setting, message)) = rejected {
             counter.fetch_add(1, Ordering::Relaxed);
+            if let Some(setting) = setting {
+                metrics.refused(setting);
+            }
             if message.starts_with("auth-required:") {
                 issue_challenge(conns, metrics, auth, conn_id);
             }
@@ -2401,6 +2416,9 @@ fn ingest_event(
         grant
     };
     if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
+        if !cfg.relay.nip62.enabled {
+            metrics.refused(Setting::Nip62Enabled);
+        }
         conns.send(
             conn_id,
             RelayMessage::Ok {
@@ -2420,6 +2438,7 @@ fn ingest_event(
     if cfg.relay.abuse.enabled {
         if leading_zero_bits(packed.id()) < cfg.relay.abuse.min_pow_difficulty as u16 {
             metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
+            metrics.refused(Setting::MinPowDifficulty);
             conns.send(
                 conn_id,
                 RelayMessage::Ok {
@@ -2449,6 +2468,7 @@ fn ingest_event(
             metrics
                 .abuse_event_rate_rejections
                 .fetch_add(1, Ordering::Relaxed);
+            metrics.refused(Setting::PubkeyEventBurst);
             let message = if charged == author {
                 "rate-limited: author EVENT budget exhausted"
             } else {
@@ -2538,6 +2558,10 @@ fn ingest_event(
             }
         };
         if let Some(message) = refusal {
+            // A protected event is refused by NIP-70 whatever its kind.
+            if owner_only && !found_protected {
+                metrics.refused(Setting::OwnerOnlyKinds);
+            }
             conns.send(
                 conn_id,
                 RelayMessage::Ok {
@@ -2617,7 +2641,7 @@ fn ingest_auth(
         .and_then(|v| v.as_str())
         .unwrap_or("?")
         .to_string();
-    match ingest_auth_inner(cfg, auth, conn_id, &event_json, dispatch) {
+    match ingest_auth_inner(cfg, metrics, auth, conn_id, &event_json, dispatch) {
         Ok(packed_id) => {
             metrics.auth_success_total.fetch_add(1, Ordering::Relaxed);
             metrics
@@ -2654,6 +2678,7 @@ fn ingest_auth(
 
 fn ingest_auth_inner(
     cfg: &Config,
+    metrics: &Metrics,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     event_json: &Value,
@@ -2662,9 +2687,11 @@ fn ingest_auth_inner(
     // Refuse AUTH under the same condition that keeps NIP-42 out of NIP-11, so
     // `enabled = false` really disables it.
     if !cfg.relay.auth.enabled {
+        metrics.refused(Setting::AuthEnabled);
         return Err("blocked: AUTH is disabled on this relay".into());
     }
     if cfg.relay.auth.service_url.is_empty() {
+        metrics.refused(Setting::AuthServiceUrl);
         return Err(
             "blocked: relay needs service_url to be configured before AUTH can work".into(),
         );
@@ -2679,7 +2706,10 @@ fn ingest_auth_inner(
     // `invalid:`, as it would be if sent as EVENT.
     let policy = cfg.timestamp_policy_for_kind(AUTH_KIND);
     let parsed = parse_and_verify_event(event_json, &cfg.event_limits(), Some(&policy), true, true)
-        .map_err(|e| format!("invalid: {e}"))?;
+        .map_err(|e| {
+            count_event_limit(metrics, AUTH_KIND, &e);
+            format!("invalid: {e}")
+        })?;
     let packed = parsed.packed.view();
     if packed.kind() != AUTH_KIND {
         return Err("wrong event kind, expected 22242".into());
@@ -2843,6 +2873,7 @@ fn check_query_work(
     metrics
         .abuse_query_cost_rejections
         .fetch_add(1, Ordering::Relaxed);
+    metrics.refused(Setting::MaxQueryWork);
     Err(format!(
         "blocked: query too broad (cost {work} > {max}); split the {request} or narrow \
          authors/kinds"
@@ -2869,15 +2900,24 @@ fn admit_req(
     // C++ RelayIngester sends `error: bad req: ...` for all of these. The
     // text after the prefix is kept.
     let bad_req = |prefix: &str, e: String| format!("{prefix}: bad req: {e}");
+    let refuse = |setting, prefix: &str, e: String| {
+        metrics.refused(setting);
+        bad_req(prefix, e)
+    };
     if filters.len() > cfg.relay.max_filters_per_req {
         // Keep strfry's wording for its legacy filter-count ceiling.
-        return Err(bad_req("invalid", "arr too big".into()));
+        return Err(refuse(
+            Setting::MaxFiltersPerReq,
+            "invalid",
+            "arr too big".into(),
+        ));
     }
     let serialized_filter_bytes = filters.iter().fold(0usize, |total, filter| {
         total.saturating_add(filter.to_string().len())
     });
     if serialized_filter_bytes > cfg.relay.max_req_filter_size {
-        return Err(bad_req(
+        return Err(refuse(
+            Setting::MaxReqFilterSize,
             "invalid",
             format!(
                 "filters exceed {} serialized bytes",
@@ -2888,7 +2928,11 @@ fn admit_req(
     let max_limit = if count_only {
         let m = cfg.relay.max_filter_limit_count + 1;
         if m == 1 {
-            return Err(bad_req("blocked", "COUNT disabled".into()));
+            return Err(refuse(
+                Setting::MaxFilterLimitCount,
+                "blocked",
+                "COUNT disabled".into(),
+            ));
         }
         m
     } else {
@@ -2902,8 +2946,12 @@ fn admit_req(
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
     )
-    .map_err(|e| bad_req(e.reason_prefix(), e.to_string()))?;
+    .map_err(|e| {
+        count_filter_limit(metrics, &e);
+        bad_req(e.reason_prefix(), e.to_string())
+    })?;
     if let Err(e) = filter_validator(cfg).validate(&fg) {
+        count_filter_limit(metrics, &e);
         return Err(bad_req("blocked", format!("filter validation failed: {e}")));
     }
     let costed = if count_only {
@@ -2938,6 +2986,17 @@ fn admit_req(
         r.is_filter_group_fully_restricted(&fg) && authed.is_none()
     };
     if requires_auth {
+        // A COUNT is refused for the filters its reader is not scoped to,
+        // a REQ for all of them.
+        let class = if count_only {
+            let identities = auth
+                .get(&conn_id)
+                .map_or(&[][..], |session| session.identities.as_slice());
+            r.count_refusal_class(&fg, identities)
+        } else {
+            r.strictest_group_class(&fg)
+        };
+        count_read_class(metrics, class);
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
     // Pending and live subscriptions both count. Over a lowered cap an open
@@ -2946,6 +3005,7 @@ fn admit_req(
         && !conns.is_open(conn_id, Ns::Req, sid)
         && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
     {
+        metrics.refused(Setting::MaxSubsPerConnection);
         return Err("blocked: too many concurrent REQs".into());
     }
     // Live filters stay in memory until closed, and a COUNT's until it is
@@ -2959,6 +3019,7 @@ fn admit_req(
         if serialized_filter_bytes > replaced
             && held - replaced + serialized_filter_bytes > filter_budget
         {
+            metrics.refused(Setting::MaxFilterBytesPerConnection);
             return Err(format!(
                 "blocked: this connection's filters exceed {filter_budget} bytes"
             ));
@@ -3075,6 +3136,7 @@ fn admit_reader(
     if reader_admitted(cfg, moderation, identities) {
         return Ok(());
     }
+    metrics.refused(Setting::ReadPolicy);
     let refusal = read_policy_refusal(cfg, !identities.is_empty());
     if refusal.starts_with("auth-required:") {
         issue_challenge(conns, metrics, auth, conn_id);
@@ -3095,6 +3157,31 @@ fn read_policy_refusal(cfg: &Config, authenticated: bool) -> String {
         format!("restricted: this relay serves only {who}")
     } else {
         format!("auth-required: this relay serves only {who}")
+    }
+}
+
+/// Count an event of `kind` refused by a limit its settings chose.
+fn count_event_limit(metrics: &Metrics, kind: u64, error: &wok_event::EventError) {
+    if let Some(setting) = error
+        .broken_limit()
+        .and_then(|limit| Config::event_limit_setting(kind, limit))
+    {
+        metrics.refused(setting);
+    }
+}
+
+/// Count a filter refused by a limit its settings chose.
+fn count_filter_limit(metrics: &Metrics, error: &wok_query::QueryError) {
+    if let Some(limit) = error.broken_limit() {
+        metrics.refused(Setting::of_filter_limit(limit));
+    }
+}
+
+/// Count a read the restricted-kind gate refuses, by the class that
+/// refused it.
+fn count_read_class(metrics: &Metrics, class: crate::restrict::ReadClass) {
+    if let Some(setting) = Setting::of_read_class(class) {
+        metrics.refused(setting);
     }
 }
 
@@ -3164,6 +3251,7 @@ fn admit_invalid(
     metrics
         .abuse_invalid_rate_rejections
         .fetch_add(1, Ordering::Relaxed);
+    metrics.refused(Setting::InvalidBurst);
     if admission == Admission::FirstRefusal {
         conns.send(
             conn_id,
@@ -3208,6 +3296,13 @@ fn admit_request(
         Request::Req | Request::NegMsg => &metrics.abuse_req_rate_rejections,
     };
     rejections.fetch_add(1, Ordering::Relaxed);
+    metrics.refused(match (refusal, request) {
+        (Refusal::Connection, Request::Req) => Setting::PerConnectionReqBurst,
+        (Refusal::Connection, Request::NegMsg) => Setting::PerConnectionNegMsgBurst,
+        (Refusal::Connection, Request::Count) => Setting::PerConnectionCountBurst,
+        (Refusal::Address, Request::Req | Request::NegMsg) => Setting::ReqBurst,
+        (Refusal::Address, Request::Count) => Setting::CountBurst,
+    });
     Err(match refusal {
         Refusal::Connection => format!("rate-limited: {command} budget exhausted"),
         Refusal::Address => format!("rate-limited: {command} budget exhausted for this address"),
@@ -3298,6 +3393,7 @@ fn ingest_neg_command(
         }
     };
     if !cfg.relay.negentropy_enabled {
+        metrics.refused(Setting::NegentropyEnabled);
         let reason = "blocked: negentropy is disabled on this relay".to_string();
         neg_err(conns, metrics, dispatch, conn_id, &sub_id, reason);
         return;
@@ -3355,11 +3451,15 @@ fn ingest_neg(
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
     )
-    .map_err(|e| format!("{}: {e}", e.reason_prefix()))?;
+    .map_err(|e| {
+        count_filter_limit(metrics, &e);
+        format!("{}: {e}", e.reason_prefix())
+    })?;
     // The rules REQ and COUNT meet, so a sync cannot list what a REQ may not.
-    filter_validator(cfg)
-        .validate(&fg)
-        .map_err(|e| format!("blocked: filter validation failed: {e}"))?;
+    filter_validator(cfg).validate(&fg).map_err(|e| {
+        count_filter_limit(metrics, &e);
+        format!("blocked: filter validation failed: {e}")
+    })?;
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
     check_query_work(cfg, metrics, query_cost, "NEG-OPEN")?;
@@ -3368,6 +3468,7 @@ fn ingest_neg(
     if r.is_filter_group_fully_restricted(&fg)
         && auth.get(&conn_id).and_then(|a| a.authed).is_none()
     {
+        count_read_class(metrics, r.strictest_group_class(&fg));
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
     if let Some(obj) = filter.as_object_mut() {
@@ -3382,6 +3483,17 @@ fn ingest_neg(
         payload,
     });
     Ok(())
+}
+
+/// The setting behind a query the scheduler refuses: a concurrency cap of
+/// zero runs none, else the connection's queue, which
+/// `max_subs_per_connection` bounds, is full.
+fn scheduler_refusal(cfg: &Config) -> Setting {
+    if cfg.relay.abuse.max_concurrent_historical_queries == 0 {
+        Setting::MaxConcurrentHistoricalQueries
+    } else {
+        Setting::MaxSubsPerConnection
+    }
 }
 
 fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::ReadVisibility {
@@ -3649,6 +3761,7 @@ fn run_req_worker(
                                         .abuse_query_concurrency_rejections
                                         .fetch_add(1, Ordering::Relaxed);
                                     let cfg_snap = cfg.read();
+                                    metrics.refused(scheduler_refusal(&cfg_snap));
                                     Some(
                                         if cfg_snap.relay.abuse.max_concurrent_historical_queries
                                             == 0
@@ -3749,7 +3862,11 @@ impl ReqWorker<'_> {
         // slice.
         if let Some(sub) = queries.next_query() {
             let identities = authed.get(&sub.conn_id).map_or(&[][..], Vec::as_slice);
-            if !stored_reader_admitted(txn, cfg, identities).unwrap_or(false) {
+            let admitted = stored_reader_admitted(txn, cfg, identities);
+            if matches!(admitted, Ok(false)) {
+                self.metrics.refused(Setting::ReadPolicy);
+            }
+            if !admitted.unwrap_or(false) {
                 let refusal = read_policy_refusal(cfg, !identities.is_empty());
                 let (conn_id, sub_id, generation, count_only) = (
                     sub.conn_id,
@@ -6987,6 +7104,8 @@ mod tests {
                 json!(["CLOSED", "waiting", refusal])
             ]
         );
+        // Each is the read policy's refusal.
+        assert_eq!(metrics.refusals.get(Setting::ReadPolicy), 2);
         assert!(!queries.has_running());
         assert_eq!(queries.waiting(), 0);
     }

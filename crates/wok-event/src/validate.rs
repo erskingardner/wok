@@ -5,7 +5,7 @@ use crate::packed::PackedEventView;
 use crate::parse::{
     from_lower_hex_array, normalize_event_json, pack_event, EventLimits, ParsedEvent,
 };
-use crate::{parse_canonical_a_tag, EventError, DELETION_KIND};
+use crate::{parse_canonical_a_tag, EventError, EventLimit, DELETION_KIND};
 
 // Re-export helper used by validate; keep json_get_string crate-private in parse
 // by duplicating the small accessor here for sig field.
@@ -92,10 +92,10 @@ fn verify_nostr_event_with(
 
 pub fn verify_event_json_size(json_str: &str, max_event_size: usize) -> Result<(), EventError> {
     if json_str.len() > max_event_size {
-        return Err(EventError::msg(format!(
-            "event too large: {}",
-            json_str.len()
-        )));
+        return Err(EventError::limit(
+            EventLimit::EventSize,
+            format!("event too large: {}", json_str.len()),
+        ));
     }
     Ok(())
 }
@@ -127,14 +127,14 @@ pub fn verify_event_timestamp(
     }
 
     if ts < earliest {
-        return Err(EventError::msg(if is_ephemeral {
-            "ephemeral event expired"
+        return Err(if is_ephemeral {
+            EventError::limit(EventLimit::EphemeralTooOld, "ephemeral event expired")
         } else {
-            "created_at too early"
-        }));
+            EventError::limit(EventLimit::TooOld, "created_at too early")
+        });
     }
     if ts > latest {
-        return Err(EventError::msg("created_at too late"));
+        return Err(EventError::limit(EventLimit::TooNew, "created_at too late"));
     }
     if packed.expiration() > 1 && packed.expiration() <= now {
         return Err(EventError::msg("event expired"));
@@ -327,6 +327,61 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("event too large"), "{err}");
+    }
+
+    #[test]
+    fn limit_errors_name_the_limit_they_broke() {
+        let now = 1_700_000_000u64;
+        let policy = TimestampPolicy {
+            now_secs: now,
+            reject_newer_than_secs: 900,
+            reject_older_than_secs: 3600,
+            reject_ephemeral_older_than_secs: 60,
+        };
+        let limits = EventLimits {
+            max_event_size: 1024,
+            max_num_tags: 2,
+            max_tag_val_size: 80,
+        };
+        let refused = |kind: u64, created_at: u64, tags: Value, content: &str| {
+            let ev = sign_event(json!({
+                "created_at": created_at, "kind": kind, "tags": tags, "content": content,
+            }));
+            parse_and_verify_event(&ev, &limits, Some(&policy), true, true)
+                .unwrap_err()
+                .broken_limit()
+        };
+        let long = "x".repeat(81);
+        let cases = [
+            (
+                refused(1, now, json!([]), &"x".repeat(1024)),
+                EventLimit::EventSize,
+            ),
+            (
+                refused(1, now, json!([["t"], ["t"], ["t"]]), ""),
+                EventLimit::NumTags,
+            ),
+            (
+                refused(1, now, json!([["t", long]]), ""),
+                EventLimit::TagValSize,
+            ),
+            (
+                refused(30000, now, json!([["d", "x".repeat(10)]]), ""),
+                EventLimit::TagValSize,
+            ),
+            (refused(1, now - 3601, json!([]), ""), EventLimit::TooOld),
+            (refused(1, now + 901, json!([]), ""), EventLimit::TooNew),
+            (
+                refused(20001, now - 61, json!([]), ""),
+                EventLimit::EphemeralTooOld,
+            ),
+        ];
+        for (index, (refused, limit)) in cases.into_iter().enumerate() {
+            assert_eq!(refused, Some(limit), "case {index}");
+        }
+        // Other refusals are not limits the caller chose.
+        assert_eq!(refused(1, now, json!([["expiration", "1"]]), ""), None);
+        assert_eq!(refused(1, now, json!([[]]), ""), None);
     }
 
     #[test]

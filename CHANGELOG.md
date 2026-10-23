@@ -108,6 +108,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `marmot` preset, for a relay dedicated to Marmot group messaging
+  (`preset = "marmot"`): only the Marmot kinds, scoped filters, 4 MiB events,
+  room for an inviter's Welcome burst and a NIP-77 pass per group, and open
+  writes so group membership stays unlinkable at the relay. It refuses to
+  start without `relay.auth.service_url`, and a reload or a dashboard or
+  NIP-86 save that would remove it is refused. See `docs/config.md`,
+  The `marmot` preset (#97 §4.2).
 - `relay.auth.accepted_kinds`, the kinds a relay accepts (empty, the
   default, accepts every kind). Events of other kinds are refused with
   `restricted: kind N is not allowed by this relay`, and NIP-11 advertises
@@ -269,6 +276,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Preset changes
 
+- `marmot` (new): over the public preset, `relay.auth.accepted_kinds =
+  [0, 3, 5, 62, 445, 1059, 10000, 10002, 10050, 30443]`,
+  `relay.filter_validation.require_scoped_filters = true`,
+  `events.max_event_size = 4194304`, `relay.max_websocket_payload_size` and
+  `relay.unix.max_frame_bytes = 8388608`, `relay.max_filter_limit = 5000`,
+  `relay.abuse.event_burst = 300`, and `[relay.abuse.per_connection]`
+  `req_rate_per_second = 50`, `req_burst = 300`, `neg_msg_burst = 500`.
 - `public`: `relay.auth.owner_only_kinds` is `[78, 30078]` (new), so NIP-78
   app data is read and published only by its author (see Security). Apps
   that publish public data in these kinds can no longer be read by other

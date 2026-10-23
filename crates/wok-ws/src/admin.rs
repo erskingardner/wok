@@ -465,11 +465,30 @@ pub(crate) fn apply_config_patch(
     })?;
     let (edited, verified) =
         patched_file(&text, patch).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    // The file may have been edited into a configuration the relay refuses
+    // to serve, which a reload of it already refused; a save must not
+    // persist or install it either.
+    let unservable = |error| {
+        (
+            StatusCode::CONFLICT,
+            format!(
+                "{} cannot be served, so nothing was saved: {error}",
+                path.display()
+            ),
+        )
+    };
+    if let Some(error) = verified.serving_error() {
+        return Err(unservable(error));
+    }
     if edited != text {
         wok_relay::config::write_file(&path, edited.as_bytes())
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     }
-    handle.config.write().apply_reload(verified);
+    handle
+        .config
+        .write()
+        .apply_reload(verified)
+        .map_err(unservable)?;
     Ok(())
 }
 

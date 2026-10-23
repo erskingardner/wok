@@ -1206,6 +1206,9 @@ impl RelayHandle {
 }
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
+    if let Some(error) = config.serving_error() {
+        return Err(error);
+    }
     env.ensure_initialized().map_err(|e| e.to_string())?;
     let backfilled =
         backfill_vanish_markers(&env, &config.vanish_policy(), config.events.max_event_size)

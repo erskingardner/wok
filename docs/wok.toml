@@ -9,7 +9,8 @@
 # values, and `wok config minimize` removes settings that repeat them.
 
 # The preset this file overlays. "public", the default, suits a general
-# public relay.
+# public relay; "marmot" a relay dedicated to Marmot group messaging, which
+# needs relay.auth.service_url below.
 preset = "public"
 
 [relay]

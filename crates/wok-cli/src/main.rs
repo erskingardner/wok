@@ -473,7 +473,9 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
             match Config::load(&path) {
                 Ok(new) => {
                     tracing::info!("config {} changed, reloading", path.display());
-                    handle.config.write().apply_reload(new);
+                    if let Err(error) = handle.config.write().apply_reload(new) {
+                        tracing::error!("config reload refused, keeping old config: {error}");
+                    }
                 }
                 Err(e) => {
                     tracing::error!("config reload failed, keeping old config: {e}");

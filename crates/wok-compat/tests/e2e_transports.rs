@@ -2279,6 +2279,62 @@ description = "Kept as written."
     handle.request_shutdown();
 }
 
+/// A config-backed NIP-86 method, like a dashboard save, edits the file on
+/// disk. One edited into a marmot config without AUTH, which a reload of it
+/// refuses, is neither saved nor installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_saves_refuse_a_file_the_relay_cannot_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let admin_hex = hex::encode(admin_key.x_only_public_key().0.serialize());
+    let file = |auth: &str| {
+        format!(
+            "preset = \"marmot\"\n\n[admin]\nenabled = true\npublic_url = \"http://{addr}\"\n\
+             pubkeys = [\"{admin_hex}\"]\nallow_config_writes = true\n\n[relay.auth]\n{auth}"
+        )
+    };
+    let served = file("service_url = \"wss://marmot.test\"\n");
+    let config_dir = tempfile::tempdir().unwrap();
+    let path = config_dir.path().join("wok.toml");
+    std::fs::write(&path, &served).unwrap();
+    let mut cfg = wok_relay::Config::parse_toml(&served).unwrap();
+    cfg.db = dir.path().to_path_buf();
+    let handle = wok_relay::start(env, cfg).unwrap();
+    handle.set_config_path(path.clone());
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The operator removes service_url; the relay keeps serving the old one.
+    let unservable = file("");
+    std::fs::write(&path, &unservable).unwrap();
+    let (_, result) = nip86_rpc(addr, &admin_key, "changerelayname", json!(["After"])).await;
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("nothing was saved") && e.contains("service_url")),
+        "{result}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), unservable);
+    let running = handle.config.read().clone();
+    assert_eq!(running.relay.auth.service_url, "wss://marmot.test");
+    assert_ne!(running.relay.info.name, "After");
+    handle.request_shutdown();
+}
+
 /// A DB change queued before a ban commits must not deliver the banned
 /// author's events afterwards: the live monitor rechecks moderation against
 /// committed state on every batch.

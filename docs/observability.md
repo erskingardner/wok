@@ -77,6 +77,7 @@ something. A token bucket's refusals carry its `_burst` key; raising its
 | `events.max_event_size`, `events.max_num_tags`, `events.max_tag_val_size` | Events, and AUTH events, over the size, tag count or tag value limit. |
 | `events.reject_older_than_secs`, `events.reject_newer_than_secs`, `events.reject_ephemeral_older_than_secs` | Events outside the `created_at` window. AUTH's ±600 s window and a 21059's 3-day allowance are NIP constants and are not counted. |
 | `relay.abuse.min_pow_difficulty` | Events short of the NIP-13 difficulty. |
+| `relay.auth.enabled`, `relay.auth.service_url` | AUTH messages while NIP-42 is off, or before the relay URL they must name is set. |
 | `relay.auth.accepted_kinds` | Events of a kind outside it. The NIP-86 kind policy is counted only by `wok_moderation_rejections_total`. |
 | `relay.auth.write_policy` | Events the write policy does not admit. |
 | `relay.auth.owner_only_kinds` | Events of an owner-only kind not sent as their author (a NIP-70 protected one is NIP-70's), and reads of one not scoped to the reader. |

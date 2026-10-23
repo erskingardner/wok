@@ -49,6 +49,10 @@ settings! {
     RejectNewerThan => "events.reject_newer_than_secs",
     RejectEphemeralOlderThan => "events.reject_ephemeral_older_than_secs",
     MinPowDifficulty => "relay.abuse.min_pow_difficulty",
+    /// AUTH while NIP-42 is off.
+    AuthEnabled => "relay.auth.enabled",
+    /// AUTH before the relay URL it must name is set.
+    AuthServiceUrl => "relay.auth.service_url",
     AcceptedKinds => "relay.auth.accepted_kinds",
     WritePolicy => "relay.auth.write_policy",
     /// Writes of an owner-only kind from anyone but its author, and reads of

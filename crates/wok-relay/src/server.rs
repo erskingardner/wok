@@ -2687,9 +2687,11 @@ fn ingest_auth_inner(
     // Refuse AUTH under the same condition that keeps NIP-42 out of NIP-11, so
     // `enabled = false` really disables it.
     if !cfg.relay.auth.enabled {
+        metrics.refused(Setting::AuthEnabled);
         return Err("blocked: AUTH is disabled on this relay".into());
     }
     if cfg.relay.auth.service_url.is_empty() {
+        metrics.refused(Setting::AuthServiceUrl);
         return Err(
             "blocked: relay needs service_url to be configured before AUTH can work".into(),
         );

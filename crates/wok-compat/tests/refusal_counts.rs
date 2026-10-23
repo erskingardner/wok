@@ -314,6 +314,27 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
             },
         )
         .await;
+    // AUTH needs NIP-42 on and the relay's URL. Neither relay sends a
+    // challenge, so the AUTH names one of its own.
+    for (setting, tweak) in [
+        (
+            Setting::AuthEnabled,
+            (|c: &mut Config| c.relay.auth.enabled = false) as fn(&mut Config),
+        ),
+        (Setting::AuthServiceUrl, |c: &mut Config| {
+            c.relay.auth.service_url.clear()
+        }),
+    ] {
+        relay
+            .expect(Some(setting), tweak, async |r| {
+                let mut client = r.client().await;
+                client.challenge = Some(json!("none"));
+                let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+                let auth = client.auth_event(&key, t, &[]).await;
+                assert!(!client.auth(&auth).await);
+            })
+            .await;
+    }
     // An AUTH meets the event limits.
     relay
         .expect(

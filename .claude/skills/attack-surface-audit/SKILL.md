@@ -11,8 +11,8 @@ inventory: every entry point, who reaches it, the gate that decides, and the
 work done before the gate. Read its "Using this page" section first.
 
 Findings go in GitHub issues, linked from the attack-surface tracking issue
-(#156 at the time of writing). A finding that is exploitable and unfixed goes
-through `SECURITY.md`, not a public issue or the docs.
+(#156 at the time of writing), except those [step 5](#5-report) sends to a
+private advisory.
 
 ## 1. Keep the inventory true
 
@@ -41,12 +41,16 @@ Evidence: `scripts/attack-surface-reach.py` (needs `cargo-llvm-cov` and the
 reaches, per profile, in `crates/wok-compat/tests/reachability/`.
 
 ```bash
-scripts/attack-surface-reach.py --check    # fails on a function newly reached
+scripts/attack-surface-reach.py --check    # fails on new reach, or a phase that reaches nothing
 ```
 
-A function newly reached by the `anonymous` phase is code an unauthenticated
-client can now run. Justify it in the pull request, then `--bless`. When you
-extend the probe (`crates/wok-compat/tests/reachability.rs`), keep it from
+`--check` fails in two cases. A phase that reached functions and now reaches
+none means the probe broke: fix the probe, never bless it. A function the
+`anonymous` phase newly reaches is code an unauthenticated client can now
+run: move it after the cheapest check that refuses the request, or behind a
+setting. Rewrite the baseline with `--bless` only when the new reach is
+intended, with the reason in the pull request. A function no longer reached
+is listed but does not fail. When you extend the probe (`crates/wok-compat/tests/reachability.rs`), keep it from
 calling the relay's crates itself (sign, frame and compress with other
 crates), or its own work is counted as the relay's.
 
@@ -108,5 +112,10 @@ failing test before fixing it, and keep the test.
 
 Resource exhaustion beyond the documented limits, and anything a client can
 use to read or write what it should not, goes to a private advisory
-(`SECURITY.md`). Settings that fail open, ordering that wastes work within a
-budget, and documentation gaps can be public issues.
+(`SECURITY.md`). Ordering that wastes work within a budget, missing warnings,
+and documentation gaps can be public issues. When a finding fits both, ask
+who has to act for it to be exploitable: if a client can exploit a relay
+whose operator configured it as documented, it is private; if the gate fails
+open only because the operator wrote a setting that the docs do not support
+(a malformed value, a list emptied on purpose) and Wok does not warn, it is a
+configuration bug and can be public, like #162.

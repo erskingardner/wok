@@ -773,6 +773,22 @@ impl Config {
         self.relay.auth.enabled && !self.relay.auth.service_url.is_empty()
     }
 
+    /// NIP-11 `limitation.auth_required`: every REQ, COUNT and NEG-OPEN
+    /// needs AUTH, under any `read_policy` but `open`. Particular kinds can
+    /// need AUTH whatever this says, as NIP-11 allows. While AUTH cannot
+    /// succeed it is not asked for, as NIP-42 is then not advertised.
+    pub fn auth_required(&self) -> bool {
+        self.relay.auth.read_policy != AccessPolicy::Open && self.auth_usable()
+    }
+
+    /// NIP-11 `limitation.restricted_writes`: an event must meet a condition
+    /// that clients are expected to know before writing, beyond ordinary
+    /// rate limits: a `write_policy` other than `open`, or proof of work.
+    pub fn restricted_writes(&self) -> bool {
+        self.relay.auth.write_policy != AccessPolicy::Open
+            || (self.relay.abuse.enabled && self.relay.abuse.min_pow_difficulty > 0)
+    }
+
     /// Explain how `relay.real_ip_header` keys the per-address budgets of a
     /// relay listening on `listening`. A set header is trusted as each
     /// client's address. With none, a client is the address that connected,
@@ -2788,6 +2804,28 @@ negentropy_enabled = true
             .auth_configuration_warning()
             .unwrap()
             .contains("enabled is false"));
+    }
+
+    #[test]
+    fn nip11_access_flags_follow_the_policies_and_proof_of_work() {
+        let mut c = Config::default();
+        c.relay.auth.service_url = "wss://relay.example.com".into();
+        assert!(!c.auth_required() && !c.restricted_writes());
+        c.relay.auth.read_policy = AccessPolicy::Authenticated;
+        assert!(c.auth_required() && !c.restricted_writes());
+        // Not while AUTH cannot succeed.
+        c.relay.auth.enabled = false;
+        assert!(!c.auth_required());
+        c.relay.auth.enabled = true;
+        c.relay.auth.read_policy = AccessPolicy::Open;
+        c.relay.auth.write_policy = AccessPolicy::Members;
+        assert!(!c.auth_required() && c.restricted_writes());
+        c.relay.auth.write_policy = AccessPolicy::Open;
+        c.relay.abuse.min_pow_difficulty = 20;
+        assert!(c.restricted_writes());
+        // Proof of work is checked only with abuse controls on.
+        c.relay.abuse.enabled = false;
+        assert!(!c.restricted_writes());
     }
 
     #[test]

@@ -1211,6 +1211,70 @@ async fn nip11_advertises_max_query_work_only_while_it_applies() {
     handle.request_shutdown();
 }
 
+/// NIP-11 says what a client must do before it may read or write:
+/// `auth_required` follows the read policy, and `restricted_writes` the
+/// write policy and proof of work, as each is enforced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip11_advertises_access_requirements_as_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let mut cfg = test_cfg(dir.path());
+    cfg.relay.auth.enabled = true;
+    cfg.relay.auth.service_url = "wss://relay.example.com".into();
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let flags = |limitation: &serde_json::Value| {
+        (
+            limitation["auth_required"].clone(),
+            limitation["restricted_writes"].clone(),
+        )
+    };
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(limitation["max_subid_length"], 64, "{limitation}");
+    assert_eq!(flags(limitation), (json!(false), json!(false)));
+
+    handle.config.write().relay.auth.read_policy = wok_relay::AccessPolicy::Members;
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(flags(limitation), (json!(true), json!(false)));
+    // While AUTH cannot succeed, clients are not told to try it: reads are
+    // refused with `restricted:` instead, and NIP-42 is not advertised.
+    handle.config.write().relay.auth.service_url.clear();
+    let nip11 = reqwest_get_nip11(addr).await;
+    assert_eq!(flags(&nip11["limitation"]), (json!(false), json!(false)));
+    assert!(!nip11["supported_nips"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(42)));
+    handle.config.write().relay.auth.service_url = "wss://relay.example.com".into();
+    {
+        let mut cfg = handle.config.write();
+        cfg.relay.auth.read_policy = wok_relay::AccessPolicy::Open;
+        cfg.relay.auth.write_policy = wok_relay::AccessPolicy::Authenticated;
+    }
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(flags(limitation), (json!(false), json!(true)));
+    {
+        let mut cfg = handle.config.write();
+        cfg.relay.auth.write_policy = wok_relay::AccessPolicy::Open;
+        cfg.relay.abuse.min_pow_difficulty = 20;
+    }
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(flags(limitation), (json!(false), json!(true)));
+    // Proof of work is not checked with abuse controls off, nor advertised.
+    handle.config.write().relay.abuse.enabled = false;
+    let limitation = &reqwest_get_nip11(addr).await["limitation"];
+    assert_eq!(flags(limitation), (json!(false), json!(false)));
+    assert_eq!(limitation["min_pow_difficulty"], 0);
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip11_and_nip86_accept_cors_requests() {
     let dir = tempfile::tempdir().unwrap();

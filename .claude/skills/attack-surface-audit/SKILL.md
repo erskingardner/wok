@@ -50,10 +50,11 @@ profile has no baseline. A function the `anonymous` phase newly reaches is
 code an unauthenticated client can now run: move it after the cheapest check
 that refuses the request, or behind a setting, and rewrite the baseline with
 `--bless` only when that reach is the point of the change, with the reason in
-the pull request. A phase that went empty is a broken probe when the probe
-stopped sending: fix the probe. When the probe still sends and the profile
-now closes that caller on purpose, `--bless` with the reason. A function no
-longer reached is listed but does not fail. When you extend the probe (`crates/wok-compat/tests/reachability.rs`), keep it from
+the pull request. A phase that went empty is intended when the profile now
+closes that caller, since the probe skips a closed caller (AUTH unusable,
+`admin.enabled` off, no Unix socket): `--bless` with the reason. When the
+caller is still open and its phase reaches nothing, the probe is broken: fix
+it. A function no longer reached is listed but does not fail. When you extend the probe (`crates/wok-compat/tests/reachability.rs`), keep it from
 calling the relay's crates itself (sign, frame and compress with other
 crates), or its own work is counted as the relay's.
 

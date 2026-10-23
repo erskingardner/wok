@@ -447,6 +447,9 @@ deprecation warning at startup, on reload and in `wok doctor`:
   preset, become `authenticated_kinds`, which any authenticated connection
   may read and no other can, and `recipient_only_kinds` becomes empty.
 
+A kind the old list shares with `owner_only_kinds`, such as 30078 listed to
+hide app data, keeps the stricter owner-only class, and the warning names it.
+
 `wok config minimize`, or a dashboard save, rewrites the file this way, and
 `wok migrate strfry` translates strfry's `relay.auth.restrictedReadKinds` and
 `restrictReadToInvolvedPubkey` the same way.

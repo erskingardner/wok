@@ -204,6 +204,24 @@ fn kinds(value: &toml::Value, dotted: &str) -> Result<Vec<u64>, String> {
         .collect()
 }
 
+/// What a warning about kinds moved to a read class adds for those that
+/// `owner_only` also lists: the strictest class applies, so only their author
+/// may still read them.
+pub(super) fn owner_only_note(kinds: &[u64], owner_only: &[u64]) -> String {
+    let covered: Vec<u64> = kinds
+        .iter()
+        .copied()
+        .filter(|kind| owner_only.contains(kind))
+        .collect();
+    if covered.is_empty() {
+        return String::new();
+    }
+    format!(
+        " Kinds {covered:?} are also in relay.auth.owner_only_kinds, the strictest class, so \
+         only their author may read them."
+    )
+}
+
 fn read_classes(file: &toml::Value, preset: &toml::Value) -> Result<Translation, String> {
     let mut translation = Translation::default();
     let Some(section) = file
@@ -237,15 +255,17 @@ fn read_classes(file: &toml::Value, preset: &toml::Value) -> Result<Translation,
             })
         })
         .transpose()?;
+    // A class as the file, or else the preset, sets it.
+    let class_kinds = |name: &'static str| -> Result<Vec<u64>, String> {
+        section
+            .get(name)
+            .or_else(|| leaf(preset, &key(name)))
+            .map_or(Ok(Vec::new()), |value| kinds(value, &dotted(name)))
+    };
+    let owner_only = class_kinds("owner_only_kinds")?;
     if involved == Some(false) {
         // The nearest meaning that never shows the kinds to a connection
         // that has not authenticated.
-        let class_kinds = |name: &'static str| -> Result<Vec<u64>, String> {
-            section
-                .get(name)
-                .or_else(|| leaf(preset, &key(name)))
-                .map_or(Ok(Vec::new()), |value| kinds(value, &dotted(name)))
-        };
         let moved = match old_kinds {
             Some(value) => kinds(value, &dotted("restricted_read_kinds"))?,
             None => class_kinds("recipient_only_kinds")?,
@@ -284,9 +304,10 @@ fn read_classes(file: &toml::Value, preset: &toml::Value) -> Result<Translation,
         translation.warnings.push(format!(
             "{} = false is no longer supported: it let a REQ that mixed in another kind read \
              kinds {moved:?} without AUTH. They are now {}, which any authenticated connection \
-             may read and no other can. `wok config minimize` rewrites the file.",
+             may read and no other can.{} `wok config minimize` rewrites the file.",
             dotted("restrict_read_to_involved_pubkey"),
-            dotted("authenticated_kinds")
+            dotted("authenticated_kinds"),
+            owner_only_note(&moved, &owner_only)
         ));
         return Ok(translation);
     }
@@ -298,9 +319,13 @@ fn read_classes(file: &toml::Value, preset: &toml::Value) -> Result<Translation,
         );
         translation.warnings.push(format!(
             "{} is deprecated: it is now {}, which only the author and first p-tag recipient \
-             may read, as before. `wok config minimize` renames it.",
+             may read, as before.{} `wok config minimize` renames it.",
             dotted("restricted_read_kinds"),
-            dotted("recipient_only_kinds")
+            dotted("recipient_only_kinds"),
+            owner_only_note(
+                &kinds(value, &dotted("restricted_read_kinds"))?,
+                &owner_only
+            )
         ));
     }
     if involved == Some(true) {
@@ -623,6 +648,34 @@ mod tests {
                 (30078, Owner),
             ]
         );
+        // A kind the owner-only class also lists stays readable by its
+        // author alone, and the warning says so.
+        let config =
+            crate::Config::parse_toml("[relay.auth]\nrestricted_read_kinds = [4, 30078]\n")
+                .unwrap();
+        assert_eq!(config.read_restrictor().class(30078), Owner);
+        assert!(
+            config.deprecations[0]
+                .contains("Kinds [30078] are also in relay.auth.owner_only_kinds"),
+            "{:?}",
+            config.deprecations
+        );
+        let config = crate::Config::parse_toml(
+            "[relay.auth]\nrestricted_read_kinds = [4, 78]\nrestrict_read_to_involved_pubkey = false\n",
+        )
+        .unwrap();
+        assert_eq!(config.read_restrictor().class(78), Owner);
+        assert!(
+            config.deprecations[0].contains("Kinds [78] are also"),
+            "{:?}",
+            config.deprecations
+        );
+        // Not when the file empties that class.
+        let config = crate::Config::parse_toml(
+            "[relay.auth]\nrestricted_read_kinds = [30078]\nowner_only_kinds = []\n",
+        )
+        .unwrap();
+        assert!(!config.deprecations[0].contains("owner_only_kinds"));
         // Both names at once are ambiguous.
         let both = "[relay.auth]\nrestricted_read_kinds = [4]\nrecipient_only_kinds = [4]\n";
         assert!(crate::Config::parse_toml(both)

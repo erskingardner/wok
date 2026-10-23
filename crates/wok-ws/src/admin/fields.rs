@@ -38,6 +38,8 @@ pub(super) struct Input {
     pub zero_off: bool,
     /// Set in the file only, so the page shows it without an input.
     pub file_only: bool,
+    /// The NIP-11 `limitation` fields that advertise it, when they do.
+    pub nip11: &'static [&'static str],
 }
 
 impl Input {
@@ -49,6 +51,7 @@ impl Input {
             unit,
             zero_off: false,
             file_only: false,
+            nip11: &[],
         }
     }
 
@@ -64,6 +67,10 @@ impl Input {
             file_only: true,
             ..self
         }
+    }
+
+    const fn nip11(self, nip11: &'static [&'static str]) -> Self {
+        Self { nip11, ..self }
     }
 }
 
@@ -198,14 +205,14 @@ pub(super) const SECTIONS: &[Section] = &[
                 "The largest WebSocket message, which must hold the largest event and its envelope. Takes effect on restart.",
                 "Events and REQs that fit their own limits are cut off by the connection.",
                 "Each connection can hold a message that large in memory while it arrives.",
-                &[Input::new("file", "max_websocket_payload_size", "relay.max_websocket_payload_size", Unit::Bytes).file_only()],
+                &[Input::new("file", "max_websocket_payload_size", "relay.max_websocket_payload_size", Unit::Bytes).file_only().nip11(&["max_message_length"])],
             ),
             field(
                 "Tags per event",
                 "The most tags one event may carry.",
                 "Heavy users can't save their follow or mute lists.",
                 "Every single-letter tag is an index entry, so one event can add thousands of writes.",
-                &[Input::new("events", "max_num_tags", "events.max_num_tags", Unit::Count)],
+                &[Input::new("events", "max_num_tags", "events.max_num_tags", Unit::Count).nip11(&["max_event_tags"])],
             ),
             field(
                 "Longest tag value",
@@ -219,14 +226,14 @@ pub(super) const SECTIONS: &[Section] = &[
                 "Refuse regular events older than this. Profiles, lists, deletions and vanish requests are always accepted, whatever it is set to.",
                 "Old posts can't be rebroadcast, and history can't be imported.",
                 "Nothing meaningful: old events sort below new ones.",
-                &[Input::new("events", "reject_older_than_secs", "events.reject_older_than_secs", Unit::Seconds).off()],
+                &[Input::new("events", "reject_older_than_secs", "events.reject_older_than_secs", Unit::Seconds).off().nip11(&["created_at_lower_limit"])],
             ),
             field(
                 "Future clock tolerance",
                 "Refuse events dated further than this ahead of the relay's clock.",
                 "Users whose clocks run fast can't post.",
                 "Future-dated posts stay pinned at the top of feeds.",
-                &[Input::new("events", "reject_newer_than_secs", "events.reject_newer_than_secs", Unit::Seconds)],
+                &[Input::new("events", "reject_newer_than_secs", "events.reject_newer_than_secs", Unit::Seconds).nip11(&["created_at_upper_limit"])],
             ),
             field(
                 "Oldest ephemeral event",
@@ -254,7 +261,7 @@ pub(super) const SECTIONS: &[Section] = &[
                 "The NIP-13 difficulty, in leading zero bits of the event id, every event must meet.",
                 "More spam gets through.",
                 "Most clients can't post: few mine proof of work, and Marmot clients never do.",
-                &[Input::new("abuse", "min_pow_difficulty", "relay.abuse.min_pow_difficulty", Unit::Count).off()],
+                &[Input::new("abuse", "min_pow_difficulty", "relay.abuse.min_pow_difficulty", Unit::Count).off().nip11(&["min_pow_difficulty"])],
             ),
             field(
                 "Vanish requests (NIP-62)",
@@ -303,35 +310,35 @@ pub(super) const SECTIONS: &[Section] = &[
                 "Open REQs on one connection, counting those still sending history. It also bounds the queries waiting for the concurrency cap.",
                 "Apps that keep many subscriptions open have some refused.",
                 "More live-matching memory per connection.",
-                &[Input::new("limits", "max_subs_per_connection", "relay.max_subs_per_connection", Unit::Count)],
+                &[Input::new("limits", "max_subs_per_connection", "relay.max_subs_per_connection", Unit::Count).nip11(&["max_subscriptions"])],
             ),
             field(
                 "Events per filter",
                 "The most events one filter returns, and the limit of a filter without one.",
                 "Results are silently cut, and clients make extra round trips.",
                 "More output per request. The outbound queue still bounds memory.",
-                &[Input::new("limits", "max_filter_limit", "relay.max_filter_limit", Unit::Count)],
+                &[Input::new("limits", "max_filter_limit", "relay.max_filter_limit", Unit::Count).nip11(&["max_limit", "default_limit"])],
             ),
             field(
                 "Events per request",
                 "The most stored events one REQ returns over all its filters.",
                 "Batched requests are silently truncated.",
                 "One request can queue many megabytes for a slow client, who is then disconnected.",
-                &[Input::new("limits", "max_total_events_per_req", "relay.max_total_events_per_req", Unit::Count).off()],
+                &[Input::new("limits", "max_total_events_per_req", "relay.max_total_events_per_req", Unit::Count).off().nip11(&["max_total_events_per_req"])],
             ),
             field(
                 "Tag letters per filter",
                 "The most distinct tag letters, # and &, one filter may use.",
                 "Comment, community and marketplace queries are refused.",
                 "Small extra checks on each candidate event.",
-                &[Input::new("limits", "max_tags_per_filter", "relay.max_tags_per_filter", Unit::Count)],
+                &[Input::new("limits", "max_tags_per_filter", "relay.max_tags_per_filter", Unit::Count).nip11(&["max_tags_per_filter"])],
             ),
             field(
                 "AND values per filter (NIP-91)",
                 "The most values all of a filter's & keys may list. Zero turns NIP-91 off.",
                 "NIP-91 queries that require several tags are refused.",
                 "Each value is checked on every candidate event.",
-                &[Input::new("limits", "max_and_entries", "relay.max_and_entries", Unit::Count)],
+                &[Input::new("limits", "max_and_entries", "relay.max_and_entries", Unit::Count).nip11(&["max_and_entries"])],
             ),
             field(
                 "Events counted per COUNT",
@@ -345,14 +352,14 @@ pub(super) const SECTIONS: &[Section] = &[
                 "The most index work a REQ, COUNT or NEG-OPEN may need, estimated before its scan. Requests over it are refused with blocked:.",
                 "Normal batched and outbox queries are refused.",
                 "One request can tie up a query worker for longer.",
-                &[Input::new("abuse", "max_query_work", "relay.abuse.max_query_work", Unit::Count).off()],
+                &[Input::new("abuse", "max_query_work", "relay.abuse.max_query_work", Unit::Count).off().nip11(&["max_query_work"])],
             ),
             field(
                 "Concurrent historical queries",
                 "Scans one connection runs at once; more wait their turn. Zero runs none.",
                 "Busy clients see slow first results.",
                 "One connection takes more than its share of the query workers.",
-                &[Input::new("abuse", "max_concurrent_historical_queries", "relay.abuse.max_concurrent_historical_queries", Unit::Count)],
+                &[Input::new("abuse", "max_concurrent_historical_queries", "relay.abuse.max_concurrent_historical_queries", Unit::Count).nip11(&["max_concurrent_historical_queries"])],
             ),
             field(
                 "Require scoped filters",

@@ -38,8 +38,7 @@ impl Preset {
         match self {
             Preset::Public => {
                 "A general public relay that any client can read from and write to: feeds, \
-                 outbox lookups, DMs and gift-wrap inboxes. Its values are Wok's built-in \
-                 defaults."
+                 threads and outbox lookups. Its values are Wok's built-in defaults."
             }
             Preset::Marmot => {
                 "A relay dedicated to Marmot group messaging, such as one a Marmot app ships \

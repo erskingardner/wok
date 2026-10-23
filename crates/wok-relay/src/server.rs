@@ -1415,6 +1415,13 @@ fn run_metrics_history(
         if observability.history_enabled && observability.history_max_points > 0 {
             metrics.record_history();
         }
+        // The dashboard's refusal counts cover the last day whatever the
+        // history keeps.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        metrics.refusals.mark(now);
         let seconds = observability.history_interval_secs.max(1);
         if !sleep_unless_shutdown(&shutdown, Duration::from_secs(seconds)) {
             return;

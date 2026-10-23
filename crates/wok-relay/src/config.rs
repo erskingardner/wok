@@ -781,9 +781,10 @@ impl Config {
             return Some(format!(
                 "relay.real_ip_header = {header:?} is trusted as each client's address by \
                  every per-address budget. Set it only when every connection comes from a \
-                 proxy that overwrites the header: a client that reaches the relay directly \
-                 could send a new address with each connection to escape those budgets, or \
-                 send another client's address to spend that client's budgets"
+                 proxy that writes the client's address as the header's last entry: a client \
+                 that reaches the relay directly could send a new address with each \
+                 connection to escape those budgets, or send another client's address to \
+                 spend that client's budgets"
             ));
         }
         let local_only = |ip: IpAddr| match ip {
@@ -801,7 +802,7 @@ impl Config {
              relay.real_ip_header is unset. If a reverse proxy forwards connections, every \
              client has the proxy's address and they all share one set of per-address \
              budgets (connections, EVENT and AUTH, REQ, COUNT); set relay.real_ip_header to \
-             the header the proxy overwrites with the client's address",
+             the header in which the proxy passes the client's address",
             addrs.join(", ")
         ))
     }

@@ -19,10 +19,10 @@ preset = "public"
 # bind = "127.0.0.1"
 # port = 7777
 
-# The header in which the proxy passes the client's address. Set it only if
-# every connection comes from a proxy that overwrites the header: a client
-# that reaches the relay directly could send a new address each time and
-# escape every per-address rate limit.
+# The header in which the proxy passes the client's address. Wok reads its
+# last entry, which the proxy writes. Set it only if every connection comes
+# through that proxy: a client that reaches the relay directly could send a
+# new address each time and escape every per-address rate limit.
 # real_ip_header = "x-real-ip"
 
 [relay.auth]

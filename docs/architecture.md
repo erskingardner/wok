@@ -152,9 +152,16 @@ a REQ reusing an open id is charged only for the difference.
    yet, since it may AUTH before EOSE.
 3. **History, on the req worker.** The worker scans up to the snapshot, then
    posts `HistoryDone{generation, snapshot, hints}` to the monitor and moves
-   on. It never waits for a reply. A REQ or COUNT it cannot start (a read failure,
-   `relay.abuse.max_concurrent_historical_queries`) or whose scan fails gets
-   CLOSED through the gate.
+   on. It never waits for a reply. A REQ or COUNT it cannot start (a read
+   failure, or a full queue, below) or whose scan fails gets CLOSED through
+   the gate.
+   - A connection runs at most `relay.abuse.max_concurrent_historical_queries`
+     scans at once. Past that, a REQ or COUNT waits in the connection's
+     queue, in arrival order, and starts at the back of the run queue when
+     one of its running scans ends. The queue holds at most
+     `relay.max_subs_per_connection`. A CLOSE, a replacing REQ or a
+     disconnect removes a waiting query as it would a running one. The
+     negentropy worker queues NEG-OPEN scans the same way.
    - Each pass, the worker takes what is queued for it, up to 64 messages,
      and applies it in order under one read transaction. Cancels, AUTH and
      disconnects take no query time. Each new REQ or COUNT gets its first

@@ -8,7 +8,7 @@
 | `e2e_transports.rs` | WebSocket + Unix end-to-end |
 | `query_cost.rs` | Query-cost gate at the default ceiling: client filters served, fan-outs refused as REQ, COUNT and NEG-OPEN |
 | `rate_keying.rs` | What each rate budget is keyed on: per-connection budgets under an address backstop, the AUTH multiplier, NEG-MSG's own bucket, IPv6 networks, and throwaway-key events charged to the AUTHed identity |
-| `req_lifecycle.rs` | Live-before-history REQs: no loss, exactly once, replacement, cap, COUNT ids |
+| `req_lifecycle.rs` | Live-before-history REQs: no loss, exactly once, replacement, cap, COUNT ids, scans queued over the concurrency cap |
 | `eose_latency.rs` | Ignored benchmark: REQ→EOSE latency under monitor fan-out |
 | `ws_deflate.rs` | permessage-deflate negotiation/frames |
 | `ws_timeouts.rs` | Handshake/frame-read/pong liveness timeouts |

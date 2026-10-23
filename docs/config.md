@@ -232,7 +232,7 @@ interface or protect the path at the reverse proxy.
 | `relay.real_ip_header` | empty | Live | No | Trusted proxy header containing the client IP; leave empty for direct peers. **The header is fully trusted for every per-address budget** (connection, EVENT, REQ, COUNT): if the proxy passes the client-supplied value through instead of overwriting it, any client can rotate fake IPs to defeat rate limits and burn other IPs' budgets. A startup warning is logged whenever this is set. Left empty behind a proxy, every client has the proxy's address and shares its budgets, so a startup warning is also logged when it is empty and the relay listens only on loopback or private addresses. |
 | `relay.max_websocket_payload_size` | `2097152` | Restart | Maximum reassembled WebSocket payload bytes. |
 | `relay.max_req_filter_size` | `262144` | Live | Yes | Maximum combined compact-JSON bytes across all filters in one REQ or COUNT. See [Filter size](#filter-size). |
-| `relay.max_filter_bytes_per_connection` | `2097152` | Live | Yes | Maximum combined compact-JSON filter bytes of the REQ subscriptions open on one connection; zero is unlimited. See [Filter size](#filter-size). |
+| `relay.max_filter_bytes_per_connection` | `2097152` | Live | Yes | Maximum combined compact-JSON filter bytes of the REQ subscriptions open on one connection, and separately of its COUNTs not yet answered; zero is unlimited. See [Filter size](#filter-size). |
 | `relay.max_filters_per_req` | `200` | Live | Yes | Unconditional maximum filter objects in one REQ or COUNT. |
 | `relay.auto_ping_seconds` | `55` | Restart | WebSocket ping interval; zero disables automatic pings. A ping unanswered for a full interval closes the connection. |
 | `relay.enable_tcp_keepalive` | `false` | Restart | Enable TCP keepalive on accepted sockets. |
@@ -300,7 +300,9 @@ Two settings bound the filters a client sends, both in compact JSON bytes.
 `max_req_filter_size` bounds the filters of one REQ or COUNT.
 `max_filter_bytes_per_connection` bounds the filters of every REQ
 subscription open on one connection, because live filters stay in memory
-until they are closed.
+until they are closed. It bounds the COUNTs a connection is waiting on the
+same way, separately, since one can wait for a scan slot (see
+`max_concurrent_historical_queries`).
 
 - **Filters per request** (`max_req_filter_size`, 256 KiB).
   - If too low: outbox clients can't fetch a large follow list in one
@@ -320,7 +322,7 @@ A REQ that would take the connection over its budget is refused with
 Closing a subscription frees its bytes. A REQ that reuses an open
 subscription ID is charged only for the difference, so after a reload lowers
 the budget, a subscription can still be replaced by filters no larger than
-its own. COUNT holds no live filter and is not charged.
+its own. A COUNT is charged to the COUNT budget until it is answered.
 
 One filter also stops at 65,535 decoded bytes per value list, whatever these
 settings are: at most 2,047 `authors`, `ids`, `#e` or `#p` values. 256 KiB
@@ -454,7 +456,7 @@ the per-connection and per-address budgets combine.
 | `relay.abuse.count_burst` | `50` | Per-address COUNT bucket capacity. |
 | `relay.abuse.invalid_rate_per_second` | `5` | Refilled tokens per network address each second for malformed messages, including CLOSE and NEG-CLOSE with an invalid subscription id. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until the bucket refills. Valid CLOSE and NEG-CLOSE are never budgeted. |
 | `relay.abuse.invalid_burst` | `20` | Per-address malformed-message bucket capacity. |
-| `relay.abuse.max_concurrent_historical_queries` | `8` | Historical scans per connection; zero rejects new scans. |
+| `relay.abuse.max_concurrent_historical_queries` | `8` | Historical scans one connection runs at once. A REQ, COUNT or NEG-OPEN over it waits, in arrival order, for one of them to end. At most `relay.max_subs_per_connection` wait; past that a REQ or COUNT is refused with `CLOSED rate-limited: too many historical queries waiting on this connection`. Zero rejects new scans. |
 | `relay.abuse.max_query_work` | `20000` | Most index entries a REQ, COUNT or NEG-OPEN may touch, estimated before the scan; zero is unlimited. See [Query work](#query-work). |
 | `relay.abuse.max_stored_events` | `0` | Global durable event ceiling; the entire write transaction aborts before exceeding it. Zero, the public preset's value, is unlimited. See [Storage](#storage). |
 | `relay.abuse.max_stored_events_per_pubkey` | `1000000` | Hard author storage quota; zero is unlimited. See [Storage](#storage). |

@@ -569,6 +569,125 @@ async fn a_req_over_the_subscription_cap_is_closed_without_eose() {
     client.recv_until(|c| c.has("EOSE", "s200")).await;
 }
 
+/// A burst of REQs and COUNTs over `max_concurrent_historical_queries` waits
+/// for the connection's running scans instead of being refused (#97 F2). A
+/// queued REQ that is closed never answers, and one that is replaced answers
+/// once, with its new filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_over_the_concurrency_cap_is_queued_not_refused() {
+    let relay = Relay::new(true, |cfg| {
+        cfg.relay.abuse.max_concurrent_historical_queries = 2;
+        // Yield often so the scans overlap.
+        cfg.relay.query_timeslice_budget_us = 100;
+    });
+    let mut client = relay.client().await;
+    let history = |limit: usize| json!({"kinds": [1], "#t": ["hist"], "limit": limit});
+    for i in 0..10 {
+        client
+            .send(json!(["REQ", format!("q{i}"), history(2_000)]))
+            .await;
+    }
+    for i in 0..3 {
+        client
+            .send(json!(["COUNT", format!("c{i}"), {"kinds": [1], "#t": ["hist"]}]))
+            .await;
+    }
+    client.send(json!(["CLOSE", "q8"])).await;
+    client.send(json!(["REQ", "q9", history(3)])).await;
+    client
+        .recv_until(|c| {
+            (0..8).all(|i| c.has("EOSE", &format!("q{i}")))
+                && c.has("EOSE", "q9")
+                && (0..3).all(|i| c.has("COUNT", &format!("c{i}")))
+        })
+        .await;
+    client.settle(Duration::from_millis(300)).await;
+    let closed: Vec<&Value> = client.frames.iter().filter(|f| f[0] == "CLOSED").collect();
+    assert!(closed.is_empty(), "{closed:?}");
+    for i in 0..8 {
+        assert_eq!(client.delivered(&format!("q{i}")).len(), 2_000, "q{i}");
+    }
+    assert_eq!(client.delivered("q9").len(), 3);
+    assert_eq!(client.replies("EOSE", "q9"), 1);
+    assert!(client.delivered("q8").is_empty());
+    assert!(!client.has("EOSE", "q8"));
+    for i in 0..3 {
+        let sub_id = format!("c{i}");
+        let count = client
+            .frames
+            .iter()
+            .find(|f| is(f, "COUNT", &sub_id))
+            .unwrap();
+        assert_eq!(count[2]["count"], HISTORY, "{count}");
+    }
+}
+
+/// A COUNT holds its filters until it is answered, which may wait for a scan
+/// slot, so a connection's unanswered COUNTs have a filter budget, apart from
+/// its REQs'.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unanswered_counts_are_charged_to_the_filter_budget() {
+    let filter = json!({"kinds": [1], "#t": ["hist"]});
+    let budget = 2 * filter.to_string().len();
+    let relay = Relay::new(true, |cfg| {
+        cfg.relay.abuse.max_concurrent_historical_queries = 1;
+        cfg.relay.query_timeslice_budget_us = 100;
+        cfg.relay.max_filter_bytes_per_connection = budget;
+    });
+    let mut client = relay.client().await;
+    for i in 0..3 {
+        client.send(json!(["COUNT", format!("c{i}"), filter])).await;
+    }
+    let answered = |c: &Client, sub_id: &str| c.has("COUNT", sub_id) || c.has("CLOSED", sub_id);
+    client
+        .recv_until(|c| (0..3).all(|i| answered(c, &format!("c{i}"))))
+        .await;
+    assert!(client.has("COUNT", "c0") && client.has("COUNT", "c1"));
+    let refused = client
+        .frames
+        .iter()
+        .find(|f| is(f, "CLOSED", "c2"))
+        .unwrap();
+    assert_eq!(
+        refused[2],
+        format!("blocked: this connection's filters exceed {budget} bytes")
+    );
+    // Answered COUNTs hold nothing.
+    client.send(json!(["COUNT", "c2", filter])).await;
+    client.recv_until(|c| c.has("COUNT", "c2")).await;
+}
+
+/// NEG-OPENs over the cap wait too: a Marmot client syncs every group at
+/// startup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_sessions_over_the_concurrency_cap_are_queued_not_refused() {
+    let relay = Relay::new(true, |cfg| {
+        cfg.relay.abuse.max_concurrent_historical_queries = 2;
+        cfg.relay.query_timeslice_budget_us = 100;
+    });
+    let mut client = relay.client().await;
+    let mut store = wok_negentropy::Vector::new();
+    store.seal().unwrap();
+    let initial = hex::encode(
+        wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap(),
+    );
+    for i in 0..6 {
+        client
+            .send(json!(["NEG-OPEN", format!("n{i}"), {"kinds": [1], "#t": ["hist"]}, initial]))
+            .await;
+    }
+    client
+        .recv_until(|c| {
+            (0..6).all(|i| c.has("NEG-MSG", &format!("n{i}")) || c.has("NEG-ERR", &format!("n{i}")))
+        })
+        .await;
+    let errors: Vec<&Value> = client.frames.iter().filter(|f| f[0] == "NEG-ERR").collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
 /// With a tiny live buffer, stored matches are re-read from the database and
 /// still arrive exactly once; ephemeral ones are either delivered or counted
 /// as dropped.

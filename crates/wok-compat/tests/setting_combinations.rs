@@ -53,7 +53,8 @@ const SETTINGS: &[(&str, &str)] = &[
     ),
     (
         "notes recipient-only",
-        "relay.auth.recipient_only_kinds = [1, 4, 1059]",
+        // The default list plus notes: the list replaces the default.
+        "relay.auth.recipient_only_kinds = [1, 4, 1059, 21059]",
     ),
     (
         "notes authenticated-only",

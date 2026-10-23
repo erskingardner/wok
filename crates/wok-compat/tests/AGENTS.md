@@ -21,6 +21,8 @@
 | `attack_surface.rs` | HTTP paths and message gates per profile, client verbs, and profiles vs `docs/attack-surface.md` |
 | `profiles/` | Configuration profiles the attack-surface tests start relays from |
 | `golden_transcripts.rs`, `transcripts/` | One fixed client script per profile, its answers saved; rewrite with `WOK_BLESS_TRANSCRIPTS=1` and review the diff |
+| `setting_combinations.rs` | Each security setting, alone and in pairs over `public`, sent the transcript script: no setting serves what another refuses, and each changes some answer |
+| `support/transcript.rs` | The golden transcript script and its normalized transcript |
 | `support/surface.rs` | Profiles, a relay serving one, and raw HTTP and WebSocket clients for the attack-surface tests |
 | `proxied_client_address.rs` | A client behind a proxy is the last `relay.real_ip_header` address, so `blockip` holds; an unparsed last entry falls back and is counted |
 | `error_routing.rs` | CLOSED/NOTICE/OK error paths |

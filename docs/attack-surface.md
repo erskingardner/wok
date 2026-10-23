@@ -25,7 +25,8 @@ questions:
 - **Setting combinations.** Can another setting make this gate fail open or
   be ignored, without an error at load or a warning? Refuse such a
   combination when the configuration loads, or warn about it there and in
-  `wok doctor`.
+  `wok doctor`, and add the setting to the
+  [combinations test](#setting-combinations).
 
 ## Who can reach Wok
 
@@ -223,6 +224,32 @@ pull request: lines that change should be the requests the change is meant to
 refuse differently, and nothing in the `default` or `public` transcripts
 should change unless that is the point of the change.
 
+## Setting combinations
+
+`wok-compat` `tests/setting_combinations.rs` turns on each security setting
+in its `SETTINGS` list over the `public` profile, alone and with each other
+setting of a different key, and sends every combination the
+[golden transcript](#golden-transcripts) script. An answer refuses its step
+when it is an `OK` that is false, a `CLOSED`, `NEG-ERR` or `NOTICE`, or an HTTP
+status of 400 or more. The test fails when:
+
+- a step that one setting refuses, and the `public` profile serves, is served
+  when another setting is on as well, unless `OPENS` lists the pair with the
+  reason that is intended;
+- a setting changes none of the script's answers, unless `UNPROBED` gives the
+  reason the script cannot see it, so a setting that stops doing anything is
+  noticed.
+
+A combination Wok refuses to load or start is printed and does not fail:
+refusing it is the safe outcome. Add a setting to `SETTINGS` when it
+restricts or opens an entry point.
+
+`OPENS` holds two pairs. `relay.abuse.enabled = false` turns
+`relay.abuse.min_pow_difficulty` off with the other abuse limits, as
+[config.md](config.md) says. Without AUTH, gift wraps are refused only
+because they are recipient-only, so emptying
+`relay.auth.recipient_only_kinds` serves them.
+
 ## Keeping this page current
 
 | Test | Fails when |
@@ -234,3 +261,4 @@ should change unless that is the point of the change.
 | `wok-ws` `nip86` tests | A NIP-86 method is missing from the [nip86.md](nip86.md#supported-methods) table, or its level there differs from the code's. |
 | `wok-cli` tests | A `wok` command has no row in [Commands](#commands), or a row names a command that does not exist. |
 | `wok-compat` `tests/golden_transcripts.rs` | A profile's relay answers the script differently from its file in `tests/transcripts/`, or a transcript has no profile. |
+| `wok-compat` `tests/setting_combinations.rs` | With two settings on, a request one of them refuses on its own is served, and `OPENS` does not list the pair; or a setting changes none of the script's answers and is not in `UNPROBED`. |

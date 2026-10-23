@@ -192,7 +192,7 @@ pub(super) fn run_writer(
                                 (
                                     is_event_vanished_ro(&txn, packed_view)?,
                                     moderation_reason_ro(&txn, packed_view)?,
-                                    grant.stored_admits(&txn, &cfg_snap)?,
+                                    grant.stored_admits(&txn, &cfg_snap, packed_view.kind())?,
                                 )
                             })
                         });

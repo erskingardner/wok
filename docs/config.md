@@ -406,9 +406,11 @@ A member is a pubkey that is not banned and is NIP-86 allowlisted
 - **`read_policy`** applies to every REQ, COUNT and NEG-OPEN. One the policy
   does not admit is refused with `auth-required:` and a challenge while
   authenticating could help, and with `restricted:` once the connection has
-  authenticated as no member, or while AUTH is unusable. Under `members`,
-  removing a member stops what its open subscriptions still deliver, and
-  ends its sync sessions; a REQ whose stored events are being sent finishes.
+  authenticated as no member, or while AUTH is unusable. A connection the
+  policy stops admitting, such as a member removed, or one that has not
+  authenticated after a reload to `authenticated`, gets nothing more on its
+  open subscriptions, and its sync sessions end with `closed: visibility
+  changed`; a REQ whose stored events are being sent finishes.
 - **`write_policy = "authenticated"`** accepts an event only on an
   authenticated connection, signed by any key.
 - **`write_policy = "members"`** accepts an event when one of these is a
@@ -427,8 +429,11 @@ A refused EVENT gets `auth-required:` and a challenge while the connection
 has not authenticated, else `restricted: this relay accepts events only from
 members` (or `authenticated users`). Bans and the kind policy apply under
 every policy, and NIP-62 vanish requests are accepted under all of them. The
-writer checks the member again against the moderation state it commits
-under, so an event whose member was removed in the meantime is refused.
+writer checks the event again against the policy, the member against the
+moderation state it commits under, and an inbox recipient's kind against
+`inbox_kinds`, all as they are when it stores the event, so an event whose
+member was removed, or whose policy a reload tightened, in the meantime is
+refused.
 
 ### Read keys from 0.7 and earlier
 

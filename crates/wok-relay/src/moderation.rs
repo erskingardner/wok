@@ -122,6 +122,9 @@ pub fn stored_is_member(
 pub struct WriteGrant {
     pub authenticated: bool,
     pub member: Option<[u8; 32]>,
+    /// The member is the recipient of one of `inbox_kinds`, which must
+    /// still list the event's kind.
+    pub inbox: bool,
 }
 
 impl WriteGrant {
@@ -137,24 +140,23 @@ impl WriteGrant {
         identities: &[[u8; 32]],
     ) -> Self {
         let auth = &cfg.relay.auth;
-        let member = (auth.write_policy == AccessPolicy::Members)
-            .then(|| {
-                let author: [u8; 32] = event.pubkey().try_into().ok()?;
-                let recipient = auth
-                    .inbox_kinds
-                    .contains(&event.kind())
-                    .then(|| first_p_tag(event))
-                    .flatten();
-                std::iter::once(author)
-                    .chain(identities.iter().copied())
-                    .chain(recipient)
-                    .find(|pubkey| is_member(cfg, snap, pubkey))
-            })
-            .flatten();
-        Self {
+        let mut grant = Self {
             authenticated: !identities.is_empty(),
-            member,
+            ..Self::default()
+        };
+        if auth.write_policy != AccessPolicy::Members {
+            return grant;
         }
+        let author: Option<[u8; 32]> = event.pubkey().try_into().ok();
+        grant.member = author
+            .into_iter()
+            .chain(identities.iter().copied())
+            .find(|pubkey| is_member(cfg, snap, pubkey));
+        if grant.member.is_none() && auth.inbox_kinds.contains(&event.kind()) {
+            grant.member = first_p_tag(event).filter(|pubkey| is_member(cfg, snap, pubkey));
+            grant.inbox = grant.member.is_some();
+        }
+        grant
     }
 
     /// Whether `relay.auth.write_policy` admits the event, by the
@@ -167,15 +169,19 @@ impl WriteGrant {
         }
     }
 
-    /// [`admits`](Self::admits) by committed moderation state: the member
-    /// must still be one.
+    /// [`admits`](Self::admits) for an event of `kind` by committed
+    /// moderation state and the writer's configuration: the member must
+    /// still be one, and an inbox recipient's kind still an inbox kind.
     pub fn stored_admits(
         &self,
         txn: &wok_db::RoTxn<'_>,
         cfg: &Config,
+        kind: u64,
     ) -> Result<bool, wok_db::DbError> {
         match (cfg.relay.auth.write_policy, self.member) {
-            (AccessPolicy::Members, Some(member)) => stored_is_member(txn, cfg, &member),
+            (AccessPolicy::Members, Some(member)) => Ok((!self.inbox
+                || cfg.relay.auth.inbox_kinds.contains(&kind))
+                && stored_is_member(txn, cfg, &member)?),
             _ => Ok(self.admits(cfg)),
         }
     }
@@ -314,23 +320,27 @@ mod tests {
         // Members: the author, an AUTHed identity (C7), or an inbox kind's
         // first recipient.
         cfg.relay.auth.write_policy = AccessPolicy::Members;
-        for (author, kind, recipient, identities, admitted_by) in [
-            (member, 1, outsider, vec![], Some(member)),
+        // (author, kind, first p tag, AUTHed identities, admitting member,
+        // whether it was admitted as an inbox recipient)
+        for (author, kind, recipient, identities, admitted_by, inbox) in [
+            (member, 1, outsider, vec![], Some(member), false),
             (
                 throwaway,
                 445,
                 outsider,
                 vec![outsider, member],
                 Some(member),
+                false,
             ),
-            (throwaway, 1059, member, vec![], Some(member)),
-            (throwaway, 21059, member, vec![outsider], Some(member)),
-            (throwaway, 4, member, vec![], None),
-            (throwaway, 445, outsider, vec![outsider], None),
-            (throwaway, 445, outsider, vec![], None),
+            (throwaway, 1059, member, vec![], Some(member), true),
+            (throwaway, 21059, member, vec![outsider], Some(member), true),
+            (throwaway, 4, member, vec![], None, false),
+            (throwaway, 445, outsider, vec![outsider], None, false),
+            (throwaway, 445, outsider, vec![], None, false),
         ] {
             let grant = grant(&author, kind, &recipient, &identities, &cfg);
             assert_eq!(grant.member, admitted_by, "kind {kind} {identities:?}");
+            assert_eq!(grant.inbox, inbox, "kind {kind} {identities:?}");
             assert_eq!(grant.admits(&cfg), admitted_by.is_some());
         }
         let anonymous = grant(&throwaway, 445, &outsider, &[], &cfg);
@@ -416,9 +426,10 @@ mod tests {
         let grant = WriteGrant {
             authenticated: true,
             member: Some(alice),
+            inbox: false,
         };
-        assert!(!grant.stored_admits(&txn, &cfg).unwrap());
+        assert!(!grant.stored_admits(&txn, &cfg, 1).unwrap());
         cfg.relay.auth.write_policy = AccessPolicy::Open;
-        assert!(grant.stored_admits(&txn, &cfg).unwrap());
+        assert!(grant.stored_admits(&txn, &cfg, 1).unwrap());
     }
 }

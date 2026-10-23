@@ -455,3 +455,58 @@ async fn authenticated_policies_need_auth_as_anyone() {
         [message]
     );
 }
+
+/// An empty client's first negentropy message.
+fn neg_init() -> String {
+    let mut store = wok_negentropy::Vector::new();
+    store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+    hex::encode(client.initiate().unwrap())
+}
+
+/// Open a sync of the group's messages and return its first reply.
+async fn neg_open(client: &mut Client) -> Value {
+    let filter = json!({"kinds": [445], "#h": [GROUP]});
+    client
+        .send(json!(["NEG-OPEN", "sync", filter, neg_init()]))
+        .await;
+    client.reply("sync", &["NEG-MSG", "NEG-ERR"]).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tightening_the_read_policy_closes_open_syncs() {
+    let relay = Relay::with_auth("");
+    let admin = key();
+    relay.handle.config.write().admin.pubkeys = vec![hex(&admin)];
+    let mut publisher = relay.connect().await;
+    assert_eq!(publisher.refusal(&group_message(GROUP)).await, None);
+    let closed = json!([
+        "NEG-ERR",
+        "sync",
+        "closed: visibility changed; reopen synchronization"
+    ]);
+
+    // A reload to members ends the anonymous sync, and it may not reopen.
+    let mut anonymous = relay.reader(None).await;
+    assert_eq!(neg_open(&mut anonymous).await[0], "NEG-MSG");
+    relay.handle.config.write().relay.auth.read_policy = wok_relay::AccessPolicy::Members;
+    assert_eq!(anonymous.reply("sync", &["NEG-ERR"]).await, closed);
+    assert_eq!(
+        neg_open(&mut anonymous).await,
+        json!([
+            "NEG-ERR",
+            "sync",
+            "auth-required: this relay serves only members"
+        ])
+    );
+
+    // An admin is a member by configuration, which a reload can end too.
+    let mut admin_conn = relay.reader(Some(&admin)).await;
+    assert_eq!(neg_open(&mut admin_conn).await[0], "NEG-MSG");
+    relay.handle.config.write().admin.pubkeys.clear();
+    assert_eq!(admin_conn.reply("sync", &["NEG-ERR"]).await, closed);
+    assert_eq!(
+        neg_open(&mut admin_conn).await[2],
+        "restricted: this relay serves only members"
+    );
+}

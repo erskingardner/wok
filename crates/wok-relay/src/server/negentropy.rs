@@ -123,6 +123,16 @@ fn public_tree_allowed(
     Ok(true)
 }
 
+/// Who `relay.auth.read_policy` admits, as far as configuration decides it:
+/// the policy, and under `members` the admin pubkeys, which are members
+/// without a moderation record. A session opened under other access is
+/// closed, so its connection is admitted again by its next NEG-OPEN.
+fn read_access(cfg: &Config) -> (AccessPolicy, Option<Vec<String>>) {
+    let policy = cfg.relay.auth.read_policy;
+    let admins = (policy == AccessPolicy::Members).then(|| cfg.admin.pubkeys.clone());
+    (policy, admins)
+}
+
 pub(super) fn run_negentropy(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -141,6 +151,7 @@ pub(super) fn run_negentropy(
     let mut sessions: HashMap<(u64, String), Session> = HashMap::new();
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut policy = read_visibility(&initial_cfg, vec![]);
+    let mut access = read_access(&initial_cfg);
     let mut generation = None;
     loop {
         let msg = if queries.has_running() {
@@ -166,8 +177,12 @@ pub(super) fn run_negentropy(
             .unwrap_or_default()
             .as_secs();
         let next_policy = read_visibility(&cfg, vec![]);
+        let next_access = read_access(&cfg);
         let current_generation = wok_db::state::policy_generation(&txn).ok();
+        // A moderation commit bumps the generation, which also covers
+        // membership by allowlist and role.
         let changed = next_policy != policy
+            || next_access != access
             || current_generation != generation
             || current_generation.is_none()
             || !cfg.relay.negentropy_enabled;
@@ -194,6 +209,7 @@ pub(super) fn run_negentropy(
             }
         });
         policy = next_policy;
+        access = next_access;
         generation = current_generation;
         queries.set_max_subs_per_connection(cfg.relay.abuse.max_concurrent_historical_queries);
         // A NEG-OPEN over the concurrency cap waits, as a REQ does (#97 F2).

@@ -101,8 +101,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A member is a pubkey that is not banned and is allowlisted, holds a role or
   is in `admin.pubkeys`. A REQ, COUNT, NEG-OPEN or EVENT the policy refuses
   gets `auth-required:` and a challenge while authenticating could help, and
-  `restricted:` otherwise. Under `read_policy = "members"`, removing a member
-  stops its live subscriptions' deliveries. A reload that changes either
+  `restricted:` otherwise. A connection the read policy stops admitting,
+  such as a removed member, or an anonymous one after a reload to
+  `authenticated`, gets nothing more on its subscriptions, and its sync
+  sessions close. A reload that changes either
   policy is logged as a warning naming the old and new policy, and `wok
   doctor`'s `relay-auth` check, like the startup warning, now also names a
   policy that needs AUTH while AUTH is unavailable. See `docs/config.md`,

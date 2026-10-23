@@ -3017,12 +3017,19 @@ fn refuse_req(
 }
 
 /// Whether `relay.auth.read_policy` admits a connection authenticated as
-/// `identities`.
-fn reader_admitted(cfg: &Config, snap: &ModerationSnapshot, identities: &[[u8; 32]]) -> bool {
+/// `identities`. Only the `members` policy reads the moderation snapshot.
+fn reader_admitted(
+    cfg: &Config,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
+    identities: &[[u8; 32]],
+) -> bool {
     match cfg.relay.auth.read_policy {
         AccessPolicy::Open => true,
         AccessPolicy::Authenticated => !identities.is_empty(),
-        AccessPolicy::Members => identities.iter().any(|pk| is_member(cfg, snap, pk)),
+        AccessPolicy::Members => {
+            let snap = moderation.read();
+            identities.iter().any(|pk| is_member(cfg, &snap, pk))
+        }
     }
 }
 
@@ -3040,7 +3047,7 @@ fn admit_reader(
     let identities = auth
         .get(&conn_id)
         .map_or(&[][..], |session| session.identities.as_slice());
-    if reader_admitted(cfg, &moderation.read(), identities) {
+    if reader_admitted(cfg, moderation, identities) {
         return Ok(());
     }
     let authenticated = !identities.is_empty();
@@ -4044,12 +4051,11 @@ fn run_req_monitor(
         let identities = |authed: &HashMap<u64, Vec<[u8; 32]>>, conn_id: u64| {
             authed.get(&conn_id).cloned().unwrap_or_default()
         };
-        // A member removed since its REQ was admitted reads no more of it.
-        // Membership is only looked up under `read_policy = "members"`.
-        let members_only = cfg_snap.relay.auth.read_policy == AccessPolicy::Members;
-        let still_admitted = |identities: &[[u8; 32]]| {
-            !members_only || reader_admitted(&cfg_snap, &moderation.read(), identities)
-        };
+        // A connection the read policy no longer admits, such as a member
+        // removed or an anonymous one after a reload to `authenticated`,
+        // reads no more of the subscriptions it was admitted to.
+        let still_admitted =
+            |identities: &[[u8; 32]]| reader_admitted(&cfg_snap, &moderation, identities);
         for msg in control.drain(..) {
             match msg {
                 MonitorMsg::Register(mut sub) => {
@@ -4491,6 +4497,7 @@ mod tests {
                 grant: WriteGrant {
                     authenticated: false,
                     member: Some(author),
+                    inbox: false,
                 },
             })
             .unwrap();
@@ -4529,6 +4536,90 @@ mod tests {
             };
             assert!(response.contains(refusal), "{response}");
             assert_eq!(txn.entries(env.dbis().event).unwrap(), 0);
+        }
+    }
+
+    /// A gift wrap admitted because its recipient is a member is refused
+    /// when a reload drops its kind from `inbox_kinds` before the writer
+    /// takes it: the grant records that it depends on that list.
+    #[test]
+    fn queued_inbox_writes_follow_the_writers_inbox_kinds() {
+        for inbox_kinds in [vec![1059], vec![]] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.auth.write_policy = crate::config::AccessPolicy::Members;
+            config.relay.auth.inbox_kinds = inbox_kinds.clone();
+            let config = Arc::new(parking_lot::RwLock::new(config));
+            let conns = Arc::new(ConnTable::new());
+            let (recipient, wrapper) = ([7u8; 32], [8u8; 32]);
+            let mut txn = env.begin_rw().unwrap();
+            wok_db::allow_pubkey(&mut txn, &recipient, "").unwrap();
+            txn.commit().unwrap();
+            let moderation = Arc::new(parking_lot::RwLock::new(
+                env.begin_ro()
+                    .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                    .unwrap(),
+            ));
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+
+            let id = [9u8; 32];
+            let mut tags = PackedEventTagBuilder::default();
+            tags.add('p', &recipient).unwrap();
+            let packed = PackedEventBuilder::build(&id, &wrapper, 1, 1059, 0, &tags).unwrap();
+            let json = json!({
+                "id": to_hex(&id),
+                "pubkey": to_hex(&wrapper),
+                "created_at": 1,
+                "kind": 1059,
+                "tags": [["p", to_hex(&recipient)]],
+                "content": "",
+                "sig": "00".repeat(64),
+            })
+            .to_string();
+            let (writer_tx, writer_rx) = bounded(4);
+            // Granted while 1059 was an inbox kind.
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: None,
+                    grant: WriteGrant {
+                        authenticated: false,
+                        member: Some(recipient),
+                        inbox: true,
+                    },
+                })
+                .unwrap();
+            drop(writer_tx);
+            run_writer(
+                env.clone(),
+                config,
+                conns,
+                Arc::new(Metrics::default()),
+                writer_rx,
+                Vec::new(),
+                moderation,
+                TAG_KIND_STEP,
+            );
+
+            let response = out_rx.try_recv().unwrap().into_text();
+            let stored = env.begin_ro().unwrap().entries(env.dbis().event).unwrap();
+            if inbox_kinds.is_empty() {
+                assert!(
+                    response.contains("accepts events only from members"),
+                    "{response}"
+                );
+                assert_eq!(stored, 0);
+            } else {
+                assert!(response.contains("true"), "{response}");
+                assert_eq!(stored, 1);
+            }
         }
     }
 
@@ -6725,6 +6816,36 @@ mod tests {
         h.store("restricted while held");
         h.cfg.write().relay.auth.recipient_only_kinds = vec![1, 20001];
         assert_eq!(h.history_done(2, 0), [eose_frame()]);
+    }
+
+    /// A reload to an authenticated read policy stops what an anonymous
+    /// connection's subscriptions deliver, held while its history was sent
+    /// and live, until it authenticates.
+    #[test]
+    fn monitor_stops_deliveries_a_tightened_read_policy_refuses() {
+        let mut h = MonitorHarness::start(0);
+        // The observer stays admitted.
+        h.send(MonitorMsg::SetAuth {
+            conn_id: 2,
+            authed: [9; 32],
+        });
+        h.register(1, json!({"kinds": [1, 20001]}), 0);
+        h.ephemeral("held");
+        h.store("held");
+        h.cfg.write().relay.auth.read_policy = crate::config::AccessPolicy::Authenticated;
+        assert_eq!(h.history_done(1, 0), [eose_frame()]);
+        h.ephemeral("live");
+        h.store("live");
+        h.sync();
+        assert_eq!(h.frames(), []);
+
+        h.send(MonitorMsg::SetAuth {
+            conn_id: 1,
+            authed: [7; 32],
+        });
+        let (_, after) = h.store("after AUTH");
+        h.sync();
+        assert_eq!(h.frames(), [event_frame(&after)]);
     }
 
     /// A pending subscription holds matches its connection may not read yet,

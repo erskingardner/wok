@@ -174,6 +174,11 @@ pub async fn dispatch(
         .get(hyper::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    // Refused before the body is read: without the header nothing can
+    // authorize the request.
+    if !has_nostr_authorization(authorization.as_deref()) {
+        return unauthorized("missing Nostr authorization");
+    }
     let body = match read_body(req.into_body(), MAX_ADMIN_BODY).await {
         Ok(body) => body,
         Err(error) => return response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
@@ -187,7 +192,7 @@ pub async fn dispatch(
         &state,
         &AuthzPolicy {
             url_ok: &|signed| signed == absolute_url,
-            require_config_admin: true,
+            signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
             require_payload: false,
         },
     ) {
@@ -214,6 +219,11 @@ pub async fn dispatch(
     resp
 }
 
+/// Whether `authorization` is a `Nostr` authorization at all.
+pub(crate) fn has_nostr_authorization(authorization: Option<&str>) -> bool {
+    authorization.is_some_and(|value| value.starts_with("Nostr "))
+}
+
 pub(crate) async fn read_body(mut body: Incoming, maximum: usize) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
@@ -232,9 +242,10 @@ pub(crate) async fn read_body(mut body: Incoming, maximum: usize) -> Result<Vec<
 pub(crate) struct AuthzPolicy<'a> {
     /// Whether the signed `u` tag names the endpoint being protected.
     pub url_ok: &'a (dyn Fn(&str) -> bool + 'a),
-    /// Restrict signers to `admin.pubkeys` (NIP-86 instead admits
-    /// role-holding pubkeys and checks levels itself).
-    pub require_config_admin: bool,
+    /// Whether the signer the event names may use the endpoint at all:
+    /// listed in `admin.pubkeys` for the dashboard, holding a management
+    /// level for NIP-86. Checked before the signature is verified.
+    pub signer_ok: &'a (dyn Fn(&str) -> bool + 'a),
     /// Demand the `payload` tag even for an empty body (pinned NIP-86).
     pub require_payload: bool,
 }
@@ -266,6 +277,18 @@ impl std::fmt::Debug for ReplayReservation<'_> {
 
 /// Verify a NIP-98 authorization event against the caller's policy and
 /// reserve its ID against replay.
+/// The reply to an authorization whose signer may not use the endpoint, and
+/// to one whose signature does not verify. It is one message for both, so a
+/// forged event cannot ask whether a key is an admin or a manager; the
+/// debug log records which.
+pub(crate) const REFUSED_SIGNER: &str =
+    "NIP-98 authorization is not from a key allowed here, or its signature is invalid";
+
+/// Check a request's NIP-98 authorization and claim its event in the replay
+/// cache. Everything the event states is checked before its signature is
+/// verified: the kind, content, time window and tags, then whether its
+/// signer may use the endpoint. A request that could never be authorized
+/// costs no verification.
 pub(crate) fn authorize<'a>(
     authorization: Option<&str>,
     method: &Method,
@@ -280,18 +303,11 @@ pub(crate) fn authorize<'a>(
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|_| "invalid Nostr authorization encoding".to_string())?;
-    let event: serde_json::Value = serde_json::from_slice(&decoded)
-        .map_err(|_| "invalid Nostr authorization JSON".to_string())?;
-    let parsed = wok_event::parse_and_verify_event(
-        &event,
-        &wok_event::EventLimits::default(),
-        None,
-        true,
-        false,
-    )
-    .map_err(|error| format!("invalid Nostr authorization event: {error}"))?;
-    let packed = parsed.packed.view();
-    if packed.kind() != 27235 {
+    let event = std::str::from_utf8(&decoded)
+        .ok()
+        .and_then(|text| wok_event::json::parse_strict(text).ok())
+        .ok_or_else(|| "invalid Nostr authorization JSON".to_string())?;
+    if event.get("kind").and_then(serde_json::Value::as_u64) != Some(27235) {
         return Err("NIP-98 authorization must be kind 27235".into());
     }
     if event.get("content").and_then(serde_json::Value::as_str) != Some("") {
@@ -301,7 +317,8 @@ pub(crate) fn authorize<'a>(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if packed.created_at().abs_diff(now) > cfg.admin.auth_window_secs {
+    let created_at = event.get("created_at").and_then(serde_json::Value::as_u64);
+    if created_at.is_none_or(|created_at| created_at.abs_diff(now) > cfg.admin.auth_window_secs) {
         return Err("NIP-98 authorization is outside the accepted time window".into());
     }
     if !(policy.url_ok)(single_tag(&event, "u")?) {
@@ -316,10 +333,24 @@ pub(crate) fn authorize<'a>(
             return Err("NIP-98 payload tag does not match the request body".into());
         }
     }
-    let pubkey = hex::encode(packed.pubkey());
-    if policy.require_config_admin && !cfg.admin.pubkeys.iter().any(|allowed| allowed == &pubkey) {
-        return Err("NIP-98 signer is not an administrator".into());
+    let claimed = event.get("pubkey").and_then(serde_json::Value::as_str);
+    if !claimed.is_some_and(|signer| (policy.signer_ok)(signer)) {
+        tracing::debug!(signer = ?claimed, "refused NIP-98 authorization: signer not allowed");
+        return Err(REFUSED_SIGNER.into());
     }
+    let parsed = wok_event::parse_and_verify_event(
+        &event,
+        &wok_event::EventLimits::default(),
+        None,
+        true,
+        false,
+    )
+    .map_err(|error| {
+        tracing::debug!(%error, "refused NIP-98 authorization: event does not verify");
+        REFUSED_SIGNER.to_string()
+    })?;
+    let packed = parsed.packed.view();
+    let pubkey = hex::encode(packed.pubkey());
     let mut id = [0u8; 32];
     id.copy_from_slice(packed.id());
     let mut used = state.used_auth.lock();
@@ -1140,7 +1171,7 @@ mod tests {
         let header = signed_auth(&key, "https://relay.example/admin/api/config", "PUT", body);
         let policy = AuthzPolicy {
             url_ok: &|signed| signed == "https://relay.example/admin/api/config",
-            require_config_admin: true,
+            signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
             require_payload: false,
         };
         let auth = || authorize(Some(&header), &Method::PUT, body, &cfg, &state, &policy);
@@ -1170,7 +1201,7 @@ mod tests {
             &AdminState::default(),
             &AuthzPolicy {
                 url_ok: &|signed| signed == "https://relay.example/admin/api/config",
-                require_config_admin: true,
+                signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
                 require_payload: false,
             },
         )
@@ -1186,7 +1217,7 @@ mod tests {
             &AdminState::default(),
             &AuthzPolicy {
                 url_ok: &|signed| signed == "https://relay.example/admin/api/overview",
-                require_config_admin: true,
+                signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
                 require_payload: false,
             },
         )
@@ -1208,12 +1239,66 @@ mod tests {
             &AdminState::default(),
             &AuthzPolicy {
                 url_ok: &|signed| signed == "https://relay.example/admin/api/overview",
-                require_config_admin: true,
+                signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
                 require_payload: false,
             },
         )
         .unwrap_err()
-        .contains("not an administrator"));
+        .contains(REFUSED_SIGNER));
+    }
+
+    /// `header` with its event's signature broken.
+    fn forged(header: &str) -> String {
+        let encoded = header.strip_prefix("Nostr ").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let mut event: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        let sig = event["sig"].as_str().unwrap().to_string();
+        let flipped = if sig.starts_with('0') { "1" } else { "0" };
+        event["sig"] = json!(format!("{flipped}{}", &sig[1..]));
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(event.to_string())
+        )
+    }
+
+    #[test]
+    fn nip98_refuses_a_forged_event_alike_whoever_it_names() {
+        let mut rng = rand::thread_rng();
+        let admin = Keypair::new(SECP256K1, &mut rng);
+        let stranger = Keypair::new(SECP256K1, &mut rng);
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        cfg.admin.pubkeys = vec![hex::encode(admin.x_only_public_key().0.serialize())];
+        let url = "https://relay.example/admin/api/overview";
+        let policy = AuthzPolicy {
+            url_ok: &|signed| signed == url,
+            signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
+            require_payload: false,
+        };
+        let refusal = |header: &str| {
+            authorize(
+                Some(header),
+                &Method::GET,
+                b"",
+                &cfg,
+                &AdminState::default(),
+                &policy,
+            )
+            .unwrap_err()
+        };
+        // A stranger is refused before its signature is checked, and a
+        // forged event naming the admin is refused by it, with one message,
+        // so the reply cannot tell anyone which keys are admins.
+        let stranger_signed = signed_auth(&stranger, url, "GET", b"");
+        assert_eq!(refusal(&stranger_signed), REFUSED_SIGNER);
+        assert_eq!(refusal(&forged(&stranger_signed)), REFUSED_SIGNER);
+        assert_eq!(
+            refusal(&forged(&signed_auth(&admin, url, "GET", b""))),
+            REFUSED_SIGNER
+        );
     }
 
     #[test]
@@ -1250,7 +1335,7 @@ mod tests {
                 &state,
                 &AuthzPolicy {
                     url_ok: &|signed| signed == url,
-                    require_config_admin: true,
+                    signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
                     require_payload: false,
                 },
             )
@@ -1271,7 +1356,7 @@ mod tests {
         let url = "https://relay.example/";
         let policy = AuthzPolicy {
             url_ok: &|signed| signed == url,
-            require_config_admin: false,
+            signer_ok: &|_| true,
             require_payload: true,
         };
 

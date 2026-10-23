@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Requests are refused by the cheapest check that can refuse them, before
+  their filters are parsed or their signature is verified, where that
+  reveals nothing:
+  - **AUTH** checks its kind, the connection's challenge and the relay tag
+    before verifying the signature (#148).
+  - **REQ, COUNT and NEG-OPEN** meet `relay.auth.read_policy` before their
+    filters are sized, parsed or priced and, for NEG-OPEN, before the payload
+    is decoded (#149).
+  - **EVENT** is refused for its kind, by `relay.auth.accepted_kinds`, the
+    NIP-86 kind policy or as an AUTH event, before it is verified (#150). The
+    author ban and `write_policy` still wait for the signature, so an
+    unsigned event cannot ask whether a key is a member or banned.
+  - **The dashboard API and NIP-86** refuse a request without a `Nostr`
+    authorization before reading its body, check the event's kind, content,
+    time window and tags, then whether its signer may use the endpoint, and
+    only then verify the signature (#147). A signer that may not and a bad
+    signature get the same 401, "NIP-98 authorization is not from a key
+    allowed here, or its signature is invalid", so a forged event cannot ask
+    which keys are admins or managers; the debug log records which. The
+    authorization event is parsed by Wok's strict JSON parser.
+
+  Some refused requests therefore get a different reason than before, such
+  as `challenge string mismatch` instead of `invalid: bad signature` for an
+  AUTH that is wrong both ways.
 - Prometheus metrics are off by default (#151). `/metrics` was served on the
   relay listener in every configuration, with `Access-Control-Allow-Origin: *`,
   so anyone who could reach the relay, and any web page, could read its

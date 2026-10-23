@@ -114,6 +114,11 @@ pub async fn dispatch(
         .get(hyper::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    // Refused before the body is read: without the header nothing can
+    // authorize the request.
+    if !admin::has_nostr_authorization(authorization.as_deref()) {
+        return admin::unauthorized("missing Nostr authorization");
+    }
     let body = match admin::read_body(req.into_body(), MAX_RPC_BODY).await {
         Ok(body) => body,
         Err(error) => return admin::response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
@@ -154,7 +159,7 @@ fn authorize_manager<'a>(
     body: &[u8],
     cfg: &Config,
     state: &'a AdminState,
-    level_of: impl FnOnce(&[u8; 32]) -> ManagementLevel,
+    level_of: impl Fn(&[u8; 32]) -> ManagementLevel,
 ) -> Result<(String, ManagementLevel, admin::ReplayReservation<'a>), String> {
     let (signer_hex, replay) = admin::authorize(
         authorization,
@@ -164,7 +169,11 @@ fn authorize_manager<'a>(
         state,
         &admin::AuthzPolicy {
             url_ok: &|signed| relay_url_matches(&cfg.admin.public_url, signed),
-            require_config_admin: false,
+            // A signer with no management level is refused before its
+            // signature is verified, and never claims a replay slot.
+            signer_ok: &|signer| {
+                parse_hex32(signer).is_ok_and(|signer| level_of(&signer) != ManagementLevel::None)
+            },
             // Pinned NIP-86 makes the NIP-98 payload tag unconditional.
             require_payload: true,
         },
@@ -531,8 +540,9 @@ mod tests {
 
         for nonce in 0..=admin::MAX_REPLAY_IDS {
             let header = signed_rpc_auth(&stranger, url, body, nonce);
+            // Refused before its signature is checked or a slot claimed.
             let error = authorize_manager(Some(&header), body, &cfg, &state, level_of).unwrap_err();
-            assert!(error.contains("no management role"), "{error}");
+            assert_eq!(error, admin::REFUSED_SIGNER);
         }
         let header = signed_rpc_auth(&admin_key, url, body, 0);
         let (_, level, _) = authorize_manager(Some(&header), body, &cfg, &state, level_of).unwrap();

@@ -40,7 +40,7 @@
 < ["CLOSED","wraps","auth-required: this relay serves only members"]
 
 ## REQ a filter that does not parse
-< ["CLOSED","bad","invalid: bad req: kinds not an array"]
+< ["CLOSED","bad","auth-required: this relay serves only members"]
 
 ## REQ every note
 < ["CLOSED","all","auth-required: this relay serves only members"]
@@ -55,7 +55,7 @@
 (no reply)
 
 ## NEG-OPEN with a payload that is not hex
-< ["NEG-ERR","neg-bad","invalid: hex decode: Invalid character 'z' at position 0"]
+< ["NEG-ERR","neg-bad","auth-required: this relay serves only members"]
 
 ## NEG-MSG for no session
 < ["NEG-ERR","neg-none","closed: unknown subscription handle"]
@@ -76,7 +76,7 @@
 < ["OK","<h9>",false,"invalid: bad signature"]
 
 ## AUTH with the wrong challenge and a forged signature
-< ["OK","<h8>",false,"invalid: bad signature"]
+< ["OK","<h8>",false,"error: challenge string mismatch"]
 
 ## AUTH as the author
 < ["OK","<h9>",true,"successfully authenticated"]
@@ -107,11 +107,11 @@
 
 ## HTTP GET /admin/api/overview signed by a stranger
 < 401 text/plain; charset=utf-8
-< NIP-98 signer is not an administrator
+< NIP-98 authorization is not from a key allowed here, or its signature is invalid
 
 ## HTTP GET /admin/api/overview with a forged signature
 < 401 text/plain; charset=utf-8
-< invalid Nostr authorization event: bad signature
+< NIP-98 authorization is not from a key allowed here, or its signature is invalid
 
 ## HTTP NIP-86 unsigned
 < 401 text/plain; charset=utf-8
@@ -119,8 +119,8 @@
 
 ## HTTP NIP-86 signed by a stranger
 < 401 text/plain; charset=utf-8
-< NIP-98 signer has no management role on this relay
+< NIP-98 authorization is not from a key allowed here, or its signature is invalid
 
 ## HTTP NIP-86 with a forged signature
 < 401 text/plain; charset=utf-8
-< invalid Nostr authorization event: bad signature
+< NIP-98 authorization is not from a key allowed here, or its signature is invalid

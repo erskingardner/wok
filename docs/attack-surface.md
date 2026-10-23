@@ -58,8 +58,10 @@ Every request on the listener passes these steps before Wok looks at its path:
    per-address connection budget (`relay.abuse.connection_*`) is spent.
 
 Wok does not check the method on the public paths: every method gets the same
-answer, except `OPTIONS`, which gets the CORS preflight (204). Any other path
-gets 404, and so does a WebSocket upgrade on any path but `/`.
+answer, except `OPTIONS`, which gets the CORS preflight (204), and a `POST` to
+`/` with `Content-Type: application/nostr+json+rpc`, which goes to the
+[management API](#management-api). Any other path gets 404, and so does a
+WebSocket upgrade on any path but `/`.
 
 | Path | Party | Gate | What runs |
 | --- | --- | --- | --- |

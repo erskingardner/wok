@@ -96,8 +96,9 @@ keeps it. Set only what the relay needs and leave the rest to the preset.
   translation, so the relay behaves as before. Each is warned about at
   startup and on reload, and in `wok doctor`'s `config-deprecations` check.
   `wok config minimize` and dashboard saves rewrite them as their
-  translation. The [filter validation](#filter-validation) switch is one.
-  The other, `relay.abuse.max_query_cost`, is ignored instead: its values
+  translation. The [filter validation](#filter-validation) switch and the
+  [read keys](#read-keys-from-07-and-earlier) are. The other,
+  `relay.abuse.max_query_cost`, is ignored instead: its values
   mean something else in the units of
   [`max_query_work`](#query-work), which replaced it.
 
@@ -338,27 +339,75 @@ control boundary.
 |---|---:|---|
 | `relay.auth.enabled` | `true` | Enable NIP-42 authentication. |
 | `relay.auth.service_url` | empty | Public relay URL placed in and checked against AUTH challenges. |
-| `relay.auth.restricted_read_kinds` | `[4, 1059, 21059]` | Kinds hidden from unauthenticated historical and live reads. |
-| `relay.auth.restrict_read_to_involved_pubkey` | `true` | Restrict authenticated reads to the author or first `p`-tag recipient. |
+| `relay.auth.recipient_only_kinds` | `[4, 1059, 21059]` | Kinds only the author and the event's first `p`-tag recipient may read: DMs and gift wraps, including NIP-59's ephemeral 21059. |
+| `relay.auth.owner_only_kinds` | `[78, 30078]` | Kinds only the author may read, and only a connection authenticated as the author may publish: NIP-78 app data. |
+| `relay.auth.authenticated_kinds` | `[]` | Kinds any authenticated connection may read, whichever pubkey it authenticated as. |
 | `relay.auth.restrict_writes` | `false` | Only NIP-86 allowlisted or role-holding pubkeys (and operator admins) may write. NIP-62 vanish requests are exempt. See [nip86.md](nip86.md). |
 
 While AUTH is usable (`enabled` with a `service_url`), every connection
 receives its NIP-42 challenge as soon as it opens.
 
-Private reads fail closed until `service_url` is configured. While AUTH is
-unusable, those reads are refused with `restricted:` and no AUTH challenge, so
-NIP-42 clients do not attempt an AUTH that cannot succeed; with
-`enabled = false` the relay refuses AUTH outright. Clearing
-`restricted_read_kinds` restores unrestricted history, but Wok stops
-advertising NIP-59, which needs both gift-wrap kinds (1059 and the live-only
-ephemeral 21059) restricted.
+### Read classes
 
-Keep `restrict_read_to_involved_pubkey` at `true` unless you understand the
-interplay: with `false`, the per-event delivery filter is skipped entirely
-and the REQ-level auth gate only fires for filter groups where **every**
-filter is restricted. A mixed REQ such as `[{"kinds":[1]},{"kinds":[1059]}]`
-then returns gift wraps to an unauthenticated client (strfry-compatible
-behavior).
+The three `*_kinds` lists are read classes. A kind in none of them can be
+read by anyone. The others are read only by:
+
+| Class | Who may read | For |
+|---|---|---|
+| `authenticated_kinds` | any connection that authenticated, as any pubkey | Data shared with every logged-in user |
+| `recipient_only_kinds` | the author and the first `p`-tag recipient | DMs (4) and gift wraps (1059, 21059) |
+| `owner_only_kinds` | the author | NIP-78 app data (78, 30078), which NIP-78 says is private to its user |
+
+A kind listed in more than one class gets the strictest. The classes apply to
+historical and live REQs, COUNT and negentropy sync alike, each event checked
+against the connection's authenticated pubkeys:
+- A REQ or NEG-OPEN whose every filter asks only for restricted kinds needs
+  AUTH first: it is refused with `auth-required:` and a challenge.
+- Any other REQ is served, and restricted events are left out of it until the
+  connection authenticates as a pubkey that may read them.
+- A COUNT that may count restricted kinds must be scoped to what the
+  connection may read: `authors` or `#p` naming only its pubkey for
+  recipient-only kinds, and `authors` alone for owner-only kinds.
+
+As NIP-78 recommends, the relay also accepts an event of an owner-only kind
+only on a connection authenticated as its author. Without AUTH the EVENT is
+refused with `auth-required:` and a challenge; once the connection has
+authenticated as another pubkey, with `restricted:`. A tool that copies
+events between relays without the authors' keys, such as `wok sync`, can
+therefore neither download nor upload them unless the relay it reads from or
+writes to sets `owner_only_kinds = []`.
+
+Private reads fail closed until `service_url` is configured. While AUTH is
+unusable, those reads, and events of owner-only kinds, are refused with
+`restricted:` and no AUTH challenge, so NIP-42 clients do not attempt an AUTH
+that cannot succeed; with `enabled = false` the relay refuses AUTH outright.
+Wok advertises NIP-59 only while both gift-wrap kinds are recipient-only, and
+NIP-78 only while both app-data kinds are owner-only.
+
+### Read keys from 0.7 and earlier
+
+Through 0.7, `relay.auth.restricted_read_kinds` listed the restricted kinds,
+and `restrict_read_to_involved_pubkey` chose how they were restricted. Both
+keys are deprecated. A file that sets them loads as follows, with a
+deprecation warning at startup, on reload and in `wok doctor`:
+- **`restricted_read_kinds`** becomes `recipient_only_kinds`, with the same
+  kinds and the same readers. A file that sets both keys is refused.
+- **`restrict_read_to_involved_pubkey = true`** is dropped: it was the
+  default, and recipient-only kinds always work that way.
+- **`restrict_read_to_involved_pubkey = false`** is no longer supported. It
+  skipped the per-event check, so a REQ that mixed in another kind, such as
+  `[{"kinds":[1]},{"kinds":[1059]}]`, returned the restricted kinds without
+  AUTH (strfry's behavior). Its kinds, from `restricted_read_kinds` or the
+  preset, become `authenticated_kinds`, which any authenticated connection
+  may read and no other can, and `recipient_only_kinds` becomes empty.
+
+`wok config minimize`, or a dashboard save, rewrites the file this way, and
+`wok migrate strfry` translates strfry's `relay.auth.restrictedReadKinds` and
+`restrictReadToInvolvedPubkey` the same way.
+
+Kinds 78 and 30078 were readable by anyone through 0.7. Apps that publish
+public data in them can no longer be read by other users; set
+`owner_only_kinds = []` to serve them as before.
 
 ## Relay information
 

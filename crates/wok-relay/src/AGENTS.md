@@ -12,7 +12,7 @@
 | `capabilities.rs` | NIP-11 capability catalog and `supported_nips` |
 | `moderation.rs` | NIP-86 commands, management levels, write-permission decisions |
 | `abuse.rs` | Per-IP / per-pubkey token buckets, query cost, PoW bits |
-| `restrict.rs` | Restricted-kind / involved-pubkey read policy |
+| `restrict.rs` | Read classes: who may read each kind (recipient-only, owner-only, authenticated) |
 | `plugin.rs` | Write-policy child process (JSONL stdin/stdout, timeout) |
 | `metrics.rs` | Counters + bounded in-process chart history |
 | `rlimit.rs` | `relay.nofiles` (`unsafe` isolated here) |

@@ -53,6 +53,8 @@ pub const CURR_DB_VERSION: u64 = WOK_DB_VERSION;
 pub const AUTH_KIND: u64 = 22242;
 pub const DELETION_KIND: u64 = 5;
 pub const GIFT_WRAP_KINDS: [u64; 2] = [1059, 21059];
+/// NIP-78 app data: a regular and an addressable kind.
+pub const APP_DATA_KINDS: [u64; 2] = [78, 30078];
 pub const REPOST_KINDS: [u64; 2] = [6, 16];
 pub const PROTECTED_TAG: char = '-';
 pub const AUTH_CHALLENGE_LEN: usize = 22;

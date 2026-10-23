@@ -325,6 +325,21 @@ regression test. Differential parity alone is not a reason to retain it.
   wrap older than 60 seconds. In `ttl` mode a wrap older than
   `ephemeral_lifetime_secs` reaches live subscribers, but the next purge
   removes it, so history does not serve it.
+- NIP-78: kinds 78 and 30078 are owner-only by default
+  (`relay.auth.owner_only_kinds`). They are served only to a connection
+  authenticated as their author, and accepted only from one: without AUTH an
+  EVENT gets `auth-required:` and a challenge, and on a connection
+  authenticated as another key, `restricted:`. NIP-78 says both SHOULD hold
+  for this private app data. The pinned strfry serves and accepts them like
+  any kind.
+- `relay.auth.restricted_read_kinds` and `restrict_read_to_involved_pubkey`
+  are replaced by read classes: `recipient_only_kinds` (author and first
+  `p`-tag recipient), `owner_only_kinds` and `authenticated_kinds`. strfry's
+  `restrictReadToInvolvedPubkey = false` skipped the per-event check, so a
+  REQ that mixed in an unrestricted kind returned the restricted kinds without
+  AUTH. Wok has no such mode: a file or strfry config that sets it gets its
+  kinds as `authenticated_kinds`, readable after AUTH as any key and never
+  without.
 - NIP-42: kind 22242 events reach no client. One sent as EVENT is refused
   with `invalid: AUTH events must be sent with AUTH`. `wok import` refuses
   one, as do `wok sync` and `wok router` downloads, in either ephemeral mode.

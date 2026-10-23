@@ -4,6 +4,7 @@
 //! catalog only contains NIPs for which the relay implements observable
 //! protocol or storage behavior.
 
+use crate::restrict::ReadClass;
 use crate::Config;
 use crate::EphemeralPersistence;
 
@@ -23,6 +24,7 @@ pub enum CapabilityCondition {
     NegentropyEnabled,
     Nip59Safe,
     Nip62Enabled,
+    Nip78Safe,
     Nip91Enabled,
     PowRequired,
 }
@@ -35,15 +37,25 @@ impl CapabilityCondition {
             Self::AuthConfigured => cfg.auth_usable(),
             Self::CountEnabled => cfg.relay.max_filter_limit_count > 0,
             Self::NegentropyEnabled => cfg.relay.negentropy_enabled,
+            // Recipients read their gift wraps, and nobody else does.
             Self::Nip59Safe => {
+                let reads = cfg.read_restrictor();
                 cfg.events.ephemeral_persistence == EphemeralPersistence::LiveOnly
                     && cfg.auth_usable()
                     && wok_event::GIFT_WRAP_KINDS
                         .iter()
-                        .all(|kind| cfg.relay.auth.restricted_read_kinds.contains(kind))
-                    && cfg.relay.auth.restrict_read_to_involved_pubkey
+                        .all(|&kind| reads.class(kind) == ReadClass::Recipient)
             }
             Self::Nip62Enabled => cfg.relay.nip62.enabled,
+            // NIP-78: app data is served only to, and accepted only from, a
+            // connection authenticated as its author.
+            Self::Nip78Safe => {
+                let reads = cfg.read_restrictor();
+                cfg.auth_usable()
+                    && wok_event::APP_DATA_KINDS
+                        .iter()
+                        .all(|&kind| reads.class(kind) == ReadClass::Owner)
+            }
             Self::Nip91Enabled => {
                 cfg.relay.max_tags_per_filter > 0 && cfg.relay.max_and_entries > 0
             }
@@ -120,6 +132,11 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
         enabled_when: CapabilityCondition::NegentropyEnabled,
     },
     RelayCapability {
+        nip: 78,
+        name: "Arbitrary custom app data",
+        enabled_when: CapabilityCondition::Nip78Safe,
+    },
+    RelayCapability {
         nip: 86,
         name: "Relay management API",
         enabled_when: CapabilityCondition::AdminEnabled,
@@ -171,13 +188,13 @@ mod tests {
         cfg.events.ephemeral_persistence = EphemeralPersistence::Ttl;
         assert_eq!(
             supported_nips(&cfg),
-            vec![1, 9, 11, 40, 42, 50, 62, 67, 70, 91]
+            vec![1, 9, 11, 40, 42, 50, 62, 67, 70, 78, 91]
         );
 
         cfg.relay.abuse.min_pow_difficulty = 20;
         assert_eq!(
             supported_nips(&cfg),
-            vec![1, 9, 11, 13, 40, 42, 50, 62, 67, 70, 91]
+            vec![1, 9, 11, 13, 40, 42, 50, 62, 67, 70, 78, 91]
         );
 
         cfg.relay.max_and_entries = 0;
@@ -201,20 +218,41 @@ mod tests {
         assert!(supported_nips(&cfg).contains(&59));
 
         for wrap in [1059, 21059] {
-            cfg.relay
-                .auth
-                .restricted_read_kinds
-                .retain(|kind| *kind != wrap);
+            let auth = &mut cfg.relay.auth;
+            auth.recipient_only_kinds.retain(|kind| *kind != wrap);
             assert!(!supported_nips(&cfg).contains(&59), "kind {wrap}");
-            cfg.relay.auth.restricted_read_kinds.push(wrap);
-            assert!(supported_nips(&cfg).contains(&59));
+            // Readable after any AUTH is not recipient-only.
+            cfg.relay.auth.authenticated_kinds.push(wrap);
+            assert!(!supported_nips(&cfg).contains(&59), "kind {wrap}");
+            // In both classes, the stricter recipient-only applies.
+            cfg.relay.auth.recipient_only_kinds.push(wrap);
+            assert!(supported_nips(&cfg).contains(&59), "kind {wrap}");
+            // Owner-only is stricter still, and hides wraps from recipients.
+            cfg.relay.auth.owner_only_kinds.push(wrap);
+            assert!(!supported_nips(&cfg).contains(&59), "kind {wrap}");
+            cfg.relay.auth.owner_only_kinds.retain(|kind| *kind != wrap);
+            cfg.relay.auth.authenticated_kinds.clear();
+            assert!(supported_nips(&cfg).contains(&59), "kind {wrap}");
         }
-
-        cfg.relay.auth.restrict_read_to_involved_pubkey = false;
-        assert!(!supported_nips(&cfg).contains(&59));
-        cfg.relay.auth.restrict_read_to_involved_pubkey = true;
 
         cfg.relay.auth.enabled = false;
         assert!(!supported_nips(&cfg).contains(&59));
+    }
+
+    #[test]
+    fn nip78_requires_owner_only_app_data_and_usable_auth() {
+        let mut cfg = Config::default();
+        assert!(!supported_nips(&cfg).contains(&78));
+        cfg.relay.auth.service_url = "wss://relay.example.com/".into();
+        assert!(supported_nips(&cfg).contains(&78));
+        for kind in wok_event::APP_DATA_KINDS {
+            cfg.relay.auth.owner_only_kinds.retain(|k| *k != kind);
+            cfg.relay.auth.recipient_only_kinds.push(kind);
+            assert!(!supported_nips(&cfg).contains(&78), "kind {kind}");
+            cfg.relay.auth.owner_only_kinds.push(kind);
+            assert!(supported_nips(&cfg).contains(&78), "kind {kind}");
+        }
+        cfg.relay.auth.enabled = false;
+        assert!(!supported_nips(&cfg).contains(&78));
     }
 }

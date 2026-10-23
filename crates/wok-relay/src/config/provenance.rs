@@ -68,10 +68,15 @@ pub(super) fn explain(text: &str, overlay_of: OverlayFn) -> Result<ConfigExplana
         .into_iter()
         .map(|(path, value)| {
             let origin = if leaf(&layers.file, &path).is_some() {
+                // A key a deprecated one was translated to is on that key's
+                // line.
                 Origin::File {
-                    line: document
-                        .as_ref()
-                        .and_then(|document| key_line(document, &path)),
+                    line: document.as_ref().and_then(|document| {
+                        key_line(document, &path).or_else(|| {
+                            let from = layers.legacy.source(&path)?;
+                            key_line(document, from)
+                        })
+                    }),
                 }
             } else if leaf(&layers.overlay, &path).is_some() {
                 Origin::Preset(layers.preset)

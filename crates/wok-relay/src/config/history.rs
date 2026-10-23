@@ -16,7 +16,7 @@ const PAST_DEFAULTS: &[(&str, &str, &str)] = &[
     ("relay.max_websocket_payload_size", "131072", "0.4.0"),
     ("relay.unix.max_frame_bytes", "131072", "0.4.0"),
     ("events.reject_older_than_secs", "94608000", "0.7.0"),
-    ("relay.auth.restricted_read_kinds", "[4, 1059]", "0.7.0"),
+    ("relay.auth.recipient_only_kinds", "[4, 1059]", "0.7.0"),
     ("relay.max_req_filter_size", "65536", "0.7.0"),
     ("events.max_num_tags", "2000", "0.7.0"),
     ("relay.max_filter_limit", "500", "0.7.0"),

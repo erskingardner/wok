@@ -665,27 +665,29 @@ impl Matcher {
 }
 
 /// Which restricted events a connection may read (mirrors
-/// `wok_query::visibility::ReadRestrictor`): the author or the first `p` tag.
+/// `wok_query::visibility::ReadRestrictor` on JSON events): by each kind's
+/// read class, any authenticated pubkey, the author or the first `p` tag, or
+/// the author alone.
 #[derive(Clone, Debug)]
-struct ReadPolicy {
-    restricted: HashSet<u64>,
-    involved_only: bool,
-}
+struct ReadPolicy(wok_relay::restrict::ReadRestrictor);
 
 impl ReadPolicy {
     fn visible(&self, event: &Value, identities: &[String]) -> bool {
-        let kind = event["kind"].as_u64().unwrap_or_default();
-        if !self.restricted.contains(&kind) || !self.involved_only {
-            return true;
-        }
+        use wok_relay::restrict::ReadClass;
+        let class = self.0.class(event["kind"].as_u64().unwrap_or_default());
         let author = event["pubkey"].as_str().unwrap_or_default();
         let recipient = event["tags"]
             .as_array()
             .and_then(|tags| tags.iter().find(|tag| tag[0] == "p"))
             .and_then(|tag| tag[1].as_str());
-        identities
-            .iter()
-            .any(|pk| pk == author || Some(pk.as_str()) == recipient)
+        match class {
+            ReadClass::Open => true,
+            ReadClass::Authenticated => !identities.is_empty(),
+            ReadClass::Recipient => identities
+                .iter()
+                .any(|pk| pk == author || Some(pk.as_str()) == recipient),
+            ReadClass::Owner => identities.iter().any(|pk| pk == author),
+        }
     }
 }
 
@@ -2898,8 +2900,16 @@ fn effective_limits(cfg: &wok_relay::Config) -> BTreeMap<String, String> {
         ),
         ("relay.auth.enabled", r.auth.enabled.to_string()),
         (
-            "relay.auth.restricted_read_kinds",
-            format!("{:?}", r.auth.restricted_read_kinds),
+            "relay.auth.recipient_only_kinds",
+            format!("{:?}", r.auth.recipient_only_kinds),
+        ),
+        (
+            "relay.auth.owner_only_kinds",
+            format!("{:?}", r.auth.owner_only_kinds),
+        ),
+        (
+            "relay.auth.authenticated_kinds",
+            format!("{:?}", r.auth.authenticated_kinds),
         ),
         (
             "relay.compression_enabled",
@@ -2947,16 +2957,7 @@ pub async fn run(input: RunInput<'_>) -> Result<(ClientsReport, Histogram<u64>)>
         nodelay,
         plan: Arc::new(plan),
         oracle: Oracle::new(corpus),
-        policy: ReadPolicy {
-            restricted: config
-                .relay
-                .auth
-                .restricted_read_kinds
-                .iter()
-                .copied()
-                .collect(),
-            involved_only: config.relay.auth.restrict_read_to_involved_pubkey,
-        },
+        policy: ReadPolicy(config.read_restrictor()),
         caps: Caps::from_config(config),
         published: Mutex::new(HashMap::new()),
         stats: Mutex::new(Stats::default()),
@@ -3284,10 +3285,10 @@ mod tests {
     }
 
     fn open_policy() -> ReadPolicy {
-        ReadPolicy {
-            restricted: [4, 1059].into_iter().collect(),
-            involved_only: true,
-        }
+        ReadPolicy(wok_relay::restrict::ReadRestrictor {
+            recipient_only: vec![4, 1059],
+            ..Default::default()
+        })
     }
 
     const NO_CAPS: Caps = Caps {

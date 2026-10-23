@@ -59,3 +59,7 @@
 #   count_burst = 50 (were 5 and 10): the per-address budgets are a backstop
 #   over all of an address's connections, so users behind one NAT no longer
 #   share a single client's budget.
+# - [relay.auth] owner_only_kinds = [78, 30078] (new): NIP-78 app data is
+#   served only to, and accepted only from, a connection authenticated as its
+#   author, as NIP-78 recommends. recipient_only_kinds = [4, 1059, 21059]
+#   replaces restricted_read_kinds, with the same kinds and readers.

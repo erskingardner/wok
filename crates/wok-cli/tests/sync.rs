@@ -132,7 +132,7 @@ fn sync(config: &Path, url: &str, args: &[&str]) -> Output {
 async fn import_sync_compare_and_delete_keep_trees_and_primary_events_equal() {
     let source = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
-    let src = config(source.path(), "[relay.auth]\nrestricted_read_kinds=[]\n");
+    let src = config(source.path(), "[relay.auth]\nrecipient_only_kinds=[]\n");
     let dst = config(target.path(), "");
     let events: Vec<_> = (0..125).map(|_| event(1)).collect();
     import(&src, &events); // No manual negentropy build: this was the missing-index bug.
@@ -247,7 +247,7 @@ async fn timestamp_rejections_and_negative_upload_acks_fail_the_command() {
     let target = tempfile::tempdir().unwrap();
     let src = config(
         source.path(),
-        "[relay.auth]\nrestricted_read_kinds=[]\nrestrict_writes=true\n",
+        "[relay.auth]\nrecipient_only_kinds=[]\nrestrict_writes=true\n",
     );
     let dst = config(target.path(), "[events]\nreject_older_than_secs=1\n");
     let old = sign(
@@ -289,9 +289,12 @@ async fn all_users_gift_wraps_transfer_then_require_the_correct_nip42_identity()
     let target = tempfile::tempdir().unwrap();
     let src = config(
         source.path(),
-        "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+        "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n",
     );
-    let dst=config(target.path(),"[relay.auth]\nenabled=true\nrestricted_read_kinds=[1059]\nrestrict_read_to_involved_pubkey=true\n");
+    let dst = config(
+        target.path(),
+        "[relay.auth]\nenabled=true\nrecipient_only_kinds=[1059]\n",
+    );
     let keys = [key(), key()];
     let events: Vec<_>=keys.iter().map(|k| sign(json!({"kind":1059,"created_at":now()-86400,"tags":[["p",hex::encode(k.x_only_public_key().0.serialize())]],"content":"encrypted gift wrap"}),&key())).collect();
     import(&src, &events);
@@ -720,7 +723,7 @@ fn stream_command_is_removed_from_the_cli() {
 async fn remote_empty_match_all_tree_is_an_error_instead_of_false_convergence() {
     let source = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
-    let src = config(source.path(), "[relay.auth]\nrestricted_read_kinds=[]\n");
+    let src = config(source.path(), "[relay.auth]\nrecipient_only_kinds=[]\n");
     let dst = config(target.path(), "");
     let event = event(1);
     import(&src, std::slice::from_ref(&event));
@@ -917,11 +920,11 @@ async fn sync_tree_and_vector_views_offer_only_current_replaceable_versions() {
         let target = tempfile::tempdir().unwrap();
         let src = config(
             source.path(),
-            "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+            "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n",
         );
         let dst = config(
             target.path(),
-            "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+            "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n",
         );
         let events = replacement::events(kind);
         drop(replacement::seed(&source.path().join("db"), &events, 5));
@@ -952,11 +955,11 @@ async fn superseded_transfers_are_reported_without_failing_sync() {
             let remote = tempfile::tempdir().unwrap();
             let lc = config(
                 local.path(),
-                "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+                "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n",
             );
             let rc = config(
                 remote.path(),
-                "[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n",
+                "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n",
             );
             let events = replacement::events(kind);
             let (le, re) = if direction == "up" {
@@ -994,7 +997,7 @@ async fn expired_ephemeral_events_are_reported_without_failing_sync() {
     // marker, until its purge, even after its NIP-40 expiration. Relays drop
     // expired events, so neither direction transfers it, and that is not a
     // failure.
-    let ttl = "[events]\nephemeral_persistence=\"ttl\"\n[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n";
+    let ttl = "[events]\nephemeral_persistence=\"ttl\"\n[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n";
     let expired = sign(
         json!({
             "kind": 20001,
@@ -1046,7 +1049,7 @@ async fn clean_replacement_databases_sync_above_the_memory_view_event_limit() {
     let local = tempfile::tempdir().unwrap();
     let remote = tempfile::tempdir().unwrap();
     let options =
-        "[relay]\nmax_sync_events=1\n[relay.auth]\nenabled=false\nrestricted_read_kinds=[]\n";
+        "[relay]\nmax_sync_events=1\n[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n";
     let lc = config(local.path(), options);
     let rc = config(remote.path(), options);
     let events: Vec<_> = [0, 3, 10000, 10002, 30443].into_iter().map(event).collect();

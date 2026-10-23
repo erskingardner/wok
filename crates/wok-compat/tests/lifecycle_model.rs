@@ -676,7 +676,7 @@ async fn in_flight_sync_revokes_on_auth_policy_deletion_ban_and_expiry() {
                     .write()
                     .relay
                     .auth
-                    .restricted_read_kinds
+                    .recipient_only_kinds
                     .push(1),
                 "ban" => fixture
                     .handle

@@ -15,7 +15,7 @@ plugin isolation guidance, and logging policy, see
   the path against the filesystem dev+inode captured before that rename;
   optional UID/GID allow-lists via peer credentials.
 - AUTH (NIP-42) requires `relay.auth.serviceUrl`. Protected events (NIP-70) are rejected without matching authenticated pubkey.
-- Restricted read kinds (default 4, 1059, 21059) are not delivered unless the subscriber is the author or first `p` tag. They fail closed until `relay.auth.service_url` makes NIP-42 usable; broad COUNT requests cannot reveal their population.
+- Read classes restrict who reads a kind: recipient-only kinds (default 4, 1059, 21059) go only to the author and first `p` tag, owner-only kinds (default 78, 30078) only to the author, and authenticated kinds to any authenticated connection. They fail closed until `relay.auth.service_url` makes NIP-42 usable; broad COUNT requests cannot reveal their population. Owner-only kinds are also accepted only from a connection authenticated as their author.
 - Write-policy plugins run as `sh -c` with a timeout; plugin failure rejects the event.
 - `wok reindex` requires the explicit `--confirm-relay-stopped` acknowledgement.
   Stop the relay and all DB utilities first; promotion retains the original

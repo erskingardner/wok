@@ -229,7 +229,10 @@ fn limit_zero_and_empty_lists() {
 
 fn restricted(identities: Vec<[u8; 32]>) -> ReadVisibility {
     ReadVisibility {
-        restrictor: ReadRestrictor::new(vec![4], true),
+        restrictor: ReadRestrictor {
+            recipient_only: vec![4],
+            ..ReadRestrictor::default()
+        },
         identities,
         ..ReadVisibility::default()
     }

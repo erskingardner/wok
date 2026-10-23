@@ -3,25 +3,19 @@
 //! inventory and from the source, so a new route or verb fails here before
 //! anyone documents it.
 
-use futures_util::{SinkExt, StreamExt};
-use secp256k1::{Keypair, SecretKey, SECP256K1};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_tungstenite::tungstenite::Message;
-use wok_db::{Env, EnvOptions};
+use std::path::Path;
 use wok_relay::protocol::ParseFailure;
 use wok_relay::{
     AccessPolicy, CapabilityCondition, ClientCommand, Config, Preset, RELAY_CAPABILITY_CATALOG,
 };
 
-const INVENTORY: &str = include_str!("../../../docs/attack-surface.md");
+#[path = "support/surface.rs"]
+mod surface;
+use surface::*;
 
-/// Methods tried on each path; one answer other than 404 makes it reachable.
-const METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
+const INVENTORY: &str = include_str!("../../../docs/attack-surface.md");
 
 /// Paths no route should answer, to catch a route that starts matching more
 /// than its own path.
@@ -90,13 +84,9 @@ fn check_profile(name: &str, cfg: &Config) {
             assert_eq!(cfg.relay.auth.write_policy, AccessPolicy::Members);
             assert!(cfg.admin.enabled);
             assert!(nips.contains(&86), "{nips:?}");
-            let mut secret = [0u8; 32];
-            secret[31] = 1;
-            let key =
-                Keypair::from_secret_key(SECP256K1, &SecretKey::from_byte_array(&secret).unwrap());
             assert_eq!(
                 cfg.admin.pubkeys,
-                [hex::encode(key.x_only_public_key().0.serialize())],
+                [hex::encode(key(1).x_only_public_key().0.serialize())],
                 "the gated admin must be the key of secret 1"
             );
         }
@@ -303,7 +293,7 @@ async fn client_message_gates_match_the_inventory() {
         let mut wire = Wire::connect(relay.addr).await;
         for (verb, gate) in &gated {
             let open = message_gate_open(&cfg, gate);
-            let reply = wire.probe(verb, &cfg).await;
+            let reply = probe(&mut wire, verb, &cfg).await;
             let text = serde_json::to_string(&reply).unwrap();
             let refused = gate_refusals(verb)
                 .iter()
@@ -349,143 +339,77 @@ fn gate_refusals(verb: &str) -> &'static [&'static str] {
     }
 }
 
-/// An id no stored event has: a scoped filter that matches nothing.
-const UNKNOWN_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// A WebSocket client that keeps every frame it reads.
-struct Wire {
-    ws: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    seen: Vec<Value>,
-}
-
-impl Wire {
-    async fn connect(addr: SocketAddr) -> Self {
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
-            .await
-            .unwrap();
-        Self {
-            ws,
-            seen: Vec::new(),
-        }
-    }
-
-    async fn send(&mut self, message: Value) {
-        self.ws
-            .send(Message::Text(message.to_string().into()))
-            .await
-            .unwrap();
-    }
-
-    /// Read frames until one matches `answers`, keeping each.
-    async fn until(&mut self, what: &str, answers: impl Fn(&Value) -> bool) -> Value {
-        loop {
-            let message = tokio::time::timeout(Duration::from_secs(5), self.ws.next())
-                .await
-                .unwrap_or_else(|_| panic!("no {what} within 5 s"))
-                .expect("the relay closed the connection")
-                .unwrap();
-            let Ok(frame) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) else {
-                continue;
+/// Send a valid message for `verb` and return the frames that answer it.
+async fn probe(wire: &mut Wire, verb: &str, cfg: &Config) -> Vec<Value> {
+    match verb {
+        "AUTH" => {
+            let challenge = if cfg.auth_usable() {
+                wire.challenge().await
+            } else {
+                "none sent".to_string()
             };
-            self.seen.push(frame.clone());
-            if answers(&frame) {
-                return frame;
-            }
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let event = wok_compat::sign_event(json!({
+                "created_at": created_at,
+                "kind": 22242,
+                "tags": [
+                    ["relay", cfg.relay.auth.service_url],
+                    ["challenge", challenge],
+                ],
+                "content": "",
+            }));
+            let id = event["id"].clone();
+            wire.send(json!(["AUTH", event])).await;
+            vec![
+                wire.until("an OK for AUTH", |frame| frame[0] == "OK" && frame[1] == id)
+                    .await,
+            ]
         }
-    }
-
-    /// The NIP-42 challenge the relay sent on connect.
-    async fn challenge(&mut self) -> String {
-        let is_challenge = |frame: &Value| frame[0] == "AUTH";
-        let frame = match self.seen.iter().find(|frame| is_challenge(frame)) {
-            Some(frame) => frame.clone(),
-            None => self.until("an AUTH challenge", is_challenge).await,
-        };
-        frame[1].as_str().unwrap().to_string()
-    }
-
-    /// Send a valid message for `verb` and return the frames that answer it.
-    async fn probe(&mut self, verb: &str, cfg: &Config) -> Vec<Value> {
-        match verb {
-            "AUTH" => {
-                let challenge = if cfg.auth_usable() {
-                    self.challenge().await
-                } else {
-                    "none sent".to_string()
-                };
-                let created_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let event = wok_compat::sign_event(json!({
-                    "created_at": created_at,
-                    "kind": 22242,
-                    "tags": [
-                        ["relay", cfg.relay.auth.service_url],
-                        ["challenge", challenge],
-                    ],
-                    "content": "",
-                }));
-                let id = event["id"].clone();
-                self.send(json!(["AUTH", event])).await;
-                vec![
-                    self.until("an OK for AUTH", |frame| frame[0] == "OK" && frame[1] == id)
-                        .await,
-                ]
-            }
-            "COUNT" => {
-                self.send(json!(["COUNT", "gate-count", {"ids": [UNKNOWN_ID]}]))
-                    .await;
-                vec![
-                    self.until("a COUNT reply", |frame| frame[1] == "gate-count")
-                        .await,
-                ]
-            }
-            "NEG-OPEN" => {
-                let open = json!(["NEG-OPEN", "gate-open", {"ids": [UNKNOWN_ID]}, neg_initial()]);
-                self.send(open).await;
-                vec![
-                    self.until("a NEG-OPEN reply", |frame| frame[1] == "gate-open")
-                        .await,
-                ]
-            }
-            "NEG-MSG" => {
-                self.send(json!(["NEG-MSG", "gate-msg", neg_initial()]))
-                    .await;
-                vec![
-                    self.until("a NEG-MSG reply", |frame| frame[1] == "gate-msg")
-                        .await,
-                ]
-            }
-            "NEG-CLOSE" => {
-                // A valid NEG-CLOSE gets no reply. The ingester sends the
-                // refusal, if any, before it reads the next message, so the
-                // answer to a REQ sent after it marks the end.
-                let start = self.seen.len();
-                self.send(json!(["NEG-CLOSE", "gate-close"])).await;
-                self.send(json!(["REQ", "gate-mark", {"ids": [UNKNOWN_ID]}]))
-                    .await;
-                self.until("a REQ reply", |frame| frame[1] == "gate-mark")
-                    .await;
-                self.seen[start..]
-                    .iter()
-                    .filter(|frame| frame[0] == "NOTICE")
-                    .cloned()
-                    .collect()
-            }
-            other => panic!("no probe for {other}"),
+        "COUNT" => {
+            wire.send(json!(["COUNT", "gate-count", {"ids": [UNKNOWN_ID]}]))
+                .await;
+            vec![
+                wire.until("a COUNT reply", |frame| frame[1] == "gate-count")
+                    .await,
+            ]
         }
+        "NEG-OPEN" => {
+            let open = json!(["NEG-OPEN", "gate-open", {"ids": [UNKNOWN_ID]}, neg_initial()]);
+            wire.send(open).await;
+            vec![
+                wire.until("a NEG-OPEN reply", |frame| frame[1] == "gate-open")
+                    .await,
+            ]
+        }
+        "NEG-MSG" => {
+            wire.send(json!(["NEG-MSG", "gate-msg", neg_initial()]))
+                .await;
+            vec![
+                wire.until("a NEG-MSG reply", |frame| frame[1] == "gate-msg")
+                    .await,
+            ]
+        }
+        "NEG-CLOSE" => {
+            // A valid NEG-CLOSE gets no reply. The ingester sends the
+            // refusal, if any, before it reads the next message, so the
+            // answer to a REQ sent after it marks the end.
+            let start = wire.seen.len();
+            wire.send(json!(["NEG-CLOSE", "gate-close"])).await;
+            wire.send(json!(["REQ", "gate-mark", {"ids": [UNKNOWN_ID]}]))
+                .await;
+            wire.until("a REQ reply", |frame| frame[1] == "gate-mark")
+                .await;
+            wire.seen[start..]
+                .iter()
+                .filter(|frame| frame[0] == "NOTICE")
+                .cloned()
+                .collect()
+        }
+        other => panic!("no probe for {other}"),
     }
-}
-
-/// A client's first message of a NIP-77 sync, over an empty set.
-fn neg_initial() -> String {
-    let mut store = wok_negentropy::Vector::new();
-    store.seal().unwrap();
-    let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
-    hex::encode(client.initiate().unwrap())
 }
 
 struct HttpRow {
@@ -517,101 +441,6 @@ fn gate_open(cfg: &Config, gate: &str) -> bool {
     }
 }
 
-/// A relay serving one profile on a loopback port.
-struct Relay {
-    addr: SocketAddr,
-    /// The metrics listener, when the profile sets one.
-    metrics: Option<SocketAddr>,
-    handle: wok_relay::RelayHandle,
-    _dir: tempfile::TempDir,
-}
-
-impl Relay {
-    async fn start(mut cfg: Config) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(
-            dir.path(),
-            EnvOptions {
-                map_size: 64 * 1024 * 1024,
-                ..EnvOptions::default()
-            },
-        )
-        .unwrap();
-        env.ensure_initialized().unwrap();
-        cfg.db = dir.path().to_path_buf();
-        cfg.relay.port = 0;
-        cfg.relay.unix.path = dir.path().join("wok.sock");
-        // Every probe comes from one address; the connection budget would
-        // answer 429 long before the probe has tried every path.
-        cfg.relay.abuse.connection_rate_per_second = 0;
-        let wants_metrics_listener = !cfg.observability.metrics_listen.is_empty();
-        let handle = wok_relay::start(env, cfg).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let serving = handle.clone();
-        tokio::spawn(async move {
-            let _ = wok_ws::serve_listener(serving, listener).await;
-        });
-        let mut metrics = None;
-        if wants_metrics_listener {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            metrics = Some(listener.local_addr().unwrap());
-            tokio::spawn(wok_ws::serve_metrics(handle.clone(), listener));
-        }
-        Self {
-            addr,
-            metrics,
-            handle,
-            _dir: dir,
-        }
-    }
-
-    async fn stop(self) {
-        let handle = self.handle;
-        tokio::task::spawn_blocking(move || handle.shutdown_and_join(Duration::from_secs(10)))
-            .await
-            .unwrap()
-            .unwrap();
-    }
-}
-
-/// Whether some method gets an answer other than 404 for `path` at `addr`.
-async fn reachable(addr: SocketAddr, path: &str) -> bool {
-    for method in METHODS {
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        if status(addr, &request).await != 404 {
-            return true;
-        }
-    }
-    false
-}
-
-/// The status code of the response to `request` sent to `addr`.
-async fn status(addr: SocketAddr, request: &str) -> u16 {
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut head = Vec::new();
-    let mut buf = [0u8; 512];
-    while !head.windows(2).any(|pair| pair == b"\r\n") {
-        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-            .await
-            .expect("no response within 5 s")
-            .unwrap();
-        assert!(
-            read > 0,
-            "connection closed before a status line: {request:?}"
-        );
-        head.extend_from_slice(&buf[..read]);
-    }
-    let head = String::from_utf8_lossy(&head);
-    head.split(' ')
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .unwrap_or_else(|| panic!("no status in {head:?}"))
-}
-
 fn upgrade_request(path: &str) -> String {
     format!(
         "GET {path} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -623,26 +452,6 @@ fn rpc_request() -> String {
     "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/nostr+json+rpc\r\n\
      Content-Length: 0\r\nConnection: close\r\n\r\n"
         .to_string()
-}
-
-fn profiles_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/profiles")
-}
-
-fn profile_names() -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(profiles_dir())
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-        .map(|path| path.file_stem().unwrap().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
-}
-
-fn load_profile(name: &str) -> Config {
-    let path = profiles_dir().join(format!("{name}.toml"));
-    Config::load(&path).unwrap_or_else(|error| panic!("profile {name}: {error}"))
 }
 
 /// The cells of each row of the first table under `heading`.

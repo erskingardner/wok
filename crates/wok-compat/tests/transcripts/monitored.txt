@@ -79,7 +79,7 @@
 < ["OK","<h13>",false,"invalid: bad signature"]
 
 ## AUTH with the wrong challenge and a forged signature
-< ["OK","<h12>",false,"invalid: bad signature"]
+< ["OK","<h12>",false,"error: challenge string mismatch"]
 
 ## AUTH as the author
 < ["OK","<h13>",true,"successfully authenticated"]

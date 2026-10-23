@@ -1606,3 +1606,99 @@ mod metrics_tests {
         assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 200);
     }
 }
+
+#[cfg(test)]
+mod admin_http_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unsigned_admin_request_is_refused_before_its_body_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        cfg.admin.pubkeys = vec!["ab".repeat(32)];
+        let handle = wok_relay::start(env, cfg).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_listener(handle, listener));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let header = |event: serde_json::Value| {
+            format!(
+                "Authorization: Nostr {}\r\n",
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    event.to_string()
+                )
+            )
+        };
+        for (target, content_type, url, method) in [
+            (
+                "PUT /admin/api/config",
+                "application/json",
+                "https://relay.example/admin/api/config",
+                "PUT",
+            ),
+            (
+                "POST /",
+                nip86::RPC_CONTENT_TYPE,
+                "https://relay.example",
+                "POST",
+            ),
+        ] {
+            // A NIP-98 event for this endpoint in every respect but its
+            // signature.
+            let unsigned = |pubkey: String| {
+                serde_json::json!({
+                    "id": "00".repeat(32),
+                    "pubkey": pubkey,
+                    "created_at": now,
+                    "kind": 27235,
+                    "tags": [["u", url], ["method", method], ["payload", "00".repeat(32)]],
+                    "content": "",
+                    "sig": "00".repeat(64),
+                })
+            };
+            let malformed = [
+                String::new(),
+                "Authorization: Bearer token\r\n".into(),
+                "Authorization: Nostr !!!!\r\n".into(),
+                // Valid base64 of something that is not JSON.
+                "Authorization: Nostr bm90IGpzb24=\r\n".into(),
+                // JSON that is not a NIP-98 event.
+                header(serde_json::Value::Null),
+                header(serde_json::json!({})),
+                header(serde_json::json!({"kind": 1, "content": ""})),
+                // A stranger, and a forgery naming the admin: one reply for
+                // both, and neither waits for the body.
+                header(unsigned("cd".repeat(32))),
+                header(unsigned("ab".repeat(32))),
+            ];
+            for authorization in &malformed {
+                // The body the request announces never arrives: a handler
+                // that read it first would wait for it.
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let request = format!(
+                    "{target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\n\
+                     {authorization}Content-Length: 1000000\r\n\r\n"
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut head = [0u8; 64];
+                let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut head))
+                    .await
+                    .unwrap_or_else(|_| panic!("{target} {authorization:?}: no answer"))
+                    .unwrap();
+                let head = String::from_utf8_lossy(&head[..read]);
+                assert!(
+                    head.starts_with("HTTP/1.1 401"),
+                    "{target} {authorization:?}: {head}"
+                );
+            }
+        }
+    }
+}

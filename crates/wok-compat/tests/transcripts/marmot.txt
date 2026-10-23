@@ -13,10 +13,10 @@
 < ["OK","<h2>",false,"restricted: kind 1 is not allowed by this relay"]
 
 ## EVENT a forged signature
-< ["OK","<h1>",false,"invalid: bad signature"]
+< ["OK","<h1>",false,"restricted: kind 1 is not allowed by this relay"]
 
 ## EVENT an id that does not match
-< ["OK","<h1>",false,"invalid: bad event id"]
+< ["OK","<h1>",false,"restricted: kind 1 is not allowed by this relay"]
 
 ## EVENT an AUTH event
 < ["OK","<h3>",false,"invalid: AUTH events must be sent with AUTH"]
@@ -28,7 +28,7 @@
 < ["OK","<h5>",false,"restricted: kind 30078 is not allowed by this relay"]
 
 ## EVENT dated an hour ahead
-< ["OK","<h6>",false,"invalid: created_at too late"]
+< ["OK","<h6>",false,"restricted: kind 1 is not allowed by this relay"]
 
 ## EVENT a vanish request for another relay
 < ["OK","<h7>",false,"blocked: vanish request not targeting this relay"]
@@ -76,7 +76,7 @@
 < ["OK","<h9>",false,"invalid: bad signature"]
 
 ## AUTH with the wrong challenge and a forged signature
-< ["OK","<h8>",false,"invalid: bad signature"]
+< ["OK","<h8>",false,"error: challenge string mismatch"]
 
 ## AUTH as the author
 < ["OK","<h9>",true,"successfully authenticated"]

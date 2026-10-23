@@ -2329,7 +2329,23 @@ fn ingest_event(
     orig: Value,
     dispatch: &mut Dispatch,
 ) {
-    let requested_kind = orig.get("kind").and_then(Value::as_u64).unwrap_or(u64::MAX);
+    let claimed_kind = orig.get("kind").and_then(Value::as_u64);
+    if let Some(message) =
+        claimed_kind.and_then(|kind| kind_refusal(cfg, metrics, moderation, kind))
+    {
+        let id = orig.get("id").and_then(Value::as_str).unwrap_or("?");
+        conns.send(
+            conn_id,
+            RelayMessage::Ok {
+                event_id: id.to_string(),
+                accepted: false,
+                message,
+            },
+            metrics,
+        );
+        return;
+    }
+    let requested_kind = claimed_kind.unwrap_or(u64::MAX);
     let policy = cfg.timestamp_policy_for_kind(requested_kind);
     let parsed = match parse_and_verify_event(&orig, &cfg.event_limits(), Some(&policy), true, true)
     {
@@ -2362,20 +2378,6 @@ fn ingest_event(
         kind = packed.kind(),
         "validated inbound event"
     );
-    // NIP-42: relays MUST exclude kind 22242 from broadcast. One sent as an
-    // EVENT is neither stored nor delivered to any subscription.
-    if packed.kind() == AUTH_KIND {
-        conns.send(
-            conn_id,
-            RelayMessage::Ok {
-                event_id: id_hex,
-                accepted: false,
-                message: "invalid: AUTH events must be sent with AUTH".into(),
-            },
-            metrics,
-        );
-        return;
-    }
     let is_vanish_request = packed.kind() == VANISH_KIND;
     let grant = {
         let snap = moderation.read();
@@ -2387,20 +2389,8 @@ fn ingest_event(
         id.copy_from_slice(packed.id());
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(packed.pubkey());
-        let kind_refusal = |setting| {
-            let message = format!(
-                "restricted: kind {} is not allowed by this relay",
-                packed.kind()
-            );
-            Some((&metrics.moderation_kind_rejections, setting, message))
-        };
-        // Only `accepted_kinds` is a setting; a NIP-86 kind policy is counted
-        // by the moderation counter alone.
-        let rejected = if !cfg.accepts_kind(packed.kind()) {
-            kind_refusal(Some(Setting::AcceptedKinds))
-        } else if !snap.kind_allowed(packed.kind()) {
-            kind_refusal(None)
-        } else if snap.banned_events.contains_key(&id) {
+        // The kind gates ran before the event was verified (`kind_refusal`).
+        let rejected = if snap.banned_events.contains_key(&id) {
             Some((
                 &metrics.moderation_banned_event_rejections,
                 None,
@@ -2657,6 +2647,44 @@ fn ingest_event(
     });
 }
 
+/// The refusal for an EVENT that its claimed kind alone decides, counted
+/// where it is decided. These gates run before the event is parsed and its
+/// signature verified: a kind refusal says nothing about who may publish,
+/// and on a relay that accepts few kinds most junk is refused without a
+/// verification. The author ban and the write policy wait for the
+/// signature, so an unsigned event cannot ask whether a key is a member or
+/// banned.
+fn kind_refusal(
+    cfg: &Config,
+    metrics: &Metrics,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
+    kind: u64,
+) -> Option<String> {
+    // NIP-42: relays MUST exclude kind 22242 from broadcast. One sent as an
+    // EVENT is neither stored nor delivered to any subscription.
+    if kind == AUTH_KIND {
+        return Some("invalid: AUTH events must be sent with AUTH".into());
+    }
+    // Only `accepted_kinds` is a setting; a NIP-86 kind policy is counted by
+    // the moderation counter alone.
+    let setting = if !cfg.accepts_kind(kind) {
+        Some(Setting::AcceptedKinds)
+    } else if !moderation.read().kind_allowed(kind) {
+        None
+    } else {
+        return None;
+    };
+    metrics
+        .moderation_kind_rejections
+        .fetch_add(1, Ordering::Relaxed);
+    if let Some(setting) = setting {
+        metrics.refused(setting);
+    }
+    Some(format!(
+        "restricted: kind {kind} is not allowed by this relay"
+    ))
+}
+
 fn ingest_auth(
     cfg: &Config,
     conns: &ConnTable,
@@ -2734,17 +2762,11 @@ fn ingest_auth_inner(
     let asess = auth
         .get_mut(&conn_id)
         .ok_or("no auth status available for connection")?;
-    // NIP-42's window of about ten minutes, not `[events]`: the challenge
-    // already prevents replay. An AUTH event that fails validation is
-    // `invalid:`, as it would be if sent as EVENT.
-    let policy = cfg.timestamp_policy_for_kind(AUTH_KIND);
-    let parsed = parse_and_verify_event(event_json, &cfg.event_limits(), Some(&policy), true, true)
-        .map_err(|e| {
-            count_event_limit(metrics, AUTH_KIND, &e);
-            format!("invalid: {e}")
-        })?;
-    let packed = parsed.packed.view();
-    if packed.kind() != AUTH_KIND {
+    // The kind, this connection's challenge and the relay's URL are checked
+    // as the event states them, before its signature is verified: the
+    // client knows all three, so refusing on them reveals nothing, and an
+    // AUTH that cannot succeed costs no verification.
+    if event_json.get("kind").and_then(Value::as_u64) != Some(AUTH_KIND) {
         return Err("wrong event kind, expected 22242".into());
     }
     let mut found_challenge = false;
@@ -2774,6 +2796,16 @@ fn ingest_auth_inner(
             cfg.relay.auth.service_url
         ));
     }
+    // NIP-42's window of about ten minutes, not `[events]`: the challenge
+    // already prevents replay. An AUTH event that fails validation is
+    // `invalid:`, as it would be if sent as EVENT.
+    let policy = cfg.timestamp_policy_for_kind(AUTH_KIND);
+    let parsed = parse_and_verify_event(event_json, &cfg.event_limits(), Some(&policy), true, true)
+        .map_err(|e| {
+            count_event_limit(metrics, AUTH_KIND, &e);
+            format!("invalid: {e}")
+        })?;
+    let packed = parsed.packed.view();
     let mut pk = [0u8; 32];
     pk.copy_from_slice(packed.pubkey());
     if !asess.identities.contains(&pk) {
@@ -2937,6 +2969,9 @@ fn admit_req(
         metrics.refused(setting);
         bad_req(prefix, e)
     };
+    // A reader the policy refuses is refused before its filters are sized,
+    // parsed or priced; the refusal names only the policy.
+    admit_reader(cfg, conns, metrics, moderation, auth, conn_id)?;
     if filters.len() > cfg.relay.max_filters_per_req {
         // Keep strfry's wording for its legacy filter-count ceiling.
         return Err(refuse(
@@ -3005,7 +3040,6 @@ fn admit_req(
         if count_only { "COUNT" } else { "REQ" },
     )?;
 
-    admit_reader(cfg, conns, metrics, moderation, auth, conn_id)?;
     let authed = auth.get(&conn_id).and_then(|a| a.authed);
     let r = cfg.read_restrictor();
     let requires_auth = if count_only {
@@ -3462,6 +3496,12 @@ fn ingest_neg(
     payload_hex: &str,
     dispatch: &mut Dispatch,
 ) -> Result<(), String> {
+    // A NEG-OPEN the read policy refuses is refused before its payload is
+    // decoded or its filter parsed. NEG-MSG continues a session its
+    // NEG-OPEN was admitted for.
+    if filter.is_some() {
+        admit_reader(cfg, conns, metrics, moderation, auth, conn_id)?;
+    }
     if payload_hex.len() > 2 * 1024 * 1024 {
         return Err("invalid: negentropy payload exceeds 1 MiB".into());
     }
@@ -3496,7 +3536,6 @@ fn ingest_neg(
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
     check_query_work(cfg, metrics, query_cost, "NEG-OPEN")?;
-    admit_reader(cfg, conns, metrics, moderation, auth, conn_id)?;
     let r = cfg.read_restrictor();
     if r.is_filter_group_fully_restricted(&fg)
         && auth.get(&conn_id).and_then(|a| a.authed).is_none()
@@ -5956,6 +5995,135 @@ mod tests {
             reply.contains("no auth status available for connection"),
             "{reply}"
         );
+        handle.request_shutdown();
+    }
+
+    /// A relay with `tweak` applied and one connection from 127.0.0.1,
+    /// registered so that AUTH, when usable, challenges it first.
+    async fn relay_with_connection(
+        tweak: impl FnOnce(&mut Config),
+    ) -> (
+        tempfile::TempDir,
+        RelayHandle,
+        crate::ConnectionGuard,
+        tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        tweak(&mut cfg);
+        let handle = start(env, cfg).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn = handle
+            .register_connection(
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                Outbound::new(tx, 0),
+            )
+            .await;
+        (dir, handle, conn, rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_is_refused_on_its_stated_kind_challenge_and_relay_before_verification() {
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
+            cfg.relay.auth.service_url = "wss://auth.example".into();
+        })
+        .await;
+        let challenge: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
+        let challenge = challenge[1].as_str().unwrap().to_string();
+        for (kind, relay, offered, refusal) in [
+            (
+                1,
+                "wss://auth.example",
+                challenge.as_str(),
+                "wrong event kind",
+            ),
+            (
+                AUTH_KIND,
+                "wss://auth.example",
+                "not-it",
+                "challenge string mismatch",
+            ),
+            (
+                AUTH_KIND,
+                "wss://elsewhere.example",
+                challenge.as_str(),
+                "incorrect or missing relay tag",
+            ),
+        ] {
+            let mut auth = sign_event(json!({
+                "created_at": now_secs(),
+                "kind": kind,
+                "tags": [["relay", relay], ["challenge", offered]],
+                "content": "",
+            }));
+            // A forged signature: each refusal comes before it is checked.
+            auth["sig"] = json!("00".repeat(64));
+            conn.client_message(json!(["AUTH", auth]).to_string()).await;
+            let reply = recv_outbound(&mut rx).await;
+            assert!(reply.contains(refusal), "{reply}");
+        }
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_the_policy_refuses_is_refused_before_its_filters_are_read() {
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
+            cfg.relay.auth.service_url = "wss://auth.example".into();
+            cfg.relay.auth.read_policy = AccessPolicy::Members;
+        })
+        .await;
+        let challenge = recv_outbound(&mut rx).await;
+        assert!(challenge.starts_with(r#"["AUTH","#), "{challenge}");
+        for message in [
+            json!(["REQ", "bad-filter", {"kinds": "one"}]),
+            json!(["COUNT", "bad-count", {"kinds": "one"}]),
+            json!(["NEG-OPEN", "bad-payload", {"kinds": [1]}, "not hex"]),
+        ] {
+            conn.client_message(message.to_string()).await;
+            let reply = recv_outbound(&mut rx).await;
+            assert!(
+                reply.contains("auth-required: this relay serves only members"),
+                "{reply}"
+            );
+        }
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_its_kind_refuses_is_refused_before_verification() {
+        let (_dir, handle, conn, mut rx) =
+            relay_with_connection(|cfg| cfg.relay.auth.accepted_kinds = vec![0]).await;
+        for (kind, refusal) in [
+            (1, "restricted: kind 1 is not allowed by this relay"),
+            (AUTH_KIND, "invalid: AUTH events must be sent with AUTH"),
+        ] {
+            let mut event = sign_event(json!({
+                "created_at": now_secs(),
+                "kind": kind,
+                "tags": [],
+                "content": "",
+            }));
+            event["sig"] = json!("00".repeat(64));
+            conn.client_message(json!(["EVENT", event]).to_string())
+                .await;
+            let reply = recv_outbound(&mut rx).await;
+            assert!(reply.contains(refusal), "{reply}");
+        }
+        // A kind the policy allows is still verified.
+        let mut event = sign_event(json!({
+            "created_at": now_secs(),
+            "kind": 0,
+            "tags": [],
+            "content": "{}",
+        }));
+        event["sig"] = json!("00".repeat(64));
+        conn.client_message(json!(["EVENT", event]).to_string())
+            .await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(reply.contains("invalid: bad signature"), "{reply}");
         handle.request_shutdown();
     }
 

@@ -353,23 +353,39 @@ async fn execute(
         }
         "allowkind" => {
             let kind = kind_param(params)?;
+            // The configuration's ceiling bounds what NIP-86 can allow.
+            if !handle.config.read().accepts_kind(kind) {
+                return Err(format!(
+                    "kind {kind} is not in relay.auth.accepted_kinds, so this relay does not \
+                     accept it"
+                ));
+            }
             manage(handle, ManagementCmd::AllowKind { kind }, reached_writer).await
         }
         "disallowkind" => {
             let kind = kind_param(params)?;
             manage(handle, ManagementCmd::DisallowKind { kind }, reached_writer).await
         }
-        // Kinds are allowed unless disallowed. The allow list holds the
-        // kinds named by `allowkind`, not every kind that is allowed.
-        "listallowedkinds" => Ok(json!(handle.moderation.read().allowed_kinds)),
-        "listdisallowedkinds" => {
+        // With `relay.auth.accepted_kinds` set, the lists are the effective
+        // set: those kinds the stored policy allows, and those it refuses.
+        // Without it kinds are allowed unless disallowed, so the allow list
+        // holds the kinds named by `allowkind`, not every kind allowed.
+        "listallowedkinds" | "listdisallowedkinds" => {
+            let mut accepted = handle.config.read().relay.auth.accepted_kinds.clone();
             let snap = handle.moderation.read();
-            let kinds = snap
-                .kind_policy
-                .as_ref()
-                .map(|policy| policy.disallowed_kinds())
-                .unwrap_or_default();
-            Ok(json!(kinds))
+            if accepted.is_empty() {
+                return Ok(if method == "listallowedkinds" {
+                    json!(snap.allowed_kinds)
+                } else {
+                    let disallowed = snap.kind_policy.as_ref().map(|p| p.disallowed_kinds());
+                    json!(disallowed.unwrap_or_default())
+                });
+            }
+            accepted.sort_unstable();
+            accepted.dedup();
+            let allowed = method == "listallowedkinds";
+            accepted.retain(|&kind| snap.kind_allowed(kind) == allowed);
+            Ok(json!(accepted))
         }
         _ => unreachable!("method checked against SUPPORTED_METHODS"),
     }

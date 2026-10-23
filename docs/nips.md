@@ -35,8 +35,10 @@ as each is enforced:
   `open`, the read classes can still need AUTH for particular kinds, as
   NIP-11 allows.
 - `restricted_writes` is `true` while `relay.auth.write_policy` is not `open`,
-  or proof of work is required (`min_pow_difficulty`, with abuse controls on).
-  Rate limits and the per-kind rule for NIP-78 app data do not set it.
+  `relay.auth.accepted_kinds` lists the only kinds accepted, or proof of work
+  is required (`min_pow_difficulty`, with abuse controls on). Rate limits,
+  the NIP-86 kind blocklist and the per-kind rule for NIP-78 app data do not
+  set it.
 
 NIP-02, NIP-04, and NIP-28 event kinds are accepted and stored, but those
 client/application semantics are deliberately not advertised as relay

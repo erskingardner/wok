@@ -1983,6 +1983,92 @@ async fn nip86_restrict_writes_allowlist_e2e() {
     handle.request_shutdown();
 }
 
+/// `relay.auth.accepted_kinds` is a ceiling: events of other kinds are
+/// refused, NIP-86 `allowkind` cannot raise it, `disallowkind` lowers it, the
+/// kind lists report the effective set, and NIP-11 says writes are
+/// restricted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_kinds_bound_the_nip86_kind_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(
+        dir.path(),
+        EnvOptions {
+            map_size: 64 * 1024 * 1024,
+            ..EnvOptions::default()
+        },
+    )
+    .unwrap();
+    env.ensure_initialized().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let (admin_pubkey, _) = admin_key.x_only_public_key();
+    let alice_key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+
+    let mut cfg = test_cfg(dir.path());
+    cfg.admin.enabled = true;
+    cfg.admin.public_url = format!("http://{addr}");
+    cfg.admin.pubkeys = vec![hex::encode(admin_pubkey.serialize())];
+    cfg.relay.auth.accepted_kinds = vec![7, 1];
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(h, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let url = format!("ws://{addr}/");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let publish = |kind: u64| {
+        sign_event_with_key(
+            json!({"created_at": now_secs(), "kind": kind, "tags": [], "content": format!("{kind}")}),
+            &alice_key,
+        )
+    };
+    let accepted = |msgs: &[String]| msgs.iter().any(|t| t.contains("true"));
+    assert!(accepted(&ws_publish(&mut ws, publish(1)).await));
+    let msgs = ws_publish(&mut ws, publish(30023)).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains("false") && t.contains("restricted: kind 30023 is not allowed")),
+        "{msgs:?}"
+    );
+    assert_eq!(
+        reqwest_get_nip11(addr).await["limitation"]["restricted_writes"],
+        true
+    );
+
+    // The effective set: the ceiling, sorted, as the stored policy allows.
+    let list = |method: &'static str| {
+        let key = &admin_key;
+        async move { nip86_rpc(addr, key, method, json!([])).await.1["result"].clone() }
+    };
+    assert_eq!(list("listallowedkinds").await, json!([1, 7]));
+    assert_eq!(list("listdisallowedkinds").await, json!([]));
+
+    // allowkind cannot raise the ceiling.
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowkind", json!([30023])).await;
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not in relay.auth.accepted_kinds")),
+        "{result}"
+    );
+    assert_eq!(list("listallowedkinds").await, json!([1, 7]));
+
+    // disallowkind lowers it, and allowkind restores a kind under it.
+    let (_, result) = nip86_rpc(addr, &admin_key, "disallowkind", json!([7])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    assert_eq!(list("listallowedkinds").await, json!([1]));
+    assert_eq!(list("listdisallowedkinds").await, json!([7]));
+    assert!(!accepted(&ws_publish(&mut ws, publish(7)).await));
+    let (_, result) = nip86_rpc(addr, &admin_key, "allowkind", json!([7])).await;
+    assert_eq!(result["result"], json!(true), "{result}");
+    assert_eq!(list("listallowedkinds").await, json!([1, 7]));
+    assert!(accepted(&ws_publish(&mut ws, publish(7)).await));
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip86_kind_policy_e2e() {
     let dir = tempfile::tempdir().unwrap();

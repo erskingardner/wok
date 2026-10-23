@@ -197,10 +197,13 @@ pub(super) fn run_writer(
                             })
                         });
                         let (vanished, moderated, write_allowed) = match stored_checks {
+                            // `accepted_kinds` as the writer's configuration
+                            // has it, like the stored kind policy.
                             Ok((vanished, moderated, write_allowed)) => (
                                 vanished
                                     || event_matches_vanish_markers(packed_view, &batch_vanish),
-                                moderated,
+                                moderated.or((!cfg_snap.accepts_kind(packed_view.kind()))
+                                    .then_some(wok_db::ModerationReason::KindNotAllowed)),
                                 write_allowed,
                             ),
                             Err(error) => {

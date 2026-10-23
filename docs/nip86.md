@@ -159,6 +159,12 @@ allows it again. `listdisallowedkinds` lists the disallowed kinds.
 - hidden from query results like a ban — including REQs without a `kinds`
   field — until `allowkind` restores it.
 
+With `relay.auth.accepted_kinds` set, the policy works under that ceiling:
+`allowkind` refuses a kind the configuration does not list, with an error,
+and `listallowedkinds` and `listdisallowedkinds` return the listed kinds the
+policy allows and disallows, sorted. See
+[accepted kinds](config.md#accepted-kinds).
+
 The all-zero map (no kinds allowed) is representable; `disallowkind` never
 refuses an exclusion. IPs given to `blockip` / `unblockip` are parsed and
 stored in canonical form, so any equivalent spelling (`2001:0db8::1` vs

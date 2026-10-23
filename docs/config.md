@@ -347,6 +347,7 @@ logged as a warning naming the old and the new policy.
 | `relay.auth.read_policy` | `open` | Who may send REQ, COUNT and NEG-OPEN: `open`, `authenticated` or `members`. See [read and write policies](#read-and-write-policies). |
 | `relay.auth.write_policy` | `open` | Who may publish: `open`, `authenticated` or `members`. NIP-62 vanish requests are always accepted. |
 | `relay.auth.inbox_kinds` | `[1059, 21059]` | Under `write_policy = "members"`, events of these kinds are also accepted when their first `p` tag is a member, so anyone can deliver gift wraps to members. |
+| `relay.auth.accepted_kinds` | `[]` | The kinds the relay accepts; empty accepts every kind. A ceiling for the NIP-86 kind policy. See [accepted kinds](#accepted-kinds). |
 
 While AUTH is usable (`enabled` with a `service_url`), every connection
 receives its NIP-42 challenge as soon as it opens.
@@ -393,7 +394,8 @@ NIP-78 only while both app-data kinds are owner-only.
 `read_policy` and `write_policy` say who may use the relay at all; the read
 classes then apply on top. NIP-11 advertises `auth_required` while
 `read_policy` is not `open` and AUTH is usable, and `restricted_writes` while
-`write_policy` is not `open` (or proof of work is required). Each is one of:
+`write_policy` is not `open` (or `accepted_kinds` is set, or proof of work is
+required). Each is one of:
 
 | Policy | Who may read | Who may write |
 |---|---|---|
@@ -438,6 +440,24 @@ moderation state it commits under, and an inbox recipient's kind against
 `inbox_kinds`, all as they are when it stores the event, so an event whose
 member was removed, or whose policy a reload tightened, in the meantime is
 refused.
+
+### Accepted kinds
+
+`accepted_kinds` makes a relay that stores only the kinds it is for, such as
+the Marmot set in the `marmot` preset. An event of another kind is refused
+with `restricted: kind N is not allowed by this relay`, and NIP-11 then
+advertises `restricted_writes`. The writer checks the kind again under the
+configuration it stores with, so a reload that drops a kind also refuses
+events of it still queued.
+
+It is a ceiling for the NIP-86 kind policy (see [nip86.md](nip86.md#kind-policy)):
+`disallowkind` can refuse a kind it lists, `allowkind` cannot accept a kind it
+leaves out, and `listallowedkinds` and `listdisallowedkinds` report the
+listed kinds the policy accepts and refuses.
+
+Only writes are bounded. Events of other kinds stored earlier stay readable;
+`wok delete` removes them. NIP-62 vanish requests are kind 62, so a relay
+that sets `accepted_kinds` honors them only if it lists 62.
 
 ### Read keys from 0.7 and earlier
 

@@ -170,10 +170,18 @@ impl Refusals {
             .map(|&setting| (setting, self.get(setting)))
     }
 
-    /// Keep a mark of the counts at `now`, at most one an hour, and drop
-    /// those older than [`REFUSAL_WINDOW_SECS`].
+    /// Drop the marks older than [`REFUSAL_WINDOW_SECS`], and keep one of
+    /// the counts at `now` if the last is an hour old. Called at least once
+    /// a minute, so the oldest mark is 23 to 24 hours old once the relay has
+    /// run a day.
     pub fn mark(&self, now: u64) {
         let mut marks = self.marks.lock();
+        while marks
+            .front()
+            .is_some_and(|(at, _)| at.saturating_add(REFUSAL_WINDOW_SECS) < now)
+        {
+            marks.pop_front();
+        }
         if marks
             .back()
             .is_some_and(|(at, _)| now < at.saturating_add(REFUSAL_MARK_SECS))
@@ -181,12 +189,6 @@ impl Refusals {
             return;
         }
         marks.push_back((now, std::array::from_fn(|i| self.get(Setting::ALL[i]))));
-        while marks
-            .front()
-            .is_some_and(|(at, _)| at.saturating_add(REFUSAL_WINDOW_SECS) < now)
-        {
-            marks.pop_front();
-        }
     }
 
     /// What each setting refused since the oldest mark of the last day, and
@@ -582,6 +584,35 @@ mod tests {
         assert_eq!(count(refusals.recent()), (start, 26));
         refusals.mark(start + 25 * 3600);
         assert_eq!(count(refusals.recent()), (start + 3600, 23));
+    }
+
+    #[test]
+    fn the_refusal_window_stays_within_the_last_day() {
+        // Marked each minute, as the history thread does whatever its
+        // chart interval, for 30 hours.
+        let refusals = Refusals::default();
+        let start = 1_000_000;
+        for minute in 0..30 * 60 {
+            let now = start + minute * 60;
+            refusals.add(Setting::MaxQueryWork, 1);
+            refusals.mark(now);
+            let (since, counts) = refusals.recent().unwrap();
+            let age = now - since;
+            if now - start >= REFUSAL_WINDOW_SECS {
+                assert!(
+                    (REFUSAL_WINDOW_SECS - 3600..=REFUSAL_WINDOW_SECS).contains(&age),
+                    "minute {minute}: window {age} s"
+                );
+            } else {
+                assert_eq!(since, start);
+            }
+            // One refusal a minute since the mark.
+            let (_, count) = counts[Setting::MaxQueryWork as usize];
+            assert_eq!(count, age / 60, "minute {minute}");
+        }
+        // After a gap longer than the window, counting starts afresh.
+        refusals.mark(start + 60 * 3600);
+        assert_eq!(refusals.recent().unwrap().0, start + 60 * 3600);
     }
 
     #[test]

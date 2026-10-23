@@ -68,7 +68,7 @@ gets 404, and so does a WebSocket upgrade on any path but `/`.
 | `/nodeinfo/2.1` | anonymous | none | The NodeInfo document. |
 | `/favicon.ico` | anonymous | none | A fixed empty icon. |
 | `/admin`, `/admin/` | anonymous | `admin.enabled` | `GET` returns the signed-out [dashboard](admin-dashboard.md) shell, which holds no relay data. Other methods get 404. |
-| `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix reads the body (at most 64 KiB) and checks NIP-98: it decodes the `Authorization` header, parses the event and verifies its signature, checks its kind, time window and `u`, `method` and `payload` tags, then checks that the signer is in `admin.pubkeys`, then claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
+| `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix reads the body (at most 64 KiB) and checks NIP-98: it decodes the `Authorization` header, parses the event and verifies its signature, checks its kind, time window and `u` and `method` tags, and its `payload` tag when the request has a body, then checks that the signer is in `admin.pubkeys`, then claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
 
 ## Messages
 
@@ -90,11 +90,11 @@ same ingester. Before Wok reads a message's verb:
 | --- | --- | --- | --- |
 | `EVENT` | anonymous | none | Per-address EVENT budget; event parse, size and tag limits, timestamp window, id and signature verification; `relay.auth.accepted_kinds` and the NIP-86 kind policy, event-id ban, author ban and `relay.auth.write_policy`; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH. The writer then checks the write policy and `accepted_kinds` again and applies storage quotas and the write-policy plugin. NIP-62 vanish requests skip the author ban, the write policy and the plugin. |
 | `AUTH` | anonymous | `relay.auth.enabled` and `relay.auth.service_url` | Per-address EVENT budget; the gate; the connection must hold a challenge; event parse and signature verification; kind 22242, `challenge` and `relay` tags. |
-| `REQ` | anonymous | none | The address's REQ backstop, then the connection's REQ budget, which is larger once authenticated (see [rates](config.md#rates)); subscription id; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; `relay.auth.read_policy`; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
+| `REQ` | anonymous | none | The connection's REQ budget, which is larger once authenticated, then the address's REQ backstop (see [rates](config.md#rates)); a connection over its own budget does not spend the backstop; subscription id; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; `relay.auth.read_policy`; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
 | `COUNT` | anonymous | `relay.max_filter_limit_count` above 0 | As `REQ`, with the COUNT budgets, and a COUNT that may count restricted kinds must name only what the connection may read. The gate is checked after the filter count and bytes. |
 | `CLOSE` | anonymous | none | A valid `CLOSE` is never budgeted; one with an invalid id spends the invalid-message budget. |
 | `NEG-OPEN` | anonymous | `relay.negentropy_enabled` | The REQ budgets, as for `REQ`; subscription id; the gate; payload size and hex decoding; filter parse and validation; query-work estimate; `relay.auth.read_policy`; AUTH for restricted kinds; the sync memory budgets. |
-| `NEG-MSG` | anonymous | `relay.negentropy_enabled` | The address's REQ backstop and the connection's NEG-MSG budget; subscription id; the gate; payload size and hex decoding; the session lookup. |
+| `NEG-MSG` | anonymous | `relay.negentropy_enabled` | The connection's NEG-MSG budget, then the address's REQ backstop; subscription id; the gate; payload size and hex decoding; the session lookup. |
 | `NEG-CLOSE` | anonymous | `relay.negentropy_enabled` | The gate first. |
 
 ## Management API
@@ -183,6 +183,7 @@ change of default cannot quietly make a profile stand for something else.
 | --- | --- |
 | `wok-compat` `tests/attack_surface.rs` | A path the listener answers, in any profile, has no row in [Network listener](#network-listener), or a row's path is unreachable while its gate is open, or reachable while it is closed. Candidate paths are the table's own, every path literal in `wok-ws`, and a few decoys. |
 | `wok-compat` `tests/attack_surface.rs` | A verb that `ClientCommand::parse` accepts has no row in [Messages](#messages), or a row names a verb it rejects. |
+| `wok-compat` `tests/attack_surface.rs` | A message whose [Messages](#messages) row names a gate is served while some profile closes that gate, or refused by it while the profile opens it. Each is sent as a valid message over a WebSocket, and only the gate's own refusal counts. |
 | `wok-compat` `tests/attack_surface.rs` | A profile file is added, removed or loses one of its properties, or is missing from [Profiles](#profiles). |
 | `wok-ws` `nip86` tests | A NIP-86 method is missing from the [nip86.md](nip86.md#supported-methods) table, or its level there differs from the code's. |
 | `wok-cli` tests | A `wok` command has no row in [Commands](#commands), or a row names a command that does not exist. |

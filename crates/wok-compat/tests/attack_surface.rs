@@ -3,12 +3,15 @@
 //! inventory and from the source, so a new route or verb fails here before
 //! anyone documents it.
 
+use futures_util::{SinkExt, StreamExt};
 use secp256k1::{Keypair, SecretKey, SECP256K1};
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::Message;
 use wok_db::{Env, EnvOptions};
 use wok_relay::protocol::ParseFailure;
 use wok_relay::{
@@ -255,6 +258,209 @@ fn verb_of(command: &ClientCommand) -> Option<&'static str> {
         ClientCommand::NegMsg { .. } => Some("NEG-MSG"),
         ClientCommand::NegClose { .. } => Some("NEG-CLOSE"),
     }
+}
+
+/// Every Messages row with a gate, sent as a valid message over a WebSocket
+/// to a relay of each profile: the gate's refusal must come back exactly
+/// when the profile closes the gate, so a verb left reachable behind a
+/// disabled feature fails here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_message_gates_match_the_inventory() {
+    let gated: Vec<(String, String)> = table("## Messages")
+        .iter()
+        .filter(|row| row[2] != "none")
+        .map(|row| (ticked(&row[0]).remove(0), row[2].clone()))
+        .collect();
+    let mut problems = Vec::new();
+    for name in profile_names() {
+        let cfg = load_profile(&name);
+        let relay = Relay::start(cfg.clone()).await;
+        let mut wire = Wire::connect(relay.addr).await;
+        for (verb, gate) in &gated {
+            let open = message_gate_open(&cfg, gate);
+            let reply = wire.probe(verb, &cfg).await;
+            let text = serde_json::to_string(&reply).unwrap();
+            let refused = gate_refusals(verb)
+                .iter()
+                .any(|refusal| text.contains(refusal));
+            if refused == open {
+                problems.push(if open {
+                    format!("{name}: {verb} is refused while {gate} is open: {text}")
+                } else {
+                    format!("{name}: {verb} is served while {gate} is closed: {text}")
+                });
+            } else if verb == "AUTH" && open && reply[0][2] != json!(true) {
+                problems.push(format!("{name}: a valid AUTH is not accepted: {text}"));
+            }
+        }
+        drop(wire);
+        relay.stop().await;
+    }
+    assert!(
+        problems.is_empty(),
+        "the relay's message gates and the Messages table of docs/attack-surface.md differ:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// Whether a profile opens the gate a Messages row names.
+fn message_gate_open(cfg: &Config, gate: &str) -> bool {
+    match gate {
+        "`relay.auth.enabled` and `relay.auth.service_url`" => cfg.auth_usable(),
+        "`relay.max_filter_limit_count` above 0" => cfg.relay.max_filter_limit_count > 0,
+        "`relay.negentropy_enabled`" => cfg.relay.negentropy_enabled,
+        other => panic!("teach message_gate_open the gate {other}"),
+    }
+}
+
+/// The text of the refusal a gated verb gets while its gate is closed.
+fn gate_refusals(verb: &str) -> &'static [&'static str] {
+    match verb {
+        "AUTH" => &["AUTH is disabled", "needs service_url"],
+        "COUNT" => &["COUNT disabled"],
+        "NEG-OPEN" | "NEG-MSG" => &["negentropy is disabled"],
+        "NEG-CLOSE" => &["negentropy disabled"],
+        other => panic!("{other} has a gate in the Messages table; give it a probe and a refusal"),
+    }
+}
+
+/// An id no stored event has: a scoped filter that matches nothing.
+const UNKNOWN_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// A WebSocket client that keeps every frame it reads.
+struct Wire {
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    seen: Vec<Value>,
+}
+
+impl Wire {
+    async fn connect(addr: SocketAddr) -> Self {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        Self {
+            ws,
+            seen: Vec::new(),
+        }
+    }
+
+    async fn send(&mut self, message: Value) {
+        self.ws
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .unwrap();
+    }
+
+    /// Read frames until one matches `answers`, keeping each.
+    async fn until(&mut self, what: &str, answers: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), self.ws.next())
+                .await
+                .unwrap_or_else(|_| panic!("no {what} within 5 s"))
+                .expect("the relay closed the connection")
+                .unwrap();
+            let Ok(frame) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) else {
+                continue;
+            };
+            self.seen.push(frame.clone());
+            if answers(&frame) {
+                return frame;
+            }
+        }
+    }
+
+    /// The NIP-42 challenge the relay sent on connect.
+    async fn challenge(&mut self) -> String {
+        let is_challenge = |frame: &Value| frame[0] == "AUTH";
+        let frame = match self.seen.iter().find(|frame| is_challenge(frame)) {
+            Some(frame) => frame.clone(),
+            None => self.until("an AUTH challenge", is_challenge).await,
+        };
+        frame[1].as_str().unwrap().to_string()
+    }
+
+    /// Send a valid message for `verb` and return the frames that answer it.
+    async fn probe(&mut self, verb: &str, cfg: &Config) -> Vec<Value> {
+        match verb {
+            "AUTH" => {
+                let challenge = if cfg.auth_usable() {
+                    self.challenge().await
+                } else {
+                    "none sent".to_string()
+                };
+                let created_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let event = wok_compat::sign_event(json!({
+                    "created_at": created_at,
+                    "kind": 22242,
+                    "tags": [
+                        ["relay", cfg.relay.auth.service_url],
+                        ["challenge", challenge],
+                    ],
+                    "content": "",
+                }));
+                let id = event["id"].clone();
+                self.send(json!(["AUTH", event])).await;
+                vec![
+                    self.until("an OK for AUTH", |frame| frame[0] == "OK" && frame[1] == id)
+                        .await,
+                ]
+            }
+            "COUNT" => {
+                self.send(json!(["COUNT", "gate-count", {"ids": [UNKNOWN_ID]}]))
+                    .await;
+                vec![
+                    self.until("a COUNT reply", |frame| frame[1] == "gate-count")
+                        .await,
+                ]
+            }
+            "NEG-OPEN" => {
+                let open = json!(["NEG-OPEN", "gate-open", {"ids": [UNKNOWN_ID]}, neg_initial()]);
+                self.send(open).await;
+                vec![
+                    self.until("a NEG-OPEN reply", |frame| frame[1] == "gate-open")
+                        .await,
+                ]
+            }
+            "NEG-MSG" => {
+                self.send(json!(["NEG-MSG", "gate-msg", neg_initial()]))
+                    .await;
+                vec![
+                    self.until("a NEG-MSG reply", |frame| frame[1] == "gate-msg")
+                        .await,
+                ]
+            }
+            "NEG-CLOSE" => {
+                // A valid NEG-CLOSE gets no reply. The ingester sends the
+                // refusal, if any, before it reads the next message, so the
+                // answer to a REQ sent after it marks the end.
+                let start = self.seen.len();
+                self.send(json!(["NEG-CLOSE", "gate-close"])).await;
+                self.send(json!(["REQ", "gate-mark", {"ids": [UNKNOWN_ID]}]))
+                    .await;
+                self.until("a REQ reply", |frame| frame[1] == "gate-mark")
+                    .await;
+                self.seen[start..]
+                    .iter()
+                    .filter(|frame| frame[0] == "NOTICE")
+                    .cloned()
+                    .collect()
+            }
+            other => panic!("no probe for {other}"),
+        }
+    }
+}
+
+/// A client's first message of a NIP-77 sync, over an empty set.
+fn neg_initial() -> String {
+    let mut store = wok_negentropy::Vector::new();
+    store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+    hex::encode(client.initiate().unwrap())
 }
 
 struct HttpRow {

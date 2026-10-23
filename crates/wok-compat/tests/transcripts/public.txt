@@ -1,0 +1,130 @@
+# profile: public
+
+## connect
+< ["AUTH","<challenge>"]
+
+## EVENT a note
+< ["OK","<h1>",true,""]
+
+## EVENT the same note again
+< ["OK","<h1>",true,"duplicate: have this event"]
+
+## EVENT a note from another key
+< ["OK","<h2>",true,""]
+
+## EVENT a forged signature
+< ["OK","<h1>",false,"invalid: bad signature"]
+
+## EVENT an id that does not match
+< ["OK","<h1>",false,"invalid: bad event id"]
+
+## EVENT an AUTH event
+< ["OK","<h3>",false,"invalid: AUTH events must be sent with AUTH"]
+
+## EVENT a protected event
+< ["OK","<h4>",false,"auth-required: event marked as protected"]
+
+## EVENT owner-only app data
+< ["OK","<h5>",false,"auth-required: kind 30078 is accepted only from its author"]
+
+## EVENT dated an hour ahead
+< ["OK","<h6>",false,"invalid: created_at too late"]
+
+## EVENT a vanish request for another relay
+< ["OK","<h7>",false,"blocked: vanish request not targeting this relay"]
+
+## REQ the author's notes
+< ["EVENT","notes",{"content":"hello","created_at":"<t+1>","id":"<h1>","kind":1,"pubkey":"<h8>","sig":"<h9>","tags":[]}]
+< ["EOSE","notes",["finish"]]
+
+## REQ only gift wraps
+< ["CLOSED","wraps","auth-required: requested filter requires authentication"]
+
+## REQ a filter that does not parse
+< ["CLOSED","bad","invalid: bad req: kinds not an array"]
+
+## REQ every note
+< ["EVENT","all",{"content":"hi","created_at":"<t+2>","id":"<h2>","kind":1,"pubkey":"<h10>","sig":"<h11>","tags":[]}]
+< ["EVENT","all",{"content":"hello","created_at":"<t+1>","id":"<h1>","kind":1,"pubkey":"<h8>","sig":"<h9>","tags":[]}]
+< ["EOSE","all",["finish"]]
+
+## COUNT notes
+< ["COUNT","count",{"count":1}]
+
+## NEG-OPEN
+< ["NEG-MSG","neg","6100000200"]
+
+## NEG-CLOSE an open session
+(no reply)
+
+## NEG-OPEN with a payload that is not hex
+< ["NEG-ERR","neg-bad","invalid: hex decode: Invalid character 'z' at position 0"]
+
+## NEG-MSG for no session
+< ["NEG-ERR","neg-none","closed: unknown subscription handle"]
+
+## CLOSE an unknown subscription
+(no reply)
+
+## a message that is not JSON
+< ["NOTICE","ERROR: bad msg: unexpected end of input at byte 1"]
+
+## an unknown verb
+< ["NOTICE","ERROR: bad msg: unknown cmd"]
+
+## AUTH with the wrong challenge
+< ["OK","<h12>",false,"error: challenge string mismatch"]
+
+## AUTH with a forged signature
+< ["OK","<h13>",false,"invalid: bad signature"]
+
+## AUTH with the wrong challenge and a forged signature
+< ["OK","<h12>",false,"invalid: bad signature"]
+
+## AUTH as the author
+< ["OK","<h13>",true,"successfully authenticated"]
+
+## REQ only gift wraps, after AUTH
+< ["EOSE","wraps-authed",["finish"]]
+
+## HTTP GET / for NIP-11
+< 200 application/json
+< {"description":"This is a wok instance.","limitation":{"auth_required":false,"created_at_upper_limit":900,"default_limit":2000,"max_and_entries":16,"max_concurrent_historical_queries":8,"max_event_tags":5000,"max_limit":2000,"max_message_length":2097152,"max_query_work":20000,"max_subid_length":64,"max_subscriptions":200,"max_tags_per_filter":8,"max_total_events_per_req":10000,"min_pow_difficulty":0,"restricted_writes":false},"name":"wok default","negentropy":1,"software":"https://github.com/erskingardner/wok","supported_nips":[1,9,11,40,42,45,50,59,62,67,70,77,78,91],"version":"<version>"}
+
+## HTTP GET / for the landing page
+< 200 text/html
+
+## HTTP OPTIONS /
+< 204 none
+
+## HTTP GET /metrics
+< 404 text/plain; charset=utf-8
+< not found
+
+## HTTP GET /admin
+< 404 text/plain
+< not found
+
+## HTTP GET /admin/api/overview unsigned
+< 404 text/plain
+< not found
+
+## HTTP GET /admin/api/overview signed by a stranger
+< 404 text/plain
+< not found
+
+## HTTP GET /admin/api/overview with a forged signature
+< 404 text/plain
+< not found
+
+## HTTP NIP-86 unsigned
+< 404 text/plain
+< not found
+
+## HTTP NIP-86 signed by a stranger
+< 404 text/plain
+< not found
+
+## HTTP NIP-86 with a forged signature
+< 404 text/plain
+< not found

@@ -194,6 +194,29 @@ A test checks that each profile still has the properties in this table, so a
 change of default cannot quietly make a profile stand for something else.
 `minimal` must turn off every capability that some setting can turn off.
 
+## Golden transcripts
+
+`wok-compat` `tests/golden_transcripts.rs` sends one fixed script to a relay
+of every profile:
+- events that are accepted, duplicated, forged, mistimed or refused by a
+  gate, and REQs, COUNTs and NEG-* messages that are served or refused;
+- malformed messages, and AUTH with right and wrong challenges and
+  signatures;
+- HTTP requests to every listener path, unsigned, signed by a stranger and
+  forged.
+
+It saves what the relay answers in `tests/transcripts/<profile>.txt`. Ids,
+keys and signatures are numbered in order of first appearance, timestamps are
+offsets, and the AUTH challenge is a placeholder, so a transcript is the same
+on every run.
+
+A change that moves a check, such as refusing a request before its signature
+is verified, changes some answers. Rerun the test with
+`WOK_BLESS_TRANSCRIPTS=1` and review the diff of `tests/transcripts/` in the
+pull request: lines that change should be the requests the change is meant to
+refuse differently, and nothing in the `default` or `public` transcripts
+should change unless that is the point of the change.
+
 ## Keeping this page current
 
 | Test | Fails when |
@@ -204,3 +227,4 @@ change of default cannot quietly make a profile stand for something else.
 | `wok-compat` `tests/attack_surface.rs` | A profile file is added, removed or loses one of its properties, or is missing from [Profiles](#profiles). |
 | `wok-ws` `nip86` tests | A NIP-86 method is missing from the [nip86.md](nip86.md#supported-methods) table, or its level there differs from the code's. |
 | `wok-cli` tests | A `wok` command has no row in [Commands](#commands), or a row names a command that does not exist. |
+| `wok-compat` `tests/golden_transcripts.rs` | A profile's relay answers the script differently from its file in `tests/transcripts/`, or a transcript has no profile. |

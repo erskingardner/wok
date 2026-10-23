@@ -1,0 +1,66 @@
+# Wok preset: marmot
+#
+# A relay dedicated to Marmot (MLS group messaging over Nostr), such as one a
+# Marmot app ships as a default: group messages (445), Welcomes in gift wraps
+# (1059), KeyPackages (30443), and the profile and relay-list kinds clients
+# look up. Users read and write everything else on other relays.
+#
+# Select it with `preset = "marmot"`. It overlays the public preset, so every
+# setting not listed here keeps its public value; docs/config.md documents
+# each. The relay refuses to start without relay.auth.service_url, because
+# recipients read their gift wraps only after NIP-42 AUTH.
+#
+# Reasons for each value (https://github.com/erskingardner/wok/issues/97,
+# section 4.2; Marmot spec a717f22, MDK 2ff9c142):
+#
+# - [relay.auth] accepted_kinds: the kinds MDK publishes, plus 5 (it retires
+#   KeyPackages with a deletion) and 62 (vanish requests). Anything else is
+#   refused, and NIP-11 advertises restricted_writes.
+# - Writes stay open (write_policy = "open", the public value). Marmot signs
+#   each 445 with a fresh key, so the relay cannot link a message to its
+#   sender, and MDK publishes 445s anonymously first. Requiring AUTH for
+#   writes would hand the relay the one thing the throwaway keys withhold:
+#   which account posts to which group. Abuse control relies on the
+#   per-connection and per-address budgets instead.
+# - Reads keep the public read classes: a 1059 only to its recipient after
+#   AUTH; 445s to anyone who names the group; 30443, 10002 and 10050 to
+#   anyone, since an inviter must fetch them.
+# - [relay.filter_validation] require_scoped_filters: each filter names ids,
+#   authors or a tag. It refuses {"kinds":[445]}, which would list every
+#   group's messages, and accepts MDK's #h group, #p inbox, ids and
+#   directory filters.
+# - [events] max_event_size = 4 MiB, [relay] max_websocket_payload_size and
+#   [relay.unix] max_frame_bytes = 8 MiB: Welcomes carry the ratchet tree and
+#   Add commits carry each new member's KeyPackage, so both grow with the
+#   group. MDK accepts events up to 5 MiB. Provisional until Welcome sizes are
+#   measured at 100, 500 and 1,000 members.
+# - [relay] max_filter_limit = 5000: directory batches with KeyPackage slots.
+# - [relay.abuse] event_burst = 300: one inviter's commit plus up to about 250
+#   Welcomes from one address.
+# - [relay.abuse.per_connection] req_rate_per_second = 50, req_burst = 300:
+#   about two REQs or NEG-OPENs per group at startup, plus ids fetches.
+#   neg_msg_burst = 500: a NIP-77 pass per group and per inbox.
+
+[events]
+max_event_size = 4194304
+
+[relay]
+max_websocket_payload_size = 8388608
+max_filter_limit = 5000
+
+[relay.unix]
+max_frame_bytes = 8388608
+
+[relay.auth]
+accepted_kinds = [0, 3, 5, 62, 445, 1059, 10000, 10002, 10050, 30443]
+
+[relay.filter_validation]
+require_scoped_filters = true
+
+[relay.abuse]
+event_burst = 300
+
+[relay.abuse.per_connection]
+req_rate_per_second = 50
+req_burst = 300
+neg_msg_burst = 500

@@ -45,9 +45,47 @@ the keys it changes; [presets/](presets/) has a copy of each.
 | Preset | Use |
 |---|---|
 | `public` | A general public relay. Its values are the built-in defaults, so its overlay is empty. |
+| `marmot` | A relay dedicated to [Marmot](#the-marmot-preset) group messaging, such as one a Marmot app ships as a default. |
 
-Further presets, starting with `marmot`, are planned; see
+Further presets, such as an allowlisted `private` one, are planned; see
 [#97](https://github.com/erskingardner/wok/issues/97).
+
+### The `marmot` preset
+
+[presets/marmot.toml](presets/marmot.toml) carries the reason for each
+value. In short, against the public preset:
+
+| Setting | `marmot` | Why |
+|---|---|---|
+| `relay.auth.accepted_kinds` | `[0, 3, 5, 62, 445, 1059, 10000, 10002, 10050, 30443]` | Group messages (445), Welcomes in gift wraps (1059), KeyPackages (30443), the profile and relay-list kinds MDK publishes, KeyPackage deletions (5) and vanish requests (62). Other kinds are refused, and NIP-11 advertises `restricted_writes`. |
+| `relay.filter_validation.require_scoped_filters` | `true` | Refuses `{"kinds":[445]}`, which would list every group's messages; MDK's `#h`, `#p`, `ids` and directory filters name their scope. |
+| `events.max_event_size` | 4 MiB | Welcomes and Add commits grow with the group; MDK accepts events up to 5 MiB. Provisional. |
+| `relay.max_websocket_payload_size`, `relay.unix.max_frame_bytes` | 8 MiB | Room for those events on either transport. |
+| `relay.max_filter_limit` | `5000` | Directory batches with KeyPackage slots. |
+| `relay.abuse.event_burst` | `300` | One inviter's commit plus up to about 250 Welcomes from one address. |
+| `relay.abuse.per_connection.req_rate_per_second`, `req_burst` | `50`, `300` | About two REQs or NEG-OPENs per group at startup, plus `ids` fetches. |
+| `relay.abuse.per_connection.neg_msg_burst` | `500` | A NIP-77 pass per group and per inbox. |
+
+Writes stay open (`write_policy = "open"`). Marmot signs each 445 with a
+fresh key, so the relay cannot link a message to its sender, and MDK
+publishes 445s on an anonymous connection; requiring AUTH to write would
+reveal which account posts to which group. Abuse control relies on the
+per-connection and per-address budgets instead. Reads keep the public read
+classes: a gift wrap only to its recipient after AUTH, 445s to anyone who
+names the group, and KeyPackages and relay lists to anyone, since an inviter
+must fetch them.
+
+A `marmot` relay needs NIP-42: it refuses to start, and a reload that would
+leave it without usable AUTH is refused, unless `relay.auth.service_url` is
+set (and `relay.auth.enabled` left on). `wok doctor` reports this as a
+failed `preset` check.
+
+```toml
+preset = "marmot"
+
+[relay.auth]
+service_url = "wss://relay.example.com"
+```
 
 `wok config show` prints the effective configuration, one dotted key per line,
 with the origin of each value: `default`, `preset <name>`, or the file and

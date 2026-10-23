@@ -90,6 +90,10 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         );
     }
 
+    // The relay refuses to start, or to reload, with this configuration.
+    if let Some(error) = cfg.serving_error() {
+        report.add("preset", CheckStatus::Fail, error);
+    }
     match cfg.auth_configuration_warning() {
         Some(detail) => report.add("relay-auth", CheckStatus::Warn, detail),
         None => report.add(

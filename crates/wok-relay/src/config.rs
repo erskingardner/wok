@@ -788,6 +788,22 @@ impl Config {
         self.relay.auth.enabled && !self.relay.auth.service_url.is_empty()
     }
 
+    /// Why the relay refuses to serve this configuration, if it does: a
+    /// requirement of its preset that the file does not meet. The relay
+    /// checks it when it starts and on each reload, not when a file is
+    /// parsed, so `wok config show` and a preset's own defaults still load.
+    pub fn serving_error(&self) -> Option<String> {
+        match self.preset {
+            Preset::Marmot if !self.auth_usable() => Some(
+                "the marmot preset needs NIP-42 AUTH, without which recipients cannot read \
+                 their gift wraps: set relay.auth.service_url to the relay's public URL, and \
+                 leave relay.auth.enabled on"
+                    .into(),
+            ),
+            _ => None,
+        }
+    }
+
     /// NIP-11 `limitation.auth_required`: every REQ, COUNT and NEG-OPEN
     /// needs AUTH, under any `read_policy` but `open`. Particular kinds can
     /// need AUTH whatever this says, as NIP-11 allows. While AUTH cannot
@@ -3031,13 +3047,16 @@ negentropy_enabled = true
 
     #[test]
     fn unknown_preset_is_an_error_naming_the_valid_presets() {
-        let error = Config::parse_toml("preset = \"marmot\"\n").unwrap_err();
-        assert_eq!(error, r#"unknown preset "marmot"; valid presets: public"#);
+        let error = Config::parse_toml("preset = \"private\"\n").unwrap_err();
+        assert_eq!(
+            error,
+            r#"unknown preset "private"; valid presets: public, marmot"#
+        );
         let error = Config::parse_toml("preset = \"Public\"\n").unwrap_err();
-        assert!(error.contains("valid presets: public"), "{error}");
+        assert!(error.contains("valid presets: public, marmot"), "{error}");
         let error = Config::parse_toml("preset = 1\n").unwrap_err();
         assert!(
-            error.contains("preset must be a string naming one of: public"),
+            error.contains("preset must be a string naming one of: public, marmot"),
             "{error}"
         );
         // Section-level keys named `preset` are still unknown fields.
@@ -3065,6 +3084,7 @@ negentropy_enabled = true
         for &preset in Preset::ALL {
             let documented = match preset {
                 Preset::Public => include_str!("../../../docs/presets/public.toml"),
+                Preset::Marmot => include_str!("../../../docs/presets/marmot.toml"),
             };
             assert_eq!(
                 preset.overlay(),
@@ -3083,6 +3103,75 @@ negentropy_enabled = true
         // The public preset is the built-in defaults.
         let public: toml::Value = toml::from_str(Preset::Public.overlay()).unwrap();
         assert_eq!(public, toml::Value::Table(Default::default()));
+    }
+
+    #[test]
+    fn the_marmot_preset_tunes_a_relay_for_marmot() {
+        let marmot = Config::parse_toml("preset = \"marmot\"\n").unwrap();
+        assert_eq!(marmot.preset, Preset::Marmot);
+        assert_eq!(marmot.events.max_event_size, 4 * 1024 * 1024);
+        assert_eq!(marmot.relay.max_websocket_payload_size, 8 * 1024 * 1024);
+        assert_eq!(marmot.relay.unix.max_frame_bytes, 8 * 1024 * 1024);
+        assert_eq!(marmot.relay.max_filter_limit, 5_000);
+        let auth = &marmot.relay.auth;
+        assert_eq!(
+            auth.accepted_kinds,
+            [0, 3, 5, 62, 445, 1059, 10000, 10002, 10050, 30443]
+        );
+        // Open writes keep group membership unlinkable at the relay (#97
+        // decision 4); reads keep the public read classes.
+        assert_eq!(auth.write_policy, AccessPolicy::Open);
+        assert_eq!(auth.read_policy, AccessPolicy::Open);
+        assert_eq!(
+            marmot.read_restrictor(),
+            Config::default().read_restrictor()
+        );
+        assert!(marmot.relay.filter_validation.require_scoped_filters);
+        assert_eq!(marmot.relay.abuse.event_burst, 300);
+        let per_connection = &marmot.relay.abuse.per_connection;
+        assert_eq!(
+            (
+                per_connection.req_rate_per_second,
+                per_connection.req_burst,
+                per_connection.neg_msg_rate_per_second,
+                per_connection.neg_msg_burst
+            ),
+            (50, 300, 50, 500)
+        );
+        assert!(marmot.restricted_writes() && !marmot.auth_required());
+        // Its own values raise no zero-guard warning.
+        assert!(marmot.zero_guard_warnings().is_empty());
+        // A file sets the preset's values from it, with provenance.
+        let explained =
+            Config::explain_toml("preset = \"marmot\"\n[relay.abuse]\nevent_burst = 500\n")
+                .unwrap();
+        let burst = entry(&explained, "relay.abuse.event_burst");
+        assert_eq!(burst.preset_value.as_deref(), Some("300"));
+        assert_eq!(
+            entry(&explained, "relay.max_filter_limit").origin,
+            Origin::Preset(Preset::Marmot)
+        );
+    }
+
+    #[test]
+    fn the_marmot_preset_needs_usable_auth_to_serve() {
+        let marmot = Config::parse_toml("preset = \"marmot\"\n").unwrap();
+        assert!(marmot
+            .serving_error()
+            .unwrap()
+            .contains("relay.auth.service_url"));
+        let served = Config::parse_toml(
+            "preset = \"marmot\"\n[relay.auth]\nservice_url = \"wss://relay.example.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(served.serving_error(), None);
+        let mut disabled = served.clone();
+        disabled.relay.auth.enabled = false;
+        assert!(disabled.serving_error().is_some());
+        // The public preset only warns.
+        assert_eq!(Config::default().serving_error(), None);
+        // Its defaults still load, for `wok config show --defaults`.
+        assert_eq!(marmot.preset_defaults().preset, Preset::Marmot);
     }
 
     fn test_overlay(_: Preset) -> &'static str {

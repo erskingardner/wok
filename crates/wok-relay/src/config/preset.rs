@@ -17,16 +17,19 @@ pub enum Preset {
     /// A general public relay. Its values are the built-in defaults.
     #[default]
     Public,
+    /// A relay dedicated to Marmot group messaging.
+    Marmot,
 }
 
 impl Preset {
     /// Every preset, in the order error messages list them.
-    pub const ALL: &'static [Preset] = &[Preset::Public];
+    pub const ALL: &'static [Preset] = &[Preset::Public, Preset::Marmot];
 
     /// The name the `preset` key uses.
     pub fn name(self) -> &'static str {
         match self {
             Preset::Public => "public",
+            Preset::Marmot => "marmot",
         }
     }
 
@@ -35,6 +38,7 @@ impl Preset {
     pub fn overlay(self) -> &'static str {
         match self {
             Preset::Public => include_str!("../../presets/public.toml"),
+            Preset::Marmot => include_str!("../../presets/marmot.toml"),
         }
     }
 

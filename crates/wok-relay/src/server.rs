@@ -11,7 +11,9 @@ use writer::*;
 mod sub_gate;
 use sub_gate::{Current, Ns, SubGate};
 
-use crate::abuse::{leading_zero_bits, AbuseController, Admission, BudgetKind};
+use crate::abuse::{
+    leading_zero_bits, AbuseController, Admission, BudgetKind, ConnectionBudgets, Refusal, Request,
+};
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
 use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
@@ -1936,6 +1938,7 @@ fn run_ingester(
     neg_txs: Vec<Sender<NegMsg>>,
 ) {
     let mut auth: HashMap<u64, AuthSession> = HashMap::new();
+    let mut budgets: HashMap<u64, ConnectionBudgets> = HashMap::new();
     let mut generations = Generations::default();
     let mut dispatch = Dispatch::new(writer_tx, req_txs, mon_txs, neg_txs);
     loop {
@@ -1978,6 +1981,7 @@ fn run_ingester(
                         .authenticated_connections
                         .fetch_sub(1, Ordering::Relaxed);
                 }
+                budgets.remove(&conn_id);
                 dispatch.close(conn_id);
             }
             IngestMsg::Client {
@@ -1997,6 +2001,7 @@ fn run_ingester(
                     &abuse,
                     &moderation,
                     &mut auth,
+                    &mut budgets,
                     &mut generations,
                     conn_id,
                     source,
@@ -2018,6 +2023,7 @@ fn handle_client(
     abuse: &AbuseController,
     moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
+    budgets: &mut HashMap<u64, ConnectionBudgets>,
     generations: &mut Generations,
     conn_id: u64,
     source: TransportSource,
@@ -2094,24 +2100,12 @@ fn handle_client(
         }
         ClientCommand::Req { sub_id, filters } => {
             metrics.client_req.fetch_add(1, Ordering::Relaxed);
-            let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-            if !abuse.admit_source(&source, BudgetKind::Req, &cfg.relay.abuse)
-                || pubkey
-                    .as_ref()
-                    .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
-            {
-                metrics
-                    .abuse_req_rate_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                refuse_req(
-                    conns,
-                    metrics,
-                    dispatch,
-                    conn_id,
-                    Ns::Req,
-                    &sub_id,
-                    "rate-limited: REQ budget exhausted".into(),
-                );
+            let request = (Request::Req, "REQ");
+            let admitted = admit_request(
+                cfg, metrics, abuse, budgets, auth, conn_id, &source, request,
+            );
+            if let Err(reason) = admitted {
+                refuse_req(conns, metrics, dispatch, conn_id, Ns::Req, &sub_id, reason);
                 return;
             }
             ingest_req(
@@ -2130,15 +2124,11 @@ fn handle_client(
         }
         ClientCommand::Count { sub_id, filters } => {
             metrics.client_count.fetch_add(1, Ordering::Relaxed);
-            let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-            if !abuse.admit_source(&source, BudgetKind::Count, &cfg.relay.abuse)
-                || pubkey
-                    .as_ref()
-                    .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Count, &cfg.relay.abuse))
-            {
-                metrics
-                    .abuse_count_rate_rejections
-                    .fetch_add(1, Ordering::Relaxed);
+            let request = (Request::Count, "COUNT");
+            let admitted = admit_request(
+                cfg, metrics, abuse, budgets, auth, conn_id, &source, request,
+            );
+            if let Err(reason) = admitted {
                 refuse_req(
                     conns,
                     metrics,
@@ -2146,7 +2136,7 @@ fn handle_client(
                     conn_id,
                     Ns::Count,
                     &sub_id,
-                    "rate-limited: COUNT budget exhausted".into(),
+                    reason,
                 );
                 return;
             }
@@ -2192,6 +2182,7 @@ fn handle_client(
                 abuse,
                 &source,
                 auth,
+                budgets,
                 conn_id,
                 sub_id,
                 Some(filter),
@@ -2210,6 +2201,7 @@ fn handle_client(
                 abuse,
                 &source,
                 auth,
+                budgets,
                 conn_id,
                 sub_id,
                 None,
@@ -2430,7 +2422,7 @@ fn ingest_event(
         }
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(packed.pubkey());
-        if !abuse.admit_pubkey(&pubkey, BudgetKind::Event, &cfg.relay.abuse) {
+        if !abuse.admit_author(&pubkey, &cfg.relay.abuse) {
             metrics
                 .abuse_event_rate_rejections
                 .fetch_add(1, Ordering::Relaxed);
@@ -3076,6 +3068,42 @@ fn admit_invalid(
     false
 }
 
+/// Charge a REQ, COUNT, NEG-OPEN or NEG-MSG, named by `request`, to its
+/// connection's own budget and its address's backstop. `Err` is the
+/// refusal reason. These budgets refill, so it is `rate-limited:`.
+#[allow(clippy::too_many_arguments)]
+fn admit_request(
+    cfg: &Config,
+    metrics: &Metrics,
+    abuse: &AbuseController,
+    budgets: &mut HashMap<u64, ConnectionBudgets>,
+    auth: &HashMap<u64, AuthSession>,
+    conn_id: u64,
+    source: &TransportSource,
+    (request, command): (Request, &str),
+) -> Result<(), String> {
+    // Any key can AUTH on an open relay, so the larger budget AUTH earns is
+    // the connection's own; the address backstop still applies.
+    let authenticated = auth
+        .get(&conn_id)
+        .is_some_and(|session| session.authed.is_some());
+    let budgets = budgets.entry(conn_id).or_default();
+    let refusal =
+        match abuse.admit_request(budgets, source, request, authenticated, &cfg.relay.abuse) {
+            Ok(()) => return Ok(()),
+            Err(refusal) => refusal,
+        };
+    let rejections = match request {
+        Request::Count => &metrics.abuse_count_rate_rejections,
+        Request::Req | Request::NegMsg => &metrics.abuse_req_rate_rejections,
+    };
+    rejections.fetch_add(1, Ordering::Relaxed);
+    Err(match refusal {
+        Refusal::Connection => format!("rate-limited: {command} budget exhausted"),
+        Refusal::Address => format!("rate-limited: {command} budget exhausted for this address"),
+    })
+}
+
 /// NIP-77: a NEG-OPEN or NEG-MSG the relay cannot service is answered with
 /// NEG-ERR, after which the subscription is closed. The worker that owns the
 /// session sends it, after dropping the session, so no NEG-MSG for this id can
@@ -3118,30 +3146,25 @@ fn ingest_neg_command(
     abuse: &AbuseController,
     source: &TransportSource,
     auth: &mut HashMap<u64, AuthSession>,
+    budgets: &mut HashMap<u64, ConnectionBudgets>,
     conn_id: u64,
     sub_id: String,
     filter: Option<Value>,
     payload_hex: String,
     dispatch: &mut Dispatch,
 ) {
-    // NEG-MSG shares the REQ token budget: reconciliation messages each cost a
-    // worker round with B-tree descents, and persistent sessions could
-    // otherwise stream them back-to-back forever.
-    let pubkey = auth.get(&conn_id).and_then(|session| session.authed);
-    if !abuse.admit_source(source, BudgetKind::Req, &cfg.relay.abuse)
-        || pubkey
-            .as_ref()
-            .is_some_and(|pk| !abuse.admit_pubkey(pk, BudgetKind::Req, &cfg.relay.abuse))
-    {
-        metrics
-            .abuse_req_rate_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        let cmd = if filter.is_some() {
-            "NEG-OPEN"
-        } else {
-            "NEG-MSG"
-        };
-        let reason = format!("rate-limited: {cmd} budget exhausted");
+    // A NEG-OPEN starts a scan, so it draws on the REQ budgets. A NEG-MSG
+    // continues a session its NEG-OPEN paid for, so a sync pass per group
+    // does not use up the REQs a client opens next. Each round still costs a
+    // worker B-tree descents, and a session could otherwise stream them
+    // forever, so they have a per-connection budget of their own.
+    let request = if filter.is_some() {
+        (Request::Req, "NEG-OPEN")
+    } else {
+        (Request::NegMsg, "NEG-MSG")
+    };
+    let admitted = admit_request(cfg, metrics, abuse, budgets, auth, conn_id, source, request);
+    if let Err(reason) = admitted {
         neg_err(conns, metrics, dispatch, conn_id, &sub_id, reason);
         return;
     }

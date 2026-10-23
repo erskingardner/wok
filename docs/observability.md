@@ -64,8 +64,8 @@ earlier release inserted are indexed, `indexed_through / high_water` is.
 |---|---|
 | `connection_rate` | Network-address connection bucket exhausted. |
 | `event_rate` | Per-address EVENT/AUTH or per-author EVENT budget exhausted. |
-| `req_rate` | REQ budget exhausted. |
-| `count_rate` | COUNT budget exhausted. |
+| `req_rate` | A connection's REQ or NEG-MSG budget, or its address's REQ backstop, exhausted (REQ, NEG-OPEN, NEG-MSG). |
+| `count_rate` | A connection's COUNT budget, or its address's COUNT backstop, exhausted. |
 | `invalid_rate` | Malformed-message budget exhausted. |
 | `pow` | Event did not meet the configured NIP-13 difficulty. |
 | `query_cost` | Estimated historical-query cost exceeded its ceiling. |

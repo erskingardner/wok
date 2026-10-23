@@ -49,3 +49,13 @@
 # - [relay.abuse] ipv6_prefix_len = 64: per-address budgets key an IPv6
 #   client by its /64, the network one host is usually given, so it cannot
 #   take a fresh budget with each address it picks. 128 keys each address.
+# - [relay.abuse.per_connection] req_rate_per_second = 20, req_burst = 100,
+#   neg_msg_rate_per_second = 50, neg_msg_burst = 200, count_rate_per_second
+#   = 5, count_burst = 20, authenticated_multiplier = 4: each connection has
+#   REQ, NEG-MSG and COUNT budgets of its own, so a 60-REQ startup and a
+#   NIP-77 pass per group fit, and AUTH raises them instead of adding a
+#   stricter per-pubkey budget. [relay.abuse] req_rate_per_second = 200,
+#   req_burst = 1000 (were 20 and 40), count_rate_per_second = 20,
+#   count_burst = 50 (were 5 and 10): the per-address budgets are a backstop
+#   over all of an address's connections, so users behind one NAT no longer
+#   share a single client's budget.

@@ -79,7 +79,8 @@ it is not a promise to reproduce upstream bugs.
   - No req worker waits on a monitor. Pinned strfry's worker blocks on the
     monitor for every REQ before sending EOSE.
 - Wok has native, reloadable abuse controls rather than delegating every
-  admission decision to a write-policy plugin: IP/pubkey token buckets,
+  admission decision to a write-policy plugin: per-connection, per-address
+  and per-author token buckets,
   pre-scan query costing, historical-query concurrency, author storage quotas,
   and optional NIP-13 proof of work. Migrated configs receive the documented
   Wok defaults and the preflight prints them for review. Per-address buckets

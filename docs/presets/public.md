@@ -18,9 +18,9 @@ fetches of large follow lists, feeds, threads, a NIP-77 pass per group) while
 every guard stays on. [config.md](../config.md) says what each one protects
 and what breaks when it is set too low.
 
-Set `relay.auth.service_url` to the relay's public URL. Without it NIP-42 is
-not advertised, nobody can log in, and the private kinds below cannot be read
-by anyone; the relay logs a warning at startup.
+Set `relay.auth.service_url` to the relay's public URL. Without it nobody can
+log in, the private kinds below cannot be read by anyone, NIP-42, NIP-59 and
+NIP-78 are not advertised, and the relay logs a warning at startup.
 
 ## What it changes from earlier releases
 

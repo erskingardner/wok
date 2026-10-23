@@ -3433,13 +3433,21 @@ max_event_size = 99999999999
                     .collect()
             })
             .collect();
-        let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
-        let mut checked = 0;
-        for entry in std::fs::read_dir(&docs).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|extension| extension != "md") {
-                continue;
+        let mut pages = Vec::new();
+        let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "md") {
+                    pages.push(path);
+                }
             }
+        }
+        assert!(pages.iter().any(|page| page.ends_with("presets/marmot.md")));
+        let mut checked = 0;
+        for path in pages {
             let text = std::fs::read_to_string(&path).unwrap();
             let links = text
                 .match_indices("config.md#")

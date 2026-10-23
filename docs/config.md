@@ -129,12 +129,12 @@ dashboard shows them read-only. A reload that changes `read_policy` or
 
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
-| `relay.auth.enabled` | `true` | NIP-42 authentication, which private reads, owner-only writes and the non-open policies need. | Off: nobody can log in, so private kinds cannot be read by anyone, and AUTH is refused with `blocked:`. | NIP-42 in `supported_nips` while usable |
-| `relay.auth.service_url` | empty | The relay URL an AUTH event must name, so an AUTH signed for another relay is refused. | Empty: AUTH cannot succeed, and the relay logs what fails closed at startup. A `marmot` relay refuses to start. | — |
+| `relay.auth.enabled` | `true` | NIP-42 authentication, which private reads, owner-only writes and the non-open policies need. | Off: nobody can log in, so private kinds cannot be read by anyone, and AUTH is refused with `blocked:`. | NIP-42 in `supported_nips` while AUTH is usable; NIP-59 and NIP-78 need it too, see [Read classes](#read-classes) |
+| `relay.auth.service_url` | empty | The relay URL an AUTH event must name, so an AUTH signed for another relay is refused. | Empty: AUTH cannot succeed, and the relay logs what fails closed at startup. A `marmot` relay refuses to start. | As `relay.auth.enabled`: AUTH is usable only with both |
 | `relay.auth.read_policy` | `"open"` | Who may send REQ, COUNT and NEG-OPEN: `open`, `authenticated` or `members`. See [Read and write policies](#read-and-write-policies). | — | `auth_required` while not `open` and AUTH is usable |
 | `relay.auth.write_policy` | `"open"` | Who may publish: `open`, `authenticated` or `members`. NIP-62 vanish requests are always accepted. | — | `restricted_writes` while not `open` |
-| `relay.auth.recipient_only_kinds` | `[4, 1059, 21059]` | DMs and gift wraps: read only by their author and first `p`-tag recipient. | Leaving out 1059 or 21059 serves gift wraps, recipient tag included, to anyone, and stops NIP-59 being advertised. | — |
-| `relay.auth.owner_only_kinds` | `[78, 30078]` | NIP-78 app data: read only by its author, and accepted only from a connection authenticated as the author. | Leaving them out serves app data to anyone, and stops NIP-78 being advertised. | — |
+| `relay.auth.recipient_only_kinds` | `[4, 1059, 21059]` | DMs and gift wraps: read only by their author and first `p`-tag recipient. | Leaving out 1059 or 21059 serves gift wraps, recipient tag included, to anyone, and stops NIP-59 being advertised. | NIP-59 in `supported_nips`, see [Read classes](#read-classes) |
+| `relay.auth.owner_only_kinds` | `[78, 30078]` | NIP-78 app data: read only by its author, and accepted only from a connection authenticated as the author. | Leaving them out serves app data to anyone, and stops NIP-78 being advertised. | NIP-78 in `supported_nips`, see [Read classes](#read-classes) |
 | `relay.auth.authenticated_kinds` | `[]` | Kinds any authenticated connection may read, whichever pubkey it authenticated as. | — | — |
 | `relay.auth.inbox_kinds` | `[1059, 21059]` | Under `write_policy = "members"`, events of these kinds are also accepted when their first `p` tag is a member, so anyone can deliver gift wraps to members. | Empty: outsiders cannot deliver DMs or Marmot Welcomes to members. | — |
 | `relay.auth.accepted_kinds` | `[]` | The kinds the relay accepts; empty accepts every kind. A ceiling for the NIP-86 kind policy. See [Accepted kinds](#accepted-kinds). | Kinds clients publish are refused with `restricted:`. | `restricted_writes` while set |
@@ -177,8 +177,12 @@ writes to sets `owner_only_kinds = []`. Apps that publish public data in
 78 or 30078, which anyone could read through 0.7, can no longer be read by
 other users; set `owner_only_kinds = []` to serve them as before.
 
-Wok advertises NIP-59 only while both gift-wrap kinds are recipient-only, and
-NIP-78 only while both app-data kinds are owner-only.
+Wok advertises NIP-59 only while recipients can read their gift wraps and
+nobody else can: AUTH is usable, both gift-wrap kinds (1059 and 21059) are
+recipient-only, with no stricter class, and `events.ephemeral_persistence` is
+`live_only`. It advertises NIP-78 only while AUTH is usable and both app-data
+kinds (78 and 30078) are owner-only. The public defaults without a
+`service_url` advertise neither.
 
 ### Read and write policies
 
@@ -267,9 +271,9 @@ the dashboard. An event that breaks one is refused with `OK false` and
 | `events.reject_older_than_secs` | `0` | Nothing meaningful: old events sort below new ones. `0` means no lower bound. A set bound spares replaceable, addressable, deletion and vanish events. | Old posts can't be rebroadcast, and history can't be imported. | `created_at_lower_limit`, only while set |
 | `events.reject_newer_than_secs` | `900` | Feeds, from future-dated posts that would stay pinned at the top. | Users whose clocks run fast can't post. | `created_at_upper_limit` |
 | `events.reject_ephemeral_older_than_secs` | `60` | Live subscribers, from replayed ephemeral events (kinds 20000–29999, such as NIP-46). AUTH and 21059 use their NIPs' windows. | Ephemeral messages from clients with slow clocks or queues are refused. | — |
-| `events.ephemeral_persistence` | `"live_only"` | Storage: `live_only` delivers ephemeral events to live subscribers without storing them; `ttl` stores them for `ephemeral_lifetime_secs`. | — | — |
+| `events.ephemeral_persistence` | `"live_only"` | Storage: `live_only` delivers ephemeral events to live subscribers without storing them; `ttl` stores them for `ephemeral_lifetime_secs`. | — | `ttl` removes NIP-59 from `supported_nips` |
 | `events.ephemeral_lifetime_secs` | `300` | How long a stored (`ttl`) ephemeral event stays readable. | Clients that reconnect miss recent ephemeral events. | — |
-| `relay.abuse.min_pow_difficulty` | `0` | Spam: the NIP-13 difficulty, in leading zero bits of the id, every event must meet. `0` is off. | — (too high: most clients can't post; few mine proof of work, and Marmot clients never do.) | `min_pow_difficulty`, `restricted_writes` while set |
+| `relay.abuse.min_pow_difficulty` | `0` | Spam: the NIP-13 difficulty, in leading zero bits of the id, every event must meet. `0` is off. | — (too high: most clients can't post; few mine proof of work, and Marmot clients never do.) | `min_pow_difficulty`, always (0 while abuse protection is off); above 0 it also adds NIP-13 to `supported_nips` and sets `restricted_writes` |
 | `relay.nip62.enabled` | `true` | NIP-62 Request to Vanish: accept requests to erase everything an author published here. | Off: users can't erase their data from this relay. Deletion markers stored earlier stay enforced. | NIP-62 in `supported_nips` |
 | `relay.nip62.service_url` | empty | The relay URL a targeted vanish request must name; empty uses `relay.auth.service_url`. `ALL_RELAYS` always matches. | — | — |
 
@@ -321,9 +325,9 @@ may keep open. All reload live and are on the dashboard.
 | `relay.max_subs_per_connection` | `200` | Live-matching memory per connection. It also bounds the queries waiting for the concurrency cap. | Apps that keep many subscriptions open have some refused with `blocked: too many concurrent REQs`. Clients use 30–100. | `max_subscriptions` |
 | `relay.max_filter_limit` | `2000` | Rows per filter: a filter's `limit` is clamped to it, and a filter without one gets it. | Results are cut, and clients make extra round trips. At 500, the default through 0.7, MDK's directory batches (`limit` 1,200) and outbox fetches without a `limit` lost events. | `max_limit`, `default_limit` |
 | `relay.max_total_events_per_req` | `10000` | Rows per REQ over all its filters, deduplicated. `0` is unlimited. | Merged batches are cut. At 2,000, the default through 0.7, five filters of 500 lost a fifth of their events. | `max_total_events_per_req` |
-| `relay.max_tags_per_filter` | `8` | Residual tag checks on each candidate event: the distinct tag letters across `#` and NIP-91 `&` keys. | Comment, community and marketplace queries are refused. At 3, the default through 0.7, a NIP-22 query on `#E`, `#K`, `#P` and `#k` was. | `max_tags_per_filter` |
-| `relay.max_and_entries` | `16` | NIP-91 checks on each candidate event: the values across all `&` keys of one filter. `0` turns NIP-91 off and removes it from `supported_nips`. | NIP-91 queries that require several tags are refused. | `max_and_entries` |
-| `relay.max_filter_limit_count` | `1000000` | COUNT de-duplication memory: the most events one COUNT filter counts. `0` turns COUNT off. | Counts of popular events, such as followers or reactions, are capped, and the reply carries `limited: true`. | — |
+| `relay.max_tags_per_filter` | `8` | Residual tag checks on each candidate event: the distinct tag letters across `#` and NIP-91 `&` keys. | Comment, community and marketplace queries are refused. At 3, the default through 0.7, a NIP-22 query on `#E`, `#K`, `#P` and `#k` was. | `max_tags_per_filter`; `0` also removes NIP-91 from `supported_nips` |
+| `relay.max_and_entries` | `16` | NIP-91 checks on each candidate event: the values across all `&` keys of one filter. `0` turns NIP-91 off. | NIP-91 queries that require several tags are refused. | `max_and_entries`; NIP-91 in `supported_nips` while it and `max_tags_per_filter` are above 0 |
+| `relay.max_filter_limit_count` | `1000000` | COUNT de-duplication memory: the most events one COUNT filter counts. `0` turns COUNT off. | Counts of popular events, such as followers or reactions, are capped, and the reply carries `limited: true`. | NIP-45 in `supported_nips` while above 0 |
 | `relay.abuse.max_query_work` | `20000` | Query workers, from requests whose estimated index work is too large. `0` is unlimited. See [Query work](#query-work). | Batched and outbox queries are refused with `blocked: query too broad`. | `max_query_work`, while abuse protection is on and it is set |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Query workers' fairness: scans one connection runs at once, counted separately for its REQs and COUNTs and its NEG-OPENs. More wait in arrival order. `0` runs none. | Busy clients see slow first results. | `max_concurrent_historical_queries` |
 | `relay.filter_validation.require_scoped_filters` | `false` | Enumeration: every filter must name `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. Refuses `{"kinds":[445]}`, `{"since":…}` or a bare `search`. On in `marmot`. | — | — |

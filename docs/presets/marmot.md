@@ -67,8 +67,14 @@ no proof of work, NIP-77 on, and the per-address backstops.
   publishes 445s anonymously, authenticating only after an `auth-required:`
   refusal. Requiring AUTH to write would give the relay the one thing the
   throwaway keys withhold: which account posts to which group. Abuse control
-  relies on the per-connection and per-address budgets instead, and
-  per-author budgets and quotas cannot apply to throwaway keys.
+  relies on the per-connection and per-address budgets instead. On an
+  anonymous connection, a new key for each event starts a new per-author
+  budget and storage count each time. On a connection logged in as an
+  account, events from other keys are charged to that account's per-author
+  EVENT budget (`relay.abuse.pubkey_event_burst`, 50 with no AUTH
+  multiplier), so a logged-in inviter's burst of Welcomes can hit it before
+  the per-address `event_burst` of 300. A key used again is held to the
+  per-author storage quota.
 - **Proof of work.** It stays 0: MDK never mines, and treats `pow:` as final.
 
 ## Not covered yet
@@ -78,6 +84,7 @@ no proof of work, NIP-77 on, and the per-address backstops.
   retention, and Wok drops those once they expire; there is no per-kind
   retention window for the rest.
 - **Per-group and per-recipient quotas.** A quota per `#h` group or per
-  gift-wrap recipient does not exist yet, and per-author quotas never apply
-  to throwaway keys. Until then the preset relies on the per-address EVENT
-  budget, `database.min_free_disk_bytes` and `database.map_size`.
+  gift-wrap recipient does not exist yet, and the per-author storage quota
+  counts each event's own key, so a new key per event escapes it. Until
+  then the preset relies on the per-address EVENT budget,
+  `database.min_free_disk_bytes` and `database.map_size`.

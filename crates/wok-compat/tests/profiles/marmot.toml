@@ -1,0 +1,7 @@
+# The marmot preset as a Marmot app's default relay runs it: only the kinds
+# MDK publishes are accepted, every filter must be scoped, and writes stay
+# open. The preset refuses to start without relay.auth.service_url.
+preset = "marmot"
+
+[relay.auth]
+service_url = "wss://relay.example.com"

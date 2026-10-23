@@ -307,7 +307,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message, NIP-86 level, Unix-socket check and `wok` command, who can reach
   it, the setting that gates it, and the work Wok does before that gate.
   Tests fail when the listener answers a path the page does not list, in any
-  of six configuration profiles, or when a client verb, NIP-86 method level
+  of seven configuration profiles, or when a client verb, NIP-86 method level
   or command differs from it. `docs/nip86.md` now gives each method's level.
 
 ### Preset changes

@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wok_db::{Env, EnvOptions};
 use wok_relay::protocol::ParseFailure;
 use wok_relay::{
-    AccessPolicy, CapabilityCondition, ClientCommand, Config, RELAY_CAPABILITY_CATALOG,
+    AccessPolicy, CapabilityCondition, ClientCommand, Config, Preset, RELAY_CAPABILITY_CATALOG,
 };
 
 const INVENTORY: &str = include_str!("../../../docs/attack-surface.md");
@@ -96,6 +96,15 @@ fn check_profile(name: &str, cfg: &Config) {
                 [hex::encode(key.x_only_public_key().0.serialize())],
                 "the gated admin must be the key of secret 1"
             );
+        }
+        "marmot" => {
+            assert_eq!(cfg.preset, Preset::Marmot);
+            assert!(cfg.auth_usable());
+            assert!(!cfg.relay.auth.accepted_kinds.is_empty());
+            assert!(cfg.relay.filter_validation.require_scoped_filters);
+            assert_eq!(cfg.relay.auth.write_policy, AccessPolicy::Open);
+            assert!(!cfg.admin.enabled);
+            assert!(nips.contains(&42) && nips.contains(&59), "{nips:?}");
         }
         "minimal" => {
             let always: BTreeSet<u64> = RELAY_CAPABILITY_CATALOG
@@ -420,11 +429,16 @@ fn ticked(cell: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every string literal in the Rust files of `dir` that looks like a URL path.
+/// Every string literal in the Rust files under `dir`, submodules included,
+/// that looks like a URL path.
 fn path_literals(dir: &Path) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let file = entry.unwrap().path();
+        if file.is_dir() {
+            paths.extend(path_literals(&file));
+            continue;
+        }
         if file.extension().is_none_or(|ext| ext != "rs") {
             continue;
         }

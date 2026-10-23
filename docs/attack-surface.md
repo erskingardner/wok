@@ -16,8 +16,9 @@ When you add or change an entry point, update its row and ask three
 questions:
 
 - **Default configuration.** Is the code reachable with no settings at all
-  (the [`default`](#profiles) profile)? If no default feature needs it, put
-  it behind a setting that is off by default.
+  (the [`default`](#profiles) profile), or with a shipped preset (`marmot`)?
+  If no default feature needs it, put it behind a setting that is off by
+  default.
 - **Work before the gate.** What runs before the gate decides? Parsing,
   decoding, signature verification and allocation all belong after the
   cheapest check that can refuse the request.
@@ -107,7 +108,9 @@ level and refuses a signer with none. It parses the request body, and
 refuses a method that is not in its method table or is above the signer's
 level before it reads the method's parameters.
 [nip86.md](nip86.md#supported-methods) lists every method with the level it
-needs.
+needs. With `relay.auth.accepted_kinds` set, the kind-policy methods work
+under that ceiling: `allowkind` cannot make the relay accept a kind the file
+does not list.
 
 ## Operator inputs
 
@@ -115,7 +118,7 @@ needs.
 | --- | --- | --- |
 | Config file | `wok relay` and the other commands | Strict TOML. `wok relay` checks the file every second and reloads `Live` settings; a file that fails to parse keeps the running configuration. Without a file at the `--config` path, `wok relay` and the database commands run on the built-in defaults with a warning. |
 | Write-policy plugin | The writer | `relay.write_policy_plugin` runs through `sh -c`; event JSON goes to its standard input. See [write-policy plugins](production-deployment.md#write-policy-plugins). |
-| Dashboard configuration writes | `PUT /admin/api/config` | Admin only, with `admin.allow_config_writes`. Admin credentials, proxy trust, authentication policy, plugin paths and restart-only settings stay file-only; see [config.md](config.md#reload-and-dashboard-boundaries). |
+| Dashboard configuration writes | `PUT /admin/api/config` | Admin only, with `admin.allow_config_writes`. Admin credentials, proxy trust, the access settings (shown read-only), plugin paths and restart-only settings stay file-only; see [config.md](config.md#reload-and-dashboard-boundaries). |
 | Management state | NIP-86 | Bans, allow lists, roles, kind policy and IP blocks are stored in the database and apply at once. The relay-info methods edit the config file like a dashboard write. |
 
 ### Commands
@@ -164,6 +167,7 @@ of running Wok. A test only points it at a temporary database and port.
 | --- | --- |
 | `default` | No settings: what a relay runs before its operator configures it. AUTH is unusable, and the dashboard, NIP-86 and the Unix socket are off. |
 | `public` | A public relay configured as [wok.toml](wok.toml) asks: AUTH works, so DMs and gift wraps reach their recipients. |
+| `marmot` | The `marmot` preset, as a Marmot app's default relay runs it: `relay.auth.accepted_kinds` limits it to the kinds MDK publishes, every filter must be scoped, and writes stay open. |
 | `gated` | A members-only relay: `relay.auth.read_policy` and `write_policy` set to `members`, AUTH, the dashboard and NIP-86. |
 | `minimal` | Every optional capability off: negentropy, COUNT, NIP-91, NIP-62, AUTH and compression. |
 | `proxied` | Behind a reverse proxy that passes the client's address in `X-Real-IP`. |

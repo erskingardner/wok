@@ -392,8 +392,8 @@ NIP-78 only while both app-data kinds are owner-only.
 
 `read_policy` and `write_policy` say who may use the relay at all; the read
 classes then apply on top. NIP-11 advertises `auth_required` while
-`read_policy` is not `open`, and `restricted_writes` while `write_policy` is
-not `open` (or proof of work is required). Each is one of:
+`read_policy` is not `open` and AUTH is usable, and `restricted_writes` while
+`write_policy` is not `open` (or proof of work is required). Each is one of:
 
 | Policy | Who may read | Who may write |
 |---|---|---|

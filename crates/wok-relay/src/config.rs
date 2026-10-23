@@ -775,9 +775,10 @@ impl Config {
 
     /// NIP-11 `limitation.auth_required`: every REQ, COUNT and NEG-OPEN
     /// needs AUTH, under any `read_policy` but `open`. Particular kinds can
-    /// need AUTH whatever this says, as NIP-11 allows.
+    /// need AUTH whatever this says, as NIP-11 allows. While AUTH cannot
+    /// succeed it is not asked for, as NIP-42 is then not advertised.
     pub fn auth_required(&self) -> bool {
-        self.relay.auth.read_policy != AccessPolicy::Open
+        self.relay.auth.read_policy != AccessPolicy::Open && self.auth_usable()
     }
 
     /// NIP-11 `limitation.restricted_writes`: an event must meet a condition
@@ -2808,9 +2809,14 @@ negentropy_enabled = true
     #[test]
     fn nip11_access_flags_follow_the_policies_and_proof_of_work() {
         let mut c = Config::default();
+        c.relay.auth.service_url = "wss://relay.example.com".into();
         assert!(!c.auth_required() && !c.restricted_writes());
         c.relay.auth.read_policy = AccessPolicy::Authenticated;
         assert!(c.auth_required() && !c.restricted_writes());
+        // Not while AUTH cannot succeed.
+        c.relay.auth.enabled = false;
+        assert!(!c.auth_required());
+        c.relay.auth.enabled = true;
         c.relay.auth.read_policy = AccessPolicy::Open;
         c.relay.auth.write_policy = AccessPolicy::Members;
         assert!(!c.auth_required() && c.restricted_writes());

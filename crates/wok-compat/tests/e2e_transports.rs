@@ -1219,7 +1219,10 @@ async fn nip11_advertises_access_requirements_as_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
-    let handle = wok_relay::start(env, test_cfg(dir.path())).unwrap();
+    let mut cfg = test_cfg(dir.path());
+    cfg.relay.auth.enabled = true;
+    cfg.relay.auth.service_url = "wss://relay.example.com".into();
+    let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let h = handle.clone();
@@ -1240,6 +1243,16 @@ async fn nip11_advertises_access_requirements_as_enforced() {
     handle.config.write().relay.auth.read_policy = wok_relay::AccessPolicy::Members;
     let limitation = &reqwest_get_nip11(addr).await["limitation"];
     assert_eq!(flags(limitation), (json!(true), json!(false)));
+    // While AUTH cannot succeed, clients are not told to try it: reads are
+    // refused with `restricted:` instead, and NIP-42 is not advertised.
+    handle.config.write().relay.auth.service_url.clear();
+    let nip11 = reqwest_get_nip11(addr).await;
+    assert_eq!(flags(&nip11["limitation"]), (json!(false), json!(false)));
+    assert!(!nip11["supported_nips"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(42)));
+    handle.config.write().relay.auth.service_url = "wss://relay.example.com".into();
     {
         let mut cfg = handle.config.write();
         cfg.relay.auth.read_policy = wok_relay::AccessPolicy::Open;

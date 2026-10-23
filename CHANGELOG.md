@@ -243,9 +243,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host can no longer take a fresh budget with each address it picks from its
   network. `128` keys each IPv6 address on its own, as before. IPv4 is
   unchanged, and NIP-86 IP bans still match exact addresses.
+- `public`: REQ and COUNT budgets are per connection first, with the
+  per-address keys as a backstop (see Changed). Files that pin the old
+  per-address values, as copies of the 0.7 `docs/wok.toml` do, keep them as
+  their backstop, and `wok doctor` flags them.
+  - New `[relay.abuse.per_connection]`: `req_rate_per_second = 20` and
+    `req_burst = 100` (REQs, replacement REQs and NEG-OPENs; a 60-REQ
+    startup fits), `neg_msg_rate_per_second = 50` and `neg_msg_burst = 200`,
+    `count_rate_per_second = 5` and `count_burst = 20`, and
+    `authenticated_multiplier = 4`.
+  - `relay.abuse.req_rate_per_second` is `200` and `req_burst` `1000` (were
+    20 and 40, the only REQ budget, per address).
+  - `relay.abuse.count_rate_per_second` is `20` and `count_burst` `50` (were
+    5 and 10).
 
 ### Changed
 
+- REQ, COUNT, NEG-OPEN and NEG-MSG are charged to a budget of the
+  connection's own (`[relay.abuse.per_connection]`) and to its address's
+  backstop (`relay.abuse.req_*`, `count_*`), and are refused when either is
+  spent. Before, the only REQ budget was 20 a second, burst 40, per address,
+  so a client opening 60 subscriptions at startup lost 20 of them, and users
+  behind one NAT, office or VPN shared that budget. The connection is
+  charged only when its address's backstop admits too. Refusals by the
+  backstop end `for this address`; both keep `rate-limited:`.
+- NEG-MSG rounds no longer cost REQ tokens. They draw on a per-connection
+  NEG-MSG budget, and on the address's REQ backstop, so a client that runs a
+  NIP-77 pass per group at startup still has its REQ budget for the
+  subscriptions it opens next. A NEG-OPEN still costs a REQ token.
+- Authenticating raises a connection's own REQ, NEG-MSG and COUNT budgets
+  by `authenticated_multiplier` (4), at once. Before, an AUTHed connection
+  was also charged to a per-pubkey REQ and COUNT bucket at the per-address
+  rate, so AUTH made the budget stricter and every connection signed in
+  with one key shared it. Those buckets are gone. The per-address backstop
+  is not multiplied, since any key can authenticate on an open relay.
 - `wok relay` warns at startup when `relay.real_ip_header` is empty and the
   relay listens only on loopback or private addresses, as behind a reverse
   proxy: every client then has the proxy's address and shares one set of

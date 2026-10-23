@@ -1018,13 +1018,20 @@ fn setting_for(reason: &str) -> &'static str {
         "relay.abuse.pubkey_event_rate_per_second / pubkey_event_burst"
     } else if r.contains("event budget") || r.contains("auth budget") {
         "relay.abuse.event_rate_per_second / event_burst"
-    } else if r.contains("req budget")
+    } else if (r.contains("req budget")
         || r.contains("neg-open budget")
-        || r.contains("neg-msg budget")
+        || r.contains("neg-msg budget"))
+        && r.contains("for this address")
     {
         "relay.abuse.req_rate_per_second / req_burst"
-    } else if r.contains("count budget") {
+    } else if r.contains("req budget") || r.contains("neg-open budget") {
+        "relay.abuse.per_connection.req_rate_per_second / req_burst"
+    } else if r.contains("neg-msg budget") {
+        "relay.abuse.per_connection.neg_msg_rate_per_second / neg_msg_burst"
+    } else if r.contains("count budget") && r.contains("for this address") {
         "relay.abuse.count_rate_per_second / count_burst"
+    } else if r.contains("count budget") {
+        "relay.abuse.per_connection.count_rate_per_second / count_burst"
     } else if r.contains("connection budget") || r.contains("http 429") {
         "relay.abuse.connection_rate_per_second / connection_burst"
     } else if r.contains("invalid messages") {
@@ -2830,6 +2837,24 @@ fn effective_limits(cfg: &wok_relay::Config) -> BTreeMap<String, String> {
     [
         ("relay.abuse.enabled", a.enabled.to_string()),
         (
+            "relay.abuse.per_connection.req_rate_per_second / req_burst",
+            format!(
+                "{} / {}",
+                a.per_connection.req_rate_per_second, a.per_connection.req_burst
+            ),
+        ),
+        (
+            "relay.abuse.per_connection.neg_msg_rate_per_second / neg_msg_burst",
+            format!(
+                "{} / {}",
+                a.per_connection.neg_msg_rate_per_second, a.per_connection.neg_msg_burst
+            ),
+        ),
+        (
+            "relay.abuse.per_connection.authenticated_multiplier",
+            a.per_connection.authenticated_multiplier.to_string(),
+        ),
+        (
             "relay.abuse.req_rate_per_second / req_burst",
             format!("{} / {}", a.req_rate_per_second, a.req_burst),
         ),
@@ -3614,11 +3639,31 @@ mod tests {
         for (reason, setting) in [
             (
                 "rate-limited: REQ budget exhausted",
-                "relay.abuse.req_rate_per_second / req_burst",
+                "relay.abuse.per_connection.req_rate_per_second / req_burst",
+            ),
+            (
+                "rate-limited: NEG-OPEN budget exhausted",
+                "relay.abuse.per_connection.req_rate_per_second / req_burst",
             ),
             (
                 "rate-limited: NEG-MSG budget exhausted",
+                "relay.abuse.per_connection.neg_msg_rate_per_second / neg_msg_burst",
+            ),
+            (
+                "rate-limited: COUNT budget exhausted",
+                "relay.abuse.per_connection.count_rate_per_second / count_burst",
+            ),
+            (
+                "rate-limited: REQ budget exhausted for this address",
                 "relay.abuse.req_rate_per_second / req_burst",
+            ),
+            (
+                "rate-limited: NEG-MSG budget exhausted for this address",
+                "relay.abuse.req_rate_per_second / req_burst",
+            ),
+            (
+                "rate-limited: COUNT budget exhausted for this address",
+                "relay.abuse.count_rate_per_second / count_burst",
             ),
             (
                 "rate-limited: author EVENT budget exhausted",

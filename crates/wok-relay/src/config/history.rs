@@ -29,6 +29,10 @@ const PAST_DEFAULTS: &[(&str, &str, &str)] = &[
         "0.7.0",
     ),
     ("relay.filter_validation.max_kinds_per_filter", "3", "0.7.0"),
+    ("relay.abuse.req_rate_per_second", "20", "0.7.0"),
+    ("relay.abuse.req_burst", "40", "0.7.0"),
+    ("relay.abuse.count_rate_per_second", "5", "0.7.0"),
+    ("relay.abuse.count_burst", "10", "0.7.0"),
 ];
 
 /// A key the operator's file pins to a built-in default that a later release

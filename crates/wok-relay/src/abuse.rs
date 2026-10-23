@@ -55,10 +55,81 @@ impl Principal {
 
 #[derive(Debug)]
 struct Bucket {
-    tokens: f64,
+    /// Tokens taken and not yet refilled. Counting what was spent rather
+    /// than what is left applies a changed burst at once, such as an AUTHed
+    /// connection's larger one.
+    spent: f64,
     last: Instant,
     /// A refusal was already reported since the last admission.
     refusal_reported: bool,
+}
+
+impl Bucket {
+    fn new(now: Instant) -> Self {
+        Self {
+            spent: 0.0,
+            last: now,
+            refusal_reported: false,
+        }
+    }
+
+    fn refill(&mut self, now: Instant, rate_per_second: u32) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.spent = (self.spent - elapsed * f64::from(rate_per_second)).max(0.0);
+        self.last = now;
+    }
+
+    fn has_token(&self, burst: u32) -> bool {
+        self.spent + 1.0 <= f64::from(burst)
+    }
+
+    fn take(&mut self) {
+        self.spent += 1.0;
+        self.refusal_reported = false;
+    }
+
+    fn admit(&mut self, now: Instant, rate_per_second: u32, burst: u32) -> Admission {
+        self.refill(now, rate_per_second);
+        if !self.has_token(burst) {
+            if self.refusal_reported {
+                return Admission::Refused;
+            }
+            self.refusal_reported = true;
+            return Admission::FirstRefusal;
+        }
+        self.take();
+        Admission::Admitted
+    }
+}
+
+/// A request that draws on its connection's own budget
+/// (`relay.abuse.per_connection`) and on its address's backstop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// A REQ, including one that replaces a subscription, or a NEG-OPEN:
+    /// each starts a scan.
+    Req,
+    /// A NEG-MSG round of a sync session already admitted by its NEG-OPEN.
+    NegMsg,
+    Count,
+}
+
+/// The budget that refused a [`Request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The connection's own.
+    Connection,
+    /// The backstop every connection from its address shares.
+    Address,
+}
+
+/// One connection's own budgets. The ingester that owns the connection
+/// keeps them, so they take no lock and end with the connection.
+#[derive(Debug, Default)]
+pub struct ConnectionBudgets {
+    req: Option<Bucket>,
+    neg_msg: Option<Bucket>,
+    count: Option<Bucket>,
 }
 
 #[derive(Debug, Default)]
@@ -101,15 +172,87 @@ impl AbuseController {
         self.admit(principal, kind, rate, burst)
     }
 
-    pub fn admit_pubkey(&self, pubkey: &[u8; 32], kind: BudgetKind, cfg: &AbuseConfig) -> bool {
+    /// Charge `request` to its connection's own budget, which is
+    /// `authenticated_multiplier` times larger once the connection is
+    /// AUTHed, and to its address's backstop, which is not. Neither is
+    /// charged unless both admit, so a connection over its own budget does
+    /// not spend its neighbours' share of the backstop. Unix-socket
+    /// connections are local and exempt, as from every rate budget.
+    pub fn admit_request(
+        &self,
+        budgets: &mut ConnectionBudgets,
+        source: &TransportSource,
+        request: Request,
+        authenticated: bool,
+        cfg: &AbuseConfig,
+    ) -> Result<(), Refusal> {
+        let TransportSource::Ip(ip) = source else {
+            return Ok(());
+        };
+        if !cfg.enabled {
+            return Ok(());
+        }
+        let own = &cfg.per_connection;
+        let (rate, burst, slot, backstop) = match request {
+            Request::Req => (
+                own.req_rate_per_second,
+                own.req_burst,
+                &mut budgets.req,
+                BudgetKind::Req,
+            ),
+            Request::NegMsg => (
+                own.neg_msg_rate_per_second,
+                own.neg_msg_burst,
+                &mut budgets.neg_msg,
+                BudgetKind::Req,
+            ),
+            Request::Count => (
+                own.count_rate_per_second,
+                own.count_burst,
+                &mut budgets.count,
+                BudgetKind::Count,
+            ),
+        };
+        let multiplier = if authenticated {
+            own.authenticated_multiplier
+        } else {
+            1
+        };
+        let (rate, burst) = (
+            rate.saturating_mul(multiplier),
+            burst.saturating_mul(multiplier),
+        );
+        let now = Instant::now();
+        let bucket = (rate != 0 && burst != 0).then(|| {
+            let bucket = slot.get_or_insert_with(|| Bucket::new(now));
+            bucket.refill(now, rate);
+            bucket
+        });
+        if bucket
+            .as_ref()
+            .is_some_and(|bucket| !bucket.has_token(burst))
+        {
+            return Err(Refusal::Connection);
+        }
+        let (backstop_rate, backstop_burst) = spec(backstop, cfg);
+        let address = Principal::address(*ip, cfg.ipv6_prefix_len);
+        if self.admit(address, backstop, backstop_rate, backstop_burst) != Admission::Admitted {
+            return Err(Refusal::Address);
+        }
+        if let Some(bucket) = bucket {
+            bucket.take();
+        }
+        Ok(())
+    }
+
+    /// Charge an event to its author's budget.
+    pub fn admit_author(&self, pubkey: &[u8; 32], cfg: &AbuseConfig) -> bool {
         if !cfg.enabled {
             return true;
         }
-        let (rate, burst) = match kind {
-            BudgetKind::Event => (cfg.pubkey_event_rate_per_second, cfg.pubkey_event_burst),
-            _ => spec(kind, cfg),
-        };
-        self.admit(Principal::Pubkey(*pubkey), kind, rate, burst) == Admission::Admitted
+        let (rate, burst) = (cfg.pubkey_event_rate_per_second, cfg.pubkey_event_burst);
+        self.admit(Principal::Pubkey(*pubkey), BudgetKind::Event, rate, burst)
+            == Admission::Admitted
     }
 
     fn admit(
@@ -131,27 +274,11 @@ impl AbuseController {
                 .buckets
                 .retain(|_, bucket| bucket.last >= stale_before);
         }
-        let bucket = state
+        state
             .buckets
             .entry((principal, kind))
-            .or_insert_with(|| Bucket {
-                tokens: burst as f64,
-                last: now,
-                refusal_reported: false,
-            });
-        let elapsed = now.duration_since(bucket.last).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * rate_per_second as f64).min(burst as f64);
-        bucket.last = now;
-        if bucket.tokens < 1.0 {
-            if bucket.refusal_reported {
-                return Admission::Refused;
-            }
-            bucket.refusal_reported = true;
-            return Admission::FirstRefusal;
-        }
-        bucket.tokens -= 1.0;
-        bucket.refusal_reported = false;
-        Admission::Admitted
+            .or_insert_with(|| Bucket::new(now))
+            .admit(now, rate_per_second, burst)
     }
 }
 
@@ -202,8 +329,96 @@ mod tests {
         assert!(!limiter.admit_source(&local, BudgetKind::Req, &cfg));
         cfg.pubkey_event_burst = 1;
         let pubkey = [7u8; 32];
-        assert!(limiter.admit_pubkey(&pubkey, BudgetKind::Event, &cfg));
-        assert!(!limiter.admit_pubkey(&pubkey, BudgetKind::Event, &cfg));
+        assert!(limiter.admit_author(&pubkey, &cfg));
+        assert!(!limiter.admit_author(&pubkey, &cfg));
+    }
+
+    #[test]
+    fn requests_draw_on_the_connection_and_its_address_backstop() {
+        let mut cfg = crate::Config::default().relay.abuse;
+        // One token a second: nothing refills between checks.
+        cfg.req_rate_per_second = 1;
+        cfg.req_burst = 3;
+        cfg.per_connection.req_rate_per_second = 1;
+        cfg.per_connection.req_burst = 2;
+        cfg.per_connection.neg_msg_rate_per_second = 1;
+        cfg.per_connection.neg_msg_burst = 1;
+        let limiter = AbuseController::default();
+        let local = source("192.0.2.1");
+        let (mut first, mut second) = (ConnectionBudgets::default(), ConnectionBudgets::default());
+        let admit = |budgets: &mut ConnectionBudgets, request, authed| {
+            limiter.admit_request(budgets, &local, request, authed, &cfg)
+        };
+        assert_eq!(admit(&mut first, Request::Req, false), Ok(()));
+        assert_eq!(admit(&mut first, Request::Req, false), Ok(()));
+        // The connection's own budget refuses first, and its refusal leaves
+        // the backstop's last token to the address's other connection.
+        assert_eq!(
+            admit(&mut first, Request::Req, false),
+            Err(Refusal::Connection)
+        );
+        assert_eq!(admit(&mut second, Request::Req, false), Ok(()));
+        assert_eq!(
+            admit(&mut second, Request::Req, false),
+            Err(Refusal::Address)
+        );
+        // NEG-MSG rounds have their own per-connection bucket but share the
+        // address's REQ backstop.
+        assert_eq!(
+            admit(&mut second, Request::NegMsg, true),
+            Err(Refusal::Address)
+        );
+        let other = source("198.51.100.1");
+        let mut third = ConnectionBudgets::default();
+        let admit = |budgets: &mut ConnectionBudgets, request, authed| {
+            limiter.admit_request(budgets, &other, request, authed, &cfg)
+        };
+        assert_eq!(admit(&mut third, Request::NegMsg, false), Ok(()));
+        assert_eq!(
+            admit(&mut third, Request::NegMsg, false),
+            Err(Refusal::Connection)
+        );
+        // AUTH multiplies the connection's bursts at once.
+        assert_eq!(admit(&mut third, Request::NegMsg, true), Ok(()));
+        assert_eq!(admit(&mut third, Request::Req, true), Ok(()));
+        assert_eq!(
+            admit(&mut third, Request::Req, true),
+            Err(Refusal::Address),
+            "the backstop is not multiplied"
+        );
+    }
+
+    #[test]
+    fn unix_connections_and_disabled_controls_skip_request_budgets() {
+        let mut cfg = crate::Config::default().relay.abuse;
+        cfg.per_connection.count_rate_per_second = 1;
+        cfg.per_connection.count_burst = 1;
+        let limiter = AbuseController::default();
+        let mut budgets = ConnectionBudgets::default();
+        for _ in 0..3 {
+            assert_eq!(
+                limiter.admit_request(
+                    &mut budgets,
+                    &TransportSource::Unix,
+                    Request::Count,
+                    false,
+                    &cfg
+                ),
+                Ok(())
+            );
+        }
+        let local = source("192.0.2.1");
+        let mut admit = |cfg: &AbuseConfig| {
+            limiter.admit_request(&mut budgets, &local, Request::Count, false, cfg)
+        };
+        assert_eq!(admit(&cfg), Ok(()));
+        assert_eq!(admit(&cfg), Err(Refusal::Connection));
+        cfg.enabled = false;
+        assert_eq!(admit(&cfg), Ok(()));
+        // A zero rate or burst turns the connection's bucket off.
+        cfg.enabled = true;
+        cfg.per_connection.count_burst = 0;
+        assert_eq!(admit(&cfg), Ok(()));
     }
 
     #[test]

@@ -275,6 +275,25 @@ pub struct AbuseConfig {
     pub max_stored_events: u64,
     pub max_stored_events_per_pubkey: u64,
     pub min_pow_difficulty: u8,
+    /// Each connection's own budgets. The address budgets above are a
+    /// backstop over all of an address's connections.
+    pub per_connection: PerConnectionConfig,
+}
+
+/// Budgets each connection has to itself (`[relay.abuse.per_connection]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerConnectionConfig {
+    /// REQs, replacement REQs and NEG-OPENs.
+    pub req_rate_per_second: u32,
+    pub req_burst: u32,
+    /// NEG-MSG rounds of sync sessions already admitted.
+    pub neg_msg_rate_per_second: u32,
+    pub neg_msg_burst: u32,
+    pub count_rate_per_second: u32,
+    pub count_burst: u32,
+    /// An AUTHed connection's budgets are this many times larger.
+    pub authenticated_multiplier: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,10 +467,10 @@ impl Default for Config {
                     event_burst: 100,
                     pubkey_event_rate_per_second: 25,
                     pubkey_event_burst: 50,
-                    req_rate_per_second: 20,
-                    req_burst: 40,
-                    count_rate_per_second: 5,
-                    count_burst: 10,
+                    req_rate_per_second: 200,
+                    req_burst: 1_000,
+                    count_rate_per_second: 20,
+                    count_burst: 50,
                     invalid_rate_per_second: 5,
                     invalid_burst: 20,
                     max_concurrent_historical_queries: 8,
@@ -459,6 +478,16 @@ impl Default for Config {
                     max_stored_events: 0,
                     max_stored_events_per_pubkey: 1_000_000,
                     min_pow_difficulty: 0,
+                    per_connection: PerConnectionConfig {
+                        req_rate_per_second: 20,
+                        // A client's startup burst of about 60 REQs fits.
+                        req_burst: 100,
+                        neg_msg_rate_per_second: 50,
+                        neg_msg_burst: 200,
+                        count_rate_per_second: 5,
+                        count_burst: 20,
+                        authenticated_multiplier: 4,
+                    },
                 },
                 unix: UnixConfig {
                     enabled: false,
@@ -607,6 +636,11 @@ fn validate(mut parsed: TomlConfig) -> Result<Config, String> {
         ));
     }
     tracing_subscriber_filter_syntax(&parsed.observability.log_filter)?;
+    if parsed.relay.abuse.per_connection.authenticated_multiplier == 0 {
+        return Err(
+            "relay.abuse.per_connection.authenticated_multiplier must be at least 1".into(),
+        );
+    }
     if !(1..=128).contains(&parsed.relay.abuse.ipv6_prefix_len) {
         return Err(
             "relay.abuse.ipv6_prefix_len must be from 1 to 128 (128 keys each IPv6 address \
@@ -1158,6 +1192,7 @@ impl Config {
                     a.max_stored_events,
                     a.max_stored_events_per_pubkey,
                     a.min_pow_difficulty,
+                    a.per_connection.clone(),
                 ),
             )
         };
@@ -1281,6 +1316,27 @@ impl Config {
                     a.invalid_burst,
                     p.invalid_rate_per_second,
                     p.invalid_burst,
+                ),
+                (
+                    "per_connection.req",
+                    a.per_connection.req_rate_per_second,
+                    a.per_connection.req_burst,
+                    p.per_connection.req_rate_per_second,
+                    p.per_connection.req_burst,
+                ),
+                (
+                    "per_connection.neg_msg",
+                    a.per_connection.neg_msg_rate_per_second,
+                    a.per_connection.neg_msg_burst,
+                    p.per_connection.neg_msg_rate_per_second,
+                    p.per_connection.neg_msg_burst,
+                ),
+                (
+                    "per_connection.count",
+                    a.per_connection.count_rate_per_second,
+                    a.per_connection.count_burst,
+                    p.per_connection.count_rate_per_second,
+                    p.per_connection.count_burst,
                 ),
             ] {
                 if zeroed(rate.into(), preset_rate.into())
@@ -2273,6 +2329,30 @@ mod tests {
     }
 
     #[test]
+    fn per_connection_budgets_have_their_own_table() {
+        let cfg = Config::parse_toml(
+            "[relay.abuse]\nreq_burst = 300\n\n\
+             [relay.abuse.per_connection]\nreq_burst = 60\nauthenticated_multiplier = 2\n",
+        )
+        .unwrap();
+        let abuse = &cfg.relay.abuse;
+        assert_eq!((abuse.req_rate_per_second, abuse.req_burst), (200, 300));
+        let own = &abuse.per_connection;
+        assert_eq!((own.req_rate_per_second, own.req_burst), (20, 60));
+        assert_eq!((own.neg_msg_rate_per_second, own.neg_msg_burst), (50, 200));
+        assert_eq!((own.count_rate_per_second, own.count_burst), (5, 20));
+        assert_eq!(own.authenticated_multiplier, 2);
+        // 0 would make every AUTHed budget zero, which disables the bucket.
+        let zero =
+            Config::parse_toml("[relay.abuse.per_connection]\nauthenticated_multiplier = 0\n")
+                .unwrap_err();
+        assert!(zero.contains("at least 1"), "{zero}");
+        let unknown =
+            Config::parse_toml("[relay.abuse.per_connection]\nevent_burst = 5\n").unwrap_err();
+        assert!(unknown.contains("event_burst"), "{unknown}");
+    }
+
+    #[test]
     fn ipv6_prefix_len_is_validated() {
         assert_eq!(Config::default().relay.abuse.ipv6_prefix_len, 64);
         for len in [1, 48, 128] {
@@ -2366,6 +2446,22 @@ mod tests {
             assert!(
                 !cfg.zero_guard_warnings().is_empty(),
                 "{field} = 0 should warn"
+            );
+        }
+        for field in [
+            "req_rate_per_second",
+            "req_burst",
+            "neg_msg_rate_per_second",
+            "neg_msg_burst",
+            "count_rate_per_second",
+            "count_burst",
+        ] {
+            let cfg = Config::parse_toml(&format!("[relay.abuse.per_connection]\n{field} = 0\n"))
+                .unwrap();
+            let warnings = cfg.zero_guard_warnings();
+            assert!(
+                warnings.iter().any(|w| w.contains("per_connection")),
+                "per_connection.{field} = 0 should warn: {warnings:?}"
             );
         }
         for field in [

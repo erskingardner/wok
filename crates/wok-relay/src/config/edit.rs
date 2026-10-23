@@ -263,7 +263,7 @@ real_ip_header = "x-real-ip"
 [relay.abuse]
 # Copied from the old sample.
 event_burst = 100
-req_burst = 40
+invalid_burst = 20
 
 [events]
 max_num_tags = 8000
@@ -289,7 +289,7 @@ max_num_tags = 8000
                 "admin.enabled",
                 "observability.log_format",
                 "relay.abuse.event_burst",
-                "relay.abuse.req_burst",
+                "relay.abuse.invalid_burst",
                 "relay.bind",
             ]
         );
@@ -336,6 +336,10 @@ max_num_tags = 8000
              restricted_read_kinds = [4, 1059]\n\
              \n\
              [relay.abuse]\n\
+             req_rate_per_second = 20\n\
+             req_burst = 40\n\
+             count_rate_per_second = 5\n\
+             count_burst = 10\n\
              # Zero means unlimited. Secure defaults bound both global and per-author use.\n\
              max_stored_events = 10000000\n\
              max_stored_events_per_pubkey = 100000\n"

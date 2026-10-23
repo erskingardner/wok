@@ -48,8 +48,8 @@ quirk. It also provides an additional Unix-domain socket transport.
   (SIGUSR1/SIGINT), write-policy plugins, Prometheus metrics, structured JSON
   tracing for Grafana/Loki pipelines, hard-bounded local chart history, and
   migration of the supported `strfry.conf` subset.
-- **Native abuse resistance**: per-IP and per-pubkey token buckets, separate
-  connection/EVENT/REQ/COUNT budgets, pre-scan query costing, historical-query
+- **Native abuse resistance**: per-connection, per-address and per-author
+  token buckets, separate connection/EVENT/REQ/NEG-MSG/COUNT budgets, pre-scan query costing, historical-query
   concurrency limits, bounded NIP-50 index growth, default global and author
   storage quotas, a free-disk reserve, rejection metrics, and optional NIP-13
   proof-of-work enforcement advertised through NIP-11.

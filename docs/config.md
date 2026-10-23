@@ -434,8 +434,9 @@ way; strfry's section is off unless `enabled = true`.
 
 ## Abuse protection
 
-All abuse settings reload live. All but `ipv6_prefix_len` are
-dashboard-editable.
+All abuse settings reload live. All but `ipv6_prefix_len` and the
+`per_connection` table are dashboard-editable. See [Rates](#rates) for how
+the per-connection and per-address budgets combine.
 
 | Key | Default | Meaning |
 |---|---:|---|
@@ -447,10 +448,10 @@ dashboard-editable.
 | `relay.abuse.event_burst` | `100` | Per-address EVENT and AUTH bucket capacity. |
 | `relay.abuse.pubkey_event_rate_per_second` | `25` | Refilled publication tokens per event author each second. |
 | `relay.abuse.pubkey_event_burst` | `50` | Per-author publication bucket capacity. |
-| `relay.abuse.req_rate_per_second` | `20` | Refilled REQ, NEG-OPEN, and NEG-MSG tokens per network address each second. |
-| `relay.abuse.req_burst` | `40` | Per-address REQ, NEG-OPEN, and NEG-MSG bucket capacity. |
-| `relay.abuse.count_rate_per_second` | `5` | Refilled COUNT tokens per network address each second. |
-| `relay.abuse.count_burst` | `10` | Per-address COUNT bucket capacity. |
+| `relay.abuse.req_rate_per_second` | `200` | Backstop: refilled REQ, NEG-OPEN, and NEG-MSG tokens per network address each second, shared by all of its connections. |
+| `relay.abuse.req_burst` | `1000` | Per-address REQ, NEG-OPEN, and NEG-MSG bucket capacity. |
+| `relay.abuse.count_rate_per_second` | `20` | Backstop: refilled COUNT tokens per network address each second, shared by all of its connections. |
+| `relay.abuse.count_burst` | `50` | Per-address COUNT bucket capacity. |
 | `relay.abuse.invalid_rate_per_second` | `5` | Refilled tokens per network address each second for malformed messages, including CLOSE and NEG-CLOSE with an invalid subscription id. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until the bucket refills. Valid CLOSE and NEG-CLOSE are never budgeted. |
 | `relay.abuse.invalid_burst` | `20` | Per-address malformed-message bucket capacity. |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Historical scans per connection; zero rejects new scans. |
@@ -458,13 +459,63 @@ dashboard-editable.
 | `relay.abuse.max_stored_events` | `0` | Global durable event ceiling; the entire write transaction aborts before exceeding it. Zero, the public preset's value, is unlimited. See [Storage](#storage). |
 | `relay.abuse.max_stored_events_per_pubkey` | `1000000` | Hard author storage quota; zero is unlimited. See [Storage](#storage). |
 | `relay.abuse.min_pow_difficulty` | `0` | Required NIP-13 leading-zero bits; zero disables it. |
+| `relay.abuse.per_connection.req_rate_per_second` | `20` | Refilled REQ tokens per connection each second. REQs that replace a subscription and NEG-OPENs draw on it too. |
+| `relay.abuse.per_connection.req_burst` | `100` | Per-connection REQ bucket capacity. A client's startup burst of about 60 REQs fits. |
+| `relay.abuse.per_connection.neg_msg_rate_per_second` | `50` | Refilled NEG-MSG tokens per connection each second, for the rounds of sync sessions already admitted by their NEG-OPEN. |
+| `relay.abuse.per_connection.neg_msg_burst` | `200` | Per-connection NEG-MSG bucket capacity. |
+| `relay.abuse.per_connection.count_rate_per_second` | `5` | Refilled COUNT tokens per connection each second. |
+| `relay.abuse.per_connection.count_burst` | `20` | Per-connection COUNT bucket capacity. |
+| `relay.abuse.per_connection.authenticated_multiplier` | `4` | An AUTHed connection's per-connection rates and bursts are this many times larger; at least 1. The per-address backstops are not multiplied. |
 
 A zero rate or burst disables that individual token bucket. Unix-socket
 connections carry no network address (an empty IP), so by design they bypass
-every per-IP token bucket — connection, EVENT, REQ, and COUNT. Per-author
+every rate bucket — connection, EVENT, REQ, COUNT, and the per-connection
+budgets. Per-author
 publication, storage quotas, query-cost gates, and proof-of-work policies
 still apply to them. Keep the socket on a trusted host with tight
 `mode`/`auth_uids`/`auth_gids`.
+
+### Rates
+
+A REQ, COUNT, NEG-OPEN or NEG-MSG is charged to two budgets, and refused
+when either is spent:
+
+- its connection's own (`per_connection.*`): 20 REQs a second with a burst
+  of 100, 50 NEG-MSG rounds a second with a burst of 200, and 5 COUNTs a
+  second with a burst of 20;
+- its address's backstop (`req_*`, `count_*`), which every connection from
+  that address shares: 200 REQs a second with a burst of 1,000, and 20
+  COUNTs a second with a burst of 50. NEG-MSG rounds draw on the REQ
+  backstop.
+
+The connection is charged only when the backstop admits too, so a client
+over its own budget does not spend what its address's other connections
+have left. Users behind one NAT, office or VPN therefore no longer share a
+single 20-REQ budget, and one host still cannot multiply its share without
+bound by opening connections.
+
+A REQ that replaces a subscription and a NEG-OPEN start scans, so they draw
+on the REQ budgets. NEG-MSG rounds continue a session its NEG-OPEN paid
+for, so they have a per-connection budget of their own: a client that runs
+a NIP-77 pass per group at startup does not spend the REQs it opens next.
+
+Once a connection has authenticated with NIP-42, its per-connection rates
+and bursts are `authenticated_multiplier` (4) times larger, and the larger
+burst applies at once. Any key can authenticate on an open relay, so the
+backstop is not multiplied. Before 0.8, an AUTHed connection was also
+charged to a per-pubkey REQ and COUNT bucket, which made its budget
+stricter; those buckets are gone.
+
+Refusals keep `rate-limited:`, because the buckets refill: `CLOSED
+rate-limited: REQ budget exhausted` (or `COUNT`, or a NEG-ERR naming
+`NEG-OPEN` or `NEG-MSG`) for the connection's own budget, and the same
+reason ending `for this address` for the backstop.
+
+Copies of the 0.7 `docs/wok.toml` pin `req_rate_per_second = 20`,
+`req_burst = 40`, `count_rate_per_second = 5` and `count_burst = 10`. These
+keys keep their meaning, a per-address budget, so such a file keeps the old
+per-address limits under the new per-connection ones, and `wok doctor`
+lists them.
 
 ### Addresses
 

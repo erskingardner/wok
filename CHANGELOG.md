@@ -103,7 +103,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gets `auth-required:` and a challenge while authenticating could help, and
   `restricted:` otherwise. A connection the read policy stops admitting,
   such as a removed member, or an anonymous one after a reload to
-  `authenticated`, gets nothing more on its subscriptions, and its sync
+  `authenticated`, gets nothing more on its subscriptions: a scan waiting or
+  running is refused with CLOSED at its next time slice, and its sync
   sessions close. A reload that changes either
   policy is logged as a warning naming the old and new policy, and `wok
   doctor`'s `relay-auth` check, like the startup warning, now also names a

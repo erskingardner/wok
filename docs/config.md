@@ -409,8 +409,10 @@ A member is a pubkey that is not banned and is NIP-86 allowlisted
   authenticated as no member, or while AUTH is unusable. A connection the
   policy stops admitting, such as a member removed, or one that has not
   authenticated after a reload to `authenticated`, gets nothing more on its
-  open subscriptions, and its sync sessions end with `closed: visibility
-  changed`; a REQ whose stored events are being sent finishes.
+  open subscriptions. A REQ or COUNT whose scan is waiting or running is
+  refused with CLOSED, and the reason above, at its next time slice, and its
+  sync sessions end with `closed: visibility changed; reopen
+  synchronization`, as does a NEG-OPEN still queued.
 - **`write_policy = "authenticated"`** accepts an event only on an
   authenticated connection, signed by any key.
 - **`write_policy = "members"`** accepts an event when one of these is a

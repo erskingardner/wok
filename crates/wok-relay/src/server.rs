@@ -3071,21 +3071,27 @@ fn admit_reader(
     if reader_admitted(cfg, moderation, identities) {
         return Ok(());
     }
-    let authenticated = !identities.is_empty();
+    let refusal = read_policy_refusal(cfg, !identities.is_empty());
+    if refusal.starts_with("auth-required:") {
+        issue_challenge(conns, metrics, auth, conn_id);
+    }
+    Err(refusal)
+}
+
+/// The CLOSED reason for a read `relay.auth.read_policy` does not admit:
+/// `auth-required:` while authenticating can help.
+fn read_policy_refusal(cfg: &Config, authenticated: bool) -> String {
     let who = match cfg.relay.auth.read_policy {
         AccessPolicy::Members => "members",
         _ => "authenticated users",
     };
     if !cfg.auth_usable() {
-        return Err(format!(
-            "restricted: this relay serves only {who}, and it does not offer AUTH"
-        ));
+        format!("restricted: this relay serves only {who}, and it does not offer AUTH")
+    } else if authenticated {
+        format!("restricted: this relay serves only {who}")
+    } else {
+        format!("auth-required: this relay serves only {who}")
     }
-    if authenticated {
-        return Err(format!("restricted: this relay serves only {who}"));
-    }
-    issue_challenge(conns, metrics, auth, conn_id);
-    Err(format!("auth-required: this relay serves only {who}"))
 }
 
 /// Reason for a read refused by the restricted-kind gate. NIP-42's
@@ -3728,6 +3734,26 @@ impl ReqWorker<'_> {
         authed: &HashMap<u64, Vec<[u8; 32]>>,
         decomp: &mut Decompressor,
     ) {
+        // The ingester admitted each query by the read policy of its time.
+        // One that waited behind its connection's running scans, or in this
+        // worker's channel, across a reload or a member's removal is refused
+        // before it reads anything more, as a running one is at its next
+        // slice.
+        if let Some(sub) = queries.next_query() {
+            let identities = authed.get(&sub.conn_id).map_or(&[][..], Vec::as_slice);
+            if !stored_reader_admitted(txn, cfg, identities).unwrap_or(false) {
+                let refusal = read_policy_refusal(cfg, !identities.is_empty());
+                let (conn_id, sub_id, generation, count_only) = (
+                    sub.conn_id,
+                    sub.sub_id.clone(),
+                    sub.generation,
+                    sub.count_only,
+                );
+                queries.remove_query(conn_id, &sub_id, count_only);
+                self.refuse(conn_id, sub_id, generation, count_only, &refusal);
+                return;
+            }
+        }
         #[cfg(test)]
         let traced = (
             queries.next_query().map(|sub| sub.sub_id.to_string()),
@@ -6837,6 +6863,63 @@ mod tests {
         h.store("restricted while held");
         h.cfg.write().relay.auth.recipient_only_kinds = vec![1, 20001];
         assert_eq!(h.history_done(2, 0), [eose_frame()]);
+    }
+
+    /// REQs the ingester admitted under an earlier read policy, one waiting
+    /// behind its connection's running scan, are refused when they reach a
+    /// slice after the policy tightened, rather than scanned.
+    #[test]
+    fn queued_scans_are_admitted_again_when_they_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.service_url = "wss://relay.example.com".into();
+        let conns = ConnTable::new();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let metrics = Metrics::default();
+        let (mon_tx, _mon_rx) = unbounded();
+        let mon_txs = vec![mon_tx];
+        let worker = ReqWorker {
+            conns: &conns,
+            metrics: &metrics,
+            mon_txs: &mon_txs,
+        };
+        // One scan at a time per connection, so the second waits.
+        let mut queries = QueryScheduler::new(1, 10_000, 1_000_001);
+        queries.set_max_waiting_per_connection(8);
+        let txn = env.begin_ro().unwrap();
+        for (generation, id) in [(1, "running"), (2, "waiting")] {
+            let sid = SubId::new(id).unwrap();
+            conns.open_sub(1, Ns::Req, &sid, generation, 0);
+            let group = NostrFilterGroup::from_value(&json!({"kinds": [1]}), 2_000, 8, 16).unwrap();
+            let mut sub = Subscription::new(1, sid, group, false);
+            sub.generation = generation;
+            queries.add_sub(&txn, sub).unwrap();
+        }
+        assert_eq!(queries.waiting(), 1);
+
+        cfg.relay.auth.read_policy = crate::config::AccessPolicy::Authenticated;
+        let mut decomp = Decompressor::new();
+        for _ in 0..2 {
+            worker.slice(&mut queries, &txn, &cfg, &HashMap::new(), &mut decomp);
+        }
+        let mut frames = Vec::new();
+        while let Ok(frame) = out_rx.try_recv() {
+            frames.push(serde_json::from_str::<Value>(&frame.into_text()).unwrap());
+        }
+        let refusal = "auth-required: this relay serves only authenticated users";
+        assert_eq!(
+            frames,
+            [
+                json!(["CLOSED", "running", refusal]),
+                json!(["CLOSED", "waiting", refusal])
+            ]
+        );
+        assert!(!queries.has_running());
+        assert_eq!(queries.waiting(), 0);
     }
 
     /// A reload to an authenticated read policy stops what an anonymous

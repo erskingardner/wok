@@ -1,14 +1,19 @@
 //! Setting combinations: each security setting below, alone and with every
 //! other, turned on over the `public` profile and sent the golden transcript
-//! script. Two rules hold:
+//! script. A reply refuses its step when it carries a refusal (an `OK` that is
+//! false, a `CLOSED`, `NEG-ERR` or `NOTICE`, or an HTTP status of 400 or more)
+//! and no data (no `EVENT`, `COUNT` or `NEG-MSG`). Three rules hold, unless
+//! `OPENS` or `UNPROBED` gives the reason they should not:
 //!
-//! - a request one setting refuses stays refused whatever other setting is
-//!   on with it, so no setting opens a gate another one closes;
-//! - every setting changes some answer of the script, unless `UNPROBED` says
-//!   why the script cannot see it, so a setting that does nothing is noticed.
+//! - a step one setting refuses for a reason of its own, where `public` serves
+//!   it or refuses it differently, stays refused with any other setting on;
+//! - a step two settings each refuse stays refused with both on;
+//! - every setting changes some answer of the script other than what NIP-11
+//!   advertises, so a setting that is advertised but not enforced, or does
+//!   nothing, is noticed.
 //!
-//! A combination Wok refuses to load is listed, not failed: refusing it is
-//! the safe outcome.
+//! A combination Wok refuses to load or start is printed, not failed:
+//! refusing it is the safe outcome.
 
 use futures_util::{stream, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,7 +67,8 @@ const SETTINGS: &[(&str, &str)] = &[
     ("COUNT off", "relay.max_filter_limit_count = 0"),
     ("negentropy off", "relay.negentropy_enabled = false"),
     ("NIP-62 off", "relay.nip62.enabled = false"),
-    ("proof of work", "relay.abuse.min_pow_difficulty = 8"),
+    // High enough that no note of the script meets it by chance.
+    ("proof of work", "relay.abuse.min_pow_difficulty = 24"),
     ("abuse limits off", "relay.abuse.enabled = false"),
     (
         "scoped filters",
@@ -93,26 +99,56 @@ admin.pubkeys = ["f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036
 ];
 
 /// Settings the script cannot see, and why.
-const UNPROBED: &[(&str, &str)] = &[(
-    "real_ip_header",
-    "the script sends no proxy header; proxied_client_address.rs covers it",
-)];
+const UNPROBED: &[(&str, &str)] = &[
+    (
+        "real_ip_header",
+        "the script sends no proxy header; proxied_client_address.rs covers it",
+    ),
+    (
+        "abuse limits off",
+        "the script stays under every budget and quota; rate_keying.rs covers them, \
+         and OPENS records that it turns proof of work off",
+    ),
+];
 
-/// Pairs in which the first setting serves requests the second refuses
-/// alone, by design, and why.
-const OPENS: &[(&str, &str, &str)] = &[
+/// Steps the first setting serves, with the second on, that the second
+/// refuses alone or with a reason of its own, by design, and why.
+const OPENS: &[(&str, &str, &[&str], &str)] = &[
     (
         "abuse limits off",
         "proof of work",
+        &[
+            "EVENT a note",
+            "EVENT the same note again",
+            "EVENT a note from another key",
+        ],
         "relay.abuse.enabled = false turns proof of work off with the other abuse \
          limits, as docs/config.md says, and NIP-11 then advertises 0",
     ),
     (
         "no recipient-only kinds",
         "AUTH off",
+        &["REQ only gift wraps", "REQ only gift wraps, after AUTH"],
         "without AUTH, gift wraps are refused only because they are recipient-only",
     ),
+    (
+        "no owner-only kinds",
+        "AUTH off",
+        &["EVENT owner-only app data"],
+        "without AUTH, kind 30078 is refused only because it is owner-only",
+    ),
+    (
+        "metrics",
+        "metrics listener",
+        &["HTTP GET /metrics on the metrics listener"],
+        "observability.metrics_enabled is what serves /metrics, on the listener \
+         metrics_listen names",
+    ),
 ];
+
+/// Steps that only advertise what the relay does. A setting that changes
+/// nothing else is not enforced, whatever NIP-11 says.
+const ADVERTISED: &[&str] = &["HTTP GET / for NIP-11"];
 
 /// How many relays run the script at once.
 const PARALLEL: usize = 4;
@@ -132,12 +168,14 @@ async fn every_setting_shows_and_none_opens_what_another_closes() {
             }
         }
     }
+    // One date for every run, so they all send the same events.
+    let base = now() - 1_000;
     let answers: BTreeMap<Vec<usize>, Result<Steps, String>> = stream::iter(runs)
         .map(|run| async move {
             let toml: Vec<&str> = std::iter::once(BASE)
                 .chain(run.iter().map(|&setting| SETTINGS[setting].1))
                 .collect();
-            let steps = answer(&toml.join("\n")).await;
+            let steps = answer(&toml.join("\n"), base).await;
             (run, steps)
         })
         .buffer_unordered(PARALLEL)
@@ -146,13 +184,20 @@ async fn every_setting_shows_and_none_opens_what_another_closes() {
     let base = answers[&vec![]]
         .as_ref()
         .expect("the base configuration loads");
+    let effects = |steps: &Steps| -> Steps {
+        steps
+            .iter()
+            .filter(|(step, _)| !ADVERTISED.contains(&step.as_str()))
+            .map(|(step, reply)| (step.clone(), reply.clone()))
+            .collect()
+    };
     let name = |setting: usize| SETTINGS[setting].0;
 
     let mut problems = Vec::new();
     let listed = UNPROBED.iter().map(|(setting, _)| *setting).chain(
         OPENS
             .iter()
-            .flat_map(|(opener, closer, _)| [*opener, *closer]),
+            .flat_map(|(opener, closer, ..)| [*opener, *closer]),
     );
     for listed in listed {
         if !SETTINGS.iter().any(|(setting, _)| *setting == listed) {
@@ -163,23 +208,26 @@ async fn every_setting_shows_and_none_opens_what_another_closes() {
         let unprobed = UNPROBED.iter().any(|(listed, _)| *listed == name(setting));
         match &answers[&vec![setting]] {
             Err(error) => problems.push(format!("Wok refuses {}: {error}", name(setting))),
-            Ok(alone) if (alone == base) != unprobed => problems.push(if unprobed {
-                format!(
-                    "{} now changes the script's answers; take it out of UNPROBED",
-                    name(setting)
-                )
-            } else {
-                format!(
-                    "{} changes none of the script's answers: give the script a step that \
-                     shows it, or list it in UNPROBED with the reason",
-                    name(setting)
-                )
-            }),
+            Ok(alone) if (effects(alone) == effects(base)) != unprobed => {
+                problems.push(if unprobed {
+                    format!(
+                        "{} now changes the script's answers; take it out of UNPROBED",
+                        name(setting)
+                    )
+                } else {
+                    format!(
+                        "{} changes none of the script's answers beyond what NIP-11 advertises: \
+                     give the script a step that shows it, or list it in UNPROBED with the reason",
+                        name(setting)
+                    )
+                })
+            }
             Ok(_) => {}
         }
     }
 
     let mut refused_to_load = Vec::new();
+    let mut opened = BTreeSet::new();
     for (run, result) in &answers {
         let &[a, b] = &run[..] else { continue };
         let together = match result {
@@ -189,35 +237,53 @@ async fn every_setting_shows_and_none_opens_what_another_closes() {
                 continue;
             }
         };
-        for (closer, other) in [(a, b), (b, a)] {
-            let Ok(alone) = &answers[&vec![closer]] else {
+        let (Ok(first), Ok(second)) = (&answers[&vec![a]], &answers[&vec![b]]) else {
+            continue;
+        };
+        for (step, combined) in together {
+            if refused(combined) {
                 continue;
-            };
-            for (step, reply) in alone {
-                let closes = refused(reply) && base.get(step).is_some_and(|base| !refused(base));
-                let Some(combined) = together.get(step) else {
-                    continue;
-                };
-                if !closes || refused(combined) {
-                    continue;
-                }
-                let by_design = OPENS
+            }
+            let by_design = |opener: usize, closer: usize| {
+                OPENS
                     .iter()
-                    .any(|(opener, closed, _)| *opener == name(other) && *closed == name(closer));
-                if !by_design {
-                    problems.push(format!(
+                    .any(|(listed_opener, listed_closer, steps, _)| {
+                        *listed_opener == name(opener)
+                            && *listed_closer == name(closer)
+                            && steps.contains(&step.as_str())
+                    })
+            };
+            for (closer, alone, opener) in [(a, first, b), (b, second, a)] {
+                if alone
+                    .get(step)
+                    .is_some_and(|reply| closes(reply, base.get(step)))
+                    && !by_design(opener, closer)
+                {
+                    opened.insert(format!(
                         "{} opens what {} closes: \"{step}\"\n  {} alone: {}  with {}: {}",
-                        name(other),
+                        name(opener),
                         name(closer),
                         name(closer),
-                        reply.trim_end(),
-                        name(other),
+                        alone[step].trim_end(),
+                        name(opener),
                         combined.trim_end(),
                     ));
                 }
             }
+            let each_refuses = [first, second]
+                .iter()
+                .all(|alone| alone.get(step).is_some_and(|reply| refused(reply)));
+            if each_refuses && !by_design(a, b) && !by_design(b, a) {
+                opened.insert(format!(
+                    "{} and {} each refuse \"{step}\" but serve it together: {}",
+                    name(a),
+                    name(b),
+                    combined.trim_end(),
+                ));
+            }
         }
     }
+    problems.extend(opened);
     eprintln!(
         "{} settings, {} combinations; Wok refuses to load {}:\n  {}",
         SETTINGS.len(),
@@ -229,10 +295,10 @@ async fn every_setting_shows_and_none_opens_what_another_closes() {
 }
 
 /// Start a relay of `toml`, send it the script, and return its answers.
-async fn answer(toml: &str) -> Result<Steps, String> {
+async fn answer(toml: &str, base: u64) -> Result<Steps, String> {
     let cfg = Config::parse_toml(toml)?;
     let relay = Relay::try_start(cfg.clone()).await?;
-    let text = transcript::record("combination", &relay, &cfg).await;
+    let text = transcript::record_at("combination", &relay, &cfg, base).await;
     relay.stop().await;
     let mut steps = Steps::new();
     let mut step = None;
@@ -248,11 +314,10 @@ async fn answer(toml: &str) -> Result<Steps, String> {
     Ok(steps)
 }
 
-/// Whether an answer refuses its step: an OK that is false, a CLOSED,
-/// NEG-ERR or NOTICE, or an HTTP status of 400 or more.
+/// Whether a reply refuses its step: it carries a refusal and no data.
 fn refused(reply: &str) -> bool {
-    reply.lines().any(|line| {
-        let line = line.trim_start_matches("< ");
+    let lines = || reply.lines().map(|line| line.trim_start_matches("< "));
+    let refusal = lines().any(|line| {
         (line.starts_with(r#"["OK""#) && line.contains(",false,"))
             || [r#"["CLOSED""#, r#"["NEG-ERR""#, r#"["NOTICE""#]
                 .iter()
@@ -262,7 +327,33 @@ fn refused(reply: &str) -> bool {
                 .next()
                 .and_then(|code| code.parse::<u16>().ok())
                 .is_some_and(|code| code >= 400)
-    })
+    });
+    let data = lines().any(|line| {
+        [r#"["EVENT""#, r#"["COUNT""#, r#"["NEG-MSG""#]
+            .iter()
+            .any(|verb| line.starts_with(verb))
+    });
+    refusal && !data
+}
+
+/// Whether a setting's reply refuses a step for a reason of its own: the
+/// `public` profile serves the step, does not have it, or refuses it with
+/// another reply. Ids are numbered by first appearance, so a setting that
+/// changes an earlier step can renumber this one; numbers are ignored.
+fn closes(reply: &str, base: Option<&String>) -> bool {
+    let unnumbered = |reply: &str| {
+        let mut out = String::new();
+        let mut rest = reply;
+        while let Some(at) = rest.find("<h") {
+            out.push_str(&rest[..at]);
+            rest = &rest[at + 2..];
+            rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            out.push_str("<h");
+        }
+        out + rest
+    };
+    refused(reply)
+        && base.is_none_or(|base| !refused(base) || unnumbered(base) != unnumbered(reply))
 }
 
 /// The dotted keys a setting sets.

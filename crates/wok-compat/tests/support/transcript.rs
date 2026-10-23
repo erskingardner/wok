@@ -14,7 +14,12 @@ use wok_relay::Config;
 
 /// Run the script against `relay` and return its transcript.
 pub async fn record(name: &str, relay: &Relay, cfg: &Config) -> String {
-    let base = now() - 1_000;
+    record_at(name, relay, cfg, now() - 1_000).await
+}
+
+/// [`record`], with the script's events dated from `base`. Runs given one
+/// `base` send the same events, with the same ids.
+pub async fn record_at(name: &str, relay: &Relay, cfg: &Config, base: u64) -> String {
     let mut out = Transcript::new(base);
     writeln!(out.text, "# profile: {name}").unwrap();
     let author = key(1);

@@ -1594,8 +1594,12 @@ impl Config {
     /// that cannot change at runtime. The frozen set matches golpe's
     /// `noReload` keys plus everything bound to a listener/socket/pool that
     /// only exists once at startup (documented as "restart required" in
-    /// strfry.conf).
-    pub fn apply_reload(&mut self, new: Config) {
+    /// strfry.conf). A config the relay would refuse to start with is
+    /// refused, and this one kept: every live reload goes through here.
+    pub fn apply_reload(&mut self, new: Config) -> Result<(), String> {
+        if let Some(error) = new.serving_error() {
+            return Err(error);
+        }
         for change in self.security_scope_changes(&new) {
             tracing::warn!("config reload: {change}");
         }
@@ -1628,6 +1632,7 @@ impl Config {
         // changes take effect after restart, while history bounds reload live.
         self.observability.log_format = old.observability.log_format;
         self.observability.log_filter = old.observability.log_filter;
+        Ok(())
     }
 }
 
@@ -2421,7 +2426,7 @@ mod tests {
             "[relay]\nport = 9999\nmax_filter_limit = 123\n\n[observability]\nlog_format = \"json\"\nhistory_max_points = 20\n",
         )
         .unwrap();
-        cfg.apply_reload(new);
+        cfg.apply_reload(new).unwrap();
         assert_eq!(cfg.relay.port, 7777, "port is restart-required");
         assert_eq!(cfg.relay.max_filter_limit, 123, "limits reload live");
         assert_eq!(cfg.observability.log_format, LogFormat::Pretty);
@@ -3172,6 +3177,11 @@ negentropy_enabled = true
         assert_eq!(Config::default().serving_error(), None);
         // Its defaults still load, for `wok config show --defaults`.
         assert_eq!(marmot.preset_defaults().preset, Preset::Marmot);
+        // No reload installs it, whichever path reloads.
+        let mut running = served.clone();
+        let error = running.apply_reload(marmot).unwrap_err();
+        assert!(error.contains("relay.auth.service_url"), "{error}");
+        assert_eq!(running.relay.auth.service_url, "wss://relay.example.com");
     }
 
     fn test_overlay(_: Preset) -> &'static str {

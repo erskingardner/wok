@@ -75,9 +75,11 @@ classes: a gift wrap only to its recipient after AUTH, 445s to anyone who
 names the group, and KeyPackages and relay lists to anyone, since an inviter
 must fetch them.
 
-A `marmot` relay needs NIP-42: it refuses to start, and a reload that would
-leave it without usable AUTH is refused, unless `relay.auth.service_url` is
-set (and `relay.auth.enabled` left on). `wok doctor` reports this as a
+A `marmot` relay needs NIP-42: it refuses to start without usable AUTH, that
+is unless `relay.auth.service_url` is set (and `relay.auth.enabled` left on).
+A reload that would leave it without, from the file watcher, a dashboard save
+or a NIP-86 relay-info method, is refused and the running configuration kept;
+a save then answers 409 and writes nothing. `wok doctor` reports this as a
 failed `preset` check.
 
 ```toml

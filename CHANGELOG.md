@@ -100,7 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`preset = "marmot"`): only the Marmot kinds, scoped filters, 4 MiB events,
   room for an inviter's Welcome burst and a NIP-77 pass per group, and open
   writes so group membership stays unlinkable at the relay. It refuses to
-  start, or reload, without `relay.auth.service_url`. See `docs/config.md`,
+  start without `relay.auth.service_url`, and a reload or a dashboard or
+  NIP-86 save that would remove it is refused. See `docs/config.md`,
   The `marmot` preset (#97 §4.2).
 - `relay.auth.accepted_kinds`, the kinds a relay accepts (empty, the
   default, accepts every kind). Events of other kinds are refused with

@@ -89,14 +89,14 @@ to the other. Earlier releases could leave a pubkey on both lists; the ban
 wins until the next `banpubkey` or `allowpubkey` for it, and `unbanpubkey`
 alone leaves it allowlisted.
 
-`allowpubkey` only has an effect when `relay.auth.restrict_writes = true`:
-then writes are accepted only from allowlisted pubkeys, pubkeys holding any
-role (built-in or custom), and operator admin pubkeys. With
-`restrict_writes = false` (the default) the allowlist is recorded but does
-not gate writes.
+`allowpubkey` makes a pubkey a member, as holding any role (built-in or
+custom) and being in `admin.pubkeys` do. Membership matters only under
+`relay.auth.read_policy = "members"` or `write_policy = "members"`; with the
+default `open` policies the allowlist is recorded but gates nothing. See
+[read and write policies](config.md#read-and-write-policies).
 
 NIP-62 vanish requests (kind 62) are exempt from pubkey bans and the write
-allowlist: NIP-62 requires relays that restrict who can post to honor them
+policy: NIP-62 requires relays that restrict who can post to honor them
 regardless of the user's status. A banned author's vanish request is stored
 and erases their events, but stays hidden from reads while the ban stands.
 Event-id bans and the kind policy still apply to vanish requests.
@@ -128,10 +128,9 @@ Role records (`createrole` / `editrole` with `id`, `label`, `description`,
 
 - The built-in ids `admin`, `moderator`, and `member` are reserved and always
   exist. `admin` and `moderator` grant the management levels above;
-  `member` grants write access when `restrict_writes` is on.
-- Custom roles grant the same write access as `member` when
-  `restrict_writes` is on; otherwise they are display metadata for
-  management UIs.
+  `member` makes its holder a member under the `members` policies.
+- Custom roles make their holders members too; under the `open` policies
+  they are display metadata for management UIs.
 
 `deleterole` strips the role from every assigned pubkey. Role assignments
 are capped (1,000 roles, 64 roles per pubkey) like every other moderation

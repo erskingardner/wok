@@ -130,6 +130,7 @@ pub(super) fn run_writer(
                 packed,
                 json,
                 authed,
+                grant,
             } = m
             {
                 let mut ok_msg = String::new();
@@ -172,12 +173,10 @@ pub(super) fn run_writer(
                                 continue;
                             }
                         };
-                        let mut author = [0u8; 32];
-                        author.copy_from_slice(packed_view.pubkey());
                         let stored_checks = env.begin_ro().and_then(|txn| {
-                            // Recheck moderation and allowlist/role
-                            // eligibility against committed state: a
-                            // ban/revocation may have landed after the
+                            // Recheck moderation and the write policy's
+                            // member against committed state: a ban or
+                            // revocation may have landed after the
                             // ingester's snapshot check. Vanish requests
                             // bypass their own markers, the author ban and
                             // write restrictions (NIP-62: honored regardless
@@ -193,7 +192,7 @@ pub(super) fn run_writer(
                                 (
                                     is_event_vanished_ro(&txn, packed_view)?,
                                     moderation_reason_ro(&txn, packed_view)?,
-                                    stored_write_permitted(&txn, &cfg_snap, &author)?,
+                                    grant.stored_admits(&txn, &cfg_snap)?,
                                 )
                             })
                         });
@@ -278,9 +277,7 @@ pub(super) fn run_writer(
                                 RelayMessage::Ok {
                                     event_id: id_hex,
                                     accepted: false,
-                                    message:
-                                        "restricted: writes are restricted to allowlisted pubkeys"
-                                            .into(),
+                                    message: grant.refusal(&cfg_snap),
                                 },
                                 &metrics,
                             );
@@ -955,6 +952,7 @@ mod tests {
                     packed: packed.into_bytes(),
                     json,
                     authed: None,
+                    grant: Default::default(),
                 })
                 .unwrap();
             writer_tx.send(WriterMsg::Close { conn_id }).unwrap();
@@ -1042,6 +1040,7 @@ mod tests {
             packed,
             json,
             authed: None,
+            grant: Default::default(),
         }
     }
 

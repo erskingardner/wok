@@ -16,6 +16,7 @@ plugin isolation guidance, and logging policy, see
   optional UID/GID allow-lists via peer credentials.
 - AUTH (NIP-42) requires `relay.auth.serviceUrl`. Protected events (NIP-70) are rejected without matching authenticated pubkey.
 - Read classes restrict who reads a kind: recipient-only kinds (default 4, 1059, 21059) go only to the author and first `p` tag, owner-only kinds (default 78, 30078) only to the author, and authenticated kinds to any authenticated connection. They fail closed until `relay.auth.service_url` makes NIP-42 usable; broad COUNT requests cannot reveal their population. Owner-only kinds are also accepted only from a connection authenticated as their author.
+- `relay.auth.read_policy` and `write_policy` limit reading and publishing to authenticated connections or members (allowlisted, role-holding or admin pubkeys that are not banned). The writer rechecks a write's member against committed moderation state, and removing a member stops its live subscriptions' deliveries.
 - Write-policy plugins run as `sh -c` with a timeout; plugin failure rejects the event.
 - `wok reindex` requires the explicit `--confirm-relay-stopped` acknowledgement.
   Stop the relay and all DB utilities first; promotion retains the original

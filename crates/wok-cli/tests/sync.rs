@@ -247,7 +247,7 @@ async fn timestamp_rejections_and_negative_upload_acks_fail_the_command() {
     let target = tempfile::tempdir().unwrap();
     let src = config(
         source.path(),
-        "[relay.auth]\nrecipient_only_kinds=[]\nrestrict_writes=true\n",
+        "[relay.auth]\nrecipient_only_kinds=[]\nwrite_policy=\"members\"\n",
     );
     let dst = config(target.path(), "[events]\nreject_older_than_secs=1\n");
     let old = sign(

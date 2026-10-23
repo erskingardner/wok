@@ -122,9 +122,9 @@ impl ModerationSnapshot {
             .unwrap_or(&[])
     }
 
-    /// Write access under `relay.auth.restrict_writes`: allowlisted pubkeys,
-    /// and pubkeys holding any role (built-in or custom), may write.
-    pub fn write_permitted(&self, pubkey: &[u8; 32]) -> bool {
+    /// Membership under `relay.auth`'s `members` policies: allowlisted
+    /// pubkeys, and pubkeys holding any role (built-in or custom).
+    pub fn is_member(&self, pubkey: &[u8; 32]) -> bool {
         self.allowed_pubkeys.contains_key(pubkey) || self.pubkey_roles.contains_key(pubkey)
     }
 
@@ -997,8 +997,8 @@ mod tests {
         assert!(snap.blocked_ips.contains_key("203.0.113.7"));
         assert!(snap.reported_events.contains_key(&[4u8; 32]));
         assert!(snap.roles.contains_key("vip"));
-        assert!(snap.write_permitted(&pk));
-        assert!(!snap.write_permitted(&[1u8; 32]));
+        assert!(snap.is_member(&pk));
+        assert!(!snap.is_member(&[1u8; 32]));
         drop(txn);
 
         // Unban / delete-role paths.

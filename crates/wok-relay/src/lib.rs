@@ -18,8 +18,10 @@ pub use capabilities::{
     relay_capabilities, supported_nips, CapabilityCondition, RelayCapability,
     RELAY_CAPABILITY_CATALOG,
 };
-pub use config::{Config, EphemeralPersistence, Preset, StrfryConfigTranslation};
-pub use moderation::{management_level, write_permitted, ManagementCmd, ManagementLevel, Role};
+pub use config::{AccessPolicy, Config, EphemeralPersistence, Preset, StrfryConfigTranslation};
+pub use moderation::{
+    is_member, management_level, ManagementCmd, ManagementLevel, Role, WriteGrant,
+};
 pub use protocol::{ClientCommand, EoseHints, RelayMessage};
 pub use rlimit::apply_nofiles_limit;
 pub use server::{

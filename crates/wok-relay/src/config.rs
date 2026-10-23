@@ -317,9 +317,45 @@ pub struct AuthConfig {
     pub owner_only_kinds: Vec<u64>,
     /// Kinds any authenticated connection may read.
     pub authenticated_kinds: Vec<u64>,
-    /// When true, only NIP-86 allowlisted or role-holding pubkeys (and
-    /// operator admin pubkeys) may write events.
-    pub restrict_writes: bool,
+    /// Who may send REQ, COUNT and NEG-OPEN.
+    pub read_policy: AccessPolicy,
+    /// Who may publish events. NIP-62 vanish requests are always accepted.
+    pub write_policy: AccessPolicy,
+    /// Under `write_policy = "members"`, events of these kinds are also
+    /// accepted when their first `p` tag is a member, so anyone can deliver
+    /// gift wraps to members.
+    pub inbox_kinds: Vec<u64>,
+}
+
+/// Who may read or write (`relay.auth.read_policy`, `write_policy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessPolicy {
+    /// Anyone.
+    #[default]
+    Open,
+    /// A connection authenticated with NIP-42, as any pubkey.
+    Authenticated,
+    /// A member: a NIP-86 allowlisted or role-holding pubkey, or one of
+    /// `admin.pubkeys`, that is not banned.
+    Members,
+}
+
+impl AccessPolicy {
+    /// The name the configuration uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Authenticated => "authenticated",
+            Self::Members => "members",
+        }
+    }
+}
+
+impl std::fmt::Display for AccessPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,7 +444,9 @@ impl Default for Config {
                     recipient_only_kinds: vec![4, 1059, 21059],
                     owner_only_kinds: wok_event::APP_DATA_KINDS.to_vec(),
                     authenticated_kinds: Vec::new(),
-                    restrict_writes: false,
+                    read_policy: AccessPolicy::Open,
+                    write_policy: AccessPolicy::Open,
+                    inbox_kinds: wok_event::GIFT_WRAP_KINDS.to_vec(),
                 },
                 info: InfoConfig {
                     name: "wok default".into(),
@@ -778,26 +816,47 @@ impl Config {
         }
     }
 
-    /// Explain when restricted reads are deliberately failing closed because
-    /// the relay cannot complete NIP-42 authentication.
+    /// Explain what is deliberately failing closed because the relay cannot
+    /// complete NIP-42 authentication: restricted read kinds, and reads and
+    /// writes its access policies limit to authenticated connections.
     pub fn auth_configuration_warning(&self) -> Option<String> {
-        let mut kinds: Vec<u64> = self.read_restrictor().restricted_kinds().collect();
-        if kinds.is_empty() {
+        if self.auth_usable() {
             return None;
         }
+        let auth = &self.relay.auth;
+        let mut needs_auth = Vec::new();
+        let mut kinds: Vec<u64> = self.read_restrictor().restricted_kinds().collect();
         kinds.sort_unstable();
         kinds.dedup();
-        if !self.relay.auth.enabled {
-            return Some(format!(
-                "restricted read kinds {kinds:?} cannot be read because relay.auth.enabled is false"
+        if !kinds.is_empty() {
+            needs_auth.push(format!("restricted read kinds {kinds:?}"));
+        }
+        if auth.read_policy != AccessPolicy::Open {
+            needs_auth.push(format!(
+                "every read (read_policy = \"{}\")",
+                auth.read_policy
             ));
         }
-        if self.relay.auth.service_url.is_empty() {
-            return Some(format!(
-                "restricted read kinds {kinds:?} cannot be read until relay.auth.service_url is configured"
-            ));
+        match auth.write_policy {
+            AccessPolicy::Open => {}
+            AccessPolicy::Authenticated => {
+                needs_auth.push("every write (write_policy = \"authenticated\")".into())
+            }
+            AccessPolicy::Members => needs_auth
+                .push("writes members sign with other keys (write_policy = \"members\")".into()),
         }
-        None
+        if needs_auth.is_empty() {
+            return None;
+        }
+        let why = if !auth.enabled {
+            "AUTH is off because relay.auth.enabled is false"
+        } else {
+            "AUTH is unavailable until relay.auth.service_url is configured"
+        };
+        Some(format!(
+            "{why}, so these fail closed: {}",
+            needs_auth.join("; ")
+        ))
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
@@ -1246,6 +1305,9 @@ impl Config {
         if prev.enabled != new_auth.enabled
             || prev.service_url != new_auth.service_url
             || prev_reads != new_reads
+            || prev.read_policy != new_auth.read_policy
+            || prev.write_policy != new_auth.write_policy
+            || prev.inbox_kinds != new_auth.inbox_kinds
         {
             let mut widened: Vec<u64> = prev_reads
                 .restricted_kinds()
@@ -1253,13 +1315,22 @@ impl Config {
                 .collect();
             widened.sort_unstable();
             widened.dedup();
-            let note = if widened.is_empty() {
-                String::new()
-            } else {
-                format!(
+            let mut note = String::new();
+            if !widened.is_empty() {
+                note.push_str(&format!(
                     " (read access WIDENED for kinds {widened:?}: readers the old classes refused can read them now)"
-                )
-            };
+                ));
+            }
+            // Policies name who may read and write at all, so each change is
+            // spelled out.
+            for (what, old, new) in [
+                ("read_policy", prev.read_policy, new_auth.read_policy),
+                ("write_policy", prev.write_policy, new_auth.write_policy),
+            ] {
+                if old != new {
+                    note.push_str(&format!(" ({what} {old} -> {new})"));
+                }
+            }
             changes.push(format!(
                 "relay.auth changed: {:?} -> {:?}{}",
                 prev, new_auth, note,
@@ -2682,6 +2753,40 @@ negentropy_enabled = true
             .auth_configuration_warning()
             .unwrap()
             .contains("enabled is false"));
+    }
+
+    #[test]
+    fn access_policies_report_unusable_auth_and_reloads() {
+        let open =
+            Config::parse_toml("[relay.auth]\nrecipient_only_kinds = []\nowner_only_kinds = []\n")
+                .unwrap();
+        assert_eq!(open.auth_configuration_warning(), None);
+        let members = Config::parse_toml(
+            "[relay.auth]\nrecipient_only_kinds = []\nowner_only_kinds = []\n\
+             read_policy = \"members\"\nwrite_policy = \"authenticated\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            members.auth_configuration_warning().unwrap(),
+            "AUTH is unavailable until relay.auth.service_url is configured, so these fail \
+             closed: every read (read_policy = \"members\"); every write (write_policy = \
+             \"authenticated\")"
+        );
+        assert!(Config::parse_toml("[relay.auth]\nread_policy = \"everyone\"\n").is_err());
+
+        // A reload names each policy it changes.
+        let changes = open.security_scope_changes(&members);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(
+            changes[0]
+                .ends_with(" (read_policy open -> members) (write_policy open -> authenticated)"),
+            "{changes:?}"
+        );
+        let inbox = Config::parse_toml(
+            "[relay.auth]\nrecipient_only_kinds = []\nowner_only_kinds = []\ninbox_kinds = []\n",
+        )
+        .unwrap();
+        assert_eq!(open.security_scope_changes(&inbox).len(), 1);
     }
 
     #[test]

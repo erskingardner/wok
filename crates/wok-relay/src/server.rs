@@ -14,9 +14,10 @@ use sub_gate::{Current, Ns, SubGate};
 use crate::abuse::{
     leading_zero_bits, AbuseController, Admission, BudgetKind, ConnectionBudgets, Refusal, Request,
 };
+use crate::config::AccessPolicy;
 use crate::config::{Config, EphemeralPersistence};
 use crate::metrics::Metrics;
-use crate::moderation::{stored_write_permitted, write_permitted, ManagementCmd};
+use crate::moderation::{is_member, ManagementCmd, WriteGrant};
 use crate::plugin::{PluginEventSifter, PluginResult};
 use crate::protocol::{
     has_reason_prefix, push_json_str, ClientCommand, EoseHints, ParseFailure, RelayMessage,
@@ -670,6 +671,9 @@ enum WriterMsg {
         packed: Vec<u8>,
         json: String,
         authed: Option<[u8; 32]>,
+        /// What admitted the event under `relay.auth.write_policy`, which
+        /// the writer checks again against committed moderation state.
+        grant: WriteGrant,
     },
     Close {
         conn_id: u64,
@@ -1315,6 +1319,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let conns = conns.clone();
         let metrics = metrics.clone();
         let mon_data_txs = mon_data_txs.clone();
+        let moderation = moderation.clone();
         thread::Builder::new()
             .name("writer".into())
             .spawn(move || {
@@ -1349,9 +1354,10 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let cfg = config.clone();
         let conns = conns.clone();
         let metrics = metrics.clone();
+        let moderation = moderation.clone();
         thread::Builder::new()
             .name(format!("req-monitor-{i}"))
-            .spawn(move || run_req_monitor(env, cfg, conns, metrics, mon_rx, data_rx))
+            .spawn(move || run_req_monitor(env, cfg, conns, metrics, moderation, mon_rx, data_rx))
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -2105,6 +2111,7 @@ fn handle_client(
                 cfg,
                 conns,
                 metrics,
+                moderation,
                 auth,
                 generations,
                 conn_id,
@@ -2137,6 +2144,7 @@ fn handle_client(
                 cfg,
                 conns,
                 metrics,
+                moderation,
                 auth,
                 generations,
                 conn_id,
@@ -2172,6 +2180,7 @@ fn handle_client(
                 conns,
                 metrics,
                 abuse,
+                moderation,
                 &source,
                 auth,
                 budgets,
@@ -2191,6 +2200,7 @@ fn handle_client(
                 conns,
                 metrics,
                 abuse,
+                moderation,
                 &source,
                 auth,
                 budgets,
@@ -2326,8 +2336,12 @@ fn ingest_event(
         return;
     }
     let is_vanish_request = packed.kind() == VANISH_KIND;
-    {
+    let grant = {
         let snap = moderation.read();
+        let identities = auth
+            .get(&conn_id)
+            .map_or(&[][..], |session| session.identities.as_slice());
+        let grant = WriteGrant::new(cfg, &snap, packed, identities);
         let mut id = [0u8; 32];
         id.copy_from_slice(packed.id());
         let mut pubkey = [0u8; 32];
@@ -2356,16 +2370,19 @@ fn ingest_event(
                 &metrics.moderation_banned_author_rejections,
                 "restricted: author is banned by the relay operator".to_string(),
             ))
-        } else if !write_permitted(cfg, &snap, &pubkey) {
+        } else if !grant.admits(cfg) {
             Some((
                 &metrics.moderation_restricted_write_rejections,
-                "restricted: writes are restricted to allowlisted pubkeys".to_string(),
+                grant.refusal(cfg),
             ))
         } else {
             None
         };
         if let Some((counter, message)) = rejected {
             counter.fetch_add(1, Ordering::Relaxed);
+            if message.starts_with("auth-required:") {
+                issue_challenge(conns, metrics, auth, conn_id);
+            }
             conns.send(
                 conn_id,
                 RelayMessage::Ok {
@@ -2377,7 +2394,8 @@ fn ingest_event(
             );
             return;
         }
-    }
+        grant
+    };
     if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
         conns.send(
             conn_id,
@@ -2574,6 +2592,7 @@ fn ingest_event(
         packed: parsed.packed.into_bytes(),
         json: parsed.json,
         authed,
+        grant,
     });
 }
 
@@ -2735,6 +2754,7 @@ fn ingest_req(
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     generations: &mut Generations,
     conn_id: u64,
@@ -2761,7 +2781,7 @@ fn ingest_req(
         return;
     }
     let admitted = admit_req(
-        cfg, conns, metrics, auth, conn_id, &sid, filters, count_only,
+        cfg, conns, metrics, moderation, auth, conn_id, &sid, filters, count_only,
     );
     let (mut sub, filter_bytes) = match admitted {
         Ok(admitted) => admitted,
@@ -2835,6 +2855,7 @@ fn admit_req(
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     sid: &SubId,
@@ -2899,6 +2920,7 @@ fn admit_req(
         if count_only { "COUNT" } else { "REQ" },
     )?;
 
+    admit_reader(cfg, conns, metrics, moderation, auth, conn_id)?;
     let authed = auth.get(&conn_id).and_then(|a| a.authed);
     let r = cfg.read_restrictor();
     let requires_auth = if count_only {
@@ -2992,6 +3014,50 @@ fn refuse_req(
             stop_sub(dispatch, conn_id, ns, sid, generation);
         }
     }
+}
+
+/// Whether `relay.auth.read_policy` admits a connection authenticated as
+/// `identities`.
+fn reader_admitted(cfg: &Config, snap: &ModerationSnapshot, identities: &[[u8; 32]]) -> bool {
+    match cfg.relay.auth.read_policy {
+        AccessPolicy::Open => true,
+        AccessPolicy::Authenticated => !identities.is_empty(),
+        AccessPolicy::Members => identities.iter().any(|pk| is_member(cfg, snap, pk)),
+    }
+}
+
+/// Refuse a REQ, COUNT or NEG-OPEN from a connection `relay.auth.read_policy`
+/// does not admit. As at the restricted-kind gate, the refusal is
+/// `auth-required:`, with a challenge, only while authenticating can help.
+fn admit_reader(
+    cfg: &Config,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
+    auth: &mut HashMap<u64, AuthSession>,
+    conn_id: u64,
+) -> Result<(), String> {
+    let identities = auth
+        .get(&conn_id)
+        .map_or(&[][..], |session| session.identities.as_slice());
+    if reader_admitted(cfg, &moderation.read(), identities) {
+        return Ok(());
+    }
+    let authenticated = !identities.is_empty();
+    let who = match cfg.relay.auth.read_policy {
+        AccessPolicy::Members => "members",
+        _ => "authenticated users",
+    };
+    if !cfg.auth_usable() {
+        return Err(format!(
+            "restricted: this relay serves only {who}, and it does not offer AUTH"
+        ));
+    }
+    if authenticated {
+        return Err(format!("restricted: this relay serves only {who}"));
+    }
+    issue_challenge(conns, metrics, auth, conn_id);
+    Err(format!("auth-required: this relay serves only {who}"))
 }
 
 /// Reason for a read refused by the restricted-kind gate. NIP-42's
@@ -3150,6 +3216,7 @@ fn ingest_neg_command(
     conns: &ConnTable,
     metrics: &Metrics,
     abuse: &AbuseController,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
     source: &TransportSource,
     auth: &mut HashMap<u64, AuthSession>,
     budgets: &mut HashMap<u64, ConnectionBudgets>,
@@ -3201,6 +3268,7 @@ fn ingest_neg_command(
         cfg,
         conns,
         metrics,
+        moderation,
         auth,
         conn_id,
         sid,
@@ -3219,6 +3287,7 @@ fn ingest_neg(
     cfg: &Config,
     conns: &ConnTable,
     metrics: &Metrics,
+    moderation: &parking_lot::RwLock<ModerationSnapshot>,
     auth: &mut HashMap<u64, AuthSession>,
     conn_id: u64,
     sid: SubId,
@@ -3252,6 +3321,7 @@ fn ingest_neg(
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
     check_query_work(cfg, metrics, query_cost, "NEG-OPEN")?;
+    admit_reader(cfg, conns, metrics, moderation, auth, conn_id)?;
     let r = cfg.read_restrictor();
     if r.is_filter_group_fully_restricted(&fg)
         && auth.get(&conn_id).and_then(|a| a.authed).is_none()
@@ -3885,6 +3955,7 @@ fn run_req_monitor(
     cfg: Arc<parking_lot::RwLock<Config>>,
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
+    moderation: Arc<parking_lot::RwLock<ModerationSnapshot>>,
     rx: Receiver<MonitorMsg>,
     data_rx: Receiver<MonitorData>,
 ) {
@@ -3973,6 +4044,12 @@ fn run_req_monitor(
         let identities = |authed: &HashMap<u64, Vec<[u8; 32]>>, conn_id: u64| {
             authed.get(&conn_id).cloned().unwrap_or_default()
         };
+        // A member removed since its REQ was admitted reads no more of it.
+        // Membership is only looked up under `read_policy = "members"`.
+        let members_only = cfg_snap.relay.auth.read_policy == AccessPolicy::Members;
+        let still_admitted = |identities: &[[u8; 32]]| {
+            !members_only || reader_admitted(&cfg_snap, &moderation.read(), identities)
+        };
         for msg in control.drain(..) {
             match msg {
                 MonitorMsg::Register(mut sub) => {
@@ -4032,7 +4109,11 @@ fn run_req_monitor(
                         hints,
                     };
                     conns.send_sub(conn_id, &sub_id, generation, eose, &metrics);
-                    let visibility = read_visibility(&cfg_snap, identities(&authed, conn_id));
+                    let identities = identities(&authed, conn_id);
+                    if !still_admitted(&identities) {
+                        continue;
+                    }
+                    let visibility = read_visibility(&cfg_snap, identities);
                     if reread_to > snapshot {
                         let sub = monitors.subscription(conn_id, &sub_id).unwrap();
                         send_stored_range(
@@ -4130,7 +4211,7 @@ fn run_req_monitor(
                                 .get(&recipient.conn_id)
                                 .map(|authed| authed.as_slice())
                                 .unwrap_or(&[]);
-                            if r.should_send_to_identities(event, pk) {
+                            if r.should_send_to_identities(event, pk) && still_admitted(pk) {
                                 live.push((
                                     recipient.conn_id,
                                     recipient.sub_id,
@@ -4168,7 +4249,7 @@ fn run_req_monitor(
             };
             let readable = |conn_id: u64, packed: PackedEventView<'_>| {
                 let pk = authed.get(&conn_id).map(|a| a.as_slice()).unwrap_or(&[]);
-                r.should_send_to_identities(packed, pk)
+                r.should_send_to_identities(packed, pk) && still_admitted(pk)
             };
             let Some(batch) = batch else {
                 let start = curr_event_id.saturating_add(1);
@@ -4369,7 +4450,7 @@ mod tests {
         config.db = dir.path().to_path_buf();
         config.relay.nip62.enabled = true;
         config.relay.nip62.service_url = "wss://relay.example.com".into();
-        config.relay.auth.restrict_writes = true;
+        config.relay.auth.write_policy = crate::config::AccessPolicy::Members;
         let config = Arc::new(parking_lot::RwLock::new(config));
         let conns = Arc::new(ConnTable::new());
         let metrics = Arc::new(Metrics::default());
@@ -4407,6 +4488,10 @@ mod tests {
                 packed: packed.into_bytes(),
                 json,
                 authed: None,
+                grant: WriteGrant {
+                    authenticated: false,
+                    member: Some(author),
+                },
             })
             .unwrap();
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
@@ -4440,7 +4525,7 @@ mod tests {
             let refusal = if ban {
                 "author is banned"
             } else {
-                "writes are restricted"
+                "accepts events only from members"
             };
             assert!(response.contains(refusal), "{response}");
             assert_eq!(txn.entries(env.dbis().event).unwrap(), 0);
@@ -4507,6 +4592,7 @@ mod tests {
                     })
                     .to_string(),
                     authed: None,
+                    grant: Default::default(),
                 })
                 .unwrap();
             drop(writer_tx);
@@ -4707,7 +4793,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.db = dir.path().to_path_buf();
             cfg.relay.auth.enabled = false;
-            cfg.relay.auth.restrict_writes = true;
+            cfg.relay.auth.write_policy = crate::config::AccessPolicy::Members;
             cfg.relay.nip62.service_url = "wss://relay.example.com".into();
             let handle = start(env.clone(), cfg).unwrap();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
@@ -6323,7 +6409,10 @@ mod tests {
             let thread = {
                 let (env, cfg, conns, metrics) =
                     (env.clone(), cfg.clone(), conns.clone(), metrics.clone());
-                thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx, data_rx))
+                let moderation = Default::default();
+                thread::spawn(move || {
+                    run_req_monitor(env, cfg, conns, metrics, moderation, rx, data_rx)
+                })
             };
             let mut harness = Self {
                 env,
@@ -7451,7 +7540,10 @@ mod tests {
         let second = {
             let (env, cfg, conns) = (first.env.clone(), first.cfg.clone(), conns.clone());
             let metrics = Arc::new(Metrics::default());
-            thread::spawn(move || run_req_monitor(env, cfg, conns, metrics, rx, data_rx))
+            let moderation = Default::default();
+            thread::spawn(move || {
+                run_req_monitor(env, cfg, conns, metrics, moderation, rx, data_rx)
+            })
         };
         let all = SubId::new("all").unwrap();
         conns.open_sub(2, Ns::Req, &all, 1, 0);

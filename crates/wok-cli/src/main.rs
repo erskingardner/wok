@@ -490,7 +490,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         "starting relay"
     );
     if let Some(warning) = cfg.auth_configuration_warning() {
-        tracing::warn!("{warning}; restricted reads fail closed");
+        tracing::warn!("{warning}");
     }
     for deprecation in &cfg.deprecations {
         tracing::warn!("{deprecation}");

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A members-only relay accepts its members' events from throwaway keys.
+  `relay.auth.restrict_writes` checked only the event's author, so an
+  allowlisted relay refused every Marmot group message (445) and gift wrap
+  (1059), which are signed by fresh or random keys (#97 C7). Its replacement,
+  `write_policy = "members"`, also admits an event sent on a connection
+  authenticated as a member, and, for `relay.auth.inbox_kinds` (default
+  `[1059, 21059]`), one whose first `p` tag is a member. The writer checks
+  that member again against committed moderation state.
 - NIP-78 app data (kinds 78 and 30078) is private to its author, as NIP-78
   recommends. It is served only to a connection authenticated as the author
   and accepted only from one: an EVENT without AUTH is refused with
@@ -88,6 +96,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `relay.auth.read_policy` and `relay.auth.write_policy`, each `open` (the
+  default), `authenticated` or `members`, and `relay.auth.inbox_kinds`.
+  A member is a pubkey that is not banned and is allowlisted, holds a role or
+  is in `admin.pubkeys`. A REQ, COUNT, NEG-OPEN or EVENT the policy refuses
+  gets `auth-required:` and a challenge while authenticating could help, and
+  `restricted:` otherwise. Under `read_policy = "members"`, removing a member
+  stops its live subscriptions' deliveries. A reload that changes either
+  policy is logged as a warning naming the old and new policy, and `wok
+  doctor`'s `relay-auth` check, like the startup warning, now also names a
+  policy that needs AUTH while AUTH is unavailable. See `docs/config.md`,
+  Read and write policies.
 - Read classes in `[relay.auth]`: `recipient_only_kinds` (default
   `[4, 1059, 21059]`, the author and first `p`-tag recipient),
   `owner_only_kinds` (default `[78, 30078]`, the author alone) and
@@ -394,6 +413,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `relay.auth.restrict_writes`. A file that still sets it loads with a
+  deprecation warning, at startup, on reload and in `wok doctor`, and `wok
+  config minimize` or a dashboard save rewrites it: `true` becomes
+  `write_policy = "members"` (see Security for what that also admits), and
+  `false` is dropped.
 - `relay.auth.restricted_read_kinds` and
   `relay.auth.restrict_read_to_involved_pubkey`. A file that still sets them
   loads with a deprecation warning, at startup, on reload and in `wok

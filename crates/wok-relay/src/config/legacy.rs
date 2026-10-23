@@ -37,7 +37,9 @@ const QUERY_COST: [&str; 3] = ["relay", "abuse", "max_query_cost"];
 /// to the author and first `p`-tag recipient, unless
 /// `restrict_read_to_involved_pubkey = false` let any authenticated
 /// connection read them, and any REQ that mixed in another kind read them
-/// without AUTH. Read classes replaced both (#97 §3.6).
+/// without AUTH. Read classes replaced both (#97 §3.6). Likewise
+/// `restrict_writes = true` accepted only events whose author was a member;
+/// `write_policy = "members"` replaced it.
 const AUTH: [&str; 2] = ["relay", "auth"];
 
 /// The rules that remain, each off at its zero or empty value.
@@ -140,6 +142,50 @@ pub(super) fn translate(file: &toml::Value, preset: &toml::Value) -> Result<Tran
         );
     }
     translation.extend(read_classes(file, preset)?);
+    translation.extend(restrict_writes(file)?);
+    Ok(translation)
+}
+
+fn restrict_writes(file: &toml::Value) -> Result<Translation, String> {
+    let mut translation = Translation::default();
+    let key = |name: &'static str| [AUTH[0], AUTH[1], name].to_vec();
+    let Some(value) = leaf(file, &key("restrict_writes")) else {
+        return Ok(translation);
+    };
+    let restrict = value
+        .as_bool()
+        .ok_or("relay.auth.restrict_writes: expected a boolean")?;
+    if leaf(file, &key("write_policy")).is_some() {
+        return Err(
+            "relay.auth.restrict_writes was replaced by relay.auth.write_policy; set only \
+             the new key"
+                .into(),
+        );
+    }
+    if restrict {
+        translation.replace(
+            key("restrict_writes"),
+            key("write_policy"),
+            toml::Value::String("members".into()),
+        );
+        translation.warnings.push(
+            "relay.auth.restrict_writes = true is deprecated: it is now relay.auth.write_policy \
+             = \"members\", which accepts members' events as before, and also events a member \
+             sends on a connection authenticated as them, such as Marmot group messages from \
+             throwaway keys, and gift wraps addressed to a member (relay.auth.inbox_kinds). \
+             `wok config minimize` rewrites it."
+                .to_string(),
+        );
+    } else {
+        translation
+            .changes
+            .push(Change::Remove(key("restrict_writes")));
+        translation.warnings.push(
+            "relay.auth.restrict_writes = false is deprecated: relay.auth.write_policy = \
+             \"open\" is the default. `wok config minimize` removes it."
+                .to_string(),
+        );
+    }
     Ok(translation)
 }
 
@@ -638,6 +684,45 @@ mod tests {
     }
 
     #[test]
+    fn restrict_writes_is_the_members_write_policy() {
+        use crate::config::AccessPolicy;
+        let (translation, file) = translated("[relay.auth]\nrestrict_writes = true\n");
+        let auth = &file["relay"]["auth"];
+        assert!(auth.get("restrict_writes").is_none());
+        assert_eq!(auth["write_policy"].as_str(), Some("members"));
+        assert_eq!(translation.warnings.len(), 1);
+        assert!(translation.warnings[0].contains("write_policy = \"members\""));
+        assert_eq!(
+            translation.source(&["relay", "auth", "write_policy"]),
+            Some(&["relay", "auth", "restrict_writes"][..])
+        );
+        let members = crate::Config::parse_toml("[relay.auth]\nrestrict_writes = true\n").unwrap();
+        assert_eq!(members.relay.auth.write_policy, AccessPolicy::Members);
+        assert_eq!(members.relay.auth.read_policy, AccessPolicy::Open);
+        let open = crate::Config::parse_toml("[relay.auth]\nrestrict_writes = false\n").unwrap();
+        assert_eq!(open.relay.auth.write_policy, AccessPolicy::Open);
+        assert_eq!(open.deprecations.len(), 1);
+
+        // Rewritten, the file loads the same without the deprecated key.
+        let minimized =
+            crate::Config::minimize_toml("[relay.auth]\nrestrict_writes = true\n").unwrap();
+        assert_eq!(minimized.text, "[relay.auth]\nwrite_policy = \"members\"\n");
+        assert_eq!(
+            crate::Config::parse_toml(&minimized.text)
+                .unwrap()
+                .relay
+                .auth
+                .write_policy,
+            AccessPolicy::Members
+        );
+        // Both keys at once are ambiguous.
+        let both = "[relay.auth]\nrestrict_writes = true\nwrite_policy = \"open\"\n";
+        assert!(crate::Config::parse_toml(both)
+            .unwrap_err()
+            .contains("set only the new key"));
+    }
+
+    #[test]
     fn malformed_legacy_keys_are_errors() {
         let file: toml::Value = toml::from_str("[relay.filter_validation]\nenabled = 1\n").unwrap();
         assert!(translate(&file, &file).is_err());
@@ -648,6 +733,7 @@ mod tests {
             "restricted_read_kinds = [-4]",
             "restricted_read_kinds = 4",
             "restrict_read_to_involved_pubkey = 0",
+            "restrict_writes = \"yes\"",
         ] {
             let file: toml::Value = toml::from_str(&format!("[relay.auth]\n{auth}\n")).unwrap();
             assert!(translate(&file, &file).is_err(), "{auth}");
@@ -675,10 +761,10 @@ mod tests {
         let upgraded = crate::Config::parse_toml(SAMPLE_0_7_0).unwrap();
         assert_eq!(rules(&upgraded), (200, 0, String::new(), false));
         assert_eq!(upgraded.relay.abuse.max_query_work, 20_000);
-        // Its read keys are renamed, and keep their meaning.
+        // Its access keys are renamed, and keep their meaning.
         assert_eq!(
             upgraded.deprecations.len(),
-            4,
+            5,
             "{:?}",
             upgraded.deprecations
         );
@@ -686,7 +772,12 @@ mod tests {
         assert!(upgraded.deprecations[1].starts_with("relay.abuse.max_query_cost is deprecated"));
         assert!(upgraded.deprecations[2].starts_with("relay.auth.restricted_read_kinds"));
         assert!(upgraded.deprecations[3].starts_with("relay.auth.restrict_read_to_involved"));
+        assert!(upgraded.deprecations[4].starts_with("relay.auth.restrict_writes = false"));
         assert_eq!(upgraded.relay.auth.recipient_only_kinds, [4, 1059]);
+        assert_eq!(
+            upgraded.relay.auth.write_policy,
+            crate::config::AccessPolicy::Open
+        );
 
         // Enabled, 0.7 refused more than three filters or three kinds per
         // filter, which the upgrade keeps.
@@ -699,7 +790,7 @@ mod tests {
         assert_eq!(rules(&upgraded), (3, 3, String::new(), false));
         assert_eq!(
             upgraded.deprecations.len(),
-            6,
+            7,
             "{:?}",
             upgraded.deprecations
         );

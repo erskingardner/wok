@@ -517,16 +517,20 @@ continues in bounded batches.
 
 ## Filter validation
 
-Optional rules for REQ and COUNT filters. Each applies when it is set and is
-off at its zero or empty value, which is the public preset's. A filter that
-breaks one is refused with `CLOSED` and `blocked: bad req: filter validation
-failed: ...`.
+Optional rules for REQ, COUNT and NEG-OPEN filters. Each applies when it is
+set and is off at its zero or empty value, which is the public preset's. A
+REQ or COUNT with a filter that breaks one is refused with `CLOSED` and
+`blocked: bad req: filter validation failed: ...`, and a NEG-OPEN with
+`NEG-ERR` and `blocked: filter validation failed: ...`, so a sync cannot list
+the ids of events a REQ may not ask for. A filter with an empty list, which
+matches nothing, is not checked.
 
 | Key | Default | Reload | Dashboard | Meaning |
 |---|---:|---|---|---|
 | `relay.filter_validation.max_kinds_per_filter` | `0` | Live | Yes | Maximum kinds listed by one filter; zero is unlimited. MDK's directory batches list six. |
 | `relay.filter_validation.allowed_kinds` | empty | Live | Yes | Comma-separated kinds a filter may list; empty permits all. A filter without `kinds` is not checked. |
-| `relay.filter_validation.require_author_or_tag` | `false` | Live | Yes | Require each filter to name exactly one author, `#p` or `#e` value. This refuses Marmot's `#h` group filters, `ids` fetches and multi-author outbox and directory batches. |
+| `relay.filter_validation.require_author_or_tag` | `false` | Live | Yes | Require each filter to name exactly one author, `#p` or `#e` value. This refuses Marmot's `#h` group filters, `ids` fetches and multi-author outbox and directory batches; prefer `require_scoped_filters`. |
+| `relay.filter_validation.require_scoped_filters` | `false` | Live | No | Require each filter to name what it wants: `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. This refuses enumeration such as `{"kinds":[445]}`, `{"since":...}` or a bare `search`, and accepts Marmot's `#h` group filters, `#p` inbox filters, `ids` fetches and directory batches. |
 
 The filters in one REQ are bounded by `relay.max_filters_per_req` alone.
 

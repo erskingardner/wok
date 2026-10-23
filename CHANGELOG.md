@@ -96,6 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `relay.filter_validation.require_scoped_filters`: every filter must name
+  `ids`, `authors` or a tag filter, with any number of values. It refuses
+  enumeration such as `{"kinds":[445]}`, which would list every group message
+  on a Marmot relay, and accepts the `#h`, `#p`, `ids` and directory filters
+  Marmot clients send, which `require_author_or_tag` refuses (#97 F13).
 - `relay.auth.read_policy` and `relay.auth.write_policy`, each `open` (the
   default), `authenticated` or `members`, and `relay.auth.inbox_kinds`.
   A member is a pubkey that is not banned and is allowlisted, holds a role or
@@ -305,6 +310,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `[relay.filter_validation]` rules now apply to NEG-OPEN as they do to REQ
+  and COUNT, refused with `NEG-ERR blocked: filter validation failed: ...`.
+  Before, a sync could list the ids of every event a REQ's filter was
+  refused for.
 - A REQ, COUNT or NEG-OPEN over `relay.abuse.max_concurrent_historical_queries`
   (8) waits for one of its connection's running scans to end, in arrival
   order, instead of being refused. Before, a startup burst on a busy relay

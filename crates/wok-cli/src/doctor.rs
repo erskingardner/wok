@@ -115,28 +115,8 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             format!("write-policy plugin: {}", cfg.relay.write_policy_plugin)
         },
     );
-    let rules = &cfg.relay.filter_validation;
-    let active: Vec<&str> = [
-        (rules.max_kinds_per_filter != 0, "max_kinds_per_filter"),
-        (!rules.allowed_kinds.is_empty(), "allowed_kinds"),
-        (rules.require_author_or_tag, "require_author_or_tag"),
-    ]
-    .into_iter()
-    .filter_map(|(set, rule)| set.then_some(rule))
-    .collect();
-    report.add(
-        "filter-validation",
-        if active.is_empty() {
-            CheckStatus::Warn
-        } else {
-            CheckStatus::Pass
-        },
-        if active.is_empty() {
-            "no ingress filter rule is set".to_string()
-        } else {
-            format!("ingress filter rules: {}", active.join(", "))
-        },
-    );
+    let (status, detail) = filter_rules_check(&cfg.relay.filter_validation);
+    report.add("filter-validation", status, detail);
     report.add(
         "abuse-limits",
         if cfg.relay.abuse.enabled {
@@ -711,6 +691,28 @@ pub(crate) fn available_bytes(path: &Path) -> Result<u64, String> {
     Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
 }
 
+/// Which `[relay.filter_validation]` rules are set, so a reload that drops
+/// one shows.
+fn filter_rules_check(rules: &wok_relay::config::FilterValidationConfig) -> (CheckStatus, String) {
+    let active: Vec<&str> = [
+        (rules.max_kinds_per_filter != 0, "max_kinds_per_filter"),
+        (!rules.allowed_kinds.is_empty(), "allowed_kinds"),
+        (rules.require_author_or_tag, "require_author_or_tag"),
+        (rules.require_scoped_filters, "require_scoped_filters"),
+    ]
+    .into_iter()
+    .filter_map(|(set, rule)| set.then_some(rule))
+    .collect();
+    if active.is_empty() {
+        (CheckStatus::Warn, "no ingress filter rule is set".into())
+    } else {
+        (
+            CheckStatus::Pass,
+            format!("ingress filter rules: {}", active.join(", ")),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,6 +885,29 @@ mod tests {
         assert_eq!(names, ["config-deprecations", "config-defaults"]);
         let defaults = report.checks.pop().unwrap();
         (report.checks.pop().unwrap(), defaults)
+    }
+
+    #[test]
+    fn filter_rules_check_lists_every_rule_set() {
+        let mut rules = Config::default().relay.filter_validation;
+        assert_eq!(filter_rules_check(&rules).0, CheckStatus::Warn);
+        // The marmot preset's only rule.
+        rules.require_scoped_filters = true;
+        assert_eq!(
+            filter_rules_check(&rules),
+            (
+                CheckStatus::Pass,
+                "ingress filter rules: require_scoped_filters".into()
+            )
+        );
+        rules.max_kinds_per_filter = 6;
+        rules.allowed_kinds = "1".into();
+        rules.require_author_or_tag = true;
+        assert_eq!(
+            filter_rules_check(&rules).1,
+            "ingress filter rules: max_kinds_per_filter, allowed_kinds, require_author_or_tag, \
+             require_scoped_filters"
+        );
     }
 
     fn config_defaults_check(text: &str) -> DoctorCheck {

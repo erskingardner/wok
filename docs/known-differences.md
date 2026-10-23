@@ -346,6 +346,10 @@ regression test. Differential parity alone is not a reason to retain it.
   a pubkey its connection authenticated as, or, for `inbox_kinds`, its first
   `p`-tag recipient is a member, so members' Marmot group messages and gift
   wraps from throwaway keys are accepted (#97 C7).
+- `[relay.filter_validation]` applies to NEG-OPEN as well as REQ and COUNT,
+  so a sync cannot list the ids a REQ may not ask for. The pinned strfry
+  validates REQ and COUNT filters only. `require_scoped_filters`, which Wok
+  adds, needs each filter to name `ids`, `authors` or a tag.
 - NIP-42: kind 22242 events reach no client. One sent as EVENT is refused
   with `invalid: AUTH events must be sent with AUTH`. `wok import` refuses
   one, as do `wok sync` and `wok router` downloads, in either ephemeral mode.

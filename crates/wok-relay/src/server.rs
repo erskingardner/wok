@@ -1525,6 +1525,7 @@ fn filter_validator(cfg: &Config) -> FilterValidator {
         max_kinds_per_filter: cfg.relay.filter_validation.max_kinds_per_filter,
         allowed_kinds: allowed,
         require_author_or_tag: cfg.relay.filter_validation.require_author_or_tag,
+        require_scoped_filters: cfg.relay.filter_validation.require_scoped_filters,
     }
 }
 
@@ -3352,6 +3353,10 @@ fn ingest_neg(
         cfg.relay.max_and_entries,
     )
     .map_err(|e| format!("{}: {e}", e.reason_prefix()))?;
+    // The rules REQ and COUNT meet, so a sync cannot list what a REQ may not.
+    filter_validator(cfg)
+        .validate(&fg)
+        .map_err(|e| format!("blocked: filter validation failed: {e}"))?;
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
     check_query_work(cfg, metrics, query_cost, "NEG-OPEN")?;

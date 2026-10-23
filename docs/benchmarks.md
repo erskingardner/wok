@@ -629,7 +629,9 @@ preserve the result directories.
 
 The relay-side helper refuses database paths outside the fixed
 `/var/lib/relay-bench/{wok,strfry}` roots and artifact paths outside
-`/opt/relay-bench/{campaigns,results}`.
+`/opt/relay-bench/{campaigns,results}`. The Prometheus evidence needs
+`observability.metrics_enabled = true` in `/etc/relay-bench/wok.toml`;
+without it the helper records no relay metrics.
 
 ```bash
 # Defaults: 100k corpus, three order-balanced repetitions, 10k idle sockets.

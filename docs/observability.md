@@ -1,16 +1,29 @@
 # Observability
 
-Wok exposes Prometheus text metrics at `/metrics`, writes structured tracing
+Wok can serve Prometheus text metrics at `/metrics`, writes structured tracing
 records, and keeps an optional bounded in-memory history for the authenticated
 operator dashboard. Prometheus counters reset at process restart; dashboard
 history is also process-local and is never exposed by a public API.
 
 ## Prometheus scraping
 
-The endpoint needs no special `Accept` header:
+Metrics are off by default. Turn them on, preferably on a listener of their
+own at a private address:
+
+```toml
+[observability]
+metrics_enabled = true
+metrics_listen = "127.0.0.1:9777"
+```
+
+That listener serves only `GET /metrics`, and the relay listener answers
+`/metrics` with 404. Without `metrics_listen`, `/metrics` is served on the
+relay listener to anyone who can reach it, with
+`Access-Control-Allow-Origin: *`, so any web page can read it cross-origin;
+see [config.md](config.md#observability).
 
 ```bash
-curl http://127.0.0.1:7777/metrics
+curl http://127.0.0.1:9777/metrics
 ```
 
 A minimal Prometheus job is:
@@ -19,12 +32,8 @@ A minimal Prometheus job is:
 scrape_configs:
   - job_name: wok
     static_configs:
-      - targets: ["127.0.0.1:7777"]
+      - targets: ["127.0.0.1:9777"]
 ```
-
-If the relay is internet-facing, expose `/metrics` only on a trusted network
-or protect it at the reverse proxy. The endpoint is unauthenticated and sends
-`Access-Control-Allow-Origin: *`, so any web page can read it cross-origin.
 
 ## Metric reference
 

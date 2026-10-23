@@ -691,14 +691,34 @@ Wok never receives private key material.
 | `observability.history_enabled` | `true` | Collect bounded in-memory dashboard samples. Disabling clears them. Live; dashboard. |
 | `observability.history_interval_secs` | `15` | Seconds between samples; at least 1. Live; dashboard. |
 | `observability.history_max_points` | `5760` | FIFO sample bound, from 0 through 100,000. Live; dashboard. |
+| `observability.metrics_enabled` | `false` | Serve Prometheus metrics at `/metrics`. Live. |
+| `observability.metrics_listen` | `""` | An IP address and port, such as `"127.0.0.1:9777"`, for a listener that serves only `/metrics`; empty serves it on the relay listener. Restart. |
 
 See [Observability](observability.md) for every exported metric and label.
 
-The Prometheus endpoint `/metrics` is served on the same public listener as
-client traffic, with `Access-Control-Allow-Origin: *`: any web page can read
-connection, event, auth and refusal counters cross-origin. If the relay is
-internet-facing, scrape it over a private interface or protect the path at
-the reverse proxy.
+Metrics are off unless `metrics_enabled` is set. On the relay listener,
+`/metrics` is served to anyone who can reach the relay, with
+`Access-Control-Allow-Origin: *`, so any web page can read its connection,
+event, AUTH and refusal counters cross-origin; the relay warns at startup when
+that listener is reachable beyond loopback and private addresses, at startup
+and on a reload that turns metrics on. Set `metrics_listen` to a private
+address instead: that listener serves only `GET /metrics`, without CORS
+headers, and the relay listener answers `/metrics` with 404. Like the relay
+listener it refuses NIP-86 IP blocks and charges the per-address connection
+budget, and the relay warns when its address is reachable beyond loopback and
+private addresses. The listener is bound at startup whenever
+`metrics_listen` is set, and answers 404 while `metrics_enabled` is off, so
+metrics can be turned on and off with a reload. Turning them on or off is
+logged as a security-scope change. A reload that changes `metrics_listen` is
+logged too, and the running listener stays until restart; on a relay started
+without one, metrics stay off until that restart rather than be served on the
+relay listener.
+
+```toml
+[observability]
+metrics_enabled = true
+metrics_listen = "127.0.0.1:9777"
+```
 
 ## Unix socket
 

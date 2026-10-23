@@ -109,6 +109,12 @@ fn check_profile(name: &str, cfg: &Config) {
             assert!(!cfg.admin.enabled);
             assert!(nips.contains(&42) && nips.contains(&59), "{nips:?}");
         }
+        "monitored" => {
+            assert!(cfg.auth_usable());
+            assert!(cfg.observability.metrics_enabled);
+            assert!(!cfg.observability.metrics_listen.is_empty());
+            assert!(!cfg.metrics_on_relay_listener());
+        }
         "minimal" => {
             let always: BTreeSet<u64> = RELAY_CAPABILITY_CATALOG
                 .iter()
@@ -120,6 +126,7 @@ fn check_profile(name: &str, cfg: &Config) {
                 "the minimal profile must turn off every capability a setting can turn off"
             );
             assert!(!cfg.relay.compression_enabled);
+            assert!(!cfg.observability.metrics_enabled);
         }
         "proxied" => {
             assert!(!cfg.relay.real_ip_header.is_empty());
@@ -138,17 +145,12 @@ fn check_profile(name: &str, cfg: &Config) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_paths_match_the_inventory() {
-    let rows: Vec<HttpRow> = table("## Network listener")
-        .iter()
-        .map(|row| HttpRow {
-            paths: ticked(&row[0]),
-            gate: row[2].trim_matches('`').to_string(),
-        })
-        .collect();
+    let relay_rows = http_rows("## Network listener");
+    let metrics_rows = http_rows("## Metrics listener");
     let mut candidates: BTreeSet<String> =
         path_literals(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../wok-ws/src"));
     candidates.extend(DECOY_PATHS.iter().map(|path| path.to_string()));
-    for row in &rows {
+    for row in relay_rows.iter().chain(&metrics_rows) {
         for path in &row.paths {
             candidates.insert(match path.strip_suffix('*') {
                 Some(prefix) => format!("{prefix}x"),
@@ -161,25 +163,37 @@ async fn http_paths_match_the_inventory() {
     for name in profile_names() {
         let cfg = load_profile(&name);
         let relay = Relay::start(cfg.clone()).await;
-        for path in &candidates {
-            let row = rows.iter().find(|row| row.matches(path));
-            let expected = row.is_some_and(|row| gate_open(&cfg, &row.gate));
-            if relay.reachable(path).await != expected {
-                problems.push(match (row, expected) {
-                    (None, _) => format!("{name}: {path} answers but has no row"),
-                    (Some(row), true) => {
-                        format!("{name}: {path} is unreachable while {} is open", row.gate)
-                    }
-                    (Some(row), false) => {
-                        format!("{name}: {path} is reachable while {} is closed", row.gate)
-                    }
-                });
+        let mut listeners = vec![("relay listener", relay.addr, &relay_rows)];
+        if let Some(metrics) = relay.metrics {
+            listeners.push(("metrics listener", metrics, &metrics_rows));
+        }
+        for (listener, addr, rows) in listeners {
+            for path in &candidates {
+                let row = rows.iter().find(|row| row.matches(path));
+                let expected = row.is_some_and(|row| gate_open(&cfg, &row.gate));
+                if reachable(addr, path).await != expected {
+                    problems.push(match (row, expected) {
+                        (None, _) => {
+                            format!("{name}: the {listener} answers {path} but has no row")
+                        }
+                        (Some(row), true) => format!(
+                            "{name}: {path} is unreachable on the {listener} while {} is open",
+                            row.gate
+                        ),
+                        (Some(row), false) => format!(
+                            "{name}: {path} is reachable on the {listener} while {} is closed",
+                            row.gate
+                        ),
+                    });
+                }
             }
-            if path != "/" && relay.status(&upgrade_request(path)).await != 404 {
+        }
+        for path in candidates.iter().filter(|path| *path != "/") {
+            if status(relay.addr, &upgrade_request(path)).await != 404 {
                 problems.push(format!("{name}: a WebSocket upgrade on {path} is served"));
             }
         }
-        let rpc = relay.status(&rpc_request()).await;
+        let rpc = status(relay.addr, &rpc_request()).await;
         if (rpc != 404) != cfg.admin.enabled {
             problems.push(format!(
                 "{name}: NIP-86 answers {rpc} with admin.enabled = {}",
@@ -190,9 +204,20 @@ async fn http_paths_match_the_inventory() {
     }
     assert!(
         problems.is_empty(),
-        "the listener and the Network listener table of docs/attack-surface.md differ:\n{}",
+        "the listeners and the listener tables of docs/attack-surface.md differ:\n{}",
         problems.join("\n")
     );
+}
+
+/// The rows of a listener table: their paths, and the gate as written.
+fn http_rows(heading: &str) -> Vec<HttpRow> {
+    table(heading)
+        .iter()
+        .map(|row| HttpRow {
+            paths: ticked(&row[0]),
+            gate: row[2].clone(),
+        })
+        .collect()
 }
 
 #[test]
@@ -483,7 +508,11 @@ impl HttpRow {
 fn gate_open(cfg: &Config, gate: &str) -> bool {
     match gate {
         "none" => true,
-        "admin.enabled" => cfg.admin.enabled,
+        "`admin.enabled`" => cfg.admin.enabled,
+        "`observability.metrics_enabled` and no `observability.metrics_listen`" => {
+            cfg.metrics_on_relay_listener()
+        }
+        "`observability.metrics_enabled`" => cfg.observability.metrics_enabled,
         other => panic!("teach gate_open the gate {other}"),
     }
 }
@@ -491,6 +520,8 @@ fn gate_open(cfg: &Config, gate: &str) -> bool {
 /// A relay serving one profile on a loopback port.
 struct Relay {
     addr: SocketAddr,
+    /// The metrics listener, when the profile sets one.
+    metrics: Option<SocketAddr>,
     handle: wok_relay::RelayHandle,
     _dir: tempfile::TempDir,
 }
@@ -513,6 +544,7 @@ impl Relay {
         // Every probe comes from one address; the connection budget would
         // answer 429 long before the probe has tried every path.
         cfg.relay.abuse.connection_rate_per_second = 0;
+        let wants_metrics_listener = !cfg.observability.metrics_listen.is_empty();
         let handle = wok_relay::start(env, cfg).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -520,8 +552,15 @@ impl Relay {
         tokio::spawn(async move {
             let _ = wok_ws::serve_listener(serving, listener).await;
         });
+        let mut metrics = None;
+        if wants_metrics_listener {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            metrics = Some(listener.local_addr().unwrap());
+            tokio::spawn(wok_ws::serve_metrics(handle.clone(), listener));
+        }
         Self {
             addr,
+            metrics,
             handle,
             _dir: dir,
         }
@@ -534,42 +573,43 @@ impl Relay {
             .unwrap()
             .unwrap();
     }
+}
 
-    async fn reachable(&self, path: &str) -> bool {
-        for method in METHODS {
-            let request = format!(
-                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-            if self.status(&request).await != 404 {
-                return true;
-            }
+/// Whether some method gets an answer other than 404 for `path` at `addr`.
+async fn reachable(addr: SocketAddr, path: &str) -> bool {
+    for method in METHODS {
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        if status(addr, &request).await != 404 {
+            return true;
         }
-        false
     }
+    false
+}
 
-    /// The status code of the response to `request`.
-    async fn status(&self, request: &str) -> u16 {
-        let mut stream = tokio::net::TcpStream::connect(self.addr).await.unwrap();
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut head = Vec::new();
-        let mut buf = [0u8; 512];
-        while !head.windows(2).any(|pair| pair == b"\r\n") {
-            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-                .await
-                .expect("no response within 5 s")
-                .unwrap();
-            assert!(
-                read > 0,
-                "connection closed before a status line: {request:?}"
-            );
-            head.extend_from_slice(&buf[..read]);
-        }
-        let head = String::from_utf8_lossy(&head);
-        head.split(' ')
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .unwrap_or_else(|| panic!("no status in {head:?}"))
+/// The status code of the response to `request` sent to `addr`.
+async fn status(addr: SocketAddr, request: &str) -> u16 {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    let mut buf = [0u8; 512];
+    while !head.windows(2).any(|pair| pair == b"\r\n") {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("no response within 5 s")
+            .unwrap();
+        assert!(
+            read > 0,
+            "connection closed before a status line: {request:?}"
+        );
+        head.extend_from_slice(&buf[..read]);
     }
+    let head = String::from_utf8_lossy(&head);
+    head.split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {head:?}"))
 }
 
 fn upgrade_request(path: &str) -> String {

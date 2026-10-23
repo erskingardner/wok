@@ -88,6 +88,9 @@ max_total_events_per_req = 30000
 max_pending_outbound_bytes = 16777216
 [relay.abuse]
 enabled = false
+[observability]
+# Readiness and the resource samples read /metrics.
+metrics_enabled = true
 [relay.unix]
 enabled = true
 path = {json.dumps(str(unix))}

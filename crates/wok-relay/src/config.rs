@@ -702,8 +702,8 @@ impl Config {
                 "relay.real_ip_header = {header:?} is trusted as each client's address by \
                  every per-address budget. Set it only when every connection comes from a \
                  proxy that overwrites the header: a client that reaches the relay directly \
-                 could send a new address with each connection and escape those budgets, or \
-                 spend another address's"
+                 could send a new address with each connection to escape those budgets, or \
+                 send another client's address to spend that client's budgets"
             ));
         }
         let local_only = |ip: IpAddr| match ip {
@@ -1138,6 +1138,7 @@ impl Config {
             (
                 (
                     a.enabled,
+                    a.ipv6_prefix_len,
                     a.connection_rate_per_second,
                     a.connection_burst,
                     a.event_rate_per_second,
@@ -2191,6 +2192,12 @@ mod tests {
         let zeroed = Config::parse_toml("[relay.abuse]\nevent_rate_per_second = 0\n").unwrap();
         let changes = full.security_scope_changes(&zeroed);
         assert!(changes.iter().any(|c| c.contains("abuse")), "{changes:?}");
+        // So is keying each IPv6 address on its own, which multiplies a
+        // network's budgets.
+        let per_address = Config::parse_toml("[relay.abuse]\nipv6_prefix_len = 128\n").unwrap();
+        let changes = Config::default().security_scope_changes(&per_address);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(changes[0].contains("ipv6_prefix_len: 128"), "{changes:?}");
     }
 
     #[test]
@@ -2316,7 +2323,14 @@ mod tests {
         for listening in [&["127.0.0.1:7777"][..], &["0.0.0.0:7777"]] {
             let warning = set.real_ip_header_warning(&addrs(listening)).unwrap();
             assert!(
-                warning.contains("relay.real_ip_header = \"x-real-ip\" is trusted"),
+                warning.starts_with("relay.real_ip_header = \"x-real-ip\" is trusted"),
+                "{warning}"
+            );
+            assert!(
+                warning.ends_with(
+                    "could send a new address with each connection to escape those \
+                     budgets, or send another client's address to spend that client's budgets"
+                ),
                 "{warning}"
             );
         }

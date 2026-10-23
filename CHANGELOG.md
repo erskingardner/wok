@@ -237,9 +237,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `public`: `relay.abuse.max_query_work` is `20000`, NIP-11
   `max_query_work`, in the units described under Changed. It replaces
   `relay.abuse.max_query_cost = 1000`, which is ignored (see Removed).
+- `public`: `relay.abuse.ipv6_prefix_len` is `64`, a new setting.
+  Per-address budgets (connections, EVENT and AUTH, REQ, COUNT, malformed
+  messages) key an IPv6 client by its /64 instead of its full address, so a
+  host can no longer take a fresh budget with each address it picks from its
+  network. `128` keys each IPv6 address on its own, as before. IPv4 is
+  unchanged, and NIP-86 IP bans still match exact addresses.
 
 ### Changed
 
+- `wok relay` warns at startup when `relay.real_ip_header` is empty and the
+  relay listens only on loopback or private addresses, as behind a reverse
+  proxy: every client then has the proxy's address and shares one set of
+  per-address budgets. The warning logged when the header is set now says to
+  set it only when every connection comes from a proxy that overwrites it.
 - Reload warns about a guard set to zero (unlimited) only when the file's
   preset does not set it to zero too. Before, every zero warned, so the
   public preset's `relay.abuse.max_stored_events = 0` would have been warned

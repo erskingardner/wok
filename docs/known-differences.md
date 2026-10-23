@@ -82,7 +82,10 @@ it is not a promise to reproduce upstream bugs.
   admission decision to a write-policy plugin: IP/pubkey token buckets,
   pre-scan query costing, historical-query concurrency, author storage quotas,
   and optional NIP-13 proof of work. Migrated configs receive the documented
-  Wok defaults and the preflight prints them for review.
+  Wok defaults and the preflight prints them for review. Per-address buckets
+  key an IPv6 client by its /64 (`relay.abuse.ipv6_prefix_len`), so a host
+  cannot take a fresh budget from each address in its network; write-policy
+  plugins still see the exact address, as in strfry.
 - Restricted reads require completed NIP-42 authentication. Wok also delivers
   authenticated state to the negentropy worker and keeps one usable challenge
   per session; the pinned strfry implementation does not complete those paths

@@ -495,18 +495,16 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     for deprecation in &cfg.deprecations {
         tracing::warn!("{deprecation}");
     }
-    if !cfg.relay.real_ip_header.is_empty() {
-        tracing::warn!(
-            "relay.real_ip_header = {:?} is fully trusted for per-IP rate limits: \
-             any client can spoof it (and burn other IPs' budgets) unless the \
-             reverse proxy overwrites that header on every request and no client \
-             can reach the relay directly",
-            cfg.relay.real_ip_header
-        );
-    }
     wok_relay::apply_nofiles_limit(cfg.relay.nofiles).map_err(anyhow::Error::msg)?;
     let env = open_env(&cfg)?;
     let listeners = wok_ws::bind_listeners(&cfg.relay.bind, cfg.relay.port).await?;
+    let listening: Vec<std::net::SocketAddr> = listeners
+        .iter()
+        .filter_map(|listener| listener.local_addr().ok())
+        .collect();
+    if let Some(warning) = cfg.real_ip_header_warning(&listening) {
+        tracing::warn!("{warning}");
+    }
     let unix_cfg = cfg.clone();
     let handle = wok_relay::start(env, cfg).map_err(|e| anyhow::anyhow!(e))?;
     if config_path.exists() {

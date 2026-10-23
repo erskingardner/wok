@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 mod edit;
@@ -251,6 +252,9 @@ pub struct RelayConfig {
 #[serde(deny_unknown_fields)]
 pub struct AbuseConfig {
     pub enabled: bool,
+    /// The leading bits of an IPv6 address that key its per-address
+    /// budgets, 1 to 128. IPv4 addresses are keyed whole.
+    pub ipv6_prefix_len: u8,
     pub connection_rate_per_second: u32,
     pub connection_burst: u32,
     pub event_rate_per_second: u32,
@@ -437,6 +441,7 @@ impl Default for Config {
                 },
                 abuse: AbuseConfig {
                     enabled: true,
+                    ipv6_prefix_len: 64,
                     connection_rate_per_second: 10,
                     connection_burst: 50,
                     event_rate_per_second: 50,
@@ -602,6 +607,13 @@ fn validate(mut parsed: TomlConfig) -> Result<Config, String> {
         ));
     }
     tracing_subscriber_filter_syntax(&parsed.observability.log_filter)?;
+    if !(1..=128).contains(&parsed.relay.abuse.ipv6_prefix_len) {
+        return Err(
+            "relay.abuse.ipv6_prefix_len must be from 1 to 128 (128 keys each IPv6 address \
+             on its own)"
+                .into(),
+        );
+    }
     Ok(parsed.into())
 }
 
@@ -676,6 +688,42 @@ impl Config {
     /// the same condition, and every AUTH challenge is gated on it.
     pub fn auth_usable(&self) -> bool {
         self.relay.auth.enabled && !self.relay.auth.service_url.is_empty()
+    }
+
+    /// Explain how `relay.real_ip_header` keys the per-address budgets of a
+    /// relay listening on `listening`. A set header is trusted as each
+    /// client's address. With none, a client is the address that connected,
+    /// so a listener only this host or a private network can reach, as behind
+    /// a reverse proxy, gives every client the proxy's address.
+    pub fn real_ip_header_warning(&self, listening: &[SocketAddr]) -> Option<String> {
+        let header = &self.relay.real_ip_header;
+        if !header.is_empty() {
+            return Some(format!(
+                "relay.real_ip_header = {header:?} is trusted as each client's address by \
+                 every per-address budget. Set it only when every connection comes from a \
+                 proxy that overwrites the header: a client that reaches the relay directly \
+                 could send a new address with each connection to escape those budgets, or \
+                 send another client's address to spend that client's budgets"
+            ));
+        }
+        let local_only = |ip: IpAddr| match ip {
+            IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+            }
+        };
+        if listening.is_empty() || !listening.iter().all(|addr| local_only(addr.ip())) {
+            return None;
+        }
+        let addrs: Vec<String> = listening.iter().map(SocketAddr::to_string).collect();
+        Some(format!(
+            "the relay listens only on loopback or private addresses ({}) and \
+             relay.real_ip_header is unset. If a reverse proxy forwards connections, every \
+             client has the proxy's address and they all share one set of per-address \
+             budgets (connections, EVENT and AUTH, REQ, COUNT); set relay.real_ip_header to \
+             the header the proxy overwrites with the client's address",
+            addrs.join(", ")
+        ))
     }
 
     /// Explain when restricted reads are deliberately failing closed because
@@ -1090,6 +1138,7 @@ impl Config {
             (
                 (
                     a.enabled,
+                    a.ipv6_prefix_len,
                     a.connection_rate_per_second,
                     a.connection_burst,
                     a.event_rate_per_second,
@@ -2143,6 +2192,12 @@ mod tests {
         let zeroed = Config::parse_toml("[relay.abuse]\nevent_rate_per_second = 0\n").unwrap();
         let changes = full.security_scope_changes(&zeroed);
         assert!(changes.iter().any(|c| c.contains("abuse")), "{changes:?}");
+        // So is keying each IPv6 address on its own, which multiplies a
+        // network's budgets.
+        let per_address = Config::parse_toml("[relay.abuse]\nipv6_prefix_len = 128\n").unwrap();
+        let changes = Config::default().security_scope_changes(&per_address);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(changes[0].contains("ipv6_prefix_len: 128"), "{changes:?}");
     }
 
     #[test]
@@ -2215,6 +2270,70 @@ mod tests {
                 .any(|c| c.contains("negentropy_enabled changed")),
             "{changes:?}"
         );
+    }
+
+    #[test]
+    fn ipv6_prefix_len_is_validated() {
+        assert_eq!(Config::default().relay.abuse.ipv6_prefix_len, 64);
+        for len in [1, 48, 128] {
+            let cfg =
+                Config::parse_toml(&format!("[relay.abuse]\nipv6_prefix_len = {len}\n")).unwrap();
+            assert_eq!(cfg.relay.abuse.ipv6_prefix_len, len);
+        }
+        let zero = Config::parse_toml("[relay.abuse]\nipv6_prefix_len = 0\n").unwrap_err();
+        assert!(zero.contains("from 1 to 128"), "{zero}");
+        let wide = Config::parse_toml("[relay.abuse]\nipv6_prefix_len = 129\n").unwrap_err();
+        assert!(wide.contains("from 1 to 128"), "{wide}");
+    }
+
+    #[test]
+    fn real_ip_header_warning_names_the_budget_risk_of_each_setup() {
+        let addrs = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter().map(|addr| addr.parse().unwrap()).collect()
+        };
+        let unset = Config::default();
+        // Only this host or a private network can connect: likely a proxy.
+        for local in [
+            &["127.0.0.1:7777"][..],
+            &["127.0.0.1:7777", "[::1]:7777"],
+            &["10.0.0.5:7777"],
+            &["192.168.1.2:7777"],
+            &["[fd00::5]:7777"],
+            &["[fe80::1]:7777"],
+        ] {
+            let warning = unset.real_ip_header_warning(&addrs(local)).unwrap();
+            assert!(
+                warning.contains("relay.real_ip_header is unset"),
+                "{warning}"
+            );
+            assert!(warning.contains(&local[0].to_string()), "{warning}");
+        }
+        // Clients can connect directly, so their addresses are their own.
+        for direct in [
+            &["0.0.0.0:7777"][..],
+            &["[::]:7777"],
+            &["203.0.113.9:7777"],
+            &["127.0.0.1:7777", "[2001:db8::1]:7777"],
+            &[],
+        ] {
+            assert_eq!(unset.real_ip_header_warning(&addrs(direct)), None);
+        }
+        let mut set = Config::default();
+        set.relay.real_ip_header = "x-real-ip".into();
+        for listening in [&["127.0.0.1:7777"][..], &["0.0.0.0:7777"]] {
+            let warning = set.real_ip_header_warning(&addrs(listening)).unwrap();
+            assert!(
+                warning.starts_with("relay.real_ip_header = \"x-real-ip\" is trusted"),
+                "{warning}"
+            );
+            assert!(
+                warning.ends_with(
+                    "could send a new address with each connection to escape those \
+                     budgets, or send another client's address to spend that client's budgets"
+                ),
+                "{warning}"
+            );
+        }
     }
 
     #[test]

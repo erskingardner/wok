@@ -46,3 +46,6 @@
 #   plan touches, with its limit, so outbox fetches, feeds and batched
 #   reaction queries are served, and a fan-out of 2,000 authors x 50 kinds
 #   (102,000) is still refused. A file's max_query_cost is ignored.
+# - [relay.abuse] ipv6_prefix_len = 64: per-address budgets key an IPv6
+#   client by its /64, the network one host is usually given, so it cannot
+#   take a fresh budget with each address it picks. 128 keys each address.

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Events from throwaway keys are charged to the AUTHed identity that sent
+  them. On a connection that has authenticated, an event whose author is not
+  one of its identities, such as a Marmot 445 signed by a fresh key or a
+  1059 gift wrap, now draws on the per-author EVENT budget
+  (`relay.abuse.pubkey_event_*`) of the connection's first identity. Before,
+  each event was charged to its own new author, so the budget never applied
+  to them. The refusal is `rate-limited: EVENT budget exhausted for the
+  authenticated pubkey`. Unauthenticated connections and the per-author
+  storage quota still key on the author (#97 F11).
 - Update Rustls to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349
   (client session secrets in `Debug` output, data sent after an ECH rejection,
   unbounded Brotli certificate decompression, and a key-exchange downgrade).

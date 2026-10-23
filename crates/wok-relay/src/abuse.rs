@@ -245,8 +245,9 @@ impl AbuseController {
         Ok(())
     }
 
-    /// Charge an event to its author's budget.
-    pub fn admit_author(&self, pubkey: &[u8; 32], cfg: &AbuseConfig) -> bool {
+    /// Charge an event to a pubkey's budget (`pubkey_event_*`): its
+    /// author's, or the AUTHed identity that published it from another key.
+    pub fn admit_pubkey_event(&self, pubkey: &[u8; 32], cfg: &AbuseConfig) -> bool {
         if !cfg.enabled {
             return true;
         }
@@ -329,8 +330,8 @@ mod tests {
         assert!(!limiter.admit_source(&local, BudgetKind::Req, &cfg));
         cfg.pubkey_event_burst = 1;
         let pubkey = [7u8; 32];
-        assert!(limiter.admit_author(&pubkey, &cfg));
-        assert!(!limiter.admit_author(&pubkey, &cfg));
+        assert!(limiter.admit_pubkey_event(&pubkey, &cfg));
+        assert!(!limiter.admit_pubkey_event(&pubkey, &cfg));
     }
 
     #[test]

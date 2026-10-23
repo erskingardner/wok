@@ -1014,7 +1014,7 @@ fn normalize_reason(message: &str) -> String {
 /// `wok_refusals_total{setting}` mapping.
 fn setting_for(reason: &str) -> &'static str {
     let r = reason.to_ascii_lowercase();
-    if r.contains("author event budget") {
+    if r.contains("author event budget") || r.contains("for the authenticated pubkey") {
         "relay.abuse.pubkey_event_rate_per_second / pubkey_event_burst"
     } else if r.contains("event budget") || r.contains("auth budget") {
         "relay.abuse.event_rate_per_second / event_burst"
@@ -3667,6 +3667,10 @@ mod tests {
             ),
             (
                 "rate-limited: author EVENT budget exhausted",
+                "relay.abuse.pubkey_event_rate_per_second / pubkey_event_burst",
+            ),
+            (
+                "rate-limited: EVENT budget exhausted for the authenticated pubkey",
                 "relay.abuse.pubkey_event_rate_per_second / pubkey_event_burst",
             ),
             (

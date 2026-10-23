@@ -1,0 +1,14 @@
+# A members-only relay: only members, that is allowlisted pubkeys, role
+# holders and admins, may read or publish, and the dashboard and NIP-86 are
+# served.
+[relay.auth]
+service_url = "wss://relay.example.com"
+read_policy = "members"
+write_policy = "members"
+
+[admin]
+enabled = true
+public_url = "https://relay.example.com"
+# The public key of secret key 1, so tests can sign NIP-98 requests as the
+# admin.
+pubkeys = ["79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"]

@@ -52,3 +52,5 @@ Out of scope:
   unsafe-code boundary, dependency policy, fuzzing and adversarial testing.
 - [docs/production-deployment.md](docs/production-deployment.md): how to run a
   hardened relay.
+- [docs/attack-surface.md](docs/attack-surface.md): every entry point, who can
+  reach it, and the gate in front of it.

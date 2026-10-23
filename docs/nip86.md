@@ -40,19 +40,21 @@ event to retry.
 
 `supportedmethods` returns the methods the caller may call at its
 [management level](#management-levels). Unknown methods return an
-`unsupported method` error.
+`unsupported method` error. Level is the lowest level that may call a
+method; admins may call every method.
 
-| Group | Methods |
-| --- | --- |
-| Pubkey bans | `banpubkey`, `unbanpubkey`, `listbannedpubkeys` |
-| Write allowlist | `allowpubkey`, `unallowpubkey`, `listallowedpubkeys` |
-| Event bans | `banevent`, `unbanevent`, `listbannedevents` |
-| Event allow list | `allowevent`, `unallowevent`, `listallowedevents` |
-| Moderation queue | `listeventsneedingmoderation` |
-| IP blocks | `blockip`, `unblockip`, `listblockedips` |
-| Relay info | `changerelayname`, `changerelaydescription`, `changerelayicon` |
-| Kind policy | `allowkind`, `disallowkind`, `listallowedkinds`, `listdisallowedkinds` |
-| Roles | `createrole`, `editrole`, `deleterole`, `assignrole`, `unassignrole` |
+| Group | Methods | Level |
+| --- | --- | --- |
+| Discovery | `supportedmethods` | Moderator |
+| Pubkey bans | `banpubkey`, `unbanpubkey`, `listbannedpubkeys` | Moderator |
+| Write allowlist | `allowpubkey`, `unallowpubkey`, `listallowedpubkeys` | Moderator |
+| Event bans | `banevent`, `unbanevent`, `listbannedevents` | Moderator |
+| Event allow list | `allowevent`, `unallowevent`, `listallowedevents` | Moderator |
+| Moderation queue | `listeventsneedingmoderation` | Moderator |
+| IP blocks | `blockip`, `unblockip`, `listblockedips` | Moderator |
+| Relay info | `changerelayname`, `changerelaydescription`, `changerelayicon` | Admin |
+| Kind policy | `allowkind`, `disallowkind`, `listallowedkinds`, `listdisallowedkinds` | Admin |
+| Roles | `createrole`, `editrole`, `deleterole`, `assignrole`, `unassignrole` | Admin |
 
 The NIP-43 invite-code methods (`listclaims`, `createclaim`, `deleteclaim`)
 are not implemented, because Wok does not implement NIP-43.

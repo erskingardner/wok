@@ -22,6 +22,7 @@ Operator and design documentation. Code remains the authority for current behavi
 | `cutover.md` | Cutover / rollback |
 | `production-deployment.md` | Hardening a live relay; macOS LMDB semaphore exhaustion (ENOSPC at `Env::open`) |
 | `security.md` | Threat model, fuzzing, unsafe policy |
+| `attack-surface.md` | Every entry point, who reaches it, its gate; test-checked inventory and profiles |
 | `observability.md` | Metrics / tracing |
 | `admin-dashboard.md` | `/admin` |
 | `unix-socket.md` | Length-prefixed Unix protocol |

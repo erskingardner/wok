@@ -549,6 +549,42 @@ mod tests {
     }
 
     #[test]
+    fn every_method_is_documented_with_its_level() {
+        let reference = include_str!("../../../docs/nip86.md");
+        let section = reference
+            .split_once("\n## Supported methods\n")
+            .expect("docs/nip86.md has no Supported methods section")
+            .1;
+        let mut documented = std::collections::BTreeMap::new();
+        for row in section
+            .lines()
+            .take_while(|line| !line.starts_with('#'))
+            .filter(|line| line.starts_with('|'))
+            .skip(2)
+        {
+            let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+            for method in cells[2].split('`').skip(1).step_by(2) {
+                documented.insert(method, cells[3]);
+            }
+        }
+        let expected: std::collections::BTreeMap<&str, &str> = SUPPORTED_METHODS
+            .iter()
+            .map(|method| {
+                let level = if requires_admin(method) {
+                    "Admin"
+                } else {
+                    "Moderator"
+                };
+                (*method, level)
+            })
+            .collect();
+        assert_eq!(
+            documented, expected,
+            "the method table of docs/nip86.md and SUPPORTED_METHODS differ"
+        );
+    }
+
+    #[test]
     fn supportedmethods_lists_what_the_caller_may_call() {
         let admin = supported_methods(ManagementLevel::Admin);
         assert!(!admin.contains(&"supportedmethods"));

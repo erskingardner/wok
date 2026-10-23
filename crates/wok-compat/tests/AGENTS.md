@@ -16,6 +16,8 @@
 | `ws_timeouts.rs` | Handshake/frame-read/pong liveness timeouts |
 | `negentropy_e2e.rs` | NEG-* sessions against a live relay |
 | `plugin_e2e.rs` | Write-policy plugin child process |
+| `attack_surface.rs` | HTTP paths per profile, client verbs, and profiles vs `docs/attack-surface.md` |
+| `profiles/` | Configuration profiles the attack-surface tests start relays from |
 | `error_routing.rs` | CLOSED/NOTICE/OK error paths |
 | `db_watch.rs` | Config/DB watch / hot-reload related |
 | `non_ascii_event_id.rs` | Non-ASCII / invalid id handling |

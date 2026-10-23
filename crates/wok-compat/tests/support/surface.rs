@@ -64,7 +64,12 @@ pub struct Relay {
 }
 
 impl Relay {
-    pub async fn start(mut cfg: Config) -> Self {
+    pub async fn start(cfg: Config) -> Self {
+        Self::try_start(cfg).await.unwrap()
+    }
+
+    /// Start a relay, or return why Wok refuses to serve `cfg`.
+    pub async fn try_start(mut cfg: Config) -> Result<Self, String> {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(
             dir.path(),
@@ -82,7 +87,7 @@ impl Relay {
         // answer 429 long before the probe has tried every path.
         cfg.relay.abuse.connection_rate_per_second = 0;
         let wants_metrics_listener = !cfg.observability.metrics_listen.is_empty();
-        let handle = wok_relay::start(env, cfg).unwrap();
+        let handle = wok_relay::start(env, cfg)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let serving = handle.clone();
@@ -95,12 +100,12 @@ impl Relay {
             metrics = Some(listener.local_addr().unwrap());
             tokio::spawn(wok_ws::serve_metrics(handle.clone(), listener));
         }
-        Self {
+        Ok(Self {
             addr,
             metrics,
             handle,
             _dir: dir,
-        }
+        })
     }
 
     pub async fn stop(self) {

@@ -8,6 +8,7 @@ Operator/CI helper scripts. Not on the relay runtime path.
 | `lab.py` | Local / two-VM Compose campaign, artifacts, shutdown and integrity |
 | `lab-bootstrap-debian.sh` | Opt-in Docker installation on clean Debian 12/13 |
 | `reliability-soak.py` | Disposable Linux relay/load processes, resource samples, restart and integrity gates |
+| `attack-surface-reach.py` | Relay functions each caller (anonymous, authenticated, admin, admitted Unix peer) reaches per profile, under coverage; `--check` against `crates/wok-compat/tests/reachability/` |
 | `release-notes.sh` | Extract changelog notes for a tag |
 | `benchmark-campaign.sh` | Two-host / full `wok-bench` campaign wrapper |
 | `benchmark-transports.sh` | Same-host Unix vs WebSocket comparison |

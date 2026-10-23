@@ -2255,21 +2255,23 @@ fn handle_client(
 /// If a repost of a protected event embeds the event anyway, relays SHOULD
 /// summarily reject it." True when a repost's `content` is an event object
 /// with a tag named `-`, whatever the JSON's spacing or the tag's other
-/// elements.
+/// elements, or is an object the relay cannot check.
 fn embeds_protected_event(content: &str) -> bool {
     // An embedded event is a JSON object; anything else needs no parse.
-    if !content.trim_start().starts_with('{') {
+    if !content
+        .trim_start_matches([' ', '\t', '\n', '\r'])
+        .starts_with('{')
+    {
         return false;
     }
     // The content is no longer than its event, which `max_event_size`
-    // bounds, and both parsers limit nesting. The strict parser refuses a
-    // repeated key, which clients' parsers accept, keeping the last value, so
-    // content it refuses is read that way too.
-    let parsed = wok_event::json::parse_strict(content)
-        .ok()
-        .or_else(|| serde_json::from_str::<Value>(content).ok());
-    let Some(Value::Object(event)) = parsed else {
-        return false;
+    // bounds. An object the strict parser refuses counts as protected:
+    // clients' parsers accept some of what it refuses (a repeated key, deep
+    // nesting, a lone surrogate, a number too large for a double), and could
+    // read a protected event there. NIP-18 makes the content the reposted
+    // event or empty, so no valid repost is refused.
+    let Ok(Value::Object(event)) = wok_event::json::parse_strict(content) else {
+        return true;
     };
     event
         .get("tags")

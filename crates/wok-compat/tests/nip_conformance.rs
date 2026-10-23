@@ -581,6 +581,8 @@ async fn nip70_reposts_that_embed_a_protected_event_are_refused() {
     // repost of a protected event embeds the event anyway, relays SHOULD
     // summarily reject it." The content is parsed: a protected event is
     // found however its JSON is spaced, and nothing else is mistaken for one.
+    // An object the strict parser refuses counts as protected, since
+    // clients' parsers can still read a protected event in it.
     let relay = Relay::new(|_| {});
     let mut conn = relay.connect().await;
     let note = |tags: Value, content: String| {
@@ -588,8 +590,8 @@ async fn nip70_reposts_that_embed_a_protected_event_are_refused() {
     };
     let protected = note(json!([["-"]]), "members only".into());
     let protected_text = protected.to_string();
-    let mut repeated_key = protected_text.clone();
-    repeated_key.insert_str(1, &format!(r#""id":{},"#, protected["id"]));
+    // The protected event with one more member, ahead of the others.
+    let with = |member: &str| format!("{{{member},{}", &protected_text[1..]);
     let embedded = [
         ("compact", protected_text.clone()),
         ("pretty", serde_json::to_string_pretty(&protected).unwrap()),
@@ -606,9 +608,21 @@ async fn nip70_reposts_that_embed_a_protected_event_are_refused() {
             "not the first tag",
             note(json!([["t", "x"], ["-"]]), "members only".into()).to_string(),
         ),
-        // Clients' parsers keep the last of a repeated key, so this is the
-        // protected event to them; the relay's strict parser refuses it.
-        ("repeated key", repeated_key),
+        // What `JSON.parse` reads as the protected event but the relay's
+        // strict parser refuses.
+        (
+            "repeated key",
+            with(&format!(r#""id":{}"#, protected["id"])),
+        ),
+        // `JSON.parse` keeps the last `tags`, the protected one.
+        ("repeated tags", with(r#""tags":[]"#)),
+        (
+            "deep extra member",
+            with(&format!(r#""x":{}0{}"#, "[".repeat(130), "]".repeat(130))),
+        ),
+        ("lone surrogate", with(r#""x":"\ud800""#)),
+        ("huge number", with(r#""x":1e400"#)),
+        ("malformed", format!("{{{protected_text}")),
         (
             "huge",
             note(json!([["-"]]), "x".repeat(600_000)).to_string(),
@@ -637,7 +651,7 @@ async fn nip70_reposts_that_embed_a_protected_event_are_refused() {
             "object without tags",
             r#"{"content":"[\"-\"]"}"#.to_string(),
         ),
-        ("malformed", format!("{{{protected_text}")),
+        ("not an object", format!("}}{protected_text}")),
         (
             "huge unprotected",
             note(json!([["t", "x"]]), "x".repeat(600_000)).to_string(),

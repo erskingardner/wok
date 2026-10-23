@@ -160,8 +160,10 @@ regression test. Differential parity alone is not a reason to retain it.
   NEG-MSG or NEG-CLOSE with an invalid one, still produces a NOTICE.
 - NIP-70: a repost (kind 6 or 16) is refused with `blocked: reposts can't
   embed protected events` when its content parses as an event object with a
-  tag named `-`. Content the strict parser refuses for a repeated key is read
-  as clients read it, keeping the last value. Pinned strfry refuses any
+  tag named `-`. Content that starts as a JSON object but that the strict
+  parser refuses is refused too, since clients' parsers accept some of it (a
+  repeated key, deep nesting, a lone surrogate, a number too large for a
+  double) and could read a protected event there. Pinned strfry refuses any
   repost whose content contains the text `["-"]`, so it refuses reposts of
   notes that only mention it and accepts protected events written with other
   spacing or a tag such as `["-",""]`.

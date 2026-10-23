@@ -72,7 +72,7 @@ WebSocket upgrade on any path but `/`.
 | `/nodeinfo/2.1` | anonymous | none | The NodeInfo document. |
 | `/favicon.ico` | anonymous | none | A fixed empty icon. |
 | `/admin`, `/admin/` | anonymous | `admin.enabled` | `GET` returns the signed-out [dashboard](admin-dashboard.md) shell, which holds no relay data. Other methods get 404. |
-| `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix refuses a request without a `Nostr` `Authorization` header before reading its body. It then reads the body (at most 64 KiB) and checks NIP-98: it decodes the header and parses the event strictly; checks its kind, empty content, time window and `u` and `method` tags, and its `payload` tag when the request has a body; checks that the signer it names is in `admin.pubkeys`; verifies the event and its signature; and claims the event in the replay cache. A signer not in the list and a bad signature get the same 401, so a forged event cannot ask which keys are admins. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
+| `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix decodes the `Authorization: Nostr` header and parses its event strictly before reading the body, and refuses a request whose header is missing or does not decode. It then reads the body (at most 64 KiB) and checks NIP-98: it checks its kind, empty content, time window and `u` and `method` tags, and its `payload` tag when the request has a body; checks that the signer it names is in `admin.pubkeys`; verifies the event and its signature; and claims the event in the replay cache. A signer not in the list and a bad signature get the same 401, so a forged event cannot ask which keys are admins. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
 
 ## Metrics listener
 
@@ -119,8 +119,8 @@ same ingester. Before Wok reads a message's verb:
 
 NIP-86 requests are a `POST` to `/` with
 `Content-Type: application/nostr+json+rpc`. They get 404 unless
-`admin.enabled` is set. A request without a `Nostr` `Authorization` header is
-refused before its body is read. Each other request reads the body (at most
+`admin.enabled` is set. A request whose `Authorization: Nostr` header is
+missing or does not decode to an event is refused before its body is read. Each other request reads the body (at most
 64 KiB) and checks NIP-98 as the dashboard API does, with a required `payload`
 tag and the `u` tag compared with `admin.public_url`. In place of
 `admin.pubkeys`, the signer the event names must hold a management level,

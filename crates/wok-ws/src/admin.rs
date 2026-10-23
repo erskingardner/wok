@@ -174,18 +174,19 @@ pub async fn dispatch(
         .get(hyper::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    // Refused before the body is read: without the header nothing can
-    // authorize the request.
-    if !has_nostr_authorization(authorization.as_deref()) {
-        return unauthorized("missing Nostr authorization");
-    }
+    // Decoded before the body is read: nothing can authorize a request whose
+    // header fails here.
+    let event = match decode_authorization(authorization.as_deref()) {
+        Ok(event) => event,
+        Err(error) => return unauthorized(&error),
+    };
     let body = match read_body(req.into_body(), MAX_ADMIN_BODY).await {
         Ok(body) => body,
         Err(error) => return response(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", &error),
     };
     let absolute_url = format!("{}{}", cfg.admin.public_url, path_and_query);
     let (admin_pubkey, replay) = match authorize(
-        authorization.as_deref(),
+        &event,
         &method,
         &body,
         &cfg,
@@ -219,9 +220,22 @@ pub async fn dispatch(
     resp
 }
 
-/// Whether `authorization` is a `Nostr` authorization at all.
-pub(crate) fn has_nostr_authorization(authorization: Option<&str>) -> bool {
-    authorization.is_some_and(|value| value.starts_with("Nostr "))
+/// The event a request's `Authorization: Nostr <base64>` header carries,
+/// decoded and parsed with Wok's strict JSON parser. Callers check this
+/// before reading the body.
+pub(crate) fn decode_authorization(
+    authorization: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let encoded = authorization
+        .and_then(|value| value.strip_prefix("Nostr "))
+        .ok_or_else(|| "missing Nostr authorization".to_string())?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "invalid Nostr authorization encoding".to_string())?;
+    std::str::from_utf8(&decoded)
+        .ok()
+        .and_then(|text| wok_event::json::parse_strict(text).ok())
+        .ok_or_else(|| "invalid Nostr authorization JSON".to_string())
 }
 
 pub(crate) async fn read_body(mut body: Incoming, maximum: usize) -> Result<Vec<u8>, String> {
@@ -290,23 +304,13 @@ pub(crate) const REFUSED_SIGNER: &str =
 /// signer may use the endpoint. A request that could never be authorized
 /// costs no verification.
 pub(crate) fn authorize<'a>(
-    authorization: Option<&str>,
+    event: &serde_json::Value,
     method: &Method,
     body: &[u8],
     cfg: &Config,
     state: &'a AdminState,
     policy: &AuthzPolicy<'_>,
 ) -> Result<(String, ReplayReservation<'a>), String> {
-    let encoded = authorization
-        .and_then(|value| value.strip_prefix("Nostr "))
-        .ok_or_else(|| "missing Nostr authorization".to_string())?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|_| "invalid Nostr authorization encoding".to_string())?;
-    let event = std::str::from_utf8(&decoded)
-        .ok()
-        .and_then(|text| wok_event::json::parse_strict(text).ok())
-        .ok_or_else(|| "invalid Nostr authorization JSON".to_string())?;
     if event.get("kind").and_then(serde_json::Value::as_u64) != Some(27235) {
         return Err("NIP-98 authorization must be kind 27235".into());
     }
@@ -321,14 +325,14 @@ pub(crate) fn authorize<'a>(
     if created_at.is_none_or(|created_at| created_at.abs_diff(now) > cfg.admin.auth_window_secs) {
         return Err("NIP-98 authorization is outside the accepted time window".into());
     }
-    if !(policy.url_ok)(single_tag(&event, "u")?) {
+    if !(policy.url_ok)(single_tag(event, "u")?) {
         return Err("NIP-98 u tag does not match the request URL".into());
     }
-    if single_tag(&event, "method")? != method.as_str() {
+    if single_tag(event, "method")? != method.as_str() {
         return Err("NIP-98 method tag does not match the request method".into());
     }
     if !body.is_empty() || policy.require_payload {
-        let payload = single_tag(&event, "payload")?;
+        let payload = single_tag(event, "payload")?;
         if payload != hex::encode(sha2::Sha256::digest(body)) {
             return Err("NIP-98 payload tag does not match the request body".into());
         }
@@ -339,7 +343,7 @@ pub(crate) fn authorize<'a>(
         return Err(REFUSED_SIGNER.into());
     }
     let parsed = wok_event::parse_and_verify_event(
-        &event,
+        event,
         &wok_event::EventLimits::default(),
         None,
         true,
@@ -1153,6 +1157,10 @@ mod tests {
         )
     }
 
+    fn decoded(header: &str) -> serde_json::Value {
+        decode_authorization(Some(header)).unwrap()
+    }
+
     fn signed_auth(key: &Keypair, url: &str, method: &str, body: &[u8]) -> String {
         signed_auth_with_nonce(key, url, method, body, None)
     }
@@ -1174,7 +1182,7 @@ mod tests {
             signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
             require_payload: false,
         };
-        let auth = || authorize(Some(&header), &Method::PUT, body, &cfg, &state, &policy);
+        let auth = || authorize(&decoded(&header), &Method::PUT, body, &cfg, &state, &policy);
         let (_, replay) = auth().unwrap();
         // While the first request is in flight, the same signed event cannot
         // authorize a concurrent second one (#51).
@@ -1194,7 +1202,7 @@ mod tests {
             b"different",
         );
         assert!(authorize(
-            Some(&wrong_payload),
+            &decoded(&wrong_payload),
             &Method::PUT,
             body,
             &cfg,
@@ -1210,7 +1218,7 @@ mod tests {
 
         let wrong_url = signed_auth(&key, "https://relay.example/admin/api/other", "GET", b"");
         assert!(authorize(
-            Some(&wrong_url),
+            &decoded(&wrong_url),
             &Method::GET,
             b"",
             &cfg,
@@ -1232,7 +1240,7 @@ mod tests {
             b"",
         );
         assert!(authorize(
-            Some(&unauthorized),
+            &decoded(&unauthorized),
             &Method::GET,
             b"",
             &cfg,
@@ -1280,7 +1288,7 @@ mod tests {
         };
         let refusal = |header: &str| {
             authorize(
-                Some(header),
+                &decoded(header),
                 &Method::GET,
                 b"",
                 &cfg,
@@ -1328,7 +1336,7 @@ mod tests {
         for nonce in ["first-request", "second-request"] {
             let header = signed_auth_with_nonce(&key, url, "GET", b"", Some(nonce));
             assert!(authorize(
-                Some(&header),
+                &decoded(&header),
                 &Method::GET,
                 b"",
                 &cfg,
@@ -1362,8 +1370,15 @@ mod tests {
 
         // Empty body signed without a payload tag: rejected in NIP-86 mode.
         let no_payload = signed_auth(&key, url, "POST", b"");
-        let err =
-            authorize(Some(&no_payload), &Method::POST, b"", &cfg, &state, &policy).unwrap_err();
+        let err = authorize(
+            &decoded(&no_payload),
+            &Method::POST,
+            b"",
+            &cfg,
+            &state,
+            &policy,
+        )
+        .unwrap_err();
         assert!(err.contains("payload"), "{err}");
 
         // With the payload tag bound to SHA-256 of the empty body: accepted.
@@ -1387,7 +1402,7 @@ mod tests {
             "Nostr {}",
             base64::engine::general_purpose::STANDARD.encode(event.to_string())
         );
-        assert!(authorize(Some(&header), &Method::POST, b"", &cfg, &state, &policy).is_ok());
+        assert!(authorize(&decoded(&header), &Method::POST, b"", &cfg, &state, &policy).is_ok());
     }
 
     #[test]

@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     NIP-86 kind policy or as an AUTH event, before it is verified (#150). The
     author ban and `write_policy` still wait for the signature, so an
     unsigned event cannot ask whether a key is a member or banned.
-  - **The dashboard API and NIP-86** refuse a request without a `Nostr`
-    authorization before reading its body, check the event's kind, content,
+  - **The dashboard API and NIP-86** refuse a request whose `Nostr`
+    authorization is missing or does not decode to an event before reading
+    its body, check the event's kind, content,
     time window and tags, then whether its signer may use the endpoint, and
     only then verify the signature (#147). A signer that may not and a bad
     signature get the same 401, "NIP-98 authorization is not from a key

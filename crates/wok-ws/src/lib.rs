@@ -1624,25 +1624,37 @@ mod admin_http_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_listener(handle, listener));
+        let malformed = [
+            "",
+            "Authorization: Bearer token\r\n",
+            "Authorization: Nostr !!!!\r\n",
+            // Valid base64 of something that is not JSON.
+            "Authorization: Nostr bm90IGpzb24=\r\n",
+        ];
         for (target, content_type) in [
             ("PUT /admin/api/config", "application/json"),
             ("POST /", nip86::RPC_CONTENT_TYPE),
         ] {
-            // The body the request announces never arrives: a handler that
-            // read it first would wait for it.
-            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let request = format!(
-                "{target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\n\
-                 Content-Length: 1000000\r\n\r\n"
-            );
-            stream.write_all(request.as_bytes()).await.unwrap();
-            let mut head = [0u8; 64];
-            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut head))
-                .await
-                .unwrap_or_else(|_| panic!("{target}: no answer before the body"))
-                .unwrap();
-            let head = String::from_utf8_lossy(&head[..read]);
-            assert!(head.starts_with("HTTP/1.1 401"), "{target}: {head}");
+            for authorization in malformed {
+                // The body the request announces never arrives: a handler
+                // that read it first would wait for it.
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let request = format!(
+                    "{target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\n\
+                     {authorization}Content-Length: 1000000\r\n\r\n"
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut head = [0u8; 64];
+                let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut head))
+                    .await
+                    .unwrap_or_else(|_| panic!("{target} {authorization:?}: no answer"))
+                    .unwrap();
+                let head = String::from_utf8_lossy(&head[..read]);
+                assert!(
+                    head.starts_with("HTTP/1.1 401"),
+                    "{target} {authorization:?}: {head}"
+                );
+            }
         }
     }
 }

@@ -491,7 +491,7 @@ pub(super) const SECTIONS: &[Section] = &[
                 "Stored events per author",
                 "Events one key may have stored. Replacing a profile or list, and deleting the author's own events, still work at the quota.",
                 "Active users and bots can no longer post new events.",
-                "One key can fill the disk. A new key for each event starts a new count each time, so throwaway keys are held only by the per-address budgets.",
+                "One key can fill the disk. Every key is held to it, a throwaway one included, but a new key for each event starts a new count each time.",
                 &[Input::new("abuse", "max_stored_events_per_pubkey", "relay.abuse.max_stored_events_per_pubkey", Unit::Count).off()],
             ),
             field(

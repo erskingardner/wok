@@ -933,7 +933,7 @@ function buildInput(input){
  if(input.unit==='switch'){field=el('input');field.type='checkbox'}
  else if(input.unit==='persistence'){field=el('select');for(const [value,text] of [['live_only','Live only'],['ttl','Keep for their lifetime']]){const option=el('option',null,text);option.value=value;field.append(option)}}
  else if(input.unit==='text'||input.unit==='url'){field=el('input');field.type=input.unit==='url'?'url':'text'}
- else{field=el('input');field.type='number';field.min='0';field.step='any'}
+ else{field=el('input');field.type='number';field.min='0';field.step=UNITS[input.unit]?'any':'1'}
  field.className='config-input';field.setAttribute('aria-label',input.key);wrap.append(field);
  const units=UNITS[input.unit];if(units){const select=el('select','unit');for(const [factor,name] of units){const option=el('option',null,name);option.value=factor;select.append(option)}select.setAttribute('aria-label',input.key+' unit');wrap.append(select)}
  if(input.zero_off){const label=el('label','off'),off=el('input');off.type='checkbox';off.className='off-switch';off.setAttribute('aria-label',input.key+' off');off.onchange=()=>{for(const part of wrap.querySelectorAll('.config-input,select.unit'))part.disabled=off.checked||!data.can_write_config;if(off.checked)field.value=''};label.append(off,document.createTextNode('Off'));wrap.append(label)}
@@ -952,8 +952,10 @@ function getValue(input,wrap){
  if(input.unit==='persistence'||input.unit==='text'||input.unit==='url')return field.value;
  if(off&&off.checked)return 0;
  if(field.value==='')throw Error(input.key+' needs a value');
- const value=Math.round(Number(field.value)*(unit?Number(unit.value):1));
- if(!Number.isFinite(value)||value<0)throw Error(input.key+' must be a positive number');
+ // A whole number of the setting's own unit, or a save could round 0.2 a
+ // second down to 0, which turns a bucket off.
+ const exact=Number(field.value)*(unit?Number(unit.value):1),value=Math.round(exact),base={bytes:'bytes',seconds:'seconds',micros:'microseconds',per_second:'per second'}[input.unit];
+ if(!Number.isFinite(exact)||exact<0||Math.abs(exact-value)>1e-9*Math.max(1,exact))throw Error(input.key+' must be a whole number'+(base?' ('+base+')':'')+', not '+field.value+(unit?' '+unit.selectedOptions[0].textContent:''));
  return value}
 function accessRows(a){
  const kinds=list=>list.length?list.map(k=>k.name?k.kind+' ('+k.name+')':String(k.kind)).join(', '):'None';
@@ -1361,6 +1363,8 @@ event_burst = 500
             "if(value!==data.config[input.group][input.name])(body[input.group]=body[input.group]||{})"
         ));
         assert!(ADMIN_HTML_V2.contains("No changes to save."));
+        // A fraction of a setting's own unit is refused, not rounded to 0.
+        assert!(ADMIN_HTML_V2.contains("Math.abs(exact-value)>1e-9*Math.max(1,exact)"));
     }
 
     #[test]

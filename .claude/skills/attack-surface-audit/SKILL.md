@@ -21,7 +21,7 @@ then run the tests that keep the inventory in step with the code. The
 "Keeping this page current" table in `docs/attack-surface.md` lists them all:
 
 ```bash
-cargo test -p wok-compat --test attack_surface --test golden_transcripts --test setting_combinations
+cargo test -p wok-compat --test attack_surface --test golden_transcripts
 cargo test -p wok-ws nip86      # NIP-86 methods and levels vs docs/nip86.md
 cargo test -p wok-cli           # `wok` commands vs the Commands table
 ```
@@ -41,16 +41,19 @@ Evidence: `scripts/attack-surface-reach.py` (needs `cargo-llvm-cov` and the
 reaches, per profile, in `crates/wok-compat/tests/reachability/`.
 
 ```bash
-scripts/attack-surface-reach.py --check    # fails on new reach, or a phase that reaches nothing
+scripts/attack-surface-reach.py --check    # fails on new reach, an emptied phase, or a missing baseline
 ```
 
-`--check` fails in two cases. A phase that reached functions and now reaches
-none means the probe broke: fix the probe, never bless it. A function the
-`anonymous` phase newly reaches is code an unauthenticated client can now
-run: move it after the cheapest check that refuses the request, or behind a
-setting. Rewrite the baseline with `--bless` only when the new reach is
-intended, with the reason in the pull request. A function no longer reached
-is listed but does not fail. When you extend the probe (`crates/wok-compat/tests/reachability.rs`), keep it from
+`--check` fails when any phase reaches a function its baseline does not
+list, when a phase whose baseline lists functions reaches none, and when a
+profile has no baseline. A function the `anonymous` phase newly reaches is
+code an unauthenticated client can now run: move it after the cheapest check
+that refuses the request, or behind a setting, and rewrite the baseline with
+`--bless` only when that reach is the point of the change, with the reason in
+the pull request. A phase that went empty is a broken probe when the probe
+stopped sending: fix the probe. When the probe still sends and the profile
+now closes that caller on purpose, `--bless` with the reason. A function no
+longer reached is listed but does not fail. When you extend the probe (`crates/wok-compat/tests/reachability.rs`), keep it from
 calling the relay's crates itself (sign, frame and compress with other
 crates), or its own work is counted as the relay's.
 
@@ -88,8 +91,14 @@ at load or a warning? Refuse such a combination when the configuration loads,
 or warn about it there and in `wok doctor`.
 
 Add each security setting to `SETTINGS` in
-`crates/wok-compat/tests/setting_combinations.rs`. The test sends every
-setting, alone and in pairs, the golden transcript script, and fails when:
+`crates/wok-compat/tests/setting_combinations.rs` and run it:
+
+```bash
+cargo test -p wok-compat --test setting_combinations
+```
+
+The test sends every setting, alone and in pairs, the golden transcript
+script, and fails when:
 
 - a step one setting refuses for a reason of its own, or that each of two
   settings refuses, is served with both on: fix it, or add the step to
@@ -116,6 +125,8 @@ use to read or write what it should not, goes to a private advisory
 and documentation gaps can be public issues. When a finding fits both, ask
 who has to act for it to be exploitable: if a client can exploit a relay
 whose operator configured it as documented, it is private; if the gate fails
-open only because the operator wrote a setting that the docs do not support
-(a malformed value, a list emptied on purpose) and Wok does not warn, it is a
-configuration bug and can be public, like #162.
+open only because the operator wrote a value the docs do not support, and
+Wok accepts it without a warning, it is a configuration bug and can be
+public. #162 is one: an `allowed_kinds` value that does not parse is treated
+as allowing every kind. An empty list that the docs define as unrestricted is
+the operator's choice, not a finding.

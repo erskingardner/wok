@@ -68,15 +68,15 @@ impl Input {
 }
 
 /// A token bucket: its refill per second and how much may be spent at
-/// once, as `[name, key]` pairs.
+/// once, as `[name, key]` pairs. Zero in either turns the bucket off.
 const fn bucket(
     group: &'static str,
     rate: [&'static str; 2],
     burst: [&'static str; 2],
 ) -> [Input; 2] {
     [
-        Input::new(group, rate[0], rate[1], Unit::PerSecond),
-        Input::new(group, burst[0], burst[1], Unit::Count),
+        Input::new(group, rate[0], rate[1], Unit::PerSecond).off(),
+        Input::new(group, burst[0], burst[1], Unit::Count).off(),
     ]
 }
 
@@ -387,7 +387,7 @@ pub(super) const SECTIONS: &[Section] = &[
     Section {
         id: "rates",
         title: "Rates",
-        help: "Token buckets: each refills at its rate per second and holds up to its burst. A connection has budgets of its own, under a backstop shared by every connection from one address (an IPv4 address, or an IPv6 network). Behind a reverse proxy, a client's address is the last entry of the client address header.",
+        help: "Token buckets: each refills at its rate per second and holds up to its burst. A connection has budgets of its own, under a backstop shared by every connection from one address (an IPv4 address, or an IPv6 network). Behind a reverse proxy, a client's address is the last entry of the client address header. Off, on a bucket's rate or its burst, turns that bucket off: unlimited.",
         fields: &[
             field(
                 "Rate limits and quotas",
@@ -456,7 +456,7 @@ pub(super) const SECTIONS: &[Section] = &[
                 "Events per author",
                 "Events from one key. An event from a key that is not one of the connection's logged-in identities is charged to its first identity instead.",
                 "Active users, bots and bulk publishing are throttled.",
-                "One key can flood the relay. Throwaway keys on anonymous connections are never charged.",
+                "One key can flood the relay. On an anonymous connection, a new key for each event starts a new budget each time.",
                 &AUTHOR_EVENT,
             ),
             field(
@@ -491,7 +491,7 @@ pub(super) const SECTIONS: &[Section] = &[
                 "Stored events per author",
                 "Events one key may have stored. Replacing a profile or list, and deleting the author's own events, still work at the quota.",
                 "Active users and bots can no longer post new events.",
-                "One key can fill the disk. Throwaway keys are never charged.",
+                "One key can fill the disk. A new key for each event starts a new count each time, so throwaway keys are held only by the per-address budgets.",
                 &[Input::new("abuse", "max_stored_events_per_pubkey", "relay.abuse.max_stored_events_per_pubkey", Unit::Count).off()],
             ),
             field(

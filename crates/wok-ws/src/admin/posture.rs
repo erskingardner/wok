@@ -86,6 +86,8 @@ pub(super) fn posture(cfg: &Config) -> Vec<String> {
         let mut sentence = format!("It shows {}", reads.join("; "));
         sentence.push_str(if cfg.auth_usable() {
             ", once they log in."
+        } else if !auth.enabled {
+            ". Nobody can log in while relay.auth.enabled is false, so nobody can read them."
         } else {
             ". Nobody can log in until relay.auth.service_url is set, so nobody can read them."
         });
@@ -97,15 +99,25 @@ pub(super) fn posture(cfg: &Config) -> Vec<String> {
 
     let abuse = &cfg.relay.abuse;
     sentences.push(if abuse.enabled {
+        // Zero in a rate or a burst turns its bucket off.
         let own = &abuse.per_connection;
-        format!(
-            "Each connection can open {} queries a second, {} at once, {}× that after login; \
-             all the connections from one address share {} a second.",
-            own.req_rate_per_second,
-            own.req_burst,
-            own.authenticated_multiplier,
-            abuse.req_rate_per_second
-        )
+        let connection = if own.req_rate_per_second == 0 || own.req_burst == 0 {
+            "Each connection's query budget is off".to_string()
+        } else {
+            format!(
+                "Each connection can open {} queries a second, {} at once, {}× that after login",
+                own.req_rate_per_second, own.req_burst, own.authenticated_multiplier
+            )
+        };
+        let address = if abuse.req_rate_per_second == 0 || abuse.req_burst == 0 {
+            "the per-address backstop is off".to_string()
+        } else {
+            format!(
+                "all the connections from one address share {} a second",
+                abuse.req_rate_per_second
+            )
+        };
+        format!("{connection}; {address}.")
     } else {
         "Rate limits, storage quotas, the query work ceiling and proof of work are off.".into()
     });
@@ -121,19 +133,30 @@ pub(super) fn access(cfg: &Config) -> serde_json::Value {
             .map(|&kind| serde_json::json!({"kind": kind, "name": kind_name(kind)}))
             .collect()
     };
-    let policy = |policy: AccessPolicy, verb: &str| match policy {
-        AccessPolicy::Open => format!("Anyone may {verb}."),
-        AccessPolicy::Authenticated => format!("A connection must log in (NIP-42 AUTH) to {verb}."),
+    const MEMBER: &str = "A member is a pubkey allowlisted or given a role with NIP-86, or \
+                          one of admin.pubkeys, that is not banned.";
+    let read_means = match auth.read_policy {
+        AccessPolicy::Open => "Anyone may read.".to_string(),
+        AccessPolicy::Authenticated => "A connection must log in (NIP-42 AUTH) to read.".into(),
+        AccessPolicy::Members => format!("A connection must log in as a member to read. {MEMBER}"),
+    };
+    let write_means = match auth.write_policy {
+        AccessPolicy::Open => "Anyone may write.".to_string(),
+        AccessPolicy::Authenticated => {
+            "A connection must log in (NIP-42 AUTH) to write; the event may be signed by any key."
+                .into()
+        }
         AccessPolicy::Members => format!(
-            "A connection must log in as a member to {verb}: a pubkey allowlisted or given a \
-             role with NIP-86, or one of admin.pubkeys, that is not banned."
+            "An event is accepted when a member signed it, from any connection; when its \
+             connection logged in as a member, whatever key signed it; or, for the inbox kinds, \
+             when its first p tag is a member. {MEMBER}"
         ),
     };
     serde_json::json!({
         "read_policy": auth.read_policy.name(),
-        "read_policy_means": policy(auth.read_policy, "read"),
+        "read_policy_means": read_means,
         "write_policy": auth.write_policy.name(),
-        "write_policy_means": policy(auth.write_policy, "write"),
+        "write_policy_means": write_means,
         "recipient_only_kinds": named(&auth.recipient_only_kinds),
         "owner_only_kinds": named(&auth.owner_only_kinds),
         "authenticated_kinds": named(&auth.authenticated_kinds),
@@ -172,8 +195,25 @@ mod tests {
                  all the connections from one address share 200 a second.",
             ]
         );
-        // Without a service URL nobody can log in to read them.
-        assert!(posture(&preset("public", ""))[1].ends_with("so nobody can read them."));
+        // Without a service URL nobody can log in to read them, and with AUTH
+        // off neither can anybody, whatever the URL.
+        assert!(posture(&preset("public", ""))[1]
+            .ends_with("until relay.auth.service_url is set, so nobody can read them."));
+        let off = preset(
+            "public",
+            "[relay.auth]\nenabled = false\nservice_url = \"wss://relay.test\"\n",
+        );
+        assert!(posture(&off)[1]
+            .ends_with("while relay.auth.enabled is false, so nobody can read them."));
+        // Zero in a rate or a burst turns its budget off, not down.
+        let zeroed = preset(
+            "public",
+            "[relay.abuse]\nreq_burst = 0\n\n[relay.abuse.per_connection]\nreq_rate_per_second = 0\n",
+        );
+        assert_eq!(
+            posture(&zeroed)[2],
+            "Each connection's query budget is off; the per-address backstop is off."
+        );
     }
 
     #[test]
@@ -213,6 +253,21 @@ mod tests {
         );
         let access = access(&cfg);
         assert_eq!(access["read_policy"], "authenticated");
+        assert!(access["read_policy_means"]
+            .as_str()
+            .unwrap()
+            .starts_with("A connection must log in (NIP-42 AUTH) to read."));
+        // A member's own events, and inbox kinds addressed to a member, need
+        // no login.
+        let writes = access["write_policy_means"].as_str().unwrap();
+        assert!(
+            writes.contains("when a member signed it, from any connection"),
+            "{writes}"
+        );
+        assert!(
+            writes.contains("when its first p tag is a member"),
+            "{writes}"
+        );
         assert_eq!(
             access["recipient_only_kinds"][0]["name"],
             "NIP-04 direct messages"

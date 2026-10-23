@@ -1513,6 +1513,29 @@ event_burst = 500
     }
 
     #[test]
+    fn a_zero_that_disables_a_guard_is_shown_as_off() {
+        // The relay warns about every zero that turns a guard off; each such
+        // input must say Off rather than look like the strictest limit.
+        for input in fields::SECTIONS
+            .iter()
+            .flat_map(|section| section.fields)
+            .flat_map(|field| field.inputs)
+            .filter(|input| !input.file_only)
+        {
+            if !dashboard_config(&Config::default())[input.group][input.name].is_number() {
+                continue;
+            }
+            let patch = serde_json::from_value(json!({ input.group: { input.name: 0 } })).unwrap();
+            let Ok((_, verified)) = patched_file("", patch) else {
+                continue;
+            };
+            if !verified.zero_guard_warnings().is_empty() {
+                assert!(input.zero_off, "{} = 0 disables a guard", input.key);
+            }
+        }
+    }
+
+    #[test]
     fn the_overview_reports_the_files_overrides_and_problems() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wok.toml");

@@ -174,10 +174,7 @@ pub async fn serve_metrics(handle: RelayHandle, listener: TcpListener) -> std::i
                     // The scraper's own address: real_ip_header is for the
                     // relay listener's proxy.
                     if !handle.admit_connection(&TransportSource::ip_address(peer.ip())) {
-                        return Ok::<_, Infallible>(text_status_response(
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "rate-limited: connection budget exhausted",
-                        ));
+                        return Ok::<_, Infallible>(empty(StatusCode::TOO_MANY_REQUESTS));
                     }
                     let served = req.uri().path() == "/metrics"
                         && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD)
@@ -1588,7 +1585,9 @@ mod metrics_tests {
             })
             .await
             .unwrap();
-        assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 429);
+        let (status, head, _) = request(served.metrics, "GET", "/metrics").await;
+        assert_eq!(status, 429);
+        assert!(!head.contains("access-control-allow-origin"), "{head}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

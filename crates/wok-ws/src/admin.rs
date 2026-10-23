@@ -958,12 +958,12 @@ function getValue(input,wrap){
  if(!Number.isFinite(exact)||exact<0||Math.abs(exact-value)>1e-9*Math.max(1,exact))throw Error(input.key+' must be a whole number'+(base?' ('+base+')':'')+', not '+field.value+(unit?' '+unit.selectedOptions[0].textContent:''));
  return value}
 function accessRows(a){
- const kinds=list=>list.length?list.map(k=>k.name?k.kind+' ('+k.name+')':String(k.kind)).join(', '):'None';
+ const kinds=list=>list.length?list.map(k=>String(k.kind)+(k.name?' ('+k.name+')':'')+(k.stricter?' (governed by '+k.stricter+', which is stricter)':'')).join(', '):'None';
  return [
   ['Reads',a.read_policy+': '+a.read_policy_means],
   ['Writes',a.write_policy+': '+a.write_policy_means],
   ['Only to author and recipient',kinds(a.recipient_only_kinds)],
-  ['Only to their author',kinds(a.owner_only_kinds)],
+  ['Only to their author',kinds(a.owner_only_kinds)+(a.owner_only_kinds.length?'; accepted only from a connection logged in as their author':'')],
   ['To any logged-in user',kinds(a.authenticated_kinds)],
   ['Deliverable to members',kinds(a.inbox_kinds)+(a.write_policy==='members'?'':' (used only with write_policy = members)')],
   ['Accepted kinds',a.accepted_kinds?a.accepted_kinds.join(', '):'Every kind'],

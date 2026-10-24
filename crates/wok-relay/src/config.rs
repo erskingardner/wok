@@ -219,6 +219,9 @@ pub struct RelayConfig {
     pub real_ip_header: String,
     pub auth: AuthConfig,
     pub info: InfoConfig,
+    /// Serve NodeInfo discovery (`/.well-known/nodeinfo`) and its document
+    /// (`/nodeinfo/2.1`). No Nostr client needs them.
+    pub nodeinfo_enabled: bool,
     pub max_websocket_payload_size: usize,
     /// Maximum combined compact-JSON bytes across all filter objects in one
     /// REQ or COUNT command.
@@ -493,6 +496,7 @@ impl Default for Config {
                     privacy: String::new(),
                     terms: String::new(),
                 },
+                nodeinfo_enabled: false,
                 max_websocket_payload_size: 2 * wok_event::DEFAULT_MAX_EVENT_SIZE,
                 max_req_filter_size: 262_144,
                 max_filter_bytes_per_connection: 2_097_152,
@@ -1593,6 +1597,12 @@ impl Config {
             changes.push(format!(
                 "relay.negentropy_enabled changed: {} -> {}",
                 self.relay.negentropy_enabled, new.relay.negentropy_enabled,
+            ));
+        }
+        if self.relay.nodeinfo_enabled != new.relay.nodeinfo_enabled {
+            changes.push(format!(
+                "relay.nodeinfo_enabled changed: {} -> {}",
+                self.relay.nodeinfo_enabled, new.relay.nodeinfo_enabled,
             ));
         }
         changes
@@ -2914,6 +2924,19 @@ negentropy_enabled = true
     }
 
     #[test]
+    fn nodeinfo_is_off_by_default_and_reloads_live() {
+        let mut running = Config::default();
+        assert!(!running.relay.nodeinfo_enabled);
+        let on = Config::parse_toml("[relay]\nnodeinfo_enabled = true\n").unwrap();
+        assert_eq!(
+            running.security_scope_changes(&on),
+            ["relay.nodeinfo_enabled changed: false -> true"]
+        );
+        running.apply_reload(on).unwrap();
+        assert!(running.relay.nodeinfo_enabled);
+    }
+
+    #[test]
     fn per_connection_budgets_have_their_own_table() {
         let cfg = Config::parse_toml(
             "[relay.abuse]\nreq_burst = 300\n\n\
@@ -3574,6 +3597,10 @@ negentropy_enabled = true
         assert_eq!(marmot.relay.max_websocket_payload_size, 8 * 1024 * 1024);
         assert_eq!(marmot.relay.unix.max_frame_bytes, 8 * 1024 * 1024);
         assert_eq!(marmot.relay.max_filter_limit, 5_000);
+        // MDK never sends COUNT or offers permessage-deflate (#166).
+        assert_eq!(marmot.relay.max_filter_limit_count, 0);
+        assert!(!marmot.relay.compression_enabled);
+        assert!(!crate::supported_nips(&marmot).contains(&45));
         let auth = &marmot.relay.auth;
         assert_eq!(
             auth.accepted_kinds,

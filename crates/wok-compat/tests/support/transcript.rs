@@ -261,6 +261,18 @@ async fn http_steps(
         ),
         ("OPTIONS /", "OPTIONS".into(), String::new(), ""),
         ("GET /metrics", "GET /metrics".into(), String::new(), ""),
+        (
+            "GET /.well-known/nodeinfo",
+            "GET /.well-known/nodeinfo".into(),
+            String::new(),
+            "",
+        ),
+        (
+            "GET /nodeinfo/2.1",
+            "GET /nodeinfo/2.1".into(),
+            String::new(),
+            "",
+        ),
         ("GET /admin", "GET /admin".into(), String::new(), ""),
         (
             "GET /admin/api/overview unsigned",

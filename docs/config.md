@@ -62,7 +62,7 @@ on who it is for, what it changes and what it refuses.
 | Preset | Use |
 |---|---|
 | [`public`](presets/public.md) | A general public relay that any client can read from and write to. Its values are the built-in defaults, so its overlay is empty. |
-| [`marmot`](presets/marmot.md) | A relay dedicated to Marmot group messaging, such as one a Marmot app ships as a default: only the Marmot kinds, scoped filters, 4 MiB events, and open writes. It refuses to start without usable NIP-42 AUTH, or with gift wraps readable by anyone but their recipient. |
+| [`marmot`](presets/marmot.md) | A relay dedicated to Marmot group messaging, such as one a Marmot app ships as a default: only the Marmot kinds, scoped filters, 4 MiB events, no COUNT or permessage-deflate, and open writes. It refuses to start without usable NIP-42 AUTH, or with gift wraps readable by anyone but their recipient. |
 
 A preset's requirements are checked when the relay starts and on every
 reload: a `marmot` file without a usable `relay.auth.service_url`, or one
@@ -354,7 +354,7 @@ may keep open. All reload live and are on the dashboard.
 | `relay.max_total_events_per_req` | `10000` | Rows per REQ over all its filters, deduplicated. `0` is unlimited. | Merged batches are cut. At 2,000, the default through 0.7, five filters of 500 lost a fifth of their events. | `max_total_events_per_req` |
 | `relay.max_tags_per_filter` | `8` | Residual tag checks on each candidate event: the distinct tag letters across `#` and NIP-91 `&` keys. `0` refuses every filter that names a tag. | Comment, community and marketplace queries are refused. At 3, the default through 0.7, a NIP-22 query on `#E`, `#K`, `#P` and `#k` was. | `max_tags_per_filter`; NIP-91 in `supported_nips` while it is above 0 |
 | `relay.max_and_entries` | `16` | NIP-91 checks on each candidate event: the values across all `&` keys of one filter. `0` turns NIP-91 off. | NIP-91 queries that require several tags are refused. | `max_and_entries`; NIP-91 in `supported_nips` while it and `max_tags_per_filter` are above 0 |
-| `relay.max_filter_limit_count` | `1000000` | COUNT de-duplication memory: the most events one COUNT filter counts. `0` turns COUNT off. | Counts of popular events, such as followers or reactions, are capped, and the reply carries `limited: true`. | NIP-45 in `supported_nips` while above 0 |
+| `relay.max_filter_limit_count` | `1000000` | COUNT de-duplication memory: the most events one COUNT filter counts. `0` turns COUNT off, as `marmot` does. | Counts of popular events, such as followers or reactions, are capped, and the reply carries `limited: true`. | NIP-45 in `supported_nips` while above 0 |
 | `relay.abuse.max_query_work` | `20000` | Query workers, from requests whose estimated index work is too large. `0` is unlimited. See [Query work](#query-work). | Batched and outbox queries are refused with `blocked: query too broad`. | `max_query_work`, while abuse protection is on and it is set |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Query workers' fairness: scans one connection runs at once, counted separately for its REQs and COUNTs and its NEG-OPENs. More wait in arrival order. `0` runs none. | Busy clients see slow first results. | `max_concurrent_historical_queries` |
 | `relay.filter_validation.require_scoped_filters` | `false` | Enumeration: every filter must name `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. Refuses `{"kinds":[445]}`, `{"since":…}` or a bare `search`. On in `marmot`. | — | — |
@@ -668,7 +668,8 @@ Restart settings, unless noted, and file-only.
 | `relay.enable_tcp_keepalive` | `false` | Enable TCP keepalive on accepted sockets. |
 | `relay.handshake_timeout_secs` | `10` | Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it. Live, for new connections. |
 | `relay.frame_read_timeout_secs` | `30` | Longest idle gap between socket reads while a partial WebSocket frame or unfinished fragmented message is buffered (slow-trickle guard); zero disables it. Live, for new connections. |
-| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. A compressed message may inflate to half of `relay.max_websocket_payload_size` plus 64 KiB, and past that to at most 32 times its compressed size, never past the maximum. |
+| `relay.nodeinfo_enabled` | `false` | Serve [NodeInfo](https://nodeinfo.diaspora.software/) at `/.well-known/nodeinfo` and `/nodeinfo/2.1`, for fediverse-style crawlers; no Nostr client uses it, and NIP-11 carries the same software and version. Off: both paths answer 404. The discovery link's host is the request's `Host` header. Live. |
+| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. Off in `marmot`. A compressed message may inflate to half of `relay.max_websocket_payload_size` plus 64 KiB, and past that to at most 32 times its compressed size, never past the maximum. |
 | `relay.compression_sliding_window` | `true` | Reuse compression context between messages. With context takeover, a connection's compressor can reference bytes from previous messages, the precondition for CRIME/BREACH-style oracles when secret and attacker-influenced bytes share a compression context. Relay traffic is essentially all public data, so practical impact is nil for most operators; if you serve auth-bearing or otherwise secret traffic over the same client connections, prefer `false`. |
 | `relay.ingester_threads` | `3` | Event-ingestion worker count. |
 | `relay.req_worker_threads` | `3` | Historical query worker count. |

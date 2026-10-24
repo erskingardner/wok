@@ -69,8 +69,8 @@ WebSocket upgrade on any path but `/`.
 | --- | --- | --- | --- |
 | `/` | anonymous | none | A WebSocket upgrade starts a [message](#messages) connection. A `POST` with `Content-Type: application/nostr+json+rpc` goes to the [management API](#management-api). Anything else gets the NIP-11 document when `Accept` names `application/nostr+json`, and the landing page otherwise. |
 | `/metrics` | anonymous | `observability.metrics_enabled` and no `observability.metrics_listen` | Prometheus metrics, with `Access-Control-Allow-Origin: *`. With `metrics_listen` set they move to the [metrics listener](#metrics-listener). See [observability](observability.md). |
-| `/.well-known/nodeinfo` | anonymous | none | NodeInfo discovery. The link's host is the request's `Host` header. |
-| `/nodeinfo/2.1` | anonymous | none | The NodeInfo document. |
+| `/.well-known/nodeinfo` | anonymous | `relay.nodeinfo_enabled` | NodeInfo discovery. The link's host is the request's `Host` header. |
+| `/nodeinfo/2.1` | anonymous | `relay.nodeinfo_enabled` | The NodeInfo document. |
 | `/favicon.ico` | anonymous | none | A fixed empty icon. |
 | `/admin`, `/admin/` | anonymous | `admin.enabled` | `GET` returns the signed-out [dashboard](admin-dashboard.md) shell, which holds no relay data. Other methods get 404. |
 | `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix checks its NIP-98 `Authorization: Nostr` header before reading the body: it decodes the header and parses its event strictly; checks its kind, empty content, time window and `u` and `method` tags; checks that the signer it names is in `admin.pubkeys`; and verifies the event and its signature. A request that fails any of these is refused without its body being read. A signer not in the list and a bad signature get the same 401, so a forged event cannot ask which keys are admins. It then reads the body (at most 64 KiB), checks the time window again and the `payload` tag when the request has a body, and claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
@@ -203,7 +203,7 @@ of running Wok. A test only points it at a temporary database and port.
 | --- | --- |
 | `default` | No settings: what a relay runs before its operator configures it. AUTH is unusable, and the dashboard, NIP-86 and the Unix socket are off. |
 | `public` | A public relay configured as [wok.toml](wok.toml) asks: AUTH works, so DMs and gift wraps reach their recipients. |
-| `marmot` | The `marmot` preset, as a Marmot app's default relay runs it: `relay.auth.accepted_kinds` limits it to the kinds MDK publishes, every filter must be scoped, and writes stay open. |
+| `marmot` | The `marmot` preset, as a Marmot app's default relay runs it: `relay.auth.accepted_kinds` limits it to the kinds MDK publishes, every filter must be scoped, COUNT and compression are off, and writes stay open. |
 | `gated` | A members-only relay: `relay.auth.read_policy` and `write_policy` set to `members`, AUTH, the dashboard and NIP-86. |
 | `minimal` | Every optional capability off: negentropy, COUNT, NIP-91, NIP-62, AUTH and compression. |
 | `proxied` | Behind a reverse proxy that passes the client's address in `X-Real-IP`. |
@@ -222,8 +222,8 @@ of every profile:
   gate, and REQs, COUNTs and NEG-* messages that are served or refused;
 - malformed messages, and AUTH with right and wrong challenges and
   signatures;
-- HTTP requests for NIP-11, the landing page, `OPTIONS /`, `/metrics` and
-  `/admin`; the dashboard API and NIP-86 unsigned, signed by a stranger and
+- HTTP requests for NIP-11, the landing page, `OPTIONS /`, `/metrics`, the
+  NodeInfo paths and `/admin`; the dashboard API and NIP-86 unsigned, signed by a stranger and
   forged; and `/metrics` on the metrics listener when the profile has one.
 
 It saves what the relay answers in `tests/transcripts/<profile>.txt`. Ids,

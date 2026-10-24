@@ -98,6 +98,8 @@ fn check_profile(name: &str, cfg: &Config) {
             assert_eq!(cfg.relay.auth.write_policy, AccessPolicy::Open);
             assert!(!cfg.admin.enabled);
             assert!(nips.contains(&42) && nips.contains(&59), "{nips:?}");
+            assert!(!nips.contains(&45), "{nips:?}");
+            assert!(!cfg.relay.compression_enabled);
         }
         "monitored" => {
             assert!(cfg.auth_usable());
@@ -437,6 +439,7 @@ fn gate_open(cfg: &Config, gate: &str) -> bool {
             cfg.metrics_on_relay_listener()
         }
         "`observability.metrics_enabled`" => cfg.observability.metrics_enabled,
+        "`relay.nodeinfo_enabled`" => cfg.relay.nodeinfo_enabled,
         other => panic!("teach gate_open the gate {other}"),
     }
 }

@@ -352,7 +352,9 @@ regression test. Differential parity alone is not a reason to retain it.
   REQ that mixed in an unrestricted kind returned the restricted kinds without
   AUTH. Wok has no such mode: a file or strfry config that sets it gets its
   kinds as `authenticated_kinds`, readable after AUTH as any key and never
-  without.
+  without. While AUTH is unusable, events of recipient-only and
+  authenticated kinds are refused with `restricted:`, since nobody could
+  read them; strfry stores them.
 - `relay.auth.write_policy` and `read_policy` (`open`, `authenticated` or
   `members`) replace `restrict_writes`, which the pinned strfry does not
   have. Under `write_policy = "members"` an event is accepted when its author,

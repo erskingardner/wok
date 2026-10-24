@@ -1,7 +1,7 @@
 # Relay functions reached in the `public` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 694
+## anonymous: 695
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -285,6 +285,7 @@
 <wok_relay::config::Config>::metrics_on_relay_listener
 <wok_relay::config::Config>::restricted_writes
 <wok_relay::config::Config>::timestamp_policy_for_kind
+<wok_relay::config::Config>::unreadable_class
 <wok_relay::metrics::Metrics>::refused
 <wok_relay::metrics::Refusals>::add
 <wok_relay::metrics::Setting>::of_read_class

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A file that gives a kind more readers than its preset does is warned about
+  when the relay starts, and by `wok doctor` in a new `read-classes` check
+  (#163). `relay.auth.recipient_only_kinds = []`, `owner_only_kinds = []` or
+  a gift-wrap kind moved to `authenticated_kinds` were named only by a
+  reload's "read access WIDENED", so a relay started with such a file served
+  those kinds more widely without a word. The warning names each kind with
+  its class in the preset and in the file.
+  - **`preset = "marmot"`** refuses to start or reload unless kinds 1059 and
+    21059 are recipient-only (or owner-only), as it refuses without usable
+    AUTH. Before, `recipient_only_kinds = []` served Welcome gift wraps, `p`
+    tags included, to anyone.
+  - **Inbox kinds** that are not recipient-only are warned about under
+    `write_policy = "members"`, at startup, on the reload that makes one and
+    in a new `inbox-kinds` doctor check: outsiders may publish them,
+    addressed to a member, for others to read. docs/config.md now says that
+    an inbox event's `OK true` tells an outsider that its `p` key is a
+    member.
+  - **Events nobody could read** are refused while AUTH is unusable, as
+    owner-only kinds already were: an event of a recipient-only or
+    authenticated kind, such as a gift wrap on the `default` profile, gets
+    `restricted: kind 1059 is read only after AUTH, which this relay does not
+    offer`, by its kind before its signature is verified. Before, it was
+    stored and every read of it refused. NIP-62 vanish requests are still
+    accepted whatever their class.
 - Limits on what an unauthenticated client can make the relay hold or do
   before its budgets apply:
   - **Compressed messages** may inflate to half of

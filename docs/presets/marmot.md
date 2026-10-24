@@ -40,11 +40,14 @@ with a reason beside each value, is [marmot.toml](marmot.toml).
 | `relay.abuse.per_connection.req_rate_per_second`, `relay.abuse.per_connection.req_burst` | 20, 100 | 50, 300 | About two REQs or NEG-OPENs per group at startup, plus `ids` fetches. |
 | `relay.abuse.per_connection.neg_msg_burst` | 200 | 500 | A NIP-77 pass per group and per inbox. |
 
-It also refuses to run without NIP-42: the relay will not start, or reload
-into a `marmot` configuration, unless `relay.auth.service_url` is set and
-`relay.auth.enabled` is on. A dashboard or NIP-86 save that would do so is
-refused with nothing written, and `wok doctor` fails its `preset` check.
-Recipients read their gift wraps only after logging in.
+It also refuses to run without NIP-42, or with gift wraps that anyone but
+their recipient can read: the relay will not start, or reload into a
+`marmot` configuration, unless `relay.auth.service_url` is set,
+`relay.auth.enabled` is on, and kinds 1059 and 21059 are in
+`relay.auth.recipient_only_kinds` (or the stricter `owner_only_kinds`). A
+dashboard or NIP-86 save that would do so is refused with nothing written,
+and `wok doctor` fails its `preset` check. Recipients read their gift wraps
+only after logging in.
 
 Everything else keeps its `public` value: the read classes, open read and
 write policies, no lower bound on `created_at`, the 900 s future tolerance,
@@ -61,7 +64,9 @@ no proof of work, NIP-77 on, and the per-address backstops.
   same rule. MDK's group, inbox, `ids` and directory filters all pass.
 - **Gift wraps to anyone but their recipient.** A 1059 is served only to the
   connection authenticated as its first `p` tag (or its author), as in
-  `public`.
+  `public`. A file that takes 1059 or 21059 out of `recipient_only_kinds`,
+  or moves it to `authenticated_kinds`, is refused, as above, rather than
+  serving Welcomes and their `p` tags to anyone.
 - **Write gating.** Writes stay open on purpose. Marmot signs each 445 with a
   fresh key, so the relay cannot tell which account sent a message, and MDK
   publishes 445s anonymously, authenticating only after an `auth-required:`

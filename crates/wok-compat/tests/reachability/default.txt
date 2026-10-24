@@ -1,7 +1,7 @@
 # Relay functions reached in the `default` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 690
+## anonymous: 689
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -12,6 +12,7 @@
 <wok_db::txn::Cursor>::count
 <wok_db::txn::RoTxn>::cursor
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
+<wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
@@ -49,12 +50,9 @@
 <wok_event::packed::PackedEventView>::first_d_tag::{closure}
 <wok_event::packed::PackedEventView>::foreach_tag::<<wok_event::packed::PackedEventView>::first_d_tag::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::tag_kind::tag_kind_keys::{closure}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_ro::{closure}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_rw::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::index_event::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::ingest_event::{closure}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::writer::event_matches_vanish_markers::{closure}>
 <wok_event::packed::PackedEventView>::id
 <wok_event::packed::PackedEventView>::kind
 <wok_event::packed::PackedEventView>::new
@@ -285,6 +283,7 @@
 <wok_relay::config::Config>::metrics_on_relay_listener
 <wok_relay::config::Config>::restricted_writes
 <wok_relay::config::Config>::timestamp_policy_for_kind
+<wok_relay::config::Config>::unreadable_class
 <wok_relay::metrics::Metrics>::refused
 <wok_relay::metrics::Refusals>::add
 <wok_relay::metrics::Setting>::of_read_class
@@ -458,6 +457,8 @@ wok_db::env::statvfs_u64::<u64>
 wok_db::fbs::decode_negentropy_filter
 wok_db::fbs::get_bytes
 wok_db::fbs::get_string
+wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>
+wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}
 wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>
 wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}
 wok_db::lookup::lookup_event_by_id_ro
@@ -498,6 +499,7 @@ wok_db::tag_kind::tag_kind_key
 wok_db::tag_kind::tag_kind_keys
 wok_db::tag_kind::tag_kind_keys::{closure}
 wok_db::txn::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
+wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 wok_db::txn::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
@@ -508,9 +510,7 @@ wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentrop
 wok_db::txn::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
 wok_db::txn::position_reverse_dup
 wok_db::vanish::is_event_vanished_ro
-wok_db::vanish::is_event_vanished_ro::{closure}
 wok_db::vanish::is_event_vanished_rw
-wok_db::vanish::is_event_vanished_rw::{closure}
 wok_db::vanish::normalize_relay_url
 wok_db::vanish::vanish_timestamp_ro
 wok_db::vanish::vanish_timestamp_rw
@@ -645,7 +645,6 @@ wok_relay::server::stop_sub
 wok_relay::server::stop_sub::{closure}
 wok_relay::server::stored_reader_admitted
 wok_relay::server::writer::event_matches_vanish_markers
-wok_relay::server::writer::event_matches_vanish_markers::{closure}
 wok_relay::server::writer::record_reports::<u64>
 wok_relay::server::writer::run_writer::{closure}
 wok_ws::accept_loop::{closure}::{closure}

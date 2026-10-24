@@ -2805,12 +2805,14 @@ fn ingest_event(
 }
 
 /// The refusal for an EVENT that its claimed kind alone decides, counted
-/// where it is decided. These gates run before the event is parsed and its
-/// signature verified: a kind refusal says nothing about who may publish,
-/// and on a relay that accepts few kinds most junk is refused without a
-/// verification. The author ban and the write policy wait for the
-/// signature, so an unsigned event cannot ask whether a key is a member or
-/// banned.
+/// where it is decided: an AUTH event, a kind `accepted_kinds` or the NIP-86
+/// kind policy does not allow, or one nobody could read while AUTH is
+/// unusable ([`Config::unreadable_class`]). These gates run before the event
+/// is parsed and its signature verified: a kind refusal says nothing about
+/// who may publish, and on a relay that accepts few kinds most junk is
+/// refused without a verification. The author ban and the write policy wait
+/// for the signature, so an unsigned event cannot ask whether a key is a
+/// member or banned.
 fn kind_refusal(
     cfg: &Config,
     metrics: &Metrics,
@@ -2829,7 +2831,15 @@ fn kind_refusal(
     } else if !moderation.read().kind_allowed(kind) {
         None
     } else {
-        return None;
+        // A kind nobody could read is not stored, and is counted by its
+        // read class.
+        let class = cfg.unreadable_class(kind)?;
+        if let Some(setting) = Setting::of_read_class(class) {
+            metrics.refused(setting);
+        }
+        return Some(format!(
+            "restricted: kind {kind} is read only after AUTH, which this relay does not offer"
+        ));
     };
     metrics
         .moderation_kind_rejections
@@ -6418,6 +6428,42 @@ mod tests {
             .await;
         let reply = recv_outbound(&mut rx).await;
         assert!(reply.contains("invalid: bad signature"), "{reply}");
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kind_nobody_could_read_is_refused_while_auth_is_unusable() {
+        let (_dir, handle, conn, mut rx) =
+            relay_with_connection(|cfg| cfg.relay.auth.authenticated_kinds = vec![30000]).await;
+        let wrap = |kind: u64| {
+            sign_event(json!({
+                "created_at": now_secs(),
+                "kind": kind,
+                "tags": [["p", "33".repeat(32)], ["d", "x"]],
+                "content": "",
+            }))
+        };
+        // Refused by its kind, before verification.
+        for kind in [4, 1059, 21059, 30000] {
+            let mut event = wrap(kind);
+            event["sig"] = json!("00".repeat(64));
+            conn.client_message(json!(["EVENT", event]).to_string())
+                .await;
+            let reply = recv_outbound(&mut rx).await;
+            assert!(
+                reply.contains(&format!(
+                    "restricted: kind {kind} is read only after AUTH, which this relay does \
+                     not offer"
+                )),
+                "{reply}"
+            );
+        }
+        // Once AUTH is usable, recipients can read them, so they are stored.
+        handle.config.write().relay.auth.service_url = "wss://auth.example".into();
+        conn.client_message(json!(["EVENT", wrap(1059)]).to_string())
+            .await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(reply.contains(r#"true,"""#), "{reply}");
         handle.request_shutdown();
     }
 

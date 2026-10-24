@@ -390,6 +390,29 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
             },
         )
         .await;
+    // While AUTH is unusable nobody could read a recipient-only or
+    // authenticated kind, so it is refused by its read class.
+    let p = json!([["p", "33".repeat(32)]]);
+    relay
+        .expect(
+            Some(Setting::RecipientOnlyKinds),
+            |c| c.relay.auth.service_url.clear(),
+            async |r| r.client().await.refused(&note(1059, t, p, "")).await,
+        )
+        .await;
+    relay
+        .expect(
+            Some(Setting::AuthenticatedKinds),
+            |c| {
+                c.relay.auth.enabled = false;
+                c.relay.auth.authenticated_kinds = vec![30000];
+            },
+            async |r| {
+                let tags = json!([["d", "list"]]);
+                r.client().await.refused(&note(30000, t, tags, "")).await
+            },
+        )
+        .await;
     // NIP-70 is not a setting, whatever the kind.
     relay
         .expect(

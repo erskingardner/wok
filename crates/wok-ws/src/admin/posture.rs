@@ -96,28 +96,24 @@ pub(super) fn posture(cfg: &Config) -> Vec<String> {
     }
     if !reads.is_empty() {
         let mut sentence = format!("It shows {}", reads.join("; "));
+        // What nobody could read is not stored.
         sentence.push_str(if cfg.auth_usable() {
             ", once they log in."
         } else if !auth.enabled {
-            ". Nobody can log in while relay.auth.enabled is false, so nobody can read them."
+            ". Nobody can log in while relay.auth.enabled is false, so nobody can read them, \
+             and it refuses them."
         } else {
-            ". Nobody can log in until relay.auth.service_url is set, so nobody can read them."
+            ". Nobody can log in until relay.auth.service_url is set, so nobody can read them, \
+             and it refuses them."
         });
         sentences.push(sentence);
     }
     // NIP-78: an owner-only kind is published only by its author, too.
-    if !owner.is_empty() {
-        sentences.push(if cfg.auth_usable() {
-            format!(
-                "It accepts {} only from a connection logged in as their author.",
-                kinds(&owner)
-            )
-        } else {
-            format!(
-                "It refuses {}, which only a connection logged in as their author may publish.",
-                kinds(&owner)
-            )
-        });
+    if !owner.is_empty() && cfg.auth_usable() {
+        sentences.push(format!(
+            "It accepts {} only from a connection logged in as their author.",
+            kinds(&owner)
+        ));
     }
     if cfg.relay.filter_validation.require_scoped_filters {
         sentences.push("Every query must name ids, authors or a tag.".into());
@@ -235,21 +231,23 @@ mod tests {
         );
         // Without a service URL nobody can log in to read them, and with AUTH
         // off neither can anybody, whatever the URL.
-        assert!(posture(&preset("public", ""))[1]
-            .ends_with("until relay.auth.service_url is set, so nobody can read them."));
+        assert!(posture(&preset("public", ""))[1].ends_with(
+            "until relay.auth.service_url is set, so nobody can read them, and it refuses them."
+        ));
         let off = preset(
             "public",
             "[relay.auth]\nenabled = false\nservice_url = \"wss://relay.test\"\n",
         );
-        assert!(posture(&off)[1]
-            .ends_with("while relay.auth.enabled is false, so nobody can read them."));
+        assert!(posture(&off)[1].ends_with(
+            "while relay.auth.enabled is false, so nobody can read them, and it refuses them."
+        ));
         // Zero in a rate or a burst turns its budget off, not down.
         let zeroed = preset(
             "public",
             "[relay.abuse]\nreq_burst = 0\n\n[relay.abuse.per_connection]\nreq_rate_per_second = 0\n",
         );
         assert_eq!(
-            posture(&zeroed)[3],
+            posture(&zeroed).last().unwrap(),
             "Each connection's query budget is off; the per-address backstop is off."
         );
     }

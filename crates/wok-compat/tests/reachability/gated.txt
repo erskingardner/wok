@@ -1,7 +1,7 @@
 # Relay functions reached in the `gated` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 416
+## anonymous: 420
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::is_member
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
@@ -108,6 +108,8 @@
 <wok_relay::abuse::Bucket>::refill
 <wok_relay::abuse::Bucket>::take
 <wok_relay::abuse::ConnectionSlot as core::ops::drop::Drop>::drop
+<wok_relay::abuse::OpenConnections>::rekey
+<wok_relay::abuse::OpenConnections>::release
 <wok_relay::abuse::Principal>::address
 <wok_relay::capabilities::CapabilityCondition>::is_enabled
 <wok_relay::capabilities::CapabilityCondition>::is_enabled::{closure}
@@ -304,6 +306,8 @@ wok_negentropy::cache::parse_negentropy_filter
 wok_negentropy::lmdb_store::open_rw
 wok_negentropy::lmdb_store::tree_key
 wok_query::monitor::kind_bit
+wok_relay::abuse::decrement::<core::net::ip_addr::IpAddr>
+wok_relay::abuse::decrement::<wok_relay::abuse::Principal>
 wok_relay::abuse::leading_zero_bits
 wok_relay::abuse::spec
 wok_relay::capabilities::relay_capabilities

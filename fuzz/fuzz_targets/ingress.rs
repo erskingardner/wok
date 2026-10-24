@@ -67,15 +67,43 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = wok_event::PackedEventView::new(data);
 
-    for role in [Role::Server, Role::Client] {
-        let mut parser = WsParser::with_role(2_097_152, Some(InflateCtx::new(false)), role);
-        for chunk in data.chunks(257) {
-            if parser.feed(chunk).is_err() {
-                break;
+    // Both inflater modes: browsers negotiate context takeover, which keeps
+    // the decompressor's window between messages.
+    for takeover in [false, true] {
+        for role in [Role::Server, Role::Client] {
+            let mut parser = WsParser::with_role(2_097_152, Some(InflateCtx::new(takeover)), role);
+            for chunk in data.chunks(257) {
+                if parser.feed(chunk).is_err() {
+                    break;
+                }
             }
         }
     }
     let _ = InflateCtx::new(false).decompress(data, 2_097_152);
+
+    // Context takeover across an idle release, which the relay runs on a
+    // timer: the input as up to 64 records, each a control byte, a two-byte
+    // little-endian length and that many payload bytes. A control byte with
+    // its low bit set releases the decompressor first, so the message is
+    // inflated after the history is replayed into a new one.
+    let mut inflater = InflateCtx::new(true);
+    let mut rest = data;
+    for _ in 0..64 {
+        let [control, lo, hi, tail @ ..] = rest else {
+            break;
+        };
+        let len = usize::from(u16::from_le_bytes([*lo, *hi])).min(tail.len());
+        let (payload, next) = tail.split_at(len);
+        if control & 1 == 1 {
+            // The first call clears the use, the second drops it.
+            inflater.release_idle();
+            inflater.release_idle();
+        }
+        if inflater.decompress(payload, 2_097_152).is_err() {
+            break; // The relay closes the connection.
+        }
+        rest = next;
+    }
 
     // fbs metadata decoders: Meta, CompressionDictionary, NegentropyFilter.
     let _ = wok_db::fbs::decode_meta(data);

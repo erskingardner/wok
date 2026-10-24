@@ -540,21 +540,26 @@ impl WsParser {
     }
 }
 
-/// How many times its compressed size a message may inflate to, beyond
-/// `INFLATE_ALLOWANCE`. Nostr messages compress a few times over at most, so
-/// this refuses only messages built to inflate, before they cost the relay
-/// more than an uncompressed message of that size on the wire would.
+/// How many times its compressed size a message may inflate to past
+/// `inflate_allowance`.
 const MAX_INFLATE_RATIO: usize = 32;
 
-/// Bytes any compressed message may inflate to whatever its ratio, so small
-/// messages that refer back to the shared window stay accepted.
-const INFLATE_ALLOWANCE: usize = 64 * 1024;
+/// Room for a message's envelope around the largest event.
+const INFLATE_ENVELOPE: usize = 64 * 1024;
 
-/// The most a compressed message of `wire_len` bytes may inflate to.
+/// What any compressed message may inflate to whatever its ratio: half the
+/// maximum message size and an envelope, which by default holds the largest
+/// event however repetitive its content.
+fn inflate_allowance(max_message: usize) -> usize {
+    max_message / 2 + INFLATE_ENVELOPE
+}
+
+/// The most a compressed message of `wire_len` bytes may inflate to: its
+/// allowance, or 32 times its compressed size if more, up to the maximum.
 fn inflate_limit(wire_len: usize, max_message: usize) -> usize {
     wire_len
         .saturating_mul(MAX_INFLATE_RATIO)
-        .saturating_add(INFLATE_ALLOWANCE)
+        .max(inflate_allowance(max_message))
         .min(max_message)
 }
 
@@ -1044,27 +1049,40 @@ mod tests {
     #[test]
     fn inflate_limit_scales_with_the_wire_size() {
         let max = 2 * 1024 * 1024;
-        // Small messages may lean on the window, whatever their ratio.
-        assert_eq!(
-            inflate_limit(10, max),
-            10 * MAX_INFLATE_RATIO + INFLATE_ALLOWANCE
-        );
-        // A large one may inflate to its ratio, and never past the maximum.
-        assert_eq!(
-            inflate_limit(40_000, max),
-            40_000 * MAX_INFLATE_RATIO + INFLATE_ALLOWANCE
-        );
+        // Any message may inflate to its allowance.
+        assert_eq!(inflate_limit(10, max), inflate_allowance(max));
+        // Past that, to its ratio, and never past the maximum.
+        assert_eq!(inflate_limit(40_000, max), 40_000 * MAX_INFLATE_RATIO);
         assert_eq!(inflate_limit(1 << 20, max), max);
     }
 
+    /// Compress `message` as a client would and frame it for the server.
+    fn compressed_frame(message: &[u8]) -> Vec<u8> {
+        let compressed = DeflateCtx::new(true).compress(message).unwrap();
+        masked_frame(true, true, OP_TEXT, &compressed)
+    }
+
     #[test]
-    fn a_message_that_inflates_far_beyond_its_size_is_refused() {
-        let mut server = WsParser::new(2 * 1024 * 1024, Some(InflateCtx::new(true)));
-        let mut client = DeflateCtx::new(true);
-        // Within the maximum, but far more than its compressed size allows.
-        let compressed = client.compress(&vec![b'a'; 1 << 20]).unwrap();
-        assert!(compressed.len() * MAX_INFLATE_RATIO + INFLATE_ALLOWANCE < 1 << 20);
-        let frame = masked_frame(true, true, OP_TEXT, &compressed);
+    fn the_largest_event_inflates_however_repetitive() {
+        let max = 2 * 1024 * 1024;
+        let mut server = WsParser::new(max, Some(InflateCtx::new(true)));
+        let content = "a".repeat(1 << 20);
+        let message = format!(r#"["EVENT",{{"content":"{content}"}}]"#);
+        assert!(message.len() > max / 2 && message.len() <= inflate_allowance(max));
+        let frame = compressed_frame(message.as_bytes());
+        let event = server.feed(&frame).unwrap().pop();
+        assert!(
+            matches!(event, Some(WsEvent::Message(MessageKind::Text, body)) if body.len() == message.len())
+        );
+    }
+
+    #[test]
+    fn a_message_past_its_inflate_limit_is_refused() {
+        let max = 2 * 1024 * 1024;
+        let mut server = WsParser::new(max, Some(InflateCtx::new(true)));
+        let message = vec![b'a'; max - 1];
+        let frame = compressed_frame(&message);
+        assert!(frame.len() * MAX_INFLATE_RATIO < max - 1);
         assert!(matches!(server.feed(&frame), Err(WsError::MessageTooLarge)));
     }
 

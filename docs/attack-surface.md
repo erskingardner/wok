@@ -96,17 +96,18 @@ same ingester. Before Wok reads a message's verb:
 
 - **WebSocket:** Wok's own RFC 6455 codec decodes the frames and, when the
   client negotiated permessage-deflate (`relay.compression_enabled`), inflates
-  the message, up to `relay.max_websocket_payload_size` and to at most 32
-  times its compressed size plus 64 KiB; a message past either is refused
-  before more of it is inflated. `relay.frame_read_timeout_secs` is the
+  the message, up to `relay.max_websocket_payload_size`. Past half that size
+  plus 64 KiB, a message may inflate to at most 32 times its compressed
+  size; one past its limit is refused before more of it is inflated. `relay.frame_read_timeout_secs` is the
   longest gap between reads while part of a frame or message is buffered.
 - **Unix socket:** the peer check runs once, when the connection is accepted
   and before any frame is read. Each frame's four-byte length is checked
   against `relay.unix.max_frame_bytes` before its body is read.
 - A connection's messages wait for the ingester in a queue it shares with
   other connections. Each connection may have at most the largest message a
-  transport accepts there, in bytes, not yet handled; the next one waits for
-  room, and the transport stops reading until there is.
+  transport accepts there, in bytes, not yet handled. The next one is held
+  until there is room, and the transport stops reading once its hold is
+  full, while it keeps writing to the client.
 - The whole message is parsed as strict JSON. A malformed message spends the
   invalid-message budget (`relay.abuse.invalid_*`). A message that is exactly
   `"\n"` is a keepalive and does nothing.

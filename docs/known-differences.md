@@ -117,8 +117,9 @@ it is not a promise to reproduce upstream bugs.
   connection).
 - Mesh client connections do not currently offer permessage-deflate. Wok's
   WebSocket server does negotiate it, and refuses a compressed message that
-  inflates to more than 32 times its compressed size plus 64 KiB; strfry
-  inflates any message up to its maximum size.
+  inflates past half of `relay.max_websocket_payload_size` plus 64 KiB and
+  to more than 32 times its compressed size; strfry inflates any message up
+  to its maximum size.
 - `wok sync` classifies a peer's negative upload ACK as superseded only when
   its reason starts with `blocked: have a newer version` (Wok's reason) or
   `replaced:` (what strfry and earlier Wok releases send). A foreign peer

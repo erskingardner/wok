@@ -1020,7 +1020,7 @@ async fn handle_ws<S>(
                     encoder.release_idle();
                     parser.release_idle();
                 }
-                _ = connection.ingress_resumed(), if !held.is_empty() => {
+                _ = connection.ready(held.front_len()), if !held.is_empty() => {
                     connection.hand_over(&mut held).await;
                 }
                 _ = connection.ingress_pauses(), if draining => {}
@@ -1050,9 +1050,7 @@ async fn handle_ws<S>(
                                         // through; anything held behind a
                                         // pause is dropped, as the close drops
                                         // the parked work ahead of it.
-                                        while !held.is_empty() && !connection.ingress_paused() {
-                                            connection.hand_over(&mut held).await;
-                                        }
+                                        connection.hand_over_rest(&mut held).await;
                                         let _ = write_bytes(&mut wr, &encoder.encode_control(frame::OP_CLOSE, &c)).await;
                                         break 'outer;
                                     }
@@ -1060,9 +1058,7 @@ async fn handle_ws<S>(
                             }
                         }
                         Err(_) => {
-                            while !held.is_empty() && !connection.ingress_paused() {
-                                connection.hand_over(&mut held).await;
-                            }
+                            connection.hand_over_rest(&mut held).await;
                             break;
                         }
                     }

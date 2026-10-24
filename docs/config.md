@@ -641,7 +641,7 @@ Restart settings, unless noted, and file-only.
 | `relay.enable_tcp_keepalive` | `false` | Enable TCP keepalive on accepted sockets. |
 | `relay.handshake_timeout_secs` | `10` | Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it. Live, for new connections. |
 | `relay.frame_read_timeout_secs` | `30` | Longest idle gap between socket reads while a partial WebSocket frame or unfinished fragmented message is buffered (slow-trickle guard); zero disables it. Live, for new connections. |
-| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. A compressed message may inflate to at most 32 times its compressed size plus 64 KiB, and never past `relay.max_websocket_payload_size`. |
+| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. A compressed message may inflate to half of `relay.max_websocket_payload_size` plus 64 KiB, and past that to at most 32 times its compressed size, never past the maximum. |
 | `relay.compression_sliding_window` | `true` | Reuse compression context between messages. With context takeover, a connection's compressor can reference bytes from previous messages, the precondition for CRIME/BREACH-style oracles when secret and attacker-influenced bytes share a compression context. Relay traffic is essentially all public data, so practical impact is nil for most operators; if you serve auth-bearing or otherwise secret traffic over the same client connections, prefer `false`. |
 | `relay.ingester_threads` | `3` | Event-ingestion worker count. |
 | `relay.req_worker_threads` | `3` | Historical query worker count. |

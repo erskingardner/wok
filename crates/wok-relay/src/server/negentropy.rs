@@ -147,6 +147,19 @@ fn read_access(cfg: &Config) -> (AccessPolicy, Option<Vec<String>>) {
 /// snapshot.
 const CLOSE_RUN: usize = 1024;
 
+/// How long NEG-CLOSEs alone may keep the worker from its snapshot: its
+/// configuration copy, read transaction and pass over every session.
+const CLOSE_ONLY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether the worker takes its snapshot this pass. It always does before any
+/// other message and while scans run, so sessions and scans see current
+/// policy. A pass that only closed sessions skips it until
+/// `CLOSE_ONLY_SNAPSHOT_INTERVAL` has passed since the last one, so closes
+/// arriving one at a time cost no more than a run of them.
+fn snapshot_due(closed_only: bool, scans_running: bool, since_last: Duration) -> bool {
+    !closed_only || scans_running || since_last >= CLOSE_ONLY_SNAPSHOT_INTERVAL
+}
+
 pub(super) fn run_negentropy(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -167,6 +180,7 @@ pub(super) fn run_negentropy(
     let mut policy = read_visibility(&initial_cfg, vec![]);
     let mut access = read_access(&initial_cfg);
     let mut generation = None;
+    let mut last_snapshot = Instant::now();
     loop {
         let msg = if queries.has_running() {
             match rx.try_recv() {
@@ -186,14 +200,21 @@ pub(super) fn run_negentropy(
         // transaction and pass over every session below then run once for
         // the run, not once per close, and scans still get their timeslice.
         let mut msg = msg;
+        let mut closed = 0;
         for _ in 0..CLOSE_RUN {
             let Some(NegMsg::CloseSub { conn_id, sub_id }) = &msg else {
                 break;
             };
             queries.remove_sub(*conn_id, sub_id);
             sessions.remove(&(*conn_id, sub_id.to_string()));
+            closed += 1;
             msg = rx.try_recv().ok();
         }
+        let closed_only = closed > 0 && msg.is_none();
+        if !snapshot_due(closed_only, queries.has_running(), last_snapshot.elapsed()) {
+            continue;
+        }
+        last_snapshot = Instant::now();
         let cfg = cfg.read().clone();
         let txn = match env.begin_ro() {
             Ok(txn) => txn,
@@ -253,6 +274,35 @@ pub(super) fn run_negentropy(
                     let conn = sub.conn_id;
                     let sid = sub.sub_id.to_string();
                     let key = (conn, sid.clone());
+                    // Sessions keep their filters for their lifetime, so a
+                    // connection's sessions have a filter budget, as its live
+                    // REQs and its COUNTs each do. It is checked before the
+                    // session this replaces is removed, so a refused
+                    // replacement leaves it running, and, as for a REQ, a
+                    // replacement no larger than it always fits.
+                    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
+                    let replaced = sessions.get(&key).map_or(0, |session| session.filter_bytes);
+                    let held: usize = sessions
+                        .iter()
+                        .filter(|(k, _)| k.0 == conn)
+                        .map(|(_, session)| session.filter_bytes)
+                        .sum();
+                    if filter_budget != 0
+                        && filter_str.len() > replaced
+                        && held - replaced + filter_str.len() > filter_budget
+                    {
+                        metrics.refused(Setting::MaxFilterBytesPerConnection);
+                        fail(
+                            &conns,
+                            &metrics,
+                            conn,
+                            &sid,
+                            &format!(
+                                "blocked: this connection's filters exceed {filter_budget} bytes"
+                            ),
+                        );
+                        continue;
+                    }
                     sessions.remove(&key);
                     queries.remove_sub(conn, &sub.sub_id);
                     // The ingester admitted this NEG-OPEN by the read policy
@@ -285,28 +335,6 @@ pub(super) fn run_negentropy(
                             conn,
                             &sid,
                             "blocked: too many synchronization sessions",
-                        );
-                        continue;
-                    }
-                    // Sessions keep their filters for their lifetime, so a
-                    // connection's sessions have a filter budget, as its live
-                    // REQs and its COUNTs each do.
-                    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
-                    let held: usize = sessions
-                        .iter()
-                        .filter(|(k, _)| k.0 == conn)
-                        .map(|(_, session)| session.filter_bytes)
-                        .sum();
-                    if filter_budget != 0 && held.saturating_add(filter_str.len()) > filter_budget {
-                        metrics.refused(Setting::MaxFilterBytesPerConnection);
-                        fail(
-                            &conns,
-                            &metrics,
-                            conn,
-                            &sid,
-                            &format!(
-                                "blocked: this connection's filters exceed {filter_budget} bytes"
-                            ),
                         );
                         continue;
                     }
@@ -776,6 +804,18 @@ mod tests {
         worker.join().unwrap();
     }
 
+    #[test]
+    fn closes_alone_take_a_snapshot_at_most_every_interval() {
+        let soon = CLOSE_ONLY_SNAPSHOT_INTERVAL / 10;
+        // Closes alone, just after a snapshot: none, however they arrive.
+        assert!(!snapshot_due(true, false, soon));
+        // Once the interval has passed, closes alone take one.
+        assert!(snapshot_due(true, false, CLOSE_ONLY_SNAPSHOT_INTERVAL));
+        // Any other message, or a running scan, always takes one.
+        assert!(snapshot_due(false, false, soon));
+        assert!(snapshot_due(true, true, soon));
+    }
+
     /// A long run of NEG-CLOSEs, almost all for sessions that do not exist,
     /// closes the one that does, and the NEG-OPEN queued behind the run is
     /// still answered.
@@ -841,7 +881,8 @@ mod tests {
     }
 
     /// A connection's sessions share `max_filter_bytes_per_connection`: a
-    /// NEG-OPEN past it is refused, and replacing a session, or closing one,
+    /// NEG-OPEN past it is refused, a refused replacement leaves the session
+    /// it would replace running, and replacing a session, or closing one,
     /// gives its bytes back.
     #[test]
     fn sessions_share_the_connection_filter_budget() {
@@ -870,14 +911,15 @@ mod tests {
             .unwrap()
             .initiate()
             .unwrap();
-        let open = |sub_id: &str| {
-            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+        let open_with = |sub_id: &str, filter: &Value| {
+            let group = NostrFilterGroup::from_value(filter, 1_000_001, 8, 16).unwrap();
             NegMsg::Open {
                 sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
                 filter_str: filter.to_string(),
                 payload: init.clone(),
             }
         };
+        let open = |sub_id: &str| open_with(sub_id, &filter);
         let answer = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>| {
             let reply = next(rx);
             (
@@ -901,7 +943,20 @@ mod tests {
             metrics.refusals.get(Setting::MaxFilterBytesPerConnection),
             1
         );
-        // Replacing a session reuses its own bytes.
+        // A larger replacement past the budget is refused, and the session
+        // it would have replaced still answers.
+        tx.send(open_with("a", &json!({"kinds": [1, 2, 3]})))
+            .unwrap();
+        let refused = next(&mut out_rx);
+        assert_eq!((&refused[0], &refused[1]), (&json!("NEG-ERR"), &json!("a")));
+        tx.send(NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new("a").unwrap(),
+            payload: init.clone(),
+        })
+        .unwrap();
+        assert_eq!(answer(&mut out_rx), ("NEG-MSG".into(), "a".into()));
+        // Replacing a session with a filter no larger reuses its own bytes.
         tx.send(open("a")).unwrap();
         assert_eq!(answer(&mut out_rx), ("NEG-MSG".into(), "a".into()));
         // Closing one frees them.

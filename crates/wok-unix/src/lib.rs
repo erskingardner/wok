@@ -224,15 +224,13 @@ async fn handle_conn(
             }
             let draining = connection.draining(&held);
             tokio::select! {
-                _ = connection.ingress_resumed(), if !held.is_empty() => {
+                _ = connection.ready(held.front_len()), if !held.is_empty() => {
                     connection.hand_over(&mut held).await;
                 }
                 _ = connection.ingress_pauses(), if draining => {}
                 n = rd.read_buf(&mut buf), if !draining => {
                     if n? == 0 {
-                        while !held.is_empty() && !connection.ingress_paused() {
-                            connection.hand_over(&mut held).await;
-                        }
+                        connection.hand_over_rest(&mut held).await;
                         return Ok(());
                     }
                     let mut start = 0;

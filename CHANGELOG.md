@@ -11,13 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Limits on what an unauthenticated client can make the relay hold or do
   before its budgets apply:
-  - **Compressed messages** may inflate to at most 32 times their compressed
-    size plus 64 KiB, and never past `relay.max_websocket_payload_size`. A
-    message built to inflate is refused as too large.
+  - **Compressed messages** may inflate to half of
+    `relay.max_websocket_payload_size` plus 64 KiB whatever their
+    compression, which holds the largest event, and past that to at most 32
+    times their compressed size, never past the maximum. A message past its
+    limit is refused as too large.
   - **Each connection's queued messages** are bounded: a connection may have
     at most the largest message a transport accepts, in bytes, waiting for the
-    ingester. Its next message waits for room, and the transport stops reading
-    meanwhile. Before, one connection could fill the shared ingest queue.
+    ingester. Its next message is held until there is room, and the transport
+    stops reading once its hold is full, while it keeps writing to the
+    client. Before, one connection could fill the shared ingest queue.
   - **NEG-CLOSE** is handled by the negentropy worker as one removal each, in
     a run, instead of a configuration copy, read transaction and pass over
     every session per message.

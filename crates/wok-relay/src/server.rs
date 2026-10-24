@@ -867,16 +867,27 @@ impl InboundShare {
         }
     }
 
+    /// The share a message of `len` bytes takes: all of it, if larger.
+    fn cost(&self, len: usize) -> u32 {
+        u32::try_from(len).unwrap_or(u32::MAX).clamp(1, self.limit)
+    }
+
     /// Wait until `len` bytes fit in the share, and hold them until the
-    /// returned permit drops. A message larger than the share waits for all
-    /// of it.
+    /// returned permit drops.
     async fn acquire(&self, len: usize) -> tokio::sync::OwnedSemaphorePermit {
-        let cost = u32::try_from(len).unwrap_or(u32::MAX).clamp(1, self.limit);
         self.permits
             .clone()
-            .acquire_many_owned(cost)
+            .acquire_many_owned(self.cost(len))
             .await
             .expect("an inbound share is never closed")
+    }
+
+    /// The share for `len` bytes, if it has room now.
+    fn try_acquire(&self, len: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.permits
+            .clone()
+            .try_acquire_many_owned(self.cost(len))
+            .ok()
     }
 }
 
@@ -906,9 +917,7 @@ impl ConnectionGuard {
     /// writing, pinging and handling control frames.
     pub async fn client_message(&self, payload: String) {
         let share = self.inbound.acquire(payload.len()).await;
-        self.handle
-            .queue_client_message(self.conn_id, self.source.clone(), payload, Some(share))
-            .await;
+        self.queue(payload, share).await;
     }
 
     /// True while earlier messages from this connection are parked behind a
@@ -943,38 +952,79 @@ impl ConnectionGuard {
     /// the hold is full: the client kept sending into a paused connection and
     /// the transport should disconnect it.
     ///
-    /// Once ingress resumes, a message read while anything is still held is
-    /// queued behind it, whatever the limit: only the transport's
-    /// `ingress_resumed` arm hands the hold over, a batch per pass, so the
-    /// transport gets back to its outbound traffic in between. The transport
-    /// stops reading while `draining`, which bounds it.
+    /// While ingress is open, a message read while anything is still held,
+    /// or while the connection's share of the ingest queue has no room for
+    /// it, is held behind, whatever the limit: only the transport's `ready`
+    /// arm hands the hold over, a batch per pass, so the transport gets back
+    /// to its outbound traffic in between. The transport stops reading while
+    /// `draining`, which bounds it.
     #[must_use]
     pub async fn receive(&self, held: &mut HeldMessages, text: String, wire_len: usize) -> bool {
         if self.ingress_paused() {
             return held.push(text, wire_len);
         }
         if held.is_empty() {
-            self.client_message(text).await;
-        } else {
-            held.push_back(text, wire_len);
+            if let Some(share) = self.inbound.try_acquire(text.len()) {
+                self.queue(text, share).await;
+                return true;
+            }
         }
+        held.push_back(text, wire_len);
         true
     }
 
+    /// Resolves once the first held message, `front` bytes long, can be
+    /// handed over: ingress is open and the connection's share has room for
+    /// it. Cancel-safe. Only the transport takes from its share, so the room
+    /// stays until `hand_over` takes it.
+    pub async fn ready(&self, front: Option<usize>) {
+        self.ingress_resumed().await;
+        if let Some(len) = front {
+            drop(self.inbound.acquire(len).await);
+        }
+    }
+
     /// Hand held messages to the ingester, in order, while ingress is not
-    /// paused. At most `HAND_OVER_BATCH` per call, so a transport that calls
-    /// this from its `select!` gets back to its outbound traffic in between.
+    /// paused and the connection's share has room. At most `HAND_OVER_BATCH`
+    /// per call, so a transport that calls this from its `select!` gets back
+    /// to its outbound traffic in between.
     pub async fn hand_over(&self, held: &mut HeldMessages) {
         for _ in 0..HAND_OVER_BATCH {
             if self.ingress_paused() {
                 break;
             }
-            let Some((text, cost)) = held.queue.pop_front() else {
+            let Some(share) = held
+                .front_len()
+                .and_then(|len| self.inbound.try_acquire(len))
+            else {
                 break;
             };
+            let (text, cost) = held.queue.pop_front().expect("a held message");
             held.bytes -= cost;
-            self.client_message(text).await;
+            self.queue(text, share).await;
         }
+    }
+
+    /// Hand over everything held while ingress is open, waiting for the
+    /// share as it frees: what a closing client sent before it closed still
+    /// reaches the ingester. Messages held behind a pause are left, as the
+    /// close drops the parked work ahead of them.
+    pub async fn hand_over_rest(&self, held: &mut HeldMessages) {
+        while !self.ingress_paused() {
+            let Some(len) = held.front_len() else {
+                break;
+            };
+            let share = self.inbound.acquire(len).await;
+            let (text, cost) = held.queue.pop_front().expect("a held message");
+            held.bytes -= cost;
+            self.queue(text, share).await;
+        }
+    }
+
+    async fn queue(&self, text: String, share: tokio::sync::OwnedSemaphorePermit) {
+        self.handle
+            .queue_client_message(self.conn_id, self.source.clone(), text, Some(share))
+            .await;
     }
 
     /// Cancellation covers the entire transport future, including writes and
@@ -1035,6 +1085,11 @@ impl HeldMessages {
 
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// The length of the first held message.
+    pub fn front_len(&self) -> Option<usize> {
+        self.queue.front().map(|(text, _)| text.len())
     }
 
     fn over_limit(&self) -> bool {
@@ -6094,6 +6149,39 @@ mod tests {
         assert_eq!(share.permits.available_permits(), 0);
         drop(whole);
         assert_eq!(share.permits.available_permits(), 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_share_holds_the_message_without_blocking_the_transport() {
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|_| {}).await;
+        let mut held = HeldMessages::new(1 << 20);
+        // Everything this connection may queue is taken.
+        let taken = conn.inbound.acquire(usize::MAX).await;
+        let req = json!(["REQ", "held", {"kinds": [1]}]).to_string();
+        let len = req.len();
+        // The transport is not kept waiting: the message is held.
+        let accepted = tokio::time::timeout(
+            Duration::from_millis(500),
+            conn.receive(&mut held, req, len),
+        )
+        .await
+        .expect("receive returns while the share is full");
+        assert!(accepted);
+        assert_eq!(held.front_len(), Some(len));
+        // `ready` waits for room, and resolves once it frees.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), conn.ready(held.front_len()))
+                .await
+                .is_err()
+        );
+        drop(taken);
+        tokio::time::timeout(Duration::from_secs(1), conn.ready(held.front_len()))
+            .await
+            .expect("room frees");
+        conn.hand_over(&mut held).await;
+        assert!(held.is_empty());
+        assert!(recv_outbound(&mut rx).await.contains(r#"["EOSE","held""#));
+        handle.request_shutdown();
     }
 
     /// A relay with `tweak` applied and one connection from 127.0.0.1,

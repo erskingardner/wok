@@ -17,8 +17,9 @@ private advisory.
 ## 1. Keep the inventory true
 
 Update the rows for every entry point, gate or check order the change touches,
-then run the tests that keep the inventory in step with the code. The
-"Keeping this page current" table in `docs/attack-surface.md` lists them all:
+then run the inventory rows of the "Keeping this page current" table in
+`docs/attack-surface.md`. The reachability and combination checks that table
+also lists are the passes in sections 2 and 4.
 
 ```bash
 cargo test -p wok-compat --test attack_surface --test golden_transcripts
@@ -52,9 +53,14 @@ that refuses the request, or behind a setting, and rewrite the baseline with
 `--bless` only when that reach is the point of the change, with the reason in
 the pull request. A phase that went empty is intended when the profile now
 closes that caller, since the probe skips a closed caller (AUTH unusable,
-`admin.enabled` off, no Unix socket): `--bless` with the reason. When the
-caller is still open and its phase reaches nothing, the probe is broken: fix
-it. A function no longer reached is listed but does not fail. When you extend the probe (`crates/wok-compat/tests/reachability.rs`), keep it from
+`admin.enabled` off, no Unix socket): `--bless` with the reason. The
+authenticated, admin and local phases count only what their caller adds, so
+one can also shrink to nothing on purpose, when that code was removed or now
+runs for anonymous callers: `--bless` with the reason. When the caller is
+still open and the probe did not send, the probe is broken: fix it. A
+function no longer reached is listed but does not fail.
+
+When you extend the probe (`crates/wok-compat/tests/reachability.rs`), keep it from
 calling the relay's crates itself (sign, frame and compress with other
 crates), or its own work is counted as the relay's.
 

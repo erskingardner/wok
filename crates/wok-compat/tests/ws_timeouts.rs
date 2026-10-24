@@ -1,11 +1,12 @@
 //! WebSocket connection-lifecycle timeouts (slowloris / slow-trickle
 //! defenses): pre-upgrade HTTP header read deadline, idle-gap deadline while
-//! a partial frame is buffered, and ping/pong liveness.
+//! a partial frame is buffered, the deadline for a whole message, and
+//! ping/pong liveness.
 
 use futures_util::SinkExt;
 use serde_json::json;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use wok_compat::sign_event;
@@ -45,7 +46,7 @@ async fn start(dir: &std::path::Path, cfg: Config) -> std::net::SocketAddr {
 
 /// Read until the peer closes (or errors) and assert it happens within
 /// `within`. Any bytes the peer sends first (e.g. a 408) are consumed.
-async fn expect_closed(stream: &mut TcpStream, within: Duration, what: &str) {
+async fn expect_closed(stream: &mut (impl AsyncRead + Unpin), within: Duration, what: &str) {
     let start = Instant::now();
     let mut buf = [0u8; 512];
     loop {
@@ -169,6 +170,45 @@ async fn trickled_partial_frame_is_closed_by_frame_read_timeout() {
         "slow-trickle partial frame",
     )
     .await;
+}
+
+/// A byte every half second stays well within the frame gap, but the frame
+/// must still be finished within `message_read_timeout_secs` of its first
+/// byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trickled_frame_is_closed_by_message_read_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(dir.path());
+    cfg.relay.frame_read_timeout_secs = 5;
+    cfg.relay.message_read_timeout_secs = 2;
+    cfg.relay.auto_ping_seconds = 0; // isolate from ping liveness
+    let addr = start(dir.path(), cfg).await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    ws_handshake(&mut stream).await;
+    let (mut rd, mut wr) = stream.into_split();
+    let trickle = tokio::spawn(async move {
+        // Masked text frame declaring a 1000-byte payload, then its payload a
+        // masked byte at a time.
+        let mut header = vec![0x81u8, 0x80 | 126];
+        header.extend_from_slice(&1000u16.to_be_bytes());
+        header.extend_from_slice(&[1, 2, 3, 4]);
+        wr.write_all(&header).await?;
+        for _ in 0..1000 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            wr.write_all(&[b'x' ^ 1]).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+
+    let start = Instant::now();
+    expect_closed(&mut rd, Duration::from_secs(8), "trickled frame").await;
+    assert!(
+        start.elapsed() >= Duration::from_millis(1_500),
+        "closed after {:?}, before the message deadline",
+        start.elapsed()
+    );
+    trickle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

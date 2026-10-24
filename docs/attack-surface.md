@@ -99,9 +99,11 @@ same ingester. Before Wok reads a message's verb:
   the message, up to `relay.max_websocket_payload_size`. Past half that size
   plus 64 KiB, a message may inflate to at most 32 times its compressed
   size; one past its limit is refused before more of it is inflated. `relay.frame_read_timeout_secs` is the
-  longest gap between reads while part of a frame or message is buffered;
-  a pause while the relay does not read, because the connection's hold is
-  full, does not count against it.
+  longest gap between reads while part of a frame or message is buffered,
+  and `relay.message_read_timeout_secs` the longest a message or control
+  frame may take from its first byte to its last; a pause while the relay
+  does not read, because the connection's hold is full, counts against
+  neither.
 - **Unix socket:** the peer check runs once, when the connection is accepted
   and before any frame is read. Each frame's four-byte length is checked
   against `relay.unix.max_frame_bytes` before its body is read.

@@ -6,7 +6,9 @@
 //! `client_no_context_takeover` echoed when the client offers it.
 
 use bytes::{Buf, BytesMut};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 pub const OP_CONT: u8 = 0x0;
 pub const OP_TEXT: u8 = 0x1;
@@ -339,6 +341,9 @@ pub struct WsParser {
     frag_opcode: Option<u8>,
     frag_rsv1: bool,
     frag: Vec<u8>,
+    /// Messages, and control frames outside one, decoded so far. Once it
+    /// moves, whatever is still buffered began after the last of them.
+    completed: u64,
     inflater: Option<InflateCtx>,
     role: Role,
 }
@@ -357,9 +362,15 @@ impl WsParser {
             frag_opcode: None,
             frag_rsv1: false,
             frag: Vec::new(),
+            completed: 0,
             inflater,
             role,
         }
+    }
+
+    /// Part of a frame or message is buffered.
+    fn assembly_pending(&self) -> bool {
+        !self.buf.is_empty() || self.frag_opcode.is_some()
     }
 
     /// Drop an idle inflater (see [`InflateCtx::release_idle`]).
@@ -391,7 +402,11 @@ impl WsParser {
         // the budget.
         let mut decoded = 0usize;
         while let Some(frame) = self.try_parse_frame()? {
-            if let Some(ev) = self.handle_frame(frame)? {
+            let event = self.handle_frame(frame)?;
+            if self.frag_opcode.is_none() {
+                self.completed = self.completed.wrapping_add(1);
+            }
+            if let Some(ev) = event {
                 if let WsEvent::Message(_, payload) = &ev {
                     decoded = decoded.saturating_add(payload.len());
                 }
@@ -708,22 +723,109 @@ pub async fn read_events<S: AsyncRead + Unpin>(
     parser: &mut WsParser,
 ) -> Result<Vec<WsEvent>, WsError> {
     let mut events = Vec::new();
-    let mut no_deadline = None;
-    read_events_into(stream, parser, &mut events, None, &mut no_deadline).await?;
+    read_events_into(stream, parser, &mut events, &mut ReadDeadlines::default()).await?;
     Ok(events)
+}
+
+/// How long a client may take while part of a frame or message is buffered
+/// (slow-trickle guards), and the deadlines those set. The caller keeps them,
+/// so that `select!` cancelling a read restarts neither, and they advance
+/// only with socket reads: unrelated outbound traffic waking the select must
+/// not restart them.
+#[derive(Debug, Default)]
+pub struct ReadDeadlines {
+    /// The longest gap between reads.
+    gap: Option<Duration>,
+    /// The longest a message or control frame may take from its first byte
+    /// to its last.
+    message: Option<Duration>,
+    gap_at: Option<Instant>,
+    message_at: Option<Instant>,
+    /// When the relay stopped reading, until it resumes.
+    paused_at: Option<Instant>,
+}
+
+impl ReadDeadlines {
+    pub fn new(gap: Option<Duration>, message: Option<Duration>) -> Self {
+        Self {
+            gap,
+            message,
+            ..Self::default()
+        }
+    }
+
+    /// The relay, not the client, has stopped reading. Until [`resume`],
+    /// the gap restarts with the next read and the message's time stops.
+    ///
+    /// [`resume`]: Self::resume
+    pub fn pause(&mut self) {
+        self.gap_at = None;
+        self.paused_at.get_or_insert_with(Instant::now);
+    }
+
+    /// The relay reads again: the message deadline moves by the pause.
+    pub fn resume(&mut self) {
+        if let Some(paused_at) = self.paused_at.take() {
+            if let Some(message_at) = &mut self.message_at {
+                *message_at += paused_at.elapsed();
+            }
+        }
+    }
+
+    /// The deadline the next read must meet, and the error past it, while
+    /// `pending`: part of a frame or message is buffered.
+    fn next(&mut self, pending: bool) -> Option<(Instant, &'static str)> {
+        if !pending {
+            return None;
+        }
+        let now = Instant::now();
+        let gap = self.gap.map(|gap| *self.gap_at.get_or_insert(now + gap));
+        let message = self
+            .message
+            .map(|message| *self.message_at.get_or_insert(now + message));
+        match (gap, message) {
+            (Some(gap), Some(message)) if message < gap => Some((message, "message read timeout")),
+            (Some(gap), _) => Some((gap, "frame read timeout")),
+            (None, Some(message)) => Some((message, "message read timeout")),
+            (None, None) => None,
+        }
+    }
+
+    /// Advance the deadlines after decoding, which followed a socket read
+    /// when `read`. When a message or control frame was `completed`, what is
+    /// still buffered arrived with the last read, so its time starts now.
+    fn decoded(&mut self, pending: bool, read: bool, completed: bool) {
+        if !pending {
+            self.gap_at = None;
+            self.message_at = None;
+            return;
+        }
+        let now = Instant::now();
+        if read {
+            self.gap_at = self.gap.map(|gap| now + gap);
+        }
+        if completed || self.message_at.is_none() {
+            self.message_at = self.message.map(|message| now + message);
+        }
+    }
 }
 
 pub async fn read_events_into<S: AsyncRead + Unpin>(
     stream: &mut S,
     parser: &mut WsParser,
     events: &mut Vec<WsEvent>,
-    frame_idle_timeout: Option<std::time::Duration>,
-    frame_deadline: &mut Option<tokio::time::Instant>,
+    deadlines: &mut ReadDeadlines,
 ) -> Result<(), WsError> {
     events.clear();
     // Frames a previous call left buffered past its budget come first.
+    let completed = parser.completed;
     parser.drain_events_into(events, parser.max_message)?;
     if !events.is_empty() {
+        deadlines.decoded(
+            parser.assembly_pending(),
+            false,
+            parser.completed != completed,
+        );
         return Ok(());
     }
     loop {
@@ -732,13 +834,10 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
         // before masking and JSON parsing.
         //
         // While a partial frame or an unfinished fragmented message is
-        // buffered, bound the idle gap between socket reads: a client may
-        // otherwise declare a large frame and dribble its payload, pinning
-        // the assembly buffer indefinitely. The deadline is owned by the
-        // caller so it survives select! cancellation of this future, and it
-        // advances only on an actual socket read — unrelated outbound
-        // traffic waking the select must not restart the guard.
-        let assembly_pending = !parser.buf.is_empty() || parser.frag_opcode.is_some();
+        // buffered, bound the gap between socket reads and the time since
+        // its first byte: a client may otherwise declare a large frame and
+        // dribble its payload, pinning the assembly buffer indefinitely.
+        let next = deadlines.next(parser.assembly_pending());
         let want = if parser.read_filled {
             READ_CHUNK
         } else {
@@ -750,13 +849,11 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
             parser.buf.reserve(want);
         }
         let room = parser.buf.capacity() - parser.buf.len();
-        let n = match frame_idle_timeout.filter(|_| assembly_pending) {
-            Some(gap) => {
-                let deadline =
-                    frame_deadline.get_or_insert_with(|| tokio::time::Instant::now() + gap);
-                match tokio::time::timeout_at(*deadline, stream.read_buf(&mut parser.buf)).await {
+        let n = match next {
+            Some((deadline, timeout)) => {
+                match tokio::time::timeout_at(deadline, stream.read_buf(&mut parser.buf)).await {
                     Ok(res) => res?,
-                    Err(_) => return Err(WsError::Protocol("frame read timeout")),
+                    Err(_) => return Err(WsError::Protocol(timeout)),
                 }
             }
             None => stream.read_buf(&mut parser.buf).await?,
@@ -765,19 +862,21 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
             return Err(WsError::Protocol("eof"));
         }
         parser.read_filled = n >= room;
+        let completed = parser.completed;
         parser.drain_events_into(events, parser.max_message)?;
         if parser.buf.is_empty() && !parser.read_filled && parser.grown {
             parser.buf = BytesMut::with_capacity(READ_IDLE);
             parser.grown = false;
         }
-        // Arm or advance the deadline after every read that leaves assembly
+        // Arm or advance the deadlines after every read that leaves assembly
         // pending — including the empty-to-partial transition where this
-        // same read also produced events — so the guard is armed before the
+        // same read also produced events — so they are armed before the
         // caller dispatches those events (dispatch can await backpressure).
-        if let Some(gap) = frame_idle_timeout {
-            *frame_deadline = (!parser.buf.is_empty() || parser.frag_opcode.is_some())
-                .then(|| tokio::time::Instant::now() + gap);
-        }
+        deadlines.decoded(
+            parser.assembly_pending(),
+            true,
+            parser.completed != completed,
+        );
         if !events.is_empty() {
             return Ok(());
         }
@@ -835,10 +934,10 @@ mod tests {
         tx.write_all(&wire).await.unwrap();
         let mut parser = WsParser::new(0, None);
         let mut events = Vec::new();
-        let mut deadline = None;
+        let mut deadlines = ReadDeadlines::default();
         let read = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            read_events_into(&mut rx, &mut parser, &mut events, None, &mut deadline),
+            read_events_into(&mut rx, &mut parser, &mut events, &mut deadlines),
         )
         .await
         .expect("the frame is parsed, not buffered forever");
@@ -863,10 +962,10 @@ mod tests {
         tx.write_all(&wire).await.unwrap();
         let mut parser = WsParser::new(max, Some(InflateCtx::new(false)));
         let mut events = Vec::new();
-        let mut deadline = None;
+        let mut deadlines = ReadDeadlines::default();
         let mut decoded = Vec::new();
         for _ in 0..2 {
-            read_events_into(&mut rx, &mut parser, &mut events, None, &mut deadline)
+            read_events_into(&mut rx, &mut parser, &mut events, &mut deadlines)
                 .await
                 .unwrap();
             decoded.push(events.len());
@@ -888,22 +987,135 @@ mod tests {
 
         let mut parser = WsParser::new(1 << 20, None);
         let mut events = Vec::new();
-        let mut deadline = None;
-        read_events_into(
-            &mut rx,
-            &mut parser,
-            &mut events,
-            Some(std::time::Duration::from_secs(30)),
-            &mut deadline,
-        )
-        .await
-        .unwrap();
+        let mut deadlines = ReadDeadlines::new(
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(120)),
+        );
+        read_events_into(&mut rx, &mut parser, &mut events, &mut deadlines)
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(
-            deadline.is_some(),
-            "deadline must be armed for the retained partial frame"
+            deadlines.gap_at.is_some() && deadlines.message_at.is_some(),
+            "deadlines must be armed for the retained partial frame"
         );
+    }
+
+    /// Writes `wire` in the pieces `cuts` marks, `every` apart, the first
+    /// at once.
+    fn write_slowly(
+        mut tx: tokio::io::DuplexStream,
+        pieces: Vec<Vec<u8>>,
+        every: Duration,
+    ) -> tokio::task::JoinHandle<tokio::io::DuplexStream> {
+        tokio::spawn(async move {
+            for (n, piece) in pieces.into_iter().enumerate() {
+                if n > 0 {
+                    tokio::time::sleep(every).await;
+                }
+                tx.write_all(&piece).await.unwrap();
+            }
+            tx
+        })
+    }
+
+    /// A frame sent a byte at a time, each well within the gap, still has to
+    /// be finished by the message deadline, which runs from its first byte.
+    #[tokio::test(start_paused = true)]
+    async fn a_trickled_frame_meets_the_message_deadline() {
+        let wire = masked_frame(true, false, OP_TEXT, &[b'x'; 100]);
+        let (tx, mut rx) = tokio::io::duplex(1024);
+        let pieces = wire.iter().map(|&byte| vec![byte]).collect();
+        let writer = write_slowly(tx, pieces, Duration::from_secs(2));
+        let mut parser = WsParser::new(1 << 20, None);
+        let mut events = Vec::new();
+        let mut deadlines =
+            ReadDeadlines::new(Some(Duration::from_secs(3)), Some(Duration::from_secs(9)));
+        let start = Instant::now();
+        let read = read_events_into(&mut rx, &mut parser, &mut events, &mut deadlines).await;
+        assert!(
+            matches!(read, Err(WsError::Protocol("message read timeout"))),
+            "{read:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(9));
+        writer.abort();
+    }
+
+    /// Each message the client finishes starts the time of the next, though
+    /// every read ends part way through a frame and the buffer is never
+    /// empty.
+    #[tokio::test(start_paused = true)]
+    async fn whole_messages_restart_the_message_deadline() {
+        let mut wire = Vec::new();
+        for n in 0..10 {
+            wire.extend(masked_frame(
+                true,
+                false,
+                OP_TEXT,
+                format!("message {n}").as_bytes(),
+            ));
+        }
+        // Each frame is 15 bytes: a piece finishes one and starts the next.
+        let mut cuts = vec![0, 7];
+        cuts.extend((1..10).map(|n| 7 + 15 * n));
+        cuts.push(wire.len());
+        let pieces = cuts.windows(2).map(|w| wire[w[0]..w[1]].to_vec()).collect();
+        let (tx, mut rx) = tokio::io::duplex(1024);
+        let writer = write_slowly(tx, pieces, Duration::from_secs(2));
+        let mut parser = WsParser::new(1 << 20, None);
+        let mut events = Vec::new();
+        let mut deadlines =
+            ReadDeadlines::new(Some(Duration::from_secs(10)), Some(Duration::from_secs(3)));
+        let mut messages = 0;
+        while messages < 10 {
+            read_events_into(&mut rx, &mut parser, &mut events, &mut deadlines)
+                .await
+                .unwrap();
+            messages += events.len();
+        }
+        writer.await.unwrap();
+    }
+
+    /// A ping inside a fragmented message is a whole frame, but the message
+    /// it interrupts goes on, and so does its time.
+    #[tokio::test(start_paused = true)]
+    async fn a_ping_inside_a_fragmented_message_does_not_restart_it() {
+        let mut pieces = vec![masked_frame(false, false, OP_TEXT, b"hel")];
+        pieces.extend((0..10).map(|_| masked_frame(true, false, OP_PING, b"")));
+        let (tx, mut rx) = tokio::io::duplex(1024);
+        let writer = write_slowly(tx, pieces, Duration::from_secs(2));
+        let mut parser = WsParser::new(1 << 20, None);
+        let mut events = Vec::new();
+        let mut deadlines =
+            ReadDeadlines::new(Some(Duration::from_secs(3)), Some(Duration::from_secs(9)));
+        let start = Instant::now();
+        let error = loop {
+            match read_events_into(&mut rx, &mut parser, &mut events, &mut deadlines).await {
+                Ok(()) => assert!(events.iter().all(|ev| matches!(ev, WsEvent::Ping(_)))),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(error, WsError::Protocol("message read timeout")));
+        assert_eq!(start.elapsed(), Duration::from_secs(9));
+        writer.abort();
+    }
+
+    /// While the relay does not read, the gap restarts and the message's time
+    /// stops, however often the paused loop passes.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_stops_the_message_time() {
+        let mut deadlines =
+            ReadDeadlines::new(Some(Duration::from_secs(5)), Some(Duration::from_secs(10)));
+        deadlines.decoded(true, true, false);
+        let armed = deadlines.message_at.unwrap();
+        deadlines.pause();
+        assert_eq!(deadlines.gap_at, None);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        deadlines.pause();
+        deadlines.resume();
+        deadlines.resume();
+        assert_eq!(deadlines.message_at, Some(armed + Duration::from_secs(60)));
     }
 
     async fn read_all(
@@ -913,9 +1125,9 @@ mod tests {
     ) -> Vec<WsEvent> {
         let mut all = Vec::new();
         let mut events = Vec::new();
-        let mut deadline = None;
+        let mut deadlines = ReadDeadlines::default();
         while all.len() < n {
-            read_events_into(rx, parser, &mut events, None, &mut deadline)
+            read_events_into(rx, parser, &mut events, &mut deadlines)
                 .await
                 .unwrap();
             all.append(&mut events);

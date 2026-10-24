@@ -54,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **NEG-OPEN** meets `relay.max_req_filter_size`, and a connection's
     sessions share `relay.max_filter_bytes_per_connection`, as REQs and
     COUNTs each do. Its payload is decoded after its filter is checked.
+  - **A partial WebSocket message** must arrive whole within
+    `relay.message_read_timeout_secs` (new, 120 seconds) of its first byte.
+    `relay.frame_read_timeout_secs` bounds only the gap between reads, so a
+    client sending a little at a time could keep a message of up to
+    `relay.max_websocket_payload_size` buffered indefinitely. A pause while
+    the relay does not read, because the connection's hold is full, does not
+    count.
 
 - Requests are refused by the cheapest check that can refuse them, before
   their filters are parsed or their signature is verified, where that
@@ -493,6 +500,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `public`: `relay.abuse.max_query_work` is `20000`, NIP-11
   `max_query_work`, in the units described under Changed. It replaces
   `relay.abuse.max_query_cost = 1000`, which is ignored (see Removed).
+- `public`: `relay.message_read_timeout_secs` is `120`, a new setting: a
+  WebSocket message or control frame must arrive within 120 seconds of its
+  first byte (see Security). `0` turns the deadline off.
 - `public`: `relay.abuse.ipv6_prefix_len` is `64`, a new setting.
   Per-address budgets (connections, EVENT and AUTH, REQ, COUNT, malformed
   messages) key an IPv6 client by its /64 instead of its full address, so a

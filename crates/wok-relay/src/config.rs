@@ -241,6 +241,10 @@ pub struct RelayConfig {
     /// or unfinished fragmented message is buffered (slow-trickle guard);
     /// zero disables it.
     pub frame_read_timeout_secs: u64,
+    /// Longest time from the first byte of a WebSocket message or control
+    /// frame to its last, not counting pauses while the relay does not read
+    /// (slow-trickle guard); zero disables it.
+    pub message_read_timeout_secs: u64,
     pub query_timeslice_budget_us: u64,
     pub max_filter_limit: u64,
     pub max_tags_per_filter: usize,
@@ -505,6 +509,7 @@ impl Default for Config {
                 enable_tcp_keepalive: false,
                 handshake_timeout_secs: 10,
                 frame_read_timeout_secs: 30,
+                message_read_timeout_secs: 120,
                 query_timeslice_budget_us: 10000,
                 max_filter_limit: 2_000,
                 max_tags_per_filter: 8,
@@ -1858,6 +1863,12 @@ impl Config {
             warnings.push(ZeroGuard::new(
                 &["relay.frame_read_timeout_secs"],
                 "relay.frame_read_timeout_secs is zero — partial-frame trickle guard disabled",
+            ));
+        }
+        if zeroed(r.message_read_timeout_secs, pr.message_read_timeout_secs) {
+            warnings.push(ZeroGuard::new(
+                &["relay.message_read_timeout_secs"],
+                "relay.message_read_timeout_secs is zero — whole-message trickle guard disabled",
             ));
         }
         warnings
@@ -3233,6 +3244,7 @@ negentropy_enabled = true
             "max_pending_outbound_bytes",
             "handshake_timeout_secs",
             "frame_read_timeout_secs",
+            "message_read_timeout_secs",
         ] {
             let cfg = Config::parse_toml(&format!("[relay]\n{field} = 0\n")).unwrap();
             assert!(

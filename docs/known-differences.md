@@ -112,7 +112,9 @@ it is not a promise to reproduce upstream bugs.
 - WebSocket connections have lifecycle timeouts strfry lacks: a pre-upgrade
   HTTP header read deadline (`relay.handshake_timeout_secs`), an idle-gap
   deadline while a partial frame or unfinished fragmented message is
-  buffered (`relay.frame_read_timeout_secs`), and ping/pong liveness (a ping
+  buffered (`relay.frame_read_timeout_secs`), a deadline for the whole of
+  each message or control frame from its first byte
+  (`relay.message_read_timeout_secs`), and ping/pong liveness (a ping
   unanswered for a full `relay.auto_ping_seconds` interval closes the
   connection).
 - Mesh client connections do not currently offer permessage-deflate. Wok's

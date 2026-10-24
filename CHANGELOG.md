@@ -394,6 +394,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tests fail when the listener answers a path the page does not list, in any
   of seven configuration profiles, or when a client verb, NIP-86 method level
   or command differs from it. `docs/nip86.md` now gives each method's level.
+- The ingress fuzz target covers the context-takeover inflater that browsers
+  negotiate (#166): compressed WebSocket messages that refer back into
+  earlier ones, and messages after the idle decompressor is released, which
+  replay up to 32 KiB of history into a new one. It covered only the
+  inflater without takeover before.
 
 ### Preset changes
 

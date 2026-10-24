@@ -58,7 +58,9 @@ rather than permanently ignored; the initial audit removed the unmaintained
 Fast property tests feed arbitrary data into strict JSON/event validation,
 protocol envelopes, WebSocket fragmentation and decompression, Negentropy
 frames, and modeled LMDB transaction sequences on every normal test run. A
-separate libFuzzer target composes the public ingress parsers. Relevant master
+separate libFuzzer target composes the public ingress parsers, inflating
+WebSocket messages with and without context takeover, and across the idle
+release that replays a takeover connection's history. Relevant master
 pushes, pull requests, and scheduled jobs run 10,000 AddressSanitizer-backed
 iterations with protocol/size-boundary seeds, a 2 MiB input ceiling, and a reused
 corpus. Any crash reproducer is retained as a workflow artifact for diagnosis

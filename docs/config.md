@@ -425,10 +425,11 @@ rarely publish.
 
 Token buckets: each refills at its rate per second and holds up to its
 burst, how much may be spent at once. A connection has budgets of its own,
-under a backstop shared by every connection from one address. All reload
-live and are on the dashboard, apart from the client address header. `0` in
-a bucket's rate or its burst turns that bucket off (unlimited). A refusal by
-a bucket is counted under its `_burst` key.
+under a backstop shared by every connection from one address, and an address
+may hold only so many connections open. All reload live and are on the
+dashboard, apart from the client address header. `0` in a bucket's rate or
+its burst turns that bucket off (unlimited). A refusal by a bucket is
+counted under its `_burst` key.
 
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
@@ -446,6 +447,7 @@ a bucket is counted under its `_burst` key.
 | `relay.abuse.count_burst` | `50` | The same, at once. | As above. | — |
 | `relay.abuse.connection_rate_per_second` | `10` | Handshake CPU and memory: new connections, and plain HTTP requests, from one address. | Shared networks fail to reconnect after an outage. | — |
 | `relay.abuse.connection_burst` | `50` | The same, at once. | As above. | — |
+| `relay.abuse.max_connections_per_address` | `256` | Memory and file descriptors: the WebSocket connections one address holds open at once. Each has its own queued messages, outbound queue and subscriptions, so this bounds how far one host multiplies them. An upgrade past it gets 429 `rate-limited: too many connections from this address`. `0` is unlimited. | Users behind one carrier NAT, office or VPN are refused new connections. Behind a proxy without `relay.real_ip_header`, every client shares one cap. | — |
 | `relay.abuse.event_rate_per_second` | `50` | Signature-check CPU and write volume: EVENT and AUTH from one address. | Marmot group invites (a commit plus a Welcome per new member) and bulk publishing fail. | — |
 | `relay.abuse.event_burst` | `100` | The same, at once. `marmot` uses 300, for one inviter's commit plus about 250 Welcomes. | As above. | — |
 | `relay.abuse.pubkey_event_rate_per_second` | `25` | One key flooding the relay: events per author, or per AUTHed identity for events from other keys; see [Throwaway keys](#throwaway-keys). | Active users, bots and bulk publishing are throttled. | — |
@@ -495,10 +497,10 @@ rate-limited: REQ budget exhausted` (or `COUNT`, or a NEG-ERR naming
 reason ending `for this address` for the backstop.
 
 Unix-socket connections carry no network address, so by design they bypass
-every rate bucket: connection, EVENT, REQ, COUNT, and the per-connection
-budgets. Per-author publication, storage quotas, the query work ceiling and
-proof of work still apply to them. Keep the socket on a trusted host with
-tight `mode`, `auth_uids` and `auth_gids`.
+every rate bucket (connection, EVENT, REQ, COUNT, and the per-connection
+budgets) and the cap on open connections. Per-author publication, storage
+quotas, the query work ceiling and proof of work still apply to them. Keep
+the socket on a trusted host with tight `mode`, `auth_uids` and `auth_gids`.
 
 ### Throwaway keys
 

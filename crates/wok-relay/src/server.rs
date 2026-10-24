@@ -12,7 +12,8 @@ mod sub_gate;
 use sub_gate::{Current, Ns, SubGate};
 
 use crate::abuse::{
-    leading_zero_bits, AbuseController, Admission, BudgetKind, ConnectionBudgets, Refusal, Request,
+    leading_zero_bits, AbuseController, Admission, BudgetKind, ConnectionBudgets, ConnectionSlot,
+    Refusal, Request,
 };
 use crate::config::AccessPolicy;
 use crate::config::{Config, EphemeralPersistence};
@@ -1250,6 +1251,20 @@ impl RelayHandle {
             self.metrics.refused(Setting::ConnectionBurst);
         }
         admitted
+    }
+
+    /// Count a connection against its address's
+    /// `relay.abuse.max_connections_per_address` while the returned slot
+    /// lives: a transport takes it before it upgrades and keeps it until the
+    /// connection ends. `None` when the address already holds that many.
+    pub fn hold_connection(&self, source: &TransportSource) -> Option<ConnectionSlot> {
+        let slot = self
+            .abuse
+            .hold_connection(source, &self.config.read().relay.abuse);
+        if slot.is_none() {
+            self.metrics.refused(Setting::MaxConnectionsPerAddress);
+        }
+        slot
     }
 
     /// Apply a NIP-86 management mutation on the writer thread and wait for

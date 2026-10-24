@@ -453,6 +453,13 @@ pub(super) const SECTIONS: &[Section] = &[
                 &ADDRESS_CONNECTION,
             ),
             field(
+                "Open connections per address",
+                "WebSocket connections one address may hold open at once. Each has its own queued messages, outbound queue and subscriptions.",
+                "Users behind the same carrier NAT, office or VPN are refused new connections. Behind a proxy without a client address header, every client shares one cap.",
+                "One host multiplies every per-connection limit by the connections it keeps open.",
+                &[Input::new("abuse", "max_connections_per_address", "relay.abuse.max_connections_per_address", Unit::Count).off()],
+            ),
+            field(
                 "Events per address",
                 "EVENT and AUTH messages from one address.",
                 "Marmot group invites, a commit plus a Welcome per new member, and bulk publishing fail.",

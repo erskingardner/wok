@@ -14,6 +14,7 @@ pub mod rlimit;
 pub mod server;
 pub mod source;
 
+pub use abuse::ConnectionSlot;
 pub use capabilities::{
     relay_capabilities, supported_nips, CapabilityCondition, RelayCapability,
     RELAY_CAPABILITY_CATALOG,

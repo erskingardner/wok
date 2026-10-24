@@ -868,5 +868,17 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
             },
         )
         .await;
+    relay
+        .expect(
+            Some(Setting::MaxConnectionsPerAddress),
+            |c| c.relay.abuse.max_connections_per_address = 2,
+            async |r| {
+                let source = r.fresh_source();
+                let open: Vec<_> = (0..2).map(|_| r.handle.hold_connection(&source)).collect();
+                assert!(open.iter().all(Option::is_some));
+                assert!(r.handle.hold_connection(&source).is_none());
+            },
+        )
+        .await;
     relay.handle.request_shutdown();
 }

@@ -392,9 +392,11 @@ regression test. Differential parity alone is not a reason to retain it.
   events that `wok sync` uploads to it, because uploads are EVENTs.
 - NIP-01 single endpoint: only `/` accepts WebSocket upgrades and serves
   NIP-11, NIP-86 and the landing page. Other paths return 404, apart from
-  `/admin`, the nodeinfo routes and, when metrics are on, `/metrics`. The pinned strfry upgrades
-  and serves NIP-11 on every path, so one relay answers under many URLs. A
-  reverse proxy that serves the relay under a path prefix must strip it.
+  `/admin` and, when they are on, the NodeInfo routes and `/metrics`. NodeInfo
+  is off unless `relay.nodeinfo_enabled` is set; the pinned strfry always
+  serves it. The pinned strfry upgrades and serves NIP-11 on every path, so
+  one relay answers under many URLs. A reverse proxy that serves the relay
+  under a path prefix must strip it.
 - NIP-11 CORS: relay responses send `Access-Control-Allow-Origin`,
   `-Allow-Headers` and `-Allow-Methods`, and `OPTIONS /` is a 204 preflight
   reply. NIP-11 is chosen when `Accept` lists `application/nostr+json` among

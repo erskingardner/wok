@@ -482,6 +482,10 @@ pub struct RelayHandle {
     config_path: Arc<parking_lot::RwLock<Option<std::path::PathBuf>>>,
     writer_tx: Sender<WriterMsg>,
     threads: Arc<RelayThreads>,
+    /// Each connection's share of the ingest queue, in bytes: the largest
+    /// message a transport accepts, as configured at start. A message larger
+    /// than the share after a reload takes all of it.
+    inbound_share: usize,
 }
 
 /// How long dropping the last `RelayHandle` waits for the relay threads.
@@ -654,6 +658,9 @@ pub enum IngestMsg {
         conn_id: u64,
         source: TransportSource,
         payload: String,
+        /// The connection's share of the ingest queue this message holds
+        /// until it is handled.
+        share: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     Close {
         conn_id: u64,
@@ -841,6 +848,38 @@ struct AuthSession {
     identities: Vec<[u8; 32]>,
 }
 
+/// A connection's share of the ingest queue: the bytes of its messages handed
+/// to the ingester and not yet handled. A message waits for its share before
+/// it is queued, so one connection never has more than the largest message
+/// the relay accepts waiting for an ingester, however small the messages.
+#[derive(Clone)]
+struct InboundShare {
+    permits: Arc<tokio::sync::Semaphore>,
+    limit: u32,
+}
+
+impl InboundShare {
+    fn new(limit: usize) -> Self {
+        let limit = u32::try_from(limit.max(1)).unwrap_or(u32::MAX);
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(limit as usize)),
+            limit,
+        }
+    }
+
+    /// Wait until `len` bytes fit in the share, and hold them until the
+    /// returned permit drops. A message larger than the share waits for all
+    /// of it.
+    async fn acquire(&self, len: usize) -> tokio::sync::OwnedSemaphorePermit {
+        let cost = u32::try_from(len).unwrap_or(u32::MAX).clamp(1, self.limit);
+        self.permits
+            .clone()
+            .acquire_many_owned(cost)
+            .await
+            .expect("an inbound share is never closed")
+    }
+}
+
 /// Owns one relay registration and guarantees transport cleanup on every exit
 /// path, including task cancellation.
 pub struct ConnectionGuard {
@@ -848,6 +887,7 @@ pub struct ConnectionGuard {
     conn_id: u64,
     source: TransportSource,
     gate: IngressGate,
+    inbound: InboundShare,
     closed: bool,
 }
 
@@ -860,13 +900,14 @@ impl ConnectionGuard {
         &self.source
     }
 
-    /// Hand a message to the ingester. This waits only for room in the
-    /// shared ingest queue, never on the ingress gate: a transport checks
-    /// `ingress_paused` itself, so a paused connection keeps writing,
-    /// pinging and handling control frames.
+    /// Hand a message to the ingester. This waits for the connection's share
+    /// of the ingest queue and for room in it, never on the ingress gate: a
+    /// transport checks `ingress_paused` itself, so a paused connection keeps
+    /// writing, pinging and handling control frames.
     pub async fn client_message(&self, payload: String) {
+        let share = self.inbound.acquire(payload.len()).await;
         self.handle
-            .client_message(self.conn_id, self.source.clone(), payload)
+            .queue_client_message(self.conn_id, self.source.clone(), payload, Some(share))
             .await;
     }
 
@@ -1080,6 +1121,7 @@ impl RelayHandle {
             conn_id,
             source,
             gate: gate.clone(),
+            inbound: InboundShare::new(self.inbound_share),
             closed: false,
         };
         let gate = Some(gate);
@@ -1138,12 +1180,24 @@ impl RelayHandle {
     /// whose ingress gate keeps what they leave parked behind a full worker
     /// bounded.
     pub async fn client_message(&self, conn_id: u64, source: TransportSource, payload: String) {
+        self.queue_client_message(conn_id, source, payload, None)
+            .await;
+    }
+
+    async fn queue_client_message(
+        &self,
+        conn_id: u64,
+        source: TransportSource,
+        payload: String,
+        share: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         let _ = self
             .ingest_route(conn_id)
             .send(IngestMsg::Client {
                 conn_id,
                 source,
                 payload,
+                share,
             })
             .await;
     }
@@ -1221,6 +1275,10 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let n_req_worker = config.relay.req_worker_threads.max(1);
     let n_req_monitor = config.relay.req_monitor_threads.max(1);
     let n_negentropy = config.relay.negentropy_threads.max(1);
+    let inbound_share = config
+        .relay
+        .max_websocket_payload_size
+        .max(config.relay.unix.max_frame_bytes);
     let config = Arc::new(parking_lot::RwLock::new(config));
     let conns = Arc::new(ConnTable::new());
     let metrics = Arc::new(Metrics::default());
@@ -1272,6 +1330,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         abuse: abuse.clone(),
         config_path: Arc::new(parking_lot::RwLock::new(None)),
         writer_tx: writer_tx.clone(),
+        inbound_share,
         threads: Arc::new(RelayThreads {
             shutdown: shutdown.clone(),
             shutdown_notify: shutdown_notify.clone(),
@@ -2024,6 +2083,7 @@ fn run_ingester(
                 conn_id,
                 source,
                 payload,
+                share,
             } => {
                 // Keep the cheap read guard for the duration of one command.
                 // Cloning Config here copied every String, PathBuf, and Vec on
@@ -2044,6 +2104,7 @@ fn run_ingester(
                     &payload,
                     &mut dispatch,
                 );
+                drop(share);
             }
         }
     }
@@ -3505,17 +3566,26 @@ fn ingest_neg(
     if payload_hex.len() > 2 * 1024 * 1024 {
         return Err("invalid: negentropy payload exceeds 1 MiB".into());
     }
-    let payload = wok_event::from_hex_strict(payload_hex).map_err(|e| format!("invalid: {e}"))?;
+    let decode = || wok_event::from_hex_strict(payload_hex).map_err(|e| format!("invalid: {e}"));
     let Some(mut filter) = filter else {
         dispatch.neg(NegMsg::Msg {
             conn_id,
             sub_id: sid,
-            payload,
+            payload: decode()?,
         });
         return Ok(());
     };
     if !filter.is_object() {
         return Err("invalid: negentropy filter must be an object".into());
+    }
+    // A session keeps its filter as a REQ keeps its live filters, so it meets
+    // the same size limit before it is parsed.
+    if filter.to_string().len() > cfg.relay.max_req_filter_size {
+        metrics.refused(Setting::MaxReqFilterSize);
+        return Err(format!(
+            "invalid: filters exceed {} serialized bytes",
+            cfg.relay.max_req_filter_size
+        ));
     }
     let max_limit = cfg.relay.max_sync_events.saturating_add(1);
     let fg = NostrFilterGroup::from_value(
@@ -3543,6 +3613,8 @@ fn ingest_neg(
         count_read_class(metrics, r.strictest_group_class(&fg));
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
     }
+    // Decoded only now, once every check that needs no payload has passed.
+    let payload = decode()?;
     if let Some(obj) = filter.as_object_mut() {
         obj.remove("since");
         obj.remove("until");
@@ -5998,6 +6070,32 @@ mod tests {
         handle.request_shutdown();
     }
 
+    #[tokio::test]
+    async fn an_inbound_share_holds_a_connection_to_its_largest_message() {
+        let share = InboundShare::new(10);
+        let first = share.acquire(6).await;
+        // Six of ten bytes are held: another six must wait for them.
+        let waiting = share.acquire(6);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("released bytes admit the next message");
+        drop(second);
+        // A message larger than the share needs all of it, and still fits.
+        let whole = tokio::time::timeout(Duration::from_secs(1), share.acquire(100))
+            .await
+            .expect("an oversized message takes the whole share");
+        assert_eq!(share.permits.available_permits(), 0);
+        drop(whole);
+        assert_eq!(share.permits.available_permits(), 10);
+    }
+
     /// A relay with `tweak` applied and one connection from 127.0.0.1,
     /// registered so that AUTH, when usable, challenges it first.
     async fn relay_with_connection(
@@ -6089,6 +6187,32 @@ mod tests {
                 "{reply}"
             );
         }
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_neg_open_meets_the_filter_size_limit_and_its_filter_before_its_payload() {
+        let (_dir, handle, conn, mut rx) =
+            relay_with_connection(|cfg| cfg.relay.max_req_filter_size = 64).await;
+        let authors: Vec<String> = (0..4).map(|n| format!("{n:064x}")).collect();
+        for (message, refusal) in [
+            // Larger than a REQ may be, whatever its payload.
+            (
+                json!(["NEG-OPEN", "big", {"authors": authors}, "00"]),
+                "invalid: filters exceed 64 serialized bytes",
+            ),
+            // A filter that does not parse is refused before the payload is
+            // decoded.
+            (
+                json!(["NEG-OPEN", "bad", {"kinds": "one"}, "not hex"]),
+                "invalid: kinds not an array",
+            ),
+        ] {
+            conn.client_message(message.to_string()).await;
+            let reply = recv_outbound(&mut rx).await;
+            assert!(reply.contains(refusal), "{reply}");
+        }
+        assert_eq!(handle.metrics.refusals.get(Setting::MaxReqFilterSize), 1);
         handle.request_shutdown();
     }
 
@@ -6546,6 +6670,7 @@ mod tests {
                     conn_id,
                     source: TransportSource::Unix,
                     payload: payload.to_string(),
+                    share: None,
                 })
                 .unwrap();
         }

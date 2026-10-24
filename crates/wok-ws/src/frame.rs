@@ -529,7 +529,7 @@ impl WsParser {
 
     fn maybe_inflate(&mut self, rsv1: bool, payload: Vec<u8>) -> Result<Vec<u8>, WsError> {
         if rsv1 {
-            let max = self.max_message;
+            let max = inflate_limit(payload.len(), self.max_message);
             match &mut self.inflater {
                 Some(d) => d.decompress(&payload, max),
                 None => Err(WsError::Protocol("RSV1 without extension")),
@@ -538,6 +538,24 @@ impl WsParser {
             Ok(payload)
         }
     }
+}
+
+/// How many times its compressed size a message may inflate to, beyond
+/// `INFLATE_ALLOWANCE`. Nostr messages compress a few times over at most, so
+/// this refuses only messages built to inflate, before they cost the relay
+/// more than an uncompressed message of that size on the wire would.
+const MAX_INFLATE_RATIO: usize = 32;
+
+/// Bytes any compressed message may inflate to whatever its ratio, so small
+/// messages that refer back to the shared window stay accepted.
+const INFLATE_ALLOWANCE: usize = 64 * 1024;
+
+/// The most a compressed message of `wire_len` bytes may inflate to.
+fn inflate_limit(wire_len: usize, max_message: usize) -> usize {
+    wire_len
+        .saturating_mul(MAX_INFLATE_RATIO)
+        .saturating_add(INFLATE_ALLOWANCE)
+        .min(max_message)
 }
 
 struct RawFrame {
@@ -1021,6 +1039,33 @@ mod tests {
         assert!(!server.is_allocated());
         let wire = client.compress(msg).unwrap();
         assert_eq!(server.decompress(&wire, 1 << 20).unwrap(), msg);
+    }
+
+    #[test]
+    fn inflate_limit_scales_with_the_wire_size() {
+        let max = 2 * 1024 * 1024;
+        // Small messages may lean on the window, whatever their ratio.
+        assert_eq!(
+            inflate_limit(10, max),
+            10 * MAX_INFLATE_RATIO + INFLATE_ALLOWANCE
+        );
+        // A large one may inflate to its ratio, and never past the maximum.
+        assert_eq!(
+            inflate_limit(40_000, max),
+            40_000 * MAX_INFLATE_RATIO + INFLATE_ALLOWANCE
+        );
+        assert_eq!(inflate_limit(1 << 20, max), max);
+    }
+
+    #[test]
+    fn a_message_that_inflates_far_beyond_its_size_is_refused() {
+        let mut server = WsParser::new(2 * 1024 * 1024, Some(InflateCtx::new(true)));
+        let mut client = DeflateCtx::new(true);
+        // Within the maximum, but far more than its compressed size allows.
+        let compressed = client.compress(&vec![b'a'; 1 << 20]).unwrap();
+        assert!(compressed.len() * MAX_INFLATE_RATIO + INFLATE_ALLOWANCE < 1 << 20);
+        let frame = masked_frame(true, true, OP_TEXT, &compressed);
+        assert!(matches!(server.feed(&frame), Err(WsError::MessageTooLarge)));
     }
 
     #[test]

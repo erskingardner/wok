@@ -320,8 +320,8 @@ may keep open. All reload live and are on the dashboard.
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
 | `relay.max_filters_per_req` | `200` | Fan-out per request. | Clients that batch many filters in one REQ are refused with `invalid: bad req: arr too big`. NDK batches about 45. | — |
-| `relay.max_req_filter_size` | `262144` | Parse and live-matching memory per REQ or COUNT, as compact JSON. | Outbox clients can't fetch a large follow list in one request. At 64 KiB, the default through 0.7, a REQ naming about 970 authors or more was refused. | — |
-| `relay.max_filter_bytes_per_connection` | `2097152` | Memory for the filters of every subscription open on one connection, and separately of its COUNTs not yet answered. `0` is unlimited. | Clients that keep several subscriptions over a long follow list open, such as a home feed and a profile feed, have new ones refused. | — |
+| `relay.max_req_filter_size` | `262144` | Parse and live-matching memory per REQ, COUNT or NEG-OPEN, as compact JSON. | Outbox clients can't fetch a large follow list in one request. At 64 KiB, the default through 0.7, a REQ naming about 970 authors or more was refused. | — |
+| `relay.max_filter_bytes_per_connection` | `2097152` | Memory for the filters of every subscription open on one connection, and separately of its COUNTs not yet answered and of its NEG-OPEN sessions. `0` is unlimited. | Clients that keep several subscriptions over a long follow list open, such as a home feed and a profile feed, have new ones refused. | — |
 | `relay.max_subs_per_connection` | `200` | Live-matching memory per connection. It also bounds the queries waiting for the concurrency cap. | Apps that keep many subscriptions open have some refused with `blocked: too many concurrent REQs`. Clients use 30–100. | `max_subscriptions` |
 | `relay.max_filter_limit` | `2000` | Rows per filter: a filter's `limit` is clamped to it, and a filter without one gets it. | Results are cut, and clients make extra round trips. At 500, the default through 0.7, MDK's directory batches (`limit` 1,200) and outbox fetches without a `limit` lost events. | `max_limit`, `default_limit` |
 | `relay.max_total_events_per_req` | `10000` | Rows per REQ over all its filters, deduplicated. `0` is unlimited. | Merged batches are cut. At 2,000, the default through 0.7, five filters of 500 lost a fifth of their events. | `max_total_events_per_req` |
@@ -641,7 +641,7 @@ Restart settings, unless noted, and file-only.
 | `relay.enable_tcp_keepalive` | `false` | Enable TCP keepalive on accepted sockets. |
 | `relay.handshake_timeout_secs` | `10` | Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it. Live, for new connections. |
 | `relay.frame_read_timeout_secs` | `30` | Longest idle gap between socket reads while a partial WebSocket frame or unfinished fragmented message is buffered (slow-trickle guard); zero disables it. Live, for new connections. |
-| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. |
+| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. A compressed message may inflate to at most 32 times its compressed size plus 64 KiB, and never past `relay.max_websocket_payload_size`. |
 | `relay.compression_sliding_window` | `true` | Reuse compression context between messages. With context takeover, a connection's compressor can reference bytes from previous messages, the precondition for CRIME/BREACH-style oracles when secret and attacker-influenced bytes share a compression context. Relay traffic is essentially all public data, so practical impact is nil for most operators; if you serve auth-bearing or otherwise secret traffic over the same client connections, prefer `false`. |
 | `relay.ingester_threads` | `3` | Event-ingestion worker count. |
 | `relay.req_worker_threads` | `3` | Historical query worker count. |

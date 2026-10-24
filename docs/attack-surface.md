@@ -96,11 +96,17 @@ same ingester. Before Wok reads a message's verb:
 
 - **WebSocket:** Wok's own RFC 6455 codec decodes the frames and, when the
   client negotiated permessage-deflate (`relay.compression_enabled`), inflates
-  the message, up to `relay.max_websocket_payload_size`.
-  `relay.frame_read_timeout_secs` bounds the wait for the rest of a frame.
+  the message, up to `relay.max_websocket_payload_size` and to at most 32
+  times its compressed size plus 64 KiB; a message past either is refused
+  before more of it is inflated. `relay.frame_read_timeout_secs` is the
+  longest gap between reads while part of a frame or message is buffered.
 - **Unix socket:** the peer check runs once, when the connection is accepted
   and before any frame is read. Each frame's four-byte length is checked
   against `relay.unix.max_frame_bytes` before its body is read.
+- A connection's messages wait for the ingester in a queue it shares with
+  other connections. Each connection may have at most the largest message a
+  transport accepts there, in bytes, not yet handled; the next one waits for
+  room, and the transport stops reading until there is.
 - The whole message is parsed as strict JSON. A malformed message spends the
   invalid-message budget (`relay.abuse.invalid_*`). A message that is exactly
   `"\n"` is a keepalive and does nothing.
@@ -112,9 +118,9 @@ same ingester. Before Wok reads a message's verb:
 | `REQ` | anonymous | none | The connection's REQ budget, which is larger once authenticated, then the address's REQ backstop (see [rates](config.md#rates)); a connection over its own budget does not spend the backstop; subscription id; `relay.auth.read_policy`; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
 | `COUNT` | anonymous | `relay.max_filter_limit_count` above 0 | As `REQ`, with the COUNT budgets, and a COUNT that may count restricted kinds must name only what the connection may read. The gate is checked after the filter count and bytes. |
 | `CLOSE` | anonymous | none | A valid `CLOSE` is never budgeted; one with an invalid id spends the invalid-message budget. |
-| `NEG-OPEN` | anonymous | `relay.negentropy_enabled` | The REQ budgets, as for `REQ`; subscription id; the gate; `relay.auth.read_policy`; payload size and hex decoding; filter parse and validation; query-work estimate; AUTH for restricted kinds; the sync memory budgets. |
+| `NEG-OPEN` | anonymous | `relay.negentropy_enabled` | The REQ budgets, as for `REQ`; subscription id; the gate; `relay.auth.read_policy`; payload size; filter bytes (`relay.max_req_filter_size`); filter parse and validation; query-work estimate; AUTH for restricted kinds; hex decoding of the payload. The negentropy worker then checks the read policy again, sessions per connection, the connection's sessions' filter bytes (`relay.max_filter_bytes_per_connection`) and the sync memory budgets. |
 | `NEG-MSG` | anonymous | `relay.negentropy_enabled` | The connection's NEG-MSG budget, then the address's REQ backstop; subscription id; the gate; payload size and hex decoding; the session lookup. |
-| `NEG-CLOSE` | anonymous | `relay.negentropy_enabled` | The gate first. |
+| `NEG-CLOSE` | anonymous | `relay.negentropy_enabled` | The gate first. It has no budget: the negentropy worker handles a run of them as one removal each, before the snapshot it takes for other messages. |
 
 ## Management API
 

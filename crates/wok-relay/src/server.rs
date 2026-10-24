@@ -12,7 +12,8 @@ mod sub_gate;
 use sub_gate::{Current, Ns, SubGate};
 
 use crate::abuse::{
-    leading_zero_bits, AbuseController, Admission, BudgetKind, ConnectionBudgets, Refusal, Request,
+    leading_zero_bits, AbuseController, Admission, BudgetKind, ConnectionBudgets, ConnectionSlot,
+    Refusal, Request,
 };
 use crate::config::AccessPolicy;
 use crate::config::{Config, EphemeralPersistence};
@@ -1250,6 +1251,20 @@ impl RelayHandle {
             self.metrics.refused(Setting::ConnectionBurst);
         }
         admitted
+    }
+
+    /// Count a connection against its address's
+    /// `relay.abuse.max_connections_per_address` while the returned slot
+    /// lives: a transport takes it before it upgrades and keeps it until the
+    /// connection ends. `None` when the address already holds that many.
+    pub fn hold_connection(&self, source: &TransportSource) -> Option<ConnectionSlot> {
+        let slot = self
+            .abuse
+            .hold_connection(source, &self.config.read().relay.abuse);
+        if slot.is_none() {
+            self.metrics.refused(Setting::MaxConnectionsPerAddress);
+        }
+        slot
     }
 
     /// Apply a NIP-86 management mutation on the writer thread and wait for
@@ -2805,12 +2820,14 @@ fn ingest_event(
 }
 
 /// The refusal for an EVENT that its claimed kind alone decides, counted
-/// where it is decided. These gates run before the event is parsed and its
-/// signature verified: a kind refusal says nothing about who may publish,
-/// and on a relay that accepts few kinds most junk is refused without a
-/// verification. The author ban and the write policy wait for the
-/// signature, so an unsigned event cannot ask whether a key is a member or
-/// banned.
+/// where it is decided: an AUTH event, a kind `accepted_kinds` or the NIP-86
+/// kind policy does not allow, or one nobody could read while AUTH is
+/// unusable ([`Config::unreadable_class`]). These gates run before the event
+/// is parsed and its signature verified: a kind refusal says nothing about
+/// who may publish, and on a relay that accepts few kinds most junk is
+/// refused without a verification. The author ban and the write policy wait
+/// for the signature, so an unsigned event cannot ask whether a key is a
+/// member or banned.
 fn kind_refusal(
     cfg: &Config,
     metrics: &Metrics,
@@ -2829,7 +2846,15 @@ fn kind_refusal(
     } else if !moderation.read().kind_allowed(kind) {
         None
     } else {
-        return None;
+        // A kind nobody could read is not stored, and is counted by its
+        // read class.
+        let class = cfg.unreadable_class(kind)?;
+        if let Some(setting) = Setting::of_read_class(class) {
+            metrics.refused(setting);
+        }
+        return Some(format!(
+            "restricted: kind {kind} is read only after AUTH, which this relay does not offer"
+        ));
     };
     metrics
         .moderation_kind_rejections
@@ -4962,6 +4987,7 @@ mod tests {
             env.ensure_initialized().unwrap();
             let mut config = Config::default();
             config.db = dir.path().to_path_buf();
+            config.relay.auth.service_url = "wss://relay.example.com".into();
             config.relay.auth.write_policy = crate::config::AccessPolicy::Members;
             config.relay.auth.inbox_kinds = inbox_kinds.clone();
             let config = Arc::new(parking_lot::RwLock::new(config));
@@ -5092,6 +5118,73 @@ mod tests {
                     "{response}"
                 );
                 assert_eq!(entries, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_writer_refuses_kinds_nobody_could_read() {
+        // Queued while AUTH was usable, and taken by a writer whose
+        // configuration a reload made it unusable in: the gift wrap is
+        // refused, and a vanish request still honored whatever its class.
+        for (kind, stored) in [(1059, false), (VANISH_KIND, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.auth.recipient_only_kinds.push(VANISH_KIND);
+            assert!(!config.auth_usable());
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let (id, author) = ([9u8; 32], [8u8; 32]);
+            let tags = PackedEventTagBuilder::default();
+            let packed = PackedEventBuilder::build(&id, &author, 1, kind, 0, &tags).unwrap();
+            let json = json!({
+                "id": to_hex(&id), "pubkey": to_hex(&author), "created_at": 1, "kind": kind,
+                "tags": [["relay", "ALL_RELAYS"]], "content": "", "sig": "00".repeat(64),
+            })
+            .to_string();
+            let (writer_tx, writer_rx) = bounded(4);
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: None,
+                    grant: Default::default(),
+                })
+                .unwrap();
+            drop(writer_tx);
+            let metrics = Arc::new(Metrics::default());
+            run_writer(
+                env.clone(),
+                Arc::new(parking_lot::RwLock::new(config)),
+                conns,
+                metrics.clone(),
+                writer_rx,
+                Vec::new(),
+                Arc::new(parking_lot::RwLock::new(Default::default())),
+                TAG_KIND_STEP,
+            );
+            let response = out_rx.try_recv().unwrap().into_text();
+            let entries = env.begin_ro().unwrap().entries(env.dbis().event).unwrap();
+            let refusals: u64 = metrics.refusals.counts().map(|(_, count)| count).sum();
+            if stored {
+                assert!(response.contains("true"), "kind {kind}: {response}");
+                assert_eq!((entries, refusals), (1, 0));
+            } else {
+                assert!(
+                    response.contains(
+                        "restricted: kind 1059 is read only after AUTH, which this relay does \
+                         not offer"
+                    ),
+                    "{response}"
+                );
+                assert_eq!(entries, 0);
+                assert_eq!(metrics.refusals.get(Setting::RecipientOnlyKinds), 1);
             }
         }
     }
@@ -6418,6 +6511,42 @@ mod tests {
             .await;
         let reply = recv_outbound(&mut rx).await;
         assert!(reply.contains("invalid: bad signature"), "{reply}");
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kind_nobody_could_read_is_refused_while_auth_is_unusable() {
+        let (_dir, handle, conn, mut rx) =
+            relay_with_connection(|cfg| cfg.relay.auth.authenticated_kinds = vec![30000]).await;
+        let wrap = |kind: u64| {
+            sign_event(json!({
+                "created_at": now_secs(),
+                "kind": kind,
+                "tags": [["p", "33".repeat(32)], ["d", "x"]],
+                "content": "",
+            }))
+        };
+        // Refused by its kind, before verification.
+        for kind in [4, 1059, 21059, 30000] {
+            let mut event = wrap(kind);
+            event["sig"] = json!("00".repeat(64));
+            conn.client_message(json!(["EVENT", event]).to_string())
+                .await;
+            let reply = recv_outbound(&mut rx).await;
+            assert!(
+                reply.contains(&format!(
+                    "restricted: kind {kind} is read only after AUTH, which this relay does \
+                     not offer"
+                )),
+                "{reply}"
+            );
+        }
+        // Once AUTH is usable, recipients can read them, so they are stored.
+        handle.config.write().relay.auth.service_url = "wss://auth.example".into();
+        conn.client_message(json!(["EVENT", wrap(1059)]).to_string())
+            .await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(reply.contains(r#"true,"""#), "{reply}");
         handle.request_shutdown();
     }
 

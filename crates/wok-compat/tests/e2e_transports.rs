@@ -198,7 +198,10 @@ async fn ws_accepts_events_beyond_the_legacy_nip44_ceiling() {
     let dir = tempfile::tempdir().unwrap();
     let env = test_env(dir.path());
     env.ensure_initialized().unwrap();
-    let cfg = test_cfg(dir.path());
+    let mut cfg = test_cfg(dir.path());
+    // A gift wrap is stored only while its recipient could read it.
+    cfg.relay.auth.enabled = true;
+    cfg.relay.auth.service_url = "wss://relay.example.com".into();
     let handle = wok_relay::start(env, cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

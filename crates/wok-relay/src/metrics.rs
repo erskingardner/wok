@@ -36,6 +36,9 @@ macro_rules! settings {
 settings! {
     // Connections.
     ConnectionBurst => "relay.abuse.connection_burst",
+    /// WebSocket upgrades from an address that holds the most connections
+    /// it may keep open.
+    MaxConnectionsPerAddress => "relay.abuse.max_connections_per_address",
     // Events.
     /// Per-address EVENT and AUTH budget.
     EventBurst => "relay.abuse.event_burst",

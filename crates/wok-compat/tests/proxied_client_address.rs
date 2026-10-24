@@ -3,7 +3,8 @@
 //! sent: only the address the proxy in front of Wok added, the last one, is
 //! the client's. A client that sends the header itself must still be refused
 //! when its own address is blocked with NIP-86 `blockip`. A last entry that is
-//! not an address leaves the connecting address, and is counted.
+//! not an address leaves the connecting address, and is counted. The cap on
+//! the connections an address holds open counts the client's address too.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -44,6 +45,11 @@ async fn start() -> (tempfile::TempDir, RelayHandle, SocketAddr) {
 /// The status of a WebSocket upgrade that arrives from the proxy with one
 /// X-Forwarded-For line per entry of `forwarded`.
 async fn upgrade_status(addr: SocketAddr, forwarded: &[&str]) -> u16 {
+    upgrade(addr, forwarded).await.0
+}
+
+/// [`upgrade_status`], with the connection, still open.
+async fn upgrade(addr: SocketAddr, forwarded: &[&str]) -> (u16, tokio::net::TcpStream) {
     let lines: String = forwarded
         .iter()
         .map(|value| format!("X-Forwarded-For: {value}\r\n"))
@@ -65,10 +71,12 @@ async fn upgrade_status(addr: SocketAddr, forwarded: &[&str]) -> u16 {
         head.extend_from_slice(&buf[..read]);
     }
     let head = String::from_utf8_lossy(&head);
-    head.split(' ')
+    let status = head
+        .split(' ')
         .nth(1)
         .and_then(|code| code.parse().ok())
-        .unwrap_or_else(|| panic!("no status in {head:?}"))
+        .unwrap_or_else(|| panic!("no status in {head:?}"));
+    (status, stream)
 }
 
 /// A proxy that replaces the header, such as nginx with
@@ -120,4 +128,40 @@ async fn an_unparsed_last_entry_leaves_the_connecting_address_and_is_counted() {
         metrics.contains("\nwok_real_ip_header_unparsed_total 1\n"),
         "{metrics}"
     );
+}
+
+/// Connections from behind the proxy count against the client's address,
+/// not the proxy's, and one that ends gives its place back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_connections_are_capped_per_client_address() {
+    let (_dir, handle, addr) = start().await;
+    handle
+        .config
+        .write()
+        .relay
+        .abuse
+        .max_connections_per_address = 2;
+    let (first, held) = upgrade(addr, &[CLAIMED]).await;
+    let (second, _also_held) = upgrade(addr, &[CLAIMED]).await;
+    assert_eq!((first, second), (101, 101));
+    assert_eq!(upgrade_status(addr, &[CLAIMED]).await, 429);
+    let metrics = handle.metrics.render();
+    let refused = "\nwok_refusals_total{setting=\"relay.abuse.max_connections_per_address\"} 1\n";
+    assert!(metrics.contains(refused), "{metrics}");
+    // Another client of the same proxy has a cap of its own.
+    let (other, _other_held) = upgrade(addr, &["198.51.100.10"]).await;
+    assert_eq!(other, 101);
+    drop(held);
+    let reopened = async {
+        loop {
+            let (status, stream) = upgrade(addr, &[CLAIMED]).await;
+            if status == 101 {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let _reopened = tokio::time::timeout(Duration::from_secs(5), reopened)
+        .await
+        .expect("a closed connection gives its place back");
 }

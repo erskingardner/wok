@@ -42,6 +42,7 @@ pub async fn record_at(name: &str, relay: &Relay, cfg: &Config, base: u64) -> St
     out.frames(&frames);
 
     let note = event(&author, base + 1, 1, json!([]), "hello");
+    let author_hex = hex::encode(author.x_only_public_key().0.serialize());
     let steps: Vec<(&str, Value)> = vec![
         ("EVENT a note", json!(["EVENT", note])),
         ("EVENT the same note again", json!(["EVENT", note])),
@@ -70,6 +71,13 @@ pub async fn record_at(name: &str, relay: &Relay, cfg: &Config, base: u64) -> St
             json!([
                 "EVENT",
                 event(&author, base + 5, 30078, json!([["d", "app"]]), "{}")
+            ]),
+        ),
+        (
+            "EVENT a gift wrap to the author",
+            json!([
+                "EVENT",
+                event(&stranger, base + 7, 1059, json!([["p", author_hex]]), "")
             ]),
         ),
         (
@@ -103,7 +111,6 @@ pub async fn record_at(name: &str, relay: &Relay, cfg: &Config, base: u64) -> St
         out.frames(&[ok]);
     }
 
-    let author_hex = hex::encode(author.x_only_public_key().0.serialize());
     let subs: Vec<(&str, &str, Value)> = vec![
         (
             "REQ the author's notes",
@@ -254,6 +261,18 @@ async fn http_steps(
         ),
         ("OPTIONS /", "OPTIONS".into(), String::new(), ""),
         ("GET /metrics", "GET /metrics".into(), String::new(), ""),
+        (
+            "GET /.well-known/nodeinfo",
+            "GET /.well-known/nodeinfo".into(),
+            String::new(),
+            "",
+        ),
+        (
+            "GET /nodeinfo/2.1",
+            "GET /nodeinfo/2.1".into(),
+            String::new(),
+            "",
+        ),
         ("GET /admin", "GET /admin".into(), String::new(), ""),
         (
             "GET /admin/api/overview unsigned",

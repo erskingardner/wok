@@ -81,6 +81,7 @@ something. A token bucket's refusals carry its `_burst` key; raising its
 | `setting` | Counts |
 |---|---|
 | `relay.abuse.connection_burst` | Connections and HTTP requests over an address's connection budget. |
+| `relay.abuse.max_connections_per_address` | WebSocket upgrades from an address that already holds that many connections open. |
 | `relay.abuse.event_burst` | EVENTs and AUTHs over an address's budget. |
 | `relay.abuse.pubkey_event_burst` | EVENTs over their author's budget, or over the AUTHed identity's for events from other keys. |
 | `events.max_event_size`, `events.max_num_tags`, `events.max_tag_val_size` | Events, and AUTH events, over the size, tag count or tag value limit. |

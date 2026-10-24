@@ -112,7 +112,9 @@ it is not a promise to reproduce upstream bugs.
 - WebSocket connections have lifecycle timeouts strfry lacks: a pre-upgrade
   HTTP header read deadline (`relay.handshake_timeout_secs`), an idle-gap
   deadline while a partial frame or unfinished fragmented message is
-  buffered (`relay.frame_read_timeout_secs`), and ping/pong liveness (a ping
+  buffered (`relay.frame_read_timeout_secs`), a deadline for the whole of
+  each message or control frame from its first byte
+  (`relay.message_read_timeout_secs`), and ping/pong liveness (a ping
   unanswered for a full `relay.auto_ping_seconds` interval closes the
   connection).
 - Mesh client connections do not currently offer permessage-deflate. Wok's
@@ -352,7 +354,9 @@ regression test. Differential parity alone is not a reason to retain it.
   REQ that mixed in an unrestricted kind returned the restricted kinds without
   AUTH. Wok has no such mode: a file or strfry config that sets it gets its
   kinds as `authenticated_kinds`, readable after AUTH as any key and never
-  without.
+  without. While AUTH is unusable, events of recipient-only and
+  authenticated kinds are refused with `restricted:`, since nobody could
+  read them; strfry stores them.
 - `relay.auth.write_policy` and `read_policy` (`open`, `authenticated` or
   `members`) replace `restrict_writes`, which the pinned strfry does not
   have. Under `write_policy = "members"` an event is accepted when its author,
@@ -390,9 +394,11 @@ regression test. Differential parity alone is not a reason to retain it.
   events that `wok sync` uploads to it, because uploads are EVENTs.
 - NIP-01 single endpoint: only `/` accepts WebSocket upgrades and serves
   NIP-11, NIP-86 and the landing page. Other paths return 404, apart from
-  `/admin`, the nodeinfo routes and, when metrics are on, `/metrics`. The pinned strfry upgrades
-  and serves NIP-11 on every path, so one relay answers under many URLs. A
-  reverse proxy that serves the relay under a path prefix must strip it.
+  `/admin` and, when they are on, the NodeInfo routes and `/metrics`. NodeInfo
+  is off unless `relay.nodeinfo_enabled` is set; the pinned strfry always
+  serves it. The pinned strfry upgrades and serves NIP-11 on every path, so
+  one relay answers under many URLs. A reverse proxy that serves the relay
+  under a path prefix must strip it.
 - NIP-11 CORS: relay responses send `Access-Control-Allow-Origin`,
   `-Allow-Headers` and `-Allow-Methods`, and `OPTIONS /` is a 204 preflight
   reply. NIP-11 is chosen when `Accept` lists `application/nostr+json` among

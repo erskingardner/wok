@@ -92,6 +92,7 @@ admin.public_url = "https://relay.example.com"
 admin.pubkeys = ["f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"]"#,
     ),
     ("metrics", "observability.metrics_enabled = true"),
+    ("NodeInfo", "relay.nodeinfo_enabled = true"),
     (
         "metrics listener",
         r#"observability.metrics_listen = "127.0.0.1:9777""#,
@@ -122,6 +123,7 @@ const OPENS: &[(&str, &str, &[&str], &str)] = &[
             "EVENT a note",
             "EVENT the same note again",
             "EVENT a note from another key",
+            "EVENT a gift wrap to the author",
         ],
         "relay.abuse.enabled = false turns proof of work off with the other abuse \
          limits, as docs/config.md says, and NIP-11 then advertises 0",
@@ -129,8 +131,13 @@ const OPENS: &[(&str, &str, &[&str], &str)] = &[
     (
         "no recipient-only kinds",
         "AUTH off",
-        &["REQ only gift wraps", "REQ only gift wraps, after AUTH"],
-        "without AUTH, gift wraps are refused only because they are recipient-only",
+        &[
+            "EVENT a gift wrap to the author",
+            "REQ only gift wraps",
+            "REQ only gift wraps, after AUTH",
+        ],
+        "without AUTH, gift wraps are refused, to write and to read, only because they \
+         are recipient-only",
     ),
     (
         "no owner-only kinds",

@@ -26,6 +26,38 @@ for size in [0, 1, 125, 126, 65535, 65536, 1048576, 2097100]:
     seeds.append(prefix + b"\0" * 4 + payload)
     compressor = zlib.compressobj(wbits=-15)
     seeds.append(compressor.compress(payload) + compressor.flush(zlib.Z_SYNC_FLUSH))
+
+# Context takeover: messages compressed in one stream, each able to refer back
+# into the ones before. As client WebSocket frames (FIN, RSV1, text, masked
+# with a zero key), and as the target's takeover records: a control byte (low
+# bit set releases the decompressor first), a two-byte little-endian length
+# and the payload.
+def takeover_messages(texts):
+    compressor = zlib.compressobj(wbits=-15)
+    messages = []
+    for text in texts:
+        payload = compressor.compress(text) + compressor.flush(zlib.Z_SYNC_FLUSH)
+        messages.append(payload[:-4])  # RFC 7692: without the flush's empty block
+    return messages
+
+req = json.dumps(["REQ", "s", {"ids": ["00" * 32], "#p": ["11" * 32]}],
+                 separators=(",", ":")).encode()
+small = takeover_messages([req + str(n).encode() for n in range(4)])
+assert all(len(payload) < 126 for payload in small)
+seeds.append(b"".join(b"\xc1" + bytes([0x80 | len(payload)]) + b"\0" * 4 + payload
+                      for payload in small))
+noise = b"".join(hashlib.sha256(struct.pack("<H", i)).hexdigest().encode() for i in range(1300))
+# A first message past the 32 KiB window, then, after a release, one that
+# refers back near the start of the window it kept.
+large = takeover_messages([noise, noise[-30000:-29000] + req])
+# Five messages under the window that together pass it, so the history ring
+# has wrapped when a release replays it, then one that refers back across it.
+parts = [noise[i * 9000:(i + 1) * 9000] for i in range(5)]
+ring = takeover_messages(parts + [parts[2][1000:2000] + req])
+for messages, controls in [(small, [0, 1, 0, 1]), (large, [0, 1]), (ring, [0] * 5 + [1])]:
+    seeds.append(b"".join(bytes([control]) + struct.pack("<H", len(payload)) + payload
+                          for control, payload in zip(controls, messages, strict=True)))
+
 for seed in seeds:
     path = root / hashlib.sha256(seed).hexdigest()
     if not path.exists():

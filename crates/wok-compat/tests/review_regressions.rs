@@ -110,15 +110,20 @@ async fn reconcile(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_default_negentropy_tree_respects_read_privacy() {
-    let relay = Relay::new(|_| {});
+    // A kind 4 is stored only while its recipient could log in to read it.
+    let relay = Relay::new(|cfg| cfg.relay.auth.service_url = "wss://review.test".into());
     let (conn, mut rx) = relay.connection().await;
+    assert_eq!(recv(&mut rx).await[0], "AUTH");
     let event = wok_compat::sign_event(json!({"created_at":now(), "kind":4,
         "tags":[["p", hex::encode([9u8;32])]], "content":"private ciphertext"}));
     publish(&conn, &mut rx, &event).await;
     conn.client_message(json!(["REQ", "ordinary", {}]).to_string())
         .await;
-    // The kind 4 is hidden, but this relay offers no AUTH to reveal it.
-    assert_eq!(recv(&mut rx).await, json!(["EOSE", "ordinary", ["finish"]]));
+    // The kind 4 is hidden until the connection authenticates as its reader.
+    assert_eq!(
+        recv(&mut rx).await,
+        json!(["EOSE", "ordinary", ["auth", "finish"]])
+    );
     // A semantically equivalent filter with a time bound uses the same tree.
     let ids = reconcile(&conn, &mut rx, json!({})).await;
     conn.close().await;

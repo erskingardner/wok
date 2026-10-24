@@ -1,6 +1,7 @@
 //! Native TOML configuration plus the legacy strfry HOCON migration parser.
 
 use crate::metrics::Setting;
+use crate::restrict::ReadClass;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -218,6 +219,9 @@ pub struct RelayConfig {
     pub real_ip_header: String,
     pub auth: AuthConfig,
     pub info: InfoConfig,
+    /// Serve NodeInfo discovery (`/.well-known/nodeinfo`) and its document
+    /// (`/nodeinfo/2.1`). No Nostr client needs them.
+    pub nodeinfo_enabled: bool,
     pub max_websocket_payload_size: usize,
     /// Maximum combined compact-JSON bytes across all filter objects in one
     /// REQ or COUNT command.
@@ -237,6 +241,10 @@ pub struct RelayConfig {
     /// or unfinished fragmented message is buffered (slow-trickle guard);
     /// zero disables it.
     pub frame_read_timeout_secs: u64,
+    /// Longest time from the first byte of a WebSocket message or control
+    /// frame to its last, not counting pauses while the relay does not read
+    /// (slow-trickle guard); zero disables it.
+    pub message_read_timeout_secs: u64,
     pub query_timeslice_budget_us: u64,
     pub max_filter_limit: u64,
     pub max_tags_per_filter: usize,
@@ -283,6 +291,9 @@ pub struct AbuseConfig {
     pub ipv6_prefix_len: u8,
     pub connection_rate_per_second: u32,
     pub connection_burst: u32,
+    /// WebSocket connections one address may hold open at once; zero is
+    /// unlimited.
+    pub max_connections_per_address: u32,
     pub event_rate_per_second: u32,
     pub event_burst: u32,
     pub pubkey_event_rate_per_second: u32,
@@ -492,6 +503,7 @@ impl Default for Config {
                     privacy: String::new(),
                     terms: String::new(),
                 },
+                nodeinfo_enabled: false,
                 max_websocket_payload_size: 2 * wok_event::DEFAULT_MAX_EVENT_SIZE,
                 max_req_filter_size: 262_144,
                 max_filter_bytes_per_connection: 2_097_152,
@@ -500,6 +512,7 @@ impl Default for Config {
                 enable_tcp_keepalive: false,
                 handshake_timeout_secs: 10,
                 frame_read_timeout_secs: 30,
+                message_read_timeout_secs: 120,
                 query_timeslice_budget_us: 10000,
                 max_filter_limit: 2_000,
                 max_tags_per_filter: 8,
@@ -543,6 +556,7 @@ impl Default for Config {
                     ipv6_prefix_len: 64,
                     connection_rate_per_second: 10,
                     connection_burst: 50,
+                    max_connections_per_address: 256,
                     event_rate_per_second: 50,
                     event_burst: 100,
                     pubkey_event_rate_per_second: 25,
@@ -840,20 +854,55 @@ impl Config {
         self.relay.auth.enabled && !self.relay.auth.service_url.is_empty()
     }
 
+    /// The read class that keeps every reader from events of `kind` while
+    /// AUTH is unusable, if any: the relay refuses to store what nobody
+    /// could read. Owner-only kinds are left to the author check, which
+    /// refuses them then too, and NIP-62 vanish requests are accepted
+    /// whatever their class.
+    pub fn unreadable_class(&self, kind: u64) -> Option<ReadClass> {
+        let auth = &self.relay.auth;
+        if self.auth_usable()
+            || kind == wok_db::VANISH_KIND
+            || auth.owner_only_kinds.contains(&kind)
+        {
+            None
+        } else if auth.recipient_only_kinds.contains(&kind) {
+            Some(ReadClass::Recipient)
+        } else if auth.authenticated_kinds.contains(&kind) {
+            Some(ReadClass::Authenticated)
+        } else {
+            None
+        }
+    }
+
     /// Why the relay refuses to serve this configuration, if it does: a
     /// requirement of its preset that the file does not meet. The relay
     /// checks it when it starts and on each reload, not when a file is
     /// parsed, so `wok config show` and a preset's own defaults still load.
     pub fn serving_error(&self) -> Option<String> {
-        match self.preset {
-            Preset::Marmot if !self.auth_usable() => Some(
+        if self.preset != Preset::Marmot {
+            return None;
+        }
+        if !self.auth_usable() {
+            return Some(
                 "the marmot preset needs NIP-42 AUTH, without which recipients cannot read \
                  their gift wraps: set relay.auth.service_url to the relay's public URL, and \
                  leave relay.auth.enabled on"
                     .into(),
-            ),
-            _ => None,
+            );
         }
+        let reads = self.read_restrictor();
+        let open: Vec<u64> = wok_event::GIFT_WRAP_KINDS
+            .into_iter()
+            .filter(|&kind| reads.class(kind) < ReadClass::Recipient)
+            .collect();
+        (!open.is_empty()).then(|| {
+            format!(
+                "the marmot preset serves gift wraps, Welcomes included, only to their \
+                 recipients, but kinds {open:?} are not in relay.auth.recipient_only_kinds: \
+                 list 1059 and 21059 there"
+            )
+        })
     }
 
     /// NIP-11 `limitation.auth_required`: every REQ, COUNT and NEG-OPEN
@@ -926,8 +975,10 @@ impl Config {
             "the relay listens only on loopback or private addresses ({}) and \
              relay.real_ip_header is unset. If a reverse proxy forwards connections, every \
              client has the proxy's address and they all share one set of per-address \
-             budgets (connections, EVENT and AUTH, REQ, COUNT); set relay.real_ip_header to \
-             the header in which the proxy passes the client's address",
+             budgets (connections, EVENT and AUTH, REQ, COUNT) and one \
+             relay.abuse.max_connections_per_address cap on open connections; set \
+             relay.real_ip_header to the header in which the proxy passes the client's \
+             address",
             addrs.join(", ")
         ))
     }
@@ -1492,6 +1543,7 @@ impl Config {
                     a.max_stored_events_per_pubkey,
                     a.min_pow_difficulty,
                     a.per_connection.clone(),
+                    a.max_connections_per_address,
                 ),
             )
         };
@@ -1518,12 +1570,11 @@ impl Config {
             || prev.inbox_kinds != new_auth.inbox_kinds
             || prev.accepted_kinds != new_auth.accepted_kinds
         {
-            let mut widened: Vec<u64> = prev_reads
-                .restricted_kinds()
-                .filter(|&kind| new_reads.class(kind) < prev_reads.class(kind))
+            let widened: Vec<u64> = self
+                .widened_reads(new)
+                .into_iter()
+                .map(|(kind, ..)| kind)
                 .collect();
-            widened.sort_unstable();
-            widened.dedup();
             let mut note = String::new();
             if !widened.is_empty() {
                 note.push_str(&format!(
@@ -1560,7 +1611,90 @@ impl Config {
                 self.relay.negentropy_enabled, new.relay.negentropy_enabled,
             ));
         }
+        if self.relay.nodeinfo_enabled != new.relay.nodeinfo_enabled {
+            changes.push(format!(
+                "relay.nodeinfo_enabled changed: {} -> {}",
+                self.relay.nodeinfo_enabled, new.relay.nodeinfo_enabled,
+            ));
+        }
         changes
+    }
+
+    /// The kinds `new` lets more readers read than this configuration does,
+    /// sorted, each with its read class here and in `new`.
+    fn widened_reads(&self, new: &Config) -> Vec<(u64, ReadClass, ReadClass)> {
+        let (old, new) = (self.read_restrictor(), new.read_restrictor());
+        let mut kinds: Vec<u64> = old.restricted_kinds().collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        kinds
+            .into_iter()
+            .map(|kind| (kind, old.class(kind), new.class(kind)))
+            .filter(|(_, old, new)| new < old)
+            .collect()
+    }
+
+    /// Name each kind the file lets more readers read than its preset does,
+    /// such as gift wraps after `recipient_only_kinds = []`. A reload names
+    /// what it widens from the running configuration
+    /// ([`security_scope_changes`](Self::security_scope_changes)); the relay
+    /// logs this at startup and `wok doctor` reports it, so a relay started
+    /// with such a file says so too.
+    pub fn read_class_warning(&self) -> Option<String> {
+        let widened = self.preset_defaults().widened_reads(self);
+        if widened.is_empty() {
+            return None;
+        }
+        let kinds: Vec<String> = widened
+            .iter()
+            .map(|&(kind, preset, now)| {
+                format!("{kind} ({} -> {})", class_name(preset), class_name(now))
+            })
+            .collect();
+        Some(format!(
+            "relay.auth lets more readers read kinds than preset {} does: {}. Readers the \
+             preset refuses can read them; list each kind in its class again unless the relay \
+             is meant to serve them more widely",
+            self.preset,
+            kinds.join(", "),
+        ))
+    }
+
+    /// Warn when, under `write_policy = "members"`, an inbox kind is
+    /// readable by more readers than its recipient: outsiders could publish
+    /// it, addressed to a member, for everyone to read.
+    pub fn inbox_kinds_warning(&self) -> Option<String> {
+        let auth = &self.relay.auth;
+        if auth.write_policy != AccessPolicy::Members {
+            return None;
+        }
+        let reads = self.read_restrictor();
+        let mut weak: Vec<u64> = auth
+            .inbox_kinds
+            .iter()
+            .copied()
+            .filter(|&kind| reads.class(kind) < ReadClass::Recipient)
+            .collect();
+        weak.sort_unstable();
+        weak.dedup();
+        if weak.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "relay.auth.inbox_kinds lists kinds {weak:?}, which are not recipient-only: under \
+             write_policy = \"members\" anyone may publish them with a member as the first p \
+             tag, so outsiders can publish events that readers other than that member can read. \
+             List them in relay.auth.recipient_only_kinds, or take them out of inbox_kinds"
+        ))
+    }
+
+    /// The [`inbox_kinds_warning`](Self::inbox_kinds_warning) a reload from
+    /// `previous` newly causes, such as by turning on `write_policy =
+    /// "members"`. Widened read classes are named by
+    /// [`security_scope_changes`](Self::security_scope_changes) instead.
+    fn inbox_kinds_reload_warning(&self, previous: &Config) -> Option<String> {
+        let now = self.inbox_kinds_warning()?;
+        (previous.inbox_kinds_warning().as_ref() != Some(&now)).then_some(now)
     }
 
     /// The configuration this config's preset gives: the built-in defaults
@@ -1678,6 +1812,15 @@ impl Config {
                     ));
                 }
             }
+            if zeroed(
+                a.max_connections_per_address.into(),
+                p.max_connections_per_address.into(),
+            ) {
+                warnings.push(ZeroGuard::new(
+                    &["relay.abuse.max_connections_per_address"],
+                    "relay.abuse.max_connections_per_address is zero — unlimited",
+                ));
+            }
             if zeroed(a.max_query_work, p.max_query_work) {
                 warnings.push(ZeroGuard::new(
                     &["relay.abuse.max_query_work"],
@@ -1738,6 +1881,12 @@ impl Config {
                 "relay.frame_read_timeout_secs is zero — partial-frame trickle guard disabled",
             ));
         }
+        if zeroed(r.message_read_timeout_secs, pr.message_read_timeout_secs) {
+            warnings.push(ZeroGuard::new(
+                &["relay.message_read_timeout_secs"],
+                "relay.message_read_timeout_secs is zero — whole-message trickle guard disabled",
+            ));
+        }
         warnings
     }
 
@@ -1773,6 +1922,9 @@ impl Config {
         for warning in new.zero_guard_warnings() {
             tracing::warn!("config reload: {warning}");
         }
+        if let Some(warning) = new.inbox_kinds_reload_warning(self) {
+            tracing::warn!("config reload: {warning}");
+        }
         for deprecation in &new.deprecations {
             tracing::warn!("config reload: {deprecation}");
         }
@@ -1801,6 +1953,16 @@ impl Config {
         self.observability.log_filter = old.observability.log_filter;
         self.observability.metrics_listen = old.observability.metrics_listen;
         Ok(())
+    }
+}
+
+/// Who may read a kind of `class`, as a warning names it.
+fn class_name(class: ReadClass) -> &'static str {
+    match class {
+        ReadClass::Open => "anyone",
+        ReadClass::Authenticated => "authenticated",
+        ReadClass::Recipient => "recipient-only",
+        ReadClass::Owner => "owner-only",
     }
 }
 
@@ -2789,6 +2951,19 @@ negentropy_enabled = true
     }
 
     #[test]
+    fn nodeinfo_is_off_by_default_and_reloads_live() {
+        let mut running = Config::default();
+        assert!(!running.relay.nodeinfo_enabled);
+        let on = Config::parse_toml("[relay]\nnodeinfo_enabled = true\n").unwrap();
+        assert_eq!(
+            running.security_scope_changes(&on),
+            ["relay.nodeinfo_enabled changed: false -> true"]
+        );
+        running.apply_reload(on).unwrap();
+        assert!(running.relay.nodeinfo_enabled);
+    }
+
+    #[test]
     fn per_connection_budgets_have_their_own_table() {
         let cfg = Config::parse_toml(
             "[relay.abuse]\nreq_burst = 300\n\n\
@@ -3050,6 +3225,7 @@ negentropy_enabled = true
             "count_burst",
             "invalid_rate_per_second",
             "invalid_burst",
+            "max_connections_per_address",
             "max_query_work",
             "max_stored_events_per_pubkey",
         ] {
@@ -3085,6 +3261,7 @@ negentropy_enabled = true
             "max_pending_outbound_bytes",
             "handshake_timeout_secs",
             "frame_read_timeout_secs",
+            "message_read_timeout_secs",
         ] {
             let cfg = Config::parse_toml(&format!("[relay]\n{field} = 0\n")).unwrap();
             assert!(
@@ -3517,6 +3694,163 @@ negentropy_enabled = true
         let error = running.apply_reload(marmot).unwrap_err();
         assert!(error.contains("relay.auth.service_url"), "{error}");
         assert_eq!(running.relay.auth.service_url, "wss://relay.example.com");
+    }
+
+    #[test]
+    fn the_marmot_preset_serves_gift_wraps_only_to_their_recipients() {
+        let marmot = |auth: &str| {
+            Config::parse_toml(&format!(
+                "preset = \"marmot\"\n[relay.auth]\nservice_url = \"wss://relay.example.com\"\n\
+                 {auth}\n"
+            ))
+            .unwrap()
+        };
+        let open = marmot("recipient_only_kinds = []");
+        let error = open.serving_error().unwrap();
+        assert!(error.contains("kinds [1059, 21059]"), "{error}");
+        // Each kind on its own, and a class with more readers.
+        let error = marmot("recipient_only_kinds = [4, 1059]")
+            .serving_error()
+            .unwrap();
+        assert!(error.contains("kinds [21059]"), "{error}");
+        let authenticated =
+            marmot("recipient_only_kinds = []\nauthenticated_kinds = [1059, 21059]");
+        assert!(authenticated.serving_error().is_some());
+        // A stricter class still serves.
+        let owner =
+            marmot("recipient_only_kinds = []\nowner_only_kinds = [78, 30078, 1059, 21059]");
+        assert_eq!(owner.serving_error(), None);
+        assert_eq!(
+            marmot("recipient_only_kinds = [1059, 21059]").serving_error(),
+            None
+        );
+        // The public preset only warns.
+        let public = Config::parse_toml("[relay.auth]\nrecipient_only_kinds = []\n").unwrap();
+        assert_eq!(public.serving_error(), None);
+        assert!(public.read_class_warning().is_some());
+        // No reload installs it.
+        let mut running = marmot("");
+        let error = running.apply_reload(open).unwrap_err();
+        assert!(error.contains("recipient_only_kinds"), "{error}");
+        assert_eq!(running.relay.auth.recipient_only_kinds, [4, 1059, 21059]);
+    }
+
+    #[test]
+    fn a_file_that_widens_a_read_class_is_warned_about() {
+        let warning = |text: &str| Config::parse_toml(text).unwrap().read_class_warning();
+        assert_eq!(Config::default().read_class_warning(), None);
+        assert_eq!(warning(""), None);
+        assert_eq!(
+            warning("[relay.auth]\nrecipient_only_kinds = []\n").unwrap(),
+            "relay.auth lets more readers read kinds than preset public does: \
+             4 (recipient-only -> anyone), 1059 (recipient-only -> anyone), \
+             21059 (recipient-only -> anyone). Readers the preset refuses can read them; \
+             list each kind in its class again unless the relay is meant to serve them more \
+             widely"
+        );
+        // Moving a kind to a class with more readers widens it too.
+        let moved = warning(
+            "[relay.auth]\nrecipient_only_kinds = [4, 21059]\nauthenticated_kinds = [1059]\n\
+             owner_only_kinds = [78]\n",
+        )
+        .unwrap();
+        assert!(
+            moved.contains(
+                "kinds than preset public does: 1059 (recipient-only -> \
+                            authenticated), 30078 (owner-only -> anyone)."
+            ),
+            "{moved}"
+        );
+        // Narrowing is not, nor is a kind listed in a stricter class too.
+        assert_eq!(
+            warning("[relay.auth]\nrecipient_only_kinds = [1, 4, 1059, 21059, 30078]\n"),
+            None
+        );
+        assert_eq!(
+            warning("[relay.auth]\nrecipient_only_kinds = []\nowner_only_kinds = [4, 78, 1059, 21059, 30078]\n"),
+            None
+        );
+        // Compared with the file's own preset.
+        let marmot = warning(
+            "preset = \"marmot\"\n[relay.auth]\nservice_url = \"wss://relay.example.com\"\n\
+             owner_only_kinds = []\n",
+        )
+        .unwrap();
+        assert!(
+            marmot.starts_with("relay.auth lets more readers read kinds than preset marmot does: 78 (owner-only -> anyone), 30078"),
+            "{marmot}"
+        );
+    }
+
+    #[test]
+    fn an_inbox_kind_others_may_read_is_warned_about() {
+        let config = |auth: &str| {
+            Config::parse_toml(&format!(
+                "[relay.auth]\nservice_url = \"wss://relay.example.com\"\n{auth}\n"
+            ))
+            .unwrap()
+        };
+        // Only write_policy = "members" admits writes for an inbox kind.
+        assert_eq!(config("inbox_kinds = [1]").inbox_kinds_warning(), None);
+        let members = config("write_policy = \"members\"");
+        assert_eq!(members.inbox_kinds_warning(), None);
+        let notes = config("write_policy = \"members\"\ninbox_kinds = [1, 1059]");
+        assert!(
+            notes.inbox_kinds_warning().unwrap().starts_with(
+                "relay.auth.inbox_kinds lists kinds [1], which are not recipient-only"
+            ),
+            "{:?}",
+            notes.inbox_kinds_warning()
+        );
+        let emptied = config("write_policy = \"members\"\nrecipient_only_kinds = [4]");
+        assert!(emptied
+            .inbox_kinds_warning()
+            .unwrap()
+            .contains("kinds [1059, 21059]"));
+        // Readable by any logged-in user is still weaker than recipient-only,
+        // and owner-only is stricter.
+        let authenticated = config(
+            "write_policy = \"members\"\ninbox_kinds = [30000]\nauthenticated_kinds = [30000]",
+        );
+        assert!(authenticated.inbox_kinds_warning().is_some());
+        let owner = config("write_policy = \"members\"\ninbox_kinds = [30078]");
+        assert_eq!(owner.inbox_kinds_warning(), None);
+        // A reload names it when it makes it a warning.
+        let open = config("inbox_kinds = [1, 1059]");
+        assert_eq!(
+            notes.inbox_kinds_reload_warning(&open),
+            notes.inbox_kinds_warning()
+        );
+        assert_eq!(notes.inbox_kinds_reload_warning(&notes), None);
+        assert_eq!(open.inbox_kinds_reload_warning(&notes), None);
+        assert!(emptied.inbox_kinds_reload_warning(&notes).is_some());
+    }
+
+    #[test]
+    fn kinds_nobody_could_read_are_refused_while_auth_is_unusable() {
+        let default = Config::default();
+        assert!(!default.auth_usable());
+        for kind in [4, 1059, 21059] {
+            assert_eq!(default.unreadable_class(kind), Some(ReadClass::Recipient));
+        }
+        // Owner-only kinds are the author check's; open kinds are readable.
+        for kind in [1, 78, 30078] {
+            assert_eq!(default.unreadable_class(kind), None, "kind {kind}");
+        }
+        let mut cfg = default.clone();
+        cfg.relay.auth.authenticated_kinds = vec![30000];
+        cfg.relay
+            .auth
+            .recipient_only_kinds
+            .push(wok_db::VANISH_KIND);
+        assert_eq!(cfg.unreadable_class(30000), Some(ReadClass::Authenticated));
+        // NIP-62: a vanish request is honored whatever its class.
+        assert_eq!(cfg.unreadable_class(wok_db::VANISH_KIND), None);
+        cfg.relay.auth.service_url = "wss://relay.example.com".into();
+        assert_eq!(cfg.unreadable_class(1059), None);
+        assert_eq!(cfg.unreadable_class(30000), None);
+        cfg.relay.auth.enabled = false;
+        assert_eq!(cfg.unreadable_class(1059), Some(ReadClass::Recipient));
     }
 
     fn test_overlay(_: Preset) -> &'static str {

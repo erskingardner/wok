@@ -91,6 +91,7 @@ struct AbusePatch {
     ipv6_prefix_len: Option<u8>,
     connection_rate_per_second: Option<u32>,
     connection_burst: Option<u32>,
+    max_connections_per_address: Option<u32>,
     event_rate_per_second: Option<u32>,
     event_burst: Option<u32>,
     pubkey_event_rate_per_second: Option<u32>,
@@ -548,6 +549,7 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
             "ipv6_prefix_len": cfg.relay.abuse.ipv6_prefix_len,
             "connection_rate_per_second": cfg.relay.abuse.connection_rate_per_second,
             "connection_burst": cfg.relay.abuse.connection_burst,
+            "max_connections_per_address": cfg.relay.abuse.max_connections_per_address,
             "event_rate_per_second": cfg.relay.abuse.event_rate_per_second,
             "event_burst": cfg.relay.abuse.event_burst,
             "pubkey_event_rate_per_second": cfg.relay.abuse.pubkey_event_rate_per_second,
@@ -794,6 +796,9 @@ fn apply_patch(config: &mut Config, patch: ConfigPatch) {
         }
         if let Some(value) = abuse.connection_burst {
             config.relay.abuse.connection_burst = value;
+        }
+        if let Some(value) = abuse.max_connections_per_address {
+            config.relay.abuse.max_connections_per_address = value;
         }
         if let Some(value) = abuse.event_rate_per_second {
             config.relay.abuse.event_rate_per_second = value;

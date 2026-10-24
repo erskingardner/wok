@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A file that gives a kind more readers than its preset does is warned about
+  when the relay starts, and by `wok doctor` in a new `read-classes` check
+  (#163). `relay.auth.recipient_only_kinds = []`, `owner_only_kinds = []` or
+  a gift-wrap kind moved to `authenticated_kinds` were named only by a
+  reload's "read access WIDENED", so a relay started with such a file served
+  those kinds more widely without a word. The warning names each kind with
+  its class in the preset and in the file.
+  - **`preset = "marmot"`** refuses to start or reload unless kinds 1059 and
+    21059 are recipient-only (or owner-only), as it refuses without usable
+    AUTH. Before, `recipient_only_kinds = []` served Welcome gift wraps, `p`
+    tags included, to anyone.
+  - **Inbox kinds** that are not recipient-only are warned about under
+    `write_policy = "members"`, at startup, on the reload that makes one and
+    in a new `inbox-kinds` doctor check: outsiders may publish them,
+    addressed to a member, for others to read. docs/config.md now says that
+    an inbox event's `OK true` tells an outsider that its `p` key is a
+    member.
+  - **Events nobody could read** are refused while AUTH is unusable, as
+    owner-only kinds already were: an event of a recipient-only or
+    authenticated kind, such as a gift wrap on the `default` profile, gets
+    `restricted: kind 1059 is read only after AUTH, which this relay does not
+    offer`, by its kind before its signature is verified, and again by the
+    writer, so one queued before a reload made AUTH unusable is refused too.
+    Before, it was stored and every read of it refused. NIP-62 vanish
+    requests are still accepted whatever their class.
 - Limits on what an unauthenticated client can make the relay hold or do
   before its budgets apply:
   - **Compressed messages** may inflate to half of
@@ -29,6 +54,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **NEG-OPEN** meets `relay.max_req_filter_size`, and a connection's
     sessions share `relay.max_filter_bytes_per_connection`, as REQs and
     COUNTs each do. Its payload is decoded after its filter is checked.
+  - **A partial WebSocket message** must arrive whole within
+    `relay.message_read_timeout_secs` (new, 120 seconds) of its first byte.
+    `relay.frame_read_timeout_secs` bounds only the gap between reads, so a
+    client sending a little at a time could keep a message of up to
+    `relay.max_websocket_payload_size` buffered indefinitely. A pause while
+    the relay does not read, because the connection's hold is full, does not
+    count.
+  - **Connections per address**: an address may hold at most
+    `relay.abuse.max_connections_per_address` (new, 256) WebSocket
+    connections open at once, keyed like the other per-address budgets (its
+    IPv6 /64, the `real_ip_header` address). Every per-connection limit,
+    such as the inbound share and the outbound queue, otherwise multiplied
+    by however many connections one host kept open; the connection budget
+    limited only how fast it opened them. An upgrade past the cap gets 429
+    and is counted in `wok_refusals_total`.
 
 - Requests are refused by the cheapest check that can refuse them, before
   their filters are parsed or their signature is verified, where that
@@ -73,6 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started without one keeps metrics off until then. **Upgrading:** a relay scraped at `/metrics`
   must set `metrics_enabled = true`, preferably with `metrics_listen` on a
   private address, and point Prometheus there.
+- NodeInfo is off by default (#166). `/.well-known/nodeinfo` and
+  `/nodeinfo/2.1` were served in every configuration, though no Nostr client
+  or Marmot client uses them and NIP-11 already gives the software and its
+  version, and the discovery link repeats the request's `Host` header (#152).
+  `relay.nodeinfo_enabled` turns them on, and reloads live; while it is off
+  both paths answer 404, and turning it on or off is logged as a
+  security-scope change. **Upgrading:** a relay that should stay listed by
+  NodeInfo crawlers must set `relay.nodeinfo_enabled = true`.
 - With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`
   by sending its own X-Forwarded-For. A proxy that appends the client's
   address to that header (nginx's `$proxy_add_x_forwarded_for`) passed Wok a
@@ -394,6 +442,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tests fail when the listener answers a path the page does not list, in any
   of seven configuration profiles, or when a client verb, NIP-86 method level
   or command differs from it. `docs/nip86.md` now gives each method's level.
+- The ingress fuzz target covers the context-takeover inflater that browsers
+  negotiate (#166): compressed WebSocket messages that refer back into
+  earlier ones, and messages after the idle decompressor is released, which
+  replay up to 32 KiB of history into a new one. It covered only the
+  inflater without takeover before.
 
 ### Preset changes
 
@@ -409,6 +462,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since MDK never sends COUNT or offers compression (#166): a COUNT is
   refused with `blocked: bad req: COUNT disabled`, NIP-11 does not list
   NIP-45, and a client that offers deflate gets an uncompressed connection.
+- `public`: `relay.nodeinfo_enabled` is `false` (new), so NodeInfo is not
+  served (see Security).
 - `public`: `relay.auth.owner_only_kinds` is `[78, 30078]` (new), so NIP-78
   app data is read and published only by its author (see Security). Apps
   that publish public data in these kinds can no longer be read by other
@@ -453,6 +508,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `public`: `relay.abuse.max_query_work` is `20000`, NIP-11
   `max_query_work`, in the units described under Changed. It replaces
   `relay.abuse.max_query_cost = 1000`, which is ignored (see Removed).
+- `public`: `relay.message_read_timeout_secs` is `120`, a new setting: a
+  WebSocket message or control frame must arrive within 120 seconds of its
+  first byte (see Security). `0` turns the deadline off.
+- `public`: `relay.abuse.max_connections_per_address` is `256`, a new
+  setting: an address may hold at most 256 WebSocket connections open at
+  once (see Security). Behind a reverse proxy, set `relay.real_ip_header`,
+  or every client shares the proxy's 256. `0` removes the cap.
 - `public`: `relay.abuse.ipv6_prefix_len` is `64`, a new setting.
   Per-address budgets (connections, EVENT and AUTH, REQ, COUNT, malformed
   messages) key an IPv6 client by its /64 instead of its full address, so a
@@ -866,10 +928,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the disallowed kinds. Which kinds are accepted does not change.
 - The relay is served on a single endpoint, as NIP-01 requires. Only `/`
   accepts WebSocket upgrades and serves NIP-11, NIP-86 and the landing page;
-  other paths return 404, apart from `/admin`, `/metrics` and the nodeinfo
-  routes. Before, every path upgraded and served NIP-11, so one relay
-  answered under any number of URLs. A reverse proxy that serves the relay
-  under a path prefix must now strip the prefix.
+  other paths return 404, apart from `/admin` and, when they are on,
+  `/metrics` and the NodeInfo routes. Before, every path upgraded and served
+  NIP-11, so one relay answered under any number of URLs. A reverse proxy
+  that serves the relay under a path prefix must now strip the prefix.
 - Relay HTTP responses send `Access-Control-Allow-Headers` (`Content-Type,
   Authorization, Accept`) and `Access-Control-Allow-Methods` (`GET, POST,
   OPTIONS`) as well as `Access-Control-Allow-Origin`, as NIP-11 requires, and

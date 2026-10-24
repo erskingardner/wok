@@ -1,7 +1,7 @@
 # Relay functions reached in the `proxied` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 695
+## anonymous: 709
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -270,11 +270,15 @@
 <wok_relay::abuse::AbuseController>::admit_request::{closure}::{closure}
 <wok_relay::abuse::AbuseController>::admit_source
 <wok_relay::abuse::AbuseController>::admit_source_reporting
+<wok_relay::abuse::AbuseController>::hold_connection
 <wok_relay::abuse::Bucket>::admit
 <wok_relay::abuse::Bucket>::has_token
 <wok_relay::abuse::Bucket>::new
 <wok_relay::abuse::Bucket>::refill
 <wok_relay::abuse::Bucket>::take
+<wok_relay::abuse::ConnectionSlot as core::ops::drop::Drop>::drop
+<wok_relay::abuse::OpenConnections>::rekey
+<wok_relay::abuse::OpenConnections>::release
 <wok_relay::abuse::Principal>::address
 <wok_relay::capabilities::CapabilityCondition>::is_enabled
 <wok_relay::capabilities::CapabilityCondition>::is_enabled::{closure}
@@ -285,6 +289,7 @@
 <wok_relay::config::Config>::metrics_on_relay_listener
 <wok_relay::config::Config>::restricted_writes
 <wok_relay::config::Config>::timestamp_policy_for_kind
+<wok_relay::config::Config>::unreadable_class
 <wok_relay::metrics::Metrics>::refused
 <wok_relay::metrics::Refusals>::add
 <wok_relay::metrics::Setting>::of_read_class
@@ -394,6 +399,7 @@
 <wok_relay::server::RelayHandle>::close::{closure}
 <wok_relay::server::RelayHandle>::finish_connection
 <wok_relay::server::RelayHandle>::finish_connection::{closure}
+<wok_relay::server::RelayHandle>::hold_connection
 <wok_relay::server::RelayHandle>::ingest_route
 <wok_relay::server::RelayHandle>::is_shutdown
 <wok_relay::server::RelayHandle>::next_conn_id
@@ -431,10 +437,15 @@
 <wok_ws::frame::InflateCtx>::decompress
 <wok_ws::frame::InflateCtx>::new
 <wok_ws::frame::InflateCtx>::remember
+<wok_ws::frame::ReadDeadlines>::decoded
+<wok_ws::frame::ReadDeadlines>::new
+<wok_ws::frame::ReadDeadlines>::next
+<wok_ws::frame::ReadDeadlines>::resume
 <wok_ws::frame::WsEncoder>::encode_frame
 <wok_ws::frame::WsEncoder>::encode_message_into
 <wok_ws::frame::WsEncoder>::new
 <wok_ws::frame::WsEncoder>::with_role
+<wok_ws::frame::WsParser>::assembly_pending
 <wok_ws::frame::WsParser>::drain_events_into
 <wok_ws::frame::WsParser>::handle_frame
 <wok_ws::frame::WsParser>::maybe_inflate
@@ -589,6 +600,8 @@ wok_query::monitor::swap_remove
 wok_query::scan::plans_pubkey_kind
 wok_query::scan::plans_tag_kind
 wok_query::visibility::physical_tree_is_globally_visible
+wok_relay::abuse::decrement::<core::net::ip_addr::IpAddr>
+wok_relay::abuse::decrement::<wok_relay::abuse::Principal>
 wok_relay::abuse::leading_zero_bits
 wok_relay::abuse::spec
 wok_relay::capabilities::relay_capabilities
@@ -677,6 +690,7 @@ wok_ws::frame::write_bytes::<tokio::io::split::WriteHalf<hyper_util::rt::tokio::
 wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>
 wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}
 wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}
+wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}::{closure}
 wok_ws::html_escape
 wok_ws::html_response
 wok_ws::json_response

@@ -1,7 +1,7 @@
 # Relay functions reached in the `monitored` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 702
+## anonymous: 708
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -436,10 +436,15 @@
 <wok_ws::frame::InflateCtx>::decompress
 <wok_ws::frame::InflateCtx>::new
 <wok_ws::frame::InflateCtx>::remember
+<wok_ws::frame::ReadDeadlines>::decoded
+<wok_ws::frame::ReadDeadlines>::new
+<wok_ws::frame::ReadDeadlines>::next
+<wok_ws::frame::ReadDeadlines>::resume
 <wok_ws::frame::WsEncoder>::encode_frame
 <wok_ws::frame::WsEncoder>::encode_message_into
 <wok_ws::frame::WsEncoder>::new
 <wok_ws::frame::WsEncoder>::with_role
+<wok_ws::frame::WsParser>::assembly_pending
 <wok_ws::frame::WsParser>::drain_events_into
 <wok_ws::frame::WsParser>::handle_frame
 <wok_ws::frame::WsParser>::maybe_inflate
@@ -681,6 +686,7 @@ wok_ws::frame::write_bytes::<tokio::io::split::WriteHalf<hyper_util::rt::tokio::
 wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>
 wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}
 wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}
+wok_ws::handle_ws::<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}::{closure}
 wok_ws::html_escape
 wok_ws::html_response
 wok_ws::json_response

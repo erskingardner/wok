@@ -1001,6 +1001,12 @@ async fn handle_ws<S>(
     let io = async {
         'outer: loop {
             let draining = connection.draining(&held);
+            // While the hold is full the relay, not the client, has stopped
+            // reading, so that pause does not count against the frame gap:
+            // the next read starts it afresh.
+            if draining {
+                frame_deadline = None;
+            }
             tokio::select! {
                 _ = ping.tick(), if auto_ping > 0 => {
                     if awaiting_pong {
@@ -1696,5 +1702,105 @@ mod admin_http_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ingress_pause_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn masked_text(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x81];
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        let mask = [1u8, 2, 3, 4];
+        frame.extend_from_slice(&mask);
+        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        frame
+    }
+
+    /// Waiting with a full hold is the relay's pause, not the client's: once
+    /// the relay reads again, a frame the client then completes is read,
+    /// however long the pause outlasted `frame_read_timeout_secs`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pause_with_a_full_hold_does_not_spend_the_frame_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let mut cfg = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        cfg.relay.ingester_threads = 1;
+        cfg.relay.max_websocket_payload_size = 4096;
+        cfg.relay.unix.max_frame_bytes = 4096;
+        cfg.relay.frame_read_timeout_secs = 1;
+        cfg.relay.compression_enabled = false;
+        cfg.relay.abuse.enabled = false;
+        let handle = wok_relay::start(env, cfg).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_listener(handle.clone(), listener));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"));
+
+        // Stall the ingester, so the connection's share and then its hold
+        // fill, with the first byte of one more frame buffered behind them.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let config = handle.config.clone();
+        let stall = std::thread::spawn(move || {
+            let _guard = config.write();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let mut burst = Vec::new();
+        for n in 0..120 {
+            let req = format!(r#"["REQ","s{n:03}",{{"ids":["{}"]}}]"#, "0".repeat(64));
+            burst.extend(masked_text(req.as_bytes()));
+        }
+        let last = masked_text(br#"["REQ","last",{"kinds":[1]}]"#);
+        burst.push(last[0]);
+        stream.write_all(&burst).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        release_tx.send(()).unwrap();
+        stall.join().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stream.write_all(&last[1..]).await.unwrap();
+
+        let mut seen = Vec::new();
+        let answered = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "the relay closed the connection");
+                seen.extend_from_slice(&chunk[..read]);
+                if seen.windows(13).any(|w| w == br#"["EOSE","last"#) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(answered.is_ok(), "no answer to the completed frame");
+        handle.request_shutdown();
     }
 }

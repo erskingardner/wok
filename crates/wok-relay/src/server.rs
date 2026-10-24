@@ -6354,6 +6354,35 @@ mod tests {
             assert!(reply.contains(refusal), "{reply}");
         }
         assert_eq!(handle.metrics.refusals.get(Setting::MaxReqFilterSize), 1);
+        // Reusing a live session's id for a filter over the limit ends that
+        // session too, as NIP-77 says: its next NEG-MSG finds no session.
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = hex::encode(
+            wok_negentropy::Negentropy::new(store, 60_000)
+                .unwrap()
+                .initiate()
+                .unwrap(),
+        );
+        conn.client_message(json!(["NEG-OPEN", "live", {"kinds": [1]}, init]).to_string())
+            .await;
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["NEG-MSG","live""#));
+        conn.client_message(json!(["NEG-OPEN", "live", {"authors": authors}, init]).to_string())
+            .await;
+        let refused = recv_outbound(&mut rx).await;
+        assert!(
+            refused.contains("invalid: filters exceed 64 serialized bytes"),
+            "{refused}"
+        );
+        conn.client_message(json!(["NEG-MSG", "live", init]).to_string())
+            .await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.contains("closed: unknown subscription handle"),
+            "{reply}"
+        );
         handle.request_shutdown();
     }
 

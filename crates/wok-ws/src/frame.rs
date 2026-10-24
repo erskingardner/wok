@@ -202,16 +202,21 @@ fn inflate_into(
 ) -> Result<(), WsError> {
     let start_in = inner.total_in();
     loop {
-        // Keep spare output capacity so "no progress" reliably means done.
-        if out.capacity() - out.len() < 64 {
-            out.reserve(32 * 1024);
-        }
+        // Each call may write only up to one byte past `max_out`, whatever
+        // the vector's capacity, so a refused message never costs more.
+        let room = (max_out + 1).saturating_sub(out.len()).min(32 * 1024);
+        let len = out.len();
+        out.resize(len + room, 0);
         let consumed = (inner.total_in() - start_in) as usize;
         let in_before = inner.total_in();
         let out_before = inner.total_out();
-        inner
-            .decompress_vec(&input[consumed..], out, flate2::FlushDecompress::Sync)
-            .map_err(|e| WsError::Inflate(e.to_string()))?;
+        let result = inner.decompress(
+            &input[consumed..],
+            &mut out[len..],
+            flate2::FlushDecompress::Sync,
+        );
+        out.truncate(len + (inner.total_out() - out_before) as usize);
+        result.map_err(|e| WsError::Inflate(e.to_string()))?;
         if out.len() > max_out {
             return Err(WsError::MessageTooLarge);
         }
@@ -1109,6 +1114,22 @@ mod tests {
     fn compressed_frame(message: &[u8]) -> Vec<u8> {
         let compressed = DeflateCtx::new(true).compress(message).unwrap();
         masked_frame(true, true, OP_TEXT, &compressed)
+    }
+
+    #[test]
+    fn inflating_stops_one_byte_past_the_limit() {
+        let compressed = DeflateCtx::new(false)
+            .compress(&vec![b'a'; 1 << 20])
+            .unwrap();
+        let mut input = compressed;
+        input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+        let mut inner = flate2::Decompress::new(false);
+        // Spare capacity far past the limit must not be filled.
+        let mut out = Vec::with_capacity(1 << 20);
+        let max_out = 100_000;
+        let refused = inflate_into(&mut inner, &input, &mut out, max_out);
+        assert!(matches!(refused, Err(WsError::MessageTooLarge)));
+        assert_eq!(out.len(), max_out + 1);
     }
 
     #[test]

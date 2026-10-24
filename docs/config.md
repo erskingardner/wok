@@ -250,7 +250,9 @@ A member is a pubkey that is not banned and is NIP-86 allowlisted
   that its first `p` tag is a member that is not banned: anyone can ask
   whether a key is a member by publishing one gift wrap to it. A refusal
   says it is not only when it is the policy's own, below; the kind policy,
-  signature, proof-of-work and rate checks refuse without asking.
+  signature, proof-of-work and rate checks refuse without asking, and so,
+  while AUTH is unusable, does the refusal of recipient-only and
+  authenticated kinds, gift wraps included.
 
 A refused EVENT gets `auth-required:` and a challenge while the connection
 has not authenticated, else `restricted: this relay accepts events only from

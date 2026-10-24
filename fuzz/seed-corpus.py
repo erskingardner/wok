@@ -46,13 +46,17 @@ small = takeover_messages([req + str(n).encode() for n in range(4)])
 assert all(len(payload) < 126 for payload in small)
 seeds.append(b"".join(b"\xc1" + bytes([0x80 | len(payload)]) + b"\0" * 4 + payload
                       for payload in small))
-# A first message past the 32 KiB window, then one that refers back near its
-# end, so the replayed history wraps.
 noise = b"".join(hashlib.sha256(struct.pack("<H", i)).hexdigest().encode() for i in range(1300))
+# A first message past the 32 KiB window, then, after a release, one that
+# refers back near the start of the window it kept.
 large = takeover_messages([noise, noise[-30000:-29000] + req])
-for messages in [small, large]:
-    seeds.append(b"".join(bytes([n & 1]) + struct.pack("<H", len(payload)) + payload
-                          for n, payload in enumerate(messages)))
+# Five messages under the window that together pass it, so the history ring
+# has wrapped when a release replays it, then one that refers back across it.
+parts = [noise[i * 9000:(i + 1) * 9000] for i in range(5)]
+ring = takeover_messages(parts + [parts[2][1000:2000] + req])
+for messages, controls in [(small, [0, 1, 0, 1]), (large, [0, 1]), (ring, [0] * 5 + [1])]:
+    seeds.append(b"".join(bytes([control]) + struct.pack("<H", len(payload)) + payload
+                          for control, payload in zip(controls, messages, strict=True)))
 
 for seed in seeds:
     path = root / hashlib.sha256(seed).hexdigest()

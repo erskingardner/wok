@@ -587,6 +587,14 @@ A NEG-OPEN meets every `filter_validation` rule, the query work ceiling and
 the read classes, as a REQ does, and draws on the REQ budgets; its rounds draw
 on the NEG-MSG budget.
 
+With `negentropy_enabled` off, the relay still keeps its negentropy trees
+current as it stores and deletes events. Turning NIP-77 back on, which
+reloads live, then answers from complete trees at once, and `wok sync`
+reconciles from them whatever this setting says. A tree that missed writes
+could not be repaired while the relay runs: `wok negentropy build` only adds
+records, and a stale tree needs `wok reindex` with the relay stopped. See
+[Trees while NIP-77 is off](mesh-and-maintenance.md#trees-while-nip-77-is-off).
+
 ## Relay information
 
 All fields reload live and are on the dashboard. They are returned in NIP-11

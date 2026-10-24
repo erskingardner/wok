@@ -1192,11 +1192,14 @@ async fn nip67_auth_follows_a_challenge_until_authenticated_as_the_recipient() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip67_auth_waits_for_usable_auth_and_its_challenge() {
-    let relay = Relay::new(|_| {});
+    // The DM is stored while AUTH is usable, as it is refused otherwise.
+    let relay = auth_relay();
     let recipient = key();
     let (note, _) = publish_note_and_dm(&relay, &recipient).await;
 
-    // AUTH is unusable: no challenge on connect, and no `auth` hint.
+    // A reload makes AUTH unusable: no challenge on connect, and no `auth`
+    // hint.
+    relay.handle.config.write().relay.auth.service_url.clear();
     let mut reader = relay.connect().await;
     let (events, other, eose) = reader.backfill("mixed", json!([{"kinds": [1, 4]}])).await;
     assert_eq!((events, other), (vec![note.clone()], vec![]));

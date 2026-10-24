@@ -102,6 +102,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             "NIP-42 authentication is usable, or nothing needs it",
         ),
     }
+    check_read_classes(cfg, &mut report);
 
     // Hot-reload merges the file over factory defaults, so a truncated or
     // partially-provisioned file silently weakens these scopes; surface
@@ -695,6 +696,34 @@ pub(crate) fn available_bytes(path: &Path) -> Result<u64, String> {
     Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
 }
 
+/// Who may read each kind, against the preset and the inbox kinds. The
+/// relay logs both warnings at startup; a reload logs what it widens.
+fn check_read_classes(cfg: &Config, report: &mut DoctorReport) {
+    match cfg.read_class_warning() {
+        Some(detail) => report.add("read-classes", CheckStatus::Warn, detail),
+        None => report.add(
+            "read-classes",
+            CheckStatus::Pass,
+            format!(
+                "no kind has more readers than preset {} gives it",
+                cfg.preset
+            ),
+        ),
+    }
+    match cfg.inbox_kinds_warning() {
+        Some(detail) => report.add("inbox-kinds", CheckStatus::Warn, detail),
+        None => report.add(
+            "inbox-kinds",
+            CheckStatus::Pass,
+            if cfg.relay.auth.write_policy == wok_relay::AccessPolicy::Members {
+                "every inbox kind is recipient-only or stricter"
+            } else {
+                "inbox kinds admit writes only under write_policy = \"members\""
+            },
+        ),
+    }
+}
+
 /// Which `[relay.filter_validation]` rules are set, so a reload that drops
 /// one shows.
 fn filter_rules_check(rules: &wok_relay::config::FilterValidationConfig) -> (CheckStatus, String) {
@@ -871,6 +900,52 @@ mod tests {
             "{}",
             tag_kind.detail
         );
+    }
+
+    #[test]
+    fn read_classes_wider_than_the_presets_are_warnings() {
+        let report = |text: &str| {
+            let cfg = Config::parse_toml(text).unwrap();
+            run(&cfg, Path::new("missing-test-config.toml"))
+        };
+        let defaults = report("");
+        assert_eq!(check(&defaults, "read-classes").status, CheckStatus::Pass);
+        assert_eq!(check(&defaults, "inbox-kinds").status, CheckStatus::Pass);
+
+        let widened =
+            report("[relay.auth]\nrecipient_only_kinds = [4]\nwrite_policy = \"members\"\n");
+        let reads = check(&widened, "read-classes");
+        assert_eq!(reads.status, CheckStatus::Warn);
+        assert!(
+            reads.detail.contains(
+                "than preset public does: 1059 (recipient-only -> anyone), \
+                 21059 (recipient-only -> anyone)."
+            ),
+            "{}",
+            reads.detail
+        );
+        let inbox = check(&widened, "inbox-kinds");
+        assert_eq!(inbox.status, CheckStatus::Warn);
+        assert!(
+            inbox.detail.contains("kinds [1059, 21059]"),
+            "{}",
+            inbox.detail
+        );
+
+        // The marmot preset refuses to serve gift wraps to anyone.
+        let marmot = report(
+            "preset = \"marmot\"\n[relay.auth]\nservice_url = \"wss://relay.example.com\"\n\
+             recipient_only_kinds = []\n",
+        );
+        assert!(!marmot.ok);
+        let preset = check(&marmot, "preset");
+        assert_eq!(preset.status, CheckStatus::Fail);
+        assert!(
+            preset.detail.contains("kinds [1059, 21059]"),
+            "{}",
+            preset.detail
+        );
+        assert_eq!(check(&marmot, "read-classes").status, CheckStatus::Warn);
     }
 
     /// The checks `check_config_defaults` reports for a file: deprecated

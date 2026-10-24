@@ -62,13 +62,15 @@ on who it is for, what it changes and what it refuses.
 | Preset | Use |
 |---|---|
 | [`public`](presets/public.md) | A general public relay that any client can read from and write to. Its values are the built-in defaults, so its overlay is empty. |
-| [`marmot`](presets/marmot.md) | A relay dedicated to Marmot group messaging, such as one a Marmot app ships as a default: only the Marmot kinds, scoped filters, 4 MiB events, no COUNT or permessage-deflate, and open writes. It refuses to start without usable NIP-42 AUTH. |
+| [`marmot`](presets/marmot.md) | A relay dedicated to Marmot group messaging, such as one a Marmot app ships as a default: only the Marmot kinds, scoped filters, 4 MiB events, no COUNT or permessage-deflate, and open writes. It refuses to start without usable NIP-42 AUTH, or with gift wraps readable by anyone but their recipient. |
 
 A preset's requirements are checked when the relay starts and on every
-reload: a `marmot` file without a usable `relay.auth.service_url` is refused,
-from the file watcher, a dashboard save or a NIP-86 relay-info method, and
-the running configuration kept; a save then answers 409 and writes nothing.
-`wok doctor` reports it as a failed `preset` check.
+reload: a `marmot` file without a usable `relay.auth.service_url`, or one
+that leaves kind 1059 or 21059 out of `relay.auth.recipient_only_kinds` (and
+`owner_only_kinds`), is refused, from the file watcher, a dashboard save or a
+NIP-86 relay-info method, and the running configuration kept; a save then
+answers 409 and writes nothing. `wok doctor` reports it as a failed `preset`
+check. Owner-only gift wraps pass, but their recipients cannot read them.
 
 Changing `preset` on reload is allowed. The reload log names the preset
 change, and every resulting security-scope change is warn-logged like any
@@ -133,17 +135,24 @@ dashboard shows them read-only. A reload that changes `read_policy` or
 | `relay.auth.service_url` | empty | The relay URL an AUTH event must name, so an AUTH signed for another relay is refused. | Empty: AUTH cannot succeed, and the relay logs what fails closed at startup. A `marmot` relay refuses to start. | As `relay.auth.enabled`: AUTH is usable only with both |
 | `relay.auth.read_policy` | `"open"` | Who may send REQ, COUNT and NEG-OPEN: `open`, `authenticated` or `members`. See [Read and write policies](#read-and-write-policies). | — | `auth_required` while not `open` and AUTH is usable |
 | `relay.auth.write_policy` | `"open"` | Who may publish: `open`, `authenticated` or `members`. NIP-62 vanish requests are always accepted. | — | `restricted_writes` while not `open` |
-| `relay.auth.recipient_only_kinds` | `[4, 1059, 21059]` | DMs and gift wraps: read only by their author and first `p`-tag recipient. | Leaving out 1059 or 21059 serves gift wraps, recipient tag included, to anyone, and stops NIP-59 being advertised. | NIP-59 in `supported_nips`, see [Read classes](#read-classes) |
+| `relay.auth.recipient_only_kinds` | `[4, 1059, 21059]` | DMs and gift wraps: read only by their author and first `p`-tag recipient. | Leaving out 1059 or 21059 serves gift wraps, recipient tag included, to anyone, and stops NIP-59 being advertised; the relay warns, and a `marmot` relay refuses to start. | NIP-59 in `supported_nips`, see [Read classes](#read-classes) |
 | `relay.auth.owner_only_kinds` | `[78, 30078]` | NIP-78 app data: read only by its author, and accepted only from a connection authenticated as the author. | Leaving them out serves app data to anyone, and stops NIP-78 being advertised. | NIP-78 in `supported_nips`, see [Read classes](#read-classes) |
 | `relay.auth.authenticated_kinds` | `[]` | Kinds any authenticated connection may read, whichever pubkey it authenticated as. | — | — |
-| `relay.auth.inbox_kinds` | `[1059, 21059]` | Under `write_policy = "members"`, events of these kinds are also accepted when their first `p` tag is a member, so anyone can deliver gift wraps to members. | Empty: outsiders cannot deliver DMs or Marmot Welcomes to members. | — |
+| `relay.auth.inbox_kinds` | `[1059, 21059]` | Under `write_policy = "members"`, events of these kinds are also accepted when their first `p` tag is a member, so anyone can deliver gift wraps to members. Each should be recipient-only; see [Read and write policies](#read-and-write-policies). | Empty: outsiders cannot deliver DMs or Marmot Welcomes to members. | — |
 | `relay.auth.accepted_kinds` | `[]` | The kinds the relay accepts; empty accepts every kind. A ceiling for the NIP-86 kind policy. See [Accepted kinds](#accepted-kinds). | Kinds clients publish are refused with `restricted:`. | `restricted_writes` while set |
 
 While AUTH is usable (`enabled` with a `service_url`), every connection
-receives its NIP-42 challenge as soon as it opens. Private reads fail closed
-until then: those reads, and events of owner-only kinds, are refused with
-`restricted:` and no challenge, so NIP-42 clients do not attempt an AUTH
-that cannot succeed. With `enabled = false` the relay refuses AUTH outright.
+receives its NIP-42 challenge as soon as it opens.
+
+While it is not, private reads fail closed: those reads, and events of every
+restricted kind, which nobody could read, are refused with `restricted:` and
+no challenge, so NIP-42 clients do not attempt an AUTH that cannot succeed.
+An event of a recipient-only or authenticated kind, such as a gift wrap,
+gets `restricted: kind 1059 is read only after AUTH, which this relay does
+not offer`, decided by its kind before its signature is verified, and again
+by the writer, so one queued before a reload made AUTH unusable is refused
+too. NIP-62 vanish requests are accepted whatever their class. With
+`enabled = false` the relay refuses AUTH outright.
 
 ### Read classes
 
@@ -156,9 +165,9 @@ read by anyone. The others are read only by:
 | `recipient_only_kinds` | the author and the first `p`-tag recipient | DMs (4) and gift wraps (1059, 21059) |
 | `owner_only_kinds` | the author | NIP-78 app data (78, 30078), which NIP-78 says is private to its user |
 
-A kind listed in more than one class gets the strictest. The classes apply to
-historical and live REQs, COUNT and negentropy sync alike, each event checked
-against the connection's authenticated pubkeys:
+A kind listed in more than one class gets the strictest. The classes apply
+to historical and live REQs, COUNT and negentropy sync alike, each event
+checked against the connection's authenticated pubkeys:
 - A REQ or NEG-OPEN whose every filter asks only for restricted kinds needs
   AUTH first: it is refused with `auth-required:` and a challenge.
 - Any other REQ is served, and restricted events are left out of it until the
@@ -166,6 +175,13 @@ against the connection's authenticated pubkeys:
 - A COUNT that may count restricted kinds must be scoped to what the
   connection may read: `authors` or `#p` naming only its pubkey for
   recipient-only kinds, and `authors` alone for owner-only kinds.
+
+A file that gives a kind more readers than its preset does, such as
+`recipient_only_kinds = []` or 1059 moved to `authenticated_kinds`, is warned
+about when the relay starts, naming each kind with its class in the preset
+and in the file, and by `wok doctor` in its `read-classes` check. A reload
+names each kind it widens from the running configuration (`read access
+WIDENED`).
 
 As NIP-78 recommends, the relay also accepts an event of an owner-only kind
 only on a connection authenticated as its author. Without AUTH the EVENT is
@@ -225,7 +241,18 @@ A member is a pubkey that is not banned and is NIP-86 allowlisted
     deliver NIP-17 DMs and Marmot Welcomes to members.
 
   The relay then learns which member sent each such event, which is inherent
-  to a members-only relay.
+  to a members-only relay. An inbox kind should be recipient-only, as the
+  default gift-wrap kinds are: otherwise outsiders can publish events of it,
+  addressed to a member, that others may read, such as notes with
+  `inbox_kinds = [1]`. The relay warns about such a kind at startup, a reload
+  that makes one warns, and `wok doctor` reports it in its `inbox-kinds`
+  check. Whatever the class, an inbox event's `OK true` tells an outsider
+  that its first `p` tag is a member that is not banned: anyone can ask
+  whether a key is a member by publishing one gift wrap to it. A refusal
+  says it is not only when it is the policy's own, below; the kind policy,
+  signature, proof-of-work and rate checks refuse without asking, and so,
+  while AUTH is unusable, does the refusal of recipient-only and
+  authenticated kinds, gift wraps included.
 
 A refused EVENT gets `auth-required:` and a challenge while the connection
 has not authenticated, else `restricted: this relay accepts events only from

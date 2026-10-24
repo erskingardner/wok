@@ -218,7 +218,6 @@
 <wok_query::subid::SubId>::as_str
 <wok_query::subid::SubId>::new
 <wok_query::subid::Subscription>::new
-<wok_query::visibility::ReadRestrictor>::class
 <wok_query::visibility::ReadRestrictor>::is_filter_fully_restricted
 <wok_query::visibility::ReadRestrictor>::is_filter_fully_restricted::{closure}
 <wok_query::visibility::ReadRestrictor>::is_filter_group_fully_restricted
@@ -258,6 +257,7 @@
 <wok_relay::config::Config>::metrics_on_relay_listener
 <wok_relay::config::Config>::restricted_writes
 <wok_relay::config::Config>::timestamp_policy_for_kind
+<wok_relay::config::Config>::unreadable_class
 <wok_relay::metrics::Metrics>::refused
 <wok_relay::metrics::Refusals>::add
 <wok_relay::metrics::Setting>::of_filter_limit

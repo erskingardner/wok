@@ -859,6 +859,15 @@ async fn upgrade_ws(
         Some("13") => {}
         _ => return empty(StatusCode::BAD_REQUEST),
     }
+    // Each connection multiplies what one address may queue, be sent and
+    // keep subscribed, so an address may hold only so many open. The slot
+    // is taken before the upgrade and given back when the connection ends.
+    let Some(slot) = handle.hold_connection(&TransportSource::ip_address(peer.ip())) else {
+        return text_status_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate-limited: too many connections from this address",
+        );
+    };
     // permessage-deflate negotiation mirroring uWS as strfry configures it:
     // respond with plain `permessage-deflate` (our context takeover per
     // compression.slidingWindow), echoing client_no_context_takeover.
@@ -901,6 +910,7 @@ async fn upgrade_ws(
     }
     let max = handle.config.read().relay.max_websocket_payload_size;
     tokio::spawn(async move {
+        let _slot = slot;
         match hyper::upgrade::on(&mut req).await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);

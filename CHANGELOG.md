@@ -61,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `relay.max_websocket_payload_size` buffered indefinitely. A pause while
     the relay does not read, because the connection's hold is full, does not
     count.
+  - **Connections per address**: an address may hold at most
+    `relay.abuse.max_connections_per_address` (new, 256) WebSocket
+    connections open at once, keyed like the other per-address budgets (its
+    IPv6 /64, the `real_ip_header` address). Every per-connection limit,
+    such as the inbound share and the outbound queue, otherwise multiplied
+    by however many connections one host kept open; the connection budget
+    limited only how fast it opened them. An upgrade past the cap gets 429
+    and is counted in `wok_refusals_total`.
 
 - Requests are refused by the cheapest check that can refuse them, before
   their filters are parsed or their signature is verified, where that
@@ -503,6 +511,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `public`: `relay.message_read_timeout_secs` is `120`, a new setting: a
   WebSocket message or control frame must arrive within 120 seconds of its
   first byte (see Security). `0` turns the deadline off.
+- `public`: `relay.abuse.max_connections_per_address` is `256`, a new
+  setting: an address may hold at most 256 WebSocket connections open at
+  once (see Security). Behind a reverse proxy, set `relay.real_ip_header`,
+  or every client shares the proxy's 256. `0` removes the cap.
 - `public`: `relay.abuse.ipv6_prefix_len` is `64`, a new setting.
   Per-address budgets (connections, EVENT and AUTH, REQ, COUNT, malformed
   messages) key an IPv6 client by its /64 instead of its full address, so a

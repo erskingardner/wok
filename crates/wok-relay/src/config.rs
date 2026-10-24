@@ -291,6 +291,9 @@ pub struct AbuseConfig {
     pub ipv6_prefix_len: u8,
     pub connection_rate_per_second: u32,
     pub connection_burst: u32,
+    /// WebSocket connections one address may hold open at once; zero is
+    /// unlimited.
+    pub max_connections_per_address: u32,
     pub event_rate_per_second: u32,
     pub event_burst: u32,
     pub pubkey_event_rate_per_second: u32,
@@ -553,6 +556,7 @@ impl Default for Config {
                     ipv6_prefix_len: 64,
                     connection_rate_per_second: 10,
                     connection_burst: 50,
+                    max_connections_per_address: 256,
                     event_rate_per_second: 50,
                     event_burst: 100,
                     pubkey_event_rate_per_second: 25,
@@ -971,8 +975,10 @@ impl Config {
             "the relay listens only on loopback or private addresses ({}) and \
              relay.real_ip_header is unset. If a reverse proxy forwards connections, every \
              client has the proxy's address and they all share one set of per-address \
-             budgets (connections, EVENT and AUTH, REQ, COUNT); set relay.real_ip_header to \
-             the header in which the proxy passes the client's address",
+             budgets (connections, EVENT and AUTH, REQ, COUNT) and one \
+             relay.abuse.max_connections_per_address cap on open connections; set \
+             relay.real_ip_header to the header in which the proxy passes the client's \
+             address",
             addrs.join(", ")
         ))
     }
@@ -1537,6 +1543,7 @@ impl Config {
                     a.max_stored_events_per_pubkey,
                     a.min_pow_difficulty,
                     a.per_connection.clone(),
+                    a.max_connections_per_address,
                 ),
             )
         };
@@ -1804,6 +1811,15 @@ impl Config {
                         ),
                     ));
                 }
+            }
+            if zeroed(
+                a.max_connections_per_address.into(),
+                p.max_connections_per_address.into(),
+            ) {
+                warnings.push(ZeroGuard::new(
+                    &["relay.abuse.max_connections_per_address"],
+                    "relay.abuse.max_connections_per_address is zero — unlimited",
+                ));
             }
             if zeroed(a.max_query_work, p.max_query_work) {
                 warnings.push(ZeroGuard::new(
@@ -3209,6 +3225,7 @@ negentropy_enabled = true
             "count_burst",
             "invalid_rate_per_second",
             "invalid_burst",
+            "max_connections_per_address",
             "max_query_work",
             "max_stored_events_per_pubkey",
         ] {

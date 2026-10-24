@@ -24,10 +24,10 @@ pub enum CostedRequest {
     /// A COUNT, priced at twice its seeks. Its rows are bounded only while
     /// it runs, by `max_filter_limit_count` and the COUNT budget.
     Count,
-    /// A NEG-OPEN, priced at its seeks. Its rows are bounded only while it
-    /// runs, by `max_sync_events` and the sync memory budgets. Not priced by
-    /// rows on purpose: a sync is meant to move many events, up to all a
-    /// relay holds (#173).
+    /// A NEG-OPEN, priced at its seeks. It is refused before its scan is
+    /// scheduled when its view would not fit the sync memory budgets, and
+    /// its scan stops past `max_sync_events`. Not priced by rows on purpose:
+    /// a sync is meant to move many events, up to all a relay holds (#173).
     NegOpen,
 }
 

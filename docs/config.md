@@ -393,11 +393,13 @@ A REQ adds the rows it can return: each filter's `limit`, or
 all its filters count up to `max_total_events_per_req`. Each NIP-91 `&`
 value adds the filter's rows again, for the check on every candidate. A
 COUNT costs twice its cursors and a NEG-OPEN its cursors, with no rows:
-their scans are not bounded by `limit`, but while they run, by
-`max_filter_limit_count` and the COUNT budget, and by `max_sync_events` and
-the sync memory budgets. A NEG-OPEN is not priced by rows on purpose: a sync
-exists to move many events, up to all a relay holds, so a broad one is served
-(see [Sync](#sync)).
+their scans are not bounded by `limit`. A COUNT's is bounded while it runs,
+by `max_filter_limit_count` and the COUNT budget. A NEG-OPEN is refused
+before its scan is scheduled when its view would not fit the sync memory
+budgets, and its scan stops, refusing the sync, past `max_sync_events`. It
+is not priced by rows on purpose: a sync exists to move many events, up to
+all a relay holds, so the ceiling leaves a broad one alone (see
+[Sync](#sync)).
 
 With the public preset's limits:
 

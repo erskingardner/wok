@@ -92,6 +92,7 @@ admin.public_url = "https://relay.example.com"
 admin.pubkeys = ["f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"]"#,
     ),
     ("metrics", "observability.metrics_enabled = true"),
+    ("NodeInfo", "relay.nodeinfo_enabled = true"),
     (
         "metrics listener",
         r#"observability.metrics_listen = "127.0.0.1:9777""#,

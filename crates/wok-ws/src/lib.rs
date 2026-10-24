@@ -321,15 +321,18 @@ async fn dispatch(
     if matches!(path.as_str(), "/admin" | "/admin/") || path.starts_with("/admin/api/") {
         return admin::dispatch(req, handle, admin_state).await;
     }
-    // `/metrics` is a route only while the relay listener serves it, so a
-    // relay without metrics answers it, preflight included, like any path.
-    let metrics_here = path == "/metrics" && handle.config.read().metrics_on_relay_listener();
-    if !metrics_here
-        && !matches!(
-            path.as_str(),
-            "/" | "/.well-known/nodeinfo" | "/nodeinfo/2.1" | "/favicon.ico"
+    // `/metrics` and the NodeInfo paths are routes only while the relay
+    // listener serves them, so a relay without them answers them, preflight
+    // included, like any path.
+    let (metrics_here, nodeinfo_here) = {
+        let cfg = handle.config.read();
+        (
+            path == "/metrics" && cfg.metrics_on_relay_listener(),
+            matches!(path.as_str(), "/.well-known/nodeinfo" | "/nodeinfo/2.1")
+                && cfg.relay.nodeinfo_enabled,
         )
-    {
+    };
+    if !metrics_here && !nodeinfo_here && !matches!(path.as_str(), "/" | "/favicon.ico") {
         return not_found();
     }
     if req.method() == hyper::Method::OPTIONS {
@@ -348,42 +351,13 @@ async fn dispatch(
     {
         return with_cors(nip86::dispatch(req, handle, admin_state).await);
     }
-    let host = req
-        .headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
     let wants_nip11 = accepts_nip11(req.headers());
     let cfg = handle.config.read().clone();
     if metrics_here {
         return text_response(METRICS_CONTENT_TYPE, handle.metrics.render());
     }
-    if path == "/.well-known/nodeinfo" {
-        let body = serde_json::json!({
-            "links": [{
-                "rel": "http://nodeinfo.diaspora.software/ns/schema/2.1",
-                "href": format!("https://{host}/nodeinfo/2.1"),
-            }]
-        });
-        return json_response(&body);
-    }
-    if path == "/nodeinfo/2.1" {
-        let body = serde_json::json!({
-            "version": "2.1",
-            "software": {
-                "name": "wok",
-                "version": VERSION,
-                "repository": "https://github.com/erskingardner/wok",
-                "homepage": "https://github.com/erskingardner/wok",
-            },
-            "protocols": ["nostr"],
-            "services": { "inbound": [], "outbound": [] },
-            "openRegistrations": false,
-            "usage": { "users": {} },
-            "metadata": { "features": ["nostr_relay"] },
-        });
-        return json_response(&body);
+    if nodeinfo_here {
+        return nodeinfo(&path, req.headers());
     }
     if path == "/favicon.ico" {
         return with_cors(
@@ -406,6 +380,38 @@ async fn dispatch(
         hyper::header::HeaderValue::from_static("Accept"),
     );
     response
+}
+
+/// NodeInfo discovery (`/.well-known/nodeinfo`) or its document
+/// (`/nodeinfo/2.1`), served while `relay.nodeinfo_enabled` is on. The
+/// discovery link's host is the request's `Host` header.
+fn nodeinfo(path: &str, headers: &hyper::HeaderMap) -> Response<Full<Bytes>> {
+    if path == "/.well-known/nodeinfo" {
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        return json_response(&serde_json::json!({
+            "links": [{
+                "rel": "http://nodeinfo.diaspora.software/ns/schema/2.1",
+                "href": format!("https://{host}/nodeinfo/2.1"),
+            }]
+        }));
+    }
+    json_response(&serde_json::json!({
+        "version": "2.1",
+        "software": {
+            "name": "wok",
+            "version": VERSION,
+            "repository": "https://github.com/erskingardner/wok",
+            "homepage": "https://github.com/erskingardner/wok",
+        },
+        "protocols": ["nostr"],
+        "services": { "inbound": [], "outbound": [] },
+        "openRegistrations": false,
+        "usage": { "users": {} },
+        "metadata": { "features": ["nostr_relay"] },
+    }))
 }
 
 /// The client a request's `relay.real_ip_header` names.
@@ -1610,6 +1616,29 @@ mod metrics_tests {
         assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 404);
         served.handle.config.write().observability.metrics_enabled = true;
         assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nodeinfo_is_off_by_default_and_follows_its_setting_live() {
+        let served = serve_both(|_| {}).await;
+        for path in ["/.well-known/nodeinfo", "/nodeinfo/2.1"] {
+            for method in ["GET", "OPTIONS"] {
+                assert_eq!(request(served.relay, method, path).await.0, 404);
+            }
+        }
+        served.handle.config.write().relay.nodeinfo_enabled = true;
+        let (status, _, body) = request(served.relay, "GET", "/.well-known/nodeinfo").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("https://localhost/nodeinfo/2.1"), "{body}");
+        let (status, _, body) = request(served.relay, "GET", "/nodeinfo/2.1").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("\"protocols\":[\"nostr\"]"), "{body}");
+        assert_eq!(
+            request(served.relay, "OPTIONS", "/nodeinfo/2.1").await.0,
+            204
+        );
+        served.handle.config.write().relay.nodeinfo_enabled = false;
+        assert_eq!(request(served.relay, "GET", "/nodeinfo/2.1").await.0, 404);
     }
 }
 

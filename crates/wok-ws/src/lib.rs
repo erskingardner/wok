@@ -1002,13 +1002,17 @@ async fn handle_ws<S>(
         'outer: loop {
             let draining = connection.draining(&held);
             // While the hold is full the relay, not the client, has stopped
-            // reading, so that pause does not count against the frame gap:
-            // the next read starts it afresh.
+            // reading, so that pause counts neither against the frame gap
+            // nor against a ping, whose pong it could not read: no ping goes
+            // out meanwhile, and the next one waits a full interval after
+            // reading resumes.
             if draining {
                 frame_deadline = None;
+                awaiting_pong = false;
+                ping.reset();
             }
             tokio::select! {
-                _ = ping.tick(), if auto_ping > 0 => {
+                _ = ping.tick(), if auto_ping > 0 && !draining => {
                     if awaiting_pong {
                         tracing::info!(conn_id, peer = %peer, reason = "pong_timeout", "client terminated");
                         break;
@@ -1722,6 +1726,115 @@ mod ingress_pause_tests {
         frame.extend_from_slice(&mask);
         frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
         frame
+    }
+
+    /// Answer every ping the relay sends and collect its text frames, until
+    /// one contains `until`.
+    async fn answer_pings_until(
+        mut rd: tokio::net::tcp::OwnedReadHalf,
+        wr: std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+        until: &[u8],
+    ) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            while buf.len() >= 2 {
+                let (opcode, len) = (buf[0] & 0x0f, (buf[1] & 0x7f) as usize);
+                let (start, len) = if len == 126 {
+                    if buf.len() < 4 {
+                        break;
+                    }
+                    (4, u16::from_be_bytes([buf[2], buf[3]]) as usize)
+                } else {
+                    (2, len)
+                };
+                if buf.len() < start + len {
+                    break;
+                }
+                let payload: Vec<u8> = buf[start..start + len].to_vec();
+                buf.drain(..start + len);
+                if opcode == 0x9 {
+                    let mask = [5u8, 6, 7, 8];
+                    let mut pong = vec![0x8a, 0x80 | payload.len() as u8];
+                    pong.extend_from_slice(&mask);
+                    pong.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+                    wr.lock().await.write_all(&pong).await.unwrap();
+                } else if payload.windows(until.len()).any(|w| w == until) {
+                    return;
+                }
+            }
+            let read = rd.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "the relay closed the connection");
+            buf.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// Nor does it count against a ping: a client that answers every ping is
+    /// not closed for a pong the relay could not read while its hold was
+    /// full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pause_with_a_full_hold_does_not_spend_a_ping() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let mut cfg = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        cfg.relay.ingester_threads = 1;
+        cfg.relay.max_websocket_payload_size = 4096;
+        cfg.relay.unix.max_frame_bytes = 4096;
+        cfg.relay.auto_ping_seconds = 1;
+        cfg.relay.compression_enabled = false;
+        cfg.relay.abuse.enabled = false;
+        let handle = wok_relay::start(env, cfg).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_listener(handle.clone(), listener));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"));
+        let (rd, wr) = stream.into_split();
+        let wr = std::sync::Arc::new(tokio::sync::Mutex::new(wr));
+        let answered = tokio::spawn(answer_pings_until(rd, wr.clone(), br#"["EOSE","last""#));
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let config = handle.config.clone();
+        let stall = std::thread::spawn(move || {
+            let _guard = config.write();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let mut burst = Vec::new();
+        for n in 0..120 {
+            let req = format!(r#"["REQ","s{n:03}",{{"ids":["{}"]}}]"#, "0".repeat(64));
+            burst.extend(masked_text(req.as_bytes()));
+        }
+        burst.extend(masked_text(br#"["REQ","last",{"kinds":[1]}]"#));
+        wr.lock().await.write_all(&burst).await.unwrap();
+        // Longer than a ping and its pong window.
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        release_tx.send(()).unwrap();
+        stall.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), answered)
+            .await
+            .expect("no answer once the pause ended")
+            .expect("the relay closed the connection");
+        handle.request_shutdown();
     }
 
     /// Waiting with a full hold is the relay's pause, not the client's: once

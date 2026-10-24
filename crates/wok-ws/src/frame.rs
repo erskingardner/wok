@@ -387,16 +387,18 @@ impl WsParser {
         events: &mut Vec<WsEvent>,
         budget: usize,
     ) -> Result<(), WsError> {
+        // At least one frame is parsed, so its limits are checked whatever
+        // the budget.
         let mut decoded = 0usize;
-        while decoded < budget {
-            let Some(frame) = self.try_parse_frame()? else {
-                break;
-            };
+        while let Some(frame) = self.try_parse_frame()? {
             if let Some(ev) = self.handle_frame(frame)? {
                 if let WsEvent::Message(_, payload) = &ev {
                     decoded = decoded.saturating_add(payload.len());
                 }
                 events.push(ev);
+            }
+            if decoded >= budget {
+                break;
             }
         }
         Ok(())
@@ -824,6 +826,23 @@ mod tests {
             WsEvent::Message(MessageKind::Text, p) => assert_eq!(p, b"hello"),
             _ => panic!(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_zero_message_limit_still_refuses_a_frame() {
+        let wire = masked_frame(true, false, OP_TEXT, b"hi");
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire).await.unwrap();
+        let mut parser = WsParser::new(0, None);
+        let mut events = Vec::new();
+        let mut deadline = None;
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_events_into(&mut rx, &mut parser, &mut events, None, &mut deadline),
+        )
+        .await
+        .expect("the frame is parsed, not buffered forever");
+        assert!(matches!(read, Err(WsError::MessageTooLarge)));
     }
 
     #[tokio::test]

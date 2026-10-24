@@ -59,8 +59,9 @@ no proof of work, NIP-77 on, and the per-address backstops.
   general one with Marmot tuning.
 - **Enumeration.** `{"kinds":[445]}` or `{"since":…}` would list every
   group's messages; with scoped filters each filter must name a group
-  (`#h`), a recipient (`#p`), `ids` or `authors`. COUNT and NEG-OPEN meet the
-  same rule. MDK's group, inbox, `ids` and directory filters all pass.
+  (`#h`), a recipient (`#p`), `ids` or `authors`. NEG-OPEN meets the same
+  rule, and COUNT is off. MDK's group, inbox, `ids` and directory filters all
+  pass.
 - **Gift wraps to anyone but their recipient.** A 1059 is served only to the
   connection authenticated as its first `p` tag (or its author), as in
   `public`.

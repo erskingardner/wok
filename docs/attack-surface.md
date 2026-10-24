@@ -67,7 +67,7 @@ WebSocket upgrade on any path but `/`.
 
 | Path | Party | Gate | What runs |
 | --- | --- | --- | --- |
-| `/` | anonymous | none | A WebSocket upgrade starts a [message](#messages) connection. A `POST` with `Content-Type: application/nostr+json+rpc` goes to the [management API](#management-api). Anything else gets the NIP-11 document when `Accept` names `application/nostr+json`, and the landing page otherwise. |
+| `/` | anonymous | none | A WebSocket upgrade starts a [message](#messages) connection, unless its address already holds `relay.abuse.max_connections_per_address` connections open, which gets 429. A `POST` with `Content-Type: application/nostr+json+rpc` goes to the [management API](#management-api). Anything else gets the NIP-11 document when `Accept` names `application/nostr+json`, and the landing page otherwise. |
 | `/metrics` | anonymous | `observability.metrics_enabled` and no `observability.metrics_listen` | Prometheus metrics, with `Access-Control-Allow-Origin: *`. With `metrics_listen` set they move to the [metrics listener](#metrics-listener). See [observability](observability.md). |
 | `/.well-known/nodeinfo` | anonymous | none | NodeInfo discovery. The link's host is the request's `Host` header. |
 | `/nodeinfo/2.1` | anonymous | none | The NodeInfo document. |

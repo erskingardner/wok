@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **NEG-OPEN** meets `relay.max_req_filter_size`, and a connection's
     sessions share `relay.max_filter_bytes_per_connection`, as REQs and
     COUNTs each do. Its payload is decoded after its filter is checked.
+  - **Connections per address**: an address may hold at most
+    `relay.abuse.max_connections_per_address` (new, 256) WebSocket
+    connections open at once, keyed like the other per-address budgets (its
+    IPv6 /64, the `real_ip_header` address). Every per-connection limit,
+    such as the inbound share and the outbound queue, otherwise multiplied
+    by however many connections one host kept open; the connection budget
+    limited only how fast it opened them. An upgrade past the cap gets 429
+    and is counted in `wok_refusals_total`.
 
 - Requests are refused by the cheapest check that can refuse them, before
   their filters are parsed or their signature is verified, where that
@@ -453,6 +461,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `public`: `relay.abuse.max_query_work` is `20000`, NIP-11
   `max_query_work`, in the units described under Changed. It replaces
   `relay.abuse.max_query_cost = 1000`, which is ignored (see Removed).
+- `public`: `relay.abuse.max_connections_per_address` is `256`, a new
+  setting: an address may hold at most 256 WebSocket connections open at
+  once (see Security). Behind a reverse proxy, set `relay.real_ip_header`,
+  or every client shares the proxy's 256. `0` removes the cap.
 - `public`: `relay.abuse.ipv6_prefix_len` is `64`, a new setting.
   Per-address budgets (connections, EVENT and AUTH, REQ, COUNT, malformed
   messages) key an IPv6 client by its /64 instead of its full address, so a

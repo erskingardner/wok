@@ -1,7 +1,7 @@
 # Relay functions reached in the `unix` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 695
+## anonymous: 698
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -271,11 +271,13 @@
 <wok_relay::abuse::AbuseController>::admit_request::{closure}::{closure}
 <wok_relay::abuse::AbuseController>::admit_source
 <wok_relay::abuse::AbuseController>::admit_source_reporting
+<wok_relay::abuse::AbuseController>::hold_connection
 <wok_relay::abuse::Bucket>::admit
 <wok_relay::abuse::Bucket>::has_token
 <wok_relay::abuse::Bucket>::new
 <wok_relay::abuse::Bucket>::refill
 <wok_relay::abuse::Bucket>::take
+<wok_relay::abuse::ConnectionSlot as core::ops::drop::Drop>::drop
 <wok_relay::abuse::Principal>::address
 <wok_relay::capabilities::CapabilityCondition>::is_enabled
 <wok_relay::config::Config>::accepts_kind
@@ -396,6 +398,7 @@
 <wok_relay::server::RelayHandle>::close::{closure}
 <wok_relay::server::RelayHandle>::finish_connection
 <wok_relay::server::RelayHandle>::finish_connection::{closure}
+<wok_relay::server::RelayHandle>::hold_connection
 <wok_relay::server::RelayHandle>::ingest_route
 <wok_relay::server::RelayHandle>::is_shutdown
 <wok_relay::server::RelayHandle>::next_conn_id

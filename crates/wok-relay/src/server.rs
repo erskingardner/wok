@@ -4972,6 +4972,7 @@ mod tests {
             env.ensure_initialized().unwrap();
             let mut config = Config::default();
             config.db = dir.path().to_path_buf();
+            config.relay.auth.service_url = "wss://relay.example.com".into();
             config.relay.auth.write_policy = crate::config::AccessPolicy::Members;
             config.relay.auth.inbox_kinds = inbox_kinds.clone();
             let config = Arc::new(parking_lot::RwLock::new(config));
@@ -5102,6 +5103,73 @@ mod tests {
                     "{response}"
                 );
                 assert_eq!(entries, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_writer_refuses_kinds_nobody_could_read() {
+        // Queued while AUTH was usable, and taken by a writer whose
+        // configuration a reload made it unusable in: the gift wrap is
+        // refused, and a vanish request still honored whatever its class.
+        for (kind, stored) in [(1059, false), (VANISH_KIND, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.auth.recipient_only_kinds.push(VANISH_KIND);
+            assert!(!config.auth_usable());
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let (id, author) = ([9u8; 32], [8u8; 32]);
+            let tags = PackedEventTagBuilder::default();
+            let packed = PackedEventBuilder::build(&id, &author, 1, kind, 0, &tags).unwrap();
+            let json = json!({
+                "id": to_hex(&id), "pubkey": to_hex(&author), "created_at": 1, "kind": kind,
+                "tags": [["relay", "ALL_RELAYS"]], "content": "", "sig": "00".repeat(64),
+            })
+            .to_string();
+            let (writer_tx, writer_rx) = bounded(4);
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: None,
+                    grant: Default::default(),
+                })
+                .unwrap();
+            drop(writer_tx);
+            let metrics = Arc::new(Metrics::default());
+            run_writer(
+                env.clone(),
+                Arc::new(parking_lot::RwLock::new(config)),
+                conns,
+                metrics.clone(),
+                writer_rx,
+                Vec::new(),
+                Arc::new(parking_lot::RwLock::new(Default::default())),
+                TAG_KIND_STEP,
+            );
+            let response = out_rx.try_recv().unwrap().into_text();
+            let entries = env.begin_ro().unwrap().entries(env.dbis().event).unwrap();
+            let refusals: u64 = metrics.refusals.counts().map(|(_, count)| count).sum();
+            if stored {
+                assert!(response.contains("true"), "kind {kind}: {response}");
+                assert_eq!((entries, refusals), (1, 0));
+            } else {
+                assert!(
+                    response.contains(
+                        "restricted: kind 1059 is read only after AUTH, which this relay does \
+                         not offer"
+                    ),
+                    "{response}"
+                );
+                assert_eq!(entries, 0);
+                assert_eq!(metrics.refusals.get(Setting::RecipientOnlyKinds), 1);
             }
         }
     }

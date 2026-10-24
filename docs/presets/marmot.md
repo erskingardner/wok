@@ -44,10 +44,11 @@ It also refuses to run without NIP-42, or with gift wraps that anyone but
 their recipient can read: the relay will not start, or reload into a
 `marmot` configuration, unless `relay.auth.service_url` is set,
 `relay.auth.enabled` is on, and kinds 1059 and 21059 are in
-`relay.auth.recipient_only_kinds` (or the stricter `owner_only_kinds`). A
-dashboard or NIP-86 save that would do so is refused with nothing written,
-and `wok doctor` fails its `preset` check. Recipients read their gift wraps
-only after logging in.
+`relay.auth.recipient_only_kinds`. The stricter `owner_only_kinds` passes
+the check too, but only a gift wrap's author can then read it, so recipients
+never receive their Welcomes. A dashboard or NIP-86 save that would do so is
+refused with nothing written, and `wok doctor` fails its `preset` check.
+Recipients read their gift wraps only after logging in.
 
 Everything else keeps its `public` value: the read classes, open read and
 write policies, no lower bound on `created_at`, the 900 s future tolerance,

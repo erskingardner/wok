@@ -70,7 +70,7 @@ that leaves kind 1059 or 21059 out of `relay.auth.recipient_only_kinds` (and
 `owner_only_kinds`), is refused, from the file watcher, a dashboard save or a
 NIP-86 relay-info method, and the running configuration kept; a save then
 answers 409 and writes nothing. `wok doctor` reports it as a failed `preset`
-check.
+check. Owner-only gift wraps pass, but their recipients cannot read them.
 
 Changing `preset` on reload is allowed. The reload log names the preset
 change, and every resulting security-scope change is warn-logged like any
@@ -142,15 +142,17 @@ dashboard shows them read-only. A reload that changes `read_policy` or
 | `relay.auth.accepted_kinds` | `[]` | The kinds the relay accepts; empty accepts every kind. A ceiling for the NIP-86 kind policy. See [Accepted kinds](#accepted-kinds). | Kinds clients publish are refused with `restricted:`. | `restricted_writes` while set |
 
 While AUTH is usable (`enabled` with a `service_url`), every connection
-receives its NIP-42 challenge as soon as it opens. Private reads fail closed
-until then: those reads, and events of every restricted kind, which nobody
-could read, are refused with `restricted:` and no challenge, so NIP-42
-clients do not attempt an AUTH that cannot succeed. An event of a
-recipient-only or authenticated kind, such as a gift wrap, gets
-`restricted: kind 1059 is read only after AUTH, which this relay does not
-offer`, decided by its kind before its signature is verified; NIP-62 vanish
-requests are accepted whatever their class. With `enabled = false` the relay
-refuses AUTH outright.
+receives its NIP-42 challenge as soon as it opens.
+
+While it is not, private reads fail closed: those reads, and events of every
+restricted kind, which nobody could read, are refused with `restricted:` and
+no challenge, so NIP-42 clients do not attempt an AUTH that cannot succeed.
+An event of a recipient-only or authenticated kind, such as a gift wrap,
+gets `restricted: kind 1059 is read only after AUTH, which this relay does
+not offer`, decided by its kind before its signature is verified, and again
+by the writer, so one queued before a reload made AUTH unusable is refused
+too. NIP-62 vanish requests are accepted whatever their class. With
+`enabled = false` the relay refuses AUTH outright.
 
 ### Read classes
 
@@ -245,9 +247,10 @@ A member is a pubkey that is not banned and is NIP-86 allowlisted
   `inbox_kinds = [1]`. The relay warns about such a kind at startup, a reload
   that makes one warns, and `wok doctor` reports it in its `inbox-kinds`
   check. Whatever the class, an inbox event's `OK true` tells an outsider
-  that its first `p` tag is a member that is not banned, and a refusal that
-  it is not: anyone can ask whether a key is a member by publishing one gift
-  wrap to it.
+  that its first `p` tag is a member that is not banned: anyone can ask
+  whether a key is a member by publishing one gift wrap to it. A refusal
+  says it is not only when it is the policy's own, below; the kind policy,
+  signature, proof-of-work and rate checks refuse without asking.
 
 A refused EVENT gets `auth-required:` and a challenge while the connection
 has not authenticated, else `restricted: this relay accepts events only from

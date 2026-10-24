@@ -30,9 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     owner-only kinds already were: an event of a recipient-only or
     authenticated kind, such as a gift wrap on the `default` profile, gets
     `restricted: kind 1059 is read only after AUTH, which this relay does not
-    offer`, by its kind before its signature is verified. Before, it was
-    stored and every read of it refused. NIP-62 vanish requests are still
-    accepted whatever their class.
+    offer`, by its kind before its signature is verified, and again by the
+    writer, so one queued before a reload made AUTH unusable is refused too.
+    Before, it was stored and every read of it refused. NIP-62 vanish
+    requests are still accepted whatever their class.
 - Limits on what an unauthenticated client can make the relay hold or do
   before its budgets apply:
   - **Compressed messages** may inflate to half of

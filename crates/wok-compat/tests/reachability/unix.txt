@@ -1,7 +1,7 @@
 # Relay functions reached in the `unix` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 688
+## anonymous: 695
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -341,19 +341,20 @@
 <wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::refuse::{closure}>
 <wok_relay::server::ConnTable>::with::<usize, <wok_relay::server::ConnTable>::open_count::{closure}>
 <wok_relay::server::ConnectionGuard as core::ops::drop::Drop>::drop
-<wok_relay::server::ConnectionGuard>::client_message
-<wok_relay::server::ConnectionGuard>::client_message::{closure}
 <wok_relay::server::ConnectionGuard>::close
 <wok_relay::server::ConnectionGuard>::close::{closure}
 <wok_relay::server::ConnectionGuard>::conn_id
 <wok_relay::server::ConnectionGuard>::draining
+<wok_relay::server::ConnectionGuard>::hand_over_rest
+<wok_relay::server::ConnectionGuard>::hand_over_rest::{closure}
 <wok_relay::server::ConnectionGuard>::ingress_paused
 <wok_relay::server::ConnectionGuard>::ingress_pauses
-<wok_relay::server::ConnectionGuard>::ingress_resumed
+<wok_relay::server::ConnectionGuard>::ready
 <wok_relay::server::ConnectionGuard>::receive
 <wok_relay::server::ConnectionGuard>::receive::{closure}
 <wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_ws::handle_ws<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}>
 <wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_ws::handle_ws<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}>::{closure}
+<wok_relay::server::ConnectionGuard>::try_queue
 <wok_relay::server::Dispatch>::close
 <wok_relay::server::Dispatch>::monitor_then
 <wok_relay::server::Dispatch>::neg
@@ -362,9 +363,13 @@
 <wok_relay::server::Dispatch>::subscription
 <wok_relay::server::Dispatch>::writer
 <wok_relay::server::Generations>::next
+<wok_relay::server::HeldMessages>::front_len
 <wok_relay::server::HeldMessages>::is_empty
 <wok_relay::server::HeldMessages>::new
 <wok_relay::server::HeldMessages>::over_limit
+<wok_relay::server::InboundShare>::cost
+<wok_relay::server::InboundShare>::new
+<wok_relay::server::InboundShare>::try_acquire
 <wok_relay::server::Lane<wok_relay::server::MonitorMsg, wok_relay::server::ReqMsg>>::close
 <wok_relay::server::Lane<wok_relay::server::MonitorMsg, wok_relay::server::ReqMsg>>::send_then
 <wok_relay::server::Lane<wok_relay::server::NegMsg>>::close
@@ -387,8 +392,6 @@
 <wok_relay::server::OutboundFrame>::is_stale
 <wok_relay::server::OutboundFrame>::is_stale::{closure}
 <wok_relay::server::RelayHandle>::admit_connection
-<wok_relay::server::RelayHandle>::client_message
-<wok_relay::server::RelayHandle>::client_message::{closure}
 <wok_relay::server::RelayHandle>::close
 <wok_relay::server::RelayHandle>::close::{closure}
 <wok_relay::server::RelayHandle>::finish_connection
@@ -618,6 +621,7 @@ wok_relay::server::ingest_event
 wok_relay::server::ingest_event::{closure}
 wok_relay::server::ingest_neg
 wok_relay::server::ingest_neg::{closure}
+wok_relay::server::ingest_neg::{closure}::{closure}
 wok_relay::server::ingest_neg_command
 wok_relay::server::ingest_req
 wok_relay::server::ingest_req::{closure}
@@ -630,6 +634,7 @@ wok_relay::server::negentropy::run_negentropy::{closure}
 wok_relay::server::negentropy::run_negentropy::{closure}::{closure}
 wok_relay::server::negentropy::send_vector
 wok_relay::server::negentropy::send_vector::{closure}
+wok_relay::server::negentropy::snapshot_due
 wok_relay::server::read_gate_refusal
 wok_relay::server::reader_admitted
 wok_relay::server::refuse_req
@@ -662,7 +667,9 @@ wok_ws::dispatch::{closure}
 wok_ws::dispatch::{closure}::{closure}
 wok_ws::empty
 wok_ws::frame::apply_mask
+wok_ws::frame::inflate_allowance
 wok_ws::frame::inflate_into
+wok_ws::frame::inflate_limit
 wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>
 wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>::{closure}
 wok_ws::frame::write_bytes::<tokio::io::split::WriteHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>

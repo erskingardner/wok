@@ -116,7 +116,10 @@ it is not a promise to reproduce upstream bugs.
   unanswered for a full `relay.auto_ping_seconds` interval closes the
   connection).
 - Mesh client connections do not currently offer permessage-deflate. Wok's
-  WebSocket server does negotiate it.
+  WebSocket server does negotiate it, and refuses a compressed message that
+  inflates past half of `relay.max_websocket_payload_size` plus 64 KiB and
+  to more than 32 times its compressed size; strfry inflates any message up
+  to its maximum size.
 - `wok sync` classifies a peer's negative upload ACK as superseded only when
   its reason starts with `blocked: have a newer version` (Wok's reason) or
   `replaced:` (what strfry and earlier Wok releases send). A foreign peer
@@ -358,7 +361,9 @@ regression test. Differential parity alone is not a reason to retain it.
   wraps from throwaway keys are accepted (#97 C7).
 - `[relay.filter_validation]` applies to NEG-OPEN as well as REQ and COUNT,
   so a sync cannot list the ids a REQ may not ask for. The pinned strfry
-  validates REQ and COUNT filters only. `require_scoped_filters`, which Wok
+  validates REQ and COUNT filters only. NEG-OPEN filters also meet
+  `relay.max_req_filter_size` and, per connection,
+  `relay.max_filter_bytes_per_connection`. `require_scoped_filters`, which Wok
   adds, needs each filter to name `ids`, `authors` or a tag.
 - NIP-42: kind 22242 events reach no client. One sent as EVENT is refused
   with `invalid: AUTH events must be sent with AUTH`. `wok import` refuses

@@ -202,16 +202,21 @@ fn inflate_into(
 ) -> Result<(), WsError> {
     let start_in = inner.total_in();
     loop {
-        // Keep spare output capacity so "no progress" reliably means done.
-        if out.capacity() - out.len() < 64 {
-            out.reserve(32 * 1024);
-        }
+        // Each call may write only up to one byte past `max_out`, whatever
+        // the vector's capacity, so a refused message never costs more.
+        let room = (max_out + 1).saturating_sub(out.len()).min(32 * 1024);
+        let len = out.len();
+        out.resize(len + room, 0);
         let consumed = (inner.total_in() - start_in) as usize;
         let in_before = inner.total_in();
         let out_before = inner.total_out();
-        inner
-            .decompress_vec(&input[consumed..], out, flate2::FlushDecompress::Sync)
-            .map_err(|e| WsError::Inflate(e.to_string()))?;
+        let result = inner.decompress(
+            &input[consumed..],
+            &mut out[len..],
+            flate2::FlushDecompress::Sync,
+        );
+        out.truncate(len + (inner.total_out() - out_before) as usize);
+        result.map_err(|e| WsError::Inflate(e.to_string()))?;
         if out.len() > max_out {
             return Err(WsError::MessageTooLarge);
         }
@@ -369,14 +374,31 @@ impl WsParser {
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<WsEvent>, WsError> {
         self.buf.extend_from_slice(data);
         let mut events = Vec::new();
-        self.drain_events_into(&mut events)?;
+        self.drain_events_into(&mut events, usize::MAX)?;
         Ok(events)
     }
 
-    fn drain_events_into(&mut self, events: &mut Vec<WsEvent>) -> Result<(), WsError> {
+    /// Decode buffered frames into `events` until about `budget` bytes of
+    /// messages are decoded. Frames past it stay buffered, still compressed,
+    /// for the next call, so a read full of small compressed frames is not
+    /// all inflated before the caller can hold or refuse any of it.
+    fn drain_events_into(
+        &mut self,
+        events: &mut Vec<WsEvent>,
+        budget: usize,
+    ) -> Result<(), WsError> {
+        // At least one frame is parsed, so its limits are checked whatever
+        // the budget.
+        let mut decoded = 0usize;
         while let Some(frame) = self.try_parse_frame()? {
             if let Some(ev) = self.handle_frame(frame)? {
+                if let WsEvent::Message(_, payload) = &ev {
+                    decoded = decoded.saturating_add(payload.len());
+                }
                 events.push(ev);
+            }
+            if decoded >= budget {
+                break;
             }
         }
         Ok(())
@@ -529,7 +551,7 @@ impl WsParser {
 
     fn maybe_inflate(&mut self, rsv1: bool, payload: Vec<u8>) -> Result<Vec<u8>, WsError> {
         if rsv1 {
-            let max = self.max_message;
+            let max = inflate_limit(payload.len(), self.max_message);
             match &mut self.inflater {
                 Some(d) => d.decompress(&payload, max),
                 None => Err(WsError::Protocol("RSV1 without extension")),
@@ -538,6 +560,29 @@ impl WsParser {
             Ok(payload)
         }
     }
+}
+
+/// How many times its compressed size a message may inflate to past
+/// `inflate_allowance`.
+const MAX_INFLATE_RATIO: usize = 32;
+
+/// Room for a message's envelope around the largest event.
+const INFLATE_ENVELOPE: usize = 64 * 1024;
+
+/// What any compressed message may inflate to whatever its ratio: half the
+/// maximum message size and an envelope, which by default holds the largest
+/// event however repetitive its content.
+fn inflate_allowance(max_message: usize) -> usize {
+    max_message / 2 + INFLATE_ENVELOPE
+}
+
+/// The most a compressed message of `wire_len` bytes may inflate to: its
+/// allowance, or 32 times its compressed size if more, up to the maximum.
+fn inflate_limit(wire_len: usize, max_message: usize) -> usize {
+    wire_len
+        .saturating_mul(MAX_INFLATE_RATIO)
+        .max(inflate_allowance(max_message))
+        .min(max_message)
 }
 
 struct RawFrame {
@@ -676,6 +721,11 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
     frame_deadline: &mut Option<tokio::time::Instant>,
 ) -> Result<(), WsError> {
     events.clear();
+    // Frames a previous call left buffered past its budget come first.
+    parser.drain_events_into(events, parser.max_message)?;
+    if !events.is_empty() {
+        return Ok(());
+    }
     loop {
         // Read directly into the parser's retained buffer. The previous
         // stack-buffer path copied every inbound WebSocket byte a second time
@@ -715,7 +765,7 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
             return Err(WsError::Protocol("eof"));
         }
         parser.read_filled = n >= room;
-        parser.drain_events_into(events)?;
+        parser.drain_events_into(events, parser.max_message)?;
         if parser.buf.is_empty() && !parser.read_filled && parser.grown {
             parser.buf = BytesMut::with_capacity(READ_IDLE);
             parser.grown = false;
@@ -776,6 +826,52 @@ mod tests {
             WsEvent::Message(MessageKind::Text, p) => assert_eq!(p, b"hello"),
             _ => panic!(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_zero_message_limit_still_refuses_a_frame() {
+        let wire = masked_frame(true, false, OP_TEXT, b"hi");
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire).await.unwrap();
+        let mut parser = WsParser::new(0, None);
+        let mut events = Vec::new();
+        let mut deadline = None;
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_events_into(&mut rx, &mut parser, &mut events, None, &mut deadline),
+        )
+        .await
+        .expect("the frame is parsed, not buffered forever");
+        assert!(matches!(read, Err(WsError::MessageTooLarge)));
+    }
+
+    #[tokio::test]
+    async fn one_read_is_decoded_a_message_at_a_time() {
+        // One read carries four compressed messages, each half the maximum
+        // when inflated. A call decodes about a maximum message's worth and
+        // leaves the rest compressed; the next calls return it without
+        // another read.
+        let max = 64 * 1024;
+        let message = vec![b'a'; max / 2];
+        let mut client = DeflateCtx::new(false);
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            let compressed = client.compress(&message).unwrap();
+            wire.extend(masked_frame(true, true, OP_TEXT, &compressed));
+        }
+        let (mut tx, mut rx) = tokio::io::duplex(1 << 16);
+        tx.write_all(&wire).await.unwrap();
+        let mut parser = WsParser::new(max, Some(InflateCtx::new(false)));
+        let mut events = Vec::new();
+        let mut deadline = None;
+        let mut decoded = Vec::new();
+        for _ in 0..2 {
+            read_events_into(&mut rx, &mut parser, &mut events, None, &mut deadline)
+                .await
+                .unwrap();
+            decoded.push(events.len());
+        }
+        assert_eq!(decoded, [2, 2]);
     }
 
     #[tokio::test]
@@ -1021,6 +1117,62 @@ mod tests {
         assert!(!server.is_allocated());
         let wire = client.compress(msg).unwrap();
         assert_eq!(server.decompress(&wire, 1 << 20).unwrap(), msg);
+    }
+
+    #[test]
+    fn inflate_limit_scales_with_the_wire_size() {
+        let max = 2 * 1024 * 1024;
+        // Any message may inflate to its allowance.
+        assert_eq!(inflate_limit(10, max), inflate_allowance(max));
+        // Past that, to its ratio, and never past the maximum.
+        assert_eq!(inflate_limit(40_000, max), 40_000 * MAX_INFLATE_RATIO);
+        assert_eq!(inflate_limit(1 << 20, max), max);
+    }
+
+    /// Compress `message` as a client would and frame it for the server.
+    fn compressed_frame(message: &[u8]) -> Vec<u8> {
+        let compressed = DeflateCtx::new(true).compress(message).unwrap();
+        masked_frame(true, true, OP_TEXT, &compressed)
+    }
+
+    #[test]
+    fn inflating_stops_one_byte_past_the_limit() {
+        let compressed = DeflateCtx::new(false)
+            .compress(&vec![b'a'; 1 << 20])
+            .unwrap();
+        let mut input = compressed;
+        input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+        let mut inner = flate2::Decompress::new(false);
+        // Spare capacity far past the limit must not be filled.
+        let mut out = Vec::with_capacity(1 << 20);
+        let max_out = 100_000;
+        let refused = inflate_into(&mut inner, &input, &mut out, max_out);
+        assert!(matches!(refused, Err(WsError::MessageTooLarge)));
+        assert_eq!(out.len(), max_out + 1);
+    }
+
+    #[test]
+    fn the_largest_event_inflates_however_repetitive() {
+        let max = 2 * 1024 * 1024;
+        let mut server = WsParser::new(max, Some(InflateCtx::new(true)));
+        let content = "a".repeat(1 << 20);
+        let message = format!(r#"["EVENT",{{"content":"{content}"}}]"#);
+        assert!(message.len() > max / 2 && message.len() <= inflate_allowance(max));
+        let frame = compressed_frame(message.as_bytes());
+        let event = server.feed(&frame).unwrap().pop();
+        assert!(
+            matches!(event, Some(WsEvent::Message(MessageKind::Text, body)) if body.len() == message.len())
+        );
+    }
+
+    #[test]
+    fn a_message_past_its_inflate_limit_is_refused() {
+        let max = 2 * 1024 * 1024;
+        let mut server = WsParser::new(max, Some(InflateCtx::new(true)));
+        let message = vec![b'a'; max - 1];
+        let frame = compressed_frame(&message);
+        assert!(frame.len() * MAX_INFLATE_RATIO < max - 1);
+        assert!(matches!(server.feed(&frame), Err(WsError::MessageTooLarge)));
     }
 
     #[test]

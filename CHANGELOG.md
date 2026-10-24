@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Limits on what an unauthenticated client can make the relay hold or do
+  before its budgets apply:
+  - **Compressed messages** may inflate to half of
+    `relay.max_websocket_payload_size` plus 64 KiB whatever their
+    compression, which holds the largest event, and past that to at most 32
+    times their compressed size, never past the maximum. A message past its
+    limit is refused as too large.
+  - **Each connection's queued messages** are bounded: a connection may have
+    at most the largest message a transport accepts, in bytes, and at most 64
+    messages, waiting for the ingester. Its next message is held until there
+    is room, and the transport stops reading once its hold is full, while it
+    keeps writing to the client. A WebSocket read is decoded about a maximum
+    message at a time. Before, one connection could fill the shared ingest
+    queue.
+  - **NEG-CLOSE** is handled by the negentropy worker as one removal each, in
+    a run, instead of a configuration copy, read transaction and pass over
+    every session per message.
+  - **NEG-OPEN** meets `relay.max_req_filter_size`, and a connection's
+    sessions share `relay.max_filter_bytes_per_connection`, as REQs and
+    COUNTs each do. Its payload is decoded after its filter is checked.
+
 - Requests are refused by the cheapest check that can refuse them, before
   their filters are parsed or their signature is verified, where that
   reveals nothing:

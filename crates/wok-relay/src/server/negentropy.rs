@@ -74,6 +74,8 @@ struct Session {
     reservation: Reservation,
     waiting_since: Option<Instant>,
     expires_at: u64,
+    /// The serialized size of the filter it keeps.
+    filter_bytes: usize,
 }
 
 fn fail(conns: &ConnTable, metrics: &Metrics, conn: u64, sid: &str, message: &str) {
@@ -141,6 +143,23 @@ fn read_access(cfg: &Config) -> (AccessPolicy, Option<Vec<String>>) {
     (policy, admins)
 }
 
+/// The most NEG-CLOSEs the worker handles in a row before it takes its next
+/// snapshot.
+const CLOSE_RUN: usize = 1024;
+
+/// How long NEG-CLOSEs alone may keep the worker from its snapshot: its
+/// configuration copy, read transaction and pass over every session.
+const CLOSE_ONLY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether the worker takes its snapshot this pass. It always does before any
+/// other message and while scans run, so sessions and scans see current
+/// policy. A pass that only closed sessions skips it until
+/// `CLOSE_ONLY_SNAPSHOT_INTERVAL` has passed since the last one, so closes
+/// arriving one at a time cost no more than a run of them.
+fn snapshot_due(closed_only: bool, scans_running: bool, since_last: Duration) -> bool {
+    !closed_only || scans_running || since_last >= CLOSE_ONLY_SNAPSHOT_INTERVAL
+}
+
 pub(super) fn run_negentropy(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -161,6 +180,7 @@ pub(super) fn run_negentropy(
     let mut policy = read_visibility(&initial_cfg, vec![]);
     let mut access = read_access(&initial_cfg);
     let mut generation = None;
+    let mut last_snapshot = Instant::now();
     loop {
         let msg = if queries.has_running() {
             match rx.try_recv() {
@@ -175,6 +195,26 @@ pub(super) fn run_negentropy(
                 Err(_) => break,
             }
         };
+        // Closing a session needs no snapshot, so a run of NEG-CLOSEs is
+        // handled here, a removal each. The configuration copy, read
+        // transaction and pass over every session below then run once for
+        // the run, not once per close, and scans still get their timeslice.
+        let mut msg = msg;
+        let mut closed = 0;
+        for _ in 0..CLOSE_RUN {
+            let Some(NegMsg::CloseSub { conn_id, sub_id }) = &msg else {
+                break;
+            };
+            queries.remove_sub(*conn_id, sub_id);
+            sessions.remove(&(*conn_id, sub_id.to_string()));
+            closed += 1;
+            msg = rx.try_recv().ok();
+        }
+        let closed_only = closed > 0 && msg.is_none();
+        if !snapshot_due(closed_only, queries.has_running(), last_snapshot.elapsed()) {
+            continue;
+        }
+        last_snapshot = Instant::now();
         let cfg = cfg.read().clone();
         let txn = match env.begin_ro() {
             Ok(txn) => txn,
@@ -234,6 +274,38 @@ pub(super) fn run_negentropy(
                     let conn = sub.conn_id;
                     let sid = sub.sub_id.to_string();
                     let key = (conn, sid.clone());
+                    // Sessions keep their filters for their lifetime, so a
+                    // connection's sessions have a filter budget, as its live
+                    // REQs and its COUNTs each do. The session this replaces
+                    // is counted out, so, as for a REQ, a replacement no
+                    // larger than it always fits.
+                    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
+                    let replaced = sessions.get(&key).map_or(0, |session| session.filter_bytes);
+                    let held: usize = sessions
+                        .iter()
+                        .filter(|(k, _)| k.0 == conn)
+                        .map(|(_, session)| session.filter_bytes)
+                        .sum();
+                    if filter_budget != 0
+                        && filter_str.len() > replaced
+                        && held - replaced + filter_str.len() > filter_budget
+                    {
+                        // NIP-77: reusing the id closed its session, and the
+                        // NEG-ERR ends this one, so neither is kept.
+                        sessions.remove(&key);
+                        queries.remove_sub(conn, &sub.sub_id);
+                        metrics.refused(Setting::MaxFilterBytesPerConnection);
+                        fail(
+                            &conns,
+                            &metrics,
+                            conn,
+                            &sid,
+                            &format!(
+                                "blocked: this connection's filters exceed {filter_budget} bytes"
+                            ),
+                        );
+                        continue;
+                    }
                     sessions.remove(&key);
                     queries.remove_sub(conn, &sub.sub_id);
                     // The ingester admitted this NEG-OPEN by the read policy
@@ -362,6 +434,7 @@ pub(super) fn run_negentropy(
                         reservation,
                         waiting_since: None,
                         expires_at: u64::MAX,
+                        filter_bytes: filter_str.len(),
                     };
                     if let View::Tree { sub, tree_id } = &session.view {
                         if !reconcile_tree(
@@ -730,6 +803,288 @@ mod tests {
             (&json!("NEG-MSG"), &json!("member"))
         );
         assert_eq!(metrics.refusals.get(Setting::ReadPolicy), 1);
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn closes_alone_take_a_snapshot_at_most_every_interval() {
+        let soon = CLOSE_ONLY_SNAPSHOT_INTERVAL / 10;
+        // Closes alone, just after a snapshot: none, however they arrive.
+        assert!(!snapshot_due(true, false, soon));
+        // Once the interval has passed, closes alone take one.
+        assert!(snapshot_due(true, false, CLOSE_ONLY_SNAPSHOT_INTERVAL));
+        // Any other message, or a running scan, always takes one.
+        assert!(snapshot_due(false, false, soon));
+        assert!(snapshot_due(true, true, soon));
+    }
+
+    /// A long run of NEG-CLOSEs, almost all for sessions that do not exist,
+    /// closes the one that does, and the NEG-OPEN queued behind the run is
+    /// still answered.
+    #[test]
+    fn a_run_of_closes_closes_its_session_and_the_next_open_is_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let conns = conns.clone();
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let open = |sub_id: &str| {
+            let filter = json!({"kinds": [1]});
+            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        let close = |sub_id: &str| NegMsg::CloseSub {
+            conn_id: 1,
+            sub_id: SubId::new(sub_id).unwrap(),
+        };
+
+        tx.send(open("kept")).unwrap();
+        assert_eq!(next(&mut out_rx)[1], "kept");
+        for n in 0..3 * CLOSE_RUN {
+            tx.send(close(&format!("none-{n}"))).unwrap();
+        }
+        tx.send(close("kept")).unwrap();
+        tx.send(open("next")).unwrap();
+        let reply = next(&mut out_rx);
+        assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!("next")));
+        tx.send(NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new("kept").unwrap(),
+            payload: init.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            next(&mut out_rx),
+            json!(["NEG-ERR", "kept", "closed: unknown subscription handle"])
+        );
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// A connection's sessions share `max_filter_bytes_per_connection`: a
+    /// NEG-OPEN past it is refused, a replacement no larger than the session
+    /// it replaces always fits, and closing a session gives its bytes back.
+    /// A refused replacement closes the session it reused, as NIP-77 says.
+    #[test]
+    fn sessions_share_the_connection_filter_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let filter = json!({"kinds": [1]});
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        // Room for two sessions' filters, not three.
+        cfg.relay.max_filter_bytes_per_connection = 2 * filter.to_string().len() + 1;
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let metrics = Arc::new(Metrics::default());
+        let worker = {
+            let (conns, metrics) = (conns.clone(), metrics.clone());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let open_with = |sub_id: &str, filter: &Value| {
+            let group = NostrFilterGroup::from_value(filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        let open = |sub_id: &str| open_with(sub_id, &filter);
+        let answer = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>| {
+            let reply = next(rx);
+            (
+                reply[0].as_str().unwrap().to_string(),
+                reply[1].as_str().unwrap().to_string(),
+            )
+        };
+
+        for sub_id in ["a", "b"] {
+            tx.send(open(sub_id)).unwrap();
+            assert_eq!(answer(&mut out_rx), ("NEG-MSG".into(), sub_id.into()));
+        }
+        tx.send(open("c")).unwrap();
+        let refused = next(&mut out_rx);
+        assert_eq!((&refused[0], &refused[1]), (&json!("NEG-ERR"), &json!("c")));
+        assert!(refused[2]
+            .as_str()
+            .unwrap()
+            .starts_with("blocked: this connection's filters"));
+        assert_eq!(
+            metrics.refusals.get(Setting::MaxFilterBytesPerConnection),
+            1
+        );
+        // Replacing a session with a filter no larger reuses its own bytes.
+        tx.send(open("a")).unwrap();
+        assert_eq!(answer(&mut out_rx), ("NEG-MSG".into(), "a".into()));
+        // A larger replacement past the budget is refused, and the session
+        // whose id it reused is closed.
+        tx.send(open_with("a", &json!({"kinds": [1, 2, 3]})))
+            .unwrap();
+        let refused = next(&mut out_rx);
+        assert_eq!((&refused[0], &refused[1]), (&json!("NEG-ERR"), &json!("a")));
+        tx.send(NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new("a").unwrap(),
+            payload: init.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            next(&mut out_rx),
+            json!(["NEG-ERR", "a", "closed: unknown subscription handle"])
+        );
+        // Closing one frees its bytes.
+        tx.send(NegMsg::CloseSub {
+            conn_id: 1,
+            sub_id: SubId::new("b").unwrap(),
+        })
+        .unwrap();
+        tx.send(open("c")).unwrap();
+        assert_eq!(answer(&mut out_rx), ("NEG-MSG".into(), "c".into()));
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// A refused replacement of a session whose scan is still waiting also
+    /// cancels that scan: once the scan ahead of it finishes, nothing comes
+    /// for the id.
+    #[test]
+    fn a_refused_replacement_cancels_the_waiting_scan_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = wok_db::EnvOptions {
+            map_size: 1 << 30,
+            ..wok_db::EnvOptions::default()
+        };
+        let env = Env::open(dir.path(), options).unwrap();
+        env.ensure_initialized().unwrap();
+        // Enough notes that a scan over them takes many timeslices.
+        let mut events: Vec<wok_db::EventToWrite> = (0..5_000u64)
+            .map(|i| {
+                let mut id = [0xCCu8; 32];
+                id[..8].copy_from_slice(&i.to_be_bytes());
+                let event = json!({
+                    "id": hex::encode(id), "pubkey": "ab".repeat(32),
+                    "created_at": 1_700_000_000 + i, "kind": 1, "tags": [],
+                    "content": "note", "sig": "00".repeat(64),
+                });
+                let parsed = wok_event::parse_and_verify_event(
+                    &event,
+                    &wok_event::EventLimits::default(),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+                wok_db::EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+
+        let notes = json!({"kinds": [1]});
+        let small = json!({"kinds": [7]});
+        let large = json!({"kinds": [7, 8, 9]});
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        // One scan at a time, in short slices, and room for `notes` and
+        // `small` but not `notes` and `large`.
+        cfg.relay.abuse.max_concurrent_historical_queries = 1;
+        cfg.relay.query_timeslice_budget_us = 1;
+        cfg.relay.max_filter_bytes_per_connection =
+            notes.to_string().len() + small.to_string().len() + 1;
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let conns = conns.clone();
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let open = |sub_id: &str, filter: &Value| {
+            let group = NostrFilterGroup::from_value(filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        // Frames until one for `sub_id` of type `kind`, none of them an
+        // answer for "a".
+        let until = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutboundFrame>,
+                     kind: &str,
+                     sub_id: &str| loop {
+            let frame = next(rx);
+            assert_ne!(
+                (&frame[0], &frame[1]),
+                (&json!("NEG-MSG"), &json!("a")),
+                "the replaced session answered"
+            );
+            if frame[0] == kind && frame[1] == sub_id {
+                return frame;
+            }
+        };
+
+        // "x" takes the only scan slot, so "a" waits behind it.
+        tx.send(open("x", &notes)).unwrap();
+        tx.send(open("a", &small)).unwrap();
+        tx.send(open("a", &large)).unwrap();
+        let refused = until(&mut out_rx, "NEG-ERR", "a");
+        assert!(refused[2]
+            .as_str()
+            .unwrap()
+            .starts_with("blocked: this connection's filters"));
+        // "x" finishes, and the scan "a" waited for never starts.
+        until(&mut out_rx, "NEG-MSG", "x");
+        tx.send(NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new("a").unwrap(),
+            payload: init.clone(),
+        })
+        .unwrap();
+        let reply = until(&mut out_rx, "NEG-ERR", "a");
+        assert_eq!(reply[2], "closed: unknown subscription handle");
         drop(tx);
         worker.join().unwrap();
     }

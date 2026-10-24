@@ -73,6 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started without one keeps metrics off until then. **Upgrading:** a relay scraped at `/metrics`
   must set `metrics_enabled = true`, preferably with `metrics_listen` on a
   private address, and point Prometheus there.
+- NodeInfo is off by default (#166). `/.well-known/nodeinfo` and
+  `/nodeinfo/2.1` were served in every configuration, though no Nostr client
+  or Marmot client uses them and NIP-11 already gives the software and its
+  version, and the discovery link repeats the request's `Host` header (#152).
+  `relay.nodeinfo_enabled` turns them on, and reloads live; while it is off
+  both paths answer 404, and turning it on or off is logged as a
+  security-scope change. **Upgrading:** a relay that should stay listed by
+  NodeInfo crawlers must set `relay.nodeinfo_enabled = true`.
 - With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`
   by sending its own X-Forwarded-For. A proxy that appends the client's
   address to that header (nginx's `$proxy_add_x_forwarded_for`) passed Wok a
@@ -414,6 +422,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since MDK never sends COUNT or offers compression (#166): a COUNT is
   refused with `blocked: bad req: COUNT disabled`, NIP-11 does not list
   NIP-45, and a client that offers deflate gets an uncompressed connection.
+- `public`: `relay.nodeinfo_enabled` is `false` (new), so NodeInfo is not
+  served (see Security).
 - `public`: `relay.auth.owner_only_kinds` is `[78, 30078]` (new), so NIP-78
   app data is read and published only by its author (see Security). Apps
   that publish public data in these kinds can no longer be read by other
@@ -871,10 +881,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the disallowed kinds. Which kinds are accepted does not change.
 - The relay is served on a single endpoint, as NIP-01 requires. Only `/`
   accepts WebSocket upgrades and serves NIP-11, NIP-86 and the landing page;
-  other paths return 404, apart from `/admin`, `/metrics` and the nodeinfo
-  routes. Before, every path upgraded and served NIP-11, so one relay
-  answered under any number of URLs. A reverse proxy that serves the relay
-  under a path prefix must now strip the prefix.
+  other paths return 404, apart from `/admin` and, when they are on,
+  `/metrics` and the NodeInfo routes. Before, every path upgraded and served
+  NIP-11, so one relay answered under any number of URLs. A reverse proxy
+  that serves the relay under a path prefix must now strip the prefix.
 - Relay HTTP responses send `Access-Control-Allow-Headers` (`Content-Type,
   Authorization, Accept`) and `Access-Control-Allow-Methods` (`GET, POST,
   OPTIONS`) as well as `Access-Control-Allow-Origin`, as NIP-11 requires, and

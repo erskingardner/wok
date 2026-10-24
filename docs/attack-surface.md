@@ -69,8 +69,8 @@ WebSocket upgrade on any path but `/`.
 | --- | --- | --- | --- |
 | `/` | anonymous | none | A WebSocket upgrade starts a [message](#messages) connection, unless its address already holds `relay.abuse.max_connections_per_address` connections open, which gets 429. A `POST` with `Content-Type: application/nostr+json+rpc` goes to the [management API](#management-api). Anything else gets the NIP-11 document when `Accept` names `application/nostr+json`, and the landing page otherwise. |
 | `/metrics` | anonymous | `observability.metrics_enabled` and no `observability.metrics_listen` | Prometheus metrics, with `Access-Control-Allow-Origin: *`. With `metrics_listen` set they move to the [metrics listener](#metrics-listener). See [observability](observability.md). |
-| `/.well-known/nodeinfo` | anonymous | none | NodeInfo discovery. The link's host is the request's `Host` header. |
-| `/nodeinfo/2.1` | anonymous | none | The NodeInfo document. |
+| `/.well-known/nodeinfo` | anonymous | `relay.nodeinfo_enabled` | NodeInfo discovery. The link's host is the request's `Host` header. |
+| `/nodeinfo/2.1` | anonymous | `relay.nodeinfo_enabled` | The NodeInfo document. |
 | `/favicon.ico` | anonymous | none | A fixed empty icon. |
 | `/admin`, `/admin/` | anonymous | `admin.enabled` | `GET` returns the signed-out [dashboard](admin-dashboard.md) shell, which holds no relay data. Other methods get 404. |
 | `/admin/api/*` | admin | `admin.enabled` | Every method and path under the prefix checks its NIP-98 `Authorization: Nostr` header before reading the body: it decodes the header and parses its event strictly; checks its kind, empty content, time window and `u` and `method` tags; checks that the signer it names is in `admin.pubkeys`; and verifies the event and its signature. A request that fails any of these is refused without its body being read. A signer not in the list and a bad signature get the same 401, so a forged event cannot ask which keys are admins. It then reads the body (at most 64 KiB), checks the time window again and the `payload` tag when the request has a body, and claims the event in the replay cache. Only then does it route, to `GET /admin/api/overview` or `PUT /admin/api/config`; configuration writes also need `admin.allow_config_writes`. |
@@ -99,9 +99,11 @@ same ingester. Before Wok reads a message's verb:
   the message, up to `relay.max_websocket_payload_size`. Past half that size
   plus 64 KiB, a message may inflate to at most 32 times its compressed
   size; one past its limit is refused before more of it is inflated. `relay.frame_read_timeout_secs` is the
-  longest gap between reads while part of a frame or message is buffered;
-  a pause while the relay does not read, because the connection's hold is
-  full, does not count against it.
+  longest gap between reads while part of a frame or message is buffered,
+  and `relay.message_read_timeout_secs` the longest a message or control
+  frame may take from its first byte to its last; a pause while the relay
+  does not read, because the connection's hold is full, counts against
+  neither.
 - **Unix socket:** the peer check runs once, when the connection is accepted
   and before any frame is read. Each frame's four-byte length is checked
   against `relay.unix.max_frame_bytes` before its body is read.
@@ -222,8 +224,8 @@ of every profile:
   gate, and REQs, COUNTs and NEG-* messages that are served or refused;
 - malformed messages, and AUTH with right and wrong challenges and
   signatures;
-- HTTP requests for NIP-11, the landing page, `OPTIONS /`, `/metrics` and
-  `/admin`; the dashboard API and NIP-86 unsigned, signed by a stranger and
+- HTTP requests for NIP-11, the landing page, `OPTIONS /`, `/metrics`, the
+  NodeInfo paths and `/admin`; the dashboard API and NIP-86 unsigned, signed by a stranger and
   forged; and `/metrics` on the metrics listener when the profile has one.
 
 It saves what the relay answers in `tests/transcripts/<profile>.txt`. Ids,

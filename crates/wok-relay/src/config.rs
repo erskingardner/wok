@@ -218,6 +218,9 @@ pub struct RelayConfig {
     pub real_ip_header: String,
     pub auth: AuthConfig,
     pub info: InfoConfig,
+    /// Serve NodeInfo discovery (`/.well-known/nodeinfo`) and its document
+    /// (`/nodeinfo/2.1`). No Nostr client needs them.
+    pub nodeinfo_enabled: bool,
     pub max_websocket_payload_size: usize,
     /// Maximum combined compact-JSON bytes across all filter objects in one
     /// REQ or COUNT command.
@@ -237,6 +240,10 @@ pub struct RelayConfig {
     /// or unfinished fragmented message is buffered (slow-trickle guard);
     /// zero disables it.
     pub frame_read_timeout_secs: u64,
+    /// Longest time from the first byte of a WebSocket message or control
+    /// frame to its last, not counting pauses while the relay does not read
+    /// (slow-trickle guard); zero disables it.
+    pub message_read_timeout_secs: u64,
     pub query_timeslice_budget_us: u64,
     pub max_filter_limit: u64,
     pub max_tags_per_filter: usize,
@@ -495,6 +502,7 @@ impl Default for Config {
                     privacy: String::new(),
                     terms: String::new(),
                 },
+                nodeinfo_enabled: false,
                 max_websocket_payload_size: 2 * wok_event::DEFAULT_MAX_EVENT_SIZE,
                 max_req_filter_size: 262_144,
                 max_filter_bytes_per_connection: 2_097_152,
@@ -503,6 +511,7 @@ impl Default for Config {
                 enable_tcp_keepalive: false,
                 handshake_timeout_secs: 10,
                 frame_read_timeout_secs: 30,
+                message_read_timeout_secs: 120,
                 query_timeslice_budget_us: 10000,
                 max_filter_limit: 2_000,
                 max_tags_per_filter: 8,
@@ -1567,6 +1576,12 @@ impl Config {
                 self.relay.negentropy_enabled, new.relay.negentropy_enabled,
             ));
         }
+        if self.relay.nodeinfo_enabled != new.relay.nodeinfo_enabled {
+            changes.push(format!(
+                "relay.nodeinfo_enabled changed: {} -> {}",
+                self.relay.nodeinfo_enabled, new.relay.nodeinfo_enabled,
+            ));
+        }
         changes
     }
 
@@ -1752,6 +1767,12 @@ impl Config {
             warnings.push(ZeroGuard::new(
                 &["relay.frame_read_timeout_secs"],
                 "relay.frame_read_timeout_secs is zero — partial-frame trickle guard disabled",
+            ));
+        }
+        if zeroed(r.message_read_timeout_secs, pr.message_read_timeout_secs) {
+            warnings.push(ZeroGuard::new(
+                &["relay.message_read_timeout_secs"],
+                "relay.message_read_timeout_secs is zero — whole-message trickle guard disabled",
             ));
         }
         warnings
@@ -2805,6 +2826,19 @@ negentropy_enabled = true
     }
 
     #[test]
+    fn nodeinfo_is_off_by_default_and_reloads_live() {
+        let mut running = Config::default();
+        assert!(!running.relay.nodeinfo_enabled);
+        let on = Config::parse_toml("[relay]\nnodeinfo_enabled = true\n").unwrap();
+        assert_eq!(
+            running.security_scope_changes(&on),
+            ["relay.nodeinfo_enabled changed: false -> true"]
+        );
+        running.apply_reload(on).unwrap();
+        assert!(running.relay.nodeinfo_enabled);
+    }
+
+    #[test]
     fn per_connection_budgets_have_their_own_table() {
         let cfg = Config::parse_toml(
             "[relay.abuse]\nreq_burst = 300\n\n\
@@ -3102,6 +3136,7 @@ negentropy_enabled = true
             "max_pending_outbound_bytes",
             "handshake_timeout_secs",
             "frame_read_timeout_secs",
+            "message_read_timeout_secs",
         ] {
             let cfg = Config::parse_toml(&format!("[relay]\n{field} = 0\n")).unwrap();
             assert!(

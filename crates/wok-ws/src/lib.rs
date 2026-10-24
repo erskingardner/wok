@@ -12,8 +12,8 @@ mod nip86;
 
 use bytes::Bytes;
 use frame::{
-    read_events_into, write_bytes, DeflateCtx, InflateCtx, MessageKind, WsEncoder, WsEvent,
-    WsParser, OP_PING, OP_PONG,
+    read_events_into, write_bytes, DeflateCtx, InflateCtx, MessageKind, ReadDeadlines, WsEncoder,
+    WsEvent, WsParser, OP_PING, OP_PONG,
 };
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -321,15 +321,18 @@ async fn dispatch(
     if matches!(path.as_str(), "/admin" | "/admin/") || path.starts_with("/admin/api/") {
         return admin::dispatch(req, handle, admin_state).await;
     }
-    // `/metrics` is a route only while the relay listener serves it, so a
-    // relay without metrics answers it, preflight included, like any path.
-    let metrics_here = path == "/metrics" && handle.config.read().metrics_on_relay_listener();
-    if !metrics_here
-        && !matches!(
-            path.as_str(),
-            "/" | "/.well-known/nodeinfo" | "/nodeinfo/2.1" | "/favicon.ico"
+    // `/metrics` and the NodeInfo paths are routes only while the relay
+    // listener serves them, so a relay without them answers them, preflight
+    // included, like any path.
+    let (metrics_here, nodeinfo_here) = {
+        let cfg = handle.config.read();
+        (
+            path == "/metrics" && cfg.metrics_on_relay_listener(),
+            matches!(path.as_str(), "/.well-known/nodeinfo" | "/nodeinfo/2.1")
+                && cfg.relay.nodeinfo_enabled,
         )
-    {
+    };
+    if !metrics_here && !nodeinfo_here && !matches!(path.as_str(), "/" | "/favicon.ico") {
         return not_found();
     }
     if req.method() == hyper::Method::OPTIONS {
@@ -348,42 +351,13 @@ async fn dispatch(
     {
         return with_cors(nip86::dispatch(req, handle, admin_state).await);
     }
-    let host = req
-        .headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
     let wants_nip11 = accepts_nip11(req.headers());
     let cfg = handle.config.read().clone();
     if metrics_here {
         return text_response(METRICS_CONTENT_TYPE, handle.metrics.render());
     }
-    if path == "/.well-known/nodeinfo" {
-        let body = serde_json::json!({
-            "links": [{
-                "rel": "http://nodeinfo.diaspora.software/ns/schema/2.1",
-                "href": format!("https://{host}/nodeinfo/2.1"),
-            }]
-        });
-        return json_response(&body);
-    }
-    if path == "/nodeinfo/2.1" {
-        let body = serde_json::json!({
-            "version": "2.1",
-            "software": {
-                "name": "wok",
-                "version": VERSION,
-                "repository": "https://github.com/erskingardner/wok",
-                "homepage": "https://github.com/erskingardner/wok",
-            },
-            "protocols": ["nostr"],
-            "services": { "inbound": [], "outbound": [] },
-            "openRegistrations": false,
-            "usage": { "users": {} },
-            "metadata": { "features": ["nostr_relay"] },
-        });
-        return json_response(&body);
+    if nodeinfo_here {
+        return nodeinfo(&path, req.headers());
     }
     if path == "/favicon.ico" {
         return with_cors(
@@ -406,6 +380,38 @@ async fn dispatch(
         hyper::header::HeaderValue::from_static("Accept"),
     );
     response
+}
+
+/// NodeInfo discovery (`/.well-known/nodeinfo`) or its document
+/// (`/nodeinfo/2.1`), served while `relay.nodeinfo_enabled` is on. The
+/// discovery link's host is the request's `Host` header.
+fn nodeinfo(path: &str, headers: &hyper::HeaderMap) -> Response<Full<Bytes>> {
+    if path == "/.well-known/nodeinfo" {
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        return json_response(&serde_json::json!({
+            "links": [{
+                "rel": "http://nodeinfo.diaspora.software/ns/schema/2.1",
+                "href": format!("https://{host}/nodeinfo/2.1"),
+            }]
+        }));
+    }
+    json_response(&serde_json::json!({
+        "version": "2.1",
+        "software": {
+            "name": "wok",
+            "version": VERSION,
+            "repository": "https://github.com/erskingardner/wok",
+            "homepage": "https://github.com/erskingardner/wok",
+        },
+        "protocols": ["nostr"],
+        "services": { "inbound": [], "outbound": [] },
+        "openRegistrations": false,
+        "usage": { "users": {} },
+        "metadata": { "features": ["nostr_relay"] },
+    }))
 }
 
 /// The client a request's `relay.real_ip_header` names.
@@ -957,9 +963,14 @@ async fn handle_ws<S>(
 {
     let source = TransportSource::ip_address(peer.ip());
     let auto_ping = handle.config.read().relay.auto_ping_seconds;
-    let frame_read_timeout = handle.config.read().relay.frame_read_timeout_secs;
-    let frame_idle_timeout =
-        (frame_read_timeout > 0).then(|| std::time::Duration::from_secs(frame_read_timeout));
+    let (frame_read_timeout, message_read_timeout) = {
+        let cfg = handle.config.read();
+        let timeout = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
+        (
+            timeout(cfg.relay.frame_read_timeout_secs),
+            timeout(cfg.relay.message_read_timeout_secs),
+        )
+    };
     // Pending memory is bounded by max_pending_outbound_bytes in Outbound.
     // A second message-count bound incorrectly disconnected healthy clients
     // during bursty historical responses with many small events.
@@ -995,10 +1006,10 @@ async fn handle_ws<S>(
     // Liveness: a ping unanswered when the next ping interval elapses means
     // the peer is gone (or deliberately silent) — close the connection.
     let mut awaiting_pong = false;
-    // Absolute partial-frame deadline, kept here (not inside the read
-    // future) so select! cancellation by outbound traffic or pings cannot
-    // restart it.
-    let mut frame_deadline = None;
+    // The partial-frame and partial-message deadlines, kept here (not inside
+    // the read future) so select! cancellation by outbound traffic or pings
+    // cannot restart them.
+    let mut deadlines = ReadDeadlines::new(frame_read_timeout, message_read_timeout);
     // Messages read while the relay has paused this connection's ingress
     // (earlier work is parked behind a busy worker). The socket stays read,
     // so control frames, Close and EOF are still handled while paused. Once
@@ -1012,14 +1023,16 @@ async fn handle_ws<S>(
         'outer: loop {
             let draining = connection.draining(&held);
             // While the hold is full the relay, not the client, has stopped
-            // reading, so that pause counts neither against the frame gap
-            // nor against a ping, whose pong it could not read: no ping goes
-            // out meanwhile, and the next one waits a full interval after
-            // reading resumes.
+            // reading, so that pause counts neither against the frame gap or
+            // the message deadline nor against a ping, whose pong it could
+            // not read: no ping goes out meanwhile, and the next one waits a
+            // full interval after reading resumes.
             if draining {
-                frame_deadline = None;
+                deadlines.pause();
                 awaiting_pong = false;
                 ping.reset();
+            } else {
+                deadlines.resume();
             }
             tokio::select! {
                 _ = ping.tick(), if auto_ping > 0 && !draining => {
@@ -1044,7 +1057,7 @@ async fn handle_ws<S>(
                     connection.hand_over(&mut held).await;
                 }
                 _ = connection.ingress_pauses(), if draining => {}
-                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, frame_idle_timeout, &mut frame_deadline), if !draining => {
+                incoming = read_events_into(&mut rd, &mut parser, &mut incoming_events, &mut deadlines), if !draining => {
                     match incoming {
                         Ok(()) => {
                             for ev in incoming_events.drain(..) {
@@ -1621,6 +1634,29 @@ mod metrics_tests {
         served.handle.config.write().observability.metrics_enabled = true;
         assert_eq!(request(served.metrics, "GET", "/metrics").await.0, 200);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nodeinfo_is_off_by_default_and_follows_its_setting_live() {
+        let served = serve_both(|_| {}).await;
+        for path in ["/.well-known/nodeinfo", "/nodeinfo/2.1"] {
+            for method in ["GET", "OPTIONS"] {
+                assert_eq!(request(served.relay, method, path).await.0, 404);
+            }
+        }
+        served.handle.config.write().relay.nodeinfo_enabled = true;
+        let (status, _, body) = request(served.relay, "GET", "/.well-known/nodeinfo").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("https://localhost/nodeinfo/2.1"), "{body}");
+        let (status, _, body) = request(served.relay, "GET", "/nodeinfo/2.1").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("\"protocols\":[\"nostr\"]"), "{body}");
+        assert_eq!(
+            request(served.relay, "OPTIONS", "/nodeinfo/2.1").await.0,
+            204
+        );
+        served.handle.config.write().relay.nodeinfo_enabled = false;
+        assert_eq!(request(served.relay, "GET", "/nodeinfo/2.1").await.0, 404);
+    }
 }
 
 #[cfg(test)]
@@ -1852,6 +1888,20 @@ mod ingress_pause_tests {
     /// however long the pause outlasted `frame_read_timeout_secs`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pause_with_a_full_hold_does_not_spend_the_frame_gap() {
+        completes_a_frame_after_a_full_hold_pause(1, 0).await;
+    }
+
+    /// Nor does it count against `message_read_timeout_secs`, which runs
+    /// from the frame's first byte, read before the pause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pause_with_a_full_hold_does_not_spend_the_message_deadline() {
+        completes_a_frame_after_a_full_hold_pause(0, 2).await;
+    }
+
+    /// Fill a connection's hold behind a stalled ingester, with the first
+    /// byte of one more frame read, wait 2.5 s, then complete the frame and
+    /// expect its answer.
+    async fn completes_a_frame_after_a_full_hold_pause(frame_timeout: u64, message_timeout: u64) {
         let dir = tempfile::tempdir().unwrap();
         let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
         let mut cfg = Config {
@@ -1861,7 +1911,8 @@ mod ingress_pause_tests {
         cfg.relay.ingester_threads = 1;
         cfg.relay.max_websocket_payload_size = 4096;
         cfg.relay.unix.max_frame_bytes = 4096;
-        cfg.relay.frame_read_timeout_secs = 1;
+        cfg.relay.frame_read_timeout_secs = frame_timeout;
+        cfg.relay.message_read_timeout_secs = message_timeout;
         cfg.relay.compression_enabled = false;
         cfg.relay.abuse.enabled = false;
         let handle = wok_relay::start(env, cfg).unwrap();
@@ -1886,7 +1937,11 @@ mod ingress_pause_tests {
         assert!(head.starts_with(b"HTTP/1.1 101"));
 
         // Stall the ingester, so the connection's share and then its hold
-        // fill, with the first byte of one more frame buffered behind them.
+        // fill, with the first byte of one more frame read behind them. A
+        // REQ of 22 ids is about 1.5 KiB: two fill the 4 KiB share and three
+        // more take the hold past its limit. The fifth arrives on its own
+        // with that byte, so nothing read is left to decode, and nothing
+        // finished, once the relay stops reading.
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let config = handle.config.clone();
@@ -1896,14 +1951,17 @@ mod ingress_pause_tests {
             let _ = release_rx.recv();
         });
         locked_rx.recv().unwrap();
-        let mut burst = Vec::new();
-        for n in 0..120 {
-            let req = format!(r#"["REQ","s{n:03}",{{"ids":["{}"]}}]"#, "0".repeat(64));
-            burst.extend(masked_text(req.as_bytes()));
-        }
+        let ids = vec![format!("\"{}\"", "0".repeat(64)); 22].join(",");
+        let req = |n: usize| masked_text(format!(r#"["REQ","s{n}",{{"ids":[{ids}]}}]"#).as_bytes());
+        stream
+            .write_all(&(0..4).flat_map(req).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let last = masked_text(br#"["REQ","last",{"kinds":[1]}]"#);
-        burst.push(last[0]);
-        stream.write_all(&burst).await.unwrap();
+        let mut fifth = req(4);
+        fifth.push(last[0]);
+        stream.write_all(&fifth).await.unwrap();
         tokio::time::sleep(Duration::from_millis(2_500)).await;
         release_tx.send(()).unwrap();
         stall.join().unwrap();

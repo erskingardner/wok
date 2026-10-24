@@ -439,6 +439,7 @@ fn gate_open(cfg: &Config, gate: &str) -> bool {
             cfg.metrics_on_relay_listener()
         }
         "`observability.metrics_enabled`" => cfg.observability.metrics_enabled,
+        "`relay.nodeinfo_enabled`" => cfg.relay.nodeinfo_enabled,
         other => panic!("teach gate_open the gate {other}"),
     }
 }

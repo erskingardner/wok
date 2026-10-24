@@ -848,6 +848,9 @@ struct AuthSession {
     identities: Vec<[u8; 32]>,
 }
 
+/// The most messages one connection may have waiting for the ingester.
+const MAX_QUEUED_MESSAGES: u32 = 64;
+
 /// A connection's share of the ingest queue: the bytes of its messages handed
 /// to the ingester and not yet handled. A message waits for its share before
 /// it is queued, so one connection never has more than the largest message
@@ -867,9 +870,14 @@ impl InboundShare {
         }
     }
 
-    /// The share a message of `len` bytes takes: all of it, if larger.
+    /// The share a message of `len` bytes takes: all of it, if larger, and
+    /// at least `1 / MAX_QUEUED_MESSAGES` of it, so however small its
+    /// messages a connection takes few of the ingest queue's slots.
     fn cost(&self, len: usize) -> u32 {
-        u32::try_from(len).unwrap_or(u32::MAX).clamp(1, self.limit)
+        let floor = (self.limit / MAX_QUEUED_MESSAGES).max(1);
+        u32::try_from(len)
+            .unwrap_or(u32::MAX)
+            .clamp(floor, self.limit)
     }
 
     /// Wait until `len` bytes fit in the share, and hold them until the
@@ -965,8 +973,13 @@ impl ConnectionGuard {
         }
         if held.is_empty() {
             if let Some(share) = self.inbound.try_acquire(text.len()) {
-                self.queue(text, share).await;
-                return true;
+                match self.try_queue(text, share) {
+                    Ok(()) => return true,
+                    Err(text) => {
+                        held.push_back(text, wire_len);
+                        return true;
+                    }
+                }
             }
         }
         held.push_back(text, wire_len);
@@ -974,13 +987,16 @@ impl ConnectionGuard {
     }
 
     /// Resolves once the first held message, `front` bytes long, can be
-    /// handed over: ingress is open and the connection's share has room for
-    /// it. Cancel-safe. Only the transport takes from its share, so the room
-    /// stays until `hand_over` takes it.
+    /// handed over: ingress is open, the connection's share has room for it
+    /// and its ingester's queue has a slot. Cancel-safe. Only the transport
+    /// takes from its share, so that room stays until `hand_over` takes it;
+    /// another connection may take the slot first, and `hand_over` then
+    /// leaves the message held for the next `ready`.
     pub async fn ready(&self, front: Option<usize>) {
         self.ingress_resumed().await;
         if let Some(len) = front {
             drop(self.inbound.acquire(len).await);
+            drop(self.handle.ingest_route(self.conn_id).reserve().await);
         }
     }
 
@@ -1000,8 +1016,11 @@ impl ConnectionGuard {
                 break;
             };
             let (text, cost) = held.queue.pop_front().expect("a held message");
+            if let Err(text) = self.try_queue(text, share) {
+                held.queue.push_front((text, cost));
+                break;
+            }
             held.bytes -= cost;
-            self.queue(text, share).await;
         }
     }
 
@@ -1025,6 +1044,28 @@ impl ConnectionGuard {
         self.handle
             .queue_client_message(self.conn_id, self.source.clone(), text, Some(share))
             .await;
+    }
+
+    /// Queue a message if the ingester's queue has a slot now; otherwise give
+    /// it back, releasing its share, for the caller to hold.
+    fn try_queue(
+        &self,
+        text: String,
+        share: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), String> {
+        use tokio::sync::mpsc::error::TrySendError;
+        let message = IngestMsg::Client {
+            conn_id: self.conn_id,
+            source: self.source.clone(),
+            payload: text,
+            share: Some(share),
+        };
+        match self.handle.ingest_route(self.conn_id).try_send(message) {
+            // A closed queue means the relay is stopping: nothing will read it.
+            Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
+            Err(TrySendError::Full(IngestMsg::Client { payload, .. })) => Err(payload),
+            Err(TrySendError::Full(_)) => unreachable!("a client message"),
+        }
     }
 
     /// Cancellation covers the entire transport future, including writes and
@@ -6123,6 +6164,18 @@ mod tests {
             "{reply}"
         );
         handle.request_shutdown();
+    }
+
+    #[test]
+    fn an_inbound_share_admits_a_bounded_number_of_small_messages() {
+        let share = InboundShare::new(64 * 1024);
+        let held: Vec<_> = (0..MAX_QUEUED_MESSAGES)
+            .map(|_| share.try_acquire(1).expect("room for another message"))
+            .collect();
+        // However small the next message, the connection has queued its most.
+        assert!(share.try_acquire(1).is_none());
+        drop(held);
+        assert!(share.try_acquire(1).is_some());
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 # Relay functions reached in the `proxied` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 698
+## anonymous: 695
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -347,13 +347,12 @@
 <wok_relay::server::ConnectionGuard>::hand_over_rest::{closure}
 <wok_relay::server::ConnectionGuard>::ingress_paused
 <wok_relay::server::ConnectionGuard>::ingress_pauses
-<wok_relay::server::ConnectionGuard>::queue
-<wok_relay::server::ConnectionGuard>::queue::{closure}
 <wok_relay::server::ConnectionGuard>::ready
 <wok_relay::server::ConnectionGuard>::receive
 <wok_relay::server::ConnectionGuard>::receive::{closure}
 <wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_ws::handle_ws<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}>
 <wok_relay::server::ConnectionGuard>::run_until_cancelled::<wok_ws::handle_ws<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>::{closure}::{closure}>::{closure}
+<wok_relay::server::ConnectionGuard>::try_queue
 <wok_relay::server::Dispatch>::close
 <wok_relay::server::Dispatch>::monitor_then
 <wok_relay::server::Dispatch>::neg
@@ -398,8 +397,6 @@
 <wok_relay::server::RelayHandle>::ingest_route
 <wok_relay::server::RelayHandle>::is_shutdown
 <wok_relay::server::RelayHandle>::next_conn_id
-<wok_relay::server::RelayHandle>::queue_client_message
-<wok_relay::server::RelayHandle>::queue_client_message::{closure}
 <wok_relay::server::RelayHandle>::register_connection
 <wok_relay::server::RelayHandle>::register_connection::{closure}
 <wok_relay::server::RelayHandle>::supported_nips

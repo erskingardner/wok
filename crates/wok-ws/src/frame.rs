@@ -369,13 +369,28 @@ impl WsParser {
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<WsEvent>, WsError> {
         self.buf.extend_from_slice(data);
         let mut events = Vec::new();
-        self.drain_events_into(&mut events)?;
+        self.drain_events_into(&mut events, usize::MAX)?;
         Ok(events)
     }
 
-    fn drain_events_into(&mut self, events: &mut Vec<WsEvent>) -> Result<(), WsError> {
-        while let Some(frame) = self.try_parse_frame()? {
+    /// Decode buffered frames into `events` until about `budget` bytes of
+    /// messages are decoded. Frames past it stay buffered, still compressed,
+    /// for the next call, so a read full of small compressed frames is not
+    /// all inflated before the caller can hold or refuse any of it.
+    fn drain_events_into(
+        &mut self,
+        events: &mut Vec<WsEvent>,
+        budget: usize,
+    ) -> Result<(), WsError> {
+        let mut decoded = 0usize;
+        while decoded < budget {
+            let Some(frame) = self.try_parse_frame()? else {
+                break;
+            };
             if let Some(ev) = self.handle_frame(frame)? {
+                if let WsEvent::Message(_, payload) = &ev {
+                    decoded = decoded.saturating_add(payload.len());
+                }
                 events.push(ev);
             }
         }
@@ -699,6 +714,11 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
     frame_deadline: &mut Option<tokio::time::Instant>,
 ) -> Result<(), WsError> {
     events.clear();
+    // Frames a previous call left buffered past its budget come first.
+    parser.drain_events_into(events, parser.max_message)?;
+    if !events.is_empty() {
+        return Ok(());
+    }
     loop {
         // Read directly into the parser's retained buffer. The previous
         // stack-buffer path copied every inbound WebSocket byte a second time
@@ -738,7 +758,7 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
             return Err(WsError::Protocol("eof"));
         }
         parser.read_filled = n >= room;
-        parser.drain_events_into(events)?;
+        parser.drain_events_into(events, parser.max_message)?;
         if parser.buf.is_empty() && !parser.read_filled && parser.grown {
             parser.buf = BytesMut::with_capacity(READ_IDLE);
             parser.grown = false;
@@ -799,6 +819,35 @@ mod tests {
             WsEvent::Message(MessageKind::Text, p) => assert_eq!(p, b"hello"),
             _ => panic!(),
         }
+    }
+
+    #[tokio::test]
+    async fn one_read_is_decoded_a_message_at_a_time() {
+        // One read carries four compressed messages, each half the maximum
+        // when inflated. A call decodes about a maximum message's worth and
+        // leaves the rest compressed; the next calls return it without
+        // another read.
+        let max = 64 * 1024;
+        let message = vec![b'a'; max / 2];
+        let mut client = DeflateCtx::new(false);
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            let compressed = client.compress(&message).unwrap();
+            wire.extend(masked_frame(true, true, OP_TEXT, &compressed));
+        }
+        let (mut tx, mut rx) = tokio::io::duplex(1 << 16);
+        tx.write_all(&wire).await.unwrap();
+        let mut parser = WsParser::new(max, Some(InflateCtx::new(false)));
+        let mut events = Vec::new();
+        let mut deadline = None;
+        let mut decoded = Vec::new();
+        for _ in 0..2 {
+            read_events_into(&mut rx, &mut parser, &mut events, None, &mut deadline)
+                .await
+                .unwrap();
+            decoded.push(events.len());
+        }
+        assert_eq!(decoded, [2, 2]);
     }
 
     #[tokio::test]

@@ -105,9 +105,11 @@ same ingester. Before Wok reads a message's verb:
   against `relay.unix.max_frame_bytes` before its body is read.
 - A connection's messages wait for the ingester in a queue it shares with
   other connections. Each connection may have at most the largest message a
-  transport accepts there, in bytes, not yet handled. The next one is held
-  until there is room, and the transport stops reading once its hold is
-  full, while it keeps writing to the client.
+  transport accepts there, in bytes, and at most 64 messages, not yet
+  handled. The next one is held until there is room and a slot, and the
+  transport stops reading once its hold is full, while it keeps writing to
+  the client. A WebSocket read is decoded about a maximum message at a time,
+  the rest left compressed until the hold has room.
 - The whole message is parsed as strict JSON. A malformed message spends the
   invalid-message budget (`relay.abuse.invalid_*`). A message that is exactly
   `"\n"` is a keepalive and does nothing.

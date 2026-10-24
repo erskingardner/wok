@@ -17,10 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     times their compressed size, never past the maximum. A message past its
     limit is refused as too large.
   - **Each connection's queued messages** are bounded: a connection may have
-    at most the largest message a transport accepts, in bytes, waiting for the
-    ingester. Its next message is held until there is room, and the transport
-    stops reading once its hold is full, while it keeps writing to the
-    client. Before, one connection could fill the shared ingest queue.
+    at most the largest message a transport accepts, in bytes, and at most 64
+    messages, waiting for the ingester. Its next message is held until there
+    is room, and the transport stops reading once its hold is full, while it
+    keeps writing to the client. A WebSocket read is decoded about a maximum
+    message at a time. Before, one connection could fill the shared ingest
+    queue.
   - **NEG-CLOSE** is handled by the negentropy worker as one removal each, in
     a run, instead of a configuration copy, read transaction and pass over
     every session per message.

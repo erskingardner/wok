@@ -395,7 +395,9 @@ value adds the filter's rows again, for the check on every candidate. A
 COUNT costs twice its cursors and a NEG-OPEN its cursors, with no rows:
 their scans are not bounded by `limit`, but while they run, by
 `max_filter_limit_count` and the COUNT budget, and by `max_sync_events` and
-the sync memory budgets.
+the sync memory budgets. A NEG-OPEN is not priced by rows on purpose: a sync
+exists to move many events, up to all a relay holds, so a broad one is served
+(see [Sync](#sync)).
 
 With the public preset's limits:
 
@@ -586,6 +588,24 @@ they are missing. All reload live and are on the dashboard.
 A NEG-OPEN meets every `filter_validation` rule, the query work ceiling and
 the read classes, as a REQ does, and draws on the REQ budgets; its rounds draw
 on the NEG-MSG budget.
+
+Broad syncs are intended. A sync exists to move many events, up to every
+event a relay holds that the client may read, so the query work ceiling counts
+only a NEG-OPEN's index seeks, not the rows it matches, and leaves `{}` or
+`{"kinds":[1]}` alone. (`relay.filter_validation.require_scoped_filters`, on
+in `marmot`, still refuses filters that name no `ids`, `authors` or tag.)
+What bounds a sync instead:
+
+- `relay.max_sync_events`, the size of its view. A scan that matches more
+  fails with `blocked: too many query results`. A filter served by a tree
+  added with `wok negentropy add` builds no view.
+- `relay.sync_memory_per_connection` and `relay.sync_memory_total`, reserved
+  for the whole view before its scan is scheduled, so a sync that would not
+  fit is refused without scanning.
+- `relay.abuse.max_concurrent_historical_queries`, the scans one connection
+  runs at once, with its NEG-OPENs counted apart from its REQs and COUNTs.
+  More wait their turn, and `relay.query_timeslice_budget_us` shares the
+  negentropy workers between running scans.
 
 ## Relay information
 

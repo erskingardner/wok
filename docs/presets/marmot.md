@@ -36,6 +36,8 @@ with a reason beside each value, is [marmot.toml](marmot.toml).
 | `events.max_event_size` | 1 MiB | 4 MiB | Welcomes carry the group's ratchet tree and Add commits each new member's KeyPackage, so both grow with the group. MDK accepts events up to 5 MiB. Provisional until Welcome sizes are measured at 100, 500 and 1,000 members. |
 | `relay.max_websocket_payload_size`, `relay.unix.max_frame_bytes` | 2 MiB | 8 MiB | Room for those events on either transport. |
 | `relay.max_filter_limit` | 2,000 | 5,000 | Directory batches with KeyPackage slots. |
+| `relay.max_filter_limit_count` | 1,000,000 | 0 | COUNT (NIP-45) off: MDK never sends it. A COUNT is priced at its index seeks, not its rows, so one filter may read up to a million rows. A COUNT is refused with `CLOSED` `blocked: bad req: COUNT disabled`, and NIP-11 no longer lists NIP-45. |
+| `relay.compression_enabled` | on | off | permessage-deflate off: MDK's WebSocket client never offers it, and MLS and NIP-44 ciphertext compresses poorly. A client that offers it gets an uncompressed connection. |
 | `relay.abuse.event_burst` | 100 | 300 | One inviter's commit plus up to about 250 Welcomes from one address. |
 | `relay.abuse.per_connection.req_rate_per_second`, `relay.abuse.per_connection.req_burst` | 20, 100 | 50, 300 | About two REQs or NEG-OPENs per group at startup, plus `ids` fetches. |
 | `relay.abuse.per_connection.neg_msg_burst` | 200 | 500 | A NIP-77 pass per group and per inbox. |
@@ -57,8 +59,9 @@ no proof of work, NIP-77 on, and the per-address backstops.
   general one with Marmot tuning.
 - **Enumeration.** `{"kinds":[445]}` or `{"since":…}` would list every
   group's messages; with scoped filters each filter must name a group
-  (`#h`), a recipient (`#p`), `ids` or `authors`. COUNT and NEG-OPEN meet the
-  same rule. MDK's group, inbox, `ids` and directory filters all pass.
+  (`#h`), a recipient (`#p`), `ids` or `authors`. NEG-OPEN meets the same
+  rule, and COUNT is off. MDK's group, inbox, `ids` and directory filters all
+  pass.
 - **Gift wraps to anyone but their recipient.** A 1059 is served only to the
   connection authenticated as its first `p` tag (or its author), as in
   `public`.

@@ -203,7 +203,7 @@ of running Wok. A test only points it at a temporary database and port.
 | --- | --- |
 | `default` | No settings: what a relay runs before its operator configures it. AUTH is unusable, and the dashboard, NIP-86 and the Unix socket are off. |
 | `public` | A public relay configured as [wok.toml](wok.toml) asks: AUTH works, so DMs and gift wraps reach their recipients. |
-| `marmot` | The `marmot` preset, as a Marmot app's default relay runs it: `relay.auth.accepted_kinds` limits it to the kinds MDK publishes, every filter must be scoped, and writes stay open. |
+| `marmot` | The `marmot` preset, as a Marmot app's default relay runs it: `relay.auth.accepted_kinds` limits it to the kinds MDK publishes, every filter must be scoped, COUNT and compression are off, and writes stay open. |
 | `gated` | A members-only relay: `relay.auth.read_policy` and `write_policy` set to `members`, AUTH, the dashboard and NIP-86. |
 | `minimal` | Every optional capability off: negentropy, COUNT, NIP-91, NIP-62, AUTH and compression. |
 | `proxied` | Behind a reverse proxy that passes the client's address in `X-Real-IP`. |

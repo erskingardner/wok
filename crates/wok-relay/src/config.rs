@@ -3449,6 +3449,10 @@ negentropy_enabled = true
         assert_eq!(marmot.relay.max_websocket_payload_size, 8 * 1024 * 1024);
         assert_eq!(marmot.relay.unix.max_frame_bytes, 8 * 1024 * 1024);
         assert_eq!(marmot.relay.max_filter_limit, 5_000);
+        // MDK never sends COUNT or offers permessage-deflate (#166).
+        assert_eq!(marmot.relay.max_filter_limit_count, 0);
+        assert!(!marmot.relay.compression_enabled);
+        assert!(!crate::supported_nips(&marmot).contains(&45));
         let auth = &marmot.relay.auth;
         assert_eq!(
             auth.accepted_kinds,

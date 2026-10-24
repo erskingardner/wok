@@ -255,6 +255,18 @@ async fn the_marmot_preset_serves_mdk_traffic() {
         "blocked: bad req: filter validation failed: filter must name ids, authors or a tag"
     );
 
+    // MDK never sends COUNT, so the preset turns it off.
+    reader
+        .send(json!(["COUNT", "count", {"kinds": [445], "#h": [GROUP]}]))
+        .await;
+    let refused = reader
+        .reply("count", &["COUNT", "CLOSED"], &mut Vec::new())
+        .await;
+    assert_eq!(
+        refused,
+        json!(["CLOSED", "count", "blocked: bad req: COUNT disabled"])
+    );
+
     // NIP-77 per group, and not over every group.
     assert_eq!(reader.neg_open(group).await[0], "NEG-MSG");
     let refused = reader.neg_open(json!({"kinds": [445]})).await;

@@ -598,6 +598,14 @@ async fn deflated_messages(relay: &Relay) {
     let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
     buf.drain(..end);
     if !head.contains("sec-websocket-extensions: permessage-deflate") {
+        // Close and read to the end, so the relay sees the stream end rather
+        // than a reset over frames left unread, such as an AUTH challenge.
+        stream.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+            .await
+            .expect("the relay closes a connection whose client closed")
+            .unwrap();
         return;
     }
     let mut deflate = flate2::Compress::new(flate2::Compression::default(), false);

@@ -24,8 +24,10 @@ pub enum CostedRequest {
     /// A COUNT, priced at twice its seeks. Its rows are bounded only while
     /// it runs, by `max_filter_limit_count` and the COUNT budget.
     Count,
-    /// A NEG-OPEN, priced at its seeks. Its rows are bounded only while it
-    /// runs, by `max_sync_events` and the sync memory budgets.
+    /// A NEG-OPEN, priced at its seeks. It is refused before its scan is
+    /// scheduled when its view would not fit the sync memory budgets, and
+    /// its scan stops past `max_sync_events`. Not priced by rows on purpose:
+    /// a sync is meant to move many events, up to all a relay holds (#173).
     NegOpen,
 }
 
@@ -294,6 +296,22 @@ mod tests {
         );
         assert_eq!(none.estimated_cost(REQ, false), 0);
         assert_eq!(none.estimated_cost(CostedRequest::Count, false), 0);
+    }
+
+    /// A sync is meant to move many events, up to all a relay holds, so a
+    /// broad NEG-OPEN costs only its seeks and is never refused for its rows
+    /// (#173). `max_sync_events` and the sync memory budgets bound it.
+    #[test]
+    fn a_broad_sync_costs_only_its_seeks() {
+        for filter in [
+            json!({}),
+            json!({"kinds": [1]}),
+            json!({"since": 0, "limit": SYNC_LIMIT}),
+        ] {
+            let fg = group(std::slice::from_ref(&filter), SYNC_LIMIT);
+            let cost = fg.estimated_cost(CostedRequest::NegOpen, false);
+            assert_eq!(cost, 1, "{filter}");
+        }
     }
 
     #[test]

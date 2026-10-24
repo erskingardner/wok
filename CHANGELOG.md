@@ -404,6 +404,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `relay.unix.max_frame_bytes = 8388608`, `relay.max_filter_limit = 5000`,
   `relay.abuse.event_burst = 300`, and `[relay.abuse.per_connection]`
   `req_rate_per_second = 50`, `req_burst = 300`, `neg_msg_burst = 500`.
+  COUNT (NIP-45) and permessage-deflate are off,
+  `relay.max_filter_limit_count = 0` and `relay.compression_enabled = false`,
+  since MDK never sends COUNT or offers compression (#166): a COUNT is
+  refused with `blocked: bad req: COUNT disabled`, NIP-11 does not list
+  NIP-45, and a client that offers deflate gets an uncompressed connection.
 - `public`: `relay.auth.owner_only_kinds` is `[78, 30078]` (new), so NIP-78
   app data is read and published only by its author (see Security). Apps
   that publish public data in these kinds can no longer be read by other

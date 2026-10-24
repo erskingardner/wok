@@ -1,7 +1,7 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 660
+## anonymous: 639
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -132,7 +132,6 @@
 <wok_query::filter::NostrFilterGroup>::from_value
 <wok_query::filter::NostrFilterGroup>::requires_content
 <wok_query::filter::NostrFilterGroup>::requires_content::{closure}
-<wok_query::hll::HyperLogLog>::for_filter
 <wok_query::monitor::ActiveMonitors>::add_pending
 <wok_query::monitor::ActiveMonitors>::allocate
 <wok_query::monitor::ActiveMonitors>::allocate::{closure}
@@ -144,7 +143,6 @@
 <wok_query::monitor::ActiveMonitors>::event_requires_content
 <wok_query::monitor::ActiveMonitors>::finish_pending
 <wok_query::monitor::ActiveMonitors>::insert
-<wok_query::monitor::ActiveMonitors>::insert::{closure}
 <wok_query::monitor::ActiveMonitors>::install
 <wok_query::monitor::ActiveMonitors>::install::{closure}
 <wok_query::monitor::ActiveMonitors>::pending_generation
@@ -221,12 +219,6 @@
 <wok_query::subid::SubId>::new
 <wok_query::subid::Subscription>::new
 <wok_query::visibility::ReadRestrictor>::class
-<wok_query::visibility::ReadRestrictor>::count_refusal
-<wok_query::visibility::ReadRestrictor>::count_refusal_class
-<wok_query::visibility::ReadRestrictor>::count_refusal_class::{closure}
-<wok_query::visibility::ReadRestrictor>::count_refusal_class::{closure}::{closure}
-<wok_query::visibility::ReadRestrictor>::is_filter_allowed_to_count
-<wok_query::visibility::ReadRestrictor>::is_filter_allowed_to_count::{closure}
 <wok_query::visibility::ReadRestrictor>::is_filter_fully_restricted
 <wok_query::visibility::ReadRestrictor>::is_filter_fully_restricted::{closure}
 <wok_query::visibility::ReadRestrictor>::is_filter_group_fully_restricted
@@ -303,12 +295,9 @@
 <wok_relay::server::ConnTable>::refuse::{closure}::{closure}
 <wok_relay::server::ConnTable>::remove
 <wok_relay::server::ConnTable>::send
-<wok_relay::server::ConnTable>::send_last
-<wok_relay::server::ConnTable>::send_last::{closure}
 <wok_relay::server::ConnTable>::send_sub
 <wok_relay::server::ConnTable>::shard
 <wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::deliver::{closure}>
-<wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::send_last::{closure}>
 <wok_relay::server::ConnTable>::with::<(usize, usize), <wok_relay::server::ConnTable>::filter_bytes::{closure}>
 <wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::is_open::{closure}>
 <wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::push_sub::{closure}>
@@ -403,12 +392,6 @@
 <wok_relay::server::sub_gate::SubGate>::open
 <wok_relay::source::TransportSource>::ip
 <wok_relay::source::TransportSource>::ip_address
-<wok_ws::frame::DeflateCtx>::compress
-<wok_ws::frame::DeflateCtx>::new
-<wok_ws::frame::DeflateCtx>::with_level
-<wok_ws::frame::InflateCtx>::decompress
-<wok_ws::frame::InflateCtx>::new
-<wok_ws::frame::InflateCtx>::remember
 <wok_ws::frame::WsEncoder>::encode_frame
 <wok_ws::frame::WsEncoder>::encode_message_into
 <wok_ws::frame::WsEncoder>::new
@@ -539,7 +522,6 @@ wok_negentropy::lmdb_store::open_rw
 wok_negentropy::lmdb_store::tree_key
 wok_negentropy::memory_view_item_bytes
 wok_query::cost::filter_seeks
-wok_query::hll::offset_for_filter
 wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::install::{closure}>
 wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::install::{closure}>::{closure}
 wok_query::monitor::for_each_key::<<wok_query::monitor::ActiveMonitors>::uninstall::{closure}>
@@ -632,9 +614,6 @@ wok_ws::dispatch::{closure}
 wok_ws::dispatch::{closure}::{closure}
 wok_ws::empty
 wok_ws::frame::apply_mask
-wok_ws::frame::inflate_allowance
-wok_ws::frame::inflate_into
-wok_ws::frame::inflate_limit
 wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>
 wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>::{closure}
 wok_ws::frame::write_bytes::<tokio::io::split::WriteHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>
@@ -663,13 +642,10 @@ wok_ws::upgrade_ws::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 18
+## authenticated: 14
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
-<wok_query::filter::FilterSetBytes>::original
 <wok_query::filter::FilterSetUint>::at
-<wok_query::hll::HyperLogLog>::encode_hex
-<wok_query::visibility::ReadRestrictor>::count_refusal::{closure}
-<wok_query::visibility::ReadRestrictor>::count_refusal::{closure}::{closure}
+<wok_query::monitor::ActiveMonitors>::insert::{closure}
 <wok_relay::server::Dispatch>::monitor
 wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>
 wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}
@@ -679,7 +655,6 @@ wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay:
 wok_query::scan::plans_pubkey_kind
 wok_query::visibility::physical_tree_is_globally_visible::{closure}
 wok_query::visibility::physical_tree_is_globally_visible::{closure}::{closure}
-wok_relay::server::admit_req::{closure}::{closure}
 wok_relay::server::negentropy::public_tree_allowed::{closure}
 wok_relay::server::negentropy::public_tree_allowed::{closure}::{closure}
 

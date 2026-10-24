@@ -98,6 +98,8 @@ fn check_profile(name: &str, cfg: &Config) {
             assert_eq!(cfg.relay.auth.write_policy, AccessPolicy::Open);
             assert!(!cfg.admin.enabled);
             assert!(nips.contains(&42) && nips.contains(&59), "{nips:?}");
+            assert!(!nips.contains(&45), "{nips:?}");
+            assert!(!cfg.relay.compression_enabled);
         }
         "monitored" => {
             assert!(cfg.auth_usable());

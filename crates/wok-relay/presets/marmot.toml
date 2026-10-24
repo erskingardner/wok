@@ -35,6 +35,12 @@
 #   group. MDK accepts events up to 5 MiB. Provisional until Welcome sizes are
 #   measured at 100, 500 and 1,000 members.
 # - [relay] max_filter_limit = 5000: directory batches with KeyPackage slots.
+# - [relay] max_filter_limit_count = 0: COUNT (NIP-45) off. MDK never sends
+#   COUNT, and a COUNT is priced at its index seeks, not its rows, so one
+#   filter may read up to a million rows.
+# - [relay] compression_enabled = false: permessage-deflate off. MDK's
+#   WebSocket client never offers it, and MLS and NIP-44 ciphertext
+#   compresses poorly.
 # - [relay.abuse] event_burst = 300: one inviter's commit plus up to about 250
 #   Welcomes from one address.
 # - [relay.abuse.per_connection] req_rate_per_second = 50, req_burst = 300:
@@ -47,6 +53,8 @@ max_event_size = 4194304
 [relay]
 max_websocket_payload_size = 8388608
 max_filter_limit = 5000
+max_filter_limit_count = 0
+compression_enabled = false
 
 [relay.unix]
 max_frame_bytes = 8388608

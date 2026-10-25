@@ -459,8 +459,8 @@ fn overview(handle: &RelayHandle) -> Response<Full<Bytes>> {
             "preset_config": dashboard_config(&cfg.preset_defaults()),
             "nip11": crate::nip11(&cfg)["limitation"],
             "refusals": refusals(&handle.metrics),
-            "warnings": cfg.zero_guards().into_iter().map(|guard| {
-                serde_json::json!({"keys": guard.keys, "warning": guard.warning})
+            "warnings": cfg.zero_guards().into_iter().chain(cfg.message_caps()).map(|warning| {
+                serde_json::json!({"keys": warning.keys, "warning": warning.warning})
             }).collect::<Vec<_>>(),
         }),
     )

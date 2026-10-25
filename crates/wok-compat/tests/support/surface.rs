@@ -220,6 +220,24 @@ impl Wire {
         }
     }
 
+    /// Read until the relay closes the connection, and return the code of
+    /// its close frame, if it sent one.
+    pub async fn closed(&mut self) -> Option<u16> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.ws.next().await {
+                    Some(Ok(Message::Close(frame))) => {
+                        return frame.map(|frame| u16::from(frame.code))
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return None,
+                }
+            }
+        })
+        .await
+        .expect("the relay kept the connection open for 5 s")
+    }
+
     /// Send a close frame and read until the relay closes the connection, so
     /// it sees the close rather than a reset over frames left unread.
     pub async fn close(mut self) {

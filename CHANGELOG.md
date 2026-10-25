@@ -278,6 +278,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `relay.abuse.event_burst = 100` without a word: none of those is a past
   default, so `config-defaults` passed them, and `wok config minimize` keeps
   them because they differ from `marmot`'s.
+- Wok warns when a message cap is too small for the limits behind it (#97
+  §2.2): `relay.max_websocket_payload_size`, or `relay.unix.max_frame_bytes`
+  while the Unix socket is on, smaller than `events.max_event_size` plus
+  `["EVENT",]`'s 10 bytes, or than `relay.max_req_filter_size` plus a REQ's
+  12. Such an event or REQ passed its own limit but was cut off, and its
+  connection closed (WebSocket 1009), with no `OK` or `CLOSED` and nothing in
+  the logs, as with `events.max_event_size = 4194304` under the `public`
+  preset's 2 MiB cap. The warning is logged at startup and on reload (the
+  caps apply at restart, the limits live), shown beside the fields on the
+  dashboard, and reported by a new `message-caps` check in `wok doctor`.
 - Operator documentation in the dashboard's order (#97 §5). `docs/config.md`
   now runs preset, access, events accepted, queries, rates, storage, sync,
   relay information and advanced, then the restart-only infrastructure, and

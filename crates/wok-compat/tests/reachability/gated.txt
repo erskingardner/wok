@@ -734,7 +734,7 @@ wok_relay::server::route_tx::<wok_relay::server::MonitorMsg>
 wok_relay::server::run_req_worker::{closure}
 wok_relay::server::stored_reader_admitted
 
-## admin: 110
+## admin: 111
 <wok_db::moderation::KindPolicy>::allow_all
 <wok_db::moderation::KindPolicy>::allows
 <wok_db::moderation::KindPolicy>::allows::{closure}
@@ -751,11 +751,12 @@ wok_relay::server::stored_reader_admitted
 <wok_relay::config::AccessPolicy>::name
 <wok_relay::config::Config>::accepted_kind_list
 <wok_relay::config::Config>::auth_configuration_warning
+<wok_relay::config::Config>::message_caps
 <wok_relay::config::Config>::preset_defaults
 <wok_relay::config::Config>::zero_guards
 <wok_relay::config::Config>::zero_guards::{closure}
-<wok_relay::config::ZeroGuard>::new::<alloc::string::String>
-<wok_relay::config::ZeroGuard>::new::<alloc::string::String>::{closure}
+<wok_relay::config::SettingWarning>::new::<alloc::string::String>
+<wok_relay::config::SettingWarning>::new::<alloc::string::String>::{closure}
 <wok_relay::config::preset::Preset as core::fmt::Display>::fmt
 <wok_relay::config::preset::Preset as core::str::traits::FromStr>::from_str
 <wok_relay::config::preset::Preset as core::str::traits::FromStr>::from_str::{closure}

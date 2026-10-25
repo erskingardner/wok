@@ -44,7 +44,9 @@ questions:
 
 Unix-socket peers have no network address, so no per-address or
 per-connection budget applies to them. The per-author EVENT budget still
-does.
+does. The relay at startup, and `wok doctor` in its `unix-access` check,
+warn when the socket's mode lets every local user connect and
+`auth_uids` and `auth_gids` are both empty.
 
 ## Network listener
 

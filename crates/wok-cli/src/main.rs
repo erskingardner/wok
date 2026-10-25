@@ -501,6 +501,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         cfg.auth_configuration_warning(),
         cfg.read_class_warning(),
         cfg.inbox_kinds_warning(),
+        cfg.unix_socket_warning(),
         cfg.pow_warning(),
         cfg.nodeinfo_warning(),
     ];

@@ -712,6 +712,30 @@ fn check_external_paths(cfg: &Config, report: &mut DoctorReport) {
         report.add("unix-socket", CheckStatus::Pass, "disabled");
         return;
     }
+    // The relay logs the warning at startup too.
+    let unix = &cfg.relay.unix;
+    let access = if let Some(warning) = cfg.unix_socket_warning() {
+        (CheckStatus::Warn, warning)
+    } else if !unix.auth_uids.is_empty() || !unix.auth_gids.is_empty() {
+        (
+            CheckStatus::Pass,
+            "relay.unix.auth_uids and auth_gids decide which peers stay connected".into(),
+        )
+    } else if unix.mode & 0o020 != 0 {
+        (
+            CheckStatus::Pass,
+            format!(
+                "mode {:#o}: the socket's owner and members of its group can connect",
+                unix.mode
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Pass,
+            format!("mode {:#o}: only the socket's owner can connect", unix.mode),
+        )
+    };
+    report.add("unix-access", access.0, access.1);
     let path = &cfg.relay.unix.path;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
@@ -1214,6 +1238,48 @@ mod tests {
         assert!(check
             .detail
             .ends_with("`wok config minimize` removes them."));
+    }
+
+    #[test]
+    fn a_unix_socket_every_local_user_may_open_is_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let access = |unix: &str| {
+            let mut cfg =
+                Config::parse_toml(&format!("[relay.unix]\nenabled = true\n{unix}\n")).unwrap();
+            cfg.relay.unix.path = temp.path().join("wok.sock");
+            let mut report = DoctorReport::new();
+            check_external_paths(&cfg, &mut report);
+            check(&report, "unix-access").clone()
+        };
+        let owner = access("");
+        assert_eq!(
+            (owner.status, owner.detail.as_str()),
+            (
+                CheckStatus::Pass,
+                "mode 0o600: only the socket's owner can connect"
+            )
+        );
+        let group = access("mode = 0o660");
+        assert_eq!(group.status, CheckStatus::Pass);
+        assert!(
+            group.detail.contains("members of its group"),
+            "{}",
+            group.detail
+        );
+        let open = access("mode = 0o666");
+        assert_eq!(open.status, CheckStatus::Warn);
+        assert!(
+            open.detail.contains("auth_uids and auth_gids are empty"),
+            "{}",
+            open.detail
+        );
+        let listed = access("mode = 0o666\nauth_gids = [0]");
+        assert_eq!(listed.status, CheckStatus::Pass);
+        assert!(
+            listed.detail.contains("decide which peers"),
+            "{}",
+            listed.detail
+        );
     }
 
     /// Every check `check_config_defaults` reports for a file, by name.

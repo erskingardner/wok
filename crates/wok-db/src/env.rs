@@ -72,8 +72,9 @@ impl EnvOptions {
 
 /// Permission bits for the database files Wok creates: LMDB's `data.mdb` and
 /// `lock.mdb`, and compact copies. Stored events include gift wraps and other
-/// recipient-only kinds, so other users get no access; the umask can only
-/// remove more. A file that already exists keeps its mode.
+/// recipient-only kinds, so users outside the file's group get no access; the
+/// group keeps read, and the umask can only remove more. A file that already
+/// exists keeps its mode.
 pub(crate) const DB_FILE_MODE: u32 = 0o640;
 
 /// Create a new file for a compact copy with [`DB_FILE_MODE`]. LMDB's

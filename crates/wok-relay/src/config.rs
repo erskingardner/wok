@@ -1761,10 +1761,11 @@ impl Config {
 
     /// Warn when every local user may connect to the Unix socket: its mode
     /// lets others write to it, and neither `auth_uids` nor `auth_gids`
-    /// limits who connects. Unix connections bypass every rate budget, so
-    /// each local user gets a channel no budget applies to. The settings
-    /// are restart-only; the relay logs this at startup and `wok doctor`
-    /// reports it.
+    /// limits who connects. Unix connections skip the connection,
+    /// per-address and per-connection budgets, so each local user gets a
+    /// channel only the per-author EVENT budget limits, which fresh keys
+    /// evade. The settings are restart-only; the relay logs this at startup
+    /// and `wok doctor` reports it.
     pub fn unix_socket_warning(&self) -> Option<String> {
         let unix = &self.relay.unix;
         if !unix.enabled
@@ -1777,8 +1778,9 @@ impl Config {
         Some(format!(
             "relay.unix.mode = {:#o} lets every local user connect to the Unix socket, unless its \
              directory keeps them out, and relay.unix.auth_uids and auth_gids are empty: each \
-             gets a connection that no rate budget applies to. Take write access from others \
-             (0o600 or 0o660), or list the peers that may connect",
+             gets a connection that skips the connection, per-address and per-connection \
+             budgets. Take write access from others (0o600 or 0o660), or list the peers that \
+             may connect",
             unix.mode
         ))
     }

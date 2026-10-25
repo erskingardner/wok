@@ -690,15 +690,30 @@ fn check_external_paths(cfg: &Config, report: &mut DoctorReport) {
         report.add("unix-socket", CheckStatus::Pass, "disabled");
         return;
     }
-    // The relay logs this at startup too.
-    match cfg.unix_socket_warning() {
-        Some(detail) => report.add("unix-access", CheckStatus::Warn, detail),
-        None => report.add(
-            "unix-access",
+    // The relay logs the warning at startup too.
+    let unix = &cfg.relay.unix;
+    let access = if let Some(warning) = cfg.unix_socket_warning() {
+        (CheckStatus::Warn, warning)
+    } else if !unix.auth_uids.is_empty() || !unix.auth_gids.is_empty() {
+        (
             CheckStatus::Pass,
-            "other local users cannot open the socket, or the peer allow-lists decide who can",
-        ),
-    }
+            "relay.unix.auth_uids and auth_gids decide which peers stay connected".into(),
+        )
+    } else if unix.mode & 0o020 != 0 {
+        (
+            CheckStatus::Pass,
+            format!(
+                "mode {:#o}: the socket's owner and members of its group can connect",
+                unix.mode
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Pass,
+            format!("mode {:#o}: only the socket's owner can connect", unix.mode),
+        )
+    };
+    report.add("unix-access", access.0, access.1);
     let path = &cfg.relay.unix.path;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
@@ -1152,7 +1167,21 @@ mod tests {
             check_external_paths(&cfg, &mut report);
             check(&report, "unix-access").clone()
         };
-        assert_eq!(access("").status, CheckStatus::Pass);
+        let owner = access("");
+        assert_eq!(
+            (owner.status, owner.detail.as_str()),
+            (
+                CheckStatus::Pass,
+                "mode 0o600: only the socket's owner can connect"
+            )
+        );
+        let group = access("mode = 0o660");
+        assert_eq!(group.status, CheckStatus::Pass);
+        assert!(
+            group.detail.contains("members of its group"),
+            "{}",
+            group.detail
+        );
         let open = access("mode = 0o666");
         assert_eq!(open.status, CheckStatus::Warn);
         assert!(
@@ -1160,9 +1189,12 @@ mod tests {
             "{}",
             open.detail
         );
-        assert_eq!(
-            access("mode = 0o666\nauth_gids = [0]").status,
-            CheckStatus::Pass
+        let listed = access("mode = 0o666\nauth_gids = [0]");
+        assert_eq!(listed.status, CheckStatus::Pass);
+        assert!(
+            listed.detail.contains("decide which peers"),
+            "{}",
+            listed.detail
         );
     }
 

@@ -495,6 +495,9 @@ fn gate_open(cfg: &Config, gate: &str) -> bool {
         }
         "`observability.metrics_enabled`" => cfg.observability.metrics_enabled,
         "`relay.nodeinfo_enabled`" => cfg.relay.nodeinfo_enabled,
+        "`relay.nodeinfo_enabled` and `relay.auth.service_url` or `admin.public_url`" => {
+            cfg.relay.nodeinfo_enabled && cfg.nodeinfo_href().is_some()
+        }
         other => panic!("teach gate_open the gate {other}"),
     }
 }

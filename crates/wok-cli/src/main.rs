@@ -513,6 +513,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         cfg.auth_configuration_warning(),
         cfg.read_class_warning(),
         cfg.inbox_kinds_warning(),
+        cfg.nodeinfo_warning(),
     ];
     for warning in warnings
         .into_iter()

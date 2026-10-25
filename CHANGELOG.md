@@ -143,11 +143,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NodeInfo is off by default (#166). `/.well-known/nodeinfo` and
   `/nodeinfo/2.1` were served in every configuration, though no Nostr client
   or Marmot client uses them and NIP-11 already gives the software and its
-  version, and the discovery link repeats the request's `Host` header (#152).
+  version, and the discovery link repeated the request's `Host` header, which
+  a cache in front of the relay could hand to other clients (#152).
   `relay.nodeinfo_enabled` turns them on, and reloads live; while it is off
   both paths answer 404, and turning it on or off is logged as a
-  security-scope change. **Upgrading:** a relay that should stay listed by
-  NodeInfo crawlers must set `relay.nodeinfo_enabled = true`.
+  security-scope change. Discovery now links to `/nodeinfo/2.1` on the origin
+  of `relay.auth.service_url`, or else `admin.public_url`; with neither set it
+  answers 404, and the relay and `wok doctor` warn. **Upgrading:** a relay
+  that should stay listed by NodeInfo crawlers must set
+  `relay.nodeinfo_enabled = true`, and `relay.auth.service_url` or
+  `admin.public_url`.
 - With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`
   by sending its own X-Forwarded-For. A proxy that appends the client's
   address to that header (nginx's `$proxy_add_x_forwarded_for`) passed Wok a

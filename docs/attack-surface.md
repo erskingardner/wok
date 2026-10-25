@@ -53,9 +53,12 @@ Every request on the listener passes these steps before Wok looks at its path:
 1. Hyper reads the request head, within `relay.handshake_timeout_secs`.
 2. With `relay.real_ip_header` set, the client's address is that header's
    last entry, across all of its lines: the one the proxy in front of Wok
-   wrote. An entry may carry a port. A last entry that is not an IP address
-   leaves the connecting address and is counted in
-   `wok_real_ip_header_unparsed_total`; no header leaves it too.
+   wrote. An entry may carry a port. In `Forwarded`, read as RFC 7239, it
+   is the last element's `for`, and that element is found from the right,
+   so nothing a client sends ahead of it, an unterminated quoted string
+   included, moves it. A last entry that names no IP address leaves the
+   connecting address and is counted in `wok_real_ip_header_unparsed_total`;
+   no header leaves it too.
 3. An address blocked with NIP-86 `blockip` gets 429, and so does one whose
    per-address connection budget (`relay.abuse.connection_*`) is spent.
 

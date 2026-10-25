@@ -262,7 +262,7 @@ async fn dispatch(
 ) -> Response<Full<Bytes>> {
     // Honor relay.real_ip_header for reverse-proxied deployments. C++ strfry
     // reads the whole value as one address; Wok reads the last entry, the
-    // one the proxy wrote.
+    // one the proxy wrote, and reads `Forwarded` as RFC 7239.
     let peer = {
         let cfg = handle.config.read();
         let header = cfg.relay.real_ip_header.as_str();
@@ -282,7 +282,7 @@ async fn dispatch(
                         tracing::warn!(
                             header,
                             entry = ?entry,
-                            "relay.real_ip_header ends in an entry that is not an IP \
+                            "relay.real_ip_header ends in an entry that names no IP \
                              address, so the connecting address stands in for the client's; \
                              check that the proxy writes the client's address last (warned \
                              at most once a minute, counted by \

@@ -431,6 +431,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps them, and verification compares the result with the original's
   fingerprint without them.
 
+- `relay.real_ip_header = "forwarded"` reads the RFC 7239 `Forwarded`
+  header (#155): the client is the `for` of its last element, quoted or not,
+  an IPv4 address with or without a port, or an IPv6 address in brackets.
+  Behind a proxy that writes `Forwarded`, such as HAProxy's
+  `option forwarded`, every client had the proxy's address and shared its
+  per-address budgets, NIP-86 IP blocks could not single one out, and each
+  request was counted in `wok_real_ip_header_unparsed_total`. The syntax
+  follows from the header's name; any other header is still an address
+  list. The last element is found from the right, so nothing a client sends
+  ahead of it moves it. One that names no address, such as `for=unknown` or
+  an obfuscated `for=_hidden`, still leaves the connecting address and is
+  counted. The ingress fuzz target covers both syntaxes.
 - NIP-86 `unbanevent`, `unallowevent`, `listallowedevents` and
   `listdisallowedkinds`, from the current NIP-86 draft. `allowevent` also
   puts the event on an allow list, with its optional reason, which

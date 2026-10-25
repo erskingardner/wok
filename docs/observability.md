@@ -100,6 +100,7 @@ something. A token bucket's refusals carry its `_burst` key; raising its
 | `relay.max_filters_per_req`, `relay.max_req_filter_size` | REQs and COUNTs with too many filters or filter bytes. |
 | `relay.max_tags_per_filter`, `relay.max_and_entries` | Filters over the tag-letter or NIP-91 `&` limit (REQ, COUNT, NEG-OPEN). |
 | `relay.max_filter_limit_count` | COUNTs while it is 0. |
+| `relay.search_enabled` | REQs, COUNTs and NEG-OPENs with a `search` filter while NIP-50 is off. |
 | `relay.filter_validation.max_kinds_per_filter`, `allowed_kinds`, `require_author_or_tag`, `require_scoped_filters` | Filters a rule refuses (REQ, COUNT, NEG-OPEN). |
 | `relay.abuse.max_query_work` | Requests whose estimated work is over the ceiling. |
 | `relay.auth.read_policy` | REQs, COUNTs and NEG-OPENs from a connection the read policy does not admit, when they arrive or, for one still waiting for a scan or sync after a reload or a member's removal, when it would start. |

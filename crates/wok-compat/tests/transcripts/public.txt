@@ -51,6 +51,10 @@
 < ["EVENT","all",{"content":"hello","created_at":"<t+1>","id":"<h1>","kind":1,"pubkey":"<h9>","sig":"<h10>","tags":[]}]
 < ["EOSE","all",["finish"]]
 
+## REQ a search
+< ["EVENT","search",{"content":"hello","created_at":"<t+1>","id":"<h1>","kind":1,"pubkey":"<h9>","sig":"<h10>","tags":[]}]
+< ["EOSE","search",["finish"]]
+
 ## COUNT notes
 < ["COUNT","count",{"count":1}]
 

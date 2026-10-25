@@ -84,6 +84,8 @@ settings! {
     MaxReqFilterSize => "relay.max_req_filter_size",
     /// COUNT while `max_filter_limit_count = 0` turns it off.
     MaxFilterLimitCount => "relay.max_filter_limit_count",
+    /// A REQ, COUNT or NEG-OPEN with a `search` filter while NIP-50 is off.
+    SearchEnabled => "relay.search_enabled",
     MaxTagsPerFilter => "relay.max_tags_per_filter",
     MaxAndEntries => "relay.max_and_entries",
     MaxKindsPerFilter => "relay.filter_validation.max_kinds_per_filter",

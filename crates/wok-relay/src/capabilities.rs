@@ -27,6 +27,7 @@ pub enum CapabilityCondition {
     Nip78Safe,
     Nip91Enabled,
     PowRequired,
+    SearchEnabled,
 }
 
 impl CapabilityCondition {
@@ -60,6 +61,7 @@ impl CapabilityCondition {
                 cfg.relay.max_tags_per_filter > 0 && cfg.relay.max_and_entries > 0
             }
             Self::PowRequired => cfg.relay.abuse.enabled && cfg.relay.abuse.min_pow_difficulty > 0,
+            Self::SearchEnabled => cfg.relay.search_enabled,
         }
     }
 }
@@ -104,7 +106,7 @@ pub const RELAY_CAPABILITY_CATALOG: &[RelayCapability] = &[
     RelayCapability {
         nip: 50,
         name: "Search capability",
-        enabled_when: CapabilityCondition::Always,
+        enabled_when: CapabilityCondition::SearchEnabled,
     },
     RelayCapability {
         nip: 59,
@@ -199,6 +201,9 @@ mod tests {
 
         cfg.relay.max_and_entries = 0;
         assert!(!supported_nips(&cfg).contains(&91));
+
+        cfg.relay.search_enabled = false;
+        assert!(!supported_nips(&cfg).contains(&50));
     }
 
     #[test]

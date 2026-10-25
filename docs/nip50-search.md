@@ -5,6 +5,11 @@ advertises NIP-50 through NIP-11. Search filters can be combined with `ids`,
 `authors`, `kinds`, tags, `since`, and `until`; every supplied constraint must
 match.
 
+`relay.search_enabled = false` turns search off: NIP-11 stops listing NIP-50,
+and a REQ, COUNT or NEG-OPEN with a `search` filter is refused with
+`blocked:` before its query is parsed. The index below is kept current either
+way; see [Search](config.md#search).
+
 ## Query semantics
 
 - Free text is split into Unicode alphanumeric terms and lowercased.

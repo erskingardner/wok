@@ -3,7 +3,7 @@
 | File | Role |
 | --- | --- |
 | `main.rs` | `Cli` / `Command`, relay startup, import/export/scan/event/delete/compact/monitor/dict/negentropy/upload/download |
-| `migrate.rs` | Read-only v3 snapshot, integrity, v5 marker, TOML translation, checksummed manifest |
+| `migrate.rs` | Read-only v3 snapshot, integrity, verification of each event against its payload, v5 marker, TOML translation, checksummed manifest |
 | `config_show.rs` | `wok config show`: effective values with their origin, `--overrides`, `--defaults` |
 | `config_minimize.rs` | `wok config minimize`: drop keys equal to the preset, `--dry-run` diff or `.bak` backup |
 | `doctor.rs` | Config (including pinned past defaults), storage, index, payload, negentropy, capacity, runtime-path report (`--json`) |

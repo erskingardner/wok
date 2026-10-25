@@ -173,7 +173,7 @@ does not list.
 | --- | --- | --- |
 | `wok relay` | Config file, the network, the Unix socket | Everything on this page. |
 | `wok info` | Database | |
-| `wok migrate strfry` | strfry LMDB environment and config | Opens the strfry database through LMDB FFI and parses its HOCON-subset config. Runs `lsof` to check that no process has the database open. Writes only a new directory. |
+| `wok migrate strfry` | strfry LMDB environment and config | Opens the strfry database through LMDB FFI and parses its HOCON-subset config. Verifies each event's id and signature against its stored payload, that the payload names the packed record's id, pubkey, kind and created_at, and that the packed tags, address, first recipient and expiration come from the payload; an event that does not verify refuses the migration (see [Events that do not verify](migration-from-strfry.md#events-that-do-not-verify)). Runs `lsof` to check that no process has the database open. Writes only a new directory. |
 | `wok config show` | Config file | |
 | `wok config minimize` | Config file | Rewrites the file and keeps the original as `<file>.bak`. |
 | `wok doctor` | Config file, database, runtime paths | |

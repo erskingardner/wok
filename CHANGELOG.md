@@ -212,6 +212,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is released only when the request failed without effect, so those can
   still be retried; a NIP-86 command that reached the writer keeps it burned
   even if the client disconnects (#51).
+- A used NIP-98 authorization could be replayed after two reloads of
+  `admin.auth_window_secs` (#164). The replay cache was pruned by the current
+  window, so with a window of 300 an event used 30 seconds ago was dropped
+  by any request after a reload to 5, and accepted again, body and all,
+  after a reload back to 300. The cache now keeps each ID for the longest
+  window the relay has run with since it started.
 - Malformed client messages now draw on a per-address token bucket
   (`relay.abuse.invalid_rate_per_second`, default 5, and `invalid_burst`,
   default 20). Before, every one earned a NOTICE, so one connection could make

@@ -40,10 +40,13 @@ access settings and the client address header read-only, so a remote save
 cannot lock anyone out or move a trust boundary. Restart settings are
 file-only too.
 
-On reload, the relay logs a warning for each guard the file sets to zero,
-which turns it off, while its preset does not; the dashboard shows the same
-warning beside the setting. A guard the preset itself turns off, such as
-`max_stored_events` in `public`, is not warned about. Each refusal a setting
+At startup and on reload, the relay logs a warning for each guard the file
+sets to zero, which turns it off, while its preset does not; the dashboard
+shows the same warning beside the setting, and `wok doctor` reports it in
+its `zero-guards` check. A restart setting, such as
+`database.min_free_disk_bytes`, is warned about once it applies. A guard the
+preset itself turns off, such as `max_stored_events` in `public`, is not
+warned about. Each refusal a setting
 makes is counted by `wok_refusals_total{setting="<key>"}`; see
 [Refusals by setting](observability.md#refusals-by-setting).
 
@@ -164,6 +167,13 @@ not offer`, decided by its kind before its signature is verified, and again
 by the writer, so one queued before a reload made AUTH unusable is refused
 too. NIP-62 vanish requests are accepted whatever their class. With
 `enabled = false` the relay refuses AUTH outright.
+
+A reload that makes AUTH unusable ends every login. Each connection is
+anonymous from then on, even after a reload makes AUTH usable again, until
+it authenticates again with the challenge it holds: its live subscriptions
+stop delivering what only its keys may read, and the NEG sessions it opened
+while logged in are closed with `closed: authentication changed; reopen
+synchronization`.
 
 ### Read classes
 
@@ -424,6 +434,13 @@ failed: ...`, so a sync cannot list the ids of events a REQ may not ask for.
 A filter with an empty list, which matches nothing, is not checked. The
 filters in one REQ are bounded by `relay.max_filters_per_req` alone.
 
+A reload that changes the rules applies them to what is already open: each
+REQ subscription or COUNT whose filters they now refuse is closed with the
+`CLOSED` it would get if sent now, and each NEG session with the `NEG-ERR`,
+so tightening them stops an enumerating subscription such as
+`{"kinds":[445]}` at once. One still sending its stored history stops at
+its next time slice, before the rest goes out.
+
 ### Query work
 
 Before a REQ, COUNT or NEG-OPEN opens a cursor, the relay estimates how many
@@ -495,7 +512,7 @@ counted under its `_burst` key.
 
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
-| `relay.abuse.enabled` | `true` | Turns every budget here, the storage quotas, the query work ceiling and proof of work on or off. | Off: none of them apply. | — |
+| `relay.abuse.enabled` | `true` | Turns every budget here, the storage quotas, the query work ceiling and proof of work on or off. | Off: none of them apply. A `min_pow_difficulty` above 0 is then ignored, which the relay warns about at startup and on reload, and `wok doctor` in its `abuse-limits` check. | — |
 | `relay.abuse.per_connection.req_rate_per_second` | `20` | Scan CPU and monitor churn from one connection: REQs, REQs that replace a subscription, and NEG-OPENs. | Apps lose subscriptions at startup. | — |
 | `relay.abuse.per_connection.req_burst` | `100` | The same, at once. A client's startup burst of about 60 REQs fits. | As above. | — |
 | `relay.abuse.per_connection.neg_msg_rate_per_second` | `50` | Sync worker time: NEG-MSG rounds of sessions already admitted by their NEG-OPEN. | Clients that sync many groups or inboxes at startup are cut off. | — |
@@ -517,7 +534,7 @@ counted under its `_burst` key.
 | `relay.abuse.invalid_rate_per_second` | `5` | Error replies to malformed messages from one address, including CLOSE and NEG-CLOSE with an invalid subscription id. Valid CLOSE and NEG-CLOSE are never budgeted. | Clients with bugs get fewer error replies to debug with. | — |
 | `relay.abuse.invalid_burst` | `20` | The same, at once. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until it refills. | As above. | — |
 | `relay.abuse.ipv6_prefix_len` | `64` | Leading bits of an IPv6 address that key its per-address budgets, from 1 to 128. IPv4 addresses are keyed one by one. | Unrelated users on one large network share a budget. (Too high: a host picks a new address in its /64 for each connection and escapes every per-address budget.) | — |
-| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
+| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget, NIP-86 IP blocks and the write-policy plugin's `sourceInfo`. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
 | `relay.trusted_proxies` | empty | The proxies in front of the relay, as IP addresses or CIDR ranges such as `"192.0.2.0/24"`. With `relay.real_ip_header` set, only a connection from one of them may name a client, and their own addresses are skipped from the header's end, so a CDN in front of the proxy works. Empty: any connection may, and the client is the header's last entry. See [Addresses](#addresses). File-only. | Empty behind two proxies: every client of the first shares its budgets. Empty while clients can reach the relay directly: they can name any address. A range that holds clients lets them name any address. | — |
 
 Rate budgets have no standard NIP-11 field; clients learn them only from
@@ -630,11 +647,12 @@ An entry where the client's should be that names no IP address, such as
 counted by `wok_real_ip_header_unparsed_total`, and is warned about at most
 once a minute.
 
-**The header is fully trusted for every per-address budget.** Without
+**The header is fully trusted for every per-address budget**, and for
+NIP-86 IP blocks and the write-policy plugin's `sourceInfo`. Without
 `relay.trusted_proxies`, if the proxy passes a client's header on without
 adding the client's address last, or a client can reach the relay directly,
-any client can rotate fake addresses to escape the budgets or spend another
-address's. With it, a client can do so only from an address inside a
+any client can rotate fake addresses to escape the budgets and IP blocks or
+spend another address's. With it, a client can do so only from an address inside a
 trusted range, or through a listed proxy that passes the header on without
 appending the address it was reached from. So the ranges must hold only your
 proxies, and each of them must append. If a CDN adds
@@ -643,7 +661,9 @@ client, and that edge's clients share one set of budgets until the ranges are
 updated. The relay warns at startup whenever the header is set, when
 `relay.trusted_proxies` is set without it, and when the header is empty
 while the relay listens only on loopback or private addresses, as behind a
-proxy. See [production-deployment.md](production-deployment.md).
+proxy. Both settings are read for each connection and request, so a reload
+that changes either applies at once: it is logged as a security-scope
+change, and the warning it newly causes is logged with it. See [production-deployment.md](production-deployment.md).
 
 ## Storage
 
@@ -794,7 +814,12 @@ Restart settings, file-only. `database.map_size` and
 
 ## Admin
 
-Live, file-only.
+Live, file-only. A reload that changes any of them is logged as a
+security-scope change, naming the keys added to and removed from
+`admin.pubkeys`. A key taken out of `admin.pubkeys` that still holds the
+NIP-86 `admin` or `moderator` role keeps that level while `admin.enabled`
+is on, until the role is unassigned; the reload warns about each one. Each authorized
+NIP-86 request is logged at `info` with its signer, level and method.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -807,7 +832,10 @@ Live, file-only.
 The public URL must have no credentials, path, query, or fragment. Each API
 request needs a new kind-27235 event with empty content, exactly one matching
 `u` and `method` tag, and, when a body is present, a SHA-256 `payload` tag.
-Authorization events are single-use. The browser delegates signing to NIP-07;
+Authorization events are single-use: an event's ID is kept for 300 seconds,
+the longest `auth_window_secs` allows, whatever the current window, so a
+reload that narrows it and one that widens it again do not let a used event
+through twice. The browser delegates signing to NIP-07;
 Wok never receives private key material.
 
 ## Observability
@@ -859,10 +887,22 @@ All Unix-socket settings require restart and are file-only.
 | `relay.unix.mode` | `0o600` | Permission bits, as TOML octal or decimal. |
 | `relay.unix.owner` | empty | User applied with `chown` after bind. |
 | `relay.unix.group` | empty | Group applied with `chown` after bind. |
-| `relay.unix.auth_uids` | `[]` | Allowed peer UIDs; empty accepts any UID. |
-| `relay.unix.auth_gids` | `[]` | Allowed peer GIDs; empty accepts any GID. |
+| `relay.unix.auth_uids` | `[]` | Allowed peer UIDs; empty accepts any UID. A peer must pass this list and `auth_gids` both. |
+| `relay.unix.auth_gids` | `[]` | Allowed peer GIDs; empty accepts any GID. Only the peer's effective GID is checked, not its supplementary groups. |
 | `relay.unix.max_frame_bytes` | `2097152` | Largest length-prefixed JSON frame. Like `relay.max_websocket_payload_size`, it must hold the largest event, REQ and COUNT, and the `message-caps` warning says when it does not while the socket is on. `marmot` uses 8 MiB. |
 | `relay.unix.max_pending_outbound_bytes` | `33554432` | Pending output budget before disconnect. |
+
+`auth_uids` and `auth_gids` combine with AND. With either set, the relay
+reads the connecting process's effective UID and GID as they were when it
+connected (`SO_PEERCRED` on Linux, `getpeereid` elsewhere) and admits it only
+if the UID is in `auth_uids` and the GID in `auth_gids`, an empty list
+matching anything. Any other peer, or one whose credentials cannot be read,
+is disconnected before its first frame is read. So `auth_uids = [1000]` with
+`auth_gids = [1001]` admits UID 1000 only while its effective group is 1001,
+not "UID 1000 or members of group 1001", and no supplementary group ever
+matches `auth_gids`. To admit every member of a group, leave both lists
+empty and set `group` with a `mode` such as `0o660`: Linux and macOS check
+the socket file's mode against all of a connecting process's groups.
 
 See [Unix socket protocol](unix-socket.md) for framing and peer authorization.
 

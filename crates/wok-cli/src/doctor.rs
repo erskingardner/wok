@@ -144,10 +144,24 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         } else {
             CheckStatus::Warn
         },
-        if cfg.relay.abuse.enabled {
-            "abuse rate limits and quotas are enabled".to_string()
+        match (cfg.relay.abuse.enabled, cfg.pow_warning()) {
+            (true, _) => "abuse rate limits and quotas are enabled".to_string(),
+            (false, None) => "abuse rate limits and quotas are disabled".to_string(),
+            (false, Some(pow)) => format!("abuse rate limits and quotas are disabled; {pow}"),
+        },
+    );
+    let zeroed = cfg.zero_guard_warnings();
+    report.add(
+        "zero-guards",
+        if zeroed.is_empty() {
+            CheckStatus::Pass
         } else {
-            "abuse rate limits and quotas are disabled".to_string()
+            CheckStatus::Warn
+        },
+        if zeroed.is_empty() {
+            "no guard is zero where its preset sets one".to_string()
+        } else {
+            zeroed.join("; ")
         },
     );
 
@@ -1045,6 +1059,46 @@ mod tests {
             preset.detail
         );
         assert_eq!(check(&marmot, "read-classes").status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn zeroed_guards_and_ignored_proof_of_work_are_warnings() {
+        let report = |text: &str| {
+            let cfg = Config::parse_toml(text).unwrap();
+            run(&cfg, Path::new("missing-test-config.toml"))
+        };
+        let defaults = report("");
+        assert_eq!(check(&defaults, "zero-guards").status, CheckStatus::Pass);
+        let abuse = check(&defaults, "abuse-limits");
+        assert_eq!(abuse.status, CheckStatus::Pass);
+
+        let zeroed =
+            report("[relay]\nhandshake_timeout_secs = 0\n[relay.abuse]\nmax_query_work = 0\n");
+        let guards = check(&zeroed, "zero-guards");
+        assert_eq!(guards.status, CheckStatus::Warn);
+        assert!(
+            guards.detail.contains("relay.abuse.max_query_work is zero")
+                && guards
+                    .detail
+                    .contains("relay.handshake_timeout_secs is zero"),
+            "{}",
+            guards.detail
+        );
+
+        let off = report("[relay.abuse]\nenabled = false\n");
+        let abuse = check(&off, "abuse-limits");
+        assert_eq!(abuse.status, CheckStatus::Warn);
+        assert_eq!(abuse.detail, "abuse rate limits and quotas are disabled");
+        let pow = report("[relay.abuse]\nenabled = false\nmin_pow_difficulty = 20\n");
+        let abuse = check(&pow, "abuse-limits");
+        assert_eq!(abuse.status, CheckStatus::Warn);
+        assert!(
+            abuse
+                .detail
+                .contains("relay.abuse.min_pow_difficulty = 20 is ignored"),
+            "{}",
+            abuse.detail
+        );
     }
 
     /// The checks `check_config_defaults` reports for a file: deprecated

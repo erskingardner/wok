@@ -26,7 +26,7 @@ pub use moderation::{
 pub use protocol::{ClientCommand, EoseHints, RelayMessage};
 pub use rlimit::apply_nofiles_limit;
 pub use server::{
-    start, ConnectionGuard, HeldMessages, Outbound, OutboundFrame, RelayHandle,
+    start, BoundAddresses, ConnectionGuard, HeldMessages, Outbound, OutboundFrame, RelayHandle,
     HELD_MESSAGE_OVERHEAD,
 };
 pub use source::TransportSource;

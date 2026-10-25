@@ -1993,11 +1993,11 @@ impl Config {
     /// Warnings for each message cap too small for a limit behind it:
     /// `relay.max_websocket_payload_size`, and `relay.unix.max_frame_bytes`
     /// while the Unix socket is on, must hold an EVENT of
-    /// `events.max_event_size` and a REQ of `relay.max_req_filter_size`, each
-    /// in its shortest envelope. Otherwise such a message passes its own
-    /// limit but is cut off with its connection, so the client gets no `OK`
-    /// or `CLOSED` saying why. Both caps apply at restart; the limits reload
-    /// live.
+    /// `events.max_event_size`, and a REQ of `relay.max_req_filter_size` (and
+    /// a COUNT, while COUNT is on), each in its shortest envelope. Otherwise
+    /// such a message passes its own limit but is cut off with its
+    /// connection, so the client gets no `OK` or `CLOSED` saying why. Both
+    /// caps apply at restart; the limits reload live.
     pub fn message_cap_warnings(&self) -> Vec<String> {
         self.message_caps()
             .into_iter()
@@ -2011,6 +2011,18 @@ impl Config {
         // The bytes each message adds to what its limit counts, at least.
         const EVENT_ENVELOPE: usize = r#"["EVENT",]"#.len();
         const REQ_ENVELOPE: usize = r#"["REQ","x",]"#.len();
+        const COUNT_ENVELOPE: usize = r#"["COUNT","x",]"#.len();
+        let event = [("an EVENT whose event takes", EVENT_ENVELOPE)];
+        // A COUNT is held to the REQ's filter limit, in a longer envelope.
+        let filters = [
+            ("a REQ whose filters take", REQ_ENVELOPE),
+            ("a COUNT whose filters take", COUNT_ENVELOPE),
+        ];
+        let filters = if self.relay.max_filter_limit_count > 0 {
+            &filters[..]
+        } else {
+            &filters[..1]
+        };
         let mut caps = vec![(
             "relay.max_websocket_payload_size",
             self.relay.max_websocket_payload_size,
@@ -2025,32 +2037,42 @@ impl Config {
             (
                 "events.max_event_size",
                 self.events.max_event_size,
-                EVENT_ENVELOPE,
-                "an EVENT whose event takes",
+                &event[..],
             ),
             (
                 "relay.max_req_filter_size",
                 self.relay.max_req_filter_size,
-                REQ_ENVELOPE,
-                "a REQ whose filters take",
+                filters,
             ),
         ];
         let mut warnings = Vec::new();
         for (cap_key, cap) in caps {
-            for (limit_key, limit, envelope, message) in limits {
-                let needed = limit.saturating_add(envelope);
-                if cap < needed {
-                    warnings.push(SettingWarning::new(
-                        &[cap_key, limit_key],
-                        format!(
-                            "{cap_key} = {cap} is too small for {limit_key} = {limit}: {message} \
-                             more than {} bytes is cut off, and its connection closed, before the \
-                             relay can answer it. Raise {cap_key} to at least {needed} (it applies \
-                             at restart), or lower {limit_key}.",
-                            cap.saturating_sub(envelope)
-                        ),
-                    ));
-                }
+            for (limit_key, limit, messages) in limits {
+                // The messages the cap cuts off, each with the size past which
+                // it is.
+                let cut: Vec<String> = messages
+                    .iter()
+                    .filter(|&&(_, envelope)| cap < limit.saturating_add(envelope))
+                    .map(|&(message, envelope)| {
+                        format!("{message} more than {} bytes", cap.saturating_sub(envelope))
+                    })
+                    .collect();
+                let cut = match cut.len() {
+                    0 => continue,
+                    1 => cut.concat(),
+                    _ => format!("{},", cut.join(", or ")),
+                };
+                let envelope = messages.iter().map(|&(_, envelope)| envelope).max();
+                let needed = limit.saturating_add(envelope.unwrap_or_default());
+                warnings.push(SettingWarning::new(
+                    &[cap_key, limit_key],
+                    format!(
+                        "{cap_key} = {cap} is too small for {limit_key} = {limit}: {cut} is cut \
+                         off, and its connection closed, before the relay can answer it. Raise \
+                         {cap_key} to at least {needed} (it applies at restart), or lower \
+                         {limit_key}."
+                    ),
+                ));
             }
         }
         warnings
@@ -3395,12 +3417,13 @@ negentropy_enabled = true
             assert_eq!(cfg.message_caps(), [], "preset {preset} with Unix on");
         }
 
+        // COUNT is on by default, and its envelope is two bytes longer.
         let mut cfg = Config::default();
         cfg.events.max_event_size = 1000;
         cfg.relay.max_req_filter_size = 1000;
-        cfg.relay.max_websocket_payload_size = 1012;
+        cfg.relay.max_websocket_payload_size = 1014;
         assert_eq!(cfg.message_caps(), []);
-        cfg.relay.max_websocket_payload_size = 1011;
+        cfg.relay.max_websocket_payload_size = 1013;
         let caps = cfg.message_caps();
         assert_eq!(caps.len(), 1, "{caps:?}");
         assert_eq!(
@@ -3410,6 +3433,32 @@ negentropy_enabled = true
                 "relay.max_req_filter_size"
             ]
         );
+        assert_eq!(
+            caps[0].warning,
+            "relay.max_websocket_payload_size = 1013 is too small for \
+             relay.max_req_filter_size = 1000: a COUNT whose filters take more than 999 bytes \
+             is cut off, and its connection closed, before the relay can answer it. Raise \
+             relay.max_websocket_payload_size to at least 1014 (it applies at restart), or \
+             lower relay.max_req_filter_size."
+        );
+        cfg.relay.max_websocket_payload_size = 1011;
+        let caps = cfg.message_caps();
+        assert_eq!(caps.len(), 1, "{caps:?}");
+        assert_eq!(
+            caps[0].warning,
+            "relay.max_websocket_payload_size = 1011 is too small for \
+             relay.max_req_filter_size = 1000: a REQ whose filters take more than 999 bytes, or \
+             a COUNT whose filters take more than 997 bytes, is cut off, and its connection \
+             closed, before the relay can answer it. Raise relay.max_websocket_payload_size to \
+             at least 1014 (it applies at restart), or lower relay.max_req_filter_size."
+        );
+        // With COUNT off, only a REQ has to fit.
+        cfg.relay.max_filter_limit_count = 0;
+        cfg.relay.max_websocket_payload_size = 1012;
+        assert_eq!(cfg.message_caps(), []);
+        cfg.relay.max_websocket_payload_size = 1011;
+        let caps = cfg.message_caps();
+        assert_eq!(caps.len(), 1, "{caps:?}");
         assert_eq!(
             caps[0].warning,
             "relay.max_websocket_payload_size = 1011 is too small for \
@@ -3456,6 +3505,29 @@ negentropy_enabled = true
         assert_eq!(running.relay.max_websocket_payload_size, 2 * 1024 * 1024);
         assert_eq!(running.events.max_event_size, 4 * 1024 * 1024);
         assert_eq!(running.message_caps().len(), 1);
+
+        // COUNT turns on live, and the cap the relay keeps must hold one.
+        let file = |count: u64, cap: usize| {
+            Config::parse_toml(&format!(
+                "[events]\nmax_event_size = 1000\n[relay]\nmax_req_filter_size = 1000\n\
+                 max_filter_limit_count = {count}\nmax_websocket_payload_size = {cap}\n"
+            ))
+            .unwrap()
+        };
+        let mut running = file(0, 1012);
+        assert_eq!(running.message_caps(), []);
+        let new = file(1000, 1014);
+        assert_eq!(new.message_caps(), []);
+        running.apply_reload(new).unwrap();
+        assert_eq!(running.relay.max_websocket_payload_size, 1012);
+        let keys: Vec<Vec<String>> = running.message_caps().into_iter().map(|w| w.keys).collect();
+        assert_eq!(
+            keys,
+            [[
+                "relay.max_websocket_payload_size",
+                "relay.max_req_filter_size"
+            ]]
+        );
     }
 
     #[test]

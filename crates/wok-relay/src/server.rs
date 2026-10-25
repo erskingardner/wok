@@ -2342,6 +2342,22 @@ fn handle_client(
         }
         ClientCommand::Count { sub_id, filters } => {
             metrics.client_count.fetch_add(1, Ordering::Relaxed);
+            // The gate is configuration alone, so it comes before the COUNT
+            // budgets and before the filters are sized.
+            if cfg.relay.max_filter_limit_count == 0 {
+                metrics.refused(Setting::MaxFilterLimitCount);
+                let reason = "blocked: bad req: COUNT disabled".to_string();
+                refuse_req(
+                    conns,
+                    metrics,
+                    dispatch,
+                    conn_id,
+                    Ns::Count,
+                    &sub_id,
+                    reason,
+                );
+                return;
+            }
             let request = (Request::Count, "COUNT");
             let admitted = admit_request(
                 cfg, metrics, abuse, budgets, auth, conn_id, &source, request,
@@ -3193,16 +3209,37 @@ fn admit_req(
             ),
         ));
     }
-    let max_limit = if count_only {
-        let m = cfg.relay.max_filter_limit_count + 1;
-        if m == 1 {
-            return Err(refuse(
-                Setting::MaxFilterLimitCount,
-                "blocked",
-                "COUNT disabled".into(),
+    // Pending and live subscriptions both count. Over a lowered cap an open
+    // id can still be replaced; new ids wait until the count drops.
+    if !count_only
+        && !conns.is_open(conn_id, Ns::Req, sid)
+        && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
+    {
+        metrics.refused(Setting::MaxSubsPerConnection);
+        return Err("blocked: too many concurrent REQs".into());
+    }
+    // Live filters stay in memory until closed, and a COUNT's until it is
+    // answered, which may wait for a scan slot, so each namespace's bytes are
+    // budgeted per connection. Like the subscription cap, a lowered budget
+    // still lets an open id be replaced by filters no larger than its own.
+    // Both need only the connection's state and the serialized size, so they
+    // come before the filters are parsed, validated and priced.
+    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
+    if filter_budget != 0 {
+        let ns = if count_only { Ns::Count } else { Ns::Req };
+        let (held, replaced) = conns.filter_bytes(conn_id, ns, sid);
+        if serialized_filter_bytes > replaced
+            && held - replaced + serialized_filter_bytes > filter_budget
+        {
+            metrics.refused(Setting::MaxFilterBytesPerConnection);
+            return Err(format!(
+                "blocked: this connection's filters exceed {filter_budget} bytes"
             ));
         }
-        m
+    }
+    // A disabled COUNT was refused before any of this (`handle_client`).
+    let max_limit = if count_only {
+        cfg.relay.max_filter_limit_count + 1
     } else {
         cfg.relay.max_filter_limit
     };
@@ -3273,32 +3310,6 @@ fn admit_req(
         };
         count_read_class(metrics, class);
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
-    }
-    // Pending and live subscriptions both count. Over a lowered cap an open
-    // id can still be replaced; new ids wait until the count drops.
-    if !count_only
-        && !conns.is_open(conn_id, Ns::Req, sid)
-        && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
-    {
-        metrics.refused(Setting::MaxSubsPerConnection);
-        return Err("blocked: too many concurrent REQs".into());
-    }
-    // Live filters stay in memory until closed, and a COUNT's until it is
-    // answered, which may wait for a scan slot, so each namespace's bytes are
-    // budgeted per connection. Like the subscription cap, a lowered budget
-    // still lets an open id be replaced by filters no larger than its own.
-    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
-    if filter_budget != 0 {
-        let ns = if count_only { Ns::Count } else { Ns::Req };
-        let (held, replaced) = conns.filter_bytes(conn_id, ns, sid);
-        if serialized_filter_bytes > replaced
-            && held - replaced + serialized_filter_bytes > filter_budget
-        {
-            metrics.refused(Setting::MaxFilterBytesPerConnection);
-            return Err(format!(
-                "blocked: this connection's filters exceed {filter_budget} bytes"
-            ));
-        }
     }
     Ok((
         Subscription::new(conn_id, sid.clone(), fg, count_only),
@@ -6059,6 +6070,59 @@ mod tests {
             handle.client_message(conn, local_source(), req(sub)).await;
             assert!(recv_outbound(&mut rx).await.contains("EOSE"));
         }
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_refusals_come_before_the_filters_are_read() {
+        // A disabled COUNT spends no COUNT budget, and the subscription cap
+        // and the connection's filter bytes refuse a REQ before its filters
+        // are parsed: this filter would fail parsing.
+        let (_dir, handle) = live_reload_relay(|cfg, _| {
+            cfg.relay.max_filter_limit_count = 0;
+            cfg.relay.abuse.per_connection.count_rate_per_second = 1;
+            cfg.relay.abuse.per_connection.count_burst = 1;
+            cfg.relay.max_subs_per_connection = 1;
+        });
+        let (conn, mut rx) = live_conn(&handle).await;
+        let count = json!(["COUNT", "n", {"kinds": [1]}]).to_string();
+        for _ in 0..3 {
+            handle
+                .client_message(conn, local_source(), count.clone())
+                .await;
+            assert_eq!(
+                recv_outbound(&mut rx).await,
+                r#"["CLOSED","n","blocked: bad req: COUNT disabled"]"#
+            );
+        }
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_count_rate_rejections
+                .load(Ordering::Relaxed),
+            0
+        );
+        let open = json!(["REQ", "a", {"kinds": [1]}]).to_string();
+        handle.client_message(conn, local_source(), open).await;
+        assert!(recv_outbound(&mut rx).await.contains("EOSE"));
+        let malformed = json!(["REQ", "b", {"kinds": "x"}]).to_string();
+        handle
+            .client_message(conn, local_source(), malformed.clone())
+            .await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            r#"["CLOSED","b","blocked: too many concurrent REQs"]"#
+        );
+        {
+            let mut cfg = handle.config.write();
+            cfg.relay.max_subs_per_connection = 2;
+            cfg.relay.max_filter_bytes_per_connection = 1;
+        }
+        handle.client_message(conn, local_source(), malformed).await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            r#"["CLOSED","b","blocked: this connection's filters exceed 1 bytes"]"#
+        );
         handle.request_shutdown();
     }
 

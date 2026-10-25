@@ -3959,8 +3959,12 @@ mod tests {
             marmot_groups: 3,
             marmot_invitees: 3,
             max_follows: 120,
-            duration_secs: 3,
-            replace_interval_ms: 1_000,
+            // A scroll page is replaced only once it finishes, and the first
+            // queues behind the connection's other startup REQs. A debug
+            // build on a loaded runner took up to 5 s for that, so run past
+            // it and tick often enough to replace soon after.
+            duration_secs: 6,
+            replace_interval_ms: 250,
             publish_rate: 8.0,
             publishers: 2,
             clients_per_address: 1,
@@ -4074,9 +4078,10 @@ mod tests {
         assert_eq!(row("marmot.burst").completed, opts.marmot_clients as u64);
         assert!(row("delivery.marmot").completed > 0);
         assert!(row("delivery.outbox").completed > 0);
+        let scroll = row("w6.scroll_replace");
         assert!(
-            row("w6.scroll_replace").sent > 3 * opts.outbox_clients as u64,
-            "replacements happen"
+            scroll.sent > 3 * opts.outbox_clients as u64,
+            "replacements happen: {scroll:#?}"
         );
         let md = render_markdown(&report, "wok", 1);
         assert!(

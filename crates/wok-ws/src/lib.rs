@@ -1083,6 +1083,7 @@ async fn handle_ws<S>(
                                             // message is whole and inflated.
                                             Err(_) if kind == MessageKind::Text => {
                                                 connection.hand_over_rest(&mut held).await;
+                                                tracing::info!(conn_id, peer = %peer, reason = "text message not UTF-8", close_code = frame::CLOSE_INVALID_DATA, "client terminated");
                                                 send_close(&mut wr, encoder.encode_close(frame::CLOSE_INVALID_DATA)).await;
                                                 break 'outer;
                                             }
@@ -1110,6 +1111,8 @@ async fn handle_ws<S>(
                                         // pause is dropped, as the close drops
                                         // the parked work ahead of it.
                                         connection.hand_over_rest(&mut held).await;
+                                        // Echoed as sent: the parser has
+                                        // checked its body.
                                         let _ = write_bytes(&mut wr, &encoder.encode_control(frame::OP_CLOSE, &c)).await;
                                         break 'outer;
                                     }
@@ -1119,6 +1122,7 @@ async fn handle_ws<S>(
                         Err(e) => {
                             connection.hand_over_rest(&mut held).await;
                             if let Some(code) = e.close_code() {
+                                tracing::info!(conn_id, peer = %peer, reason = %e, close_code = code, "client terminated");
                                 send_close(&mut wr, encoder.encode_close(code)).await;
                             }
                             break;

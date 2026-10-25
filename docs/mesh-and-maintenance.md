@@ -245,6 +245,26 @@ include scanned rows, the fixed high-water mark, matched rows, and new inserts.
 Smaller batches reduce writer hold time; larger batches trade more memory and
 write latency for throughput. A batch size of zero is rejected.
 
+## Trees while NIP-77 is off
+
+`relay.negentropy_enabled = false` stops the relay answering NEG-OPEN and
+NEG-MSG, but its writer keeps updating every registered tree, the default
+`{}` tree included, as it stores and deletes events. That costs each write a
+B-tree update per tree the event matches, and in return:
+
+- turning NIP-77 back on, which reloads live, serves complete trees at once;
+- `wok sync`, which reconciles from a local tree whether or not the relay
+  answers NIP-77, finds it consistent;
+- no tree can go stale behind the setting. A tree that missed writes would
+  lack the events stored meanwhile and keep those deleted or replaced, and
+  only `wok reindex --confirm-relay-stopped` repairs that, since
+  `wok negentropy build` only adds records. The relay checks the size of the
+  `{}` tree before it serves it, but not the contents of a filtered tree.
+
+The writer runs this on stored events' timestamps and ids only, after an
+event has passed every check and been stored, so a client chooses nothing
+the tree code parses.
+
 ## Precomputed-tree filters and restricted kinds
 
 `wok negentropy add <filter>` registers a persistent tree for a filter.

@@ -1,7 +1,7 @@
 # Relay functions reached in the `monitored` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 725
+## anonymous: 728
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -428,6 +428,9 @@
 <wok_relay::server::negentropy::MemoryPool>::reserve::{closure}::{closure}
 <wok_relay::server::negentropy::Reservation as core::ops::drop::Drop>::drop
 <wok_relay::server::negentropy::Reservation>::shrink
+<wok_relay::server::negentropy::Swept>::forget
+<wok_relay::server::negentropy::Swept>::start
+<wok_relay::server::negentropy::Swept>::took
 <wok_relay::server::sub_gate::SubGate>::admit
 <wok_relay::server::sub_gate::SubGate>::admit::{closure}
 <wok_relay::server::sub_gate::SubGate>::close

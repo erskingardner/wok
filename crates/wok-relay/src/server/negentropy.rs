@@ -577,12 +577,13 @@ pub(super) fn run_negentropy(
                     payload,
                 } => {
                     let key = (conn_id, sub_id.to_string());
-                    let mut valid = false;
                     // Sent before the NEG-ERR of the sweep that closed its
                     // session reached the client, so it is not answered.
                     let swept_handle = !sessions.contains_key(&key) && swept.crossed(&key);
-                    if let Some(session) = sessions.get_mut(&key) {
-                        valid = match &mut session.view {
+                    // Whether a session answered with its NEG-MSG, or with
+                    // the NEG-ERR that closes it; `None` when none could.
+                    let answered = sessions.get_mut(&key).and_then(|session| {
+                        let answered = match &mut session.view {
                             View::Memory { items, .. } if items.is_sealed() => send_vector(
                                 &conns,
                                 &metrics,
@@ -605,22 +606,32 @@ pub(super) fn run_negentropy(
                                     &payload,
                                 )
                             }
-                            _ => false,
+                            _ => return None,
                         };
-                        if valid {
+                        if answered {
                             session.waiting_since = Some(Instant::now());
                         }
-                    }
-                    if !valid && !swept_handle {
-                        sessions.remove(&key);
-                        queries.remove_sub(conn_id, &sub_id);
-                        fail(
-                            &conns,
-                            &metrics,
-                            conn_id,
-                            sub_id.as_str(),
-                            "closed: unknown subscription handle",
-                        );
+                        Some(answered)
+                    });
+                    match answered {
+                        Some(true) => {}
+                        // Its NEG-ERR said why, so it is the only one.
+                        Some(false) => {
+                            sessions.remove(&key);
+                            queries.remove_sub(conn_id, &sub_id);
+                        }
+                        None if swept_handle => {}
+                        None => {
+                            sessions.remove(&key);
+                            queries.remove_sub(conn_id, &sub_id);
+                            fail(
+                                &conns,
+                                &metrics,
+                                conn_id,
+                                sub_id.as_str(),
+                                "closed: unknown subscription handle",
+                            );
+                        }
                     }
                 }
                 NegMsg::SetAuth {
@@ -757,10 +768,9 @@ pub(super) fn run_negentropy(
             }
             if let Some(session) = sessions.get_mut(&key) {
                 if let View::Memory { initial, items } = &mut session.view {
-                    if items.seal().is_err()
-                        || !send_vector(&conns, &metrics, key.0, &key.1, items, initial)
-                    {
-                        sessions.remove(&key);
+                    let answered = if items.seal().is_ok() {
+                        send_vector(&conns, &metrics, key.0, &key.1, items, initial)
+                    } else {
                         fail(
                             &conns,
                             &metrics,
@@ -768,6 +778,10 @@ pub(super) fn run_negentropy(
                             &key.1,
                             "error: synchronization reconciliation failed",
                         );
+                        false
+                    };
+                    if !answered {
+                        sessions.remove(&key);
                         continue;
                     }
                     *initial = Vec::new();
@@ -781,6 +795,8 @@ pub(super) fn run_negentropy(
     }
 }
 
+/// Reconcile one message against a session's in-memory view. Returns false
+/// on protocol error, after its NEG-ERR (caller removes the view).
 fn send_vector(
     conns: &ConnTable,
     metrics: &Metrics,
@@ -789,24 +805,13 @@ fn send_vector(
     items: &mut Vector,
     payload: &[u8],
 ) -> bool {
-    match Negentropy::new(items, 500_000).and_then(|mut ne| ne.reconcile(payload)) {
-        Ok(reply) => {
-            conns.send(
-                conn,
-                RelayMessage::NegMsg {
-                    sub_id: sid.into(),
-                    payload_hex: hex::encode(reply),
-                },
-                metrics,
-            );
-            true
-        }
-        Err(_) => false,
-    }
+    let resp = Negentropy::new(items, 500_000).and_then(|mut ne| ne.reconcile(payload));
+    answer(conns, metrics, conn, sid, resp)
 }
 
 /// Reconcile one message against a precomputed tree ("stateless" view in
-/// C++). Returns false on protocol error (caller removes the view).
+/// C++). Returns false on protocol error, after its NEG-ERR (caller removes
+/// the view).
 #[allow(clippy::too_many_arguments)]
 fn reconcile_tree(
     txn: &wok_db::RoTxn<'_>,
@@ -834,6 +839,19 @@ fn reconcile_tree(
         let mut ne = Negentropy::new(sub_store, 500_000).map_err(|e| e.to_string())?;
         ne.reconcile(payload).map_err(|e| e.to_string())
     })();
+    answer(conns, metrics, conn, sid, resp)
+}
+
+/// Send either view's reply: the NEG-MSG, or the one NEG-ERR that closes the
+/// session when the message did not reconcile. Returns whether it was the
+/// NEG-MSG.
+fn answer<E>(
+    conns: &ConnTable,
+    metrics: &Metrics,
+    conn: u64,
+    sid: &str,
+    resp: Result<Vec<u8>, E>,
+) -> bool {
     match resp {
         Ok(r) => {
             conns.send(
@@ -1144,6 +1162,95 @@ mod tests {
             out_rx.try_recv().is_err(),
             "a frame for the dropped NEG-MSGs"
         );
+    }
+
+    /// A message that does not reconcile gets one NEG-ERR, and the same one
+    /// from a tree as from a view built in memory: the session is closed,
+    /// not unknown. That holds for a NEG-OPEN's message as for a NEG-MSG's.
+    #[test]
+    fn a_message_that_does_not_reconcile_gets_one_neg_err_from_either_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let open = |sub_id: &str, filter: Value, payload: &[u8]| {
+            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: payload.to_vec(),
+            }
+        };
+        // `{}` is answered from the tree the database starts with, and
+        // `{"kinds":[1]}`, which no tree has, from memory.
+        {
+            let txn = env.begin_ro().unwrap();
+            let mut trees = Vec::new();
+            wok_db::foreach_negentropy_filter(&txn, |_, filter| {
+                trees.push(filter.to_string());
+                true
+            })
+            .unwrap();
+            assert_eq!(trees, ["{}"]);
+            let NegMsg::Open { sub, .. } = open("tree", json!({}), &[]) else {
+                unreachable!()
+            };
+            assert!(public_tree_allowed(&txn, &sub, &cfg).unwrap());
+        }
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let conns = conns.clone();
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        // No protocol version byte.
+        let garbage = [0u8];
+        let msg = |sub_id: &str, payload: &[u8]| NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new(sub_id).unwrap(),
+            payload: payload.to_vec(),
+        };
+        let served = |reply: Value, sub_id: &str| {
+            assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!(sub_id)));
+        };
+        let invalid =
+            |sub_id: &str| json!(["NEG-ERR", sub_id, "error: invalid reconciliation message"]);
+        let unknown =
+            |sub_id: &str| json!(["NEG-ERR", sub_id, "closed: unknown subscription handle"]);
+
+        for (sub_id, filter) in [("tree", json!({})), ("memory", json!({"kinds": [1]}))] {
+            tx.send(open(sub_id, filter.clone(), &init)).unwrap();
+            served(next(&mut out_rx), sub_id);
+            tx.send(msg(sub_id, &init)).unwrap();
+            served(next(&mut out_rx), sub_id);
+            tx.send(msg(sub_id, &garbage)).unwrap();
+            assert_eq!(next(&mut out_rx), invalid(sub_id));
+            // The NEG-ERR was its only reply, and closed the session.
+            tx.send(msg("never", &init)).unwrap();
+            assert_eq!(next(&mut out_rx), unknown("never"));
+            tx.send(msg(sub_id, &init)).unwrap();
+            assert_eq!(next(&mut out_rx), unknown(sub_id));
+            // A NEG-OPEN whose message does not reconcile opens no session.
+            tx.send(open(sub_id, filter, &garbage)).unwrap();
+            assert_eq!(next(&mut out_rx), invalid(sub_id));
+            tx.send(msg(sub_id, &init)).unwrap();
+            assert_eq!(next(&mut out_rx), unknown(sub_id));
+        }
+        drop(tx);
+        worker.join().unwrap();
+        assert!(out_rx.try_recv().is_err(), "a second NEG-ERR");
     }
 
     /// A reload that made AUTH unusable ended every login, so the sessions

@@ -908,6 +908,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A NEG-OPEN or NEG-MSG whose negentropy message does not reconcile gets one
+  `NEG-ERR`, `error: invalid reconciliation message`, from a session served
+  from a negentropy tree or from memory alike (#219). A NEG-MSG to a session
+  served from a tree got that, then a second `NEG-ERR`, `closed: unknown
+  subscription handle`; one to a session built in memory got only the
+  second, which named the wrong cause. **Clients see new reasons** from a
+  session built in memory: a NEG-MSG now gets `error: invalid reconciliation
+  message` instead of `closed: unknown subscription handle`, and a NEG-OPEN
+  gets it instead of `error: synchronization reconciliation failed`.
 - An npub in `admin.pubkeys` makes its key a member under the `members`
   policies while `admin.enabled` is off (#214). Only a file with admin on had
   its `admin.pubkeys` converted to lowercase hex, which membership compares

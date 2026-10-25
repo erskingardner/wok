@@ -533,9 +533,9 @@ fn check_stale_defaults(
     );
 }
 
-/// Keys pinned to the public preset's value under another preset, as a file
-/// written for `public`, such as a copy of the 0.7 sample, keeps them. None
-/// is a past default, so the `config-defaults` check does not name them.
+/// Keys pinned to the public preset's value under another preset, often by a
+/// file written for `public` such as a copy of the 0.7 sample. None is a
+/// past default, so the `config-defaults` check does not name them.
 fn check_public_values(explanation: &ConfigExplanation, report: &mut DoctorReport) {
     let preset = explanation.config.preset;
     if preset == Preset::Public {
@@ -568,8 +568,8 @@ fn check_public_values(explanation: &ConfigExplanation, report: &mut DoctorRepor
         format!(
             "{} {} the public preset's value, so the relay does not get preset {preset}'s: {}. \
              A file written for the public preset, such as a copy of an earlier release's \
-             sample, sets these. Delete a line to use the preset's value, or keep it if you \
-             chose that value.",
+             sample, can set these without meaning to. Delete a line to use the preset's \
+             value, or keep it if you chose that value.",
             kept.len(),
             if kept.len() == 1 {
                 "key keeps"

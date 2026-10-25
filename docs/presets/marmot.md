@@ -56,13 +56,22 @@ Everything else keeps its `public` value: the read classes, open read and
 write policies, no lower bound on `created_at`, the 900 s future tolerance,
 no proof of work, NIP-77 on, and the per-address backstops.
 
-A setting in the file still wins over the preset. A file written for
-`public` that lists the settings above, as a copy of the 0.7
-`docs/wok.toml` does, keeps their `public` values after it adds
-`preset = "marmot"`. `wok doctor` names each one in its
-`config-public-values` check; delete those lines, or run
-`wok config minimize` before changing the preset, which removes every
-setting that repeats `public`'s value.
+A setting in the file still wins over the preset. A copy of the 0.7
+`docs/wok.toml`, which lists every 0.7 default, keeps six `public` values
+after it adds `preset = "marmot"`: `events.max_event_size` at 1 MiB,
+`relay.max_websocket_payload_size` and `relay.unix.max_frame_bytes` at
+2 MiB, COUNT (`relay.max_filter_limit_count`) and permessage-deflate
+(`relay.compression_enabled`) on, and `relay.abuse.event_burst` at 100.
+`wok doctor` names those in its `config-public-values` check. The same
+file's `relay.max_filter_limit = 500` is the 0.7 default, so the relay stays
+at 500 and the `config-defaults` check names it instead. The sample sets no
+accepted kinds, scoped filters or per-connection budgets, so those take
+`marmot`'s values.
+
+To drop the six, delete their lines, or run `wok config minimize` while the
+file still selects `public`: it removes every setting that repeats
+`public`'s value. It keeps `max_filter_limit = 500`, which differs from
+`public`'s 2,000; delete that line too unless you chose 500.
 
 ## What it deliberately refuses
 

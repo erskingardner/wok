@@ -7,10 +7,12 @@
 #![forbid(unsafe_code)]
 
 mod admin;
+pub mod forwarded;
 pub mod frame;
 mod nip86;
 
 use bytes::Bytes;
+use forwarded::Forwarded;
 use frame::{
     read_events_into, write_bytes, DeflateCtx, InflateCtx, MessageKind, ReadDeadlines, WsEncoder,
     WsEvent, WsParser, OP_PING, OP_PONG,
@@ -260,14 +262,14 @@ async fn dispatch(
 ) -> Response<Full<Bytes>> {
     // Honor relay.real_ip_header for reverse-proxied deployments. C++ strfry
     // reads the whole value as one address; Wok reads the last entry, the
-    // one the proxy wrote.
+    // one the proxy wrote, and reads `Forwarded` as RFC 7239.
     let peer = {
         let cfg = handle.config.read();
         let header = cfg.relay.real_ip_header.as_str();
         if header.is_empty() {
             peer
         } else {
-            match forwarded_client(req.headers(), header) {
+            match forwarded::client(req.headers(), header) {
                 Forwarded::Client(ip) => SocketAddr::new(ip, 0),
                 Forwarded::Absent => peer,
                 Forwarded::Unparsed(entry) => {
@@ -280,7 +282,7 @@ async fn dispatch(
                         tracing::warn!(
                             header,
                             entry = ?entry,
-                            "relay.real_ip_header ends in an entry that is not an IP \
+                            "relay.real_ip_header ends in an entry that names no IP \
                              address, so the connecting address stands in for the client's; \
                              check that the proxy writes the client's address last (warned \
                              at most once a minute, counted by \
@@ -412,36 +414,6 @@ fn nodeinfo(path: &str, headers: &hyper::HeaderMap) -> Response<Full<Bytes>> {
         "usage": { "users": {} },
         "metadata": { "features": ["nostr_relay"] },
     }))
-}
-
-/// The client a request's `relay.real_ip_header` names.
-#[derive(Debug, PartialEq)]
-enum Forwarded {
-    /// The request has no such header.
-    Absent,
-    Client(IpAddr),
-    /// The header's last entry, which is not an address.
-    Unparsed(String),
-}
-
-/// The client in the last entry of a forwarded-address header, the one the
-/// proxy in front of Wok wrote: a proxy that appends to the client's own
-/// header, or adds its own line after it, leaves the client's entries in
-/// front. The header's lines form one comma-separated list (RFC 9110
-/// §5.3), and an entry may carry a port.
-fn forwarded_client(headers: &hyper::HeaderMap, name: &str) -> Forwarded {
-    let Some(line) = headers.get_all(name).iter().next_back() else {
-        return Forwarded::Absent;
-    };
-    let line = String::from_utf8_lossy(line.as_bytes());
-    let entry = line.rsplit(',').next().unwrap_or_default().trim();
-    entry
-        .parse::<IpAddr>()
-        .or_else(|_| entry.parse::<SocketAddr>().map(|addr| addr.ip()))
-        .map_or_else(
-            |_| Forwarded::Unparsed(entry.to_string()),
-            Forwarded::Client,
-        )
 }
 
 /// When the relay last warned about an unparsed `relay.real_ip_header`, in
@@ -1271,65 +1243,6 @@ mod http_tests {
         assert!(!accept(&["application/nostr+json;q=0"]));
         assert!(!accept(&["application/nostr+json; q=0.000"]));
         assert!(!accept(&["application/nostr+jsonx"]));
-    }
-
-    fn forwarded(lines: &[&str]) -> Forwarded {
-        let mut headers = hyper::HeaderMap::new();
-        for line in lines {
-            headers.append(
-                "x-forwarded-for",
-                hyper::header::HeaderValue::from_str(line).unwrap(),
-            );
-        }
-        forwarded_client(&headers, "x-forwarded-for")
-    }
-
-    fn client(ip: &str) -> Forwarded {
-        Forwarded::Client(ip.parse().unwrap())
-    }
-
-    #[test]
-    fn the_forwarded_client_is_the_last_entry() {
-        assert_eq!(forwarded(&[]), Forwarded::Absent);
-        assert_eq!(forwarded(&["203.0.113.7"]), client("203.0.113.7"));
-        assert_eq!(forwarded(&[" 203.0.113.7 "]), client("203.0.113.7"));
-        // Appended to the client's own header.
-        assert_eq!(
-            forwarded(&["198.51.100.9, 203.0.113.7"]),
-            client("203.0.113.7")
-        );
-        assert_eq!(
-            forwarded(&["198.51.100.9,203.0.113.7"]),
-            client("203.0.113.7")
-        );
-        // A line of the proxy's own after the client's.
-        assert_eq!(
-            forwarded(&["198.51.100.9", "203.0.113.7"]),
-            client("203.0.113.7")
-        );
-        assert_eq!(
-            forwarded(&["192.0.2.1, 198.51.100.9", "203.0.113.7"]),
-            client("203.0.113.7")
-        );
-        // Entries with a port, and IPv6.
-        assert_eq!(forwarded(&["203.0.113.7:4711"]), client("203.0.113.7"));
-        assert_eq!(forwarded(&["2001:db8::1"]), client("2001:db8::1"));
-        assert_eq!(forwarded(&["[2001:db8::1]:4711"]), client("2001:db8::1"));
-    }
-
-    #[test]
-    fn a_last_entry_that_is_not_an_address_is_unparsed() {
-        let unparsed = |entry: &str| Forwarded::Unparsed(entry.to_string());
-        assert_eq!(forwarded(&["203.0.113.7, unknown"]), unparsed("unknown"));
-        assert_eq!(forwarded(&["203.0.113.7,"]), unparsed(""));
-        assert_eq!(forwarded(&["203.0.113.7", ""]), unparsed(""));
-        // RFC 7239 Forwarded syntax is not an address list.
-        assert_eq!(
-            forwarded(&["for=192.0.2.60;proto=https"]),
-            unparsed("for=192.0.2.60;proto=https")
-        );
-        // A client's address in front does not rescue the proxy's entry.
-        assert_eq!(forwarded(&["203.0.113.7", "_hidden"]), unparsed("_hidden"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 653
+## anonymous: 655
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -406,6 +406,7 @@
 <wok_ws::frame::WsEncoder>::encode_message_into
 <wok_ws::frame::WsEncoder>::new
 <wok_ws::frame::WsEncoder>::with_role
+<wok_ws::frame::WsError>::close_code
 <wok_ws::frame::WsParser>::assembly_pending
 <wok_ws::frame::WsParser>::drain_events_into
 <wok_ws::frame::WsParser>::handle_frame
@@ -627,6 +628,7 @@ wok_ws::dispatch::{closure}
 wok_ws::dispatch::{closure}::{closure}
 wok_ws::empty
 wok_ws::frame::apply_mask
+wok_ws::frame::check_close
 wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>
 wok_ws::frame::read_events_into::<tokio::io::split::ReadHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>::{closure}
 wok_ws::frame::write_bytes::<tokio::io::split::WriteHalf<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>>

@@ -1393,13 +1393,10 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     let config = Arc::new(parking_lot::RwLock::new(config));
     let conns = Arc::new(ConnTable::new());
     let metrics = Arc::new(Metrics::default());
-    {
-        let cfg = config.read();
-        metrics.history.configure(
-            cfg.observability.history_enabled,
-            cfg.observability.history_max_points,
-        );
-    }
+    // The history thread's first wake runs here, so the first sample and
+    // refusal mark are kept by the time `start` returns, however soon the
+    // relay is stopped.
+    let first_wake = metrics_history_wake(&config, &metrics, None);
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let abuse = Arc::new(AbuseController::default());
@@ -1483,7 +1480,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         let shutdown = shutdown.clone();
         thread::Builder::new()
             .name("metrics-history".into())
-            .spawn(move || run_metrics_history(cfg, metrics, shutdown))
+            .spawn(move || run_metrics_history(cfg, metrics, shutdown, first_wake))
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
@@ -1571,42 +1568,52 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
     Ok(handle)
 }
 
+/// The history thread, from the wake `start` ran for it: sleep, then wake
+/// again, until the relay stops.
 fn run_metrics_history(
     cfg: Arc<parking_lot::RwLock<Config>>,
     metrics: Arc<Metrics>,
     shutdown: Arc<AtomicBool>,
+    (mut last_sample, mut wait): (std::time::Instant, Duration),
 ) {
-    let mut last_sample: Option<std::time::Instant> = None;
-    while !shutdown.load(Ordering::Relaxed) {
-        let observability = cfg.read().observability.clone();
-        metrics.history.configure(
-            observability.history_enabled,
-            observability.history_max_points,
-        );
-        let interval = Duration::from_secs(observability.history_interval_secs.max(1));
-        let now = std::time::Instant::now();
-        if last_sample.is_none_or(|last| now >= last + interval) {
+    while sleep_unless_shutdown(&shutdown, wait) {
+        (last_sample, wait) = metrics_history_wake(&cfg, &metrics, Some(last_sample));
+    }
+}
+
+/// One wake of the history thread: apply the history settings, take a
+/// sample if one is due, and keep a refusal mark. Returns when the last
+/// sample was taken and how long to sleep.
+fn metrics_history_wake(
+    cfg: &parking_lot::RwLock<Config>,
+    metrics: &Metrics,
+    last_sample: Option<std::time::Instant>,
+) -> (std::time::Instant, Duration) {
+    let observability = cfg.read().observability.clone();
+    metrics.history.configure(
+        observability.history_enabled,
+        observability.history_max_points,
+    );
+    let interval = Duration::from_secs(observability.history_interval_secs.max(1));
+    let now = std::time::Instant::now();
+    let last_sample = match last_sample {
+        Some(last) if now < last + interval => last,
+        _ => {
             if observability.history_enabled && observability.history_max_points > 0 {
                 metrics.record_history();
             }
-            last_sample = Some(now);
+            now
         }
-        // The dashboard's refusal counts cover the last day whatever the
-        // history keeps or how far apart its samples are.
-        let unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        metrics.refusals.mark(unix);
-        let wait = history_wait(
-            last_sample.unwrap_or(now),
-            interval,
-            std::time::Instant::now(),
-        );
-        if !sleep_unless_shutdown(&shutdown, wait) {
-            return;
-        }
-    }
+    };
+    // The dashboard's refusal counts cover the last day whatever the
+    // history keeps or how far apart its samples are.
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    metrics.refusals.mark(unix);
+    let wait = history_wait(last_sample, interval, std::time::Instant::now());
+    (last_sample, wait)
 }
 
 /// The history thread wakes at least this often, so refusal marks stay
@@ -5684,6 +5691,15 @@ mod tests {
             history_wait(now, fifteen, now + fifteen * 2),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn start_returns_with_the_first_history_sample_and_refusal_mark() {
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        // Read without waiting for the history thread.
+        assert_eq!(handle.metrics.history.snapshots().len(), 1);
+        assert!(handle.metrics.refusals.recent().is_some());
+        handle.shutdown_and_join(Duration::from_secs(10)).unwrap();
     }
 
     fn local_source() -> TransportSource {

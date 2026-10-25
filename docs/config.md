@@ -486,7 +486,7 @@ counted under its `_burst` key.
 | `relay.abuse.invalid_rate_per_second` | `5` | Error replies to malformed messages from one address, including CLOSE and NEG-CLOSE with an invalid subscription id. Valid CLOSE and NEG-CLOSE are never budgeted. | Clients with bugs get fewer error replies to debug with. | — |
 | `relay.abuse.invalid_burst` | `20` | The same, at once. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until it refills. | As above. | — |
 | `relay.abuse.ipv6_prefix_len` | `64` | Leading bits of an IPv6 address that key its per-address budgets, from 1 to 128. IPv4 addresses are keyed one by one. | Unrelated users on one large network share a budget. (Too high: a host picks a new address in its /64 for each connection and escapes every per-address budget.) | — |
-| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget. Wok reads its last entry. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
+| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
 
 Rate budgets have no standard NIP-11 field; clients learn them only from
 refusals.
@@ -564,8 +564,18 @@ Behind a reverse proxy the client's address is the proxy's unless
 reads the header's last entry, the address the proxy in front of it wrote,
 so a proxy that replaces the header, appends the client's address to it
 (nginx's `$proxy_add_x_forwarded_for`), or adds a line of its own (HAProxy's
-`option forwardfor`) all work; an entry may carry a port. A last entry that
-is not an IP address leaves the connecting address, is counted by
+`option forwardfor`) all work; an entry may carry a port.
+
+`relay.real_ip_header = "forwarded"` reads the RFC 7239 `Forwarded` header
+(HAProxy's `option forwarded`): the client is the `for` parameter of its
+last element, such as `for=192.0.2.60;proto=https` or
+`for="[2001:db8::1]:4711"`. The syntax follows from the header's name, not
+its content. That element must be well formed, with one `for`; whatever
+comes before it, which the client may have sent, does not matter. Any other
+header is read as a list of addresses.
+
+A last entry that names no IP address, such as `unknown` or an obfuscated
+`for=_hidden`, leaves the connecting address, is counted by
 `wok_real_ip_header_unparsed_total`, and is warned about at most once a
 minute. Behind two proxies in a row, that entry is the first proxy's
 address, so every client of that proxy shares one set of budgets.

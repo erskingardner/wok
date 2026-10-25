@@ -311,6 +311,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Events print in the normalized form `wok export` writes.
   `--no-verify` skips the id and signature checks, like `wok import
   --no-verify`.
+- New database files are created with mode `0640`, less the umask, instead
+  of `0664` (#56): `data.mdb` and `lock.mdb`, `wok compact` output and the
+  copy `wok migrate strfry` takes. Stored events include gift wraps and
+  other recipient-only kinds, which any local user who could reach the
+  database directory could read unless the umask removed other users'
+  access. Existing files keep their mode: `chmod g-w,o= data.mdb lock.mdb`
+  in the database directory narrows them. The example systemd unit's
+  `UMask=0077` and `0700` state directory already kept other users out.
 
 ### Added
 
@@ -1153,6 +1161,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order hit it: live subscriptions catching up, `wok monitor`, the router,
   negentropy tree builds, and `wok migrate strfry`'s verification and
   fingerprints.
+- `wok compact <file>` writes the compact copy to that file, as `wok compact
+  -` writes it to standard output. It failed with `No such file or
+  directory`: LMDB took the path for a directory to write `data.mdb` in, and
+  the command refuses a path that exists.
 
 ## [0.7.0] - 2026-09-08
 

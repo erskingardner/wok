@@ -135,7 +135,8 @@ const OPENS: &[(&str, &str, &[&str], &str)] = &[
             "EVENT a gift wrap to the author",
         ],
         "relay.abuse.enabled = false turns proof of work off with the other abuse \
-         limits, as docs/config.md says, and NIP-11 then advertises 0",
+         limits, as docs/config.md says, and NIP-11 then advertises 0; the relay \
+         warns that the difficulty is ignored, at startup, on reload and in wok doctor",
     ),
     (
         "no recipient-only kinds",

@@ -9,16 +9,19 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use wok_relay::config::MAX_AUTH_WINDOW_SECS;
 use wok_relay::{Config, EphemeralPersistence, RelayHandle};
 
 mod fields;
 mod posture;
 
 const MAX_ADMIN_BODY: usize = 64 * 1024;
-pub(crate) const MAX_REPLAY_IDS: usize = 4096;
+/// Five times the IDs a 60 s window held, as each is now kept for 300 s.
+pub(crate) const MAX_REPLAY_IDS: usize = 5 * 4096;
 
 #[derive(Default)]
 pub struct AdminState {
+    /// The NIP-98 events already used, each ID with its `created_at`.
     used_auth: Mutex<HashMap<[u8; 32], u64>>,
 }
 
@@ -152,10 +155,15 @@ pub async fn dispatch(
     handle: Arc<RelayHandle>,
     state: Arc<AdminState>,
 ) -> Response<Full<Bytes>> {
-    let cfg = handle.config.read().clone();
-    if !cfg.admin.enabled {
-        return response(StatusCode::NOT_FOUND, "text/plain", "not found");
-    }
+    // Checked before the configuration is copied: with admin off, a request
+    // costs one read of the lock.
+    let cfg = {
+        let cfg = handle.config.read();
+        if !cfg.admin.enabled {
+            return response(StatusCode::NOT_FOUND, "text/plain", "not found");
+        }
+        cfg.clone()
+    };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let path_and_query = req
@@ -395,7 +403,10 @@ pub(crate) fn authorize<'a>(
         }
     }
     let mut used = state.used_auth.lock();
-    used.retain(|_, created_at| created_at.abs_diff(now) <= cfg.admin.auth_window_secs);
+    // Kept for the longest window any configuration may set, not the current
+    // one: pruned by a window a reload narrowed, an event would be accepted
+    // again once a reload widened it back.
+    used.retain(|_, created_at| created_at.abs_diff(now) <= MAX_AUTH_WINDOW_SECS);
     if used.contains_key(&verified.id) {
         return Err("NIP-98 authorization event has already been used".into());
     }
@@ -412,6 +423,39 @@ pub(crate) fn authorize<'a>(
             id: verified.id,
         },
     ))
+}
+
+/// What the code under test logs, as `tracing_subscriber::fmt` writes it.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct Logs(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Logs {
+    /// A subscriber that writes here.
+    pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        let writer = self.clone();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish()
+    }
+
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8(self.0.lock().clone()).unwrap()
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn unix_now() -> u64 {
@@ -669,11 +713,7 @@ pub(crate) fn apply_config_patch(
         wok_relay::config::write_file(&path, edited.as_bytes())
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     }
-    handle
-        .config
-        .write()
-        .apply_reload(verified)
-        .map_err(unservable)?;
+    handle.reload_config(verified).map_err(unservable)?;
     Ok(())
 }
 
@@ -1198,6 +1238,21 @@ mod tests {
         body: &[u8],
         nonce: Option<&str>,
     ) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        signed_auth_at(key, url, method, body, nonce, now)
+    }
+
+    fn signed_auth_at(
+        key: &Keypair,
+        url: &str,
+        method: &str,
+        body: &[u8],
+        nonce: Option<&str>,
+        created_at: u64,
+    ) -> String {
         let (pubkey, _) = key.x_only_public_key();
         let mut tags = vec![json!(["u", url]), json!(["method", method])];
         if let Some(nonce) = nonce {
@@ -1208,7 +1263,7 @@ mod tests {
         }
         let mut event = json!({
             "pubkey": hex::encode(pubkey.serialize()),
-            "created_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            "created_at": created_at,
             "kind": 27235,
             "tags": tags,
             "content": "",
@@ -1238,6 +1293,52 @@ mod tests {
 
     fn signed_auth(key: &Keypair, url: &str, method: &str, body: &[u8]) -> String {
         signed_auth_with_nonce(key, url, method, body, None)
+    }
+
+    #[test]
+    fn narrowing_then_widening_the_auth_window_does_not_reopen_replay() {
+        let mut rng = rand::thread_rng();
+        let key = Keypair::new(SECP256K1, &mut rng);
+        let (pubkey, _) = key.x_only_public_key();
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        cfg.admin.pubkeys = vec![hex::encode(pubkey.serialize())];
+        cfg.admin.auth_window_secs = 300;
+        let state = AdminState::default();
+        let url = "https://relay.example/admin/api/overview";
+        let policy = AuthzPolicy {
+            url_ok: &|signed| signed == url,
+            signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
+            require_payload: false,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // A captured header, signed 30 s ago, is used under a 300 s window.
+        let captured = signed_auth_at(&key, url, "GET", b"", None, now - 30);
+        let used = |cfg: &Config, state| {
+            check(&captured, &Method::GET, b"", cfg, state, &policy).map(|_| ())
+        };
+        used(&cfg, &state).unwrap();
+        // Reloads narrow the window to 1 s and to 5 s, and a request is
+        // checked under each: pruned by the current window, the cache used
+        // to drop the captured ID here. The widen below checks it is still
+        // there.
+        for secs in [1, 5] {
+            let mut narrow = cfg.clone();
+            narrow.admin.auth_window_secs = secs;
+            let nonce = secs.to_string();
+            let fresh = signed_auth_with_nonce(&key, url, "GET", b"", Some(&nonce));
+            check(&fresh, &Method::GET, b"", &narrow, &state, &policy).unwrap();
+            assert!(used(&narrow, &state).unwrap_err().contains("time window"));
+        }
+        // A reload back to 300 s: the captured event is in its window again,
+        // and still used.
+        assert!(used(&cfg, &state)
+            .unwrap_err()
+            .contains("already been used"));
     }
 
     #[test]
@@ -1499,6 +1600,60 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(event.to_string())
         );
         assert!(check(&header, &Method::POST, b"", &cfg, &state, &policy).is_ok());
+    }
+
+    /// A dashboard or NIP-86 save installs the whole file, which may hold an
+    /// edit the file watcher has not reloaded yet. The save logs that edit's
+    /// warnings then, or nobody would: the watcher's reload finds nothing
+    /// changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_logs_the_warnings_of_a_pending_file_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wok.toml");
+        let (kept, removed) = (hex::encode([1u8; 32]), hex::encode([2u8; 32]));
+        let file = |pubkeys: &str, relay: &str| {
+            format!(
+                "[relay]\n{relay}\n[admin]\nenabled = true\n\
+                 public_url = \"https://relay.example\"\npubkeys = [{pubkeys}]\n\
+                 allow_config_writes = true\n"
+            )
+        };
+        let text = file(&format!("\"{kept}\", \"{removed}\""), "");
+        std::fs::write(&path, &text).unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let mut cfg = Config::parse_toml(&text).unwrap();
+        cfg.db = dir.path().to_path_buf();
+        let handle = wok_relay::start(env, cfg).unwrap();
+        handle.set_config_path(path.clone());
+        handle
+            .manage(wok_relay::ManagementCmd::AssignRole {
+                pubkey: [2u8; 32],
+                role: "admin".into(),
+            })
+            .await
+            .unwrap();
+        std::fs::write(
+            &path,
+            file(
+                &format!("\"{kept}\""),
+                "real_ip_header = \"x-forwarded-for\"",
+            ),
+        )
+        .unwrap();
+        let logs = Logs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            apply_config_patch(&handle, br#"{"info":{"name":"renamed"}}"#).unwrap();
+        });
+        let logs = logs.text();
+        assert!(
+            logs.contains(&format!("admin.pubkeys no longer lists {removed} (admin)")),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("relay.real_ip_header = \"x-forwarded-for\" is trusted"),
+            "{logs}"
+        );
+        handle.request_shutdown();
     }
 
     #[test]

@@ -244,6 +244,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NIP-59 was advertised. NIP-59 is now advertised only while both gift-wrap
   kinds are restricted; configs that list restricted kinds explicitly need
   21059 added.
+- `wok download` verifies each event's id and signature before printing it,
+  as `wok import`, `wok sync` and `wok router` already did (#154). Before, it
+  printed whatever the relay sent, so used on its own rather than piped into
+  `wok import` it passed a malicious relay's forged events through. An event
+  that fails, or a message that is not JSON, is skipped and logged on stderr
+  with the reason, and the command exits nonzero with the number skipped.
+  It also exits nonzero when the connection closes before EOSE; before, a
+  dump cut short exited 0, and a ping or close frame ended it with a JSON
+  error. Events print in the normalized form `wok export` writes.
+  `--no-verify` skips the id and signature checks, like `wok import
+  --no-verify`.
 
 ### Added
 
@@ -490,6 +501,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ahead of it moves it. One that names no address, such as `for=unknown` or
   an obfuscated `for=_hidden`, still leaves the connecting address and is
   counted. The ingress fuzz target covers both syntaxes.
+- `relay.trusted_proxies` lists the proxies in front of the relay, as
+  addresses or CIDR ranges (#155). Behind a CDN and then nginx, the last
+  entry of `relay.real_ip_header` is the CDN edge's address, so every client
+  of that edge shared one set of per-address budgets and NIP-86 `blockip`
+  could not single one out. With the proxies listed, Wok skips their
+  addresses from the header's end, and the first address outside them is the
+  client. A connection from outside them is its own address and its header
+  is ignored, so a client that reaches the relay directly can no longer name
+  another address. Empty, the default, keeps the header's last entry from any
+  connection. A range of every address is refused, the startup warning names
+  the ranges, and a reload that changes them or `relay.real_ip_header` is now
+  logged as a security-scope change.
 - NIP-86 `unbanevent`, `unallowevent`, `listallowedevents` and
   `listdisallowedkinds`, from the current NIP-86 draft. `allowevent` also
   puts the event on an allow list, with its optional reason, which

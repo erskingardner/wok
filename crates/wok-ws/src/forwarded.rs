@@ -3,67 +3,101 @@
 
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use wok_relay::config::IpRange;
 
 /// The client a request's `relay.real_ip_header` names.
 #[derive(Debug, PartialEq)]
 pub enum Forwarded {
     /// The request has no such header.
     Absent,
+    /// The connection is not from one of `relay.trusted_proxies`, so its
+    /// header, if any, is ignored.
+    Untrusted,
     Client(IpAddr),
-    /// The header's last entry, which names no address.
+    /// The entry where the client's address should be, which names no
+    /// address.
     Unparsed(String),
 }
 
-/// The client in the last entry of the header `name`, the one the proxy in
-/// front of Wok wrote: a proxy that appends to the client's own header, or
-/// adds its own line after it, leaves the client's entries in front. The
-/// header's lines form one comma-separated list (RFC 9110 §5.3), so the
-/// last entry is on the last line. `Forwarded` is read as RFC 7239 defines
-/// it, by its name rather than its content, so what a client sends cannot
-/// choose the syntax. Any other header is a list of addresses, each of
-/// which may carry a port.
-pub fn client(headers: &hyper::HeaderMap, name: &str) -> Forwarded {
-    let Some(line) = headers.get_all(name).iter().next_back() else {
-        return Forwarded::Absent;
-    };
-    let line = String::from_utf8_lossy(line.as_bytes());
-    if name.eq_ignore_ascii_case("forwarded") {
-        last_forwarded_element(&line)
-    } else {
-        last_list_entry(&line)
+/// The client that the header `name` names on a connection from `peer`.
+///
+/// Without `trusted` proxies it is the header's last entry, the one the
+/// proxy in front of Wok wrote: a proxy that appends to the client's own
+/// header, or adds its own line after it, leaves the client's entries in
+/// front. With them, only a connection from one of them may name a client,
+/// and the client is the first address from the header's end that is not
+/// one of them. Each proxy appends the address it was reached from, so every
+/// entry after the client's was written by a trusted proxy, and whatever the
+/// client sent stays ahead of its address. When every address is a proxy's,
+/// the first is the client.
+///
+/// The header's lines form one comma-separated list (RFC 9110 §5.3).
+/// `Forwarded` is read as RFC 7239 defines it, by its name rather than its
+/// content, so what a client sends cannot choose the syntax. Any other
+/// header is a list of addresses, each of which may carry a port.
+pub fn client(
+    headers: &hyper::HeaderMap,
+    name: &str,
+    peer: IpAddr,
+    trusted: &[IpRange],
+) -> Forwarded {
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|range| range.contains(ip));
+    if !trusted.is_empty() && !is_trusted(peer) {
+        return Forwarded::Untrusted;
+    }
+    let rfc7239 = name.eq_ignore_ascii_case("forwarded");
+    let mut first = Forwarded::Absent;
+    for line in headers.get_all(name).iter().rev() {
+        let line = String::from_utf8_lossy(line.as_bytes());
+        let mut rest = Some(line.as_ref());
+        while let Some(text) = rest {
+            let (entry, ahead) = if rfc7239 {
+                split_last_element(text)
+            } else {
+                split_last_entry(text)
+            };
+            let address = if rfc7239 {
+                element_for(entry).as_deref().and_then(node_address)
+            } else {
+                list_entry_address(entry)
+            };
+            let Some(ip) = address else {
+                return Forwarded::Unparsed(entry.to_string());
+            };
+            if !is_trusted(ip) {
+                return Forwarded::Client(ip);
+            }
+            first = Forwarded::Client(ip);
+            rest = ahead;
+        }
+    }
+    first
+}
+
+/// The last entry of an address list, such as X-Forwarded-For, and the text
+/// ahead of it, if any.
+fn split_last_entry(line: &str) -> (&str, Option<&str>) {
+    match line.rsplit_once(',') {
+        Some((ahead, entry)) => (entry.trim(), Some(ahead)),
+        None => (line.trim(), None),
     }
 }
 
-/// The client in the last entry of an address list, such as
-/// X-Forwarded-For.
-fn last_list_entry(line: &str) -> Forwarded {
-    let entry = line.rsplit(',').next().unwrap_or_default().trim();
+/// The address of an address-list entry, with or without a port.
+fn list_entry_address(entry: &str) -> Option<IpAddr> {
     entry
         .parse::<IpAddr>()
         .or_else(|_| entry.parse::<SocketAddr>().map(|addr| addr.ip()))
-        .map_or_else(
-            |_| Forwarded::Unparsed(entry.to_string()),
-            Forwarded::Client,
-        )
+        .ok()
 }
 
-/// The client in the `for` parameter of the last element of an RFC 7239
-/// `Forwarded` line. The element must be well formed, with exactly one
-/// `for`, naming an address; anything ahead of it may be anything.
-fn last_forwarded_element(line: &str) -> Forwarded {
-    let element = last_element(line).trim_matches(is_ows);
-    match element_for(element).as_deref().and_then(node_address) {
-        Some(ip) => Forwarded::Client(ip),
-        None => Forwarded::Unparsed(element.to_string()),
-    }
-}
-
-/// The text after the last comma of `line` that is outside a quoted string.
-/// It is found from the right, so text ahead of the proxy's element, which
-/// the client may have written, cannot move where that element starts, not
-/// even an unterminated quoted string. Inside a quoted string, a quote
-/// after an odd run of backslashes is escaped.
-fn last_element(line: &str) -> &str {
+/// The last element of an RFC 7239 `Forwarded` line, after its last comma
+/// outside a quoted string, and the text ahead of it, if any. Elements are
+/// found from the right, so text ahead of the ones the proxies wrote, which
+/// the client may have written, cannot move where they start, not even an
+/// unterminated quoted string. Inside a quoted string, a quote after an odd
+/// run of backslashes is escaped.
+fn split_last_element(line: &str) -> (&str, Option<&str>) {
     let bytes = line.as_bytes();
     let mut quoted = false;
     for at in (0..bytes.len()).rev() {
@@ -73,11 +107,13 @@ fn last_element(line: &str) -> &str {
                 quoted = backslashes.count() % 2 == 1;
             }
             b'"' => quoted = true,
-            b',' if !quoted => return &line[at + 1..],
+            b',' if !quoted => {
+                return (line[at + 1..].trim_matches(is_ows), Some(&line[..at]));
+            }
             _ => {}
         }
     }
-    line
+    (line.trim_matches(is_ows), None)
 }
 
 /// The `for` value of a forwarded-element: `;`-separated pairs, each a
@@ -195,9 +231,11 @@ fn is_ows(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wok_relay::config::IpRange;
 
-    /// The client in a header `name` with one line per entry of `lines`.
-    fn read(name: &str, lines: &[&str]) -> Forwarded {
+    /// The client in a header `name` with one line per entry of `lines`,
+    /// on a connection from `peer`, behind `trusted` proxies.
+    fn read_from(peer: &str, trusted: &[&str], name: &str, lines: &[&str]) -> Forwarded {
         let mut headers = hyper::HeaderMap::new();
         for line in lines {
             headers.append(
@@ -205,7 +243,13 @@ mod tests {
                 hyper::header::HeaderValue::from_str(line).unwrap(),
             );
         }
-        client(&headers, name)
+        let trusted: Vec<IpRange> = trusted.iter().map(|range| range.parse().unwrap()).collect();
+        client(&headers, name, peer.parse().unwrap(), &trusted)
+    }
+
+    /// Without trusted proxies, from any connection.
+    fn read(name: &str, lines: &[&str]) -> Forwarded {
+        read_from("203.0.113.200", &[], name, lines)
     }
 
     fn forwarded(lines: &[&str]) -> Forwarded {
@@ -385,5 +429,103 @@ mod tests {
         ] {
             assert_eq!(rfc7239(&[element]), unparsed(element), "{element}");
         }
+    }
+
+    /// The local proxy in front of Wok, and the CDN in front of it.
+    const PROXIES: &[&str] = &["127.0.0.1", "192.0.2.0/24"];
+
+    /// The client in X-Forwarded-For lines from the local proxy.
+    fn behind(lines: &[&str]) -> Forwarded {
+        read_from("127.0.0.1", PROXIES, "x-forwarded-for", lines)
+    }
+
+    /// The client in Forwarded lines from the local proxy.
+    fn rfc7239_behind(lines: &[&str]) -> Forwarded {
+        read_from("127.0.0.1", PROXIES, "forwarded", lines)
+    }
+
+    #[test]
+    fn trusted_proxies_are_skipped_from_the_right() {
+        // The local proxy appends the CDN edge's address to the CDN's list.
+        assert_eq!(behind(&["203.0.113.7, 192.0.2.10"]), at("203.0.113.7"));
+        assert_eq!(behind(&["203.0.113.7:4711, 192.0.2.10"]), at("203.0.113.7"));
+        // What the client sent stays ahead of its address.
+        assert_eq!(
+            behind(&["198.51.100.9, 203.0.113.7, 192.0.2.10"]),
+            at("203.0.113.7")
+        );
+        assert_eq!(
+            behind(&["198.51.100.9", "203.0.113.7, 192.0.2.10"]),
+            at("203.0.113.7")
+        );
+        // The CDN appends to the client's line, the local proxy adds its own.
+        assert_eq!(
+            behind(&["198.51.100.9, 203.0.113.7", "192.0.2.10"]),
+            at("203.0.113.7")
+        );
+        // A client past the CDN that claims a CDN address is its own address.
+        assert_eq!(behind(&["192.0.2.10, 203.0.113.7"]), at("203.0.113.7"));
+        // An IPv4-mapped address is its IPv4 address.
+        assert_eq!(
+            behind(&["203.0.113.7, ::ffff:192.0.2.10"]),
+            at("203.0.113.7")
+        );
+        // When every address is a proxy, the first is the client.
+        assert_eq!(behind(&["192.0.2.11, 192.0.2.10"]), at("192.0.2.11"));
+        assert_eq!(behind(&["192.0.2.11", "192.0.2.10"]), at("192.0.2.11"));
+        // Forwarded, element by element.
+        assert_eq!(
+            rfc7239_behind(&[
+                r#"for=198.51.100.9, for="203.0.113.7:4711", for=192.0.2.10;proto=https"#
+            ]),
+            at("203.0.113.7")
+        );
+        assert_eq!(
+            rfc7239_behind(&[r#"for="198.51.100.9, for=203.0.113.7"#, "for=192.0.2.10"]),
+            at("203.0.113.7")
+        );
+        assert_eq!(
+            rfc7239_behind(&[r#"for="[2001:db8::7]";host="a, b", For=192.0.2.10"#]),
+            at("2001:db8::7")
+        );
+    }
+
+    #[test]
+    fn a_connection_from_outside_the_trusted_proxies_is_its_own_address() {
+        let direct = |lines: &[&str]| read_from("203.0.113.7", PROXIES, "x-forwarded-for", lines);
+        assert_eq!(direct(&["198.51.100.9"]), Forwarded::Untrusted);
+        assert_eq!(direct(&["198.51.100.9, 192.0.2.10"]), Forwarded::Untrusted);
+        assert_eq!(direct(&["unknown"]), Forwarded::Untrusted);
+        assert_eq!(direct(&[]), Forwarded::Untrusted);
+        // An IPv4-mapped connection is its IPv4 address.
+        assert_eq!(
+            read_from(
+                "::ffff:127.0.0.1",
+                PROXIES,
+                "x-forwarded-for",
+                &["203.0.113.7"]
+            ),
+            at("203.0.113.7")
+        );
+    }
+
+    #[test]
+    fn the_walk_stops_at_an_entry_that_names_no_address() {
+        assert_eq!(behind(&[]), Forwarded::Absent);
+        assert_eq!(
+            behind(&["203.0.113.7, unknown, 192.0.2.10"]),
+            unparsed("unknown")
+        );
+        assert_eq!(behind(&["203.0.113.7, , 192.0.2.10"]), unparsed(""));
+        assert_eq!(behind(&["203.0.113.7", "", "192.0.2.10"]), unparsed(""));
+        assert_eq!(
+            rfc7239_behind(&["for=203.0.113.7, for=_hidden, for=192.0.2.10"]),
+            unparsed("for=_hidden")
+        );
+        // Past the client's address, nothing is read.
+        assert_eq!(
+            behind(&["unknown, 203.0.113.7, 192.0.2.10"]),
+            at("203.0.113.7")
+        );
     }
 }

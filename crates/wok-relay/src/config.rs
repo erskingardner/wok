@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 
 mod edit;
 mod history;
+mod ip_range;
 mod legacy;
 mod preset;
 mod provenance;
 
 pub use edit::{write_file, Minimized};
 pub use history::{PublicValue, StaleDefault};
+pub use ip_range::IpRange;
 pub use preset::Preset;
 pub use provenance::{ConfigEntry, ConfigExplanation, Origin};
 
@@ -217,6 +219,10 @@ pub struct RelayConfig {
     pub port: u16,
     pub nofiles: u64,
     pub real_ip_header: String,
+    /// The proxies whose entries in `real_ip_header` are skipped, and whose
+    /// connections alone may set it. Empty: any connection may, and the
+    /// client is the header's last entry.
+    pub trusted_proxies: Vec<IpRange>,
     pub auth: AuthConfig,
     pub info: InfoConfig,
     /// Serve NodeInfo discovery (`/.well-known/nodeinfo`) and its document
@@ -481,6 +487,7 @@ impl Default for Config {
                 port: 7777,
                 nofiles: 524288,
                 real_ip_header: String::new(),
+                trusted_proxies: Vec::new(),
                 auth: AuthConfig {
                     enabled: true,
                     service_url: String::new(),
@@ -957,11 +964,32 @@ impl Config {
 
     /// Explain how `relay.real_ip_header` keys the per-address budgets of a
     /// relay listening on `listening`. A set header is trusted as each
-    /// client's address. With none, a client is the address that connected,
-    /// so a listener only this host or a private network can reach, as behind
-    /// a reverse proxy, gives every client the proxy's address.
+    /// client's address, on every connection or only on those from
+    /// `relay.trusted_proxies`. With none, a client is the address that
+    /// connected, so a listener only this host or a private network can
+    /// reach, as behind a reverse proxy, gives every client the proxy's
+    /// address.
     pub fn real_ip_header_warning(&self, listening: &[SocketAddr]) -> Option<String> {
         let header = &self.relay.real_ip_header;
+        let trusted = &self.relay.trusted_proxies;
+        if header.is_empty() && !trusted.is_empty() {
+            return Some(
+                "relay.trusted_proxies is set but relay.real_ip_header is not, so it changes \
+                 nothing: each client is the address that connected"
+                    .into(),
+            );
+        }
+        if !header.is_empty() && !trusted.is_empty() {
+            let ranges: Vec<String> = trusted.iter().map(ToString::to_string).collect();
+            return Some(format!(
+                "relay.real_ip_header = {header:?} is trusted as each client's address on \
+                 connections from relay.trusted_proxies ({}); any other connection is its own \
+                 address. Wok skips the addresses in those ranges from the header's end, so \
+                 they must hold only your proxies: a client with an address in them could name \
+                 any address as its own",
+                ranges.join(", ")
+            ));
+        }
         if !header.is_empty() {
             return Some(format!(
                 "relay.real_ip_header = {header:?} is trusted as each client's address by \
@@ -969,7 +997,8 @@ impl Config {
                  proxy that writes the client's address as the header's last entry: a client \
                  that reaches the relay directly could send a new address with each \
                  connection to escape those budgets, or send another client's address to \
-                 spend that client's budgets"
+                 spend that client's budgets. List the proxies in relay.trusted_proxies to make \
+                 any other connection its own address"
             ));
         }
         if listening.is_empty() || !listening.iter().all(|addr| local_only(addr.ip())) {
@@ -1499,6 +1528,26 @@ impl Config {
                 } else {
                     ""
                 },
+            ));
+        }
+        if self.relay.real_ip_header != new.relay.real_ip_header {
+            changes.push(format!(
+                "relay.real_ip_header changed: {:?} -> {:?}",
+                self.relay.real_ip_header, new.relay.real_ip_header,
+            ));
+        }
+        if self.relay.trusted_proxies != new.relay.trusted_proxies {
+            let ranges = |c: &Config| -> Vec<String> {
+                c.relay
+                    .trusted_proxies
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            };
+            changes.push(format!(
+                "relay.trusted_proxies changed: {:?} -> {:?}",
+                ranges(self),
+                ranges(new),
             ));
         }
         if self.relay.write_policy_timeout_secs != new.relay.write_policy_timeout_secs {
@@ -3213,11 +3262,84 @@ negentropy_enabled = true
             assert!(
                 warning.ends_with(
                     "could send a new address with each connection to escape those \
-                     budgets, or send another client's address to spend that client's budgets"
+                     budgets, or send another client's address to spend that client's budgets. \
+                     List the proxies in relay.trusted_proxies to make any other connection its \
+                     own address"
                 ),
                 "{warning}"
             );
         }
+    }
+
+    #[test]
+    fn trusted_proxies_are_ip_ranges() {
+        let cfg = Config::parse_toml(
+            "[relay]\nreal_ip_header = \"x-forwarded-for\"\n\
+             trusted_proxies = [\"10.0.0.0/8\", \"2001:db8::/32\", \"127.0.0.1\", \"192.0.2.77/24\"]\n",
+        )
+        .unwrap();
+        let ranges: Vec<String> = cfg
+            .relay
+            .trusted_proxies
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            ranges,
+            ["10.0.0.0/8", "2001:db8::/32", "127.0.0.1", "192.0.2.0/24"]
+        );
+        for (range, reason) in [
+            ("0.0.0.0/0", "every address"),
+            ("10.0.0.0/33", "prefix length"),
+            ("relay.example", "not an IP address"),
+        ] {
+            let error = Config::parse_toml(&format!("[relay]\ntrusted_proxies = [\"{range}\"]\n"))
+                .unwrap_err();
+            assert!(error.contains(reason), "{range}: {error}");
+        }
+    }
+
+    #[test]
+    fn real_ip_header_warning_names_the_trusted_proxies() {
+        let listening: Vec<SocketAddr> = vec!["0.0.0.0:7777".parse().unwrap()];
+        let mut cfg = Config::default();
+        cfg.relay.trusted_proxies = vec![
+            "127.0.0.1".parse().unwrap(),
+            "192.0.2.0/24".parse().unwrap(),
+        ];
+        // Without the header they change nothing.
+        let warning = cfg.real_ip_header_warning(&listening).unwrap();
+        assert!(
+            warning.starts_with("relay.trusted_proxies is set but relay.real_ip_header is not"),
+            "{warning}"
+        );
+        cfg.relay.real_ip_header = "x-forwarded-for".into();
+        let warning = cfg.real_ip_header_warning(&listening).unwrap();
+        assert!(
+            warning.starts_with(
+                "relay.real_ip_header = \"x-forwarded-for\" is trusted as each client's address \
+                 on connections from relay.trusted_proxies (127.0.0.1, 192.0.2.0/24)"
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains("must hold only your proxies"), "{warning}");
+    }
+
+    #[test]
+    fn security_scope_changes_flag_the_client_address_settings() {
+        let base = Config::default();
+        let mut header = base.clone();
+        header.relay.real_ip_header = "x-real-ip".into();
+        assert_eq!(
+            base.security_scope_changes(&header),
+            ["relay.real_ip_header changed: \"\" -> \"x-real-ip\""]
+        );
+        let mut proxies = header.clone();
+        proxies.relay.trusted_proxies = vec!["10.0.0.0/8".parse().unwrap()];
+        assert_eq!(
+            header.security_scope_changes(&proxies),
+            ["relay.trusted_proxies changed: [] -> [\"10.0.0.0/8\"]"]
+        );
     }
 
     #[test]

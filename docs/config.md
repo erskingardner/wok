@@ -509,6 +509,7 @@ counted under its `_burst` key.
 | `relay.abuse.invalid_burst` | `20` | The same, at once. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until it refills. | As above. | — |
 | `relay.abuse.ipv6_prefix_len` | `64` | Leading bits of an IPv6 address that key its per-address budgets, from 1 to 128. IPv4 addresses are keyed one by one. | Unrelated users on one large network share a budget. (Too high: a host picks a new address in its /64 for each connection and escapes every per-address budget.) | — |
 | `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
+| `relay.trusted_proxies` | empty | The proxies in front of the relay, as IP addresses or CIDR ranges such as `"192.0.2.0/24"`. With `relay.real_ip_header` set, only a connection from one of them may name a client, and their own addresses are skipped from the header's end, so a CDN in front of the proxy works. Empty: any connection may, and the client is the header's last entry. See [Addresses](#addresses). File-only. | Empty behind two proxies: every client of the first shares its budgets. Empty while clients can reach the relay directly: they can name any address. A range that holds clients lets them name any address. | — |
 
 Rate budgets have no standard NIP-11 field; clients learn them only from
 refusals.
@@ -596,19 +597,44 @@ its content. That element must be well formed, with one `for`; whatever
 comes before it, which the client may have sent, does not matter. Any other
 header is read as a list of addresses.
 
-A last entry that names no IP address, such as `unknown` or an obfuscated
-`for=_hidden`, leaves the connecting address, is counted by
-`wok_real_ip_header_unparsed_total`, and is warned about at most once a
-minute. Behind two proxies in a row, that entry is the first proxy's
-address, so every client of that proxy shares one set of budgets.
+Behind two proxies in a row, such as a CDN and then nginx, the last entry
+is the first proxy's address, so every client of that proxy would share one
+set of budgets. `relay.trusted_proxies` lists the proxies, as addresses or
+CIDR ranges:
 
-**The header is fully trusted for every per-address budget.** If the proxy
-passes a client's header on without adding the client's address last, or a
-client can reach the relay directly, any client can rotate fake addresses to
-escape the budgets or spend another address's. The relay warns at startup
-whenever the header is set, and when it is empty while the relay listens
-only on loopback or private addresses, as behind a proxy. See
-[production-deployment.md](production-deployment.md).
+```toml
+[relay]
+real_ip_header = "x-forwarded-for"
+trusted_proxies = ["127.0.0.1", "::1", "192.0.2.0/24"]
+```
+
+With it set, a connection from outside those ranges is its own address and
+its header is ignored. On a connection from inside them, Wok walks the
+header's entries from the end and skips each address in a range; the first
+address outside them is the client. Each proxy appends the address it was
+reached from, so whatever the client sent stays ahead of its address. When
+every address is a proxy's, the first is the client. An IPv4-mapped address
+is matched as its IPv4 address. A range of every address (`/0`) is refused.
+
+An entry where the client's should be that names no IP address, such as
+`unknown` or an obfuscated `for=_hidden`, leaves the connecting address, is
+counted by `wok_real_ip_header_unparsed_total`, and is warned about at most
+once a minute.
+
+**The header is fully trusted for every per-address budget.** Without
+`relay.trusted_proxies`, if the proxy passes a client's header on without
+adding the client's address last, or a client can reach the relay directly,
+any client can rotate fake addresses to escape the budgets or spend another
+address's. With it, a client can do so only from an address inside a
+trusted range, or through a listed proxy that passes the header on without
+appending the address it was reached from. So the ranges must hold only your
+proxies, and each of them must append. If a CDN adds
+addresses the ranges miss, its edge at such an address is taken for the
+client, and that edge's clients share one set of budgets until the ranges are
+updated. The relay warns at startup whenever the header is set, when
+`relay.trusted_proxies` is set without it, and when the header is empty
+while the relay listens only on loopback or private addresses, as behind a
+proxy. See [production-deployment.md](production-deployment.md).
 
 ## Storage
 

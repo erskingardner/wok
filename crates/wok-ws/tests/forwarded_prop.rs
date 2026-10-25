@@ -1,9 +1,11 @@
 //! The client address header holds whatever a client sent ahead of what the
-//! proxy in front of Wok wrote. Whatever the client sends, only the proxy's
-//! last entry decides the client's address, and no header panics the parser.
+//! proxies in front of Wok wrote. Whatever the client sends, only the
+//! proxies' entries decide the client's address, and no header panics the
+//! parser.
 
 use proptest::prelude::*;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
+use wok_relay::config::IpRange;
 use wok_ws::forwarded::{client, Forwarded};
 
 /// A header `name` with one line per entry of `lines`, leaving out a line
@@ -16,6 +18,33 @@ fn headers(name: &'static str, lines: &[String]) -> hyper::HeaderMap {
         }
     }
     headers
+}
+
+/// The client in `lines` of the header `name`, without trusted proxies.
+fn read(name: &'static str, lines: &[String]) -> Forwarded {
+    client(
+        &headers(name, lines),
+        name,
+        IpAddr::from([203, 0, 113, 200]),
+        &[],
+    )
+}
+
+/// The local proxy in front of Wok, and a CDN's ranges in front of it.
+fn proxies() -> Vec<IpRange> {
+    ["127.0.0.1", "192.0.2.0/24", "2001:db8::/32"]
+        .iter()
+        .map(|range| range.parse().unwrap())
+        .collect()
+}
+
+/// An address in one of the CDN's ranges.
+fn cdn_address() -> impl Strategy<Value = IpAddr> {
+    prop_oneof![
+        any::<u8>().prop_map(|host| IpAddr::from([192, 0, 2, host])),
+        any::<u128>()
+            .prop_map(|host| IpAddr::V6(Ipv6Addr::from((0x2001_0db8 << 96) | (host >> 32)))),
+    ]
 }
 
 /// Header text a client could send, heavy in the characters both formats
@@ -88,7 +117,7 @@ proptest! {
     #[test]
     fn no_header_panics(lines in proptest::collection::vec(sent(), 0..4)) {
         for name in ["forwarded", "x-forwarded-for"] {
-            let _ = client(&headers(name, &lines), name);
+            let _ = read(name, &lines);
         }
     }
 
@@ -109,7 +138,7 @@ proptest! {
         pairs.push(format!("{name}={}", node(ip, port)));
         pairs.extend(after);
         let lines = behind(sent, &pairs.join(";"), appended);
-        prop_assert_eq!(client(&headers("forwarded", &lines), "forwarded"), Forwarded::Client(ip));
+        prop_assert_eq!(read("forwarded", &lines), Forwarded::Client(ip));
     }
 
     /// A proxy's element that names no address leaves the client unparsed:
@@ -127,8 +156,8 @@ proptest! {
         appended in any::<bool>(),
     ) {
         let lines = behind(sent, element, appended);
-        let read = client(&headers("forwarded", &lines), "forwarded");
-        prop_assert!(matches!(read, Forwarded::Unparsed(_)), "{:?}", read);
+        let got = read("forwarded", &lines);
+        prop_assert!(matches!(got, Forwarded::Unparsed(_)), "{:?}", got);
     }
 
     /// Behind a proxy that writes an address list, the client is its last
@@ -146,8 +175,50 @@ proptest! {
         };
         let lines = behind(sent, &entry, appended);
         prop_assert_eq!(
-            client(&headers("x-forwarded-for", &lines), "x-forwarded-for"),
+            read("x-forwarded-for", &lines),
             Forwarded::Client(ip)
         );
+    }
+
+    /// Behind trusted proxies, the client is the address the first of them
+    /// wrote, whatever the client sent ahead of it and however many proxies
+    /// follow, on the client's line or lines of their own.
+    #[test]
+    fn trusted_proxies_are_skipped(
+        sent in proptest::collection::vec(sent(), 0..3),
+        ip in any::<IpAddr>(),
+        hops in proptest::collection::vec(cdn_address(), 0..4),
+        rfc7239 in any::<bool>(),
+        appended in any::<bool>(),
+        own_lines in any::<bool>(),
+    ) {
+        let proxies = proxies();
+        prop_assume!(!proxies.iter().any(|range| range.contains(ip)));
+        let entry = |ip: IpAddr| if rfc7239 { format!("for={}", node(ip, None)) } else { ip.to_string() };
+        let written: Vec<String> = std::iter::once(ip).chain(hops).map(entry).collect();
+        let lines = if own_lines {
+            let mut lines = behind(sent, &written[0], appended);
+            lines.extend_from_slice(&written[1..]);
+            lines
+        } else {
+            behind(sent, &written.join(", "), appended)
+        };
+        let name = if rfc7239 { "forwarded" } else { "x-forwarded-for" };
+        let peer = IpAddr::from([127, 0, 0, 1]);
+        prop_assert_eq!(client(&headers(name, &lines), name, peer, &proxies), Forwarded::Client(ip));
+    }
+
+    /// A connection from outside the trusted proxies is its own address,
+    /// whatever its header says.
+    #[test]
+    fn an_untrusted_connection_is_its_own_address(
+        lines in proptest::collection::vec(sent(), 0..3),
+        peer in any::<IpAddr>(),
+        rfc7239 in any::<bool>(),
+    ) {
+        let proxies = proxies();
+        prop_assume!(!proxies.iter().any(|range| range.contains(peer)));
+        let name = if rfc7239 { "forwarded" } else { "x-forwarded-for" };
+        prop_assert_eq!(client(&headers(name, &lines), name, peer, &proxies), Forwarded::Untrusted);
     }
 }

@@ -57,7 +57,10 @@ host, bind to an explicitly firewalled private address. Set
 `relay.real_ip_header` only when every direct connection is from a trusted
 proxy that writes the client's address as that header's last entry, as one
 that replaces the header or appends to it does. For an RFC 7239 `Forwarded`
-header, set it to `forwarded`. Configure `relay.auth.service_url` and
+header, set it to `forwarded`. List the proxy in `relay.trusted_proxies`
+(`["127.0.0.1", "::1"]` for one on the same host) so that a connection from
+anywhere else is its own address; behind a CDN and then the proxy, add the
+CDN's published ranges. Configure `relay.auth.service_url` and
 `admin.public_url` with the exact external HTTPS origins before enabling those
 features. Wok serves the relay only at `/`, NIP-01's single endpoint, so a
 proxy that publishes it under a path prefix must strip the prefix before

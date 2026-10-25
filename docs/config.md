@@ -62,7 +62,7 @@ on who it is for, what it changes and what it refuses.
 | Preset | Use |
 |---|---|
 | [`public`](presets/public.md) | A general public relay that any client can read from and write to. Its values are the built-in defaults, so its overlay is empty. |
-| [`marmot`](presets/marmot.md) | A relay dedicated to Marmot group messaging, such as one a Marmot app ships as a default: only the Marmot kinds, scoped filters, 4 MiB events, no COUNT or permessage-deflate, and open writes. It refuses to start without usable NIP-42 AUTH, or with gift wraps readable by anyone but their recipient. |
+| [`marmot`](presets/marmot.md) | A relay dedicated to Marmot group messaging, such as one a Marmot app ships as a default: only the Marmot kinds, scoped filters, 4 MiB events, no COUNT or permessage-deflate, NIP-77 limits sized to MDK's syncs, and open writes. It refuses to start without usable NIP-42 AUTH, or with gift wraps readable by anyone but their recipient. |
 
 A preset's requirements are checked when the relay starts and on every
 reload: a `marmot` file without a usable `relay.auth.service_url`, or one
@@ -107,8 +107,9 @@ keeps it. Set only what the relay needs and leave the rest to the preset.
   `events.max_event_size` at 1 MiB, `relay.max_websocket_payload_size` and
   `relay.unix.max_frame_bytes` at 2 MiB, COUNT
   (`relay.max_filter_limit_count`) and permessage-deflate
-  (`relay.compression_enabled`) on, and `relay.abuse.event_burst` at 100
-  when it moves to `preset = "marmot"`. None of those is a past default, and
+  (`relay.compression_enabled`) on, `relay.abuse.event_burst` at 100, and
+  `relay.max_sync_events` and `relay.sync_memory_per_connection` at their
+  `public` values when it moves to `preset = "marmot"`. None of those is a past default, and
   `minimize` keeps them because they differ from `marmot`'s. Delete the line to use the preset's value, or keep it if
   you chose that value.
 - **Deprecated settings** that a release replaced still load, as their
@@ -677,8 +678,8 @@ they are missing. All reload live and are on the dashboard.
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
 | `relay.negentropy_enabled` | `true` | Answering NEG-OPEN, and advertising NIP-77. | Off: Marmot clients, which require NIP-77, and other sync clients fall back or fail. | NIP-77 in `supported_nips` |
-| `relay.max_sync_events` | `1000000` | The size of one temporary sync view; direct trees do not build one. | Large syncs fail with `blocked: too many query results`, and clients fall back to slower REQs. | — |
-| `relay.sync_memory_per_connection` | `268435456` | Memory the sync sessions of one connection may reserve. `0` refuses every session. | Clients that sync many groups at once are refused. | — |
+| `relay.max_sync_events` | `1000000` | The size of one temporary sync view; direct trees do not build one. `marmot` uses 65,536, four times the 16,384 events an MDK session compares. | Large syncs fail with `blocked: too many query results`, and clients fall back to slower REQs. Below 16,385, MDK's `limit`, an MDK sync fails once its group or inbox holds more events than this. | — |
+| `relay.sync_memory_per_connection` | `268435456` | Memory the sync sessions of one connection may reserve. A session reserves 4 MiB, plus 256 bytes (1 KiB with `search`) per event of its `limit`, or of `max_sync_events` without one, unless a tree serves it. `0` refuses every session. `marmot` uses 128 MiB, 15 of MDK's 8 MiB sessions. | Clients that sync many groups at once are refused. At 64 MiB or less, the eighth of the syncs MDK runs at once is. | — |
 | `relay.sync_memory_total` | `1073741824` | Memory every sync session together may reserve. `0` refuses every session. | Syncs are refused while several clients sync at once; four full syncs use up the default pool. | — |
 | `relay.sync_idle_timeout_secs` | `60` | Memory held by abandoned sessions: the longest wait for the client's next round. Active construction has no fixed lifetime. `0` expires sessions at once. | Slow clients' syncs are closed between rounds. | — |
 

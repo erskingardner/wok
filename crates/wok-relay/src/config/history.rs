@@ -231,7 +231,14 @@ mod tests {
                 kept("relay.abuse.event_burst", "100", "300", 139),
                 kept("relay.compression_enabled", "true", "false", 81),
                 kept("relay.max_filter_limit_count", "1000000", "0", 73),
+                kept("relay.max_sync_events", "1000000", "65536", 93),
                 kept("relay.max_websocket_payload_size", "2097152", "8388608", 53),
+                kept(
+                    "relay.sync_memory_per_connection",
+                    "268435456",
+                    "134217728",
+                    94
+                ),
                 kept("relay.unix.max_frame_bytes", "2097152", "8388608", 163),
             ]
         );

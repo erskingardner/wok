@@ -3920,6 +3920,13 @@ negentropy_enabled = true
         assert_eq!(marmot.relay.max_filter_limit_count, 0);
         assert!(!marmot.relay.compression_enabled);
         assert!(!crate::supported_nips(&marmot).contains(&45));
+        // NIP-77 sized to MDK's syncs (#166).
+        assert_eq!(marmot.relay.max_sync_events, 65_536);
+        assert_eq!(marmot.relay.sync_memory_per_connection, 128 * 1024 * 1024);
+        assert_eq!(
+            marmot.relay.sync_memory_total,
+            Config::default().relay.sync_memory_total
+        );
         let auth = &marmot.relay.auth;
         assert_eq!(
             auth.accepted_kinds,
@@ -3957,6 +3964,36 @@ negentropy_enabled = true
         assert_eq!(
             entry(&explained, "relay.max_filter_limit").origin,
             Origin::Preset(Preset::Marmot)
+        );
+    }
+
+    #[test]
+    fn the_marmot_preset_holds_mdks_concurrent_syncs() {
+        // MDK's NEG-OPEN names one group or inbox with limit 16,385, and it
+        // runs at most eight on one relay connection. The negentropy worker
+        // reserves a view's rounds plus 256 bytes per event of its limit,
+        // capped at max_sync_events + 1, before its scan.
+        const MDK_LIMIT: u64 = 16_385;
+        let reserved = |limit: u64| {
+            wok_negentropy::ROUND_MEMORY_BYTES
+                + limit * wok_negentropy::memory_view_item_bytes(false)
+        };
+        let marmot = Config::parse_toml("preset = \"marmot\"\n").unwrap();
+        // Four times the 16,384 events MDK compares (its limit is one more,
+        // to see a full set), so the cap never cuts it.
+        assert_eq!(marmot.relay.max_sync_events, 4 * (MDK_LIMIT - 1));
+        // 15 of MDK's sessions fit in a connection's budget, nearly twice
+        // the eight it runs at once.
+        assert_eq!(
+            marmot.relay.sync_memory_per_connection / reserved(MDK_LIMIT),
+            15
+        );
+        // A sync without a limit reserves 20 MiB, not the public 248 MiB.
+        let mib = |bytes: u64| bytes / (1024 * 1024);
+        assert_eq!(mib(reserved(marmot.relay.max_sync_events + 1)), 20);
+        assert_eq!(
+            mib(reserved(Config::default().relay.max_sync_events + 1)),
+            248
         );
     }
 

@@ -319,24 +319,33 @@ fn verification_fits_the_reader_slots_left() {
     let max_readers = env.stats().unwrap().max_readers as usize;
     let gate = std::sync::RwLock::new(());
     let held = gate.write().unwrap();
-    std::thread::scope(|scope| {
+    let (holding, report) = std::thread::scope(|scope| {
         let (began, results) = std::sync::mpsc::channel();
-        for _ in 0..max_readers {
-            let began = began.clone();
-            let (env, gate) = (&env, &gate);
-            scope.spawn(move || {
-                let txn = env.begin_ro();
-                began.send(txn.is_ok()).unwrap();
-                if txn.is_ok() {
-                    drop(gate.read().unwrap());
-                }
-            });
-        }
+        let holders: Vec<_> = (0..max_readers)
+            .map(|_| {
+                let began = began.clone();
+                let (env, gate) = (&env, &gate);
+                scope.spawn(move || {
+                    let txn = env.begin_ro();
+                    began.send(txn.is_ok()).unwrap();
+                    if txn.is_ok() {
+                        drop(gate.read().unwrap());
+                    }
+                })
+            })
+            .collect();
         let holding = results.iter().take(max_readers).filter(|ok| *ok).count();
-        assert_eq!(holding, max_readers - 1);
-
-        let report = verify_events(&env, 8).unwrap();
-        assert_eq!((report.events, report.failed), (5_000, 5_000));
+        let report = verify_events(&env, 8);
         drop(held);
+        // A thread frees its slot as it exits, after the scope stops waiting
+        // for it. One freed after the environment closes writes to unmapped
+        // memory, so join them all first.
+        for holder in holders {
+            holder.join().unwrap();
+        }
+        (holding, report)
     });
+    assert_eq!(holding, max_readers - 1);
+    let report = report.unwrap();
+    assert_eq!((report.events, report.failed), (5_000, 5_000));
 }

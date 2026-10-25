@@ -27,8 +27,10 @@ relays must set; every other setting comes from the preset, so upgrades
 bring improved defaults. Add only the settings
 this relay needs, and after an upgrade run `wok doctor`: its
 `config-defaults` check names settings pinned to a default the preset has
-since replaced, and its `config-deprecations` check names settings a
-release replaced, which `wok config minimize` rewrites. See
+since replaced, its `config-public-values` check names settings that keep
+the `public` preset's value under a preset that replaces it, and its
+`config-deprecations` check names settings a release replaced, which
+`wok config minimize` rewrites. See
 [Set only overrides](config.md#set-only-overrides).
 
 Set at least these deployment-specific values in `/etc/wok/wok.toml`, with

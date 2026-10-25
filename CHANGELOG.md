@@ -270,6 +270,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged as a security-scope change. Subscriptions already open keep their
   search filters until they close, and the search index stays current, so
   turning search back on answers from a complete index.
+- `wok doctor` has a `config-public-values` check under any preset but
+  `public` (#97). It names each setting the file pins to the `public`
+  preset's value where its own preset gives another. A copy of the 0.7
+  `docs/wok.toml` with `preset = "marmot"` kept 1 MiB events, 2 MiB
+  WebSocket messages and Unix frames, COUNT, permessage-deflate and
+  `relay.abuse.event_burst = 100` without a word: none of those is a past
+  default, so `config-defaults` passed them, and `wok config minimize` keeps
+  them because they differ from `marmot`'s.
 - Wok warns when a message cap is too small for the limits behind it (#97
   §2.2): `relay.max_websocket_payload_size`, or `relay.unix.max_frame_bytes`
   while the Unix socket is on, smaller than `events.max_event_size` plus

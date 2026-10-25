@@ -244,6 +244,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NIP-59 was advertised. NIP-59 is now advertised only while both gift-wrap
   kinds are restricted; configs that list restricted kinds explicitly need
   21059 added.
+- `wok download` verifies each event's id and signature before printing it,
+  as `wok import`, `wok sync` and `wok router` already did (#154). Before, it
+  printed whatever the relay sent, so used on its own rather than piped into
+  `wok import` it passed a malicious relay's forged events through. An event
+  that fails, or a message that is not JSON, is skipped and logged on stderr
+  with the reason, and the command exits nonzero with the number skipped.
+  It also exits nonzero when the connection closes before EOSE; before, a
+  dump cut short exited 0, and a ping or close frame ended it with a JSON
+  error. Events print in the normalized form `wok export` writes.
+  `--no-verify` skips the id and signature checks, like `wok import
+  --no-verify`.
 
 ### Added
 

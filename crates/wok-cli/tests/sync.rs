@@ -532,6 +532,104 @@ async fn serving_peer(events: Vec<Value>) -> (String, tokio::task::JoinHandle<()
     (url, task)
 }
 
+fn printed_events(output: &Output) -> Vec<Value> {
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| wok_event::json::parse_strict(line).unwrap())
+        .collect()
+}
+
+/// A relay that answers the first REQ with `frames`, then hangs up.
+async fn scripted_peer(frames: Vec<Message>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if message
+                .to_text()
+                .is_ok_and(|text| text.starts_with(r#"["REQ""#))
+            {
+                break;
+            }
+        }
+        // The client may leave after EOSE, before these finish.
+        for frame in frames {
+            let _ = ws.send(frame).await;
+        }
+        let _ = ws.close(None).await;
+    });
+    (url, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn download_prints_only_events_that_verify_unless_told_not_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "");
+    let good = event(1);
+    let mut forged = event(1);
+    forged["content"] = json!("forged");
+    let forged_id = forged["id"].as_str().unwrap().to_string();
+    let text = |value: Value| Message::Text(value.to_string().into());
+    let frames = || {
+        vec![
+            text(json!(["EVENT", "_", good])),
+            Message::Ping(b"ping".to_vec().into()),
+            Message::Text("not json".into()),
+            text(json!(["EVENT", "_", forged])),
+            text(json!(["EOSE", "_"])),
+        ]
+    };
+
+    let (url, task) = scripted_peer(frames()).await;
+    let output = cli(&cfg, &["download", &url]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(printed_events(&output), vec![good.clone()], "{stderr}");
+    assert!(stderr.contains(&forged_id), "{stderr}");
+    assert!(stderr.contains("1 printed, 2 rejected"), "{stderr}");
+    task.await.unwrap();
+
+    let (url, task) = scripted_peer(frames()).await;
+    let output = cli(&cfg, &["download", &url, "--no-verify"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(
+        printed_events(&output),
+        vec![good.clone(), forged.clone()],
+        "{stderr}"
+    );
+    assert!(stderr.contains("2 printed, 1 rejected"), "{stderr}");
+    task.await.unwrap();
+
+    let (url, task) = scripted_peer(vec![
+        text(json!(["EVENT", "_", good])),
+        text(json!(["EVENT", "_", forged])),
+        text(json!(["EOSE", "_"])),
+    ])
+    .await;
+    let output = cli(&cfg, &["download", &url, "--no-verify"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        printed_events(&output),
+        vec![good.clone(), forged],
+        "{stderr}"
+    );
+    task.await.unwrap();
+
+    // A dump the relay cuts short is not complete, however valid its events.
+    let (url, task) = scripted_peer(vec![text(json!(["EVENT", "_", good]))]).await;
+    let output = cli(&cfg, &["download", &url]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(printed_events(&output), vec![good], "{stderr}");
+    assert!(stderr.contains("closed before EOSE"), "{stderr}");
+    task.await.unwrap();
+}
+
 struct KillOnDrop(std::process::Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {

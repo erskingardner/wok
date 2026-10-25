@@ -221,10 +221,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `wok import`, `wok sync` and `wok router` already did (#154). Before, it
   printed whatever the relay sent, so used on its own rather than piped into
   `wok import` it passed a malicious relay's forged events through. An event
-  that fails is skipped and logged on stderr with its id and reason, and the
-  command exits nonzero after EOSE with the number skipped. Events print in
-  the normalized form `wok export` writes. `--no-verify` prints them without
-  checking ids or signatures, like `wok import --no-verify`.
+  that fails, or a message that is not JSON, is skipped and logged on stderr
+  with the reason, and the command exits nonzero with the number skipped.
+  It also exits nonzero when the connection closes before EOSE; before, a
+  dump cut short exited 0, and a ping or close frame ended it with a JSON
+  error. Events print in the normalized form `wok export` writes.
+  `--no-verify` skips the id and signature checks, like `wok import
+  --no-verify`.
 
 ### Added
 

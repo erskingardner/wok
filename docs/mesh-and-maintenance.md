@@ -123,12 +123,16 @@ on and cannot be disabled.
 
 `wok download <url> [--filter <json>]` sends one REQ and prints each event the
 relay returns before EOSE as a JSON line on stdout, in the normalized form
-`wok export` writes, ready for `wok import`. It verifies each event's id and
-signature first, accepting the legacy tao preimage as `wok import` does. An
-event that fails is skipped and logged on stderr with its id and reason, and
-the command exits nonzero after EOSE with the number skipped. `--no-verify`
-prints events without checking ids or signatures, like `wok import
---no-verify`; it still skips anything that is not a well-formed event.
+`wok export` writes, ready for `wok import`. It checks each event as `wok
+import` does: its id (NIP-01 or the legacy tao preimage) and signature, the
+local `events.max_event_size`, `max_num_tags` and `max_tag_val_size` limits,
+and the canonical kind spelling in a deletion's `a` tags. An event
+that fails, or a message that is not JSON, is skipped and logged on stderr.
+The command exits nonzero when it skipped anything or the connection closed
+before EOSE; the events it printed stay printed. In `wok download … | wok
+import` the shell reports import's exit status unless `pipefail` is set.
+`--no-verify` skips the id, signature and `max_event_size` checks, as `wok
+import --no-verify` does; the other checks still apply.
 
 ## Persistent mesh links
 

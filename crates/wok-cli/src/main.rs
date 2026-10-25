@@ -1629,11 +1629,24 @@ async fn cmd_download(
     let filter = filter.unwrap_or_else(|| "{}".into());
     let req = format!(r#"["REQ","_",{filter}]"#);
     ws.send(Message::Text(req.into())).await?;
-    let (mut printed, mut rejected) = (0u64, 0u64);
+    let (mut printed, mut rejected, mut eose) = (0u64, 0u64, false);
     while let Some(msg) = ws.next().await {
-        let msg = msg?;
-        let v = wok_event::json::parse_strict(msg.to_text()?)?;
+        // Reading on past a ping flushes tungstenite's queued pong.
+        let text = match msg? {
+            Message::Text(text) => text,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        let v = match wok_event::json::parse_strict(&text) {
+            Ok(v) => v,
+            Err(error) => {
+                rejected += 1;
+                tracing::warn!(%error, "download rejected unreadable message");
+                continue;
+            }
+        };
         if v[0] == "EOSE" {
+            eose = true;
             break;
         }
         if v[0] == "EVENT" {
@@ -1650,8 +1663,11 @@ async fn cmd_download(
             }
         }
     }
+    if !eose {
+        bail!("download incomplete: connection closed before EOSE; {printed} printed, {rejected} rejected");
+    }
     if rejected > 0 {
-        bail!("download incomplete: {rejected} events rejected; {printed} printed");
+        bail!("download incomplete: {printed} printed, {rejected} rejected");
     }
     Ok(())
 }

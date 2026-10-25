@@ -192,7 +192,7 @@ does not list.
 | `wok integrity` | Database | |
 | `wok sync` | A remote relay | Parses its NIP-77 messages; verifies each downloaded event before storing it. |
 | `wok upload` | JSONL events on standard input, a remote relay | Sends the events to the URL. |
-| `wok download` | A remote relay | Verifies ids and signatures unless `--no-verify`; skips and reports events that fail, and exits nonzero. |
+| `wok download` | A remote relay | Checks each event as `wok import` does, ids and signatures unless `--no-verify`, and skips and reports those that fail. Exits nonzero if it skipped any or the connection closed before EOSE. |
 | `wok router` | Router config file, every relay it names | Verifies each downloaded event before storing it. Reloads the router config when it changes. |
 
 Outbound commands dial whatever URL they are given, including loopback and

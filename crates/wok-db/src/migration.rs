@@ -195,8 +195,14 @@ pub fn verify_events(env: &Env, threads: usize) -> Result<EventVerificationRepor
     let spare = stats.max_readers.saturating_sub(stats.readers) as usize;
     let spawned = threads.saturating_sub(1).min(spare);
     let reports = std::thread::scope(|scope| {
+        // A worker the OS cannot start leaves its runs to the others, and
+        // the ones already started are still joined below.
         let workers: Vec<_> = (0..spawned)
-            .map(|_| scope.spawn(|| verify_runs(env, &runs)))
+            .map_while(|_| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, || verify_runs(env, &runs))
+                    .ok()
+            })
             .collect();
         let mine = std::panic::catch_unwind(AssertUnwindSafe(|| verify_runs(env, &runs)));
         // Join every worker before any result can return. A scope waits only

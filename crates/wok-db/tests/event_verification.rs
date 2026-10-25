@@ -335,17 +335,20 @@ fn verification_fits_the_reader_slots_left() {
             })
             .collect();
         let holding = results.iter().take(max_readers).filter(|ok| *ok).count();
-        let report = verify_events(&env, 8);
+        let report =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify_events(&env, 8)));
         drop(held);
         // A thread frees its slot as it exits, after the scope stops waiting
         // for it. One freed after the environment closes writes to unmapped
-        // memory, so join them all first.
+        // memory, so join them all first, even if verification panicked.
         for holder in holders {
             holder.join().unwrap();
         }
         (holding, report)
     });
     assert_eq!(holding, max_readers - 1);
-    let report = report.unwrap();
+    let report = report
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .unwrap();
     assert_eq!((report.events, report.failed), (5_000, 5_000));
 }

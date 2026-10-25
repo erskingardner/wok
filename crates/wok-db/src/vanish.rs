@@ -81,14 +81,22 @@ impl VanishPolicy {
     }
 }
 
-fn normalize_relay_url(url: &str) -> String {
-    let mut value = url.trim();
-    if let Some(rest) = value.strip_prefix("wss://") {
-        value = rest;
-    } else if let Some(rest) = value.strip_prefix("ws://") {
-        value = rest;
+/// A relay URL as NIP-42 AUTH and NIP-62 vanish requests compare it with the
+/// relay's service URL: in lowercase, without its scheme, query, fragment,
+/// trailing slashes, or the port its scheme implies. The path is kept, so
+/// relays that share a host by path do not accept each other's URLs.
+pub fn normalize_relay_url(url: &str) -> String {
+    let url = url.trim();
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let authority = match scheme.to_ascii_lowercase().as_str() {
+        "wss" | "https" => authority.strip_suffix(":443"),
+        "ws" | "http" => authority.strip_suffix(":80"),
+        _ => None,
     }
-    value.trim_end_matches('/').to_ascii_lowercase()
+    .unwrap_or(authority);
+    format!("{authority}{}", path.trim_end_matches('/')).to_ascii_lowercase()
 }
 
 fn read_timestamp(raw: &[u8]) -> Option<u64> {
@@ -412,5 +420,58 @@ mod tests {
         let event =
             PackedEventBuilder::build(&[1; 32], &[2; 32], 1, VANISH_KIND, 0, &tags).unwrap();
         assert!(policy.targets_this_relay(event.view()));
+    }
+
+    #[test]
+    fn relay_urls_differ_by_path_but_not_by_spelling() {
+        let same = [
+            ("wss://relay.example.com", "wss://relay.example.com/"),
+            ("wss://relay.example.com", "WSS://Relay.Example.COM//"),
+            ("wss://relay.example.com", "wss://relay.example.com:443"),
+            ("wss://relay.example.com", "ws://relay.example.com:80/"),
+            (
+                "wss://relay.example.com",
+                "wss://relay.example.com/?client=x#y",
+            ),
+            ("wss://relay.example.com", " relay.example.com "),
+            (
+                "wss://host.example/relayA",
+                "wss://host.example:443/relayA/",
+            ),
+            ("wss://host.example/relayA", "wss://host.example/RelayA?x=1"),
+            ("wss://[::1]:443/a", "wss://[::1]/a"),
+        ];
+        for (a, b) in same {
+            assert_eq!(normalize_relay_url(a), normalize_relay_url(b), "{a} vs {b}");
+        }
+        let different = [
+            ("wss://host.example/relayA", "wss://host.example/relayB"),
+            ("wss://host.example/relayA", "wss://host.example"),
+            ("wss://host.example/relayA", "wss://host.example/relayA/sub"),
+            ("wss://host.example", "wss://host.example:8443"),
+            ("wss://host.example", "wss://host.example:80"),
+            ("wss://host.example", "wss://other.example"),
+        ];
+        for (a, b) in different {
+            assert_ne!(normalize_relay_url(a), normalize_relay_url(b), "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn a_targeted_vanish_request_must_name_the_relay_path() {
+        let policy = VanishPolicy {
+            enabled: true,
+            service_url: "wss://host.example/relayA".into(),
+        };
+        let request = |relay: &str| {
+            policy.targets_this_relay_json(
+                &serde_json::json!({"kind": 62, "tags": [["relay", relay]]}).to_string(),
+            )
+        };
+        assert!(request("wss://host.example/relayA/"));
+        assert!(request("wss://host.example:443/relayA"));
+        assert!(!request("wss://host.example/relayB"));
+        assert!(!request("wss://host.example"));
+        assert!(request("ALL_RELAYS"));
     }
 }

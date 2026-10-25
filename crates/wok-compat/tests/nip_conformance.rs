@@ -100,11 +100,23 @@ impl Conn {
     /// Answer `challenge`, an AUTH frame already received, as `key`, and
     /// return the OK reply.
     async fn answer(&mut self, key: &Keypair, challenge: &Value, created_at: u64) -> Value {
+        self.answer_for(AUTH_RELAY, key, challenge, created_at)
+            .await
+    }
+
+    /// [`answer`](Self::answer) with an AUTH event naming `relay`.
+    async fn answer_for(
+        &mut self,
+        relay: &str,
+        key: &Keypair,
+        challenge: &Value,
+        created_at: u64,
+    ) -> Value {
         let event = sign_event_with_key(
             json!({
                 "created_at": created_at,
                 "kind": 22242,
-                "tags": [["relay", AUTH_RELAY], ["challenge", challenge[1]]],
+                "tags": [["relay", relay], ["challenge", challenge[1]]],
                 "content": "",
             }),
             key,
@@ -820,6 +832,33 @@ async fn nip42_auth_accepts_about_ten_minutes_of_clock_skew() {
                 (&json!(false), &json!(reason)),
                 "{reply}"
             ),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip42_relay_tag_must_name_the_relay_path() {
+    // Relays that share a host by path must not accept each other's AUTH, so
+    // one cannot pass on its challenge to sign in as a user of the other.
+    let relay = Relay::new(|cfg| cfg.relay.auth.service_url = "wss://host.test/relayA".into());
+    for (tag, accepted) in [
+        ("wss://host.test/relayA", true),
+        ("wss://Host.Test:443/relayA/", true),
+        ("wss://host.test/relayA?client=x", true),
+        ("wss://host.test/relayB", false),
+        ("wss://host.test", false),
+        ("wss://host.test/relayA/sub", false),
+    ] {
+        let mut conn = relay.connect().await;
+        let challenge = conn.recv().await;
+        assert_eq!(challenge[0], "AUTH", "{challenge}");
+        let reply = conn.answer_for(tag, &key(), &challenge, now()).await;
+        assert_eq!(reply[2], accepted, "{tag}: {reply}");
+        if !accepted {
+            assert_eq!(
+                reply[3], "error: incorrect or missing relay tag, expected: wss://host.test/relayA",
+                "{tag}: {reply}"
+            );
         }
     }
 }

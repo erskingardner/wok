@@ -143,7 +143,7 @@ dashboard shows them read-only. A reload that changes `read_policy` or
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
 | `relay.auth.enabled` | `true` | NIP-42 authentication, which private reads, owner-only writes and the non-open policies need. | Off: nobody can log in, so private kinds cannot be read by anyone, and AUTH is refused with `blocked:`. | NIP-42 in `supported_nips` while AUTH is usable; NIP-59 and NIP-78 need it too, see [Read classes](#read-classes) |
-| `relay.auth.service_url` | empty | The relay URL an AUTH event must name, so an AUTH signed for another relay is refused. | Empty: AUTH cannot succeed, and the relay logs what fails closed at startup. A `marmot` relay refuses to start. | As `relay.auth.enabled`: AUTH is usable only with both |
+| `relay.auth.service_url` | empty | The relay URL an AUTH event must name, path included, so an AUTH signed for another relay, on this host or another, is refused. Case, the scheme, a query, trailing slashes and the port the scheme implies are ignored. | Empty: AUTH cannot succeed, and the relay logs what fails closed at startup. A `marmot` relay refuses to start. | As `relay.auth.enabled`: AUTH is usable only with both |
 | `relay.auth.read_policy` | `"open"` | Who may send REQ, COUNT and NEG-OPEN: `open`, `authenticated` or `members`. See [Read and write policies](#read-and-write-policies). | — | `auth_required` while not `open` and AUTH is usable |
 | `relay.auth.write_policy` | `"open"` | Who may publish: `open`, `authenticated` or `members`. NIP-62 vanish requests are always accepted. | — | `restricted_writes` while not `open` |
 | `relay.auth.recipient_only_kinds` | `[4, 1059, 21059]` | DMs and gift wraps: read only by their author and first `p`-tag recipient. | Leaving out 1059 or 21059 serves gift wraps, recipient tag included, to anyone, and stops NIP-59 being advertised; the relay warns, and a `marmot` relay refuses to start. | NIP-59 in `supported_nips`, see [Read classes](#read-classes) |
@@ -316,7 +316,7 @@ the dashboard. An event that breaks one is refused with `OK false` and
 | `events.ephemeral_lifetime_secs` | `300` | How long a stored (`ttl`) ephemeral event stays readable. | Clients that reconnect miss recent ephemeral events. | — |
 | `relay.abuse.min_pow_difficulty` | `0` | Spam: the NIP-13 difficulty, in leading zero bits of the id, every event must meet. `0` is off. | — (too high: most clients can't post; few mine proof of work, and Marmot clients never do.) | `min_pow_difficulty`, always (0 while abuse protection is off); above 0 it also adds NIP-13 to `supported_nips` and sets `restricted_writes` |
 | `relay.nip62.enabled` | `true` | NIP-62 Request to Vanish: accept requests to erase everything an author published here. | Off: users can't erase their data from this relay. Deletion markers stored earlier stay enforced. | NIP-62 in `supported_nips` |
-| `relay.nip62.service_url` | empty | The relay URL a targeted vanish request must name; empty uses `relay.auth.service_url`. `ALL_RELAYS` always matches. | — | — |
+| `relay.nip62.service_url` | empty | The relay URL a targeted vanish request must name, compared as for AUTH; empty uses `relay.auth.service_url`. `ALL_RELAYS` always matches. | — | — |
 
 The 1 MiB event ceiling accommodates bounded extended-length NIP-44
 payloads, including kind 1059 gift wraps and kind 445 MLS group events. Wok

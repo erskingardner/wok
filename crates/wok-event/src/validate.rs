@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::hash::{verify_id, verify_id_allowing_legacy, verify_sig};
 use crate::packed::PackedEventView;
 use crate::parse::{
-    expiration_tag, from_hex_exact, from_lower_hex_array, normalize_event_json, pack_event, to_hex,
+    from_hex_exact, from_lower_hex_array, normalize_event_json, pack_event, parse_uint64, to_hex,
     EventLimits, ParsedEvent,
 };
 use crate::{
@@ -168,7 +168,10 @@ pub fn verify_strfry_event(packed: PackedEventView<'_>, orig: &Value) -> Result<
 /// - The first 32-byte packed `p`, the only one recipient-only reads admit,
 ///   is the payload's first `p` that decodes to 32 bytes, or neither has one.
 /// - The expiration is what strfry wrote: 1 for ephemeral kinds, otherwise
-///   the payload's first `expiration` tag, or 0 when it has none.
+///   the payload's first `expiration` tag, or 0 when it has none. strfry
+///   refused an event whose first `expiration` tag is not a time of at least
+///   100, so such a payload is refused too: 0 and 1 are the markers for no
+///   expiry and for an ephemeral event.
 fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), EventError> {
     let kind = packed.kind();
     let mut carried = HashSet::new();
@@ -280,10 +283,11 @@ fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), Ev
         }
     }
 
+    let own = strfry_expiration(orig)?;
     let expected = if is_ephemeral_kind(kind) {
         1
     } else {
-        expiration_tag(orig).unwrap_or(0)
+        own.unwrap_or(0)
     };
     if packed.expiration() != expected {
         return Err(EventError::msg(format!(
@@ -292,6 +296,32 @@ fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), Ev
         )));
     }
     Ok(())
+}
+
+/// The time in `orig`'s first `expiration` tag, as strfry's packer read it:
+/// none without one, and an error for one it refused, which is not digits or
+/// below 100.
+fn strfry_expiration(orig: &Value) -> Result<Option<u64>, EventError> {
+    let tags = orig.get("tags").and_then(Value::as_array);
+    let Some(tag) = tags
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .find(|tag| tag.first().and_then(Value::as_str) == Some("expiration"))
+    else {
+        return Ok(None);
+    };
+    let value = match tag.get(1) {
+        Some(value) => value.as_str(),
+        None => Some(""),
+    };
+    match value.map(|value| (value, parse_uint64(value))) {
+        Some((_, Ok(expiration))) if expiration >= 100 => Ok(Some(expiration)),
+        Some((value, _)) => Err(EventError::msg(format!(
+            "payload expiration {value:?} is not a time strfry packs"
+        ))),
+        None => Err(EventError::msg("payload expiration is not a string")),
+    }
 }
 
 pub fn verify_event_json_size(json_str: &str, max_event_size: usize) -> Result<(), EventError> {
@@ -716,6 +746,53 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "packed expiration 1700000100 differs from the 0 strfry packs from the payload"
+        );
+    }
+
+    #[test]
+    fn stored_events_whose_expiration_strfry_refused_are_refused() {
+        // 0 and 1 mean no expiry and ephemeral to Wok, so a payload whose
+        // first expiration is not a time strfry packed must not verify with
+        // either.
+        for (kind, tags, value) in [
+            (1, json!([["expiration", "0"]]), r#""0""#),
+            (1, json!([["expiration", "1"]]), r#""1""#),
+            (1, json!([["expiration", "99"]]), r#""99""#),
+            (
+                1,
+                json!([["expiration", "soon"], ["expiration", "1700000100"]]),
+                r#""soon""#,
+            ),
+            (1, json!([["expiration"]]), r#""""#),
+            (20001, json!([["expiration", "0"]]), r#""0""#),
+        ] {
+            let ev = sign_event(json!({
+                "created_at": 1_700_000_000u64,
+                "kind": kind,
+                "tags": tags,
+                "content": "",
+            }));
+            for expiration in [0, 1, 1_700_000_100] {
+                assert_eq!(
+                    verify_strfry_event(strfry_record(&ev, expiration, &[]).view(), &ev)
+                        .unwrap_err()
+                        .to_string(),
+                    format!("payload expiration {value} is not a time strfry packs"),
+                    "{tags} packed with {expiration}"
+                );
+            }
+        }
+        let ev = sign_event(json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [["expiration", 5]],
+            "content": "",
+        }));
+        assert_eq!(
+            verify_strfry_event(strfry_record(&ev, 0, &[]).view(), &ev)
+                .unwrap_err()
+                .to_string(),
+            "payload expiration is not a string"
         );
     }
 

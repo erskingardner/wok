@@ -94,7 +94,9 @@ from the payload as strfry's database version 3 packs them:
 - The first packed `p` of 32 bytes, the only one recipient-only reads admit,
   is the payload's first `p` that decodes to 32 bytes, or neither has one.
 - The packed expiration is the one strfry writes: 1 for an ephemeral kind,
-  otherwise the payload's first `expiration` tag, or 0 when it has none.
+  otherwise the payload's first `expiration` tag, or 0 when it has none. A
+  payload whose first `expiration` tag is not a time of at least 100 is
+  refused, as strfry refused it: Wok reads 0 as no expiry and 1 as ephemeral.
 
 Migration then checks the event's id and signature, accepting either id
 preimage a stored event may use (NIP-01, or the one strfry hashed for events

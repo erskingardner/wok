@@ -131,7 +131,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             CheckStatus::Warn
         },
         if caps.is_empty() {
-            "each message cap holds the largest EVENT and REQ its limits accept".to_string()
+            "each message cap holds the largest EVENT, REQ and COUNT its limits accept".to_string()
         } else {
             caps.join(" ")
         },

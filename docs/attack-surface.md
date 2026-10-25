@@ -33,7 +33,7 @@ questions:
 | Party | Who | Gate |
 | --- | --- | --- |
 | anonymous | Any client that can connect to `relay.bind` and `relay.port` | Per-address connection budget; NIP-86 IP blocks |
-| authenticated | A client that completed NIP-42 AUTH on its connection | `relay.auth.enabled` and `relay.auth.service_url` |
+| authenticated | A client that completed NIP-42 AUTH on its connection, since a reload last made AUTH unusable | `relay.auth.enabled` and `relay.auth.service_url` |
 | member | A client authenticated as a pubkey that is NIP-86 allowlisted, holds a role, or is in `admin.pubkeys`, and is not banned | `relay.auth.read_policy` and `write_policy` set to `members` |
 | manager | A NIP-98 signer holding the NIP-86 `admin` or `moderator` [role](nip86.md#management-levels) | `admin.enabled` |
 | admin | A NIP-98 signer listed in `admin.pubkeys` | `admin.enabled` |

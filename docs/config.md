@@ -327,8 +327,9 @@ envelope, at least 10 bytes (`["EVENT",` and `]`). A message over the cap is
 cut off and its connection closed, with no `OK`, so Wok warns at startup, on
 reload, beside the field on the dashboard and in `wok doctor`'s
 `message-caps` check whenever a cap is too small for `events.max_event_size`
-or `relay.max_req_filter_size` (plus 12 bytes for a REQ's envelope). The
-caps apply at restart, and both limits reload live.
+or `relay.max_req_filter_size` (plus 12 bytes for a REQ's envelope, or 14
+for a COUNT's while COUNT is on). The caps apply at restart, and both limits
+reload live.
 
 Single-letter tag values longer than 255 bytes are indexed by their SHA-256,
 so up to `max_tag_val_size` a `#x` filter matches them, an addressable event
@@ -761,7 +762,7 @@ Restart settings, unless noted, and file-only.
 | `relay.bind` | `"127.0.0.1"` | TCP listen address: an IPv4 or IPv6 literal (`::1` or `[::1]`), or a hostname. A hostname listens on every address it resolves to (`localhost` → `127.0.0.1` and `::1`), skipping resolved addresses that are not assigned on this host or whose family it lacks, as long as one binds. |
 | `relay.port` | `7777` | TCP listen port. |
 | `relay.nofiles` | `524288` | Requested process file-descriptor limit. |
-| `relay.max_websocket_payload_size` | `2097152` | Largest reassembled WebSocket message; it must hold the largest event and its envelope, and the largest REQ. Too low: events and REQs that fit their own limits are cut off with their connection, and the `message-caps` warning says so. NIP-11 `max_message_length`. Shown read-only on the dashboard. |
+| `relay.max_websocket_payload_size` | `2097152` | Largest reassembled WebSocket message; it must hold the largest event and its envelope, and the largest REQ and COUNT. Too low: events, REQs and COUNTs that fit their own limits are cut off with their connection, and the `message-caps` warning says so. NIP-11 `max_message_length`. Shown read-only on the dashboard. |
 | `relay.auto_ping_seconds` | `55` | WebSocket ping interval; zero disables automatic pings. A ping unanswered for a full interval closes the connection. |
 | `relay.enable_tcp_keepalive` | `false` | Enable TCP keepalive on accepted sockets. |
 | `relay.handshake_timeout_secs` | `10` | Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it. Live, for new connections. |
@@ -860,7 +861,7 @@ All Unix-socket settings require restart and are file-only.
 | `relay.unix.group` | empty | Group applied with `chown` after bind. |
 | `relay.unix.auth_uids` | `[]` | Allowed peer UIDs; empty accepts any UID. A peer must pass this list and `auth_gids` both. |
 | `relay.unix.auth_gids` | `[]` | Allowed peer GIDs; empty accepts any GID. Only the peer's effective GID is checked, not its supplementary groups. |
-| `relay.unix.max_frame_bytes` | `2097152` | Largest length-prefixed JSON frame. Like `relay.max_websocket_payload_size`, it must hold the largest event and REQ, and the `message-caps` warning says when it does not while the socket is on. `marmot` uses 8 MiB. |
+| `relay.unix.max_frame_bytes` | `2097152` | Largest length-prefixed JSON frame. Like `relay.max_websocket_payload_size`, it must hold the largest event, REQ and COUNT, and the `message-caps` warning says when it does not while the socket is on. `marmot` uses 8 MiB. |
 | `relay.unix.max_pending_outbound_bytes` | `33554432` | Pending output budget before disconnect. |
 
 `auth_uids` and `auth_gids` combine with AND. With either set, the relay

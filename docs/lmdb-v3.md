@@ -6,8 +6,9 @@ Endianness: native (little-endian on supported hosts). An import source must
 have `Meta.endianness = 1` and `Meta.dbVersion = 3`.
 
 Wok never runs directly on that source. `wok migrate strfry` takes a read-only,
-transactionally consistent copy, verifies the copied records, and changes the
-copy's `Meta.dbVersion` to Wok version 5. Version 4 introduced the ownership boundary;
+transactionally consistent copy, verifies the copied records and each event's
+id and signature against its payload, and changes the copy's `Meta.dbVersion`
+to Wok version 5. Version 4 introduced the ownership boundary;
 the first Wok format retains the v3 record layout to make migration lossless,
 but future Wok versions may evolve it. There is no implicit migration during
 normal `relay`, `info`, or database utility commands.

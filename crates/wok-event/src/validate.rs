@@ -3,7 +3,8 @@ use serde_json::Value;
 use crate::hash::{verify_id, verify_id_allowing_legacy, verify_sig};
 use crate::packed::PackedEventView;
 use crate::parse::{
-    from_lower_hex_array, normalize_event_json, pack_event, EventLimits, ParsedEvent,
+    from_hex_exact, from_lower_hex_array, normalize_event_json, pack_event, EventLimits,
+    ParsedEvent,
 };
 use crate::{parse_canonical_a_tag, EventError, EventLimit, DELETION_KIND};
 
@@ -85,6 +86,57 @@ fn verify_nostr_event_with(
     let sig = from_lower_hex_array::<64>(sig_hex)?;
     let valid = verify_sig(&sig, packed.id(), packed.pubkey())?;
     if !valid {
+        return Err(EventError::msg("bad signature"));
+    }
+    Ok(())
+}
+
+/// Verify an event a relay has already stored: its payload `orig` must name
+/// the id, pubkey, kind and created_at of its PackedEvent `packed`, hash to
+/// that id with either preimage ([`IdPreimage::Nip01OrLegacy`]), and carry a
+/// valid signature by that pubkey. Hex is decoded as strfry decoded it on
+/// ingest, in either case and with an optional `0x`, so every event strfry
+/// verified passes; nothing else about the event is checked.
+pub fn verify_stored_event(packed: PackedEventView<'_>, orig: &Value) -> Result<(), EventError> {
+    let field = |key: &str| {
+        orig.get(key)
+            .ok_or_else(|| EventError::msg(format!("missing {key}")))
+    };
+    let bytes = |key: &str, len: usize| -> Result<Vec<u8>, EventError> {
+        let decoded = from_hex_exact(json_string(
+            field(key)?,
+            &format!("event {key} was not a string"),
+        )?)?;
+        if decoded.len() != len {
+            return Err(EventError::msg(format!("unexpected {key} size")));
+        }
+        Ok(decoded)
+    };
+    let unsigned = |key: &str| {
+        field(key)?
+            .as_u64()
+            .ok_or_else(|| EventError::msg(format!("event {key} was not an integer")))
+    };
+    if bytes("id", 32)? != packed.id() {
+        return Err(EventError::msg("payload id differs from the packed record"));
+    }
+    if bytes("pubkey", 32)? != packed.pubkey() {
+        return Err(EventError::msg(
+            "payload pubkey differs from the packed record",
+        ));
+    }
+    if unsigned("kind")? != packed.kind() {
+        return Err(EventError::msg(
+            "payload kind differs from the packed record",
+        ));
+    }
+    if unsigned("created_at")? != packed.created_at() {
+        return Err(EventError::msg(
+            "payload created_at differs from the packed record",
+        ));
+    }
+    verify_id_allowing_legacy(orig, packed.id())?;
+    if !verify_sig(&bytes("sig", 64)?, packed.id(), packed.pubkey())? {
         return Err(EventError::msg("bad signature"));
     }
     Ok(())
@@ -295,6 +347,112 @@ mod tests {
         }));
         ev["id"] = json!("11".repeat(32));
         assert!(parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).is_err());
+    }
+
+    #[test]
+    fn stored_events_verify_against_their_packed_record() {
+        let ev = sign_event(json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [["p", "22".repeat(32)]],
+            "content": "stored",
+        }));
+        let packed = crate::nostr_json_to_packed_event(&ev, &EventLimits::default()).unwrap();
+        verify_stored_event(packed.view(), &ev).unwrap();
+
+        let refused = |key: &str, value: Value| {
+            let mut changed = ev.clone();
+            changed[key] = value;
+            verify_stored_event(packed.view(), &changed)
+                .unwrap_err()
+                .to_string()
+        };
+        let other = || hex::encode([0x33; 32]);
+        assert_eq!(
+            refused("id", json!(other())),
+            "payload id differs from the packed record"
+        );
+        assert_eq!(
+            refused("pubkey", json!(other())),
+            "payload pubkey differs from the packed record"
+        );
+        assert_eq!(
+            refused("kind", json!(7)),
+            "payload kind differs from the packed record"
+        );
+        assert_eq!(
+            refused("created_at", json!(1)),
+            "payload created_at differs from the packed record"
+        );
+        assert_eq!(refused("content", json!("edited")), "bad event id");
+        assert_eq!(refused("tags", json!([])), "bad event id");
+        let mut sig = ev["sig"].as_str().unwrap().to_owned();
+        sig.replace_range(..2, if sig.starts_with("00") { "01" } else { "00" });
+        assert_eq!(refused("sig", json!(sig)), "bad signature");
+        assert_eq!(
+            refused("sig", json!("00".repeat(32))),
+            "unexpected sig size"
+        );
+        assert_eq!(refused("kind", json!("1")), "event kind was not an integer");
+        let mut missing = ev.clone();
+        missing.as_object_mut().unwrap().remove("sig");
+        assert_eq!(
+            verify_stored_event(packed.view(), &missing)
+                .unwrap_err()
+                .to_string(),
+            "missing sig"
+        );
+    }
+
+    #[test]
+    fn stored_events_accept_the_legacy_preimage() {
+        // strfry hashed U+007F escaped; NIP-01 writes it verbatim.
+        let mut rng = rand::thread_rng();
+        let kp = Keypair::new(SECP256K1, &mut rng);
+        let mut ev = json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [],
+            "content": "del \u{7f}",
+            "pubkey": hex::encode(kp.x_only_public_key().0.serialize()),
+        });
+        let id = crate::legacy_event_id_hash(&ev).unwrap();
+        assert_ne!(id, crate::event_id_hash(&ev).unwrap());
+        ev["id"] = json!(hex::encode(id));
+        ev["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &kp).as_ref()));
+        let packed = crate::nostr_json_to_packed_event(&ev, &EventLimits::default()).unwrap();
+        verify_stored_event(packed.view(), &ev).unwrap();
+        assert!(verify_nostr_event(packed.view(), &ev).is_err());
+    }
+
+    #[test]
+    fn stored_events_accept_hex_as_strfry_decoded_it() {
+        // strfry decoded hex in either case, after an optional `0x`, and
+        // stored the JSON as sent. The id hashes the pubkey as written.
+        let mut rng = rand::thread_rng();
+        let kp = Keypair::new(SECP256K1, &mut rng);
+        let pubkey = kp.x_only_public_key().0.serialize();
+        let mut ev = json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [],
+            "content": "upper",
+            "pubkey": hex::encode_upper(pubkey),
+        });
+        let id = crate::event_id_hash(&ev).unwrap();
+        ev["id"] = json!(format!("0x{}", hex::encode_upper(id)));
+        ev["sig"] = json!(hex::encode_upper(SECP256K1.sign_schnorr(&id, &kp).as_ref()));
+        let tags = PackedEventTagBuilder::default();
+        let packed = PackedEventBuilder::build(&id, &pubkey, 1_700_000_000, 1, 0, &tags).unwrap();
+        verify_stored_event(packed.view(), &ev).unwrap();
+        // Lowercasing the pubkey changes the preimage.
+        ev["pubkey"] = json!(hex::encode(pubkey));
+        assert_eq!(
+            verify_stored_event(packed.view(), &ev)
+                .unwrap_err()
+                .to_string(),
+            "bad event id"
+        );
     }
 
     #[test]

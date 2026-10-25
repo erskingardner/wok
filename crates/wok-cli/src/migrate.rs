@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wok_db::{
-    check_integrity, event_fingerprint, snapshot_lmdb_readonly, Env, EnvOptions, EnvironmentStats,
-    IntegrityReport,
+    check_integrity, event_fingerprint, snapshot_lmdb_readonly, verify_events, Env, EnvOptions,
+    EnvironmentStats, EventVerificationReport, IntegrityReport,
 };
 use wok_relay::{Config, StrfryConfigTranslation};
 
@@ -45,6 +45,7 @@ struct MigrationManifest {
 #[derive(Serialize)]
 struct Verification {
     source_integrity_ok: bool,
+    source_events_verified: bool,
     event_records_unchanged: bool,
     target_opens_as_wok: bool,
 }
@@ -64,6 +65,9 @@ pub struct MigrationPreflight {
     pub available_output_bytes: Option<u64>,
     pub lmdb: EnvironmentStats,
     pub source_integrity: IntegrityReport,
+    /// Each event against its payload. Absent from the preflight a migration
+    /// repeats, which verifies its snapshot instead.
+    pub event_verification: Option<EventVerificationReport>,
     pub translated_keys: Vec<String>,
     pub ignored_keys: Vec<String>,
     pub external_paths: Vec<ExternalPathCheck>,
@@ -115,6 +119,20 @@ impl MigrationPreflight {
                 "FAIL"
             }
         ));
+        if let Some(verification) = &self.event_verification {
+            if verification.ok() {
+                out.push_str(&format!(
+                    "Event verification: PASS ({} events)\n",
+                    verification.events
+                ));
+            } else {
+                out.push_str(&format!(
+                    "Event verification: FAIL ({} of {} events)\n",
+                    verification.failed, verification.events
+                ));
+                out.push_str(&failure_lines(verification));
+            }
+        }
         match self.available_output_bytes {
             Some(available) => out.push_str(&format!(
                 "Capacity: {} bytes estimated, {} bytes available\n",
@@ -163,7 +181,7 @@ pub fn check_strfry(
     output: &Path,
     json: bool,
 ) -> Result<()> {
-    let prepared = prepare_strfry(source_db, source_config, output)?;
+    let prepared = prepare_strfry(source_db, source_config, output, true)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&prepared.report)?);
     } else {
@@ -176,7 +194,7 @@ pub fn check_strfry(
 }
 
 pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> Result<()> {
-    let prepared = prepare_strfry(source_db, source_config, output)?;
+    let prepared = prepare_strfry(source_db, source_config, output, false)?;
     if !prepared.report.ok {
         bail!(
             "migration preflight failed; run `wok migrate strfry --check` for the complete report"
@@ -227,6 +245,18 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
     let source_integrity = check_integrity(&snapshot.begin_ro()?)?;
     if !source_integrity.ok() {
         bail!("source database failed integrity checks: {source_integrity:?}");
+    }
+    // The snapshot is private to this process; strfry should be stopped by
+    // now (docs/migration-from-strfry.md), so verification uses every core.
+    let verification = verify_events(&snapshot, verify_threads(1))?;
+    if !verification.ok() {
+        bail!(
+            "{} of {} source events do not verify against their stored payloads:\n{}\
+             Delete them from the strfry database, or restore it from a backup, and migrate again.",
+            verification.failed,
+            verification.events,
+            failure_lines(&verification),
+        );
     }
     let before = event_fingerprint(&snapshot)?;
     snapshot.upgrade_strfry_v3_to_wok()?;
@@ -292,6 +322,7 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
         ignored_config_keys: report.ignored_keys,
         verification: Verification {
             source_integrity_ok: true,
+            source_events_verified: true,
             event_records_unchanged: true,
             target_opens_as_wok: true,
         },
@@ -344,10 +375,33 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
     Ok(())
 }
 
+/// Workers for [`verify_events`]: the available cores divided by `share`.
+fn verify_threads(share: usize) -> usize {
+    std::thread::available_parallelism().map_or(1, |cores| (cores.get() / share).max(1))
+}
+
+fn failure_lines(verification: &EventVerificationReport) -> String {
+    let mut out = String::new();
+    for failure in &verification.failures {
+        out.push_str(&format!(
+            "  levId {} (id {}): {}\n",
+            failure.lev_id, failure.id, failure.reason
+        ));
+    }
+    let unnamed = verification.failed - verification.failures.len() as u64;
+    if unnamed != 0 {
+        out.push_str(&format!("  and {unnamed} more\n"));
+    }
+    out
+}
+
+/// With `verify`, also check each source event against its payload, on half
+/// the cores, since a preflight may run beside strfry.
 fn prepare_strfry(
     source_db: &Path,
     source_config: &Path,
     output: &Path,
+    verify: bool,
 ) -> Result<PreparedMigration> {
     let source_db = absolute_existing(source_db, "source database")?;
     let source_config = absolute_existing(source_config, "source config")?;
@@ -389,6 +443,9 @@ fn prepare_strfry(
     let source_db_version = env.db_version()?;
     let lmdb = env.stats()?;
     let source_integrity = check_integrity(&env.begin_ro()?)?;
+    let event_verification = verify
+        .then(|| verify_events(&env, verify_threads(2)))
+        .transpose()?;
     drop(env);
 
     let source_data_bytes = std::fs::metadata(source_db.join("data.mdb"))
@@ -463,6 +520,9 @@ fn prepare_strfry(
     let ok = output_available
         && source_db_version == wok_event::STRFRY_DB_VERSION
         && source_integrity.ok()
+        && event_verification
+            .as_ref()
+            .is_none_or(EventVerificationReport::ok)
         && external_paths.iter().all(|check| check.ok)
         && available_output_bytes
             .map(|available| available >= estimated_output_bytes)
@@ -481,6 +541,7 @@ fn prepare_strfry(
         available_output_bytes,
         lmdb,
         source_integrity,
+        event_verification,
         translated_keys,
         ignored_keys,
         external_paths,
@@ -671,32 +732,11 @@ mod tests {
         let source_config = temp.path().join("strfry.conf");
         let output = temp.path().join("wok-output");
 
-        let source = Env::open(&source_db, EnvOptions::for_tests()).unwrap();
-        {
-            let mut txn = source.begin_rw().unwrap();
-            txn.put_u64(
-                source.dbis().meta,
-                1,
-                &encode_meta(&Meta {
-                    db_version: wok_event::STRFRY_DB_VERSION,
-                    endianness: 1,
-                    negentropy_modification_counter: 1,
-                }),
-                lmdb_sys::MDB_NOOVERWRITE | lmdb_sys::MDB_APPEND,
-            )
-            .unwrap();
-            txn.put_u64(
-                source.dbis().negentropy_filter,
-                1,
-                &encode_negentropy_filter("{}"),
-                lmdb_sys::MDB_NOOVERWRITE | lmdb_sys::MDB_APPEND,
-            )
-            .unwrap();
-            let parsed = signed_event();
-            let mut events = [EventToWrite::new(parsed.packed.into_bytes(), parsed.json)];
-            write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
-            txn.commit().unwrap();
-        }
+        let parsed = signed_event();
+        let source = strfry_source(
+            &source_db,
+            vec![EventToWrite::new(parsed.packed.into_bytes(), parsed.json)],
+        );
         let source_fingerprint = event_fingerprint(&source).unwrap();
         drop(source);
         std::fs::write(
@@ -709,9 +749,11 @@ mod tests {
         .unwrap();
         let source_data_before = sha256_file(&source_db.join("data.mdb")).unwrap();
 
-        let preflight = prepare_strfry(&source_db, &source_config, &output).unwrap();
+        let preflight = prepare_strfry(&source_db, &source_config, &output, true).unwrap();
         assert!(preflight.report.ok, "{:#?}", preflight.report);
         assert_eq!(preflight.report.event_count, 1);
+        let verification = preflight.report.event_verification.as_ref().unwrap();
+        assert_eq!((verification.events, verification.failed), (1, 0));
         assert!(preflight
             .report
             .translated_keys
@@ -760,6 +802,7 @@ mod tests {
         assert_eq!(manifest["event_count"], 1);
         assert_eq!(manifest["source_db_version"], 3);
         assert_eq!(manifest["target_db_version"], wok_event::WOK_DB_VERSION);
+        assert_eq!(manifest["verification"]["source_events_verified"], true);
         assert_eq!(manifest["verification"]["event_records_unchanged"], true);
         assert_eq!(manifest["ignored_config_keys"], json!(["relay.info.nips"]));
         assert!(manifest["translated_config_keys"]
@@ -769,22 +812,150 @@ mod tests {
             .any(|key| key == "relay.port"));
     }
 
-    fn signed_event() -> wok_event::ParsedEvent {
+    #[test]
+    fn refuses_sources_whose_events_do_not_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_db = temp.path().join("strfry-db");
+        let source_config = temp.path().join("strfry.conf");
+        let output = temp.path().join("wok-output");
+
+        let packed = |event: &serde_json::Value| {
+            wok_event::nostr_json_to_packed_event(event, &EventLimits::default())
+                .unwrap()
+                .into_bytes()
+        };
+        let tao = wok_event::json::to_tao_string;
+        let good = signed("good", 1_700_000_000);
+        // Another signed event's payload under this record.
+        let swapped = signed("swapped", 1_700_000_001);
+        let mut bad_sig = signed("bad signature", 1_700_000_002);
+        let sig = bad_sig["sig"].as_str().unwrap().to_owned();
+        bad_sig["sig"] = json!(format!("{}{}", &sig[64..], &sig[..64]));
+        // The packed record moves the event a day later than it was signed.
+        let moved = signed("moved", 1_700_000_003);
+        let mut moved_packed = moved.clone();
+        moved_packed["created_at"] = json!(1_700_086_403u64);
+        let source = strfry_source(
+            &source_db,
+            vec![
+                EventToWrite::new(packed(&good), tao(&good)),
+                EventToWrite::new(packed(&swapped), tao(&good)),
+                EventToWrite::new(packed(&bad_sig), tao(&bad_sig)),
+                EventToWrite::new(packed(&moved_packed), tao(&moved)),
+            ],
+        );
+        drop(source);
+        std::fs::write(
+            &source_config,
+            format!("db = \"{}\"\n", source_db.display()),
+        )
+        .unwrap();
+
+        let preflight = prepare_strfry(&source_db, &source_config, &output, true).unwrap();
+        let report = &preflight.report;
+        assert!(
+            report.source_integrity.ok(),
+            "{:#?}",
+            report.source_integrity
+        );
+        assert!(!report.ok);
+        let verification = report.event_verification.as_ref().unwrap();
+        assert_eq!((verification.events, verification.failed), (4, 3));
+        let mut reasons: Vec<_> = verification
+            .failures
+            .iter()
+            .map(|failure| (failure.id.as_str(), failure.reason.as_str()))
+            .collect();
+        reasons.sort();
+        let mut expected = vec![
+            (
+                swapped["id"].as_str().unwrap(),
+                "payload id differs from the packed record",
+            ),
+            (bad_sig["id"].as_str().unwrap(), "bad signature"),
+            (
+                moved["id"].as_str().unwrap(),
+                "payload created_at differs from the packed record",
+            ),
+        ];
+        expected.sort();
+        assert_eq!(reasons, expected);
+        let human = report.render_human();
+        assert!(
+            human.contains("Event verification: FAIL (3 of 4 events)"),
+            "{human}"
+        );
+        assert!(human.contains(bad_sig["id"].as_str().unwrap()), "{human}");
+
+        // The migration itself verifies its snapshot, whatever the preflight
+        // it repeats found.
+        let error = migrate_strfry(&source_db, &source_config, &output)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("3 of 4 source events do not verify against their stored payloads"),
+            "{error}"
+        );
+        for (id, reason) in expected {
+            assert!(error.contains(&format!("(id {id}): {reason}")), "{error}");
+        }
+        assert!(!output.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".wok-migrate-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A strfry v3 database at `path` holding `events` as given.
+    fn strfry_source(path: &Path, mut events: Vec<EventToWrite>) -> Env {
+        let source = Env::open(path, EnvOptions::for_tests()).unwrap();
+        let mut txn = source.begin_rw().unwrap();
+        txn.put_u64(
+            source.dbis().meta,
+            1,
+            &encode_meta(&Meta {
+                db_version: wok_event::STRFRY_DB_VERSION,
+                endianness: 1,
+                negentropy_modification_counter: 1,
+            }),
+            lmdb_sys::MDB_NOOVERWRITE | lmdb_sys::MDB_APPEND,
+        )
+        .unwrap();
+        txn.put_u64(
+            source.dbis().negentropy_filter,
+            1,
+            &encode_negentropy_filter("{}"),
+            lmdb_sys::MDB_NOOVERWRITE | lmdb_sys::MDB_APPEND,
+        )
+        .unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        source
+    }
+
+    fn signed(content: &str, created_at: u64) -> serde_json::Value {
         use secp256k1::{Keypair, SECP256K1};
         let mut rng = rand::thread_rng();
         let keypair = Keypair::new(SECP256K1, &mut rng);
         let (pubkey, _) = keypair.x_only_public_key();
         let mut event = json!({
-            "created_at": 1_700_000_000u64,
+            "created_at": created_at,
             "kind": 1,
             "tags": [],
-            "content": "migration fixture",
+            "content": content,
             "pubkey": hex::encode(pubkey.serialize()),
         });
         let id = wok_event::event_id_hash(&event).unwrap();
         event["id"] = json!(hex::encode(id));
         let sig = SECP256K1.sign_schnorr(&id, &keypair);
         event["sig"] = json!(hex::encode(sig.as_ref()));
+        event
+    }
+
+    fn signed_event() -> wok_event::ParsedEvent {
+        let event = signed("migration fixture", 1_700_000_000);
         parse_and_verify_event(&event, &EventLimits::default(), None, true, false).unwrap()
     }
 }

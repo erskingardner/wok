@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `wok migrate strfry` verifies every event against its stored payload
+  before it migrates the database (#55). The payload must name the packed
+  record's id, pubkey, kind and created_at, hash to that id, and carry a
+  valid signature by that pubkey. Integrity checked only that the indexes
+  match the packed records, so a strfry database written by `strfry import
+  --no-verify` or `--fried`, or edited by hand, could migrate a record
+  whose payload is another event, or no event its author signed, which the
+  relay then served for queries it does not match. A source holding such
+  an event is refused, and up to 100 of them are named by local ID, id and
+  reason; `--check` reports the same. Verification spreads over every core,
+  or half of them for `--check`, which may run beside strfry: a million
+  events took 3.4 s on a 14-core Apple M4 Max.
 - A file that gives a kind more readers than its preset does is warned about
   when the relay starts, and by `wok doctor` in a new `read-classes` check
   (#163). `relay.auth.recipient_only_kinds = []`, `owner_only_kinds = []` or

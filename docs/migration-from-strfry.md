@@ -17,7 +17,8 @@ wok migrate strfry \
   --check
 ```
 
-The report includes source version and full integrity results, event count,
+The report includes source version, full integrity results, the verification
+of every event against its payload, event count,
 source and estimated output sizes, free space and LMDB map utilization, every
 translated and ignored config key, external executable/socket path checks, any
 process holding `data.mdb` open, and the exact generated TOML. Add `--json` for
@@ -48,17 +49,49 @@ passes.
 1. The source LMDB environment is opened read-only and copied with LMDB's
    transactionally consistent compact-copy operation.
 2. The copy must be strfry database version 3 and pass Wok's integrity checks.
-3. Every Event and EventPayload record is fingerprinted using its local event
+3. Every event in the copy must verify against its stored payload: the payload
+   names the packed record's id, pubkey, kind and created_at, hashes to that
+   id, and carries a valid Schnorr signature by that pubkey. See
+   [Events that do not verify](#events-that-do-not-verify).
+4. Every Event and EventPayload record is fingerprinted using its local event
    ID, exact packed bytes, and exact stored payload bytes.
-4. Only the copied Meta database ownership marker is changed, from strfry v3
+5. Only the copied Meta database ownership marker is changed, from strfry v3
    to Wok v5.
-5. The event fingerprint and count must remain identical after that change, and
+6. The event fingerprint and count must remain identical after that change, and
    the result must reopen as a Wok database.
-6. Supported source settings are translated into native Wok TOML, with the
+7. Supported source settings are translated into native Wok TOML, with the
    database path selecting the new Wok database.
 
 The command does not write to the source `data.mdb` or source config. A failed
 migration does not promote a partial output.
+
+## Events that do not verify
+
+Integrity derives every index from an event's packed record, and the relay
+serves its payload. strfry verifies an event's id and signature and packs it
+from its JSON as it accepts it, but `strfry import --no-verify` skips the
+verification and `--fried` takes the packed record as given. A database
+written by those, or edited by hand, can hold a record whose payload is
+another event, or no event its author signed. Migration does not trust the
+source on this. It checks every event's id and signature, accepting either id
+preimage a stored event may use (NIP-01, or the one strfry hashed for events
+containing U+007F), and reads hex as strfry read it, in either case. It checks
+nothing else about the event, so an event strfry verified fails only if Wok's
+JSON parser refuses its payload, for example for nesting deeper than 128
+levels (see [known differences](known-differences.md)).
+
+Any event that fails refuses the migration. It is not skipped: migration
+copies every record or none. The error, like the preflight report, gives the
+number that failed and names up to 100 of them by local ID, the id the
+indexes hold, and the reason, such as `bad signature` or `payload id differs
+from the packed record`. To migrate, stop strfry, delete those events (for
+example `strfry delete --filter '{"ids":["<id>"]}'`) or restore the database
+from a backup, and run the migration again.
+
+Verification costs a SHA-256 and a Schnorr signature check per event, spread
+over every core. The preflight, which may run beside strfry, uses half of
+them. The migration verifies its own snapshot, not the database the preflight
+read, so what it promotes is what it verified.
 
 ## Output
 
@@ -73,7 +106,8 @@ migration does not promote a partial output.
 
 The manifest records source and target paths and versions, Wok's version,
 migration time, event count and fingerprint, config hashes, the final Wok
-`data.mdb` hash, verification results, and review warnings.
+`data.mdb` hash, verification results (`source_events_verified` is the check
+above), and review warnings.
 It also records `superseded_groups` and `superseded_events` for retained
 replaceable history, and `legacy_long_tag_records` for records that lack long
 tag values and that reindex can repack. Preflight warns about these versions and migration reports

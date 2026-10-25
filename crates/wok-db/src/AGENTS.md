@@ -25,6 +25,6 @@ LMDB environment and table access. Start at `lib.rs` for the public API.
 | `state.rs` | Transactional sequence, lazy author counters, visibility generation |
 | `crash_tests.rs` | Test-only checkpoints and subprocess kill/restart coverage |
 | `reindex.rs` | Rebuild indexes from PackedEvent + payload primaries |
-| `migration.rs` | Read-only LMDB snapshot + event fingerprint for `wok migrate` |
+| `migration.rs` | Read-only LMDB snapshot, event fingerprint, and parallel verification of each event against its payload (`verify_events`) for `wok migrate` |
 
 Unsafe is allowed only at the LMDB FFI boundary (`env`, `txn`, snapshot copy). Do not add new `unsafe` elsewhere without isolating it the same way.

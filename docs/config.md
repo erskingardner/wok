@@ -835,8 +835,8 @@ NIP-86 request is logged at `info` with its signer, level and method.
 Each `admin.pubkeys` entry is read as lowercase hex, an npub converted,
 whether or not `admin.enabled` is on. While it is on, an entry that is no key
 refuses the file. While it is off, the file still loads and the entry grants
-nothing; the relay warns at startup and on reload, and `wok doctor` in its
-`admin-pubkeys` check.
+nothing; the relay warns about it at startup and on reload, and `wok doctor`
+reports it in its `admin-pubkeys` check.
 
 The public URL must have no credentials, path, query, or fragment. Each API
 request needs a new kind-27235 event with empty content, exactly one matching

@@ -520,7 +520,7 @@ counted under its `_burst` key.
 | `relay.abuse.invalid_rate_per_second` | `5` | Error replies to malformed messages from one address, including CLOSE and NEG-CLOSE with an invalid subscription id. Valid CLOSE and NEG-CLOSE are never budgeted. | Clients with bugs get fewer error replies to debug with. | — |
 | `relay.abuse.invalid_burst` | `20` | The same, at once. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until it refills. | As above. | — |
 | `relay.abuse.ipv6_prefix_len` | `64` | Leading bits of an IPv6 address that key its per-address budgets, from 1 to 128. IPv4 addresses are keyed one by one. | Unrelated users on one large network share a budget. (Too high: a host picks a new address in its /64 for each connection and escapes every per-address budget.) | — |
-| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
+| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget, NIP-86 IP blocks and the write-policy plugin's `sourceInfo`. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
 | `relay.trusted_proxies` | empty | The proxies in front of the relay, as IP addresses or CIDR ranges such as `"192.0.2.0/24"`. With `relay.real_ip_header` set, only a connection from one of them may name a client, and their own addresses are skipped from the header's end, so a CDN in front of the proxy works. Empty: any connection may, and the client is the header's last entry. See [Addresses](#addresses). File-only. | Empty behind two proxies: every client of the first shares its budgets. Empty while clients can reach the relay directly: they can name any address. A range that holds clients lets them name any address. | — |
 
 Rate budgets have no standard NIP-11 field; clients learn them only from
@@ -633,11 +633,12 @@ An entry where the client's should be that names no IP address, such as
 counted by `wok_real_ip_header_unparsed_total`, and is warned about at most
 once a minute.
 
-**The header is fully trusted for every per-address budget.** Without
+**The header is fully trusted for every per-address budget**, and for
+NIP-86 IP blocks and the write-policy plugin's `sourceInfo`. Without
 `relay.trusted_proxies`, if the proxy passes a client's header on without
 adding the client's address last, or a client can reach the relay directly,
-any client can rotate fake addresses to escape the budgets or spend another
-address's. With it, a client can do so only from an address inside a
+any client can rotate fake addresses to escape the budgets and IP blocks or
+spend another address's. With it, a client can do so only from an address inside a
 trusted range, or through a listed proxy that passes the header on without
 appending the address it was reached from. So the ranges must hold only your
 proxies, and each of them must append. If a CDN adds
@@ -646,7 +647,9 @@ client, and that edge's clients share one set of budgets until the ranges are
 updated. The relay warns at startup whenever the header is set, when
 `relay.trusted_proxies` is set without it, and when the header is empty
 while the relay listens only on loopback or private addresses, as behind a
-proxy. See [production-deployment.md](production-deployment.md).
+proxy. Both settings are read for each connection and request, so a reload
+that changes either applies at once: it is logged as a security-scope
+change, and the warning it newly causes is logged with it. See [production-deployment.md](production-deployment.md).
 
 ## Storage
 
@@ -797,7 +800,12 @@ Restart settings, file-only. `database.map_size` and
 
 ## Admin
 
-Live, file-only.
+Live, file-only. A reload that changes any of them is logged as a
+security-scope change, naming the keys added to and removed from
+`admin.pubkeys`. A key taken out of `admin.pubkeys` that still holds the
+NIP-86 `admin` or `moderator` role keeps that level while `admin.enabled`
+is on, until the role is unassigned; the reload warns about each one. Each authorized
+NIP-86 request is logged at `info` with its signer, level and method.
 
 | Key | Default | Meaning |
 |---|---|---|

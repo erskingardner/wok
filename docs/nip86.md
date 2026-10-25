@@ -72,7 +72,9 @@ Every call is made by a NIP-98 signer at one of two levels:
   role methods return a `requires the admin role` error.
 
 `assignrole` / `unassignrole` manage these grants without restarting the
-relay or editing the config file.
+relay or editing the config file. A role is independent of
+`admin.pubkeys`: removing a key from the file leaves any role it holds, and
+the reload that removes it warns when that role is `admin` or `moderator`.
 
 ## Ban and allowlist semantics
 

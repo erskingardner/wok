@@ -82,23 +82,32 @@ impl VanishPolicy {
 }
 
 /// A relay URL as NIP-42 AUTH and NIP-62 vanish requests compare it with the
-/// relay's service URL: without its scheme, query, fragment, trailing
-/// slashes, or the port its scheme implies, and with its host in lowercase.
-/// The path is kept as written, so relays that share a host by path, which
-/// proxies match case-sensitively, do not accept each other's URLs.
+/// relay's service URL: without its query, fragment, trailing slashes, or
+/// the port its scheme implies, and with its scheme and host in lowercase.
+/// A URL without a scheme is `wss`, as clients take it, and `https` and
+/// `http` count as `wss` and `ws`. The scheme and the path are kept, so
+/// relays on another port or path of the same host, which proxies match
+/// case-sensitively, do not accept each other's URLs.
 pub fn normalize_relay_url(url: &str) -> String {
     let url = url.trim();
-    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let (scheme, rest) = url.split_once("://").unwrap_or(("wss", url));
     let rest = rest.split(['?', '#']).next().unwrap_or_default();
     let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    let authority = match scheme.to_ascii_lowercase().as_str() {
-        "wss" | "https" => authority.strip_suffix(":443"),
-        "ws" | "http" => authority.strip_suffix(":80"),
+    let scheme = match scheme.to_ascii_lowercase().as_str() {
+        "https" => "wss".to_string(),
+        "http" => "ws".to_string(),
+        other => other.to_string(),
+    };
+    let default_port = match scheme.as_str() {
+        "wss" => Some(":443"),
+        "ws" => Some(":80"),
         _ => None,
-    }
-    .unwrap_or(authority);
+    };
+    let authority = default_port
+        .and_then(|port| authority.strip_suffix(port))
+        .unwrap_or(authority);
     format!(
-        "{}{}",
+        "{scheme}://{}{}",
         authority.to_ascii_lowercase(),
         path.trim_end_matches('/')
     )
@@ -412,12 +421,13 @@ mod tests {
             service_url: "wss://Relay.Example.com/".into(),
         };
         let mut tags = PackedEventTagBuilder::default();
-        tags.add('r', b"ws://relay.example.com").unwrap();
+        tags.add('r', b"WSS://relay.example.com").unwrap();
         let event =
             PackedEventBuilder::build(&[1; 32], &[2; 32], 1, VANISH_KIND, 0, &tags).unwrap();
         assert!(policy.targets_this_relay(event.view()));
-        assert!(policy
-            .targets_this_relay_json(r#"{"kind":62,"tags":[["relay","ws://relay.example.com"]]}"#));
+        assert!(policy.targets_this_relay_json(
+            r#"{"kind":62,"tags":[["relay","WSS://relay.example.com"]]}"#
+        ));
         assert!(!policy.targets_this_relay_json(r#"{"kind":62,"tags":[["random","ALL_RELAYS"]]}"#));
 
         let mut tags = PackedEventTagBuilder::default();
@@ -433,7 +443,8 @@ mod tests {
             ("wss://relay.example.com", "wss://relay.example.com/"),
             ("wss://relay.example.com", "WSS://Relay.Example.COM//"),
             ("wss://relay.example.com", "wss://relay.example.com:443"),
-            ("wss://relay.example.com", "ws://relay.example.com:80/"),
+            ("wss://relay.example.com", "https://relay.example.com:443/"),
+            ("ws://relay.example.com", "ws://relay.example.com:80/"),
             (
                 "wss://relay.example.com",
                 "wss://relay.example.com/?client=x#y",
@@ -456,6 +467,8 @@ mod tests {
             ("wss://host.example/relayA", "wss://host.example/RelayA"),
             ("wss://host.example", "wss://host.example:8443"),
             ("wss://host.example", "wss://host.example:80"),
+            ("wss://host.example/relay", "ws://host.example/relay"),
+            ("wss://host.example:443/relay", "ws://host.example:80/relay"),
             ("wss://host.example", "wss://other.example"),
         ];
         for (a, b) in different {
@@ -478,6 +491,7 @@ mod tests {
         assert!(request("wss://host.example:443/relayA"));
         assert!(!request("wss://host.example/relayB"));
         assert!(!request("wss://host.example/relaya"));
+        assert!(!request("ws://host.example:80/relayA"));
         assert!(!request("wss://host.example"));
         assert!(request("ALL_RELAYS"));
     }

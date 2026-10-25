@@ -9,19 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- NIP-42 AUTH compares the path of its `relay` tag with the path of
+- NIP-42 AUTH compares the scheme and path of its `relay` tag with those of
   `relay.auth.service_url` (#167). Only the host and port were compared, as
   in strfry, so where one host serves several relays by path, a relay at
   `wss://host/a` accepted an AUTH signed for `wss://host/b`: a co-tenant
   relay could pass its own challenge to a user and sign in as them here.
-  The path is compared as written, case included; the host's case, the
-  scheme, a query, trailing slashes and the port the scheme implies are
-  ignored. **Set `service_url` to the URL clients
-  connect to, path included**: a relay served at `wss://host/relay` whose
-  `service_url` is `wss://host` now refuses its clients' AUTH with
+  The path is compared as written, case included, and `ws` differs from
+  `wss`; the host's case, a query, trailing slashes and the port the scheme
+  implies are ignored, and `https` and `http` count as `wss` and `ws`.
+  **Set `service_url` to the URL clients connect to, scheme and path
+  included**: a relay served at `wss://host/relay` whose `service_url` is
+  `wss://host`, or `ws://host/relay`, now refuses its clients' AUTH with
   `incorrect or missing relay tag`. NIP-62 vanish requests' `relay` tags
   are compared the same way: a default port or query no longer stops one
-  from matching, and the path's case now does.
+  from matching, and the path's case and the scheme now do.
 - `wok migrate strfry` verifies every event against its stored payload
   before it migrates the database (#55). The payload must name the packed
   record's id, pubkey, kind and created_at, hash to that id, and carry a

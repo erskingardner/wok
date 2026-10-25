@@ -847,6 +847,7 @@ async fn nip42_relay_tag_must_name_the_relay_path() {
         ("wss://host.test/relayA?client=x", true),
         ("wss://host.test/relayB", false),
         ("wss://host.test/relaya", false),
+        ("ws://host.test:80/relayA", false),
         ("wss://host.test", false),
         ("wss://host.test/relayA/sub", false),
     ] {

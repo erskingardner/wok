@@ -186,7 +186,10 @@ WIDENED`).
 As NIP-78 recommends, the relay also accepts an event of an owner-only kind
 only on a connection authenticated as its author. Without AUTH the EVENT is
 refused with `auth-required:` and a challenge; once the connection has
-authenticated as another pubkey, with `restricted:`. A tool that copies
+authenticated as another pubkey, with `restricted:`. The writer checks this
+again under its own configuration, as it does the author's AUTH that NIP-70
+protected events need, so an event queued before a reload made AUTH
+unusable, or moved its kind into `owner_only_kinds`, is refused too. A tool that copies
 events between relays without the authors' keys, such as `wok sync`, can
 therefore neither download nor upload them unless the relay it reads from or
 writes to sets `owner_only_kinds = []`. Apps that publish public data in

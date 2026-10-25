@@ -487,12 +487,27 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle, bound: Bou
                     tracing::info!("config {} changed, reloading", path.display());
                     let mut cfg = handle.config.write();
                     let previous = cfg.clone();
-                    if let Err(error) = cfg.apply_reload(new) {
-                        tracing::error!("config reload refused, keeping old config: {error}");
-                    } else if let Some(warning) =
-                        cfg.metrics_reload_warning(&previous, &bound.relay, bound.metrics)
-                    {
-                        tracing::warn!("config reload: {warning}");
+                    let reloaded = cfg.apply_reload(new).map(|()| cfg.clone());
+                    // Released before the moderation snapshot is read.
+                    drop(cfg);
+                    match reloaded {
+                        Err(error) => {
+                            tracing::error!("config reload refused, keeping old config: {error}");
+                        }
+                        Ok(cfg) => {
+                            let warnings = [
+                                cfg.metrics_reload_warning(&previous, &bound.relay, bound.metrics),
+                                cfg.real_ip_header_reload_warning(&previous, &bound.relay),
+                                wok_relay::moderation::removed_admin_roles_warning(
+                                    &previous,
+                                    &cfg,
+                                    &handle.moderation.read(),
+                                ),
+                            ];
+                            for warning in warnings.into_iter().flatten() {
+                                tracing::warn!("config reload: {warning}");
+                            }
+                        }
                     }
                 }
                 Err(e) => {

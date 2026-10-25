@@ -134,17 +134,11 @@ pub async fn dispatch(
             Ok(ok) => ok,
             Err(error) => return admin::unauthorized(&error),
         };
-    tracing::info!(
-        manager = %signer_hex,
-        level = ?level,
-        "authorized NIP-86 management request"
-    );
-
     // Once a command reaches the writer it is applied even if this request
     // is cancelled or its reply reports an error, so only a failure before
     // that point releases the replay reservation.
     let mut reached_writer = false;
-    match execute(&handle, level, &body, &mut reached_writer).await {
+    match execute(&handle, &signer_hex, level, &body, &mut reached_writer).await {
         Ok(result) => admin::json(StatusCode::OK, json!({ "result": result })),
         Err(error) => {
             if !reached_writer {
@@ -209,16 +203,29 @@ fn authorize_manager<'a>(
 
 async fn execute(
     handle: &Arc<RelayHandle>,
+    manager: &str,
     level: ManagementLevel,
     body: &[u8],
     reached_writer: &mut bool,
 ) -> Result<Value, String> {
-    let request: Value =
-        serde_json::from_slice(body).map_err(|error| format!("invalid request JSON: {error}"))?;
+    let request = serde_json::from_slice::<Value>(body);
     let method = request
-        .get("method")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "request method must be a string".to_string())?;
+        .as_ref()
+        .ok()
+        .and_then(|request| request.get("method"))
+        .and_then(Value::as_str);
+    // Each authorized request is logged with the method it names, whether
+    // or not it then runs.
+    tracing::info!(
+        manager = %manager,
+        level = ?level,
+        method = ?method,
+        "authorized NIP-86 management request"
+    );
+    let request = request
+        .as_ref()
+        .map_err(|error| format!("invalid request JSON: {error}"))?;
+    let method = method.ok_or_else(|| "request method must be a string".to_string())?;
     let params = request
         .get("params")
         .and_then(Value::as_array)
@@ -526,6 +533,67 @@ mod tests {
             "Nostr {}",
             base64::engine::general_purpose::STANDARD.encode(event.to_string())
         )
+    }
+
+    /// What `execute` logs, as `tracing_subscriber::fmt` writes it.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn each_authorized_request_is_logged_with_its_method() {
+        use tracing::instrument::WithSubscriber;
+        let dir = tempfile::tempdir().unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let cfg = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let handle = Arc::new(wok_relay::start(env, cfg).unwrap());
+        let manager = hex::encode([7u8; 32]);
+        for (body, method) in [
+            (
+                &br#"{"method":"supportedmethods","params":[]}"#[..],
+                r#"method=Some("supportedmethods")"#,
+            ),
+            // One that runs nothing is logged too.
+            (&b"not json"[..], "method=None"),
+        ] {
+            let logs = Logs::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let mut reached_writer = false;
+            let _ = execute(
+                &handle,
+                &manager,
+                ManagementLevel::Admin,
+                body,
+                &mut reached_writer,
+            )
+            .with_subscriber(subscriber)
+            .await;
+            let logs = String::from_utf8(logs.0.lock().clone()).unwrap();
+            let line = logs
+                .lines()
+                .find(|line| line.contains("authorized NIP-86 management request"))
+                .unwrap_or_else(|| panic!("nothing logged:\n{logs}"));
+            assert!(line.contains(&format!("manager={manager}")), "{line}");
+            assert!(line.contains(method), "{line}");
+        }
+        handle.request_shutdown();
     }
 
     /// Both halves of a NIP-86 authorization, as dispatch runs them around

@@ -160,6 +160,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address, but is counted by `wok_real_ip_header_unparsed_total` and warned
   about at most once a minute. Relays without `real_ip_header`, the default,
   and proxies that replace the header are unaffected.
+- Reloads that move a trust boundary say so (#164). A reload that sets or
+  changes `relay.real_ip_header` or `relay.trusted_proxies`, which apply to
+  the next connection and request, logs the warning the relay gives at
+  startup, which now names NIP-86 IP blocks and the write-policy plugin's
+  `sourceInfo` beside the per-address budgets. Changes to `admin.enabled`,
+  `public_url`, `pubkeys`, `allow_config_writes` and `auth_window_secs` are
+  logged as security-scope changes, naming each key added and removed, and
+  a key removed from `admin.pubkeys` that still holds the NIP-86 `admin` or
+  `moderator` role, which it keeps, is warned about. Each authorized NIP-86
+  request is logged with its method.
 - A members-only relay accepts its members' events from throwaway keys.
   `relay.auth.restrict_writes` checked only the event's author, so an
   allowlisted relay refused every Marmot group message (445) and gift wrap

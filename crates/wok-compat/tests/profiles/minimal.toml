@@ -7,6 +7,8 @@ negentropy_enabled = false
 max_filter_limit_count = 0
 # NIP-91 AND filters.
 max_and_entries = 0
+# NIP-50 search.
+search_enabled = false
 # permessage-deflate.
 compression_enabled = false
 

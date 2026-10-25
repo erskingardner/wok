@@ -562,6 +562,16 @@ async fn each_refusal_is_counted_by_the_setting_that_made_it() {
         .await;
     relay
         .expect(
+            Some(Setting::SearchEnabled),
+            |c| c.relay.search_enabled = false,
+            async |r| {
+                let filter = json!({"search": "nostr"});
+                r.client().await.closed("REQ", "s", &[filter]).await
+            },
+        )
+        .await;
+    relay
+        .expect(
             Some(Setting::MaxTagsPerFilter),
             |c| c.relay.max_tags_per_filter = 2,
             async |r| {

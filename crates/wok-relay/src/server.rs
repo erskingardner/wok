@@ -3206,6 +3206,14 @@ fn admit_req(
     } else {
         cfg.relay.max_filter_limit
     };
+    // With NIP-50 off, its query parser is not reached.
+    if !cfg.relay.search_enabled && filters.iter().any(|filter| filter.get("search").is_some()) {
+        return Err(refuse(
+            Setting::SearchEnabled,
+            "blocked",
+            "search disabled".into(),
+        ));
+    }
     let mut arr = vec![json!("REQ"), json!(sid.as_str())];
     arr.extend(filters);
     let fg = NostrFilterGroup::from_req(
@@ -3725,6 +3733,10 @@ fn ingest_neg(
             "invalid: filters exceed {} serialized bytes",
             cfg.relay.max_req_filter_size
         ));
+    }
+    if !cfg.relay.search_enabled && filter.get("search").is_some() {
+        metrics.refused(Setting::SearchEnabled);
+        return Err("blocked: search disabled".into());
     }
     let max_limit = cfg.relay.max_sync_events.saturating_add(1);
     let fg = NostrFilterGroup::from_value(

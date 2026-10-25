@@ -348,6 +348,13 @@ pub(super) const SECTIONS: &[Section] = &[
                 &[Input::new("limits", "max_filter_limit_count", "relay.max_filter_limit_count", Unit::Count)],
             ),
             field(
+                "Search (NIP-50)",
+                "Answer filters with a search, and advertise NIP-50. Off, a REQ, COUNT or NEG-OPEN with one is refused.",
+                "",
+                "",
+                &[Input::new("limits", "search_enabled", "relay.search_enabled", Unit::Switch)],
+            ),
+            field(
                 "Query work ceiling",
                 "The most index work a REQ, COUNT or NEG-OPEN may need, estimated before its scan. Requests over it are refused with blocked:.",
                 "Normal batched and outbox queries are refused.",

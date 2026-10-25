@@ -48,6 +48,9 @@
 ## REQ every note
 < ["CLOSED","all","auth-required: this relay serves only members"]
 
+## REQ a search
+< ["CLOSED","search","auth-required: this relay serves only members"]
+
 ## COUNT notes
 < ["CLOSED","count","auth-required: this relay serves only members"]
 

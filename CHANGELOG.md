@@ -247,6 +247,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `relay.search_enabled` turns NIP-50 search off (#153). Search was served
+  and advertised in every configuration, so its query parser and ranked scan
+  were reachable even in the `minimal` attack-surface profile, which turns
+  off every capability a setting can. Off, NIP-11 no longer lists NIP-50, and
+  a REQ or COUNT whose filters carry `search` gets `CLOSED`
+  `blocked: bad req: search disabled`, a NEG-OPEN `NEG-ERR`
+  `blocked: search disabled`, before any filter is parsed; each is counted
+  by `wok_refusals_total{setting="relay.search_enabled"}`. It defaults to
+  `true`, reloads live, is on the dashboard, and turning it on or off is
+  logged as a security-scope change. Subscriptions already open keep their
+  search filters until they close, and the search index stays current, so
+  turning search back on answers from a complete index.
 - Operator documentation in the dashboard's order (#97 §5). `docs/config.md`
   now runs preset, access, events accepted, queries, rates, storage, sync,
   relay information and advanced, then the restart-only infrastructure, and

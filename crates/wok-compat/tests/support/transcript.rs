@@ -128,6 +128,11 @@ pub async fn record_at(name: &str, relay: &Relay, cfg: &Config, base: u64) -> St
             json!({"kinds": "one"}),
         ),
         ("REQ every note", "all", json!({"kinds": [1]})),
+        (
+            "REQ a search",
+            "search",
+            json!({"authors": [author_hex], "search": "hello"}),
+        ),
     ];
     for (label, sub, filter) in subs {
         out.step(label);

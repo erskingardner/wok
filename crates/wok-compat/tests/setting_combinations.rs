@@ -67,6 +67,7 @@ const SETTINGS: &[(&str, &str)] = &[
     ),
     ("COUNT off", "relay.max_filter_limit_count = 0"),
     ("negentropy off", "relay.negentropy_enabled = false"),
+    ("search off", "relay.search_enabled = false"),
     ("NIP-62 off", "relay.nip62.enabled = false"),
     // High enough that no note of the script meets it by chance.
     ("proof of work", "relay.abuse.min_pow_difficulty = 24"),

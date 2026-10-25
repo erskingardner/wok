@@ -73,6 +73,7 @@ struct LimitsPatch {
     max_tags_per_filter: Option<usize>,
     max_and_entries: Option<usize>,
     max_filter_limit_count: Option<u64>,
+    search_enabled: Option<bool>,
     max_total_events_per_req: Option<u64>,
     max_subs_per_connection: Option<usize>,
     max_pending_outbound_bytes: Option<usize>,
@@ -534,6 +535,7 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
             "max_tags_per_filter": cfg.relay.max_tags_per_filter,
             "max_and_entries": cfg.relay.max_and_entries,
             "max_filter_limit_count": cfg.relay.max_filter_limit_count,
+            "search_enabled": cfg.relay.search_enabled,
             "max_total_events_per_req": cfg.relay.max_total_events_per_req,
             "max_subs_per_connection": cfg.relay.max_subs_per_connection,
             "max_pending_outbound_bytes": cfg.relay.max_pending_outbound_bytes,
@@ -755,6 +757,9 @@ fn apply_patch(config: &mut Config, patch: ConfigPatch) {
         }
         if let Some(value) = limits.max_filter_limit_count {
             config.relay.max_filter_limit_count = value;
+        }
+        if let Some(value) = limits.search_enabled {
+            config.relay.search_enabled = value;
         }
         if let Some(value) = limits.max_total_events_per_req {
             config.relay.max_total_events_per_req = value;

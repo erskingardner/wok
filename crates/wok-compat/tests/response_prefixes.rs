@@ -293,6 +293,50 @@ async fn req_refusals_use_the_prefix_that_fits() {
     conn.close().await;
 }
 
+/// With `relay.search_enabled` off, NIP-50 is not advertised, and a REQ,
+/// COUNT or NEG-OPEN with a `search` filter is `blocked:`, like COUNT and
+/// NIP-77 while they are off. The query is not parsed: one the parser
+/// refuses gets the same answer. Filters without `search` are served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_filters_are_blocked_while_search_is_off() {
+    let too_long = "x".repeat(2_000);
+    let relay = Relay::new(|_| {});
+    let (conn, mut rx) = relay.connection().await;
+    send(&conn, json!(["REQ", "s", {"search": too_long}])).await;
+    assert_reply(&recv(&mut rx).await, "CLOSED", "s", "invalid: ");
+    conn.close().await;
+
+    let relay = Relay::new(|cfg| cfg.relay.search_enabled = false);
+    let (conn, mut rx) = relay.connection().await;
+    let cases = [
+        json!(["REQ", "s", {"search": "nostr"}]),
+        json!(["REQ", "s", {"kinds": [1]}, {"search": "nostr", "kinds": [1]}]),
+        json!(["REQ", "s", {"search": too_long}]),
+        json!(["REQ", "s", {"search": 7}]),
+        json!(["COUNT", "s", {"search": "nostr"}]),
+    ];
+    for req in cases {
+        send(&conn, req.clone()).await;
+        assert_eq!(
+            recv(&mut rx).await,
+            json!(["CLOSED", "s", "blocked: bad req: search disabled"]),
+            "{req}"
+        );
+    }
+    send(
+        &conn,
+        json!(["NEG-OPEN", "n", {"search": "nostr"}, neg_initial()]),
+    )
+    .await;
+    assert_eq!(
+        recv(&mut rx).await,
+        json!(["NEG-ERR", "n", "blocked: search disabled"])
+    );
+    send(&conn, json!(["REQ", "plain", {"kinds": [1]}])).await;
+    assert_eq!(recv(&mut rx).await[0], "EOSE");
+    conn.close().await;
+}
+
 /// NIP-42 flow: `auth-required:` and a challenge, AUTH, then the same REQ id
 /// is re-sent and served. Once authenticated, a COUNT not scoped to an
 /// authenticated key is `restricted:` rather than another `auth-required:`, so

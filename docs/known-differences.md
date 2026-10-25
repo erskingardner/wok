@@ -50,9 +50,10 @@ it is not a promise to reproduce upstream bugs.
   the proxy in front of it wrote, and accepts a port. Pinned strfry parses
   the value as one address, as Wok did through 0.7, so behind a proxy that
   appends to a client's own X-Forwarded-For the client gets the proxy's
-  address; in Wok, that let it escape a NIP-86 `blockip`. When the value is
-  not an address both fall back to the connecting address; strfry logs
-  every such request, and Wok counts them in
+  address; in Wok, that let it escape a NIP-86 `blockip`. Wok reads a
+  `Forwarded` header as RFC 7239, taking its last element's `for`, which
+  strfry cannot parse. When the value names no address both fall back to the
+  connecting address; strfry logs every such request, and Wok counts them in
   `wok_real_ip_header_unparsed_total` and warns at most once a minute.
 
 - Latest-only replaceable reads are enforced independently of physical
@@ -221,8 +222,8 @@ regression test. Differential parity alone is not a reason to retain it.
   over a size limit, and `unsupported:` for filter elements NIP-01 does not
   define, such as an unknown key or a tag key that is not a single letter
   (NIP-01's own example is `unsupported: filter contains unknown elements`).
-  `blocked:` is for `relay.filter_validation` rules, a disabled COUNT and
-  Wok's query-work ceiling (`relay.abuse.max_query_work`).
+  `blocked:` is for `relay.filter_validation` rules, a disabled COUNT or
+  NIP-50 search, and Wok's query-work ceiling (`relay.abuse.max_query_work`).
   NIP-01 keeps `error:` "for when none of that fits", so a REQ or COUNT gets
   it only for the relay's own failures, such as a database read that fails.
 - OK reasons for storage failures use `error:` instead of `Write error:`, and

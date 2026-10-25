@@ -51,6 +51,9 @@
 < ["EVENT","all",{"content":"hello","created_at":"<t+1>","id":"<h1>","kind":1,"pubkey":"<h9>","sig":"<h10>","tags":[]}]
 < ["EOSE","all",["finish"]]
 
+## REQ a search
+< ["CLOSED","search","blocked: bad req: search disabled"]
+
 ## COUNT notes
 < ["CLOSED","count","blocked: bad req: COUNT disabled"]
 
@@ -92,7 +95,7 @@
 
 ## HTTP GET / for NIP-11
 < 200 application/json
-< {"description":"This is a wok instance.","limitation":{"auth_required":false,"created_at_upper_limit":900,"default_limit":2000,"max_and_entries":0,"max_concurrent_historical_queries":8,"max_event_tags":5000,"max_limit":2000,"max_message_length":2097152,"max_query_work":20000,"max_subid_length":64,"max_subscriptions":200,"max_tags_per_filter":8,"max_total_events_per_req":10000,"min_pow_difficulty":0,"restricted_writes":false},"name":"wok default","negentropy":1,"software":"https://github.com/erskingardner/wok","supported_nips":[1,9,11,40,50,67,70],"version":"<version>"}
+< {"description":"This is a wok instance.","limitation":{"auth_required":false,"created_at_upper_limit":900,"default_limit":2000,"max_and_entries":0,"max_concurrent_historical_queries":8,"max_event_tags":5000,"max_limit":2000,"max_message_length":2097152,"max_query_work":20000,"max_subid_length":64,"max_subscriptions":200,"max_tags_per_filter":8,"max_total_events_per_req":10000,"min_pow_difficulty":0,"restricted_writes":false},"name":"wok default","negentropy":1,"software":"https://github.com/erskingardner/wok","supported_nips":[1,9,11,40,67,70],"version":"<version>"}
 
 ## HTTP GET / for the landing page
 < 200 text/html

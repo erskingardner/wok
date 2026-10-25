@@ -84,6 +84,8 @@ settings! {
     MaxReqFilterSize => "relay.max_req_filter_size",
     /// COUNT while `max_filter_limit_count = 0` turns it off.
     MaxFilterLimitCount => "relay.max_filter_limit_count",
+    /// A REQ, COUNT or NEG-OPEN with a `search` filter while NIP-50 is off.
+    SearchEnabled => "relay.search_enabled",
     MaxTagsPerFilter => "relay.max_tags_per_filter",
     MaxAndEntries => "relay.max_and_entries",
     MaxKindsPerFilter => "relay.filter_validation.max_kinds_per_filter",
@@ -290,8 +292,8 @@ pub struct Metrics {
     pub auth_success_total: AtomicU64,
     pub auth_failure_total: AtomicU64,
     pub slow_client_terminations: AtomicU64,
-    /// Requests whose `relay.real_ip_header` ended in an entry that is not
-    /// an address, so the connecting address stood in for the client's.
+    /// Requests whose `relay.real_ip_header` ended in an entry that names no
+    /// address, so the connecting address stood in for the client's.
     pub real_ip_header_unparsed: AtomicU64,
     pub abuse_connection_rejections: AtomicU64,
     pub abuse_event_rate_rejections: AtomicU64,

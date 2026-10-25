@@ -304,7 +304,7 @@ pub(crate) fn pack_event(
 
 /// Matches C++ `parseUint64`: every character must be an ASCII digit and the
 /// value must fit in u64 (so `+100` and whitespace are rejected).
-fn parse_uint64(s: &str) -> Result<u64, EventError> {
+pub(crate) fn parse_uint64(s: &str) -> Result<u64, EventError> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return Err(EventError::msg(format!("invalid uint64: {s}")));
     }

@@ -17,7 +17,8 @@ wok migrate strfry \
   --check
 ```
 
-The report includes source version and full integrity results, event count,
+The report includes source version, full integrity results, the verification
+of every event against its payload, event count,
 source and estimated output sizes, free space and LMDB map utilization, every
 translated and ignored config key, external executable/socket path checks, any
 process holding `data.mdb` open, and the exact generated TOML. Add `--json` for
@@ -48,17 +49,75 @@ passes.
 1. The source LMDB environment is opened read-only and copied with LMDB's
    transactionally consistent compact-copy operation.
 2. The copy must be strfry database version 3 and pass Wok's integrity checks.
-3. Every Event and EventPayload record is fingerprinted using its local event
+3. Every event in the copy must verify against its stored payload: the payload
+   names the packed record's id, pubkey, kind and created_at, hashes to that
+   id, and carries a valid Schnorr signature by that pubkey, and the packed
+   record, from which every index is derived, indexes nothing the payload does
+   not carry. See
+   [Events that do not verify](#events-that-do-not-verify).
+4. Every Event and EventPayload record is fingerprinted using its local event
    ID, exact packed bytes, and exact stored payload bytes.
-4. Only the copied Meta database ownership marker is changed, from strfry v3
+5. Only the copied Meta database ownership marker is changed, from strfry v3
    to Wok v5.
-5. The event fingerprint and count must remain identical after that change, and
+6. The event fingerprint and count must remain identical after that change, and
    the result must reopen as a Wok database.
-6. Supported source settings are translated into native Wok TOML, with the
+7. Supported source settings are translated into native Wok TOML, with the
    database path selecting the new Wok database.
 
 The command does not write to the source `data.mdb` or source config. A failed
 migration does not promote a partial output.
+
+## Events that do not verify
+
+Integrity derives every index from an event's packed record, and the relay
+serves its payload. strfry verifies an event's id and signature and packs it
+from its JSON as it accepts it, but `strfry import --no-verify` skips the
+verification and `--fried` takes the packed record as given. A database
+written by those, or edited by hand, can hold a record whose payload is
+another event, a record that files a signed event under another recipient,
+address, deletion target or expiry, or no event its author signed. Migration
+does not trust the source on this. The payload must name the packed record's
+id, pubkey, kind and created_at, and the packed tags and expiration must come
+from the payload as strfry's database version 3 packs them:
+
+- Every packed tag is one of the payload's single-letter tags, an `e` or `p`
+  value as the bytes its 64 hex characters decode to and any other value as
+  written up to 255 bytes, or hashed as Wok packs a longer one. The exception
+  is the empty `d` strfry adds to replaceable and addressable kinds and kind
+  41. A payload tag the record leaves out is accepted, as strfry left out
+  values longer than 255 bytes: it only keeps queries from finding the event
+  by that tag.
+- The first packed `d`, which keys replacement, is the payload's address:
+  empty for a replaceable kind, and for an addressable kind the payload's
+  first `d`, or empty when it has none. strfry skipped a `d` longer than 255
+  bytes, so for one the next `d`, or empty, is accepted as well as its hash.
+- The first packed `p` of 32 bytes, the only one recipient-only reads admit,
+  is the payload's first `p` that decodes to 32 bytes, or neither has one.
+- The packed expiration is the one strfry writes: 1 for an ephemeral kind,
+  otherwise the payload's first `expiration` tag, or 0 when it has none. A
+  payload whose first `expiration` tag is not a time of at least 100 is
+  refused, as strfry refused it: Wok reads 0 as no expiry and 1 as ephemeral.
+
+Migration then checks the event's id and signature, accepting either id
+preimage a stored event may use (NIP-01, or the one strfry hashed for events
+containing U+007F). Hex is read as strfry read it, in either case and after an
+optional `0x`, and no limit from strfry's config is applied, so an event
+strfry verified and packed fails only if Wok's JSON parser refuses its
+payload, for example for nesting deeper than 128 levels (see
+[known differences](known-differences.md)).
+
+Any event that fails refuses the migration. It is not skipped: migration
+copies every record or none. The error, like the preflight report, gives the
+number that failed and names up to 100 of them by local ID, the id the
+indexes hold, and the reason, such as `bad signature` or `packed p tag <hex> is
+not in the payload`. To migrate, stop strfry, delete those events (for
+example `strfry delete --filter '{"ids":["<id>"]}'`) or restore the database
+from a backup, and run the migration again.
+
+Verification costs a pass over the tags, a SHA-256 and a Schnorr signature
+check per event, spread over every core. The preflight, which may run beside strfry, uses half of
+them. The migration verifies its own snapshot, not the database the preflight
+read, so what it promotes is what it verified.
 
 ## Output
 
@@ -73,7 +132,8 @@ migration does not promote a partial output.
 
 The manifest records source and target paths and versions, Wok's version,
 migration time, event count and fingerprint, config hashes, the final Wok
-`data.mdb` hash, verification results, and review warnings.
+`data.mdb` hash, verification results (`source_events_verified` is the check
+above), and review warnings.
 It also records `superseded_groups` and `superseded_events` for retained
 replaceable history, and `legacy_long_tag_records` for records that lack long
 tag values and that reindex can repack. Preflight warns about these versions and migration reports

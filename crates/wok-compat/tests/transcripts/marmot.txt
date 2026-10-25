@@ -48,6 +48,9 @@
 ## REQ every note
 < ["CLOSED","all","blocked: bad req: filter validation failed: filter must name ids, authors or a tag"]
 
+## REQ a search
+< ["EOSE","search",["finish"]]
+
 ## COUNT notes
 < ["CLOSED","count","blocked: bad req: COUNT disabled"]
 

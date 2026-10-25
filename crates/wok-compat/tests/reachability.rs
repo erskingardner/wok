@@ -85,16 +85,19 @@ async fn reach_authenticated() {
     wire.until("AUTH", |frame| frame[0] == "OK" && frame[1] == id)
         .await;
     let me = hex::encode(author.x_only_public_key().0.serialize());
-    for (n, message) in [
-        json!(["EVENT", event(&author, 1, json!([["-"]]), "protected")]),
-        json!(["EVENT", event(&author, 30078, json!([["d", "app"]]), "{}")]),
-        json!(["EVENT", event(&author, 1, json!([]), "note")]),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let id = message[1]["id"].clone();
-        wire.send(message).await;
+    let mut events = [
+        event(&author, 1, json!([["-"]]), "protected"),
+        event(&author, 30078, json!([["d", "app"]]), "{}"),
+        event(&author, 1, json!([]), "note"),
+    ];
+    // Highest id first. Looking an id up visits the first stored id at or
+    // after it, if there is one, so in a profile whose anonymous clients
+    // store nothing, every event after the first reaches that visit whatever
+    // ids this second's `created_at` gives them.
+    events.sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
+    for (n, ev) in events.into_iter().enumerate() {
+        let id = ev["id"].clone();
+        wire.send(json!(["EVENT", ev])).await;
         wire.until(&format!("OK {n}"), |frame| {
             frame[0] == "OK" && frame[1] == id
         })
@@ -198,6 +201,13 @@ async fn reach_admin() {
             "{method}: {status} {reply}"
         );
     }
+    // `disallowkind` leaves a kind policy in the moderation table, and a read
+    // of events while the table holds records first looks up which types of
+    // record it holds (`ModerationView::new`). No admin request reads events:
+    // the req monitor does when the database watcher sees data.mdb change,
+    // which it checks every 100 ms. The probe cannot see the watcher, so it
+    // gives it ten checks before stopping the relay.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     stop(relay).await;
 }
 

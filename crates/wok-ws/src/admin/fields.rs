@@ -348,6 +348,13 @@ pub(super) const SECTIONS: &[Section] = &[
                 &[Input::new("limits", "max_filter_limit_count", "relay.max_filter_limit_count", Unit::Count)],
             ),
             field(
+                "Search (NIP-50)",
+                "Answer filters with a search, and advertise NIP-50. Off, a REQ, COUNT or NEG-OPEN with one is refused.",
+                "",
+                "",
+                &[Input::new("limits", "search_enabled", "relay.search_enabled", Unit::Switch)],
+            ),
+            field(
                 "Query work ceiling",
                 "The most index work a REQ, COUNT or NEG-OPEN may need, estimated before its scan. Requests over it are refused with blocked:.",
                 "Normal batched and outbox queries are refused.",
@@ -489,7 +496,7 @@ pub(super) const SECTIONS: &[Section] = &[
             ),
             field(
                 "Client address header",
-                "The header in which a reverse proxy passes each client's address, such as X-Forwarded-For. Wok reads its last entry, the one the proxy wrote, with or without a port. When that entry is not an address, the connecting address stands in, and wok_real_ip_header_unparsed_total counts the request. Empty: each client is the address that connected. Set in wok.toml, because every per-address budget trusts it.",
+                "The header in which a reverse proxy passes each client's address, such as X-Forwarded-For. Wok reads its last entry, the one the proxy wrote, with or without a port; in Forwarded (RFC 7239), the last element's for. When that entry names no address, the connecting address stands in, and wok_real_ip_header_unparsed_total counts the request. Empty: each client is the address that connected. Set in wok.toml, because every per-address budget trusts it.",
                 "Left empty behind a proxy, every client has the proxy's address and shares one set of budgets.",
                 "Set while clients can reach the relay directly, a client can send any address, to escape its budgets or spend another's.",
                 &[Input::new("file", "real_ip_header", "relay.real_ip_header", Unit::Text).file_only()],

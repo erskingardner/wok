@@ -53,9 +53,12 @@ Every request on the listener passes these steps before Wok looks at its path:
 1. Hyper reads the request head, within `relay.handshake_timeout_secs`.
 2. With `relay.real_ip_header` set, the client's address is that header's
    last entry, across all of its lines: the one the proxy in front of Wok
-   wrote. An entry may carry a port. A last entry that is not an IP address
-   leaves the connecting address and is counted in
-   `wok_real_ip_header_unparsed_total`; no header leaves it too.
+   wrote. An entry may carry a port. In `Forwarded`, read as RFC 7239, it
+   is the last element's `for`, and that element is found from the right,
+   so nothing a client sends ahead of it, an unterminated quoted string
+   included, moves it. A last entry that names no IP address leaves the
+   connecting address and is counted in `wok_real_ip_header_unparsed_total`;
+   no header leaves it too.
 3. An address blocked with NIP-86 `blockip` gets 429, and so does one whose
    per-address connection budget (`relay.abuse.connection_*`) is spent.
 
@@ -125,12 +128,12 @@ same ingester. Before Wok reads a message's verb:
 
 | Message | Party | Gate | Checks, in order |
 | --- | --- | --- | --- |
-| `EVENT` | anonymous | none | Per-address EVENT budget; by the kind the event states, an AUTH event (22242) is refused, and so is a kind `relay.auth.accepted_kinds` (kind 62 is exempt while NIP-62 is on) or the NIP-86 kind policy does not allow, and, while AUTH is unusable, a recipient-only or authenticated kind, which nobody could read (kind 62 is exempt whatever its class); event parse, size and tag limits, timestamp window, id and signature verification; event-id ban, author ban and `relay.auth.write_policy`; a NIP-62 vanish request must name this relay; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; a repost may not embed a protected event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH; an event already stored is answered `duplicate:` and goes no further. The writer then runs the write-policy plugin; only an event it accepts is checked again against stored vanish requests, the bans, the kind policy, `accepted_kinds`, the write policy and, while AUTH is unusable, the recipient-only and authenticated kinds, before it stores or broadcasts it, then against the storage quotas. A vanish request skips the author ban, the write policy, the plugin, the NIP-70 and owner-only checks and the stored vanish markers, but not the event-id ban, the kind policy, proof of work or the per-author budget. The author ban and the write policy wait for the signature, so an unsigned event cannot ask whether a key is a member or banned. Storing an event updates each negentropy tree it matches, with NIP-77 on or off (see [Trees while NIP-77 is off](mesh-and-maintenance.md#trees-while-nip-77-is-off)). |
+| `EVENT` | anonymous | none | Per-address EVENT budget; by the kind the event states, an AUTH event (22242) is refused, and so is a kind `relay.auth.accepted_kinds` (kind 62 is exempt while NIP-62 is on) or the NIP-86 kind policy does not allow, and, while AUTH is unusable, a recipient-only or authenticated kind, which nobody could read (kind 62 is exempt whatever its class); event parse, size and tag limits, timestamp window, id and signature verification; event-id ban, author ban and `relay.auth.write_policy`; a NIP-62 vanish request must name this relay; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; a repost may not embed a protected event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH; an event already stored is answered `duplicate:` and goes no further. The writer then runs the write-policy plugin; only an event it accepts is checked again against stored vanish requests, the bans, the kind policy, `accepted_kinds`, the write policy, while AUTH is unusable the recipient-only and authenticated kinds, and the author's AUTH that NIP-70 protected events and `owner_only_kinds` need, before it stores or broadcasts it, then against the storage quotas. A vanish request skips the author ban, the write policy, the plugin, the NIP-70 and owner-only checks and the stored vanish markers, but not the event-id ban, the kind policy, proof of work or the per-author budget. The author ban and the write policy wait for the signature, so an unsigned event cannot ask whether a key is a member or banned. Storing an event updates each negentropy tree it matches, with NIP-77 on or off (see [Trees while NIP-77 is off](mesh-and-maintenance.md#trees-while-nip-77-is-off)). |
 | `AUTH` | anonymous | `relay.auth.enabled` and `relay.auth.service_url` | Per-address EVENT budget; the gate; the connection must hold a challenge; kind 22242, this connection's `challenge` and the relay's `relay` tag, as the event states them; event parse and signature verification. |
-| `REQ` | anonymous | none | The connection's REQ budget, which is larger once authenticated, then the address's REQ backstop (see [rates](config.md#rates)); a connection over its own budget does not spend the backstop; subscription id; `relay.auth.read_policy`; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
+| `REQ` | anonymous | none | The connection's REQ budget, which is larger once authenticated, then the address's REQ backstop (see [rates](config.md#rates)); a connection over its own budget does not spend the backstop; subscription id; `relay.auth.read_policy`; filter count and bytes; a NIP-50 `search` filter while `relay.search_enabled` is off; filter parse and validation (`relay.filter_validation`); query-work estimate; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
 | `COUNT` | anonymous | `relay.max_filter_limit_count` above 0 | As `REQ`, with the COUNT budgets, and a COUNT that may count restricted kinds must name only what the connection may read. The gate is checked after the filter count and bytes. |
 | `CLOSE` | anonymous | none | A valid `CLOSE` is never budgeted; one with an invalid id spends the invalid-message budget. |
-| `NEG-OPEN` | anonymous | `relay.negentropy_enabled` | The REQ budgets, as for `REQ`; subscription id; the gate; `relay.auth.read_policy`; payload size; filter bytes (`relay.max_req_filter_size`); filter parse and validation; query-work estimate, which counts index seeks and not rows, because a sync is meant to move many events, up to all the relay holds (see [Sync](config.md#sync)); AUTH for restricted kinds; hex decoding of the payload. The negentropy worker then checks the read policy again, sessions per connection, the connection's sessions' filter bytes (`relay.max_filter_bytes_per_connection`) and the sync memory budgets, reserved for the whole view before its scan. The view is at most `relay.max_sync_events`, and the connection's scans at once at most `relay.abuse.max_concurrent_historical_queries`. |
+| `NEG-OPEN` | anonymous | `relay.negentropy_enabled` | The REQ budgets, as for `REQ`; subscription id; the gate; `relay.auth.read_policy`; payload size; filter bytes (`relay.max_req_filter_size`); a `search` filter while `relay.search_enabled` is off; filter parse and validation; query-work estimate, which counts index seeks and not rows, because a sync is meant to move many events, up to all the relay holds (see [Sync](config.md#sync)); AUTH for restricted kinds; hex decoding of the payload. The negentropy worker then checks the read policy again, sessions per connection, the connection's sessions' filter bytes (`relay.max_filter_bytes_per_connection`) and the sync memory budgets, reserved for the whole view before its scan. The view is at most `relay.max_sync_events`, and the connection's scans at once at most `relay.abuse.max_concurrent_historical_queries`. |
 | `NEG-MSG` | anonymous | `relay.negentropy_enabled` | The connection's NEG-MSG budget, then the address's REQ backstop; subscription id; the gate; payload size and hex decoding; the session lookup. |
 | `NEG-CLOSE` | anonymous | `relay.negentropy_enabled` | The gate first. It has no budget: the negentropy worker handles a run of them as one removal each, before the snapshot it takes for other messages. |
 
@@ -170,7 +173,7 @@ does not list.
 | --- | --- | --- |
 | `wok relay` | Config file, the network, the Unix socket | Everything on this page. |
 | `wok info` | Database | |
-| `wok migrate strfry` | strfry LMDB environment and config | Opens the strfry database through LMDB FFI and parses its HOCON-subset config. Runs `lsof` to check that no process has the database open. Writes only a new directory. |
+| `wok migrate strfry` | strfry LMDB environment and config | Opens the strfry database through LMDB FFI and parses its HOCON-subset config. Verifies each event's id and signature against its stored payload, that the payload names the packed record's id, pubkey, kind and created_at, and that the packed tags, address, first recipient and expiration come from the payload; an event that does not verify refuses the migration (see [Events that do not verify](migration-from-strfry.md#events-that-do-not-verify)). Runs `lsof` to check that no process has the database open. Writes only a new directory. |
 | `wok config show` | Config file | |
 | `wok config minimize` | Config file | Rewrites the file and keeps the original as `<file>.bak`. |
 | `wok doctor` | Config file, database, runtime paths | |
@@ -212,7 +215,7 @@ of running Wok. A test only points it at a temporary database and port.
 | `public` | A public relay configured as [wok.toml](wok.toml) asks: AUTH works, so DMs and gift wraps reach their recipients. |
 | `marmot` | The `marmot` preset, as a Marmot app's default relay runs it: `relay.auth.accepted_kinds` limits it to the kinds MDK publishes, every filter must be scoped, COUNT and compression are off, and writes stay open. |
 | `gated` | A members-only relay: `relay.auth.read_policy` and `write_policy` set to `members`, AUTH, the dashboard and NIP-86. |
-| `minimal` | Every optional capability off: negentropy, COUNT, NIP-91, NIP-62, AUTH and compression. |
+| `minimal` | Every optional capability off: negentropy, COUNT, NIP-91, NIP-50 search, NIP-62, AUTH and compression. |
 | `proxied` | Behind a reverse proxy that passes the client's address in `X-Real-IP`. |
 | `unix` | The Unix socket on, limited to one UID. |
 | `monitored` | A public relay scraped by Prometheus on a private address: metrics on, on a listener of their own. |
@@ -262,7 +265,9 @@ profile, each phase in a process of its own:
   in a stranger's name and in an admin's; and it connects to the Unix socket
   as a peer the socket refuses;
 - **authenticated** authenticates with NIP-42 and sends what AUTH unlocks;
-- **admin** calls the dashboard API and every NIP-86 method as an admin;
+- **admin** calls the dashboard API and every NIP-86 method as an admin,
+  then gives the database watcher a second to see their changes and start a
+  read of the database;
 - **local** sends the anonymous messages over the Unix socket as a peer it
   admits.
 

@@ -3104,9 +3104,6 @@ fn ingest_auth(
     match ingest_auth_inner(cfg, metrics, auth, conn_id, &event_json, dispatch) {
         Ok(packed_id) => {
             metrics.auth_success_total.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .authenticated_connections
-                .fetch_add(1, Ordering::Relaxed);
             conns.send(
                 conn_id,
                 RelayMessage::Ok {
@@ -3214,8 +3211,15 @@ fn ingest_auth_inner(
         asess.identities.push(pk);
     }
     // Keep admission accounting pinned to the first identity; authenticating
-    // another key must not reset the connection's abuse budget.
-    asess.authed.get_or_insert(pk);
+    // another key must not reset the connection's abuse budget. The gauge
+    // counts connections, as `IngestMsg::Close` and `expire` take them out,
+    // so another key or the same one again adds nothing.
+    if asess.authed.is_none() {
+        asess.authed = Some(pk);
+        metrics
+            .authenticated_connections
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let epoch = cfg.auth_epoch;
     dispatch.req(ReqMsg::SetAuth {
         conn_id,
@@ -7190,6 +7194,64 @@ mod tests {
         assert!(authed.is_empty());
         add_login(&mut authed, &mut seen, 1, [7; 32], 1);
         assert_eq!(authed.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_authenticated_gauge_counts_connections_not_logins() {
+        // Each successful AUTH added one, while closing the connection took
+        // one away, so a second key or a repeated AUTH left a closed
+        // connection counted (#214).
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
+            cfg.relay.auth.service_url = "wss://auth.example".into();
+        })
+        .await;
+        let challenge: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
+        let challenge = challenge[1].as_str().unwrap().to_string();
+        let login = |key: &Keypair, created_at: u64| {
+            let auth = sign_event_with_key(
+                json!({
+                    "created_at": created_at,
+                    "kind": AUTH_KIND,
+                    "tags": [["relay", "wss://auth.example"], ["challenge", challenge]],
+                    "content": "",
+                }),
+                key,
+            );
+            json!(["AUTH", auth]).to_string()
+        };
+        let authenticated = || {
+            handle
+                .metrics
+                .authenticated_connections
+                .load(Ordering::Relaxed)
+        };
+        let first = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let second = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        // A second key, and the first again.
+        for (key, created_at) in [
+            (&first, now_secs()),
+            (&second, now_secs()),
+            (&first, now_secs() - 1),
+        ] {
+            conn.client_message(login(key, created_at)).await;
+            let reply = recv_outbound(&mut rx).await;
+            assert!(
+                reply.starts_with(r#"["OK""#) && reply.contains("true"),
+                "{reply}"
+            );
+            assert_eq!(authenticated(), 1);
+        }
+        drop(conn);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while authenticated() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a closed connection is counted: {}",
+                authenticated()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

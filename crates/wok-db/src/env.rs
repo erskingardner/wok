@@ -24,6 +24,8 @@ use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
 use lmdb_sys::*;
 use std::ffi::CString;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
@@ -66,6 +68,32 @@ impl EnvOptions {
             ..Self::default()
         }
     }
+}
+
+/// Permission bits for the database files Wok creates: LMDB's `data.mdb` and
+/// `lock.mdb`, and compact copies. Stored events include gift wraps and other
+/// recipient-only kinds, so other users get no access; the umask can only
+/// remove more. A file that already exists keeps its mode.
+pub(crate) const DB_FILE_MODE: u32 = 0o640;
+
+/// Create a new file for a compact copy with [`DB_FILE_MODE`]. LMDB's
+/// `mdb_env_copy2` would create it with mode `0666`.
+pub(crate) fn create_copy_file(path: &Path) -> Result<std::fs::File, DbError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(DB_FILE_MODE)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                DbError::msg(format!(
+                    "output file '{}' exists, not overwriting",
+                    path.display()
+                ))
+            } else {
+                DbError::msg(format!("create '{}': {e}", path.display()))
+            }
+        })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -218,7 +246,7 @@ impl Env {
         }
         let cpath = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| DbError::msg("db path contains NUL"))?;
-        let rc = unsafe { mdb_env_open(env, cpath.as_ptr(), flags, 0o664) };
+        let rc = unsafe { mdb_env_open(env, cpath.as_ptr(), flags, DB_FILE_MODE as mode_t) };
         if rc != 0 {
             unsafe { mdb_env_close(env) };
             return Err(DbError::from_rc(rc));
@@ -508,16 +536,10 @@ impl Env {
         check(unsafe { mdb_env_copyfd2(self.inner.env, fd, MDB_CP_COMPACT) })
     }
 
+    /// Write a compact copy to a new file at `path`.
     pub fn compact_to_path(&self, path: &Path) -> Result<(), DbError> {
-        if path.exists() {
-            return Err(DbError::msg(format!(
-                "output file '{}' exists, not overwriting",
-                path.display()
-            )));
-        }
-        let cpath = CString::new(path.to_string_lossy().as_bytes())
-            .map_err(|_| DbError::msg("path NUL"))?;
-        check(unsafe { mdb_env_copy2(self.inner.env, cpath.as_ptr(), MDB_CP_COMPACT) })
+        let file = create_copy_file(path)?;
+        self.compact_to_fd(file.as_raw_fd())
     }
 }
 

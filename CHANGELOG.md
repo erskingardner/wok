@@ -713,6 +713,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decoding a zstd-compressed payload no longer zeroes a buffer as large as
+  its size bound first. Reindex, search backfill and integrity bound it at
+  16 MiB and spent about 75 µs per compressed event zeroing it, more than a
+  Schnorr signature check takes; relay reads bound it by
+  `events.max_event_size`.
 - An `authors` and `kinds` filter past 1,000 (author, kind) pairs under a
   small `limit` no longer reads every event the authors wrote when they
   rarely publish those kinds. A picture feed (`kinds [20,21]`, `limit 50`) of

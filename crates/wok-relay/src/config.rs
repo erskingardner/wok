@@ -39,6 +39,13 @@ pub struct Config {
     /// translation. Logged at startup and on reload.
     #[serde(skip)]
     pub deprecations: Vec<String>,
+    /// How many reloads have made NIP-42 AUTH unusable. Each one ends every
+    /// connection's login: a thread that holds a connection's authenticated
+    /// identities drops those from an earlier epoch, so nobody stays logged
+    /// in while nobody can log in, nor after AUTH comes back. Not in the
+    /// file.
+    #[serde(skip)]
+    pub auth_epoch: u64,
 }
 
 /// A warning about settings, with the keys it is about, so the dashboard can
@@ -610,6 +617,7 @@ impl Default for Config {
                 },
             },
             deprecations: Vec::new(),
+            auth_epoch: 0,
         }
     }
 }
@@ -655,6 +663,7 @@ impl From<TomlConfig> for Config {
             observability: config.observability,
             relay: config.relay,
             deprecations: Vec::new(),
+            auth_epoch: 0,
         }
     }
 }
@@ -2176,6 +2185,7 @@ impl Config {
             tracing::warn!("config reload: {deprecation}");
         }
         let old = std::mem::replace(self, new);
+        self.auth_epoch = old.auth_epoch + u64::from(old.auth_usable() && !self.auth_usable());
         self.db = old.db;
         self.db_maxreaders = old.db_maxreaders;
         self.db_mapsize = old.db_mapsize;
@@ -3044,6 +3054,26 @@ mod tests {
                 .unwrap_err()
                 .contains("at least 1")
         );
+    }
+
+    #[test]
+    fn a_reload_that_makes_auth_unusable_starts_an_auth_epoch() {
+        let mut cfg = Config::default();
+        cfg.relay.auth.service_url = "wss://auth.example".into();
+        let mut reload = |enabled: bool| {
+            let mut new = cfg.clone();
+            new.relay.auth.enabled = enabled;
+            new.auth_epoch = 0;
+            cfg.apply_reload(new).unwrap();
+            cfg.auth_epoch
+        };
+        // Only a reload from usable to unusable ends the logins: AUTH that
+        // stays usable keeps them, and AUTH that stays off has none.
+        assert_eq!(reload(true), 0);
+        assert_eq!(reload(false), 1);
+        assert_eq!(reload(false), 1);
+        assert_eq!(reload(true), 1);
+        assert_eq!(reload(false), 2);
     }
 
     #[test]

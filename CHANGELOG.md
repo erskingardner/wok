@@ -74,6 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `relay.abuse.min_pow_difficulty` above 0 under `relay.abuse.enabled =
   false`, which ignores it, is warned about at startup, on the reload that
   causes it, and in the `abuse-limits` doctor check.
+- A reload that makes AUTH unusable ends every login (#164). Each thread
+  serving a connection kept the keys it had authenticated as, so after a
+  reload turned `relay.auth.enabled` off or emptied `service_url`, a
+  logged-in connection still read its gift wraps and DMs, which nobody is
+  meant to while AUTH is off, and went on reading them once a reload made
+  AUTH usable again. The connection is now anonymous from that reload on:
+  the NEG sessions it opened while logged in are closed with `closed:
+  authentication changed; reopen synchronization`, its live subscriptions
+  deliver nothing only its keys may read, and once AUTH is back it
+  authenticates again with the challenge it holds.
 - The writer checks NIP-70 protected events and `relay.auth.owner_only_kinds`
   again under its own configuration before it stores or broadcasts them, as
   it does `accepted_kinds` and the write policy. An event queued before a

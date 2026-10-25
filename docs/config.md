@@ -168,6 +168,13 @@ by the writer, so one queued before a reload made AUTH unusable is refused
 too. NIP-62 vanish requests are accepted whatever their class. With
 `enabled = false` the relay refuses AUTH outright.
 
+A reload that makes AUTH unusable ends every login. Each connection is
+anonymous from then on, even after a reload makes AUTH usable again, until
+it authenticates again with the challenge it holds: its live subscriptions
+stop delivering what only its keys may read, and the NEG sessions it opened
+while logged in are closed with `closed: authentication changed; reopen
+synchronization`.
+
 ### Read classes
 
 The three `*_kinds` lists are read classes. A kind in none of them can be

@@ -105,10 +105,15 @@ pub async fn dispatch(
     handle: Arc<RelayHandle>,
     state: Arc<AdminState>,
 ) -> Response<Full<Bytes>> {
-    let cfg = handle.config.read().clone();
-    if !cfg.admin.enabled {
-        return admin::response(StatusCode::NOT_FOUND, "text/plain", "not found");
-    }
+    // Checked before the configuration is copied: with admin off, a request
+    // costs one read of the lock.
+    let cfg = {
+        let cfg = handle.config.read();
+        if !cfg.admin.enabled {
+            return admin::response(StatusCode::NOT_FOUND, "text/plain", "not found");
+        }
+        cfg.clone()
+    };
     let authorization = req
         .headers()
         .get(hyper::header::AUTHORIZATION)

@@ -117,8 +117,8 @@ pub fn stored_is_member(
 
 /// Name each key a reload from `previous` takes out of `admin.pubkeys` that
 /// still holds the built-in `admin` or `moderator` role. The file no longer
-/// makes it an admin, but the role keeps its NIP-86 management level, and
-/// membership, until the role is unassigned.
+/// makes it an admin, but the role keeps its NIP-86 management level until
+/// the role is unassigned.
 pub fn removed_admin_roles_warning(
     previous: &Config,
     cfg: &Config,

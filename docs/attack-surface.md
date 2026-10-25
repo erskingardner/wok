@@ -262,7 +262,9 @@ profile, each phase in a process of its own:
   in a stranger's name and in an admin's; and it connects to the Unix socket
   as a peer the socket refuses;
 - **authenticated** authenticates with NIP-42 and sends what AUTH unlocks;
-- **admin** calls the dashboard API and every NIP-86 method as an admin;
+- **admin** calls the dashboard API and every NIP-86 method as an admin,
+  then gives the database watcher a second to see their changes and start a
+  read of the database;
 - **local** sends the anonymous messages over the Unix socket as a peer it
   admits.
 

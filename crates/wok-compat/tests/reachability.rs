@@ -198,6 +198,13 @@ async fn reach_admin() {
             "{method}: {status} {reply}"
         );
     }
+    // `disallowkind` leaves a kind policy in the moderation table, and a read
+    // of events while the table holds records first looks up which types of
+    // record it holds (`ModerationView::new`). No admin request reads events:
+    // the req monitor does when the database watcher sees data.mdb change,
+    // which it checks every 100 ms. The probe cannot see the watcher, so it
+    // gives it ten checks before stopping the relay.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     stop(relay).await;
 }
 

@@ -1844,6 +1844,88 @@ fn filter_validator(cfg: &Config) -> FilterValidator {
     }
 }
 
+/// The CLOSED reason for a REQ or COUNT whose filters `filter_validator`
+/// refuses.
+fn req_filter_refusal(error: &wok_query::QueryError) -> String {
+    format!("blocked: bad req: filter validation failed: {error}")
+}
+
+/// The NEG-ERR reason for a NEG-OPEN whose filter `filter_validator`
+/// refuses.
+fn neg_filter_refusal(error: &wok_query::QueryError) -> String {
+    format!("blocked: filter validation failed: {error}")
+}
+
+/// The `relay.filter_validation` rules a thread last checked what it holds
+/// against, so it can tell when a reload changes them.
+struct FilterRules {
+    rules: crate::config::FilterValidationConfig,
+    validator: FilterValidator,
+}
+
+impl FilterRules {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            rules: cfg.relay.filter_validation.clone(),
+            validator: filter_validator(cfg),
+        }
+    }
+
+    /// Take the rules `cfg` sets, returning whether a reload changed them.
+    fn follow(&mut self, cfg: &Config) -> bool {
+        if cfg.relay.filter_validation == self.rules {
+            return false;
+        }
+        *self = Self::new(cfg);
+        true
+    }
+}
+
+/// Once a reload changes the filter rules, end each query, running or
+/// waiting, whose filters they refuse, with the CLOSED its REQ or COUNT
+/// would get now: a history scan would otherwise go on sending what the
+/// rules refuse until it finished. Under the config guard of each slice.
+fn close_refused_queries(
+    queries: &mut QueryScheduler,
+    filters: &mut FilterRules,
+    cfg: &Config,
+    worker: &ReqWorker<'_>,
+) {
+    if !filters.follow(cfg) {
+        return;
+    }
+    let validator = &filters.validator;
+    let refused = queries.remove_refused(|sub| validator.validate(&sub.filter_group).err());
+    for (sub, error) in refused {
+        count_filter_limit(worker.metrics, &error);
+        let reason = req_filter_refusal(&error);
+        worker.refuse(
+            sub.conn_id,
+            sub.sub_id,
+            sub.generation,
+            sub.count_only,
+            &reason,
+        );
+    }
+}
+
+/// Close each REQ subscription, pending or live, whose filters `validator`
+/// refuses, with the CLOSED its REQ would get if sent now: a reload that
+/// tightened `relay.filter_validation` applies to what is already open.
+fn close_refused_subs(
+    monitors: &mut ActiveMonitors,
+    validator: &FilterValidator,
+    conns: &ConnTable,
+    metrics: &Metrics,
+) {
+    let refused = monitors.remove_refused(|sub| validator.validate(&sub.filter_group).err());
+    for (conn_id, sub_id, generation, error) in refused {
+        count_filter_limit(metrics, &error);
+        let closed = RelayMessage::closed_error(sub_id.as_str(), req_filter_refusal(&error));
+        conns.send_last(conn_id, Ns::Req, &sub_id, generation, closed, metrics);
+    }
+}
+
 fn gen_challenge() -> String {
     let mut rng = rand::thread_rng();
     (0..AUTH_CHALLENGE_LEN)
@@ -3375,7 +3457,7 @@ fn admit_req(
     })?;
     if let Err(e) = filter_validator(cfg).validate(&fg) {
         count_filter_limit(metrics, &e);
-        return Err(bad_req("blocked", format!("filter validation failed: {e}")));
+        return Err(req_filter_refusal(&e));
     }
     let costed = if count_only {
         CostedRequest::Count
@@ -3873,7 +3955,7 @@ fn ingest_neg(
     // The rules REQ and COUNT meet, so a sync cannot list what a REQ may not.
     filter_validator(cfg).validate(&fg).map_err(|e| {
         count_filter_limit(metrics, &e);
-        format!("blocked: filter validation failed: {e}")
+        neg_filter_refusal(&e)
     })?;
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
@@ -4123,6 +4205,7 @@ fn run_req_worker(
         initial_cfg.relay.max_total_events_per_req,
         initial_cfg.relay.max_filter_limit_count.saturating_add(1),
     );
+    let mut filters = FilterRules::new(&initial_cfg);
     drop(initial_cfg);
     queries.set_completeness(true);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
@@ -4158,6 +4241,7 @@ fn run_req_worker(
         }
         {
             let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
+            close_refused_queries(&mut queries, &mut filters, &cfg_snap, &worker);
             queries.set_max_subs_per_connection(
                 cfg_snap.relay.abuse.max_concurrent_historical_queries,
             );
@@ -4188,9 +4272,30 @@ fn run_req_worker(
                         Some(txn) => {
                             if queries.has_running() && share.due(true, std::time::Instant::now()) {
                                 let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
+                                close_refused_queries(
+                                    &mut queries,
+                                    &mut filters,
+                                    &cfg_snap,
+                                    &worker,
+                                );
                                 share.slice(|| {
                                     worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp)
                                 });
+                            }
+                            // Admitted under rules a reload has tightened
+                            // since: refused, and the query it replaces ends
+                            // with it, as `add_sub` would have ended it.
+                            if let Err(error) = filters.validator.validate(&sub.filter_group) {
+                                queries.remove_query(conn, &sub_id, count_only);
+                                count_filter_limit(&metrics, &error);
+                                worker.refuse(
+                                    conn,
+                                    sub_id,
+                                    generation,
+                                    count_only,
+                                    &req_filter_refusal(&error),
+                                );
+                                continue;
                             }
                             // With nothing running, this slice starts the share.
                             let idle = !queries.has_running();
@@ -4198,6 +4303,12 @@ fn run_req_worker(
                                 Ok(Scheduled::Running) => {
                                     // The new query is first in the run queue.
                                     let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
+                                    close_refused_queries(
+                                        &mut queries,
+                                        &mut filters,
+                                        &cfg_snap,
+                                        &worker,
+                                    );
                                     let mut first = || {
                                         worker.slice(
                                             &mut queries,
@@ -4271,6 +4382,7 @@ fn run_req_worker(
             let waiting = !rx.is_empty();
             if open && queries.has_running() && share.due(waiting, std::time::Instant::now()) {
                 let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
+                close_refused_queries(&mut queries, &mut filters, &cfg_snap, &worker);
                 share.slice(|| worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp));
             }
         }
@@ -4586,6 +4698,11 @@ fn send_buffered_stored(
     }
 }
 
+/// How often a monitor holding subscriptions checks for filter rules a
+/// reload has changed when no traffic wakes it, as often as the negentropy
+/// worker re-checks its sessions.
+const FILTER_RULES_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
 fn run_req_monitor(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -4598,6 +4715,7 @@ fn run_req_monitor(
     // The ingester caps subscriptions per connection before registering them.
     let mut monitors = ActiveMonitors::new(usize::MAX);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
+    let mut filters = FilterRules::new(&cfg.read());
     let mut auth_epoch = 0;
     // Newest local event id already matched against every subscription.
     let mut curr_event_id = u64::MAX;
@@ -4614,6 +4732,14 @@ fn run_req_monitor(
         } else {
             crossbeam_channel::never()
         };
+        // A reload wakes no monitor, so one holding subscriptions also looks
+        // for changed filter rules on a timer: a refused subscription past
+        // EOSE would otherwise keep its slot until the next event.
+        let rules_timer = if monitors.is_empty() {
+            crossbeam_channel::never()
+        } else {
+            crossbeam_channel::after(FILTER_RULES_CHECK_INTERVAL)
+        };
         crossbeam_channel::select! {
             recv(rx) -> msg => match msg {
                 Ok(msg) => control.push(msg),
@@ -4624,6 +4750,7 @@ fn run_req_monitor(
                 Err(_) => data_open = false,
             },
             recv(retry_timer) -> _ => {}
+            recv(rules_timer) -> _ => {}
         }
         // A closed queue never wakes the monitor again; it stops once both are.
         if !control_open {
@@ -4644,10 +4771,16 @@ fn run_req_monitor(
         control.extend(rx.try_iter());
         if control.is_empty() && data.is_empty() {
             retry = false;
+            if filters.follow(&cfg.read()) {
+                close_refused_subs(&mut monitors, &filters.validator, &conns, &metrics);
+            }
             continue;
         }
         let cfg_snap = cfg.read();
         expire_logins(&mut authed, &mut auth_epoch, cfg_snap.auth_epoch);
+        if filters.follow(&cfg_snap) {
+            close_refused_subs(&mut monitors, &filters.validator, &conns, &metrics);
+        }
         let r = cfg_snap.read_restrictor();
         let global_visibility = read_visibility(&cfg_snap, vec![]);
         let max_event_size = cfg_snap.events.max_event_size;
@@ -4690,6 +4823,29 @@ fn run_req_monitor(
         for msg in control.drain(..) {
             match msg {
                 MonitorMsg::Register(mut sub) => {
+                    // Admitted under rules a reload has tightened since.
+                    if let Err(error) = filters.validator.validate(&sub.filter_group) {
+                        count_filter_limit(&metrics, &error);
+                        let reason = req_filter_refusal(&error);
+                        let closed = RelayMessage::closed_error(sub.sub_id.as_str(), reason);
+                        conns.send_last(
+                            sub.conn_id,
+                            Ns::Req,
+                            &sub.sub_id,
+                            sub.generation,
+                            closed,
+                            &metrics,
+                        );
+                        // The older generation it replaced at the gate goes
+                        // with it, as `add_pending` would have replaced it.
+                        if monitors
+                            .subscription(sub.conn_id, &sub.sub_id)
+                            .is_some_and(|old| old.generation < sub.generation)
+                        {
+                            monitors.remove_sub(sub.conn_id, &sub.sub_id);
+                        }
+                        continue;
+                    }
                     // Stored events after the REQ's history snapshot are the
                     // monitor's. Those it already matched are re-read when the
                     // history is done; everything it matches from here on is
@@ -6912,6 +7068,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_tightens_filter_validation_closes_what_it_refuses() {
+        // The rules were checked only at admission, so turning on
+        // require_scoped_filters left an enumerating subscription streaming
+        // every new event (#164).
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|_| {}).await;
+        let req = |sub: &str, filter: Value| json!(["REQ", sub, filter]).to_string();
+        conn.client_message(req("all", json!({"kinds": [1]}))).await;
+        assert!(recv_outbound(&mut rx).await.starts_with(r#"["EOSE","all""#));
+        conn.client_message(req("tagged", json!({"kinds": [1], "#t": ["wok"]})))
+            .await;
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EOSE","tagged""#));
+
+        let mut tightened = handle.config.read().clone();
+        tightened.relay.filter_validation.require_scoped_filters = true;
+        handle.config.write().apply_reload(tightened).unwrap();
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [["t", "wok"]], "content": "after",
+        }));
+        conn.client_message(json!(["EVENT", event]).to_string())
+            .await;
+        // The enumerating one is closed, with what its REQ gets now, and
+        // receives nothing more; the scoped one still streams.
+        let (mut closed, mut streamed) = (None, false);
+        while closed.is_none() || !streamed {
+            let frame: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
+            match (frame[0].as_str().unwrap(), frame[1].as_str().unwrap_or("")) {
+                ("CLOSED", "all") => closed = Some(frame[2].as_str().unwrap().to_string()),
+                ("EVENT", "tagged") => streamed = true,
+                ("EVENT", "all") => panic!("{frame}"),
+                _ => {}
+            }
+        }
+        let closed = closed.unwrap();
+        assert!(
+            closed.starts_with("blocked: bad req: filter validation failed: "),
+            "{closed}"
+        );
+        conn.client_message(req("again", json!({"kinds": [1]})))
+            .await;
+        let refused: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
+        assert_eq!(refused, json!(["CLOSED", "again", closed]));
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_tightens_filter_validation_frees_a_quiet_subscriptions_slot() {
+        // Only an event woke the monitor, so on a quiet relay a refused
+        // subscription past EOSE kept its slot, and a scoped REQ under a new
+        // id was refused as one too many.
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
+            cfg.relay.max_subs_per_connection = 1;
+        })
+        .await;
+        let req = |sub: &str, filter: Value| json!(["REQ", sub, filter]).to_string();
+        conn.client_message(req("all", json!({"kinds": [1]}))).await;
+        assert!(recv_outbound(&mut rx).await.starts_with(r#"["EOSE","all""#));
+
+        let mut tightened = handle.config.read().clone();
+        tightened.relay.filter_validation.require_scoped_filters = true;
+        handle.reload_config(tightened).unwrap();
+        // No event is published.
+        let closed = recv_outbound(&mut rx).await;
+        assert!(
+            closed.starts_with(r#"["CLOSED","all","blocked: bad req: filter validation failed: "#),
+            "{closed}"
+        );
+        conn.client_message(req("tagged", json!({"kinds": [1], "#t": ["wok"]})))
+            .await;
+        let eose = recv_outbound(&mut rx).await;
+        assert!(eose.starts_with(r#"["EOSE","tagged""#), "{eose}");
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reader_the_policy_refuses_is_refused_before_its_filters_are_read() {
         let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
             cfg.relay.auth.service_url = "wss://auth.example".into();
@@ -8761,6 +8993,92 @@ mod tests {
                 mon_rx.try_recv().is_err(),
                 "the replaced query kept running"
             );
+            drop(req_tx);
+            worker.join().unwrap();
+        }
+    }
+
+    /// A reload that tightens `relay.filter_validation` ends a REQ or COUNT
+    /// it now refuses at the scan's next slice, with the CLOSED a new one
+    /// would get, rather than once the rest of the history has gone out.
+    #[test]
+    fn a_reload_that_tightens_filter_validation_ends_a_running_scan() {
+        // Enough history that the scan spans many time slices.
+        let (dir, env, snapshot) = long_history();
+        for count in [false, true] {
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let ns = if count { Ns::Count } else { Ns::Req };
+            conns.open_sub(1, ns, &SubId::new("all").unwrap(), 1, 0);
+            let (req_tx, req_rx) = bounded(8);
+            let (mon_tx, mon_rx) = bounded(8);
+            trace::record(env.path());
+            let sub = queued_sub(
+                "all",
+                json!({"kinds": [1], "limit": 50_000}),
+                1,
+                count,
+                snapshot,
+            );
+            req_tx
+                .send(if count {
+                    ReqMsg::Count(sub)
+                } else {
+                    ReqMsg::Scan(sub)
+                })
+                .unwrap();
+            let cfg = Arc::new(parking_lot::RwLock::new(slow_scan_config(dir.path())));
+            let worker = {
+                let (env, cfg, conns) = (env.clone(), cfg.clone(), conns.clone());
+                let metrics = Arc::new(Metrics::default());
+                thread::spawn(move || {
+                    run_req_worker(env, cfg, conns, metrics, req_rx, vec![mon_tx])
+                })
+            };
+            // Once the scan has had a slice, a reload turns the rule on. No
+            // event is published, so only the worker can notice.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while trace::slices(env.path()).is_empty() {
+                assert!(std::time::Instant::now() < deadline, "no slice");
+                thread::yield_now();
+            }
+            cfg.write().relay.filter_validation.require_scoped_filters = true;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut events = 0;
+            let closed = loop {
+                match outbound.try_recv() {
+                    Ok(frame) => {
+                        let frame = frame.into_text();
+                        if frame.starts_with(r#"["EVENT","all""#) {
+                            events += 1;
+                        } else {
+                            break frame;
+                        }
+                    }
+                    Err(_) => {
+                        assert!(std::time::Instant::now() < deadline, "no CLOSED");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            };
+            assert!(
+                closed.starts_with(
+                    r#"["CLOSED","all","blocked: bad req: filter validation failed: "#
+                ),
+                "{closed}"
+            );
+            assert!(events < 20_000, "the whole history went out first");
+            if !count {
+                assert!(matches!(
+                    mon_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    MonitorMsg::Remove { generation: 1, .. }
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+            assert!(outbound.try_recv().is_err(), "a frame followed CLOSED");
+            // A scan that kept going would report its history done.
+            assert!(mon_rx.try_recv().is_err(), "the scan kept running");
             drop(req_tx);
             worker.join().unwrap();
         }

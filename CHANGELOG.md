@@ -52,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     writer, so one queued before a reload made AUTH unusable is refused too.
     Before, it was stored and every read of it refused. NIP-62 vanish
     requests are still accepted whatever their class.
+- A reload that tightens `relay.filter_validation` closes the REQ
+  subscriptions, COUNTs and NEG sessions whose filters it now refuses (#164).
+  The rules were checked only when a REQ, COUNT or NEG-OPEN arrived, so
+  turning on `require_scoped_filters` to stop `{"kinds":[445]}` enumeration
+  left those subscriptions sending the rest of their history and then every
+  new event. Each is closed with the `CLOSED` or `NEG-ERR` it would get if
+  sent now; one still sending history stops at its next time slice.
 - NIP-86 `blockip` closes the WebSocket connections already open from the
   address (#164). The block was checked only when a connection opened, so
   the client it was meant to stop kept reading and publishing on the

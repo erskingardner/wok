@@ -1397,6 +1397,42 @@ mod tests {
     }
 
     #[test]
+    fn nip98_refuses_an_event_that_repeats_a_key() {
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        cfg.admin.pubkeys = vec![hex::encode(key.x_only_public_key().0.serialize())];
+        let url = "https://relay.example/admin/api/overview";
+        let signed = signed_auth(&key, url, "GET", b"");
+        let text = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(signed.strip_prefix("Nostr ").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        // A signed event with a stray first `kind`. Stock serde_json keeps
+        // the last value and would pass it; Wok's event parser refuses a
+        // repeated key, as it does on the relay's EVENT path.
+        let repeated = text.replacen('{', r#"{"kind":1,"#, 1);
+        let lenient: serde_json::Value = serde_json::from_str(&repeated).unwrap();
+        let policy = AuthzPolicy {
+            url_ok: &|signed| signed == url,
+            signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
+            require_payload: false,
+        };
+        assert!(verify(&lenient, &Method::GET, &cfg, &policy).is_ok());
+        let header = format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(&repeated)
+        );
+        assert_eq!(
+            decode_authorization(Some(&header)).unwrap_err(),
+            "invalid Nostr authorization JSON"
+        );
+    }
+
+    #[test]
     fn nip98_expiring_while_the_body_arrives_is_refused() {
         let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
         let mut cfg = Config::default();

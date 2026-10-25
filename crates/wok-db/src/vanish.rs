@@ -5,6 +5,7 @@ use crate::payload::{event_json_owned, Decompressor};
 use crate::txn::{RoTxn, RwTxn};
 use crate::write::{delete_events, NegentropySink};
 use crate::{get_packed_ro, DbError, Env};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use wok_event::{PackedEventView, GIFT_WRAP_KINDS};
 
@@ -55,28 +56,29 @@ impl VanishPolicy {
         if !self.enabled {
             return false;
         }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(json) else {
-            return false;
-        };
-        if event.get("kind").and_then(serde_json::Value::as_u64) != Some(VANISH_KIND) {
+        wok_event::json::parse_strict(json).is_ok_and(|event| self.targets_this_relay_value(&event))
+    }
+
+    /// [`targets_this_relay_json`](Self::targets_this_relay_json) for an
+    /// event already parsed, such as one a client sent and the relay has not
+    /// yet verified.
+    pub fn targets_this_relay_value(&self, event: &Value) -> bool {
+        if !self.enabled || event.get("kind").and_then(Value::as_u64) != Some(VANISH_KIND) {
             return false;
         }
         let expected = normalize_relay_url(&self.service_url);
         event
             .get("tags")
-            .and_then(serde_json::Value::as_array)
+            .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(serde_json::Value::as_array)
+            .filter_map(Value::as_array)
             .any(|tag| {
-                tag.first().and_then(serde_json::Value::as_str) == Some("relay")
-                    && tag
-                        .get(1)
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|value| {
-                            value == "ALL_RELAYS"
-                                || (!expected.is_empty() && normalize_relay_url(value) == expected)
-                        })
+                tag.first().and_then(Value::as_str) == Some("relay")
+                    && tag.get(1).and_then(Value::as_str).is_some_and(|value| {
+                        value == "ALL_RELAYS"
+                            || (!expected.is_empty() && normalize_relay_url(value) == expected)
+                    })
             })
     }
 }
@@ -406,6 +408,15 @@ mod tests {
         assert!(policy
             .targets_this_relay_json(r#"{"kind":62,"tags":[["relay","ws://relay.example.com"]]}"#));
         assert!(!policy.targets_this_relay_json(r#"{"kind":62,"tags":[["random","ALL_RELAYS"]]}"#));
+        // The JSON is read as strictly as any event: stock serde_json would
+        // keep the second `tags`.
+        assert!(!policy.targets_this_relay_json(
+            r#"{"kind":62,"tags":[["relay","ALL_RELAYS"]],"tags":[["relay","ALL_RELAYS"]]}"#
+        ));
+        let stated =
+            serde_json::json!({"kind": 62, "tags": [["relay", "wss://relay.example.com"]]});
+        assert!(policy.targets_this_relay_value(&stated));
+        assert!(!VanishPolicy::disabled().targets_this_relay_value(&stated));
 
         let mut tags = PackedEventTagBuilder::default();
         tags.add('r', ALL_RELAYS).unwrap();

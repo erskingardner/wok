@@ -423,9 +423,13 @@ A REQ adds the rows it can return: each filter's `limit`, or
 all its filters count up to `max_total_events_per_req`. Each NIP-91 `&`
 value adds the filter's rows again, for the check on every candidate. A
 COUNT costs twice its cursors and a NEG-OPEN its cursors, with no rows:
-their scans are not bounded by `limit`, but while they run, by
-`max_filter_limit_count` and the COUNT budget, and by `max_sync_events` and
-the sync memory budgets.
+their scans are not bounded by `limit`. A COUNT's is bounded while it runs,
+by `max_filter_limit_count` and the COUNT budget. A NEG-OPEN is refused
+before its scan is scheduled when its view would not fit the sync memory
+budgets, and its scan stops, refusing the sync, past `max_sync_events`. It
+is not priced by rows on purpose: a sync exists to move many events, up to
+all a relay holds, so the ceiling leaves a broad one alone (see
+[Sync](#sync)).
 
 With the public preset's limits:
 
@@ -618,6 +622,24 @@ they are missing. All reload live and are on the dashboard.
 A NEG-OPEN meets every `filter_validation` rule, the query work ceiling and
 the read classes, as a REQ does, and draws on the REQ budgets; its rounds draw
 on the NEG-MSG budget.
+
+Broad syncs are intended. A sync exists to move many events, up to every
+event a relay holds that the client may read, so the query work ceiling counts
+only a NEG-OPEN's index seeks, not the rows it matches, and leaves `{}` or
+`{"kinds":[1]}` alone. (`relay.filter_validation.require_scoped_filters`, on
+in `marmot`, still refuses filters that name no `ids`, `authors` or tag.)
+What bounds a sync instead:
+
+- `relay.max_sync_events`, the size of its view. A scan that matches more
+  fails with `blocked: too many query results`. A filter served by a tree
+  added with `wok negentropy add` builds no view.
+- `relay.sync_memory_per_connection` and `relay.sync_memory_total`, reserved
+  for the whole view before its scan is scheduled, so a sync that would not
+  fit is refused without scanning.
+- `relay.abuse.max_concurrent_historical_queries`, the scans one connection
+  runs at once, with its NEG-OPENs counted apart from its REQs and COUNTs.
+  More wait their turn, and `relay.query_timeslice_budget_us` shares the
+  negentropy workers between running scans.
 
 With `negentropy_enabled` off, the relay still keeps its negentropy trees
 current as it stores and deletes events. Turning NIP-77 back on, which

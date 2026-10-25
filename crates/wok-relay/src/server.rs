@@ -3835,6 +3835,20 @@ fn expire_logins(authed: &mut HashMap<u64, Vec<[u8; 32]>>, seen: &mut u64, epoch
     authed.drain().map(|(conn_id, _)| conn_id).collect()
 }
 
+/// The configuration for a REQ worker's slice, with the logins a reload
+/// since ended forgotten. A slice reads identities beside the configuration,
+/// so one that sees a reload making AUTH unusable must not see the logins
+/// it ended, however late in the worker's pass the reload came.
+fn slice_config<'a>(
+    cfg: &'a parking_lot::RwLock<Config>,
+    authed: &mut HashMap<u64, Vec<[u8; 32]>>,
+    seen: &mut u64,
+) -> parking_lot::RwLockReadGuard<'a, Config> {
+    let cfg = cfg.read();
+    expire_logins(authed, seen, cfg.auth_epoch);
+    cfg
+}
+
 /// Record that a connection authenticated as `pubkey` in `epoch`, unless a
 /// later reload already ended that epoch's logins.
 fn add_login(
@@ -4054,8 +4068,7 @@ fn run_req_worker(
             }
         }
         {
-            let cfg_snap = cfg.read();
-            expire_logins(&mut authed, &mut auth_epoch, cfg_snap.auth_epoch);
+            let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
             queries.set_max_subs_per_connection(
                 cfg_snap.relay.abuse.max_concurrent_historical_queries,
             );
@@ -4085,7 +4098,7 @@ fn run_req_worker(
                     let reason = match &txn {
                         Some(txn) => {
                             if queries.has_running() && share.due(true, std::time::Instant::now()) {
-                                let cfg_snap = cfg.read();
+                                let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
                                 share.slice(|| {
                                     worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp)
                                 });
@@ -4095,7 +4108,7 @@ fn run_req_worker(
                             match queries.add_sub(txn, sub) {
                                 Ok(Scheduled::Running) => {
                                     // The new query is first in the run queue.
-                                    let cfg_snap = cfg.read();
+                                    let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
                                     let mut first = || {
                                         worker.slice(
                                             &mut queries,
@@ -4168,7 +4181,7 @@ fn run_req_worker(
         if let Some(txn) = &txn {
             let waiting = !rx.is_empty();
             if open && queries.has_running() && share.due(waiting, std::time::Instant::now()) {
-                let cfg_snap = cfg.read();
+                let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
                 share.slice(|| worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp));
             }
         }
@@ -6666,6 +6679,25 @@ mod tests {
             );
         }
         handle.request_shutdown();
+    }
+
+    #[test]
+    fn a_req_slice_never_reads_a_reload_beside_the_logins_it_ended() {
+        let cfg = parking_lot::RwLock::new(Config::default());
+        let mut authed = HashMap::from([(1, vec![[7u8; 32]])]);
+        let mut seen = 0;
+        assert_eq!(slice_config(&cfg, &mut authed, &mut seen).auth_epoch, 0);
+        assert_eq!(authed.len(), 1);
+        // A reload that made AUTH unusable after the pass began: the next
+        // slice of it reads the reload and no login.
+        cfg.write().auth_epoch = 1;
+        assert_eq!(slice_config(&cfg, &mut authed, &mut seen).auth_epoch, 1);
+        assert!(authed.is_empty());
+        // A login from before it, taken later in the pass, is void.
+        add_login(&mut authed, &mut seen, 1, [7; 32], 0);
+        assert!(authed.is_empty());
+        add_login(&mut authed, &mut seen, 1, [7; 32], 1);
+        assert_eq!(authed.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

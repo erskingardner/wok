@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     writer, so one queued before a reload made AUTH unusable is refused too.
     Before, it was stored and every read of it refused. NIP-62 vanish
     requests are still accepted whatever their class.
+- NIP-86 `blockip` closes the WebSocket connections already open from the
+  address (#164). The block was checked only when a connection opened, so
+  the client it was meant to stop kept reading and publishing on the
+  connection it had until that closed.
 - A guard the file sets to zero, turning it off where its preset keeps it,
   is warned about when the relay starts and by `wok doctor` in a new
   `zero-guards` check, not only on reload and on the dashboard (#164). A

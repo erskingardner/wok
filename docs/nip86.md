@@ -176,7 +176,9 @@ sorted, and `listdisallowedkinds` every kind the policy disallows. See
 The all-zero map (no kinds allowed) is representable; `disallowkind` never
 refuses an exclusion. IPs given to `blockip` / `unblockip` are parsed and
 stored in canonical form, so any equivalent spelling (`2001:0db8::1` vs
-`2001:db8::1`) refers to the same record.
+`2001:db8::1`) refers to the same record. A block is checked when a
+connection or HTTP request is admitted, and `blockip` also closes the
+WebSocket connections already open from the address, before it answers.
 
 ## Persistence
 

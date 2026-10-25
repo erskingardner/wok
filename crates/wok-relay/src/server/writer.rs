@@ -77,7 +77,16 @@ pub(super) fn run_writer(
         let mut maintenance_requested = false;
         for m in batch.drain(..) {
             if let WriterMsg::Management(msg) = m {
+                let blocks = matches!(msg.cmd, ManagementCmd::BlockIp { .. });
                 let result = apply_management(&env, &moderation, msg.cmd);
+                // Before the reply, so the manager hears of the block once its
+                // address's connections are told to close.
+                if blocks && result.is_ok() {
+                    let closed = conns.kill_blocked(&moderation.read().blocked_ips);
+                    if closed > 0 {
+                        tracing::info!(closed, "closed connections from a blocked IP address");
+                    }
+                }
                 let _ = msg.reply.send(result);
             } else if matches!(m, WriterMsg::Maintenance) {
                 maintenance_requested = true;

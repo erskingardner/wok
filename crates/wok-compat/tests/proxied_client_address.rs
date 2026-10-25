@@ -5,6 +5,8 @@
 //! when its own address is blocked with NIP-86 `blockip`. A last entry that is
 //! not an address leaves the connecting address, and is counted. The cap on
 //! the connections an address holds open counts the client's address too.
+//! An RFC 7239 `Forwarded` header names the client in its last element's
+//! `for`.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -18,12 +20,17 @@ const CLAIMED: &str = "198.51.100.9";
 
 /// A relay that trusts X-Forwarded-For, with [`BLOCKED`] blocked.
 async fn start() -> (tempfile::TempDir, RelayHandle, SocketAddr) {
+    start_behind("x-forwarded-for").await
+}
+
+/// A relay that trusts `header`, with [`BLOCKED`] blocked.
+async fn start_behind(header: &str) -> (tempfile::TempDir, RelayHandle, SocketAddr) {
     let (dir, env) = wok_compat::temp_db();
     let mut cfg = Config {
         db: dir.path().to_path_buf(),
         ..Default::default()
     };
-    cfg.relay.real_ip_header = "x-forwarded-for".into();
+    cfg.relay.real_ip_header = header.into();
     let handle = wok_relay::start(env, cfg).unwrap();
     // The command NIP-86 `blockip` submits.
     handle
@@ -50,9 +57,18 @@ async fn upgrade_status(addr: SocketAddr, forwarded: &[&str]) -> u16 {
 
 /// [`upgrade_status`], with the connection, still open.
 async fn upgrade(addr: SocketAddr, forwarded: &[&str]) -> (u16, tokio::net::TcpStream) {
+    upgrade_through(addr, "X-Forwarded-For", forwarded).await
+}
+
+/// [`upgrade`], with one `header` line per entry of `forwarded`.
+async fn upgrade_through(
+    addr: SocketAddr,
+    header: &str,
+    forwarded: &[&str],
+) -> (u16, tokio::net::TcpStream) {
     let lines: String = forwarded
         .iter()
-        .map(|value| format!("X-Forwarded-For: {value}\r\n"))
+        .map(|value| format!("{header}: {value}\r\n"))
         .collect();
     let request = format!(
         "GET / HTTP/1.1\r\nHost: localhost\r\n{lines}Upgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -121,6 +137,45 @@ async fn an_unparsed_last_entry_leaves_the_connecting_address_and_is_counted() {
     // The connecting address, 127.0.0.1, is not blocked.
     assert_eq!(
         upgrade_status(addr, &[&format!("for={BLOCKED}")]).await,
+        101
+    );
+    let metrics = handle.metrics.render();
+    assert!(
+        metrics.contains("\nwok_real_ip_header_unparsed_total 1\n"),
+        "{metrics}"
+    );
+}
+
+/// A proxy that writes RFC 7239 `Forwarded`: it replaces the header,
+/// appends its element to the client's own, or adds a line after the
+/// client's. Whatever the client sent ahead, even an unterminated quoted
+/// string, the proxy's element names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_client_is_refused_behind_a_forwarded_proxy() {
+    let (_dir, _handle, addr) = start_behind("forwarded").await;
+    let element = format!("for=\"{BLOCKED}:4711\";proto=https");
+    for lines in [
+        vec![element.clone()],
+        vec![format!("for={CLAIMED}, {element}")],
+        vec![format!("for=\"{CLAIMED}, {element}")],
+        vec![format!("for={CLAIMED}"), format!("For={BLOCKED}")],
+    ] {
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(
+            upgrade_through(addr, "Forwarded", &lines).await.0,
+            429,
+            "a blocked client behind Forwarded: {lines:?} must be refused"
+        );
+    }
+}
+
+/// A `Forwarded` element that hides the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_obfuscated_forwarded_client_leaves_the_connecting_address_and_is_counted() {
+    let (_dir, handle, addr) = start_behind("forwarded").await;
+    let lines = [format!("for={BLOCKED}, for=_hidden")];
+    assert_eq!(
+        upgrade_through(addr, "Forwarded", &[&lines[0]]).await.0,
         101
     );
     let metrics = handle.metrics.render();

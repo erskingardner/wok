@@ -679,7 +679,7 @@ wok_ws::dispatch
 wok_ws::dispatch::{closure}
 wok_ws::dispatch::{closure}::{closure}
 wok_ws::empty
-wok_ws::forwarded_client
+wok_ws::forwarded::client
 wok_ws::frame::apply_mask
 wok_ws::frame::inflate_allowance
 wok_ws::frame::inflate_into

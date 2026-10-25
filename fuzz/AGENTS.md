@@ -1,6 +1,6 @@
 # fuzz/
 
-Separate cargo-fuzz workspace (`wok-fuzz`), not a member of the root workspace. Exercises untrusted ingress: JSON/events, WebSocket frames/compression (with and without context takeover, and the takeover history replayed after an idle release), Negentropy, and related parse paths.
+Separate cargo-fuzz workspace (`wok-fuzz`), not a member of the root workspace. Exercises untrusted ingress: JSON/events, client address headers (RFC 7239 `Forwarded` and address lists), WebSocket frames/compression (with and without context takeover, and the takeover history replayed after an idle release), Negentropy, and related parse paths.
 
 ## Layout
 

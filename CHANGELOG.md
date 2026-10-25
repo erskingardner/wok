@@ -109,6 +109,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     NIP-86 kind policy or as an AUTH event, before it is verified (#150). The
     author ban and `write_policy` still wait for the signature, so an
     unsigned event cannot ask whether a key is a member or banned.
+  - **EVENT** short of `relay.abuse.min_pow_difficulty`, counted from the id
+    it states, and a vanish request while NIP-62 is off or whose `relay` tags
+    do not name this relay, are refused before it is verified too (#165).
   - **The dashboard API and NIP-86** check a request's `Nostr`
     authorization before reading its body: the event's kind, content, time
     window and tags, then whether its signer may use the endpoint, and only

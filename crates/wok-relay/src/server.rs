@@ -2509,9 +2509,10 @@ fn ingest_event(
     dispatch: &mut Dispatch,
 ) {
     let claimed_kind = orig.get("kind").and_then(Value::as_u64);
-    if let Some(message) =
-        claimed_kind.and_then(|kind| kind_refusal(cfg, metrics, moderation, kind))
-    {
+    let refusal = claimed_kind
+        .and_then(|kind| kind_refusal(cfg, metrics, moderation, kind, &orig))
+        .or_else(|| pow_refusal(cfg, metrics, &orig));
+    if let Some(message) = refusal {
         let id = orig.get("id").and_then(Value::as_str).unwrap_or("?");
         conns.send(
             conn_id,
@@ -2618,44 +2619,9 @@ fn ingest_event(
         }
         grant
     };
-    if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
-        if !cfg.relay.nip62.enabled {
-            metrics.refused(Setting::Nip62Enabled);
-        }
-        conns.send(
-            conn_id,
-            RelayMessage::Ok {
-                event_id: id_hex,
-                accepted: false,
-                message: if cfg.relay.nip62.enabled {
-                    "blocked: vanish request not targeting this relay".into()
-                } else {
-                    "blocked: NIP-62 is disabled".into()
-                },
-            },
-            metrics,
-        );
-        return;
-    }
-
+    // The vanish request's relay tag and the proof of work were checked
+    // before the event was verified (`kind_refusal`, `pow_refusal`).
     if cfg.relay.abuse.enabled {
-        if leading_zero_bits(packed.id()) < cfg.relay.abuse.min_pow_difficulty as u16 {
-            metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
-            metrics.refused(Setting::MinPowDifficulty);
-            conns.send(
-                conn_id,
-                RelayMessage::Ok {
-                    event_id: id_hex,
-                    accepted: false,
-                    message: format!(
-                        "pow: difficulty {} required",
-                        cfg.relay.abuse.min_pow_difficulty
-                    ),
-                },
-                metrics,
-            );
-            return;
-        }
         // An event signed by a key that is not one of the connection's AUTHed
         // identities, such as a Marmot 445 from a fresh key per event or a
         // 1059 from a random one, is charged to the connection's first
@@ -2837,20 +2803,23 @@ fn check_author_auth(
     Err(refusal)
 }
 
-/// The refusal for an EVENT that its claimed kind alone decides, counted
-/// where it is decided: an AUTH event, a kind `accepted_kinds` or the NIP-86
-/// kind policy does not allow, or one nobody could read while AUTH is
-/// unusable ([`Config::unreadable_class`]). These gates run before the event
-/// is parsed and its signature verified: a kind refusal says nothing about
-/// who may publish, and on a relay that accepts few kinds most junk is
-/// refused without a verification. The author ban and the write policy wait
-/// for the signature, so an unsigned event cannot ask whether a key is a
-/// member or banned.
+/// The refusal for an EVENT that its claimed kind decides, with a vanish
+/// request's tags, counted where it is decided: an AUTH event, a kind `accepted_kinds` or the NIP-86
+/// kind policy does not allow, one nobody could read while AUTH is unusable
+/// ([`Config::unreadable_class`]), or a NIP-62 vanish request while NIP-62 is
+/// off or whose stated `relay` tags do not name this relay. These gates run
+/// before the event is parsed and its signature verified: a kind refusal
+/// says nothing about who may publish, and on a relay that accepts few kinds
+/// most junk is refused without a verification. The kind and tags are
+/// hashed into the id that verification then checks. The author ban and the
+/// write policy wait for the signature, so an unsigned event cannot ask
+/// whether a key is a member or banned.
 fn kind_refusal(
     cfg: &Config,
     metrics: &Metrics,
     moderation: &parking_lot::RwLock<ModerationSnapshot>,
     kind: u64,
+    event: &Value,
 ) -> Option<String> {
     // NIP-42: relays MUST exclude kind 22242 from broadcast. One sent as an
     // EVENT is neither stored nor delivered to any subscription.
@@ -2863,6 +2832,13 @@ fn kind_refusal(
         Some(Setting::AcceptedKinds)
     } else if !moderation.read().kind_allowed(kind) {
         None
+    } else if kind == VANISH_KIND {
+        if !cfg.relay.nip62.enabled {
+            metrics.refused(Setting::Nip62Enabled);
+            return Some("blocked: NIP-62 is disabled".into());
+        }
+        return (!cfg.vanish_policy().targets_this_relay_value(event))
+            .then(|| "blocked: vanish request not targeting this relay".into());
     } else {
         // A kind nobody could read is not stored, and is counted by its
         // read class.
@@ -2883,6 +2859,27 @@ fn kind_refusal(
     Some(format!(
         "restricted: kind {kind} is not allowed by this relay"
     ))
+}
+
+/// NIP-13 proof of work, counted from the id the event states, before that
+/// id is hashed and the signature verified: an id that does not match the
+/// event still fails verification afterwards. One that is not 64 lowercase
+/// hex digits is left to verification to refuse.
+fn pow_refusal(cfg: &Config, metrics: &Metrics, event: &Value) -> Option<String> {
+    let required = cfg.relay.abuse.min_pow_difficulty;
+    if !cfg.relay.abuse.enabled || required == 0 {
+        return None;
+    }
+    let id = event.get("id").and_then(Value::as_str)?;
+    let id = wok_event::from_lower_hex_exact(id)
+        .ok()
+        .filter(|id| id.len() == 32)?;
+    if leading_zero_bits(&id) >= u16::from(required) {
+        return None;
+    }
+    metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
+    metrics.refused(Setting::MinPowDifficulty);
+    Some(format!("pow: difficulty {required} required"))
 }
 
 fn ingest_auth(
@@ -5613,6 +5610,78 @@ mod tests {
             1
         );
         handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stated_pow_and_vanish_targets_are_refused_before_verification() {
+        // Each refusal depends only on what the event states, so a forged
+        // event gets it rather than the signature's.
+        let forged = |ev: Value| {
+            let mut ev = sign_event(ev);
+            ev["sig"] = json!("00".repeat(64));
+            ev
+        };
+        let vanish = |relay: &str| {
+            json!({
+                "created_at": now_secs(), "kind": VANISH_KIND,
+                "tags": [["relay", relay]], "content": ""
+            })
+        };
+        // An id with the difficulty that does not match its event is still
+        // refused by verification.
+        let mut unmatched = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "zero id"
+        }));
+        unmatched["id"] = json!("00".repeat(32));
+        // (min_pow_difficulty, NIP-62 on, event, reply)
+        let cases = [
+            (
+                255,
+                true,
+                forged(json!({
+                    "created_at": now_secs(), "kind": 1, "tags": [], "content": "no-pow"
+                })),
+                "pow: difficulty 255 required",
+            ),
+            (255, true, unmatched, "invalid: "),
+            (
+                0,
+                true,
+                forged(vanish("wss://other.example.com")),
+                "blocked: vanish request not targeting this relay",
+            ),
+            (
+                0,
+                false,
+                forged(vanish("ALL_RELAYS")),
+                "blocked: NIP-62 is disabled",
+            ),
+        ];
+        for (min_pow, nip62, event, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut cfg = Config::default();
+            cfg.db = dir.path().to_path_buf();
+            cfg.relay.auth.enabled = false;
+            cfg.relay.abuse.min_pow_difficulty = min_pow;
+            cfg.relay.nip62.enabled = nip62;
+            cfg.relay.nip62.service_url = "wss://relay.example.com".into();
+            let handle = start(env, cfg).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+            let conn = handle.next_conn_id();
+            handle.register(conn, Outbound::new(tx, 0)).await;
+            handle
+                .client_message(
+                    conn,
+                    TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    json!(["EVENT", event]).to_string(),
+                )
+                .await;
+            let response = recv_outbound(&mut rx).await;
+            assert!(response.contains(expected), "{expected}: {response}");
+            handle.request_shutdown();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

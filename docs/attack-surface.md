@@ -143,6 +143,19 @@ same ingester. Before Wok reads a message's verb:
 | `NEG-MSG` | anonymous | `relay.negentropy_enabled` | The connection's NEG-MSG budget, then the address's REQ backstop; subscription id; the gate; payload size and hex decoding; the session lookup. |
 | `NEG-CLOSE` | anonymous | `relay.negentropy_enabled` | The gate first. It has no budget: the negentropy worker handles a run of them as one removal each, before the snapshot it takes for other messages. |
 
+Wok accepts one cost of NIP-62 by choice. On a relay that restricts who may
+publish (`relay.auth.write_policy` `authenticated` or `members`), anyone can
+still store a vanish request, one per fresh key. On a connection that has not
+authenticated, each new key gets a new per-author EVENT budget, and vanish
+requests are exempt from the per-author storage quota. They are limited only
+by the per-address EVENT budget (which a Unix connection skips), proof of
+work when `relay.abuse.min_pow_difficulty` is set, the global quota
+`relay.abuse.max_stored_events`, which is unlimited by default, and the disk
+reserve. NIP-62 requires a relay that restricts who
+can post to honor vanish requests whatever the user's status, and storing the
+request keeps its vanish marker across `wok import` and sync, which learn of
+a vanish only from the request itself.
+
 ## Management API
 
 NIP-86 requests are a `POST` to `/` with

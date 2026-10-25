@@ -1759,6 +1759,29 @@ impl Config {
         (previous.inbox_kinds_warning().as_ref() != Some(&now)).then_some(now)
     }
 
+    /// Warn when `relay.abuse.min_pow_difficulty` asks for proof of work
+    /// that the relay does not check: `relay.abuse.enabled = false` turns it
+    /// off with the rest of abuse protection.
+    pub fn pow_warning(&self) -> Option<String> {
+        let abuse = &self.relay.abuse;
+        (!abuse.enabled && abuse.min_pow_difficulty > 0).then(|| {
+            format!(
+                "relay.abuse.min_pow_difficulty = {} is ignored: relay.abuse.enabled = false \
+                 turns proof of work off with the rest of abuse protection, so events are \
+                 accepted whatever their difficulty and NIP-11 advertises 0. Set \
+                 relay.abuse.enabled = true to require it, or remove min_pow_difficulty",
+                abuse.min_pow_difficulty
+            )
+        })
+    }
+
+    /// The [`pow_warning`](Self::pow_warning) a reload from `previous` newly
+    /// causes, such as by turning abuse protection off.
+    fn pow_reload_warning(&self, previous: &Config) -> Option<String> {
+        let now = self.pow_warning()?;
+        (previous.pow_warning().as_ref() != Some(&now)).then_some(now)
+    }
+
     /// The configuration this config's preset gives: the built-in defaults
     /// with the preset's overlay, before any file.
     pub fn preset_defaults(&self) -> Config {
@@ -1766,11 +1789,11 @@ impl Config {
             .expect("every built-in preset parses")
     }
 
-    /// Warnings for every zero-valued guard that silently means "unlimited"
-    /// (all editable live through the dashboard). Surfaced on reload so a
-    /// single zero can't silently disarm a guard. A guard that the preset
-    /// itself turns off, such as `relay.abuse.max_stored_events` in the
-    /// public preset, is not warned about.
+    /// Warnings for every zero-valued guard that silently means "unlimited".
+    /// Surfaced at startup, on reload, on the dashboard and by `wok doctor`
+    /// so a single zero can't silently disarm a guard. A guard that the
+    /// preset itself turns off, such as `relay.abuse.max_stored_events` in
+    /// the public preset, is not warned about.
     pub fn zero_guard_warnings(&self) -> Vec<String> {
         self.zero_guards()
             .into_iter()
@@ -1949,6 +1972,21 @@ impl Config {
                 "relay.message_read_timeout_secs is zero — whole-message trickle guard disabled",
             ));
         }
+        if zeroed(
+            r.max_live_buffer_bytes as u64,
+            pr.max_live_buffer_bytes as u64,
+        ) {
+            warnings.push(SettingWarning::new(
+                &["relay.max_live_buffer_bytes"],
+                "relay.max_live_buffer_bytes is zero — live matches held for a subscription while its history is sent are unlimited",
+            ));
+        }
+        if zeroed(self.db_min_free_disk_bytes, preset.db_min_free_disk_bytes) {
+            warnings.push(SettingWarning::new(
+                &["database.min_free_disk_bytes"],
+                "database.min_free_disk_bytes is zero — writes are no longer refused before the disk fills",
+            ));
+        }
         warnings
     }
 
@@ -2047,10 +2085,10 @@ impl Config {
         for change in self.security_scope_changes(&new) {
             tracing::warn!("config reload: {change}");
         }
-        for warning in new.zero_guard_warnings() {
+        if let Some(warning) = new.inbox_kinds_reload_warning(self) {
             tracing::warn!("config reload: {warning}");
         }
-        if let Some(warning) = new.inbox_kinds_reload_warning(self) {
+        if let Some(warning) = new.pow_reload_warning(self) {
             tracing::warn!("config reload: {warning}");
         }
         for deprecation in &new.deprecations {
@@ -2080,6 +2118,11 @@ impl Config {
         self.observability.log_format = old.observability.log_format;
         self.observability.log_filter = old.observability.log_filter;
         self.observability.metrics_listen = old.observability.metrics_listen;
+        // Of the guards as they run: a restart-only zero, such as
+        // `database.min_free_disk_bytes`, is warned about once it applies.
+        for warning in self.zero_guard_warnings() {
+            tracing::warn!("config reload: {warning}");
+        }
         // The caps stay as the relay started, and the limits change now.
         for warning in self.message_cap_warnings() {
             tracing::warn!("config reload: {warning}");
@@ -3552,6 +3595,7 @@ negentropy_enabled = true
             "handshake_timeout_secs",
             "frame_read_timeout_secs",
             "message_read_timeout_secs",
+            "max_live_buffer_bytes",
         ] {
             let cfg = Config::parse_toml(&format!("[relay]\n{field} = 0\n")).unwrap();
             assert!(
@@ -3559,10 +3603,32 @@ negentropy_enabled = true
                 "{field} = 0 should warn"
             );
         }
+        let cfg = Config::parse_toml("[database]\nmin_free_disk_bytes = 0\n").unwrap();
+        assert!(warns_about(&cfg, "database.min_free_disk_bytes"));
         // With abuse protection disabled entirely, zero budgets are moot.
         let cfg = Config::parse_toml("[relay.abuse]\nenabled = false\nevent_rate_per_second = 0\n")
             .unwrap();
         assert!(cfg.zero_guard_warnings().is_empty());
+    }
+
+    #[test]
+    fn proof_of_work_ignored_with_abuse_protection_off_warns() {
+        let parse = |abuse: &str| Config::parse_toml(&format!("[relay.abuse]\n{abuse}\n")).unwrap();
+        assert_eq!(Config::default().pow_warning(), None);
+        let required = parse("min_pow_difficulty = 20");
+        assert_eq!(required.pow_warning(), None);
+        assert_eq!(parse("enabled = false").pow_warning(), None);
+        let ignored = parse("enabled = false\nmin_pow_difficulty = 20");
+        let warning = ignored.pow_warning().unwrap();
+        assert!(
+            warning.starts_with("relay.abuse.min_pow_difficulty = 20 is ignored"),
+            "{warning}"
+        );
+        // A reload names it when it turns abuse protection off under a
+        // difficulty, and not again while nothing about it changes.
+        assert_eq!(ignored.pow_reload_warning(&required), Some(warning));
+        assert_eq!(ignored.pow_reload_warning(&ignored), None);
+        assert_eq!(required.pow_reload_warning(&ignored), None);
     }
 
     #[test]

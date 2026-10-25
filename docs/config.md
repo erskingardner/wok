@@ -40,10 +40,13 @@ access settings and the client address header read-only, so a remote save
 cannot lock anyone out or move a trust boundary. Restart settings are
 file-only too.
 
-On reload, the relay logs a warning for each guard the file sets to zero,
-which turns it off, while its preset does not; the dashboard shows the same
-warning beside the setting. A guard the preset itself turns off, such as
-`max_stored_events` in `public`, is not warned about. Each refusal a setting
+At startup and on reload, the relay logs a warning for each guard the file
+sets to zero, which turns it off, while its preset does not; the dashboard
+shows the same warning beside the setting, and `wok doctor` reports it in
+its `zero-guards` check. A restart setting, such as
+`database.min_free_disk_bytes`, is warned about once it applies. A guard the
+preset itself turns off, such as `max_stored_events` in `public`, is not
+warned about. Each refusal a setting
 makes is counted by `wok_refusals_total{setting="<key>"}`; see
 [Refusals by setting](observability.md#refusals-by-setting).
 
@@ -494,7 +497,7 @@ counted under its `_burst` key.
 
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
-| `relay.abuse.enabled` | `true` | Turns every budget here, the storage quotas, the query work ceiling and proof of work on or off. | Off: none of them apply. | — |
+| `relay.abuse.enabled` | `true` | Turns every budget here, the storage quotas, the query work ceiling and proof of work on or off. | Off: none of them apply. A `min_pow_difficulty` above 0 is then ignored, which the relay warns about at startup and on reload, and `wok doctor` in its `abuse-limits` check. | — |
 | `relay.abuse.per_connection.req_rate_per_second` | `20` | Scan CPU and monitor churn from one connection: REQs, REQs that replace a subscription, and NEG-OPENs. | Apps lose subscriptions at startup. | — |
 | `relay.abuse.per_connection.req_burst` | `100` | The same, at once. A client's startup burst of about 60 REQs fits. | As above. | — |
 | `relay.abuse.per_connection.neg_msg_rate_per_second` | `50` | Sync worker time: NEG-MSG rounds of sessions already admitted by their NEG-OPEN. | Clients that sync many groups or inboxes at startup are cut off. | — |

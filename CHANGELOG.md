@@ -52,6 +52,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     writer, so one queued before a reload made AUTH unusable is refused too.
     Before, it was stored and every read of it refused. NIP-62 vanish
     requests are still accepted whatever their class.
+- A guard the file sets to zero, turning it off where its preset keeps it,
+  is warned about when the relay starts and by `wok doctor` in a new
+  `zero-guards` check, not only on reload and on the dashboard (#164). A
+  relay started with `relay.abuse.max_query_work = 0` or
+  `relay.handshake_timeout_secs = 0` logged nothing.
+  `relay.max_live_buffer_bytes` and `database.min_free_disk_bytes` are now
+  guarded too; the second, a restart setting, is warned about once it
+  applies. A
+  `relay.abuse.min_pow_difficulty` above 0 under `relay.abuse.enabled =
+  false`, which ignores it, is warned about at startup, on the reload that
+  causes it, and in the `abuse-limits` doctor check.
 - The writer checks NIP-70 protected events and `relay.auth.owner_only_kinds`
   again under its own configuration before it stores or broadcasts them, as
   it does `accepted_kinds` and the write policy. An event queued before a

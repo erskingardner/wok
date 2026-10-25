@@ -27,11 +27,14 @@
 ## EVENT owner-only app data
 < ["OK","<h5>",false,"auth-required: kind 30078 is accepted only from its author"]
 
+## EVENT a gift wrap to the author
+< ["OK","<h6>",true,""]
+
 ## EVENT dated an hour ahead
-< ["OK","<h6>",false,"invalid: created_at too late"]
+< ["OK","<h7>",false,"invalid: created_at too late"]
 
 ## EVENT a vanish request for another relay
-< ["OK","<h7>",false,"blocked: vanish request not targeting this relay"]
+< ["OK","<h8>",false,"blocked: vanish request not targeting this relay"]
 
 ## REQ the author's notes
 < ["CLOSED","notes","auth-required: this relay serves only members"]
@@ -70,18 +73,19 @@
 < ["NOTICE","ERROR: bad msg: unknown cmd"]
 
 ## AUTH with the wrong challenge
-< ["OK","<h8>",false,"error: challenge string mismatch"]
+< ["OK","<h9>",false,"error: challenge string mismatch"]
 
 ## AUTH with a forged signature
-< ["OK","<h9>",false,"invalid: bad signature"]
+< ["OK","<h10>",false,"invalid: bad signature"]
 
 ## AUTH with the wrong challenge and a forged signature
-< ["OK","<h8>",false,"error: challenge string mismatch"]
+< ["OK","<h9>",false,"error: challenge string mismatch"]
 
 ## AUTH as the author
-< ["OK","<h9>",true,"successfully authenticated"]
+< ["OK","<h10>",true,"successfully authenticated"]
 
 ## REQ only gift wraps, after AUTH
+< ["EVENT","wraps-authed",{"content":"","created_at":"<t+7>","id":"<h6>","kind":1059,"pubkey":"<h11>","sig":"<h12>","tags":[["p","<h13>"]]}]
 < ["EOSE","wraps-authed",["finish"]]
 
 ## HTTP GET / for NIP-11

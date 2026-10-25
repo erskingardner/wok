@@ -1034,6 +1034,8 @@ fn setting_for(reason: &str) -> &'static str {
         "relay.abuse.count_rate_per_second / count_burst"
     } else if r.contains("count budget") {
         "relay.abuse.per_connection.count_rate_per_second / count_burst"
+    } else if r.contains("too many connections from this address") {
+        "relay.abuse.max_connections_per_address"
     } else if r.contains("connection budget") || r.contains("http 429") {
         "relay.abuse.connection_rate_per_second / connection_burst"
     } else if r.contains("invalid messages") {
@@ -2868,6 +2870,10 @@ fn effective_limits(cfg: &wok_relay::Config) -> BTreeMap<String, String> {
             "relay.abuse.connection_rate_per_second / connection_burst",
             format!("{} / {}", a.connection_rate_per_second, a.connection_burst),
         ),
+        (
+            "relay.abuse.max_connections_per_address",
+            a.max_connections_per_address.to_string(),
+        ),
         ("relay.abuse.max_query_work", a.max_query_work.to_string()),
         (
             "relay.abuse.max_concurrent_historical_queries",
@@ -3705,6 +3711,10 @@ mod tests {
             (
                 "rate-limited: connection budget exhausted",
                 "relay.abuse.connection_rate_per_second / connection_burst",
+            ),
+            (
+                "rate-limited: too many connections from this address",
+                "relay.abuse.max_connections_per_address",
             ),
             (
                 "auth-required: requested filter requires authentication",

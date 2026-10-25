@@ -8,7 +8,8 @@
 # Select it with `preset = "marmot"`. It overlays the public preset, so every
 # setting not listed here keeps its public value; docs/config.md documents
 # each. The relay refuses to start without relay.auth.service_url, because
-# recipients read their gift wraps only after NIP-42 AUTH.
+# recipients read their gift wraps only after NIP-42 AUTH, and unless kinds
+# 1059 and 21059 stay recipient-only.
 #
 # Reasons for each value (https://github.com/erskingardner/wok/issues/97,
 # section 4.2; Marmot spec a717f22, MDK 2ff9c142):

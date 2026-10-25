@@ -503,7 +503,12 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         wok = env!("CARGO_PKG_VERSION"),
         "starting relay"
     );
-    if let Some(warning) = cfg.auth_configuration_warning() {
+    let warnings = [
+        cfg.auth_configuration_warning(),
+        cfg.read_class_warning(),
+        cfg.inbox_kinds_warning(),
+    ];
+    for warning in warnings.into_iter().flatten() {
         tracing::warn!("{warning}");
     }
     for deprecation in &cfg.deprecations {

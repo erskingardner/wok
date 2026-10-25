@@ -295,6 +295,28 @@ pub(super) fn run_writer(
                             );
                             continue;
                         }
+                        // What nobody could read, as the writer's
+                        // configuration has it: a reload may have made AUTH
+                        // unusable since the ingester's check.
+                        if let Some(class) = cfg_snap.unreadable_class(packed_view.kind()) {
+                            if let Some(setting) = Setting::of_read_class(class) {
+                                metrics.refused(setting);
+                            }
+                            conns.send(
+                                conn_id,
+                                RelayMessage::Ok {
+                                    event_id: to_hex(packed_view.id()),
+                                    accepted: false,
+                                    message: format!(
+                                        "restricted: kind {} is read only after AUTH, which \
+                                         this relay does not offer",
+                                        packed_view.kind()
+                                    ),
+                                },
+                                &metrics,
+                            );
+                            continue;
+                        }
                     }
                     let is_live_only = cfg_snap.events.ephemeral_persistence
                         == EphemeralPersistence::LiveOnly
@@ -1072,10 +1094,12 @@ mod tests {
     #[test]
     fn backfill_steps_are_bounded_and_interleave_with_writes() {
         let (dir, env) = unindexed_database(50);
-        let config = Config {
+        let mut config = Config {
             db: dir.path().to_path_buf(),
             ..Config::default()
         };
+        // The queued gift wrap is stored only while someone could read it.
+        config.relay.auth.service_url = "wss://relay.example.com".into();
         let metrics = Arc::new(Metrics::default());
         // The publication is queued before the writer starts, and the channel
         // closes behind it.

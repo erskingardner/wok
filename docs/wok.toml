@@ -29,7 +29,7 @@ preset = "public"
 [relay.auth]
 # The relay's public URL, exactly as clients open it: NIP-42 AUTH events must
 # name it. Until it is set, AUTH is unavailable, so DMs and gift wraps cannot
-# be read. Set it before the first start.
+# be read, and the relay refuses them. Set it before the first start.
 # service_url = "wss://relay.example.com"
 
 [relay.info]

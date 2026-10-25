@@ -5,6 +5,7 @@ use crate::source::TransportSource;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,9 +139,71 @@ struct State {
     checks: u64,
 }
 
+/// The WebSocket connections each address holds open.
+#[derive(Debug, Default)]
+struct OpenConnections {
+    /// By the address each connection came from.
+    by_ip: HashMap<IpAddr, u32>,
+    /// The same, summed by [`Principal`] under `ipv6_prefix_len`. The prefix
+    /// reloads live, so this is rebuilt from `by_ip` when it changes, and the
+    /// connections already open count under the new key.
+    by_principal: HashMap<Principal, u32>,
+    ipv6_prefix_len: u8,
+}
+
+impl OpenConnections {
+    fn rekey(&mut self, ipv6_prefix_len: u8) {
+        if self.ipv6_prefix_len == ipv6_prefix_len {
+            return;
+        }
+        self.ipv6_prefix_len = ipv6_prefix_len;
+        self.by_principal.clear();
+        for (&ip, &count) in &self.by_ip {
+            *self
+                .by_principal
+                .entry(Principal::address(ip, ipv6_prefix_len))
+                .or_insert(0) += count;
+        }
+    }
+
+    fn release(&mut self, ip: IpAddr) {
+        decrement(&mut self.by_ip, &ip);
+        decrement(
+            &mut self.by_principal,
+            &Principal::address(ip, self.ipv6_prefix_len),
+        );
+    }
+}
+
+/// Take one from `key`'s count, removing it at zero.
+fn decrement<K: std::hash::Hash + Eq>(counts: &mut HashMap<K, u32>, key: &K) {
+    if let Some(count) = counts.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(key);
+        }
+    }
+}
+
+/// One connection counted against its address's
+/// `relay.abuse.max_connections_per_address` until it drops.
+#[derive(Debug)]
+pub struct ConnectionSlot {
+    held: Option<(Arc<Mutex<OpenConnections>>, IpAddr)>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        if let Some((open, ip)) = self.held.take() {
+            open.lock().release(ip);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AbuseController {
     state: Mutex<State>,
+    open: Arc<Mutex<OpenConnections>>,
 }
 
 impl AbuseController {
@@ -170,6 +233,40 @@ impl AbuseController {
         };
         let (rate, burst) = spec(kind, cfg);
         self.admit(principal, kind, rate, burst)
+    }
+
+    /// Count a connection from `source` until the returned slot drops, or
+    /// `None`, counting nothing, when its address already holds
+    /// `max_connections_per_address` of them. Connections are counted while
+    /// the cap is off too, so turning it on counts those already open.
+    /// Unix-socket connections carry no address and are not counted.
+    pub fn hold_connection(
+        &self,
+        source: &TransportSource,
+        cfg: &AbuseConfig,
+    ) -> Option<ConnectionSlot> {
+        let TransportSource::Ip(ip) = source else {
+            return Some(ConnectionSlot { held: None });
+        };
+        let cap = if cfg.enabled {
+            cfg.max_connections_per_address
+        } else {
+            0
+        };
+        let mut open = self.open.lock();
+        open.rekey(cfg.ipv6_prefix_len);
+        let count = open
+            .by_principal
+            .entry(Principal::address(*ip, cfg.ipv6_prefix_len))
+            .or_insert(0);
+        if cap != 0 && *count >= cap {
+            return None;
+        }
+        *count += 1;
+        *open.by_ip.entry(*ip).or_insert(0) += 1;
+        Some(ConnectionSlot {
+            held: Some((self.open.clone(), *ip)),
+        })
     }
 
     /// Charge `request` to its connection's own budget, which is
@@ -312,6 +409,110 @@ mod tests {
 
     fn source(ip: &str) -> TransportSource {
         TransportSource::ip_address(ip.parse().unwrap())
+    }
+
+    #[test]
+    fn an_address_holds_at_most_its_cap_of_connections() {
+        let mut cfg = crate::Config::default().relay.abuse;
+        cfg.max_connections_per_address = 2;
+        let limiter = AbuseController::default();
+        let first = limiter.hold_connection(&source("192.0.2.1"), &cfg);
+        let second = limiter.hold_connection(&source("192.0.2.1"), &cfg);
+        assert!(first.is_some() && second.is_some());
+        assert!(limiter
+            .hold_connection(&source("192.0.2.1"), &cfg)
+            .is_none());
+        // Another address, and the other end of the same /64, are keyed
+        // like every per-address budget.
+        assert!(limiter
+            .hold_connection(&source("192.0.2.2"), &cfg)
+            .is_some());
+        let v6 = [
+            limiter.hold_connection(&source("2001:db8:1:1::1"), &cfg),
+            limiter.hold_connection(&source("2001:db8:1:1:ffff::2"), &cfg),
+        ];
+        assert!(v6.iter().all(Option::is_some));
+        assert!(limiter
+            .hold_connection(&source("2001:db8:1:1::3"), &cfg)
+            .is_none());
+        assert!(limiter
+            .hold_connection(&source("2001:db8:1:2::1"), &cfg)
+            .is_some());
+        // A connection that ends gives its place back.
+        drop(first);
+        let third = limiter.hold_connection(&source("192.0.2.1"), &cfg);
+        assert!(third.is_some());
+        drop((second, third));
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let open = limiter.open.lock();
+        assert!(!open.by_ip.contains_key(&ip));
+        assert!(!open
+            .by_principal
+            .contains_key(&Principal::address(ip, cfg.ipv6_prefix_len)));
+        drop(open);
+        // Unix sockets are not counted.
+        cfg.max_connections_per_address = 1;
+        let unix: Vec<_> = (0..3)
+            .map(|_| limiter.hold_connection(&TransportSource::Unix, &cfg))
+            .collect();
+        assert!(unix.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn connections_are_counted_while_the_cap_is_off() {
+        let mut cfg = crate::Config::default().relay.abuse;
+        cfg.max_connections_per_address = 0;
+        let limiter = AbuseController::default();
+        let open: Vec<_> = (0..3)
+            .map(|_| limiter.hold_connection(&source("192.0.2.1"), &cfg))
+            .collect();
+        assert!(open.iter().all(Option::is_some));
+        cfg.max_connections_per_address = 3;
+        cfg.enabled = false;
+        assert!(limiter
+            .hold_connection(&source("192.0.2.1"), &cfg)
+            .is_some());
+        cfg.enabled = true;
+        assert!(limiter
+            .hold_connection(&source("192.0.2.1"), &cfg)
+            .is_none());
+    }
+
+    #[test]
+    fn a_changed_ipv6_prefix_counts_the_connections_already_open() {
+        let mut cfg = crate::Config::default().relay.abuse;
+        cfg.max_connections_per_address = 2;
+        cfg.ipv6_prefix_len = 128;
+        let limiter = AbuseController::default();
+        let held = [
+            limiter.hold_connection(&source("2001:db8:1:1::1"), &cfg),
+            limiter.hold_connection(&source("2001:db8:1:1::1"), &cfg),
+        ];
+        let other = limiter.hold_connection(&source("2001:db8:1:1::2"), &cfg);
+        assert!(held.iter().chain([&other]).all(Option::is_some));
+        // Widened to the /64, the network already holds three.
+        cfg.ipv6_prefix_len = 64;
+        assert!(limiter
+            .hold_connection(&source("2001:db8:1:1::3"), &cfg)
+            .is_none());
+        // Narrowed again, each address counts its own.
+        cfg.ipv6_prefix_len = 128;
+        assert!(limiter
+            .hold_connection(&source("2001:db8:1:1::1"), &cfg)
+            .is_none());
+        let third = limiter.hold_connection(&source("2001:db8:1:1::3"), &cfg);
+        assert!(third.is_some());
+        // Slots taken under one prefix are given back under another.
+        cfg.ipv6_prefix_len = 64;
+        drop((held, third));
+        let fourth = limiter.hold_connection(&source("2001:db8:1:1::4"), &cfg);
+        assert!(fourth.is_some());
+        assert!(limiter
+            .hold_connection(&source("2001:db8:1:1::5"), &cfg)
+            .is_none());
+        drop((other, fourth));
+        let open = limiter.open.lock();
+        assert!(open.by_ip.is_empty() && open.by_principal.is_empty());
     }
 
     #[test]

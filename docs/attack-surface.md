@@ -67,7 +67,7 @@ WebSocket upgrade on any path but `/`.
 
 | Path | Party | Gate | What runs |
 | --- | --- | --- | --- |
-| `/` | anonymous | none | A WebSocket upgrade starts a [message](#messages) connection. A `POST` with `Content-Type: application/nostr+json+rpc` goes to the [management API](#management-api). Anything else gets the NIP-11 document when `Accept` names `application/nostr+json`, and the landing page otherwise. |
+| `/` | anonymous | none | A WebSocket upgrade starts a [message](#messages) connection, unless its address already holds `relay.abuse.max_connections_per_address` connections open, which gets 429. A `POST` with `Content-Type: application/nostr+json+rpc` goes to the [management API](#management-api). Anything else gets the NIP-11 document when `Accept` names `application/nostr+json`, and the landing page otherwise. |
 | `/metrics` | anonymous | `observability.metrics_enabled` and no `observability.metrics_listen` | Prometheus metrics, with `Access-Control-Allow-Origin: *`. With `metrics_listen` set they move to the [metrics listener](#metrics-listener). See [observability](observability.md). |
 | `/.well-known/nodeinfo` | anonymous | `relay.nodeinfo_enabled` | NodeInfo discovery. The link's host is the request's `Host` header. |
 | `/nodeinfo/2.1` | anonymous | `relay.nodeinfo_enabled` | The NodeInfo document. |
@@ -120,7 +120,7 @@ same ingester. Before Wok reads a message's verb:
 
 | Message | Party | Gate | Checks, in order |
 | --- | --- | --- | --- |
-| `EVENT` | anonymous | none | Per-address EVENT budget; by the kind the event states, an AUTH event (22242) is refused, and so is a kind `relay.auth.accepted_kinds` (kind 62 is exempt while NIP-62 is on) or the NIP-86 kind policy does not allow; event parse, size and tag limits, timestamp window, id and signature verification; event-id ban, author ban and `relay.auth.write_policy`; a NIP-62 vanish request must name this relay; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; a repost may not embed a protected event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH; an event already stored is answered `duplicate:` and goes no further. The writer then runs the write-policy plugin; only an event it accepts is checked again against stored vanish requests, the bans, the kind policy, `accepted_kinds` and the write policy, then against the storage quotas. A vanish request skips the author ban, the write policy, the plugin, the NIP-70 and owner-only checks and the stored vanish markers, but not the event-id ban, the kind policy, proof of work or the per-author budget. The author ban and the write policy wait for the signature, so an unsigned event cannot ask whether a key is a member or banned. |
+| `EVENT` | anonymous | none | Per-address EVENT budget; by the kind the event states, an AUTH event (22242) is refused, and so is a kind `relay.auth.accepted_kinds` (kind 62 is exempt while NIP-62 is on) or the NIP-86 kind policy does not allow, and, while AUTH is unusable, a recipient-only or authenticated kind, which nobody could read (kind 62 is exempt whatever its class); event parse, size and tag limits, timestamp window, id and signature verification; event-id ban, author ban and `relay.auth.write_policy`; a NIP-62 vanish request must name this relay; NIP-13 proof of work; the per-author budget, charged to the connection's first AUTHed identity when another key signed the event; a repost may not embed a protected event; NIP-70 protected events and `relay.auth.owner_only_kinds` need the author's AUTH; an event already stored is answered `duplicate:` and goes no further. The writer then runs the write-policy plugin; only an event it accepts is checked again against stored vanish requests, the bans, the kind policy, `accepted_kinds`, the write policy and, while AUTH is unusable, the recipient-only and authenticated kinds, before it stores or broadcasts it, then against the storage quotas. A vanish request skips the author ban, the write policy, the plugin, the NIP-70 and owner-only checks and the stored vanish markers, but not the event-id ban, the kind policy, proof of work or the per-author budget. The author ban and the write policy wait for the signature, so an unsigned event cannot ask whether a key is a member or banned. Storing an event updates each negentropy tree it matches, with NIP-77 on or off (see [Trees while NIP-77 is off](mesh-and-maintenance.md#trees-while-nip-77-is-off)). |
 | `AUTH` | anonymous | `relay.auth.enabled` and `relay.auth.service_url` | Per-address EVENT budget; the gate; the connection must hold a challenge; kind 22242, this connection's `challenge` and the relay's `relay` tag, as the event states them; event parse and signature verification. |
 | `REQ` | anonymous | none | The connection's REQ budget, which is larger once authenticated, then the address's REQ backstop (see [rates](config.md#rates)); a connection over its own budget does not spend the backstop; subscription id; `relay.auth.read_policy`; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
 | `COUNT` | anonymous | `relay.max_filter_limit_count` above 0 | As `REQ`, with the COUNT budgets, and a COUNT that may count restricted kinds must name only what the connection may read. The gate is checked after the filter count and bytes. |
@@ -324,9 +324,12 @@ or opens an entry point.
 `OPENS` records that `relay.abuse.enabled = false` turns
 `relay.abuse.min_pow_difficulty` off with the other abuse limits, as
 [config.md](config.md) says; that without AUTH, gift wraps and kind 30078
-are refused only because they are recipient-only and owner-only, so emptying
-those lists serves them; and that `observability.metrics_enabled` is what
-serves `/metrics` on the metrics listener.
+are refused, to write and to read, only because they are recipient-only and
+owner-only, so emptying those lists serves them; and that
+`observability.metrics_enabled` is what serves `/metrics` on the metrics
+listener. Emptying `recipient_only_kinds` over `public` is the operator's
+choice, which the relay warns about at startup and in `wok doctor`; the
+`marmot` preset refuses to start with it.
 
 ## Keeping this page current
 

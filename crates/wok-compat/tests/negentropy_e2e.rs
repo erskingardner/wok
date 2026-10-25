@@ -248,3 +248,72 @@ async fn refused_malformed_neg_msg_still_closes_its_session() {
     );
     handle.request_shutdown();
 }
+
+/// The writer keeps the negentropy trees current while NIP-77 is off, so
+/// turning it back on, which reloads live, answers at once from a tree that
+/// holds every event stored meanwhile. A tree that skipped them would need a
+/// reindex with the relay stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trees_stay_current_while_nip77_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+    let mut cfg = test_cfg(dir.path());
+    cfg.relay.negentropy_enabled = false;
+    let handle = wok_relay::start(env.clone(), cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(wok_ws::serve_listener(handle.clone(), listener));
+    let mut ws = ws_connect(addr).await;
+
+    for i in 0..3u64 {
+        let event = sign_event(json!({
+            "created_at": now_secs() - 100 + i,
+            "kind": 1,
+            "tags": [],
+            "content": format!("stored while NIP-77 is off {i}"),
+        }));
+        ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+            .await
+            .unwrap();
+        let id = event["id"].as_str().unwrap();
+        let msgs = recv_matching(&mut ws, id).await;
+        assert!(
+            msgs.iter()
+                .any(|t| t.contains(&format!(r#""OK","{id}",true"#))),
+            "{msgs:?}"
+        );
+    }
+
+    let mut client_store = wok_negentropy::Vector::new();
+    client_store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(client_store, 60_000).unwrap();
+    let init = hex::encode(client.initiate().unwrap());
+    let open = json!(["NEG-OPEN", "s", {}, init]).to_string();
+    ws.send(Message::Text(open.clone().into())).await.unwrap();
+    let msgs = recv_matching(&mut ws, "\"NEG-ERR\"").await;
+    assert!(
+        msgs.iter().any(|t| t.contains("negentropy is disabled")),
+        "{msgs:?}"
+    );
+    {
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(wok_negentropy::verify_tree(&txn, 1, "{}").unwrap(), 3);
+    }
+
+    handle.config.write().relay.negentropy_enabled = true;
+    ws.send(Message::Text(open.into())).await.unwrap();
+    let msgs = recv_matching(&mut ws, "\"NEG-").await;
+    let reply: serde_json::Value = serde_json::from_str(msgs.last().unwrap()).unwrap();
+    assert_eq!(reply[0], "NEG-MSG", "{msgs:?}");
+    let (mut have, mut need) = (Vec::new(), Vec::new());
+    client
+        .reconcile_with_ids(
+            &hex::decode(reply[2].as_str().unwrap()).unwrap(),
+            &mut have,
+            &mut need,
+        )
+        .unwrap();
+    assert_eq!((have.len(), need.len()), (0, 3));
+
+    handle.request_shutdown();
+}

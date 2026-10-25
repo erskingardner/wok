@@ -43,6 +43,8 @@ pub enum WsError {
     /// Part of a frame or message outlived its read deadline.
     Timeout(&'static str),
     Protocol(&'static str),
+    /// Text the peer sent is not UTF-8.
+    InvalidData(&'static str),
     MessageTooLarge,
     Inflate(String),
     Deflate(String),
@@ -54,7 +56,7 @@ impl WsError {
     pub fn close_code(&self) -> Option<u16> {
         match self {
             Self::Protocol(_) => Some(CLOSE_PROTOCOL_ERROR),
-            Self::Inflate(_) => Some(CLOSE_INVALID_DATA),
+            Self::InvalidData(_) | Self::Inflate(_) => Some(CLOSE_INVALID_DATA),
             Self::MessageTooLarge => Some(CLOSE_TOO_BIG),
             Self::Io(_) | Self::Eof | Self::Timeout(_) | Self::Deflate(_) => None,
         }
@@ -68,6 +70,7 @@ impl std::fmt::Display for WsError {
             Self::Eof => write!(f, "eof"),
             Self::Timeout(e) => write!(f, "{e}"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
+            Self::InvalidData(e) => write!(f, "invalid data: {e}"),
             Self::MessageTooLarge => write!(f, "message too large"),
             Self::Inflate(e) => write!(f, "inflate: {e}"),
             Self::Deflate(e) => write!(f, "deflate: {e}"),
@@ -541,7 +544,10 @@ impl WsParser {
         match frame.opcode {
             OP_PING => Ok(Some(WsEvent::Ping(frame.payload))),
             OP_PONG => Ok(Some(WsEvent::Pong(frame.payload))),
-            OP_CLOSE => Ok(Some(WsEvent::Close(frame.payload))),
+            OP_CLOSE => {
+                check_close(&frame.payload)?;
+                Ok(Some(WsEvent::Close(frame.payload)))
+            }
             OP_TEXT | OP_BINARY => {
                 if self.frag_opcode.is_some() {
                     return Err(WsError::Protocol("new message during fragmented message"));
@@ -606,6 +612,31 @@ impl WsParser {
             Ok(payload)
         }
     }
+}
+
+/// RFC 6455 §5.5.1: a Close frame's body is empty, or a status code followed
+/// by a UTF-8 reason. One the peer could not have sent fails the connection.
+fn check_close(payload: &[u8]) -> Result<(), WsError> {
+    match payload {
+        [] => Ok(()),
+        [_] => Err(WsError::Protocol("1-byte close body")),
+        [hi, lo, reason @ ..] => {
+            if !close_code_allowed(u16::from_be_bytes([*hi, *lo])) {
+                Err(WsError::Protocol("close status code not allowed"))
+            } else if std::str::from_utf8(reason).is_err() {
+                Err(WsError::InvalidData("close reason not UTF-8"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The status codes a Close frame may carry (RFC 6455 §7.4): those the IANA
+/// registry assigns, less 1004, which is reserved, and 1005, 1006 and 1015,
+/// which must not be sent; and 3000–4999, left to libraries and applications.
+fn close_code_allowed(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 /// How many times its compressed size a message may inflate to past
@@ -1247,6 +1278,44 @@ mod tests {
         ]);
     }
 
+    /// RFC 6455 §5.5.1, §7.4: a Close body that is one byte, or whose status
+    /// code may not be sent, fails the connection with 1002, and one whose
+    /// reason is not UTF-8 with 1007. The rest are passed on to be echoed.
+    #[test]
+    fn a_close_body_is_checked() {
+        let close = |body: &[u8]| {
+            let mut parser = WsParser::new(1 << 20, None);
+            parser
+                .feed(&masked_frame(true, false, OP_CLOSE, body))
+                .map(|mut events| match events.pop() {
+                    Some(WsEvent::Close(echo)) => echo,
+                    other => panic!("{other:?}"),
+                })
+                .map_err(|e| e.close_code().unwrap())
+        };
+        let with = |code: u16, reason: &[u8]| [&code.to_be_bytes()[..], reason].concat();
+        assert_eq!(close(b""), Ok(Vec::new()));
+        for code in [
+            1000, 1001, 1002, 1003, 1007, 1011, 1012, 1014, 3000, 3999, 4000, 4999,
+        ] {
+            assert_eq!(close(&with(code, b"")), Ok(with(code, b"")), "{code}");
+        }
+        assert_eq!(
+            close(&with(1000, "bye é".as_bytes())),
+            Ok(with(1000, "bye é".as_bytes()))
+        );
+        assert_eq!(close(b"\x03"), Err(CLOSE_PROTOCOL_ERROR));
+        for code in [0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, u16::MAX] {
+            assert_eq!(close(&with(code, b"")), Err(CLOSE_PROTOCOL_ERROR), "{code}");
+        }
+        assert_eq!(close(&with(1000, b"\xff")), Err(CLOSE_INVALID_DATA));
+        // A character cut short at the end of the frame.
+        assert_eq!(
+            close(&with(1000, &"é".as_bytes()[..1])),
+            Err(CLOSE_INVALID_DATA)
+        );
+    }
+
     /// A compressed message marks only its first frame, and is inflated once
     /// whole.
     #[test]
@@ -1270,6 +1339,7 @@ mod tests {
     #[test]
     fn only_protocol_breaches_have_a_close_code() {
         assert_eq!(WsError::Protocol("x").close_code(), Some(1002));
+        assert_eq!(WsError::InvalidData("x").close_code(), Some(1007));
         assert_eq!(WsError::Inflate("x".into()).close_code(), Some(1007));
         assert_eq!(WsError::MessageTooLarge.close_code(), Some(1009));
         assert_eq!(WsError::Eof.close_code(), None);

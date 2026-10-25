@@ -984,9 +984,10 @@ impl Config {
         if !header.is_empty() && !trusted.is_empty() {
             let ranges: Vec<String> = trusted.iter().map(ToString::to_string).collect();
             return Some(format!(
-                "relay.real_ip_header = {header:?} is trusted as each client's address on \
-                 connections from relay.trusted_proxies ({}); any other connection is its own \
-                 address. Wok skips the addresses in those ranges from the header's end, so \
+                "relay.real_ip_header = {header:?} is trusted as each client's address, by \
+                 the per-address budgets, NIP-86 IP blocks and the write-policy plugin's \
+                 sourceInfo, on connections from relay.trusted_proxies ({}); any other \
+                 connection is its own address. Wok skips the addresses in those ranges from the header's end, so \
                  they must hold only your proxies: a client with an address in them could name \
                  any address as its own",
                 ranges.join(", ")
@@ -995,11 +996,12 @@ impl Config {
         if !header.is_empty() {
             return Some(format!(
                 "relay.real_ip_header = {header:?} is trusted as each client's address by \
-                 every per-address budget. Set it only when every connection comes from a \
-                 proxy that writes the client's address as the header's last entry: a client \
-                 that reaches the relay directly could send a new address with each \
-                 connection to escape those budgets, or send another client's address to \
-                 spend that client's budgets. List the proxies in relay.trusted_proxies to make \
+                 every per-address budget, NIP-86 IP blocks and the write-policy plugin's \
+                 sourceInfo. Set it only when every connection comes from a proxy that writes \
+                 the client's address as the header's last entry: a client that reaches the \
+                 relay directly could send a new address with each connection to escape those \
+                 budgets and IP blocks, or send another client's address to spend that \
+                 client's budgets. List the proxies in relay.trusted_proxies to make \
                  any other connection its own address"
             ));
         }
@@ -1017,6 +1019,19 @@ impl Config {
              address",
             addrs.join(", ")
         ))
+    }
+
+    /// The [`real_ip_header_warning`](Self::real_ip_header_warning) a reload
+    /// from `previous` newly causes. Both settings are read for each
+    /// connection and request, so a reload changes whose address a client
+    /// is at once.
+    pub fn real_ip_header_reload_warning(
+        &self,
+        previous: &Config,
+        listening: &[SocketAddr],
+    ) -> Option<String> {
+        let now = self.real_ip_header_warning(listening)?;
+        (previous.real_ip_header_warning(listening).as_ref() != Some(&now)).then_some(now)
     }
 
     /// Who may read each kind: `relay.auth`'s read classes.
@@ -1486,9 +1501,9 @@ impl Config {
     }
 
     /// Describe changes to restart-safe security scopes (write-policy plugin,
-    /// filter validation, abuse budgets, NIP-42 read restriction scope,
-    /// NIP-62 vanish scope, negentropy enable switch) between this config and
-    /// a reload candidate. TOML loading merges the supplied file over its
+    /// client address header, filter validation, abuse budgets, NIP-42 read
+    /// restriction scope, NIP-62 vanish scope, negentropy enable switch,
+    /// admin settings) between this config and a reload candidate. TOML loading merges the supplied file over its
     /// preset and the factory defaults, so a valid-but-incomplete file (or a
     /// changed `preset`) silently changes omitted sections — these diffs are
     /// warn-logged on reload so the change is at least visible in the logs.
@@ -1677,6 +1692,50 @@ impl Config {
             changes.push(format!(
                 "relay.search_enabled changed: {} -> {}",
                 self.relay.search_enabled, new.relay.search_enabled,
+            ));
+        }
+        // Who may manage the relay, and how a request proves it.
+        let (prev_admin, new_admin) = (&self.admin, &new.admin);
+        if prev_admin.enabled != new_admin.enabled {
+            changes.push(format!(
+                "admin.enabled changed: {} -> {}",
+                prev_admin.enabled, new_admin.enabled,
+            ));
+        }
+        if prev_admin.public_url != new_admin.public_url {
+            changes.push(format!(
+                "admin.public_url changed: {:?} -> {:?}",
+                prev_admin.public_url, new_admin.public_url,
+            ));
+        }
+        let missing = |from: &[String], wanted: &[String]| -> Vec<String> {
+            from.iter()
+                .filter(|key| !wanted.contains(key))
+                .cloned()
+                .collect()
+        };
+        let added = missing(&new_admin.pubkeys, &prev_admin.pubkeys);
+        let removed = missing(&prev_admin.pubkeys, &new_admin.pubkeys);
+        if !added.is_empty() || !removed.is_empty() {
+            changes.push(format!(
+                "admin.pubkeys changed: added {added:?}, removed {removed:?}{}",
+                if added.is_empty() {
+                    ""
+                } else {
+                    " (each added key is an admin while admin.enabled is on)"
+                },
+            ));
+        }
+        if prev_admin.allow_config_writes != new_admin.allow_config_writes {
+            changes.push(format!(
+                "admin.allow_config_writes changed: {} -> {}",
+                prev_admin.allow_config_writes, new_admin.allow_config_writes,
+            ));
+        }
+        if prev_admin.auth_window_secs != new_admin.auth_window_secs {
+            changes.push(format!(
+                "admin.auth_window_secs changed: {} -> {}",
+                prev_admin.auth_window_secs, new_admin.auth_window_secs,
             ));
         }
         changes
@@ -3404,13 +3463,93 @@ negentropy_enabled = true
             assert!(
                 warning.ends_with(
                     "could send a new address with each connection to escape those \
-                     budgets, or send another client's address to spend that client's budgets. \
-                     List the proxies in relay.trusted_proxies to make any other connection its \
-                     own address"
+                     budgets and IP blocks, or send another client's address to spend that \
+                     client's budgets. List the proxies in relay.trusted_proxies to make any \
+                     other connection its own address"
+                ),
+                "{warning}"
+            );
+            assert!(
+                warning.contains(
+                    "every per-address budget, NIP-86 IP blocks and the write-policy plugin's \
+                     sourceInfo"
                 ),
                 "{warning}"
             );
         }
+    }
+
+    #[test]
+    fn a_reload_warns_about_the_client_address_header_it_sets() {
+        let listening: Vec<SocketAddr> = vec!["0.0.0.0:7777".parse().unwrap()];
+        let direct = Config::default();
+        let mut header = direct.clone();
+        header.relay.real_ip_header = "x-forwarded-for".into();
+        // The header is read on each request, so setting it is warned about
+        // as the reload makes it, naming who trusts it.
+        let warning = header
+            .real_ip_header_reload_warning(&direct, &listening)
+            .unwrap();
+        assert!(warning.contains("NIP-86 IP blocks"), "{warning}");
+        assert_eq!(
+            header.real_ip_header_reload_warning(&header, &listening),
+            None
+        );
+        assert_eq!(
+            direct.real_ip_header_reload_warning(&header, &listening),
+            None
+        );
+        // Narrowing it to listed proxies changes the warning, so that is
+        // named too.
+        let mut proxied = header.clone();
+        proxied.relay.trusted_proxies = vec!["10.0.0.0/8".parse().unwrap()];
+        let warning = proxied
+            .real_ip_header_reload_warning(&header, &listening)
+            .unwrap();
+        assert!(warning.contains("10.0.0.0/8"), "{warning}");
+    }
+
+    #[test]
+    fn security_scope_changes_flag_the_admin_settings() {
+        let key = |n: u8| hex::encode([n; 32]);
+        let base = Config::parse_toml(&format!(
+            "[admin]\nenabled = true\npublic_url = \"https://relay.example\"\npubkeys = [\"{}\"]\n",
+            key(1)
+        ))
+        .unwrap();
+        assert!(base.security_scope_changes(&base.clone()).is_empty());
+        let mut changed = base.clone();
+        changed.admin.enabled = false;
+        changed.admin.public_url = "https://other.example".into();
+        changed.admin.pubkeys = vec![key(2)];
+        changed.admin.allow_config_writes = true;
+        changed.admin.auth_window_secs = 300;
+        assert_eq!(
+            base.security_scope_changes(&changed),
+            [
+                "admin.enabled changed: true -> false".to_string(),
+                "admin.public_url changed: \"https://relay.example\" -> \"https://other.example\""
+                    .to_string(),
+                format!(
+                    "admin.pubkeys changed: added [\"{}\"], removed [\"{}\"] (each added key \
+                     is an admin while admin.enabled is on)",
+                    key(2),
+                    key(1)
+                ),
+                "admin.allow_config_writes changed: false -> true".to_string(),
+                "admin.auth_window_secs changed: 60 -> 300".to_string(),
+            ]
+        );
+        // Removing a key names no grant.
+        let mut fewer = base.clone();
+        fewer.admin.pubkeys.clear();
+        assert_eq!(
+            base.security_scope_changes(&fewer),
+            [format!(
+                "admin.pubkeys changed: added [], removed [\"{}\"]",
+                key(1)
+            )]
+        );
     }
 
     #[test]
@@ -3581,8 +3720,9 @@ negentropy_enabled = true
         let warning = cfg.real_ip_header_warning(&listening).unwrap();
         assert!(
             warning.starts_with(
-                "relay.real_ip_header = \"x-forwarded-for\" is trusted as each client's address \
-                 on connections from relay.trusted_proxies (127.0.0.1, 192.0.2.0/24)"
+                "relay.real_ip_header = \"x-forwarded-for\" is trusted as each client's address, \
+                 by the per-address budgets, NIP-86 IP blocks and the write-policy plugin's \
+                 sourceInfo, on connections from relay.trusted_proxies (127.0.0.1, 192.0.2.0/24)"
             ),
             "{warning}"
         );

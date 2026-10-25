@@ -161,6 +161,8 @@ enum OutboundSendError {
 /// A connection's outbound queue and the gate in front of it.
 struct ConnEntry {
     out: Outbound,
+    /// The client's address, for NIP-86 `blockip` to close the connection.
+    ip: Option<std::net::IpAddr>,
     /// Held while a frame is queued for the connection, together with the
     /// gate check that admits it.
     state: Mutex<ConnState>,
@@ -229,14 +231,38 @@ impl ConnTable {
     }
 
     fn insert(&self, id: u64, out: Outbound) {
+        self.insert_from(id, out, None);
+    }
+
+    fn insert_from(&self, id: u64, out: Outbound, ip: Option<std::net::IpAddr>) {
         let entry = Arc::new(ConnEntry {
             out,
+            ip,
             state: Mutex::new(ConnState {
                 subs: SubGate::default(),
                 gone: false,
             }),
         });
         self.shard(id).write().insert(id, entry);
+    }
+
+    /// Close each connection whose address is in `blocked`: a block is
+    /// otherwise checked only when a connection opens. Returns how many it
+    /// closed.
+    fn kill_blocked(&self, blocked: &HashMap<String, String>) -> usize {
+        let mut closed = 0;
+        for shard in self.shards.iter() {
+            for entry in shard.read().values() {
+                if entry
+                    .ip
+                    .is_some_and(|ip| blocked.contains_key(&ip.to_string()))
+                {
+                    entry.out.kill();
+                    closed += 1;
+                }
+            }
+        }
+        closed
     }
 
     fn remove(&self, id: u64) {
@@ -481,12 +507,22 @@ pub struct RelayHandle {
     shutdown_notify: Arc<tokio::sync::Notify>,
     abuse: Arc<AbuseController>,
     config_path: Arc<parking_lot::RwLock<Option<std::path::PathBuf>>>,
+    bound: Arc<parking_lot::RwLock<BoundAddresses>>,
     writer_tx: Sender<WriterMsg>,
     threads: Arc<RelayThreads>,
     /// Each connection's share of the ingest queue, in bytes: the largest
     /// message a transport accepts, as configured at start. A message larger
     /// than the share after a reload takes all of it.
     inbound_share: usize,
+}
+
+/// The addresses the relay's listeners bound at startup, which a reload
+/// cannot change. The warnings a reload logs about who can reach the relay
+/// are checked against them.
+#[derive(Debug, Clone, Default)]
+pub struct BoundAddresses {
+    pub relay: Vec<std::net::SocketAddr>,
+    pub metrics: Option<std::net::SocketAddr>,
 }
 
 /// How long dropping the last `RelayHandle` waits for the relay threads.
@@ -1207,7 +1243,18 @@ impl RelayHandle {
     ) -> ConnectionGuard {
         let conn_id = self.next_conn_id();
         let gate = out.gate.clone();
-        self.conns.insert(conn_id, out);
+        let kill = out.killed();
+        self.conns.insert_from(conn_id, out, source.ip());
+        // A blockip that committed after this connection was admitted closed
+        // the connections in the table before it was there.
+        if source.ip().is_some_and(|ip| {
+            self.moderation
+                .read()
+                .blocked_ips
+                .contains_key(&ip.to_string())
+        }) {
+            kill.notify_one();
+        }
         self.metrics
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -1369,6 +1416,39 @@ impl RelayHandle {
     pub fn config_path(&self) -> Option<std::path::PathBuf> {
         self.config_path.read().clone()
     }
+
+    pub fn set_bound_addresses(&self, bound: BoundAddresses) {
+        *self.bound.write() = bound;
+    }
+
+    /// Install `new` as the running configuration, as the file watcher and
+    /// every dashboard or NIP-86 configuration save do, through
+    /// [`Config::apply_reload`]. Then log the warnings the change newly
+    /// causes that depend on the listeners or the moderation state, so a
+    /// save that installs a pending file edit before the watcher sees it
+    /// logs them too.
+    pub fn reload_config(&self, new: Config) -> Result<(), String> {
+        let (previous, now) = {
+            let mut cfg = self.config.write();
+            let previous = cfg.clone();
+            cfg.apply_reload(new)?;
+            (previous, cfg.clone())
+        };
+        let bound = self.bound.read().clone();
+        let warnings = [
+            now.metrics_reload_warning(&previous, &bound.relay, bound.metrics),
+            now.real_ip_header_reload_warning(&previous, &bound.relay),
+            crate::moderation::removed_admin_roles_warning(
+                &previous,
+                &now,
+                &self.moderation.read(),
+            ),
+        ];
+        for warning in warnings.into_iter().flatten() {
+            tracing::warn!("config reload: {warning}");
+        }
+        Ok(())
+    }
 }
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
@@ -1437,6 +1517,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         shutdown_notify: shutdown_notify.clone(),
         abuse: abuse.clone(),
         config_path: Arc::new(parking_lot::RwLock::new(None)),
+        bound: Arc::new(parking_lot::RwLock::new(BoundAddresses::default())),
         writer_tx: writer_tx.clone(),
         inbound_share,
         threads: Arc::new(RelayThreads {
@@ -2424,6 +2505,22 @@ fn handle_client(
         }
         ClientCommand::Count { sub_id, filters } => {
             metrics.client_count.fetch_add(1, Ordering::Relaxed);
+            // The gate is configuration alone, so it comes before the COUNT
+            // budgets and before the filters are sized.
+            if cfg.relay.max_filter_limit_count == 0 {
+                metrics.refused(Setting::MaxFilterLimitCount);
+                let reason = "blocked: bad req: COUNT disabled".to_string();
+                refuse_req(
+                    conns,
+                    metrics,
+                    dispatch,
+                    conn_id,
+                    Ns::Count,
+                    &sub_id,
+                    reason,
+                );
+                return;
+            }
             let request = (Request::Count, "COUNT");
             let admitted = admit_request(
                 cfg, metrics, abuse, budgets, auth, conn_id, &source, request,
@@ -2591,9 +2688,10 @@ fn ingest_event(
     dispatch: &mut Dispatch,
 ) {
     let claimed_kind = orig.get("kind").and_then(Value::as_u64);
-    if let Some(message) =
-        claimed_kind.and_then(|kind| kind_refusal(cfg, metrics, moderation, kind))
-    {
+    let refusal = claimed_kind
+        .and_then(|kind| kind_refusal(cfg, metrics, moderation, kind, &orig))
+        .or_else(|| pow_refusal(cfg, metrics, &orig));
+    if let Some(message) = refusal {
         let id = orig.get("id").and_then(Value::as_str).unwrap_or("?");
         conns.send(
             conn_id,
@@ -2700,44 +2798,9 @@ fn ingest_event(
         }
         grant
     };
-    if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
-        if !cfg.relay.nip62.enabled {
-            metrics.refused(Setting::Nip62Enabled);
-        }
-        conns.send(
-            conn_id,
-            RelayMessage::Ok {
-                event_id: id_hex,
-                accepted: false,
-                message: if cfg.relay.nip62.enabled {
-                    "blocked: vanish request not targeting this relay".into()
-                } else {
-                    "blocked: NIP-62 is disabled".into()
-                },
-            },
-            metrics,
-        );
-        return;
-    }
-
+    // The vanish request's relay tag and the proof of work were checked
+    // before the event was verified (`kind_refusal`, `pow_refusal`).
     if cfg.relay.abuse.enabled {
-        if leading_zero_bits(packed.id()) < cfg.relay.abuse.min_pow_difficulty as u16 {
-            metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
-            metrics.refused(Setting::MinPowDifficulty);
-            conns.send(
-                conn_id,
-                RelayMessage::Ok {
-                    event_id: id_hex,
-                    accepted: false,
-                    message: format!(
-                        "pow: difficulty {} required",
-                        cfg.relay.abuse.min_pow_difficulty
-                    ),
-                },
-                metrics,
-            );
-            return;
-        }
         // An event signed by a key that is not one of the connection's AUTHed
         // identities, such as a Marmot 445 from a fresh key per event or a
         // 1059 from a random one, is charged to the connection's first
@@ -2919,20 +2982,23 @@ fn check_author_auth(
     Err(refusal)
 }
 
-/// The refusal for an EVENT that its claimed kind alone decides, counted
-/// where it is decided: an AUTH event, a kind `accepted_kinds` or the NIP-86
-/// kind policy does not allow, or one nobody could read while AUTH is
-/// unusable ([`Config::unreadable_class`]). These gates run before the event
-/// is parsed and its signature verified: a kind refusal says nothing about
-/// who may publish, and on a relay that accepts few kinds most junk is
-/// refused without a verification. The author ban and the write policy wait
-/// for the signature, so an unsigned event cannot ask whether a key is a
-/// member or banned.
+/// The refusal for an EVENT that its claimed kind decides, with a vanish
+/// request's tags, counted where it is decided: an AUTH event, a kind `accepted_kinds` or the NIP-86
+/// kind policy does not allow, one nobody could read while AUTH is unusable
+/// ([`Config::unreadable_class`]), or a NIP-62 vanish request while NIP-62 is
+/// off or whose stated `relay` tags do not name this relay. These gates run
+/// before the event is parsed and its signature verified: a kind refusal
+/// says nothing about who may publish, and on a relay that accepts few kinds
+/// most junk is refused without a verification. The kind and tags are
+/// hashed into the id that verification then checks. The author ban and the
+/// write policy wait for the signature, so an unsigned event cannot ask
+/// whether a key is a member or banned.
 fn kind_refusal(
     cfg: &Config,
     metrics: &Metrics,
     moderation: &parking_lot::RwLock<ModerationSnapshot>,
     kind: u64,
+    event: &Value,
 ) -> Option<String> {
     // NIP-42: relays MUST exclude kind 22242 from broadcast. One sent as an
     // EVENT is neither stored nor delivered to any subscription.
@@ -2945,6 +3011,13 @@ fn kind_refusal(
         Some(Setting::AcceptedKinds)
     } else if !moderation.read().kind_allowed(kind) {
         None
+    } else if kind == VANISH_KIND {
+        if !cfg.relay.nip62.enabled {
+            metrics.refused(Setting::Nip62Enabled);
+            return Some("blocked: NIP-62 is disabled".into());
+        }
+        return (!cfg.vanish_policy().targets_this_relay_value(event))
+            .then(|| "blocked: vanish request not targeting this relay".into());
     } else {
         // A kind nobody could read is not stored, and is counted by its
         // read class.
@@ -2965,6 +3038,27 @@ fn kind_refusal(
     Some(format!(
         "restricted: kind {kind} is not allowed by this relay"
     ))
+}
+
+/// NIP-13 proof of work, counted from the id the event states, before that
+/// id is hashed and the signature verified: an id that does not match the
+/// event still fails verification afterwards. One that is not 64 lowercase
+/// hex digits is left to verification to refuse.
+fn pow_refusal(cfg: &Config, metrics: &Metrics, event: &Value) -> Option<String> {
+    let required = cfg.relay.abuse.min_pow_difficulty;
+    if !cfg.relay.abuse.enabled || required == 0 {
+        return None;
+    }
+    let id = event.get("id").and_then(Value::as_str)?;
+    let id = wok_event::from_lower_hex_exact(id)
+        .ok()
+        .filter(|id| id.len() == 32)?;
+    if leading_zero_bits(&id) >= u16::from(required) {
+        return None;
+    }
+    metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
+    metrics.refused(Setting::MinPowDifficulty);
+    Some(format!("pow: difficulty {required} required"))
 }
 
 fn ingest_auth(
@@ -3275,16 +3369,37 @@ fn admit_req(
             ),
         ));
     }
-    let max_limit = if count_only {
-        let m = cfg.relay.max_filter_limit_count + 1;
-        if m == 1 {
-            return Err(refuse(
-                Setting::MaxFilterLimitCount,
-                "blocked",
-                "COUNT disabled".into(),
+    // Pending and live subscriptions both count. Over a lowered cap an open
+    // id can still be replaced; new ids wait until the count drops.
+    if !count_only
+        && !conns.is_open(conn_id, Ns::Req, sid)
+        && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
+    {
+        metrics.refused(Setting::MaxSubsPerConnection);
+        return Err("blocked: too many concurrent REQs".into());
+    }
+    // Live filters stay in memory until closed, and a COUNT's until it is
+    // answered, which may wait for a scan slot, so each namespace's bytes are
+    // budgeted per connection. Like the subscription cap, a lowered budget
+    // still lets an open id be replaced by filters no larger than its own.
+    // Both need only the connection's state and the serialized size, so they
+    // come before the filters are parsed, validated and priced.
+    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
+    if filter_budget != 0 {
+        let ns = if count_only { Ns::Count } else { Ns::Req };
+        let (held, replaced) = conns.filter_bytes(conn_id, ns, sid);
+        if serialized_filter_bytes > replaced
+            && held - replaced + serialized_filter_bytes > filter_budget
+        {
+            metrics.refused(Setting::MaxFilterBytesPerConnection);
+            return Err(format!(
+                "blocked: this connection's filters exceed {filter_budget} bytes"
             ));
         }
-        m
+    }
+    // A disabled COUNT was refused before any of this (`handle_client`).
+    let max_limit = if count_only {
+        cfg.relay.max_filter_limit_count + 1
     } else {
         cfg.relay.max_filter_limit
     };
@@ -3355,32 +3470,6 @@ fn admit_req(
         };
         count_read_class(metrics, class);
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
-    }
-    // Pending and live subscriptions both count. Over a lowered cap an open
-    // id can still be replaced; new ids wait until the count drops.
-    if !count_only
-        && !conns.is_open(conn_id, Ns::Req, sid)
-        && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
-    {
-        metrics.refused(Setting::MaxSubsPerConnection);
-        return Err("blocked: too many concurrent REQs".into());
-    }
-    // Live filters stay in memory until closed, and a COUNT's until it is
-    // answered, which may wait for a scan slot, so each namespace's bytes are
-    // budgeted per connection. Like the subscription cap, a lowered budget
-    // still lets an open id be replaced by filters no larger than its own.
-    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
-    if filter_budget != 0 {
-        let ns = if count_only { Ns::Count } else { Ns::Req };
-        let (held, replaced) = conns.filter_bytes(conn_id, ns, sid);
-        if serialized_filter_bytes > replaced
-            && held - replaced + serialized_filter_bytes > filter_budget
-        {
-            metrics.refused(Setting::MaxFilterBytesPerConnection);
-            return Err(format!(
-                "blocked: this connection's filters exceed {filter_budget} bytes"
-            ));
-        }
     }
     Ok((
         Subscription::new(conn_id, sid.clone(), fg, count_only),
@@ -5747,6 +5836,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stated_pow_and_vanish_targets_are_refused_before_verification() {
+        // Each refusal depends only on what the event states, so a forged
+        // event gets it rather than the signature's.
+        let forged = |ev: Value| {
+            let mut ev = sign_event(ev);
+            ev["sig"] = json!("00".repeat(64));
+            ev
+        };
+        let vanish = |relay: &str| {
+            json!({
+                "created_at": now_secs(), "kind": VANISH_KIND,
+                "tags": [["relay", relay]], "content": ""
+            })
+        };
+        // An id with the difficulty that does not match its event is still
+        // refused by verification.
+        let mut unmatched = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "zero id"
+        }));
+        unmatched["id"] = json!("00".repeat(32));
+        // (min_pow_difficulty, NIP-62 on, event, reply)
+        let cases = [
+            (
+                255,
+                true,
+                forged(json!({
+                    "created_at": now_secs(), "kind": 1, "tags": [], "content": "no-pow"
+                })),
+                "pow: difficulty 255 required",
+            ),
+            (255, true, unmatched, "invalid: "),
+            (
+                0,
+                true,
+                forged(vanish("wss://other.example.com")),
+                "blocked: vanish request not targeting this relay",
+            ),
+            (
+                0,
+                false,
+                forged(vanish("ALL_RELAYS")),
+                "blocked: NIP-62 is disabled",
+            ),
+        ];
+        for (min_pow, nip62, event, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut cfg = Config::default();
+            cfg.db = dir.path().to_path_buf();
+            cfg.relay.auth.enabled = false;
+            cfg.relay.abuse.min_pow_difficulty = min_pow;
+            cfg.relay.nip62.enabled = nip62;
+            cfg.relay.nip62.service_url = "wss://relay.example.com".into();
+            let handle = start(env, cfg).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+            let conn = handle.next_conn_id();
+            handle.register(conn, Outbound::new(tx, 0)).await;
+            handle
+                .client_message(
+                    conn,
+                    TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    json!(["EVENT", event]).to_string(),
+                )
+                .await;
+            let response = recv_outbound(&mut rx).await;
+            assert!(response.contains(expected), "{expected}: {response}");
+            handle.request_shutdown();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restricted_writes_and_bans_cannot_veto_vanish_requests() {
         // NIP-62: relays that restrict who can post MUST honor vanish requests
         // regardless of the user's status. Losing allowlist membership or
@@ -6008,6 +6169,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blockip_closes_the_open_connections_from_its_address() {
+        // A block was checked only when a connection opened, so a blocked
+        // client's open WebSocket kept reading and publishing (#164).
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        let connect = |ip: &'static str| {
+            let handle = &handle;
+            async move {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+                let out = Outbound::new(tx, 0);
+                let killed = out.killed();
+                let source = TransportSource::ip_address(ip.parse().unwrap());
+                let conn = handle.register_connection(source, out).await;
+                (conn, rx, killed)
+            }
+        };
+        let closed = |killed: Arc<tokio::sync::Notify>, within: Duration| async move {
+            tokio::time::timeout(within, killed.notified())
+                .await
+                .is_ok()
+        };
+        let (_blocked, _rx, blocked) = connect("203.0.113.7").await;
+        let (_other, _rx2, other) = connect("203.0.113.8").await;
+        handle
+            .manage(ManagementCmd::BlockIp {
+                ip: "203.0.113.7".into(),
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+        // Told to close by the time the block is acknowledged.
+        assert!(closed(blocked, Duration::ZERO).await);
+        assert!(!closed(other, Duration::from_millis(100)).await);
+        // One admitted before the block and registered after it is closed
+        // as it registers.
+        let (_late, _rx3, late) = connect("203.0.113.7").await;
+        assert!(closed(late, Duration::ZERO).await);
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_reload_applies_the_write_policy_timeout() {
         // The writer captured the timeout at startup, so lowering it had no
         // effect until a restart (#54).
@@ -6190,6 +6391,59 @@ mod tests {
             handle.client_message(conn, local_source(), req(sub)).await;
             assert!(recv_outbound(&mut rx).await.contains("EOSE"));
         }
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_refusals_come_before_the_filters_are_read() {
+        // A disabled COUNT spends no COUNT budget, and the subscription cap
+        // and the connection's filter bytes refuse a REQ before its filters
+        // are parsed: this filter would fail parsing.
+        let (_dir, handle) = live_reload_relay(|cfg, _| {
+            cfg.relay.max_filter_limit_count = 0;
+            cfg.relay.abuse.per_connection.count_rate_per_second = 1;
+            cfg.relay.abuse.per_connection.count_burst = 1;
+            cfg.relay.max_subs_per_connection = 1;
+        });
+        let (conn, mut rx) = live_conn(&handle).await;
+        let count = json!(["COUNT", "n", {"kinds": [1]}]).to_string();
+        for _ in 0..3 {
+            handle
+                .client_message(conn, local_source(), count.clone())
+                .await;
+            assert_eq!(
+                recv_outbound(&mut rx).await,
+                r#"["CLOSED","n","blocked: bad req: COUNT disabled"]"#
+            );
+        }
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_count_rate_rejections
+                .load(Ordering::Relaxed),
+            0
+        );
+        let open = json!(["REQ", "a", {"kinds": [1]}]).to_string();
+        handle.client_message(conn, local_source(), open).await;
+        assert!(recv_outbound(&mut rx).await.contains("EOSE"));
+        let malformed = json!(["REQ", "b", {"kinds": "x"}]).to_string();
+        handle
+            .client_message(conn, local_source(), malformed.clone())
+            .await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            r#"["CLOSED","b","blocked: too many concurrent REQs"]"#
+        );
+        {
+            let mut cfg = handle.config.write();
+            cfg.relay.max_subs_per_connection = 2;
+            cfg.relay.max_filter_bytes_per_connection = 1;
+        }
+        handle.client_message(conn, local_source(), malformed).await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            r#"["CLOSED","b","blocked: this connection's filters exceed 1 bytes"]"#
+        );
         handle.request_shutdown();
     }
 

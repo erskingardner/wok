@@ -155,10 +155,15 @@ pub async fn dispatch(
     handle: Arc<RelayHandle>,
     state: Arc<AdminState>,
 ) -> Response<Full<Bytes>> {
-    let cfg = handle.config.read().clone();
-    if !cfg.admin.enabled {
-        return response(StatusCode::NOT_FOUND, "text/plain", "not found");
-    }
+    // Checked before the configuration is copied: with admin off, a request
+    // costs one read of the lock.
+    let cfg = {
+        let cfg = handle.config.read();
+        if !cfg.admin.enabled {
+            return response(StatusCode::NOT_FOUND, "text/plain", "not found");
+        }
+        cfg.clone()
+    };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let path_and_query = req
@@ -420,6 +425,39 @@ pub(crate) fn authorize<'a>(
     ))
 }
 
+/// What the code under test logs, as `tracing_subscriber::fmt` writes it.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct Logs(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Logs {
+    /// A subscriber that writes here.
+    pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        let writer = self.clone();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish()
+    }
+
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8(self.0.lock().clone()).unwrap()
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -675,11 +713,7 @@ pub(crate) fn apply_config_patch(
         wok_relay::config::write_file(&path, edited.as_bytes())
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     }
-    handle
-        .config
-        .write()
-        .apply_reload(verified)
-        .map_err(unservable)?;
+    handle.reload_config(verified).map_err(unservable)?;
     Ok(())
 }
 
@@ -1566,6 +1600,60 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(event.to_string())
         );
         assert!(check(&header, &Method::POST, b"", &cfg, &state, &policy).is_ok());
+    }
+
+    /// A dashboard or NIP-86 save installs the whole file, which may hold an
+    /// edit the file watcher has not reloaded yet. The save logs that edit's
+    /// warnings then, or nobody would: the watcher's reload finds nothing
+    /// changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_logs_the_warnings_of_a_pending_file_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wok.toml");
+        let (kept, removed) = (hex::encode([1u8; 32]), hex::encode([2u8; 32]));
+        let file = |pubkeys: &str, relay: &str| {
+            format!(
+                "[relay]\n{relay}\n[admin]\nenabled = true\n\
+                 public_url = \"https://relay.example\"\npubkeys = [{pubkeys}]\n\
+                 allow_config_writes = true\n"
+            )
+        };
+        let text = file(&format!("\"{kept}\", \"{removed}\""), "");
+        std::fs::write(&path, &text).unwrap();
+        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let mut cfg = Config::parse_toml(&text).unwrap();
+        cfg.db = dir.path().to_path_buf();
+        let handle = wok_relay::start(env, cfg).unwrap();
+        handle.set_config_path(path.clone());
+        handle
+            .manage(wok_relay::ManagementCmd::AssignRole {
+                pubkey: [2u8; 32],
+                role: "admin".into(),
+            })
+            .await
+            .unwrap();
+        std::fs::write(
+            &path,
+            file(
+                &format!("\"{kept}\""),
+                "real_ip_header = \"x-forwarded-for\"",
+            ),
+        )
+        .unwrap();
+        let logs = Logs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            apply_config_patch(&handle, br#"{"info":{"name":"renamed"}}"#).unwrap();
+        });
+        let logs = logs.text();
+        assert!(
+            logs.contains(&format!("admin.pubkeys no longer lists {removed} (admin)")),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("relay.real_ip_header = \"x-forwarded-for\" is trusted"),
+            "{logs}"
+        );
+        handle.request_shutdown();
     }
 
     #[test]

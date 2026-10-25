@@ -1,7 +1,7 @@
 # Relay functions reached in the `default` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 708
+## anonymous: 709
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -22,9 +22,9 @@
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
 <wok_db::txn::RwTxn>::largest_integer_key
-<wok_db::vanish::VanishPolicy>::targets_this_relay_json
-<wok_db::vanish::VanishPolicy>::targets_this_relay_json::{closure}
-<wok_db::vanish::VanishPolicy>::targets_this_relay_json::{closure}::{closure}
+<wok_db::vanish::VanishPolicy>::targets_this_relay_value
+<wok_db::vanish::VanishPolicy>::targets_this_relay_value::{closure}
+<wok_db::vanish::VanishPolicy>::targets_this_relay_value::{closure}::{closure}
 <wok_db::write::EventToWrite>::new
 <wok_db::write::EventToWrite>::with_context::<u64>
 <wok_event::error::EventError>::broken_limit
@@ -605,7 +605,6 @@ wok_query::scan::plans_tag_kind
 wok_query::visibility::physical_tree_is_globally_visible
 wok_relay::abuse::decrement::<core::net::ip_addr::IpAddr>
 wok_relay::abuse::decrement::<wok_relay::abuse::Principal>
-wok_relay::abuse::leading_zero_bits
 wok_relay::abuse::spec
 wok_relay::capabilities::relay_capabilities
 wok_relay::capabilities::relay_capabilities::{closure}
@@ -643,6 +642,7 @@ wok_relay::server::ingest_neg_command
 wok_relay::server::ingest_req
 wok_relay::server::ingest_req::{closure}
 wok_relay::server::kind_refusal
+wok_relay::server::kind_refusal::{closure}
 wok_relay::server::neg_err
 wok_relay::server::negentropy::fail
 wok_relay::server::negentropy::public_tree_allowed
@@ -652,6 +652,7 @@ wok_relay::server::negentropy::run_negentropy::{closure}::{closure}
 wok_relay::server::negentropy::send_vector
 wok_relay::server::negentropy::send_vector::{closure}
 wok_relay::server::negentropy::snapshot_due
+wok_relay::server::pow_refusal
 wok_relay::server::read_gate_refusal
 wok_relay::server::reader_admitted
 wok_relay::server::refuse_req

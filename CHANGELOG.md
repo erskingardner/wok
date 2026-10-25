@@ -59,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left those subscriptions sending the rest of their history and then every
   new event. Each is closed with the `CLOSED` or `NEG-ERR` it would get if
   sent now; one still sending history stops at its next time slice.
+- NIP-86 `blockip` closes the WebSocket connections already open from the
+  address (#164). The block was checked only when a connection opened, so
+  the client it was meant to stop kept reading and publishing on the
+  connection it had until that closed.
 - A guard the file sets to zero, turning it off where its preset keeps it,
   is warned about when the relay starts and by `wok doctor` in a new
   `zero-guards` check, not only on reload and on the dashboard (#164). A
@@ -123,10 +127,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **REQ, COUNT and NEG-OPEN** meet `relay.auth.read_policy` before their
     filters are sized, parsed or priced and, for NEG-OPEN, before the payload
     is decoded (#149).
+  - **COUNT** is refused while disabled before it spends the COUNT budgets,
+    and a REQ over the connection's subscriptions, or a REQ or COUNT over its
+    filter bytes, before its filters are parsed, validated and priced (#165).
   - **EVENT** is refused for its kind, by `relay.auth.accepted_kinds`, the
     NIP-86 kind policy or as an AUTH event, before it is verified (#150). The
     author ban and `write_policy` still wait for the signature, so an
     unsigned event cannot ask whether a key is a member or banned.
+  - **EVENT** short of `relay.abuse.min_pow_difficulty`, counted from the id
+    it states, and a vanish request while NIP-62 is off or whose `relay` tags
+    do not name this relay, are refused before it is verified too (#165).
   - **The dashboard API and NIP-86** check a request's `Nostr`
     authorization before reading its body: the event's kind, content, time
     window and tags, then whether its signer may use the endpoint, and only
@@ -178,6 +188,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address, but is counted by `wok_real_ip_header_unparsed_total` and warned
   about at most once a minute. Relays without `real_ip_header`, the default,
   and proxies that replace the header are unaffected.
+- Reloads that move a trust boundary say so (#164). A reload that sets or
+  changes `relay.real_ip_header` or `relay.trusted_proxies`, which apply to
+  the next connection and request, logs the warning the relay gives at
+  startup, which now names NIP-86 IP blocks and the write-policy plugin's
+  `sourceInfo` beside the per-address budgets. Changes to `admin.enabled`,
+  `public_url`, `pubkeys`, `allow_config_writes` and `auth_window_secs` are
+  logged as security-scope changes, naming each key added and removed, and
+  a key removed from `admin.pubkeys` that still holds the NIP-86 `admin` or
+  `moderator` role, which it keeps, is warned about. Each authorized NIP-86
+  request is logged with its method.
 - A members-only relay accepts its members' events from throwaway keys.
   `relay.auth.restrict_writes` checked only the event's author, so an
   allowlisted relay refused every Marmot group message (445) and gift wrap

@@ -72,7 +72,9 @@ Every call is made by a NIP-98 signer at one of two levels:
   role methods return a `requires the admin role` error.
 
 `assignrole` / `unassignrole` manage these grants without restarting the
-relay or editing the config file.
+relay or editing the config file. A role is independent of
+`admin.pubkeys`: removing a key from the file leaves any role it holds, and
+the reload that removes it warns when that role is `admin` or `moderator`.
 
 ## Ban and allowlist semantics
 
@@ -174,7 +176,9 @@ sorted, and `listdisallowedkinds` every kind the policy disallows. See
 The all-zero map (no kinds allowed) is representable; `disallowkind` never
 refuses an exclusion. IPs given to `blockip` / `unblockip` are parsed and
 stored in canonical form, so any equivalent spelling (`2001:0db8::1` vs
-`2001:db8::1`) refers to the same record.
+`2001:db8::1`) refers to the same record. A block is checked when a
+connection or HTTP request is admitted, and `blockip` also closes the
+WebSocket connections already open from the address, before it answers.
 
 ## Persistence
 

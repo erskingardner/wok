@@ -58,6 +58,15 @@ for messages, controls in [(small, [0, 1, 0, 1]), (large, [0, 1]), (ring, [0] * 
     seeds.append(b"".join(bytes([control]) + struct.pack("<H", len(payload)) + payload
                           for control, payload in zip(controls, messages, strict=True)))
 
+# Client address headers, a line per header line: RFC 7239 Forwarded, with a
+# client's unterminated quote ahead of the proxy's element, and an address list.
+seeds += [
+    b'for=192.0.2.60;proto=https',
+    b'for="198.51.100.9, for="[2001:db8::1]:4711";proto=https;by=203.0.113.43',
+    b'for=198.51.100.9\nFor="192.0.2.60:_eth0";host="a\\", for=198.51.100.9"',
+    b'198.51.100.9, 203.0.113.7\n[2001:db8::1]:4711',
+]
+
 for seed in seeds:
     path = root / hashlib.sha256(seed).hexdigest()
     if not path.exists():

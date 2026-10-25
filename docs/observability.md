@@ -51,7 +51,7 @@ scrape_configs:
 | `wok_auth_success_total` | counter | none | Successful NIP-42 authentications. |
 | `wok_auth_failure_total` | counter | none | Failed NIP-42 authentication attempts. |
 | `wok_slow_client_terminations_total` | counter | none | Connections closed after exceeding their pending-output byte budget. |
-| `wok_real_ip_header_unparsed_total` | counter | none | Requests whose `relay.real_ip_header` ended in an entry that is not an IP address, so the connecting address stood in for the client's. Any increase means the proxy does not write the client's address last in that header. |
+| `wok_real_ip_header_unparsed_total` | counter | none | Requests whose `relay.real_ip_header` ended in an entry that names no IP address (in `Forwarded`, a last element without one `for` naming an address), so the connecting address stood in for the client's. Any increase means the proxy does not write the client's address last in that header. |
 | `wok_refusals_total` | counter | `setting` | Requests and events refused, by the config key that refused them. See [Refusals by setting](#refusals-by-setting). |
 | `wok_abuse_rejections_total` | counter | `reason` | Deprecated: removed in the release after 0.8. Requests or events rejected by an abuse guard. |
 | `wok_moderation_rejections_total` | counter | `reason` | Events refused by a NIP-86 ban (`banned_event`, `banned_author`), by the write policy (`restricted_writes`), or by `relay.auth.accepted_kinds` or the NIP-86 kind policy (`kind_not_allowed`). |
@@ -100,6 +100,7 @@ something. A token bucket's refusals carry its `_burst` key; raising its
 | `relay.max_filters_per_req`, `relay.max_req_filter_size` | REQs and COUNTs with too many filters or filter bytes. |
 | `relay.max_tags_per_filter`, `relay.max_and_entries` | Filters over the tag-letter or NIP-91 `&` limit (REQ, COUNT, NEG-OPEN). |
 | `relay.max_filter_limit_count` | COUNTs while it is 0. |
+| `relay.search_enabled` | REQs, COUNTs and NEG-OPENs with a `search` filter while NIP-50 is off. |
 | `relay.filter_validation.max_kinds_per_filter`, `allowed_kinds`, `require_author_or_tag`, `require_scoped_filters` | Filters a rule refuses (REQ, COUNT, NEG-OPEN). |
 | `relay.abuse.max_query_work` | Requests whose estimated work is over the ceiling. |
 | `relay.auth.read_policy` | REQs, COUNTs and NEG-OPENs from a connection the read policy does not admit, when they arrive or, for one still waiting for a scan or sync after a reload or a member's removal, when it would start. |

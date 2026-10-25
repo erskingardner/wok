@@ -62,10 +62,23 @@ pub(super) fn posture(cfg: &Config) -> Vec<String> {
             who(auth.write_policy).to_lowercase()
         )
     };
-    if auth.write_policy == AccessPolicy::Members && !auth.inbox_kinds.is_empty() {
+    // An inbox kind the relay refuses from anyone, because nobody could
+    // read it, only its author may publish it, or it is not accepted, is
+    // delivered to nobody.
+    let deliverable: Vec<u64> = auth
+        .inbox_kinds
+        .iter()
+        .copied()
+        .filter(|&kind| {
+            cfg.unreadable_class(kind).is_none()
+                && !auth.owner_only_kinds.contains(&kind)
+                && cfg.accepts_kind(kind)
+        })
+        .collect();
+    if auth.write_policy == AccessPolicy::Members && !deliverable.is_empty() {
         access.push_str(&format!(
             ", and anyone can deliver {} to a member",
-            kinds(&auth.inbox_kinds)
+            kinds(&deliverable)
         ));
     }
     access.push('.');
@@ -320,6 +333,33 @@ mod tests {
                 "It shows kind 4 only to their author and recipient, once they log in.",
                 "Rate limits, storage quotas, the query work ceiling and proof of work are off.",
             ]
+        );
+        // Inbox kinds nobody could read are refused before delivery, and so
+        // are owner-only ones and ones the relay does not accept.
+        let members = |extra: &str| {
+            posture(&preset(
+                "public",
+                &format!("[relay.auth]\nwrite_policy = \"members\"\n{extra}"),
+            ))[0]
+                .clone()
+        };
+        assert_eq!(members(""), "Anyone can read; only members can write.");
+        assert_eq!(
+            members("recipient_only_kinds = [4, 21059]\n"),
+            "Anyone can read; only members can write, and anyone can deliver kind 1059 to a \
+             member."
+        );
+        assert_eq!(
+            members("service_url = \"wss://relay.test\"\nowner_only_kinds = [1059]\n"),
+            "Anyone can read; only members can write, and anyone can deliver kind 21059 to a \
+             member."
+        );
+        assert!(
+            members("service_url = \"wss://relay.test\"\naccepted_kinds = [1, 1059]\n")
+                .starts_with(
+                "Anyone can read; only members can write, and anyone can deliver kind 1059 to a \
+             member."
+            )
         );
         let access = access(&cfg);
         assert_eq!(access["read_policy"], "authenticated");

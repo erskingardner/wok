@@ -251,6 +251,10 @@ pub struct RelayConfig {
     #[serde(default = "default_max_and_entries")]
     pub max_and_entries: usize,
     pub max_filter_limit_count: u64,
+    /// Serve NIP-50 `search` filters and advertise NIP-50. Off, a REQ,
+    /// COUNT or NEG-OPEN whose filters carry `search` is refused before
+    /// they are parsed.
+    pub search_enabled: bool,
     pub max_total_events_per_req: u64,
     pub max_subs_per_connection: usize,
     /// Per-subscription bytes of live matches held while its history is
@@ -518,6 +522,7 @@ impl Default for Config {
                 max_tags_per_filter: 8,
                 max_and_entries: default_max_and_entries(),
                 max_filter_limit_count: 1_000_000,
+                search_enabled: true,
                 max_total_events_per_req: 10_000,
                 max_subs_per_connection: 200,
                 max_live_buffer_bytes: default_max_live_buffer_bytes(),
@@ -1615,6 +1620,12 @@ impl Config {
             changes.push(format!(
                 "relay.nodeinfo_enabled changed: {} -> {}",
                 self.relay.nodeinfo_enabled, new.relay.nodeinfo_enabled,
+            ));
+        }
+        if self.relay.search_enabled != new.relay.search_enabled {
+            changes.push(format!(
+                "relay.search_enabled changed: {} -> {}",
+                self.relay.search_enabled, new.relay.search_enabled,
             ));
         }
         changes
@@ -2948,6 +2959,19 @@ negentropy_enabled = true
                 .any(|c| c.contains("negentropy_enabled changed")),
             "{changes:?}"
         );
+    }
+
+    #[test]
+    fn search_is_on_by_default_and_reloads_live() {
+        let mut running = Config::default();
+        assert!(running.relay.search_enabled);
+        let off = Config::parse_toml("[relay]\nsearch_enabled = false\n").unwrap();
+        assert_eq!(
+            running.security_scope_changes(&off),
+            ["relay.search_enabled changed: true -> false"]
+        );
+        running.apply_reload(off).unwrap();
+        assert!(!running.relay.search_enabled);
     }
 
     #[test]

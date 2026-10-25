@@ -81,6 +81,18 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = InflateCtx::new(false).decompress(data, 2_097_152);
 
+    // The client address header in both syntaxes, the input's lines as its
+    // lines.
+    for name in ["forwarded", "x-forwarded-for"] {
+        let mut headers = hyper::HeaderMap::new();
+        for line in data.split(|&b| b == b'\n').take(8) {
+            if let Ok(value) = hyper::header::HeaderValue::from_bytes(line) {
+                headers.append(name, value);
+            }
+        }
+        let _ = wok_ws::forwarded::client(&headers, name);
+    }
+
     // Context takeover across an idle release, which the relay runs on a
     // timer: the input as up to 64 records, each a control byte, a two-byte
     // little-endian length and that many payload bytes. A control byte with

@@ -194,7 +194,10 @@ WIDENED`).
 As NIP-78 recommends, the relay also accepts an event of an owner-only kind
 only on a connection authenticated as its author. Without AUTH the EVENT is
 refused with `auth-required:` and a challenge; once the connection has
-authenticated as another pubkey, with `restricted:`. A tool that copies
+authenticated as another pubkey, with `restricted:`. The writer checks this
+again under its own configuration, as it does the author's AUTH that NIP-70
+protected events need, so an event queued before a reload made AUTH
+unusable, or moved its kind into `owner_only_kinds`, is refused too. A tool that copies
 events between relays without the authors' keys, such as `wok sync`, can
 therefore neither download nor upload them unless the relay it reads from or
 writes to sets `owner_only_kinds = []`. Apps that publish public data in
@@ -363,6 +366,7 @@ may keep open. All reload live and are on the dashboard.
 | `relay.max_tags_per_filter` | `8` | Residual tag checks on each candidate event: the distinct tag letters across `#` and NIP-91 `&` keys. `0` refuses every filter that names a tag. | Comment, community and marketplace queries are refused. At 3, the default through 0.7, a NIP-22 query on `#E`, `#K`, `#P` and `#k` was. | `max_tags_per_filter`; NIP-91 in `supported_nips` while it is above 0 |
 | `relay.max_and_entries` | `16` | NIP-91 checks on each candidate event: the values across all `&` keys of one filter. `0` turns NIP-91 off. | NIP-91 queries that require several tags are refused. | `max_and_entries`; NIP-91 in `supported_nips` while it and `max_tags_per_filter` are above 0 |
 | `relay.max_filter_limit_count` | `1000000` | COUNT de-duplication memory: the most events one COUNT filter counts. `0` turns COUNT off, as `marmot` does. | Counts of popular events, such as followers or reactions, are capped, and the reply carries `limited: true`. | NIP-45 in `supported_nips` while above 0 |
+| `relay.search_enabled` | `true` | Answering NIP-50 `search` filters, and advertising NIP-50. Off, a REQ or COUNT with one is refused with `blocked: bad req: search disabled`, and a NEG-OPEN with `blocked: search disabled`. See [Search](#search). | Off: clients' searches are refused here, and NIP-50 clients look for search on relays that advertise it. | NIP-50 in `supported_nips` while on |
 | `relay.abuse.max_query_work` | `20000` | Query workers, from requests whose estimated index work is too large. `0` is unlimited. See [Query work](#query-work). | Batched and outbox queries are refused with `blocked: query too broad`. | `max_query_work`, while abuse protection is on and it is set |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Query workers' fairness: scans one connection runs at once, counted separately for its REQs and COUNTs and its NEG-OPENs. More wait in arrival order. `0` runs none. | Busy clients see slow first results. | `max_concurrent_historical_queries` |
 | `relay.filter_validation.require_scoped_filters` | `false` | Enumeration: every filter must name `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. Refuses `{"kinds":[445]}`, `{"since":…}` or a bare `search`. On in `marmot`. | — | — |
@@ -390,6 +394,16 @@ A scan over `max_concurrent_historical_queries` waits, in arrival order, for
 one of the same kind to end. At most `max_subs_per_connection` wait; past
 that a REQ or COUNT is refused with `CLOSED rate-limited: too many
 historical queries waiting on this connection`.
+
+### Search
+
+`relay.search_enabled` gates the NIP-50 query parser and the ranked search
+scan: while it is off, a request with a `search` filter is refused before its
+filters are parsed, whatever else it asks for. Subscriptions already open
+when a reload turns it off keep their search filters until they close. The
+writer keeps the search index current as it stores and deletes events either
+way, so turning search back on, which reloads live, answers from a complete
+index at once.
 
 ### Filter validation
 
@@ -494,7 +508,7 @@ counted under its `_burst` key.
 | `relay.abuse.invalid_rate_per_second` | `5` | Error replies to malformed messages from one address, including CLOSE and NEG-CLOSE with an invalid subscription id. Valid CLOSE and NEG-CLOSE are never budgeted. | Clients with bugs get fewer error replies to debug with. | — |
 | `relay.abuse.invalid_burst` | `20` | The same, at once. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until it refills. | As above. | — |
 | `relay.abuse.ipv6_prefix_len` | `64` | Leading bits of an IPv6 address that key its per-address budgets, from 1 to 128. IPv4 addresses are keyed one by one. | Unrelated users on one large network share a budget. (Too high: a host picks a new address in its /64 for each connection and escapes every per-address budget.) | — |
-| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget. Wok reads its last entry. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
+| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
 
 Rate budgets have no standard NIP-11 field; clients learn them only from
 refusals.
@@ -572,8 +586,18 @@ Behind a reverse proxy the client's address is the proxy's unless
 reads the header's last entry, the address the proxy in front of it wrote,
 so a proxy that replaces the header, appends the client's address to it
 (nginx's `$proxy_add_x_forwarded_for`), or adds a line of its own (HAProxy's
-`option forwardfor`) all work; an entry may carry a port. A last entry that
-is not an IP address leaves the connecting address, is counted by
+`option forwardfor`) all work; an entry may carry a port.
+
+`relay.real_ip_header = "forwarded"` reads the RFC 7239 `Forwarded` header
+(HAProxy's `option forwarded`): the client is the `for` parameter of its
+last element, such as `for=192.0.2.60;proto=https` or
+`for="[2001:db8::1]:4711"`. The syntax follows from the header's name, not
+its content. That element must be well formed, with one `for`; whatever
+comes before it, which the client may have sent, does not matter. Any other
+header is read as a list of addresses.
+
+A last entry that names no IP address, such as `unknown` or an obfuscated
+`for=_hidden`, leaves the connecting address, is counted by
 `wok_real_ip_header_unparsed_total`, and is warned about at most once a
 minute. Behind two proxies in a row, that entry is the first proxy's
 address, so every client of that proxy shares one set of budgets.

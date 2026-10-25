@@ -320,6 +320,61 @@ async fn client_message_gates_match_the_inventory() {
     );
 }
 
+/// A NIP-50 `search` filter, in each request that takes filters, sent to a
+/// relay of each profile: the search gate's refusal must come back exactly
+/// when the profile turns search off, before the query is parsed. The
+/// Messages rows must name the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_filters_follow_the_search_gate() {
+    for row in table("## Messages") {
+        if ticked(&row[0])
+            .iter()
+            .any(|verb| verb == "REQ" || verb == "NEG-OPEN")
+        {
+            assert!(
+                row[3].contains("`relay.search_enabled`"),
+                "the {} row of docs/attack-surface.md does not name the search gate",
+                row[0]
+            );
+        }
+    }
+    // Scoped, so `require_scoped_filters` lets it through, and longer than
+    // the search parser accepts, so a relay that parsed it before the gate
+    // would answer `invalid:`.
+    let filter = json!({"ids": [UNKNOWN_ID], "search": "x".repeat(2_000)});
+    let mut problems = Vec::new();
+    for name in profile_names() {
+        let cfg = load_profile(&name);
+        let relay = Relay::start(cfg.clone()).await;
+        let mut wire = Wire::connect(relay.addr).await;
+        let mut probes = vec![("REQ", json!(["REQ", "search-req", filter]))];
+        if cfg.relay.max_filter_limit_count > 0 {
+            probes.push(("COUNT", json!(["COUNT", "search-count", filter])));
+        }
+        if cfg.relay.negentropy_enabled {
+            let open = json!(["NEG-OPEN", "search-neg", filter, neg_initial()]);
+            probes.push(("NEG-OPEN", open));
+        }
+        for (verb, message) in probes {
+            let sub = message[1].clone();
+            wire.send(message).await;
+            let reply = wire.until(verb, |frame| frame[1] == sub).await;
+            let refused = reply[2]
+                .as_str()
+                .is_some_and(|reason| reason.ends_with("search disabled"));
+            if refused == cfg.relay.search_enabled {
+                problems.push(format!(
+                    "{name}: {verb} with search gets {reply} with relay.search_enabled = {}",
+                    cfg.relay.search_enabled
+                ));
+            }
+        }
+        drop(wire);
+        relay.stop().await;
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 /// Whether a profile opens the gate a Messages row names.
 fn message_gate_open(cfg: &Config, gate: &str) -> bool {
     match gate {

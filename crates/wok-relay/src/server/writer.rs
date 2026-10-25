@@ -317,6 +317,28 @@ pub(super) fn run_writer(
                             );
                             continue;
                         }
+                        // The author's AUTH, as the writer's configuration
+                        // requires it: a reload may have made AUTH unusable,
+                        // or moved the kind into `owner_only_kinds`, since
+                        // the ingester's check.
+                        if let Err(message) = check_author_auth(
+                            &cfg_snap,
+                            &metrics,
+                            packed_view,
+                            &grant,
+                            grant.challenged,
+                        ) {
+                            conns.send(
+                                conn_id,
+                                RelayMessage::Ok {
+                                    event_id: to_hex(packed_view.id()),
+                                    accepted: false,
+                                    message,
+                                },
+                                &metrics,
+                            );
+                            continue;
+                        }
                     }
                     let is_live_only = cfg_snap.events.ephemeral_persistence
                         == EphemeralPersistence::LiveOnly

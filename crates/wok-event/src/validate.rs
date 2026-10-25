@@ -1,11 +1,18 @@
+use std::borrow::Cow;
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::hash::{verify_id, verify_id_allowing_legacy, verify_sig};
 use crate::packed::PackedEventView;
 use crate::parse::{
-    from_lower_hex_array, normalize_event_json, pack_event, EventLimits, ParsedEvent,
+    from_hex_exact, from_lower_hex_array, normalize_event_json, pack_event, parse_uint64, to_hex,
+    EventLimits, ParsedEvent,
 };
-use crate::{parse_canonical_a_tag, EventError, EventLimit, DELETION_KIND};
+use crate::{
+    indexed_tag_value, is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind,
+    parse_canonical_a_tag, EventError, EventLimit, DELETION_KIND, MAX_INDEXED_TAG_VAL_SIZE,
+};
 
 // Re-export helper used by validate; keep json_get_string crate-private in parse
 // by duplicating the small accessor here for sig field.
@@ -88,6 +95,233 @@ fn verify_nostr_event_with(
         return Err(EventError::msg("bad signature"));
     }
     Ok(())
+}
+
+/// Verify an event a strfry v3 database stores: the payload `orig` must name
+/// the id, pubkey, kind and created_at of its PackedEvent `packed`, which
+/// must index nothing the payload does not carry ([`check_packed_tags`]).
+/// The payload must hash to that id with either preimage
+/// ([`IdPreimage::Nip01OrLegacy`]) and carry a valid signature by that
+/// pubkey. Hex is decoded as strfry decoded it on ingest, in either case and
+/// with an optional `0x`, and no limit strfry's config set is applied, so
+/// every event strfry verified and packed passes.
+pub fn verify_strfry_event(packed: PackedEventView<'_>, orig: &Value) -> Result<(), EventError> {
+    let field = |key: &str| {
+        orig.get(key)
+            .ok_or_else(|| EventError::msg(format!("missing {key}")))
+    };
+    let bytes = |key: &str, len: usize| -> Result<Vec<u8>, EventError> {
+        let decoded = from_hex_exact(json_string(
+            field(key)?,
+            &format!("event {key} was not a string"),
+        )?)?;
+        if decoded.len() != len {
+            return Err(EventError::msg(format!("unexpected {key} size")));
+        }
+        Ok(decoded)
+    };
+    let unsigned = |key: &str| {
+        field(key)?
+            .as_u64()
+            .ok_or_else(|| EventError::msg(format!("event {key} was not an integer")))
+    };
+    if bytes("id", 32)? != packed.id() {
+        return Err(EventError::msg("payload id differs from the packed record"));
+    }
+    if bytes("pubkey", 32)? != packed.pubkey() {
+        return Err(EventError::msg(
+            "payload pubkey differs from the packed record",
+        ));
+    }
+    if unsigned("kind")? != packed.kind() {
+        return Err(EventError::msg(
+            "payload kind differs from the packed record",
+        ));
+    }
+    if unsigned("created_at")? != packed.created_at() {
+        return Err(EventError::msg(
+            "payload created_at differs from the packed record",
+        ));
+    }
+    check_packed_tags(packed, orig)?;
+    verify_id_allowing_legacy(orig, packed.id())?;
+    if !verify_sig(&bytes("sig", 64)?, packed.id(), packed.pubkey())? {
+        return Err(EventError::msg("bad signature"));
+    }
+    Ok(())
+}
+
+/// Check that PackedEvent `packed` indexes, replaces, deletes and expires by
+/// nothing its payload `orig` does not carry, as strfry's database version 3
+/// packs a payload (052c56e through the pinned 9acdaeb):
+///
+/// - Every packed tag is a single-letter payload tag: `e` and `p` values as
+///   the bytes their 64 hex characters decode to (either case, after an
+///   optional `0x`), others as written up to 255 bytes, or longer ones as
+///   [`indexed_tag_value`] hashes them. The exception is the empty `d`
+///   strfry adds to kinds 0, 3, 41, 10000-19999 and 30000-39999. A payload
+///   tag may be left out, as strfry left out values longer than 255 bytes.
+/// - The first packed `d`, which keys replacement, is the payload's address:
+///   empty for replaceable kinds, and for addressable kinds the first `d`,
+///   hashed when long. strfry skipped a long one, so then the next `d` of up
+///   to 255 bytes, or empty, is accepted too.
+/// - The first 32-byte packed `p`, the only one recipient-only reads admit,
+///   is the payload's first `p` that decodes to 32 bytes, or neither has one.
+/// - The expiration is what strfry wrote: 1 for ephemeral kinds, otherwise
+///   the payload's first `expiration` tag, or 0 when it has none. strfry
+///   refused an event whose first `expiration` tag is not a time of at least
+///   100, so such a payload is refused too: 0 and 1 are the markers for no
+///   expiry and for an ephemeral event.
+fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), EventError> {
+    let kind = packed.kind();
+    let mut carried = HashSet::new();
+    // The first `d` as Wok packs it, and as strfry did.
+    let (mut address, mut strfry_address) = (None, None);
+    let mut recipient = None;
+    let tags = orig.get("tags").and_then(Value::as_array);
+    for tag in tags.into_iter().flatten().filter_map(Value::as_array) {
+        let Some(name) = tag.first().and_then(Value::as_str) else {
+            continue;
+        };
+        let value = match tag.get(1) {
+            Some(value) => match value.as_str() {
+                Some(value) => value,
+                None => continue,
+            },
+            None => "",
+        };
+        // One byte, as packed: a one-character name like `é` is not.
+        let &[name] = name.as_bytes() else {
+            continue;
+        };
+        let name = name as char;
+        let packed_value = if name == 'e' || name == 'p' {
+            if value.len() != 64 {
+                continue;
+            }
+            let Ok(raw) = from_hex_exact(value) else {
+                continue;
+            };
+            Cow::Owned(raw)
+        } else {
+            indexed_tag_value(value.as_bytes())
+        };
+        if name == 'p' && packed_value.len() == 32 && recipient.is_none() {
+            recipient = Some(packed_value.clone());
+        }
+        if name == 'd' {
+            address.get_or_insert_with(|| packed_value.clone());
+            if strfry_address.is_none() && value.len() <= MAX_INDEXED_TAG_VAL_SIZE {
+                strfry_address = Some(packed_value.clone());
+            }
+        }
+        carried.insert((name, packed_value));
+    }
+
+    let virtual_d = kind == 41 || is_replaceable_kind(kind) || is_param_replaceable_kind(kind);
+    let (mut first_d, mut first_p) = (None, None);
+    let mut stray = None;
+    packed.foreach_tag(|name, value| {
+        if name == 'd' && first_d.is_none() {
+            first_d = Some(value.to_vec());
+        }
+        if name == 'p' && value.len() == 32 && first_p.is_none() {
+            first_p = Some(value.to_vec());
+        }
+        if (name == 'd' && value.is_empty() && virtual_d)
+            || carried.contains(&(name, Cow::Borrowed(value)))
+        {
+            return true;
+        }
+        stray = Some(if name == 'e' || name == 'p' {
+            format!("packed {name} tag {} is not in the payload", to_hex(value))
+        } else {
+            format!(
+                "packed {name} tag {:?} is not in the payload",
+                String::from_utf8_lossy(value)
+            )
+        });
+        false
+    });
+    if let Some(stray) = stray {
+        return Err(EventError::msg(stray));
+    }
+
+    if first_p.as_deref() != recipient.as_deref() {
+        let shown = |p: Option<&[u8]>| p.map_or("none".into(), to_hex);
+        return Err(EventError::msg(format!(
+            "packed recipient {} differs from the payload's {}",
+            shown(first_p.as_deref()),
+            shown(recipient.as_deref()),
+        )));
+    }
+
+    let empty = Cow::Borrowed(&b""[..]);
+    let addresses = if is_replaceable_kind(kind) {
+        Some((empty.clone(), empty))
+    } else if is_param_replaceable_kind(kind) {
+        Some((
+            strfry_address.unwrap_or_else(|| empty.clone()),
+            address.unwrap_or(empty),
+        ))
+    } else {
+        None
+    };
+    if let Some((strfry, wok)) = addresses {
+        let first_d = first_d.as_deref();
+        if first_d != Some(&strfry[..]) && first_d != Some(&wok[..]) {
+            let shown = |d: Option<&[u8]>| {
+                d.map_or("none".into(), |d| {
+                    format!("{:?}", String::from_utf8_lossy(d))
+                })
+            };
+            return Err(EventError::msg(format!(
+                "packed address {} differs from the payload's {}",
+                shown(first_d),
+                shown(Some(&strfry)),
+            )));
+        }
+    }
+
+    let own = strfry_expiration(orig)?;
+    let expected = if is_ephemeral_kind(kind) {
+        1
+    } else {
+        own.unwrap_or(0)
+    };
+    if packed.expiration() != expected {
+        return Err(EventError::msg(format!(
+            "packed expiration {} differs from the {expected} strfry packs from the payload",
+            packed.expiration()
+        )));
+    }
+    Ok(())
+}
+
+/// The time in `orig`'s first `expiration` tag, as strfry's packer read it:
+/// none without one, and an error for one it refused, which is not digits or
+/// below 100.
+fn strfry_expiration(orig: &Value) -> Result<Option<u64>, EventError> {
+    let tags = orig.get("tags").and_then(Value::as_array);
+    let Some(tag) = tags
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .find(|tag| tag.first().and_then(Value::as_str) == Some("expiration"))
+    else {
+        return Ok(None);
+    };
+    let value = match tag.get(1) {
+        Some(value) => value.as_str(),
+        None => Some(""),
+    };
+    match value.map(|value| (value, parse_uint64(value))) {
+        Some((_, Ok(expiration))) if expiration >= 100 => Ok(Some(expiration)),
+        Some((value, _)) => Err(EventError::msg(format!(
+            "payload expiration {value:?} is not a time strfry packs"
+        ))),
+        None => Err(EventError::msg("payload expiration is not a string")),
+    }
 }
 
 pub fn verify_event_json_size(json_str: &str, max_event_size: usize) -> Result<(), EventError> {
@@ -223,8 +457,8 @@ pub fn parse_and_verify_event_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packed::PackedEventBuilder;
-    use crate::PackedEventTagBuilder;
+    use crate::packed::{PackedEvent, PackedEventBuilder};
+    use crate::{indexed_tag_value, PackedEventTagBuilder, MAX_INDEXED_TAG_VAL_SIZE};
     use secp256k1::{Keypair, SECP256K1};
     use serde_json::json;
 
@@ -295,6 +529,426 @@ mod tests {
         }));
         ev["id"] = json!("11".repeat(32));
         assert!(parse_and_verify_event(&ev, &EventLimits::default(), None, true, false).is_err());
+    }
+
+    #[test]
+    fn stored_events_verify_against_their_packed_record() {
+        let ev = sign_event(json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [["p", "22".repeat(32)]],
+            "content": "stored",
+        }));
+        let packed = crate::nostr_json_to_packed_event(&ev, &EventLimits::default()).unwrap();
+        verify_strfry_event(packed.view(), &ev).unwrap();
+
+        let refused = |key: &str, value: Value| {
+            let mut changed = ev.clone();
+            changed[key] = value;
+            verify_strfry_event(packed.view(), &changed)
+                .unwrap_err()
+                .to_string()
+        };
+        let other = || hex::encode([0x33; 32]);
+        assert_eq!(
+            refused("id", json!(other())),
+            "payload id differs from the packed record"
+        );
+        assert_eq!(
+            refused("pubkey", json!(other())),
+            "payload pubkey differs from the packed record"
+        );
+        assert_eq!(
+            refused("kind", json!(7)),
+            "payload kind differs from the packed record"
+        );
+        assert_eq!(
+            refused("created_at", json!(1)),
+            "payload created_at differs from the packed record"
+        );
+        assert_eq!(refused("content", json!("edited")), "bad event id");
+        assert_eq!(
+            refused("tags", json!([])),
+            format!("packed p tag {} is not in the payload", "22".repeat(32))
+        );
+        assert_eq!(
+            refused(
+                "tags",
+                json!([["p", "22".repeat(32)], ["client", "edited"]])
+            ),
+            "bad event id"
+        );
+        let mut sig = ev["sig"].as_str().unwrap().to_owned();
+        sig.replace_range(..2, if sig.starts_with("00") { "01" } else { "00" });
+        assert_eq!(refused("sig", json!(sig)), "bad signature");
+        assert_eq!(
+            refused("sig", json!("00".repeat(32))),
+            "unexpected sig size"
+        );
+        assert_eq!(refused("kind", json!("1")), "event kind was not an integer");
+        let mut missing = ev.clone();
+        missing.as_object_mut().unwrap().remove("sig");
+        assert_eq!(
+            verify_strfry_event(packed.view(), &missing)
+                .unwrap_err()
+                .to_string(),
+            "missing sig"
+        );
+    }
+
+    #[test]
+    fn stored_events_accept_the_legacy_preimage() {
+        // strfry hashed U+007F escaped; NIP-01 writes it verbatim.
+        let mut rng = rand::thread_rng();
+        let kp = Keypair::new(SECP256K1, &mut rng);
+        let mut ev = json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [],
+            "content": "del \u{7f}",
+            "pubkey": hex::encode(kp.x_only_public_key().0.serialize()),
+        });
+        let id = crate::legacy_event_id_hash(&ev).unwrap();
+        assert_ne!(id, crate::event_id_hash(&ev).unwrap());
+        ev["id"] = json!(hex::encode(id));
+        ev["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &kp).as_ref()));
+        let packed = crate::nostr_json_to_packed_event(&ev, &EventLimits::default()).unwrap();
+        verify_strfry_event(packed.view(), &ev).unwrap();
+        assert!(verify_nostr_event(packed.view(), &ev).is_err());
+    }
+
+    #[test]
+    fn stored_events_accept_hex_as_strfry_decoded_it() {
+        // strfry decoded hex in either case, after an optional `0x`, and
+        // stored the JSON as sent. The id hashes the pubkey as written.
+        let mut rng = rand::thread_rng();
+        let kp = Keypair::new(SECP256K1, &mut rng);
+        let pubkey = kp.x_only_public_key().0.serialize();
+        let mut ev = json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [],
+            "content": "upper",
+            "pubkey": hex::encode_upper(pubkey),
+        });
+        let id = crate::event_id_hash(&ev).unwrap();
+        ev["id"] = json!(format!("0x{}", hex::encode_upper(id)));
+        ev["sig"] = json!(hex::encode_upper(SECP256K1.sign_schnorr(&id, &kp).as_ref()));
+        let tags = PackedEventTagBuilder::default();
+        let packed = PackedEventBuilder::build(&id, &pubkey, 1_700_000_000, 1, 0, &tags).unwrap();
+        verify_strfry_event(packed.view(), &ev).unwrap();
+        // Lowercasing the pubkey changes the preimage.
+        ev["pubkey"] = json!(hex::encode(pubkey));
+        assert_eq!(
+            verify_strfry_event(packed.view(), &ev)
+                .unwrap_err()
+                .to_string(),
+            "bad event id"
+        );
+    }
+
+    /// The record strfry stores for `ev`, with these tags and expiration.
+    fn strfry_record(ev: &Value, expiration: u64, tags: &[(char, &[u8])]) -> PackedEvent {
+        let mut builder = PackedEventTagBuilder::default();
+        for (name, value) in tags {
+            builder.add(*name, value).unwrap();
+        }
+        let hex = |key: &str| from_hex_exact(ev[key].as_str().unwrap()).unwrap();
+        PackedEventBuilder::build(
+            &hex("id"),
+            &hex("pubkey"),
+            ev["created_at"].as_u64().unwrap(),
+            ev["kind"].as_u64().unwrap(),
+            expiration,
+            &builder,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stored_events_index_only_what_their_payload_carries() {
+        let long = "z".repeat(MAX_INDEXED_TAG_VAL_SIZE + 1);
+        let (p, e) = ([0x22; 32], [0xab; 32]);
+        let ev = sign_event(json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [
+                ["p", hex::encode(p), "wss://relay.example"],
+                ["e", hex::encode_upper(e)],
+                ["t", long],
+                ["t"],
+                ["client", "wok"],
+                ["expiration", "0200"],
+                ["expiration", "300"],
+            ],
+            "content": "tagged",
+        }));
+        let packed = |expiration, tags: &[(char, &[u8])]| strfry_record(&ev, expiration, tags);
+        let verify = |expiration, tags: &[(char, &[u8])]| {
+            verify_strfry_event(packed(expiration, tags).view(), &ev).map_err(|e| e.to_string())
+        };
+        // As strfry packed it: e and p decoded in either case, the long
+        // value dropped, the first expiration.
+        verify(200, &[('p', &p), ('e', &e), ('t', b"")]).unwrap();
+        // Tags left out, or in another order.
+        verify(200, &[('t', b""), ('p', &p)]).unwrap();
+
+        let forged = [0x33; 32];
+        let stray = |tags: &[(char, &[u8])], error: String| {
+            assert_eq!(verify(200, tags).unwrap_err(), error);
+        };
+        // Another recipient for recipient-only reads, another deletion target.
+        stray(
+            &[('p', &forged)],
+            format!("packed p tag {} is not in the payload", "33".repeat(32)),
+        );
+        stray(
+            &[('p', &p), ('e', &forged)],
+            format!("packed e tag {} is not in the payload", "33".repeat(32)),
+        );
+        // A value the payload does not carry.
+        stray(
+            &[('p', &p), ('t', b"wok")],
+            r#"packed t tag "wok" is not in the payload"#.into(),
+        );
+        // A long value as Wok's ingest packs it, hashed, but not another's
+        // hash.
+        verify(
+            200,
+            &[('p', &p), ('t', &indexed_tag_value(long.as_bytes()))],
+        )
+        .unwrap();
+        let other = indexed_tag_value(&[b'z'; MAX_INDEXED_TAG_VAL_SIZE + 2]).into_owned();
+        assert!(verify(200, &[('t', &other)])
+            .unwrap_err()
+            .starts_with("packed t tag "));
+        // A multi-letter tag is not indexed.
+        stray(
+            &[('c', b"wok")],
+            r#"packed c tag "wok" is not in the payload"#.into(),
+        );
+
+        // The expiration strfry packed and no other: clearing it would keep
+        // an expired event served.
+        for expiration in [0, 1, 300] {
+            assert_eq!(
+                verify(expiration, &[('p', &p)]).unwrap_err(),
+                format!(
+                    "packed expiration {expiration} differs from the 200 strfry packs from the payload"
+                )
+            );
+        }
+        let mut plain = ev.clone();
+        plain["tags"] = json!([]);
+        let plain = sign_event(plain);
+        assert_eq!(
+            verify_strfry_event(strfry_record(&plain, 1_700_000_100, &[]).view(), &plain)
+                .unwrap_err()
+                .to_string(),
+            "packed expiration 1700000100 differs from the 0 strfry packs from the payload"
+        );
+    }
+
+    #[test]
+    fn stored_events_whose_expiration_strfry_refused_are_refused() {
+        // 0 and 1 mean no expiry and ephemeral to Wok, so a payload whose
+        // first expiration is not a time strfry packed must not verify with
+        // either.
+        for (kind, tags, value) in [
+            (1, json!([["expiration", "0"]]), r#""0""#),
+            (1, json!([["expiration", "1"]]), r#""1""#),
+            (1, json!([["expiration", "99"]]), r#""99""#),
+            (
+                1,
+                json!([["expiration", "soon"], ["expiration", "1700000100"]]),
+                r#""soon""#,
+            ),
+            (1, json!([["expiration"]]), r#""""#),
+            (20001, json!([["expiration", "0"]]), r#""0""#),
+        ] {
+            let ev = sign_event(json!({
+                "created_at": 1_700_000_000u64,
+                "kind": kind,
+                "tags": tags,
+                "content": "",
+            }));
+            for expiration in [0, 1, 1_700_000_100] {
+                assert_eq!(
+                    verify_strfry_event(strfry_record(&ev, expiration, &[]).view(), &ev)
+                        .unwrap_err()
+                        .to_string(),
+                    format!("payload expiration {value} is not a time strfry packs"),
+                    "{tags} packed with {expiration}"
+                );
+            }
+        }
+        let ev = sign_event(json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [["expiration", 5]],
+            "content": "",
+        }));
+        assert_eq!(
+            verify_strfry_event(strfry_record(&ev, 0, &[]).view(), &ev)
+                .unwrap_err()
+                .to_string(),
+            "payload expiration is not a string"
+        );
+    }
+
+    #[test]
+    fn stored_events_keep_their_first_recipient() {
+        // Recipient-only reads admit the first 32-byte packed p.
+        let (a, b) = ([0xaa; 32], [0xbb; 32]);
+        let ev = sign_event(json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 4,
+            "tags": [
+                ["p", format!("0x{}", "cc".repeat(31))],
+                ["p", hex::encode(a)],
+                ["p", hex::encode(b)],
+            ],
+            "content": "dm",
+        }));
+        let short = [0xcc; 31];
+        let verify = |tags: &[(char, &[u8])]| {
+            verify_strfry_event(strfry_record(&ev, 0, tags).view(), &ev)
+                .map_err(|error| error.to_string())
+        };
+        // As strfry packed it, a 31-byte p from `0x` hex included.
+        verify(&[('p', &short), ('p', &a), ('p', &b)]).unwrap();
+        // Later or shorter p tags left out.
+        verify(&[('p', &a)]).unwrap();
+        verify(&[('p', &short), ('p', &a)]).unwrap();
+        // The first recipient swapped or left out.
+        let differs = |first: &str| {
+            format!(
+                "packed recipient {first} differs from the payload's {}",
+                "aa".repeat(32)
+            )
+        };
+        assert_eq!(
+            verify(&[('p', &b), ('p', &a)]).unwrap_err(),
+            differs(&"bb".repeat(32))
+        );
+        assert_eq!(verify(&[('p', &b)]).unwrap_err(), differs(&"bb".repeat(32)));
+        assert_eq!(verify(&[('p', &short)]).unwrap_err(), differs("none"));
+        assert_eq!(verify(&[]).unwrap_err(), differs("none"));
+    }
+
+    #[test]
+    fn stored_events_keep_the_address_their_payload_names() {
+        let event = |kind: u64, tags: Value| {
+            sign_event(json!({
+                "created_at": 1_700_000_000u64,
+                "kind": kind,
+                "tags": tags,
+                "content": "",
+            }))
+        };
+        let verify = |ev: &Value, expiration, tags: &[(char, &[u8])]| {
+            verify_strfry_event(strfry_record(ev, expiration, tags).view(), ev)
+                .map_err(|error| error.to_string())
+        };
+        let long = "y".repeat(MAX_INDEXED_TAG_VAL_SIZE + 1);
+        let tagged = json!([["d", long], ["d", "x"], ["expiration", "1000"]]);
+        // As strfry packed them: an empty d first for replaceable kinds, kind
+        // 41 among them, and last for addressable ones; a long d dropped;
+        // the ephemeral marker.
+        for (kind, expiration, tags) in [
+            (0, 1000, &[('d', &b""[..]), ('d', b"x")][..]),
+            (41, 1000, &[('d', b""), ('d', b"x")]),
+            (10002, 1000, &[('d', b""), ('d', b"x")]),
+            (30023, 1000, &[('d', b"x"), ('d', b"")]),
+            (20001, 1, &[('d', b"x")]),
+            (1, 1000, &[('d', b"x")]),
+        ] {
+            let ev = event(kind, tagged.clone());
+            verify(&ev, expiration, tags).unwrap_or_else(|error| panic!("kind {kind}: {error}"));
+        }
+        // Kind 41 is regular to Wok, so its empty d is allowed, not needed.
+        verify(&event(41, tagged.clone()), 1000, &[('d', b"x")]).unwrap();
+        // Wok's ingest packs a long first d hashed, as the address.
+        let hashed = indexed_tag_value(long.as_bytes());
+        verify(
+            &event(30023, tagged.clone()),
+            1000,
+            &[('d', &hashed), ('d', b"x"), ('d', b"")],
+        )
+        .unwrap();
+        // Without a d of its own, an addressable event's address is empty.
+        verify(&event(30023, json!([])), 0, &[('d', b"")]).unwrap();
+        // A payload d listed first moves a replaceable event's address, and
+        // a leading empty d moves an addressable one's.
+        for (kind, tags, error) in [
+            (
+                10002,
+                &[('d', &b"x"[..]), ('d', b"")][..],
+                r#"packed address "x" differs from the payload's """#,
+            ),
+            (
+                30023,
+                &[('d', b""), ('d', b"x")],
+                r#"packed address "" differs from the payload's "x""#,
+            ),
+            (
+                30023,
+                &[],
+                r#"packed address none differs from the payload's "x""#,
+            ),
+            (
+                0,
+                &[],
+                r#"packed address none differs from the payload's """#,
+            ),
+        ] {
+            let ev = event(kind, tagged.clone());
+            assert_eq!(verify(&ev, 1000, tags).unwrap_err(), error, "kind {kind}");
+        }
+        // Only the kinds strfry gave one carry an empty d.
+        assert_eq!(
+            verify(&event(1, json!([])), 0, &[('d', b"")]).unwrap_err(),
+            r#"packed d tag "" is not in the payload"#
+        );
+        // The ephemeral marker is for ephemeral kinds, and an ephemeral
+        // record carries it, not 0 or its own expiration.
+        assert_eq!(
+            verify(&event(1, json!([])), 1, &[]).unwrap_err(),
+            "packed expiration 1 differs from the 0 strfry packs from the payload"
+        );
+        for expiration in [0, 1000] {
+            assert_eq!(
+                verify(&event(20001, tagged.clone()), expiration, &[('d', b"x")]).unwrap_err(),
+                format!(
+                    "packed expiration {expiration} differs from the 1 strfry packs from the payload"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn payload_tags_strfry_could_not_pack_vouch_for_nothing() {
+        for (tags, packed) in [
+            (json!([["p", "22"]]), ('p', &b"\x22"[..])),
+            (
+                json!([["p", "22".repeat(32), "x"], ["p", "2".repeat(63)]]),
+                ('p', &[0x22; 31][..]),
+            ),
+            (json!([["t", 1]]), ('t', b"1")),
+            (json!([["\u{e9}", "x"]]), ('\u{e9}', b"x")),
+            (json!({"t": "x"}), ('t', b"x")),
+        ] {
+            let ev = sign_event(json!({
+                "created_at": 1_700_000_000u64,
+                "kind": 1,
+                "tags": tags,
+                "content": "",
+            }));
+            let error = verify_strfry_event(strfry_record(&ev, 0, &[packed]).view(), &ev)
+                .unwrap_err()
+                .to_string();
+            assert!(error.ends_with("is not in the payload"), "{tags}: {error}");
+        }
     }
 
     #[test]

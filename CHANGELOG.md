@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `wok migrate strfry` verifies every event against its stored payload
+  before it migrates the database (#55). The payload must name the packed
+  record's id, pubkey, kind and created_at, hash to that id, and carry a
+  valid signature by that pubkey. The packed record, which every index,
+  recipient-only read, replacement, deletion and expiry uses, must index
+  nothing the payload does not carry: each packed tag is one of the
+  payload's (or the empty `d` strfry adds), a replaceable or addressable
+  event keeps the payload's address, the first recipient is the payload's,
+  and the expiration is the one strfry writes. Integrity checked only that
+  the indexes match the packed records, so a strfry database written by
+  `strfry import --no-verify` or `--fried`, or edited by hand, could migrate
+  an event the relay then served for queries it does not match, filed under
+  a recipient, address, deletion target or expiry its author did not sign,
+  or not signed at all. A source holding such an event is refused, and up to
+  100 of them are named by local ID, id and reason; `--check` reports the
+  same. Verification spreads over every core, or half of them for `--check`,
+  which may run beside strfry: a million events took about 4 s on a 14-core
+  Apple M4 Max.
 - A file that gives a kind more readers than its preset does is warned about
   when the relay starts, and by `wok doctor` in a new `read-classes` check
   (#163). `relay.auth.recipient_only_kinds = []`, `owner_only_kinds = []` or
@@ -34,6 +52,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     writer, so one queued before a reload made AUTH unusable is refused too.
     Before, it was stored and every read of it refused. NIP-62 vanish
     requests are still accepted whatever their class.
+- The writer checks NIP-70 protected events and `relay.auth.owner_only_kinds`
+  again under its own configuration before it stores or broadcasts them, as
+  it does `accepted_kinds` and the write policy. An event queued before a
+  reload made AUTH unusable, or moved its kind into `owner_only_kinds`, was
+  stored and answered `OK true`; it now gets the refusal the ingester would
+  give, counted under `owner_only_kinds` unless the event is protected, but
+  `restricted:` instead of `auth-required:` when the connection holds no
+  challenge, which only the ingester can issue. NIP-62 vanish requests are
+  still exempt.
 - Limits on what an unauthenticated client can make the relay hold or do
   before its budgets apply:
   - **Compressed messages** may inflate to half of
@@ -220,6 +247,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `relay.search_enabled` turns NIP-50 search off (#153). Search was served
+  and advertised in every configuration, so its query parser and ranked scan
+  were reachable even in the `minimal` attack-surface profile, which turns
+  off every capability a setting can. Off, NIP-11 no longer lists NIP-50, and
+  a REQ or COUNT whose filters carry `search` gets `CLOSED`
+  `blocked: bad req: search disabled`, a NEG-OPEN `NEG-ERR`
+  `blocked: search disabled`, before any filter is parsed; each is counted
+  by `wok_refusals_total{setting="relay.search_enabled"}`. It defaults to
+  `true`, reloads live, is on the dashboard, and turning it on or off is
+  logged as a security-scope change. Subscriptions already open keep their
+  search filters until they close, and the search index stays current, so
+  turning search back on answers from a complete index.
 - `wok doctor` has a `config-public-values` check under any preset but
   `public` (#97). It names each setting the file pins to the `public`
   preset's value where its own preset gives another. A copy of the 0.7
@@ -439,6 +478,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps them, and verification compares the result with the original's
   fingerprint without them.
 
+- `relay.real_ip_header = "forwarded"` reads the RFC 7239 `Forwarded`
+  header (#155): the client is the `for` of its last element, quoted or not,
+  an IPv4 address with or without a port, or an IPv6 address in brackets.
+  Behind a proxy that writes `Forwarded`, such as HAProxy's
+  `option forwarded`, every client had the proxy's address and shared its
+  per-address budgets, NIP-86 IP blocks could not single one out, and each
+  request was counted in `wok_real_ip_header_unparsed_total`. The syntax
+  follows from the header's name; any other header is still an address
+  list. The last element is found from the right, so nothing a client sends
+  ahead of it moves it. One that names no address, such as `for=unknown` or
+  an obfuscated `for=_hidden`, still leaves the connecting address and is
+  counted. The ingress fuzz target covers both syntaxes.
 - NIP-86 `unbanevent`, `unallowevent`, `listallowedevents` and
   `listdisallowedkinds`, from the current NIP-86 draft. `allowevent` also
   puts the event on an allow list, with its optional reason, which
@@ -721,6 +772,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decoding a zstd-compressed payload no longer zeroes a buffer as large as
+  its size bound first. Reindex, search backfill and integrity bound it at
+  16 MiB and spent about 75 µs per compressed event zeroing it, more than a
+  Schnorr signature check takes; relay reads bound it by
+  `events.max_event_size`.
 - An `authors` and `kinds` filter past 1,000 (author, kind) pairs under a
   small `limit` no longer reads every event the authors wrote when they
   rarely publish those kinds. A picture feed (`kinds [20,21]`, `limit 50`) of
@@ -988,6 +1044,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a framing error, 1007 for a compressed message that does not inflate
   and 1009 for one too large. Before, the connection dropped with no Close
   frame, as a read timeout still does.
+- A client's WebSocket Close frame is checked before the relay echoes it, as
+  RFC 6455 §5.5.1 and §7.4 require. A 1-byte body or a status code that may
+  not be sent, such as 1005 or 1016, closes the connection with 1002, and a
+  reason that is not UTF-8 with 1007. Before, any body was echoed as sent.
+  Each connection failed for breaking the protocol is now logged as `client
+  terminated` with the `reason` and `close_code`, as a pong timeout is.
 
 ## [0.7.0] - 2026-09-08
 

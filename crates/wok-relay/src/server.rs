@@ -161,6 +161,8 @@ enum OutboundSendError {
 /// A connection's outbound queue and the gate in front of it.
 struct ConnEntry {
     out: Outbound,
+    /// The client's address, for NIP-86 `blockip` to close the connection.
+    ip: Option<std::net::IpAddr>,
     /// Held while a frame is queued for the connection, together with the
     /// gate check that admits it.
     state: Mutex<ConnState>,
@@ -229,14 +231,38 @@ impl ConnTable {
     }
 
     fn insert(&self, id: u64, out: Outbound) {
+        self.insert_from(id, out, None);
+    }
+
+    fn insert_from(&self, id: u64, out: Outbound, ip: Option<std::net::IpAddr>) {
         let entry = Arc::new(ConnEntry {
             out,
+            ip,
             state: Mutex::new(ConnState {
                 subs: SubGate::default(),
                 gone: false,
             }),
         });
         self.shard(id).write().insert(id, entry);
+    }
+
+    /// Close each connection whose address is in `blocked`: a block is
+    /// otherwise checked only when a connection opens. Returns how many it
+    /// closed.
+    fn kill_blocked(&self, blocked: &HashMap<String, String>) -> usize {
+        let mut closed = 0;
+        for shard in self.shards.iter() {
+            for entry in shard.read().values() {
+                if entry
+                    .ip
+                    .is_some_and(|ip| blocked.contains_key(&ip.to_string()))
+                {
+                    entry.out.kill();
+                    closed += 1;
+                }
+            }
+        }
+        closed
     }
 
     fn remove(&self, id: u64) {
@@ -1207,7 +1233,18 @@ impl RelayHandle {
     ) -> ConnectionGuard {
         let conn_id = self.next_conn_id();
         let gate = out.gate.clone();
-        self.conns.insert(conn_id, out);
+        let kill = out.killed();
+        self.conns.insert_from(conn_id, out, source.ip());
+        // A blockip that committed after this connection was admitted closed
+        // the connections in the table before it was there.
+        if source.ip().is_some_and(|ip| {
+            self.moderation
+                .read()
+                .blocked_ips
+                .contains_key(&ip.to_string())
+        }) {
+            kill.notify_one();
+        }
         self.metrics
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -5874,6 +5911,46 @@ mod tests {
 
     fn local_source() -> TransportSource {
         TransportSource::ip_address("127.0.0.1".parse().unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blockip_closes_the_open_connections_from_its_address() {
+        // A block was checked only when a connection opened, so a blocked
+        // client's open WebSocket kept reading and publishing (#164).
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        let connect = |ip: &'static str| {
+            let handle = &handle;
+            async move {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+                let out = Outbound::new(tx, 0);
+                let killed = out.killed();
+                let source = TransportSource::ip_address(ip.parse().unwrap());
+                let conn = handle.register_connection(source, out).await;
+                (conn, rx, killed)
+            }
+        };
+        let closed = |killed: Arc<tokio::sync::Notify>, within: Duration| async move {
+            tokio::time::timeout(within, killed.notified())
+                .await
+                .is_ok()
+        };
+        let (_blocked, _rx, blocked) = connect("203.0.113.7").await;
+        let (_other, _rx2, other) = connect("203.0.113.8").await;
+        handle
+            .manage(ManagementCmd::BlockIp {
+                ip: "203.0.113.7".into(),
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+        // Told to close by the time the block is acknowledged.
+        assert!(closed(blocked, Duration::ZERO).await);
+        assert!(!closed(other, Duration::from_millis(100)).await);
+        // One admitted before the block and registered after it is closed
+        // as it registers.
+        let (_late, _rx3, late) = connect("203.0.113.7").await;
+        assert!(closed(late, Duration::ZERO).await);
+        handle.request_shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

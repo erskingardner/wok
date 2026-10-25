@@ -64,7 +64,9 @@ Every request on the listener passes these steps before Wok looks at its path:
    address leaves the connecting address and is counted in
    `wok_real_ip_header_unparsed_total`; no header leaves it too.
 3. An address blocked with NIP-86 `blockip` gets 429, and so does one whose
-   per-address connection budget (`relay.abuse.connection_*`) is spent.
+   per-address connection budget (`relay.abuse.connection_*`) is spent. A
+   `blockip` also closes the WebSocket connections already open from that
+   address when it commits.
 
 Wok does not check the method on the public paths: every method gets the same
 answer, except `OPTIONS`, which gets the CORS preflight (204), and a `POST` to

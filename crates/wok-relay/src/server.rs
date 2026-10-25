@@ -2700,62 +2700,12 @@ fn ingest_event(
         return;
     }
 
-    let mut found_protected = false;
-    packed.foreach_tag(|n, _| {
-        if n == PROTECTED_TAG {
-            found_protected = true;
-            return false;
-        }
-        true
-    });
-
-    // NIP-70 protected events, and kinds only their author may read, such as
-    // NIP-78 app data, are accepted only on a connection authenticated as
-    // their author.
-    let owner_only = cfg.relay.auth.owner_only_kinds.contains(&packed.kind());
-    let mut authed = None;
-    if (found_protected || owner_only) && !is_vanish_request {
-        let refusal = if !cfg.auth_usable() {
-            Some(if found_protected {
-                "blocked: event marked as protected".to_string()
-            } else {
-                format!(
-                    "restricted: kind {} needs AUTH as its author, which this relay does not offer",
-                    packed.kind()
-                )
-            })
-        } else {
-            let auth_required = || {
-                if found_protected {
-                    "auth-required: event marked as protected".to_string()
-                } else {
-                    format!(
-                        "auth-required: kind {} is accepted only from its author",
-                        packed.kind()
-                    )
-                }
-            };
-            match auth.get(&conn_id) {
-                None => {
-                    issue_challenge(conns, metrics, auth, conn_id);
-                    Some(auth_required())
-                }
-                Some(asess) if asess.authed.is_none() => Some(auth_required()),
-                Some(asess) => {
-                    let pk: [u8; 32] = packed.pubkey().try_into().unwrap();
-                    if asess.identities.contains(&pk) {
-                        authed = Some(pk);
-                        None
-                    } else {
-                        Some("restricted: must be published by the author".to_string())
-                    }
-                }
-            }
-        };
-        if let Some(message) = refusal {
-            // A protected event is refused by NIP-70 whatever its kind.
-            if owner_only && !found_protected {
-                metrics.refused(Setting::OwnerOnlyKinds);
+    // The write-policy plugin is told the author's AUTH where it was required.
+    let authed = match check_author_auth(cfg, metrics, packed, &grant) {
+        Ok(required) => required.then(|| packed.pubkey().try_into().unwrap()),
+        Err(message) => {
+            if message.starts_with("auth-required:") {
+                issue_challenge(conns, metrics, auth, conn_id);
             }
             conns.send(
                 conn_id,
@@ -2768,7 +2718,7 @@ fn ingest_event(
             );
             return;
         }
-    }
+    };
 
     {
         // Preserve the cheap duplicate fast path before write-policy plugins
@@ -2817,6 +2767,54 @@ fn ingest_event(
         authed,
         grant,
     });
+}
+
+/// NIP-70 protected events, and kinds only their author may read, such as
+/// NIP-78 app data, are accepted only while AUTH is usable and from a
+/// connection that had authenticated as their author. `Ok` says whether the
+/// event needed that; `Err` is the refusal. The ingester and the writer each
+/// check with their own configuration: a reload may make AUTH unusable, or
+/// move a kind into `owner_only_kinds`, while an event waits for the writer.
+/// NIP-62 vanish requests are exempt. A refused owner-only kind is counted
+/// under `owner_only_kinds` unless the event is protected, which NIP-70
+/// refuses whatever its kind.
+fn check_author_auth(
+    cfg: &Config,
+    metrics: &Metrics,
+    event: PackedEventView<'_>,
+    grant: &WriteGrant,
+) -> Result<bool, String> {
+    let kind = event.kind();
+    let mut protected = false;
+    event.foreach_tag(|n, _| {
+        protected = n == PROTECTED_TAG;
+        !protected
+    });
+    let owner_only = cfg.relay.auth.owner_only_kinds.contains(&kind);
+    if !(protected || owner_only) || kind == VANISH_KIND {
+        return Ok(false);
+    }
+    let refusal = if !cfg.auth_usable() {
+        if protected {
+            "blocked: event marked as protected".to_string()
+        } else {
+            format!(
+                "restricted: kind {kind} needs AUTH as its author, which this relay does not offer"
+            )
+        }
+    } else if grant.as_author {
+        return Ok(true);
+    } else if grant.authenticated {
+        "restricted: must be published by the author".to_string()
+    } else if protected {
+        "auth-required: event marked as protected".to_string()
+    } else {
+        format!("auth-required: kind {kind} is accepted only from its author")
+    };
+    if !protected {
+        metrics.refused(Setting::OwnerOnlyKinds);
+    }
+    Err(refusal)
 }
 
 /// The refusal for an EVENT that its claimed kind alone decides, counted
@@ -4933,6 +4931,7 @@ mod tests {
                 authed: None,
                 grant: WriteGrant {
                     authenticated: false,
+                    as_author: false,
                     member: Some(author),
                     inbox: false,
                 },
@@ -5029,6 +5028,7 @@ mod tests {
                     authed: None,
                     grant: WriteGrant {
                         authenticated: false,
+                        as_author: false,
                         member: Some(recipient),
                         inbox: true,
                     },
@@ -5186,6 +5186,135 @@ mod tests {
                 assert_eq!(entries, 0);
                 assert_eq!(metrics.refusals.get(Setting::RecipientOnlyKinds), 1);
             }
+        }
+    }
+
+    #[test]
+    fn the_writer_rechecks_the_authors_auth() {
+        // Queued by the author's own connection, and taken by a writer whose
+        // configuration a reload changed: AUTH became unusable, or kind 7
+        // became owner-only. A vanish request is honored whatever it carries.
+        let author = [8u8; 32];
+        let as_author = WriteGrant {
+            authenticated: true,
+            as_author: true,
+            ..WriteGrant::default()
+        };
+        let as_other = WriteGrant {
+            authenticated: true,
+            ..WriteGrant::default()
+        };
+        // (AUTH usable, kind, protected, grant, refusal, owner-only refusals)
+        for (auth_usable, kind, protected, grant, refusal, owner_refusals) in [
+            (
+                false,
+                30078,
+                false,
+                as_author,
+                Some(
+                    "restricted: kind 30078 needs AUTH as its author, which this relay does not \
+                     offer",
+                ),
+                1,
+            ),
+            (
+                false,
+                1,
+                true,
+                as_author,
+                Some("blocked: event marked as protected"),
+                0,
+            ),
+            (false, VANISH_KIND, true, as_author, None, 0),
+            (
+                true,
+                7,
+                false,
+                WriteGrant::default(),
+                Some("auth-required: kind 7 is accepted only from its author"),
+                1,
+            ),
+            (
+                true,
+                7,
+                false,
+                as_other,
+                Some("restricted: must be published by the author"),
+                1,
+            ),
+            (true, 7, false, as_author, None, 0),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config::default();
+            config.db = dir.path().to_path_buf();
+            config.relay.auth.owner_only_kinds.extend([7, VANISH_KIND]);
+            if auth_usable {
+                config.relay.auth.service_url = "wss://relay.example.com".into();
+            }
+            assert_eq!(config.auth_usable(), auth_usable);
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let id = [9u8; 32];
+            let mut tags = PackedEventTagBuilder::default();
+            if protected {
+                tags.add(PROTECTED_TAG, b"").unwrap();
+            }
+            let packed = PackedEventBuilder::build(&id, &author, 1, kind, 0, &tags).unwrap();
+            let mut json_tags = vec![json!(["relay", "ALL_RELAYS"])];
+            if protected {
+                json_tags.push(json!(["-"]));
+            }
+            let json = json!({
+                "id": to_hex(&id), "pubkey": to_hex(&author), "created_at": 1, "kind": kind,
+                "tags": json_tags, "content": "", "sig": "00".repeat(64),
+            })
+            .to_string();
+            let (writer_tx, writer_rx) = bounded(4);
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: grant.as_author.then_some(author),
+                    grant,
+                })
+                .unwrap();
+            drop(writer_tx);
+            let metrics = Arc::new(Metrics::default());
+            run_writer(
+                env.clone(),
+                Arc::new(parking_lot::RwLock::new(config)),
+                conns,
+                metrics.clone(),
+                writer_rx,
+                Vec::new(),
+                Arc::new(parking_lot::RwLock::new(Default::default())),
+                TAG_KIND_STEP,
+            );
+            let response = out_rx.try_recv().unwrap().into_text();
+            let entries = env.begin_ro().unwrap().entries(env.dbis().event).unwrap();
+            let refusals: u64 = metrics.refusals.counts().map(|(_, count)| count).sum();
+            let case = format!("kind {kind}, protected {protected}, {grant:?}");
+            match refusal {
+                None => {
+                    assert!(response.contains("true"), "{case}: {response}");
+                    assert_eq!(entries, 1, "{case}");
+                }
+                Some(refusal) => {
+                    assert!(response.contains(refusal), "{case}: {response}");
+                    assert_eq!(entries, 0, "{case}");
+                }
+            }
+            assert_eq!(
+                metrics.refusals.get(Setting::OwnerOnlyKinds),
+                owner_refusals,
+                "{case}"
+            );
+            assert_eq!(refusals, owner_refusals, "{case}");
         }
     }
 

@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     writer, so one queued before a reload made AUTH unusable is refused too.
     Before, it was stored and every read of it refused. NIP-62 vanish
     requests are still accepted whatever their class.
+- The writer checks NIP-70 protected events and `relay.auth.owner_only_kinds`
+  again under its own configuration before it stores or broadcasts them, as
+  it does `accepted_kinds` and the write policy. An event queued before a
+  reload made AUTH unusable, or moved its kind into `owner_only_kinds`, was
+  stored and answered `OK true`; it now gets the refusal the ingester would
+  give, counted under `owner_only_kinds` unless the event is protected.
+  NIP-62 vanish requests are still exempt.
 - Limits on what an unauthenticated client can make the relay hold or do
   before its budgets apply:
   - **Compressed messages** may inflate to half of

@@ -121,6 +121,9 @@ pub fn stored_is_member(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriteGrant {
     pub authenticated: bool,
+    /// The connection had authenticated as the event's author, which NIP-70
+    /// protected events and `owner_only_kinds` require whatever the policy.
+    pub as_author: bool,
     pub member: Option<[u8; 32]>,
     /// The member is the recipient of one of `inbox_kinds`, which must
     /// still list the event's kind.
@@ -140,14 +143,15 @@ impl WriteGrant {
         identities: &[[u8; 32]],
     ) -> Self {
         let auth = &cfg.relay.auth;
+        let author: Option<[u8; 32]> = event.pubkey().try_into().ok();
         let mut grant = Self {
             authenticated: !identities.is_empty(),
+            as_author: author.is_some_and(|author| identities.contains(&author)),
             ..Self::default()
         };
         if auth.write_policy != AccessPolicy::Members {
             return grant;
         }
-        let author: Option<[u8; 32]> = event.pubkey().try_into().ok();
         grant.member = author
             .into_iter()
             .chain(identities.iter().copied())
@@ -316,6 +320,10 @@ mod tests {
         let authed = grant(&throwaway, 445, &outsider, &[outsider], &cfg);
         assert_eq!(authed.member, None);
         assert!(authed.admits(&cfg));
+        // Whether one of the identities is the author is recorded under
+        // every policy, for NIP-70 and `owner_only_kinds`.
+        assert!(!authed.as_author);
+        assert!(grant(&throwaway, 445, &outsider, &[outsider, throwaway], &cfg).as_author);
 
         // Members: the author, an AUTHed identity (C7), or an inbox kind's
         // first recipient.
@@ -426,7 +434,7 @@ mod tests {
         let grant = WriteGrant {
             authenticated: true,
             member: Some(alice),
-            inbox: false,
+            ..WriteGrant::default()
         };
         assert!(!grant.stored_admits(&txn, &cfg, 1).unwrap());
         cfg.relay.auth.write_policy = AccessPolicy::Open;

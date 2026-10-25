@@ -1,7 +1,7 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 652
+## anonymous: 655
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -48,7 +48,7 @@
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_rw::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::index_event::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::ingest_event::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::check_author_auth::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_relay::server::writer::event_matches_vanish_markers::{closure}>
 <wok_event::packed::PackedEventView>::id
 <wok_event::packed::PackedEventView>::kind
@@ -264,6 +264,7 @@
 <wok_relay::metrics::Setting>::of_read_class
 <wok_relay::moderation::WriteGrant>::admits
 <wok_relay::moderation::WriteGrant>::new
+<wok_relay::moderation::WriteGrant>::new::{closure}
 <wok_relay::moderation::WriteGrant>::stored_admits
 <wok_relay::protocol::ClientCommand>::parse
 <wok_relay::protocol::ClientCommand>::parse::{closure}
@@ -566,6 +567,8 @@ wok_relay::server::admit_request::{closure}
 wok_relay::server::broadcast_stored::<u64>
 wok_relay::server::broadcast_stored::<u64>::{closure}
 wok_relay::server::bump_relay_metrics
+wok_relay::server::check_author_auth
+wok_relay::server::check_author_auth::{closure}
 wok_relay::server::check_query_work
 wok_relay::server::close_req
 wok_relay::server::count_event_limit

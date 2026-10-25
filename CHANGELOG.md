@@ -440,6 +440,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps them, and verification compares the result with the original's
   fingerprint without them.
 
+- `relay.real_ip_header = "forwarded"` reads the RFC 7239 `Forwarded`
+  header (#155): the client is the `for` of its last element, quoted or not,
+  an IPv4 address with or without a port, or an IPv6 address in brackets.
+  Behind a proxy that writes `Forwarded`, such as HAProxy's
+  `option forwarded`, every client had the proxy's address and shared its
+  per-address budgets, NIP-86 IP blocks could not single one out, and each
+  request was counted in `wok_real_ip_header_unparsed_total`. The syntax
+  follows from the header's name; any other header is still an address
+  list. The last element is found from the right, so nothing a client sends
+  ahead of it moves it. One that names no address, such as `for=unknown` or
+  an obfuscated `for=_hidden`, still leaves the connecting address and is
+  counted. The ingress fuzz target covers both syntaxes.
 - NIP-86 `unbanevent`, `unallowevent`, `listallowedevents` and
   `listdisallowedkinds`, from the current NIP-86 draft. `allowevent` also
   puts the event on an allow list, with its optional reason, which
@@ -989,6 +1001,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a framing error, 1007 for a compressed message that does not inflate
   and 1009 for one too large. Before, the connection dropped with no Close
   frame, as a read timeout still does.
+- A client's WebSocket Close frame is checked before the relay echoes it, as
+  RFC 6455 §5.5.1 and §7.4 require. A 1-byte body or a status code that may
+  not be sent, such as 1005 or 1016, closes the connection with 1002, and a
+  reason that is not UTF-8 with 1007. Before, any body was echoed as sent.
+  Each connection failed for breaking the protocol is now logged as `client
+  terminated` with the `reason` and `close_code`, as a pong timeout is.
 
 ## [0.7.0] - 2026-09-08
 

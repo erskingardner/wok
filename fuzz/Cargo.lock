@@ -1467,6 +1467,7 @@ dependencies = [
 name = "wok-fuzz"
 version = "0.0.0"
 dependencies = [
+ "hyper",
  "libfuzzer-sys",
  "wok-db",
  "wok-event",

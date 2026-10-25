@@ -50,9 +50,10 @@ it is not a promise to reproduce upstream bugs.
   the proxy in front of it wrote, and accepts a port. Pinned strfry parses
   the value as one address, as Wok did through 0.7, so behind a proxy that
   appends to a client's own X-Forwarded-For the client gets the proxy's
-  address; in Wok, that let it escape a NIP-86 `blockip`. When the value is
-  not an address both fall back to the connecting address; strfry logs
-  every such request, and Wok counts them in
+  address; in Wok, that let it escape a NIP-86 `blockip`. Wok reads a
+  `Forwarded` header as RFC 7239, taking its last element's `for`, which
+  strfry cannot parse. When the value names no address both fall back to the
+  connecting address; strfry logs every such request, and Wok counts them in
   `wok_real_ip_header_unparsed_total` and warns at most once a minute.
 
 - Latest-only replaceable reads are enforced independently of physical
@@ -132,6 +133,13 @@ it is not a promise to reproduce upstream bugs.
   and continuation frames once permessage-deflate is negotiated. A binary
   message that is not UTF-8 is still refused with a NOTICE, like any other
   message that is not JSON.
+- A client's Close frame is echoed only when its body is valid (RFC 6455
+  §5.5.1, §7.4). A 1-byte body, or a status code below 1000, 1004–1006,
+  1015, 1016–2999 or 5000 and above, fails the connection with 1002, and a
+  reason that is not UTF-8 with 1007. The IANA-registered 1012–1014 and all
+  of 3000–3999 are accepted. The pinned strfry's uWebSockets answers any
+  invalid Close body with an empty Close frame instead, and counts 1012–3999
+  as invalid.
 - `wok sync` classifies a peer's negative upload ACK as superseded only when
   its reason starts with `blocked: have a newer version` (Wok's reason) or
   `replaced:` (what strfry and earlier Wok releases send). A foreign peer

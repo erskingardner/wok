@@ -8,6 +8,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+hyper = "1"
 libfuzzer-sys = "0.4"
 wok-db = { path = "../crates/wok-db" }
 wok-event = { path = "../crates/wok-event" }

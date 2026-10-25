@@ -8,8 +8,8 @@ Plain HTTP serves NIP-11 (`Accept: application/nostr+json`), the landing page an
 
 - `Cargo.toml`
 - `build.rs` — embeds `WOK_GIT_HASH` for NIP-11 / landing footer
-- `src/` — listener, dispatch, frame codec, admin API
-- `tests/` — frame property tests
+- `src/` — listener, dispatch, client address header, frame codec, admin API
+- `tests/` — frame and client address header property tests
 
 Nagle is disabled (`TCP_NODELAY`) on accepted streams. Outbound is bounded by pending bytes, not message count. Mesh *client* links in the CLI still use tungstenite and do not speak deflate.
 

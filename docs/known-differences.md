@@ -188,6 +188,12 @@ regression test. Differential parity alone is not a reason to retain it.
   pinned strfry still challenges and then rejects every AUTH. An authenticated
   COUNT that is not scoped to an authenticated key is `restricted:`, not
   another `auth-required:`. `relay.auth.enabled = false` now also refuses AUTH.
+- NIP-42: an AUTH event's `relay` tag is compared with `relay.auth.service_url`
+  scheme and path included. Pinned strfry compares only the host and port,
+  so on a host that serves several relays by path, each accepted an AUTH
+  signed for another, and `ws://host` matched `wss://host`. The path is
+  compared as written, case included; the host's case, a query, trailing
+  slashes and the port the scheme implies do not matter.
 - NIP-42: while AUTH is usable, the challenge is sent when the connection
   opens, not only after a restricted request is refused. A client can then
   authenticate before its first REQ, so a restricted live subscription such

@@ -83,8 +83,8 @@ pub use tag_kind::{
 pub use txn::{RoTxn, RwTxn};
 pub use vanish::{
     backfill_vanish_markers, is_event_vanished_ro, is_event_vanished_rw, mark_vanished,
-    sweep_vanished_events, vanish_timestamp_ro, vanish_timestamp_rw, VanishPolicy, ALL_RELAYS,
-    VANISH_KIND,
+    normalize_relay_url, sweep_vanished_events, vanish_timestamp_ro, vanish_timestamp_rw,
+    VanishPolicy, ALL_RELAYS, VANISH_KIND,
 };
 pub use write::{
     delete_event_basic, delete_events, lookup_event_by_id, most_recent_levid, write_events,

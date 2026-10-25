@@ -81,11 +81,63 @@ struct Session {
     filter: NostrFilterGroup,
 }
 
+/// Handles whose sessions a sweep closed, each with the count of messages
+/// the worker had taken or had queued when the sweep started. A NEG-MSG
+/// among those crossed the sweep's NEG-ERR: the client sent it before that
+/// NEG-ERR could reach it. The NEG-ERR said why the session closed, so the
+/// NEG-MSG is dropped rather than answered with a second NEG-ERR that would
+/// hide the reason. One sent later, when the client may have read the
+/// NEG-ERR, is answered as any unknown handle is.
+#[derive(Default)]
+struct Swept {
+    /// Messages taken from the channel so far.
+    taken: u64,
+    /// Messages taken or queued when the current sweep started.
+    through: u64,
+    handles: HashMap<(u64, String), u64>,
+}
+
+impl Swept {
+    /// Count a message taken from the channel.
+    fn took(&mut self, msg: Option<NegMsg>) -> Option<NegMsg> {
+        if msg.is_some() {
+            self.taken += 1;
+        }
+        msg
+    }
+
+    /// Start a sweep while `queued` messages wait behind the one in hand,
+    /// first forgetting what no message still to come can have crossed.
+    fn start(&mut self, queued: usize) {
+        let taken = self.taken;
+        self.handles.retain(|_, through| *through >= taken);
+        self.through = taken + queued as u64;
+    }
+
+    fn insert(&mut self, conn: u64, sid: &str) {
+        self.handles.insert((conn, sid.to_string()), self.through);
+    }
+
+    /// Whether the message in hand crossed the NEG-ERR of the sweep that
+    /// closed the session `key` names.
+    fn crossed(&self, key: &(u64, String)) -> bool {
+        self.handles
+            .get(key)
+            .is_some_and(|&through| self.taken <= through)
+    }
+
+    /// Forget a handle the client has opened or closed since.
+    fn forget(&mut self, conn: u64, sid: &str) {
+        self.handles.remove(&(conn, sid.to_string()));
+    }
+}
+
 /// Close `conn_id`'s sessions and scans: its identities changed, and with
 /// them what it may see.
 fn reauthenticated(
     sessions: &mut HashMap<(u64, String), Session>,
     queries: &mut QueryScheduler,
+    swept: &mut Swept,
     conns: &ConnTable,
     metrics: &Metrics,
     conn_id: u64,
@@ -99,6 +151,7 @@ fn reauthenticated(
                 sid,
                 "closed: authentication changed; reopen synchronization",
             );
+            swept.insert(*conn, sid);
             false
         } else {
             true
@@ -205,6 +258,7 @@ pub(super) fn run_negentropy(
     );
     queries.ensure_exists = false;
     let mut sessions: HashMap<(u64, String), Session> = HashMap::new();
+    let mut swept = Swept::default();
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut auth_epoch = 0;
     let mut policy = read_visibility(&initial_cfg, vec![]);
@@ -230,7 +284,7 @@ pub(super) fn run_negentropy(
         // handled here, a removal each. The configuration copy, read
         // transaction and pass over every session below then run once for
         // the run, not once per close, and scans still get their timeslice.
-        let mut msg = msg;
+        let mut msg = swept.took(msg);
         let mut closed = 0;
         for _ in 0..CLOSE_RUN {
             let Some(NegMsg::CloseSub { conn_id, sub_id }) = &msg else {
@@ -238,8 +292,9 @@ pub(super) fn run_negentropy(
             };
             queries.remove_sub(*conn_id, sub_id);
             sessions.remove(&(*conn_id, sub_id.to_string()));
+            swept.forget(*conn_id, sub_id.as_str());
             closed += 1;
-            msg = rx.try_recv().ok();
+            msg = swept.took(rx.try_recv().ok());
         }
         let closed_only = closed > 0 && msg.is_none();
         if !snapshot_due(closed_only, queries.has_running(), last_snapshot.elapsed()) {
@@ -247,10 +302,18 @@ pub(super) fn run_negentropy(
         }
         last_snapshot = Instant::now();
         let cfg = cfg.read().clone();
+        swept.start(rx.len());
         // A reload that made AUTH unusable ended every login, so a session
         // opened since sees what its connection no longer may.
         for conn_id in expire_logins(&mut authed, &mut auth_epoch, cfg.auth_epoch) {
-            reauthenticated(&mut sessions, &mut queries, &conns, &metrics, conn_id);
+            reauthenticated(
+                &mut sessions,
+                &mut queries,
+                &mut swept,
+                &conns,
+                &metrics,
+                conn_id,
+            );
         }
         let txn = match env.begin_ro() {
             Ok(txn) => txn,
@@ -287,6 +350,7 @@ pub(super) fn run_negentropy(
                         "closed: visibility changed; reopen synchronization"
                     },
                 );
+                swept.insert(*conn, sid);
                 false
             } else {
                 true
@@ -303,6 +367,7 @@ pub(super) fn run_negentropy(
                 queries.remove_sub(*conn, &SubId::new(sid).unwrap());
                 count_filter_limit(&metrics, &error);
                 fail(&conns, &metrics, *conn, sid, &neg_filter_refusal(&error));
+                swept.insert(*conn, sid);
                 false
             });
         }
@@ -324,6 +389,7 @@ pub(super) fn run_negentropy(
                     let conn = sub.conn_id;
                     let sid = sub.sub_id.to_string();
                     let key = (conn, sid.clone());
+                    swept.forget(conn, &sid);
                     // Sessions keep their filters for their lifetime, so a
                     // connection's sessions have a filter budget, as its live
                     // REQs and its COUNTs each do. The session this replaces
@@ -512,6 +578,9 @@ pub(super) fn run_negentropy(
                 } => {
                     let key = (conn_id, sub_id.to_string());
                     let mut valid = false;
+                    // Sent before the NEG-ERR of the sweep that closed its
+                    // session reached the client, so it is not answered.
+                    let swept_handle = !sessions.contains_key(&key) && swept.crossed(&key);
                     if let Some(session) = sessions.get_mut(&key) {
                         valid = match &mut session.view {
                             View::Memory { items, .. } if items.is_sealed() => send_vector(
@@ -542,7 +611,7 @@ pub(super) fn run_negentropy(
                             session.waiting_since = Some(Instant::now());
                         }
                     }
-                    if !valid {
+                    if !valid && !swept_handle {
                         sessions.remove(&key);
                         queries.remove_sub(conn_id, &sub_id);
                         fail(
@@ -559,21 +628,37 @@ pub(super) fn run_negentropy(
                     authed: pk,
                     epoch,
                 } => {
+                    swept.start(rx.len());
                     for conn_id in expire_logins(&mut authed, &mut auth_epoch, epoch) {
-                        reauthenticated(&mut sessions, &mut queries, &conns, &metrics, conn_id);
+                        reauthenticated(
+                            &mut sessions,
+                            &mut queries,
+                            &mut swept,
+                            &conns,
+                            &metrics,
+                            conn_id,
+                        );
                     }
                     // A login from an epoch a reload already ended is void.
                     if epoch == auth_epoch {
                         let identities = authed.entry(conn_id).or_default();
                         if !identities.contains(&pk) {
                             identities.push(pk);
-                            reauthenticated(&mut sessions, &mut queries, &conns, &metrics, conn_id);
+                            reauthenticated(
+                                &mut sessions,
+                                &mut queries,
+                                &mut swept,
+                                &conns,
+                                &metrics,
+                                conn_id,
+                            );
                         }
                     }
                 }
                 NegMsg::CloseSub { conn_id, sub_id } => {
                     queries.remove_sub(conn_id, &sub_id);
                     sessions.remove(&(conn_id, sub_id.to_string()));
+                    swept.forget(conn_id, sub_id.as_str());
                 }
                 NegMsg::Fail {
                     conn_id,
@@ -921,6 +1006,144 @@ mod tests {
         served(next(&mut out_rx), "tagged-again");
         drop(tx);
         worker.join().unwrap();
+    }
+
+    /// A NEG-MSG already queued for the worker when a sweep closed its
+    /// session gets no second NEG-ERR: the sweep's said why the session
+    /// closed, and "unknown subscription handle" after it would hide that.
+    /// A handle the worker never had is still unknown, as is a swept one
+    /// named after the sweep, when the client may have read its NEG-ERR.
+    #[test]
+    fn a_neg_msg_for_a_session_a_sweep_closed_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let (cfg, conns) = (cfg.clone(), conns.clone());
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let open = |sub_id: &str, filter: Value| {
+            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        let msg = |sub_id: &str| NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new(sub_id).unwrap(),
+            payload: init.clone(),
+        };
+        let served = |reply: Value, sub_id: &str| {
+            assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!(sub_id)));
+        };
+        let err = |sub_id: &str, reason: &str| json!(["NEG-ERR", sub_id, reason]);
+        let unknown = |sub_id: &str| err(sub_id, "closed: unknown subscription handle");
+        let tagged = || json!({"kinds": [1], "#t": ["wok"]});
+
+        // Each change is made under the config lock, which the worker needs
+        // for its next pass, so the messages sent under it are queued before
+        // the pass that sweeps.
+
+        // The filter sweep.
+        tx.send(open("all", json!({"kinds": [1]}))).unwrap();
+        served(next(&mut out_rx), "all");
+        tx.send(open("tagged", tagged())).unwrap();
+        served(next(&mut out_rx), "tagged");
+        {
+            let mut cfg = cfg.write();
+            cfg.relay.filter_validation.require_scoped_filters = true;
+            tx.send(msg("all")).unwrap();
+            tx.send(msg("all")).unwrap();
+            tx.send(msg("never")).unwrap();
+        }
+        let reply = next(&mut out_rx);
+        assert_eq!((&reply[0], &reply[1]), (&json!("NEG-ERR"), &json!("all")));
+        assert!(
+            reply[2]
+                .as_str()
+                .unwrap()
+                .starts_with("blocked: filter validation failed: "),
+            "{reply}"
+        );
+        // Nothing for the swept "all"; the handle never opened is unknown.
+        assert_eq!(next(&mut out_rx), unknown("never"));
+        // Sent after the sweep, a NEG-MSG for "all" is unknown too.
+        tx.send(msg("all")).unwrap();
+        assert_eq!(next(&mut out_rx), unknown("all"));
+        // The session the rules still admit is answered.
+        tx.send(msg("tagged")).unwrap();
+        served(next(&mut out_rx), "tagged");
+
+        // A login closes the connection's sessions.
+        {
+            let _cfg = cfg.write();
+            tx.send(NegMsg::SetAuth {
+                conn_id: 1,
+                authed: [7; 32],
+                epoch: 0,
+            })
+            .unwrap();
+            tx.send(msg("tagged")).unwrap();
+            tx.send(msg("never")).unwrap();
+        }
+        assert_eq!(
+            next(&mut out_rx),
+            err(
+                "tagged",
+                "closed: authentication changed; reopen synchronization"
+            )
+        );
+        assert_eq!(next(&mut out_rx), unknown("never"));
+
+        // The visibility sweep. A NEG-CLOSE for a swept handle forgets it,
+        // so a NEG-MSG queued after the NEG-CLOSE is unknown.
+        tx.send(open("a", tagged())).unwrap();
+        served(next(&mut out_rx), "a");
+        tx.send(open("b", tagged())).unwrap();
+        served(next(&mut out_rx), "b");
+        {
+            let mut cfg = cfg.write();
+            cfg.relay.auth.read_policy = AccessPolicy::Authenticated;
+            tx.send(msg("a")).unwrap();
+            tx.send(NegMsg::CloseSub {
+                conn_id: 1,
+                sub_id: SubId::new("b").unwrap(),
+            })
+            .unwrap();
+            tx.send(msg("b")).unwrap();
+        }
+        let visibility =
+            |sub_id: &str| err(sub_id, "closed: visibility changed; reopen synchronization");
+        let swept: HashSet<String> = (0..2).map(|_| next(&mut out_rx).to_string()).collect();
+        let expected: HashSet<String> = ["a", "b"]
+            .into_iter()
+            .map(|sub_id| visibility(sub_id).to_string())
+            .collect();
+        assert_eq!(swept, expected);
+        assert_eq!(next(&mut out_rx), unknown("b"));
+        drop(tx);
+        worker.join().unwrap();
+        assert!(
+            out_rx.try_recv().is_err(),
+            "a frame for the dropped NEG-MSGs"
+        );
     }
 
     /// A reload that made AUTH unusable ended every login, so the sessions

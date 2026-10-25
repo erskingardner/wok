@@ -513,10 +513,12 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         cfg.auth_configuration_warning(),
         cfg.read_class_warning(),
         cfg.inbox_kinds_warning(),
+        cfg.pow_warning(),
     ];
     for warning in warnings
         .into_iter()
         .flatten()
+        .chain(cfg.zero_guard_warnings())
         .chain(cfg.message_cap_warnings())
     {
         tracing::warn!("{warning}");

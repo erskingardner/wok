@@ -340,7 +340,8 @@ or opens an entry point.
 
 `OPENS` records that `relay.abuse.enabled = false` turns
 `relay.abuse.min_pow_difficulty` off with the other abuse limits, as
-[config.md](config.md) says; that without AUTH, gift wraps and kind 30078
+[config.md](config.md) says, and as the relay warns at startup, on reload
+and in `wok doctor`; that without AUTH, gift wraps and kind 30078
 are refused, to write and to read, only because they are recipient-only and
 owner-only, so emptying those lists serves them; and that
 `observability.metrics_enabled` is what serves `/metrics` on the metrics

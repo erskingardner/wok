@@ -658,10 +658,12 @@ wok_ws::upgrade_ws::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 14
+## authenticated: 16
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 <wok_query::filter::FilterSetUint>::at
+<wok_query::monitor::ActiveMonitors>::close_conn
 <wok_query::monitor::ActiveMonitors>::insert::{closure}
+<wok_query::scheduler::QueryScheduler>::close_conn
 <wok_relay::server::Dispatch>::monitor
 wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>
 wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}

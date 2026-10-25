@@ -44,8 +44,9 @@ impl Preset {
                 "A relay dedicated to Marmot group messaging, such as one a Marmot app ships \
                  as a default. It accepts only the Marmot kinds, needs every filter to name \
                  ids, authors or a tag, takes 4 MiB events, turns off COUNT and \
-                 permessage-deflate, which Marmot clients do not use, and leaves writes open \
-                 so the relay cannot link group messages to their senders. It needs \
+                 permessage-deflate, which Marmot clients do not use, sizes NIP-77 sync \
+                 limits to their per-group syncs, and leaves writes open so the relay \
+                 cannot link group messages to their senders. It needs \
                  relay.auth.service_url, because recipients read their gift wraps after \
                  NIP-42 AUTH."
             }

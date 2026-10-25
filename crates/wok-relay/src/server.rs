@@ -161,6 +161,8 @@ enum OutboundSendError {
 /// A connection's outbound queue and the gate in front of it.
 struct ConnEntry {
     out: Outbound,
+    /// The client's address, for NIP-86 `blockip` to close the connection.
+    ip: Option<std::net::IpAddr>,
     /// Held while a frame is queued for the connection, together with the
     /// gate check that admits it.
     state: Mutex<ConnState>,
@@ -229,14 +231,38 @@ impl ConnTable {
     }
 
     fn insert(&self, id: u64, out: Outbound) {
+        self.insert_from(id, out, None);
+    }
+
+    fn insert_from(&self, id: u64, out: Outbound, ip: Option<std::net::IpAddr>) {
         let entry = Arc::new(ConnEntry {
             out,
+            ip,
             state: Mutex::new(ConnState {
                 subs: SubGate::default(),
                 gone: false,
             }),
         });
         self.shard(id).write().insert(id, entry);
+    }
+
+    /// Close each connection whose address is in `blocked`: a block is
+    /// otherwise checked only when a connection opens. Returns how many it
+    /// closed.
+    fn kill_blocked(&self, blocked: &HashMap<String, String>) -> usize {
+        let mut closed = 0;
+        for shard in self.shards.iter() {
+            for entry in shard.read().values() {
+                if entry
+                    .ip
+                    .is_some_and(|ip| blocked.contains_key(&ip.to_string()))
+                {
+                    entry.out.kill();
+                    closed += 1;
+                }
+            }
+        }
+        closed
     }
 
     fn remove(&self, id: u64) {
@@ -481,12 +507,22 @@ pub struct RelayHandle {
     shutdown_notify: Arc<tokio::sync::Notify>,
     abuse: Arc<AbuseController>,
     config_path: Arc<parking_lot::RwLock<Option<std::path::PathBuf>>>,
+    bound: Arc<parking_lot::RwLock<BoundAddresses>>,
     writer_tx: Sender<WriterMsg>,
     threads: Arc<RelayThreads>,
     /// Each connection's share of the ingest queue, in bytes: the largest
     /// message a transport accepts, as configured at start. A message larger
     /// than the share after a reload takes all of it.
     inbound_share: usize,
+}
+
+/// The addresses the relay's listeners bound at startup, which a reload
+/// cannot change. The warnings a reload logs about who can reach the relay
+/// are checked against them.
+#[derive(Debug, Clone, Default)]
+pub struct BoundAddresses {
+    pub relay: Vec<std::net::SocketAddr>,
+    pub metrics: Option<std::net::SocketAddr>,
 }
 
 /// How long dropping the last `RelayHandle` waits for the relay threads.
@@ -711,6 +747,8 @@ enum ReqMsg {
     SetAuth {
         conn_id: u64,
         authed: [u8; 32],
+        /// The `Config::auth_epoch` the connection authenticated in.
+        epoch: u64,
     },
     /// Stop this generation's REQ history scan or COUNT, after CLOSE, a
     /// refusal or a replacement the client no longer waits for. Cleanup only:
@@ -758,6 +796,8 @@ enum MonitorMsg {
     SetAuth {
         conn_id: u64,
         authed: [u8; 32],
+        /// The `Config::auth_epoch` the connection authenticated in.
+        epoch: u64,
     },
     Close {
         conn_id: u64,
@@ -826,6 +866,8 @@ enum NegMsg {
     SetAuth {
         conn_id: u64,
         authed: [u8; 32],
+        /// The `Config::auth_epoch` the connection authenticated in.
+        epoch: u64,
     },
     CloseSub {
         conn_id: u64,
@@ -847,6 +889,20 @@ struct AuthSession {
     challenge: String,
     authed: Option<[u8; 32]>,
     identities: Vec<[u8; 32]>,
+}
+
+impl AuthSession {
+    /// Forget its identities: a reload that made AUTH unusable ended them.
+    /// The challenge stays, so the client can authenticate again once AUTH
+    /// is back.
+    fn expire(&mut self, metrics: &Metrics) {
+        self.identities.clear();
+        if self.authed.take().is_some() {
+            metrics
+                .authenticated_connections
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The most messages one connection may have waiting for the ingester.
@@ -1207,7 +1263,18 @@ impl RelayHandle {
     ) -> ConnectionGuard {
         let conn_id = self.next_conn_id();
         let gate = out.gate.clone();
-        self.conns.insert(conn_id, out);
+        let kill = out.killed();
+        self.conns.insert_from(conn_id, out, source.ip());
+        // A blockip that committed after this connection was admitted closed
+        // the connections in the table before it was there.
+        if source.ip().is_some_and(|ip| {
+            self.moderation
+                .read()
+                .blocked_ips
+                .contains_key(&ip.to_string())
+        }) {
+            kill.notify_one();
+        }
         self.metrics
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -1369,6 +1436,39 @@ impl RelayHandle {
     pub fn config_path(&self) -> Option<std::path::PathBuf> {
         self.config_path.read().clone()
     }
+
+    pub fn set_bound_addresses(&self, bound: BoundAddresses) {
+        *self.bound.write() = bound;
+    }
+
+    /// Install `new` as the running configuration, as the file watcher and
+    /// every dashboard or NIP-86 configuration save do, through
+    /// [`Config::apply_reload`]. Then log the warnings the change newly
+    /// causes that depend on the listeners or the moderation state, so a
+    /// save that installs a pending file edit before the watcher sees it
+    /// logs them too.
+    pub fn reload_config(&self, new: Config) -> Result<(), String> {
+        let (previous, now) = {
+            let mut cfg = self.config.write();
+            let previous = cfg.clone();
+            cfg.apply_reload(new)?;
+            (previous, cfg.clone())
+        };
+        let bound = self.bound.read().clone();
+        let warnings = [
+            now.metrics_reload_warning(&previous, &bound.relay, bound.metrics),
+            now.real_ip_header_reload_warning(&previous, &bound.relay),
+            crate::moderation::removed_admin_roles_warning(
+                &previous,
+                &now,
+                &self.moderation.read(),
+            ),
+        ];
+        for warning in warnings.into_iter().flatten() {
+            tracing::warn!("config reload: {warning}");
+        }
+        Ok(())
+    }
 }
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
@@ -1437,6 +1537,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         shutdown_notify: shutdown_notify.clone(),
         abuse: abuse.clone(),
         config_path: Arc::new(parking_lot::RwLock::new(None)),
+        bound: Arc::new(parking_lot::RwLock::new(BoundAddresses::default())),
         writer_tx: writer_tx.clone(),
         inbound_share,
         threads: Arc::new(RelayThreads {
@@ -1740,6 +1841,88 @@ fn filter_validator(cfg: &Config) -> FilterValidator {
         allowed_kinds: allowed,
         require_author_or_tag: cfg.relay.filter_validation.require_author_or_tag,
         require_scoped_filters: cfg.relay.filter_validation.require_scoped_filters,
+    }
+}
+
+/// The CLOSED reason for a REQ or COUNT whose filters `filter_validator`
+/// refuses.
+fn req_filter_refusal(error: &wok_query::QueryError) -> String {
+    format!("blocked: bad req: filter validation failed: {error}")
+}
+
+/// The NEG-ERR reason for a NEG-OPEN whose filter `filter_validator`
+/// refuses.
+fn neg_filter_refusal(error: &wok_query::QueryError) -> String {
+    format!("blocked: filter validation failed: {error}")
+}
+
+/// The `relay.filter_validation` rules a thread last checked what it holds
+/// against, so it can tell when a reload changes them.
+struct FilterRules {
+    rules: crate::config::FilterValidationConfig,
+    validator: FilterValidator,
+}
+
+impl FilterRules {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            rules: cfg.relay.filter_validation.clone(),
+            validator: filter_validator(cfg),
+        }
+    }
+
+    /// Take the rules `cfg` sets, returning whether a reload changed them.
+    fn follow(&mut self, cfg: &Config) -> bool {
+        if cfg.relay.filter_validation == self.rules {
+            return false;
+        }
+        *self = Self::new(cfg);
+        true
+    }
+}
+
+/// Once a reload changes the filter rules, end each query, running or
+/// waiting, whose filters they refuse, with the CLOSED its REQ or COUNT
+/// would get now: a history scan would otherwise go on sending what the
+/// rules refuse until it finished. Under the config guard of each slice.
+fn close_refused_queries(
+    queries: &mut QueryScheduler,
+    filters: &mut FilterRules,
+    cfg: &Config,
+    worker: &ReqWorker<'_>,
+) {
+    if !filters.follow(cfg) {
+        return;
+    }
+    let validator = &filters.validator;
+    let refused = queries.remove_refused(|sub| validator.validate(&sub.filter_group).err());
+    for (sub, error) in refused {
+        count_filter_limit(worker.metrics, &error);
+        let reason = req_filter_refusal(&error);
+        worker.refuse(
+            sub.conn_id,
+            sub.sub_id,
+            sub.generation,
+            sub.count_only,
+            &reason,
+        );
+    }
+}
+
+/// Close each REQ subscription, pending or live, whose filters `validator`
+/// refuses, with the CLOSED its REQ would get if sent now: a reload that
+/// tightened `relay.filter_validation` applies to what is already open.
+fn close_refused_subs(
+    monitors: &mut ActiveMonitors,
+    validator: &FilterValidator,
+    conns: &ConnTable,
+    metrics: &Metrics,
+) {
+    let refused = monitors.remove_refused(|sub| validator.validate(&sub.filter_group).err());
+    for (conn_id, sub_id, generation, error) in refused {
+        count_filter_limit(metrics, &error);
+        let closed = RelayMessage::closed_error(sub_id.as_str(), req_filter_refusal(&error));
+        conns.send_last(conn_id, Ns::Req, &sub_id, generation, closed, metrics);
     }
 }
 
@@ -2151,6 +2334,7 @@ fn run_ingester(
     neg_txs: Vec<Sender<NegMsg>>,
 ) {
     let mut auth: HashMap<u64, AuthSession> = HashMap::new();
+    let mut auth_epoch = cfg.read().auth_epoch;
     let mut budgets: HashMap<u64, ConnectionBudgets> = HashMap::new();
     let mut generations = Generations::default();
     let mut dispatch = Dispatch::new(writer_tx, req_txs, mon_txs, neg_txs);
@@ -2207,6 +2391,13 @@ fn run_ingester(
                 // Cloning Config here copied every String, PathBuf, and Vec on
                 // the hottest ingress path even though reloads are rare.
                 let cfg_snap = cfg.read();
+                // A reload that made AUTH unusable ended every login.
+                if cfg_snap.auth_epoch > auth_epoch {
+                    auth_epoch = cfg_snap.auth_epoch;
+                    for session in auth.values_mut() {
+                        session.expire(&metrics);
+                    }
+                }
                 handle_client(
                     &env,
                     &cfg_snap,
@@ -2342,6 +2533,22 @@ fn handle_client(
         }
         ClientCommand::Count { sub_id, filters } => {
             metrics.client_count.fetch_add(1, Ordering::Relaxed);
+            // The gate is configuration alone, so it comes before the COUNT
+            // budgets and before the filters are sized.
+            if cfg.relay.max_filter_limit_count == 0 {
+                metrics.refused(Setting::MaxFilterLimitCount);
+                let reason = "blocked: bad req: COUNT disabled".to_string();
+                refuse_req(
+                    conns,
+                    metrics,
+                    dispatch,
+                    conn_id,
+                    Ns::Count,
+                    &sub_id,
+                    reason,
+                );
+                return;
+            }
             let request = (Request::Count, "COUNT");
             let admitted = admit_request(
                 cfg, metrics, abuse, budgets, auth, conn_id, &source, request,
@@ -2509,9 +2716,10 @@ fn ingest_event(
     dispatch: &mut Dispatch,
 ) {
     let claimed_kind = orig.get("kind").and_then(Value::as_u64);
-    if let Some(message) =
-        claimed_kind.and_then(|kind| kind_refusal(cfg, metrics, moderation, kind))
-    {
+    let refusal = claimed_kind
+        .and_then(|kind| kind_refusal(cfg, metrics, moderation, kind, &orig))
+        .or_else(|| pow_refusal(cfg, metrics, &orig));
+    if let Some(message) = refusal {
         let id = orig.get("id").and_then(Value::as_str).unwrap_or("?");
         conns.send(
             conn_id,
@@ -2618,44 +2826,9 @@ fn ingest_event(
         }
         grant
     };
-    if is_vanish_request && !cfg.vanish_policy().targets_this_relay_json(&parsed.json) {
-        if !cfg.relay.nip62.enabled {
-            metrics.refused(Setting::Nip62Enabled);
-        }
-        conns.send(
-            conn_id,
-            RelayMessage::Ok {
-                event_id: id_hex,
-                accepted: false,
-                message: if cfg.relay.nip62.enabled {
-                    "blocked: vanish request not targeting this relay".into()
-                } else {
-                    "blocked: NIP-62 is disabled".into()
-                },
-            },
-            metrics,
-        );
-        return;
-    }
-
+    // The vanish request's relay tag and the proof of work were checked
+    // before the event was verified (`kind_refusal`, `pow_refusal`).
     if cfg.relay.abuse.enabled {
-        if leading_zero_bits(packed.id()) < cfg.relay.abuse.min_pow_difficulty as u16 {
-            metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
-            metrics.refused(Setting::MinPowDifficulty);
-            conns.send(
-                conn_id,
-                RelayMessage::Ok {
-                    event_id: id_hex,
-                    accepted: false,
-                    message: format!(
-                        "pow: difficulty {} required",
-                        cfg.relay.abuse.min_pow_difficulty
-                    ),
-                },
-                metrics,
-            );
-            return;
-        }
         // An event signed by a key that is not one of the connection's AUTHed
         // identities, such as a Marmot 445 from a fresh key per event or a
         // 1059 from a random one, is charged to the connection's first
@@ -2837,20 +3010,23 @@ fn check_author_auth(
     Err(refusal)
 }
 
-/// The refusal for an EVENT that its claimed kind alone decides, counted
-/// where it is decided: an AUTH event, a kind `accepted_kinds` or the NIP-86
-/// kind policy does not allow, or one nobody could read while AUTH is
-/// unusable ([`Config::unreadable_class`]). These gates run before the event
-/// is parsed and its signature verified: a kind refusal says nothing about
-/// who may publish, and on a relay that accepts few kinds most junk is
-/// refused without a verification. The author ban and the write policy wait
-/// for the signature, so an unsigned event cannot ask whether a key is a
-/// member or banned.
+/// The refusal for an EVENT that its claimed kind decides, with a vanish
+/// request's tags, counted where it is decided: an AUTH event, a kind `accepted_kinds` or the NIP-86
+/// kind policy does not allow, one nobody could read while AUTH is unusable
+/// ([`Config::unreadable_class`]), or a NIP-62 vanish request while NIP-62 is
+/// off or whose stated `relay` tags do not name this relay. These gates run
+/// before the event is parsed and its signature verified: a kind refusal
+/// says nothing about who may publish, and on a relay that accepts few kinds
+/// most junk is refused without a verification. The kind and tags are
+/// hashed into the id that verification then checks. The author ban and the
+/// write policy wait for the signature, so an unsigned event cannot ask
+/// whether a key is a member or banned.
 fn kind_refusal(
     cfg: &Config,
     metrics: &Metrics,
     moderation: &parking_lot::RwLock<ModerationSnapshot>,
     kind: u64,
+    event: &Value,
 ) -> Option<String> {
     // NIP-42: relays MUST exclude kind 22242 from broadcast. One sent as an
     // EVENT is neither stored nor delivered to any subscription.
@@ -2863,6 +3039,13 @@ fn kind_refusal(
         Some(Setting::AcceptedKinds)
     } else if !moderation.read().kind_allowed(kind) {
         None
+    } else if kind == VANISH_KIND {
+        if !cfg.relay.nip62.enabled {
+            metrics.refused(Setting::Nip62Enabled);
+            return Some("blocked: NIP-62 is disabled".into());
+        }
+        return (!cfg.vanish_policy().targets_this_relay_value(event))
+            .then(|| "blocked: vanish request not targeting this relay".into());
     } else {
         // A kind nobody could read is not stored, and is counted by its
         // read class.
@@ -2883,6 +3066,27 @@ fn kind_refusal(
     Some(format!(
         "restricted: kind {kind} is not allowed by this relay"
     ))
+}
+
+/// NIP-13 proof of work, counted from the id the event states, before that
+/// id is hashed and the signature verified: an id that does not match the
+/// event still fails verification afterwards. One that is not 64 lowercase
+/// hex digits is left to verification to refuse.
+fn pow_refusal(cfg: &Config, metrics: &Metrics, event: &Value) -> Option<String> {
+    let required = cfg.relay.abuse.min_pow_difficulty;
+    if !cfg.relay.abuse.enabled || required == 0 {
+        return None;
+    }
+    let id = event.get("id").and_then(Value::as_str)?;
+    let id = wok_event::from_lower_hex_exact(id)
+        .ok()
+        .filter(|id| id.len() == 32)?;
+    if leading_zero_bits(&id) >= u16::from(required) {
+        return None;
+    }
+    metrics.abuse_pow_rejections.fetch_add(1, Ordering::Relaxed);
+    metrics.refused(Setting::MinPowDifficulty);
+    Some(format!("pow: difficulty {required} required"))
 }
 
 fn ingest_auth(
@@ -3017,17 +3221,21 @@ fn ingest_auth_inner(
     // Keep admission accounting pinned to the first identity; authenticating
     // another key must not reset the connection's abuse budget.
     asess.authed.get_or_insert(pk);
+    let epoch = cfg.auth_epoch;
     dispatch.req(ReqMsg::SetAuth {
         conn_id,
         authed: pk,
+        epoch,
     });
     dispatch.monitor(MonitorMsg::SetAuth {
         conn_id,
         authed: pk,
+        epoch,
     });
     dispatch.neg(NegMsg::SetAuth {
         conn_id,
         authed: pk,
+        epoch,
     });
     let mut id = [0u8; 32];
     id.copy_from_slice(packed.id());
@@ -3193,16 +3401,37 @@ fn admit_req(
             ),
         ));
     }
-    let max_limit = if count_only {
-        let m = cfg.relay.max_filter_limit_count + 1;
-        if m == 1 {
-            return Err(refuse(
-                Setting::MaxFilterLimitCount,
-                "blocked",
-                "COUNT disabled".into(),
+    // Pending and live subscriptions both count. Over a lowered cap an open
+    // id can still be replaced; new ids wait until the count drops.
+    if !count_only
+        && !conns.is_open(conn_id, Ns::Req, sid)
+        && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
+    {
+        metrics.refused(Setting::MaxSubsPerConnection);
+        return Err("blocked: too many concurrent REQs".into());
+    }
+    // Live filters stay in memory until closed, and a COUNT's until it is
+    // answered, which may wait for a scan slot, so each namespace's bytes are
+    // budgeted per connection. Like the subscription cap, a lowered budget
+    // still lets an open id be replaced by filters no larger than its own.
+    // Both need only the connection's state and the serialized size, so they
+    // come before the filters are parsed, validated and priced.
+    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
+    if filter_budget != 0 {
+        let ns = if count_only { Ns::Count } else { Ns::Req };
+        let (held, replaced) = conns.filter_bytes(conn_id, ns, sid);
+        if serialized_filter_bytes > replaced
+            && held - replaced + serialized_filter_bytes > filter_budget
+        {
+            metrics.refused(Setting::MaxFilterBytesPerConnection);
+            return Err(format!(
+                "blocked: this connection's filters exceed {filter_budget} bytes"
             ));
         }
-        m
+    }
+    // A disabled COUNT was refused before any of this (`handle_client`).
+    let max_limit = if count_only {
+        cfg.relay.max_filter_limit_count + 1
     } else {
         cfg.relay.max_filter_limit
     };
@@ -3228,7 +3457,7 @@ fn admit_req(
     })?;
     if let Err(e) = filter_validator(cfg).validate(&fg) {
         count_filter_limit(metrics, &e);
-        return Err(bad_req("blocked", format!("filter validation failed: {e}")));
+        return Err(req_filter_refusal(&e));
     }
     let costed = if count_only {
         CostedRequest::Count
@@ -3273,32 +3502,6 @@ fn admit_req(
         };
         count_read_class(metrics, class);
         return Err(read_gate_refusal(cfg, conns, metrics, auth, conn_id).into());
-    }
-    // Pending and live subscriptions both count. Over a lowered cap an open
-    // id can still be replaced; new ids wait until the count drops.
-    if !count_only
-        && !conns.is_open(conn_id, Ns::Req, sid)
-        && conns.open_count(conn_id, Ns::Req) >= cfg.relay.max_subs_per_connection
-    {
-        metrics.refused(Setting::MaxSubsPerConnection);
-        return Err("blocked: too many concurrent REQs".into());
-    }
-    // Live filters stay in memory until closed, and a COUNT's until it is
-    // answered, which may wait for a scan slot, so each namespace's bytes are
-    // budgeted per connection. Like the subscription cap, a lowered budget
-    // still lets an open id be replaced by filters no larger than its own.
-    let filter_budget = cfg.relay.max_filter_bytes_per_connection;
-    if filter_budget != 0 {
-        let ns = if count_only { Ns::Count } else { Ns::Req };
-        let (held, replaced) = conns.filter_bytes(conn_id, ns, sid);
-        if serialized_filter_bytes > replaced
-            && held - replaced + serialized_filter_bytes > filter_budget
-        {
-            metrics.refused(Setting::MaxFilterBytesPerConnection);
-            return Err(format!(
-                "blocked: this connection's filters exceed {filter_budget} bytes"
-            ));
-        }
     }
     Ok((
         Subscription::new(conn_id, sid.clone(), fg, count_only),
@@ -3752,7 +3955,7 @@ fn ingest_neg(
     // The rules REQ and COUNT meet, so a sync cannot list what a REQ may not.
     filter_validator(cfg).validate(&fg).map_err(|e| {
         count_filter_limit(metrics, &e);
-        format!("blocked: filter validation failed: {e}")
+        neg_filter_refusal(&e)
     })?;
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
@@ -3788,6 +3991,50 @@ fn scheduler_refusal(cfg: &Config) -> Setting {
         Setting::MaxConcurrentHistoricalQueries
     } else {
         Setting::MaxSubsPerConnection
+    }
+}
+
+/// Forget the identities a worker holds, by connection, from before
+/// `epoch`: a reload that made AUTH unusable ended them
+/// (`Config::auth_epoch`). `seen` is the epoch they are from. Returns the
+/// connections it forgot identities of.
+fn expire_logins(authed: &mut HashMap<u64, Vec<[u8; 32]>>, seen: &mut u64, epoch: u64) -> Vec<u64> {
+    if epoch <= *seen {
+        return Vec::new();
+    }
+    *seen = epoch;
+    authed.drain().map(|(conn_id, _)| conn_id).collect()
+}
+
+/// The configuration for a REQ worker's slice, with the logins a reload
+/// since ended forgotten. A slice reads identities beside the configuration,
+/// so one that sees a reload making AUTH unusable must not see the logins
+/// it ended, however late in the worker's pass the reload came.
+fn slice_config<'a>(
+    cfg: &'a parking_lot::RwLock<Config>,
+    authed: &mut HashMap<u64, Vec<[u8; 32]>>,
+    seen: &mut u64,
+) -> parking_lot::RwLockReadGuard<'a, Config> {
+    let cfg = cfg.read();
+    expire_logins(authed, seen, cfg.auth_epoch);
+    cfg
+}
+
+/// Record that a connection authenticated as `pubkey` in `epoch`, unless a
+/// later reload already ended that epoch's logins.
+fn add_login(
+    authed: &mut HashMap<u64, Vec<[u8; 32]>>,
+    seen: &mut u64,
+    conn_id: u64,
+    pubkey: [u8; 32],
+    epoch: u64,
+) {
+    expire_logins(authed, seen, epoch);
+    if epoch == *seen {
+        let identities = authed.entry(conn_id).or_default();
+        if !identities.contains(&pubkey) {
+            identities.push(pubkey);
+        }
     }
 }
 
@@ -3958,9 +4205,11 @@ fn run_req_worker(
         initial_cfg.relay.max_total_events_per_req,
         initial_cfg.relay.max_filter_limit_count.saturating_add(1),
     );
+    let mut filters = FilterRules::new(&initial_cfg);
     drop(initial_cfg);
     queries.set_completeness(true);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
+    let mut auth_epoch = 0;
     let mut decomp = Decompressor::new();
     let mut pass = Vec::with_capacity(REQ_PASS_MAX);
     let worker = ReqWorker {
@@ -3991,7 +4240,8 @@ fn run_req_worker(
             }
         }
         {
-            let cfg_snap = cfg.read();
+            let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
+            close_refused_queries(&mut queries, &mut filters, &cfg_snap, &worker);
             queries.set_max_subs_per_connection(
                 cfg_snap.relay.abuse.max_concurrent_historical_queries,
             );
@@ -4021,17 +4271,44 @@ fn run_req_worker(
                     let reason = match &txn {
                         Some(txn) => {
                             if queries.has_running() && share.due(true, std::time::Instant::now()) {
-                                let cfg_snap = cfg.read();
+                                let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
+                                close_refused_queries(
+                                    &mut queries,
+                                    &mut filters,
+                                    &cfg_snap,
+                                    &worker,
+                                );
                                 share.slice(|| {
                                     worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp)
                                 });
+                            }
+                            // Admitted under rules a reload has tightened
+                            // since: refused, and the query it replaces ends
+                            // with it, as `add_sub` would have ended it.
+                            if let Err(error) = filters.validator.validate(&sub.filter_group) {
+                                queries.remove_query(conn, &sub_id, count_only);
+                                count_filter_limit(&metrics, &error);
+                                worker.refuse(
+                                    conn,
+                                    sub_id,
+                                    generation,
+                                    count_only,
+                                    &req_filter_refusal(&error),
+                                );
+                                continue;
                             }
                             // With nothing running, this slice starts the share.
                             let idle = !queries.has_running();
                             match queries.add_sub(txn, sub) {
                                 Ok(Scheduled::Running) => {
                                     // The new query is first in the run queue.
-                                    let cfg_snap = cfg.read();
+                                    let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
+                                    close_refused_queries(
+                                        &mut queries,
+                                        &mut filters,
+                                        &cfg_snap,
+                                        &worker,
+                                    );
                                     let mut first = || {
                                         worker.slice(
                                             &mut queries,
@@ -4085,12 +4362,8 @@ fn run_req_worker(
                 ReqMsg::SetAuth {
                     conn_id,
                     authed: pk,
-                } => {
-                    let identities = authed.entry(conn_id).or_default();
-                    if !identities.contains(&pk) {
-                        identities.push(pk);
-                    }
-                }
+                    epoch,
+                } => add_login(&mut authed, &mut auth_epoch, conn_id, pk, epoch),
                 ReqMsg::Cancel {
                     conn_id,
                     sub_id,
@@ -4108,7 +4381,8 @@ fn run_req_worker(
         if let Some(txn) = &txn {
             let waiting = !rx.is_empty();
             if open && queries.has_running() && share.due(waiting, std::time::Instant::now()) {
-                let cfg_snap = cfg.read();
+                let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
+                close_refused_queries(&mut queries, &mut filters, &cfg_snap, &worker);
                 share.slice(|| worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp));
             }
         }
@@ -4424,6 +4698,11 @@ fn send_buffered_stored(
     }
 }
 
+/// How often a monitor holding subscriptions checks for filter rules a
+/// reload has changed when no traffic wakes it, as often as the negentropy
+/// worker re-checks its sessions.
+const FILTER_RULES_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
 fn run_req_monitor(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -4436,6 +4715,8 @@ fn run_req_monitor(
     // The ingester caps subscriptions per connection before registering them.
     let mut monitors = ActiveMonitors::new(usize::MAX);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
+    let mut filters = FilterRules::new(&cfg.read());
+    let mut auth_epoch = 0;
     // Newest local event id already matched against every subscription.
     let mut curr_event_id = u64::MAX;
     let mut decomp = Decompressor::new();
@@ -4451,6 +4732,14 @@ fn run_req_monitor(
         } else {
             crossbeam_channel::never()
         };
+        // A reload wakes no monitor, so one holding subscriptions also looks
+        // for changed filter rules on a timer: a refused subscription past
+        // EOSE would otherwise keep its slot until the next event.
+        let rules_timer = if monitors.is_empty() {
+            crossbeam_channel::never()
+        } else {
+            crossbeam_channel::after(FILTER_RULES_CHECK_INTERVAL)
+        };
         crossbeam_channel::select! {
             recv(rx) -> msg => match msg {
                 Ok(msg) => control.push(msg),
@@ -4461,6 +4750,7 @@ fn run_req_monitor(
                 Err(_) => data_open = false,
             },
             recv(retry_timer) -> _ => {}
+            recv(rules_timer) -> _ => {}
         }
         // A closed queue never wakes the monitor again; it stops once both are.
         if !control_open {
@@ -4481,9 +4771,16 @@ fn run_req_monitor(
         control.extend(rx.try_iter());
         if control.is_empty() && data.is_empty() {
             retry = false;
+            if filters.follow(&cfg.read()) {
+                close_refused_subs(&mut monitors, &filters.validator, &conns, &metrics);
+            }
             continue;
         }
         let cfg_snap = cfg.read();
+        expire_logins(&mut authed, &mut auth_epoch, cfg_snap.auth_epoch);
+        if filters.follow(&cfg_snap) {
+            close_refused_subs(&mut monitors, &filters.validator, &conns, &metrics);
+        }
         let r = cfg_snap.read_restrictor();
         let global_visibility = read_visibility(&cfg_snap, vec![]);
         let max_event_size = cfg_snap.events.max_event_size;
@@ -4526,6 +4823,29 @@ fn run_req_monitor(
         for msg in control.drain(..) {
             match msg {
                 MonitorMsg::Register(mut sub) => {
+                    // Admitted under rules a reload has tightened since.
+                    if let Err(error) = filters.validator.validate(&sub.filter_group) {
+                        count_filter_limit(&metrics, &error);
+                        let reason = req_filter_refusal(&error);
+                        let closed = RelayMessage::closed_error(sub.sub_id.as_str(), reason);
+                        conns.send_last(
+                            sub.conn_id,
+                            Ns::Req,
+                            &sub.sub_id,
+                            sub.generation,
+                            closed,
+                            &metrics,
+                        );
+                        // The older generation it replaced at the gate goes
+                        // with it, as `add_pending` would have replaced it.
+                        if monitors
+                            .subscription(sub.conn_id, &sub.sub_id)
+                            .is_some_and(|old| old.generation < sub.generation)
+                        {
+                            monitors.remove_sub(sub.conn_id, &sub.sub_id);
+                        }
+                        continue;
+                    }
                     // Stored events after the REQ's history snapshot are the
                     // monitor's. Those it already matched are re-read when the
                     // history is done; everything it matches from here on is
@@ -4638,12 +4958,8 @@ fn run_req_monitor(
                 MonitorMsg::SetAuth {
                     conn_id,
                     authed: pk,
-                } => {
-                    let identities = authed.entry(conn_id).or_default();
-                    if !identities.contains(&pk) {
-                        identities.push(pk);
-                    }
-                }
+                    epoch,
+                } => add_login(&mut authed, &mut auth_epoch, conn_id, pk, epoch),
                 MonitorMsg::Close { conn_id } => {
                     authed.remove(&conn_id);
                     monitors.close_conn(conn_id);
@@ -5616,6 +5932,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stated_pow_and_vanish_targets_are_refused_before_verification() {
+        // Each refusal depends only on what the event states, so a forged
+        // event gets it rather than the signature's.
+        let forged = |ev: Value| {
+            let mut ev = sign_event(ev);
+            ev["sig"] = json!("00".repeat(64));
+            ev
+        };
+        let vanish = |relay: &str| {
+            json!({
+                "created_at": now_secs(), "kind": VANISH_KIND,
+                "tags": [["relay", relay]], "content": ""
+            })
+        };
+        // An id with the difficulty that does not match its event is still
+        // refused by verification.
+        let mut unmatched = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [], "content": "zero id"
+        }));
+        unmatched["id"] = json!("00".repeat(32));
+        // (min_pow_difficulty, NIP-62 on, event, reply)
+        let cases = [
+            (
+                255,
+                true,
+                forged(json!({
+                    "created_at": now_secs(), "kind": 1, "tags": [], "content": "no-pow"
+                })),
+                "pow: difficulty 255 required",
+            ),
+            (255, true, unmatched, "invalid: "),
+            (
+                0,
+                true,
+                forged(vanish("wss://other.example.com")),
+                "blocked: vanish request not targeting this relay",
+            ),
+            (
+                0,
+                false,
+                forged(vanish("ALL_RELAYS")),
+                "blocked: NIP-62 is disabled",
+            ),
+        ];
+        for (min_pow, nip62, event, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), small_map_env_options()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut cfg = Config::default();
+            cfg.db = dir.path().to_path_buf();
+            cfg.relay.auth.enabled = false;
+            cfg.relay.abuse.min_pow_difficulty = min_pow;
+            cfg.relay.nip62.enabled = nip62;
+            cfg.relay.nip62.service_url = "wss://relay.example.com".into();
+            let handle = start(env, cfg).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+            let conn = handle.next_conn_id();
+            handle.register(conn, Outbound::new(tx, 0)).await;
+            handle
+                .client_message(
+                    conn,
+                    TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    json!(["EVENT", event]).to_string(),
+                )
+                .await;
+            let response = recv_outbound(&mut rx).await;
+            assert!(response.contains(expected), "{expected}: {response}");
+            handle.request_shutdown();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restricted_writes_and_bans_cannot_veto_vanish_requests() {
         // NIP-62: relays that restrict who can post MUST honor vanish requests
         // regardless of the user's status. Losing allowlist membership or
@@ -5877,6 +6265,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blockip_closes_the_open_connections_from_its_address() {
+        // A block was checked only when a connection opened, so a blocked
+        // client's open WebSocket kept reading and publishing (#164).
+        let (_dir, handle) = live_reload_relay(|_, _| {});
+        let connect = |ip: &'static str| {
+            let handle = &handle;
+            async move {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+                let out = Outbound::new(tx, 0);
+                let killed = out.killed();
+                let source = TransportSource::ip_address(ip.parse().unwrap());
+                let conn = handle.register_connection(source, out).await;
+                (conn, rx, killed)
+            }
+        };
+        let closed = |killed: Arc<tokio::sync::Notify>, within: Duration| async move {
+            tokio::time::timeout(within, killed.notified())
+                .await
+                .is_ok()
+        };
+        let (_blocked, _rx, blocked) = connect("203.0.113.7").await;
+        let (_other, _rx2, other) = connect("203.0.113.8").await;
+        handle
+            .manage(ManagementCmd::BlockIp {
+                ip: "203.0.113.7".into(),
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+        // Told to close by the time the block is acknowledged.
+        assert!(closed(blocked, Duration::ZERO).await);
+        assert!(!closed(other, Duration::from_millis(100)).await);
+        // One admitted before the block and registered after it is closed
+        // as it registers.
+        let (_late, _rx3, late) = connect("203.0.113.7").await;
+        assert!(closed(late, Duration::ZERO).await);
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_reload_applies_the_write_policy_timeout() {
         // The writer captured the timeout at startup, so lowering it had no
         // effect until a restart (#54).
@@ -6059,6 +6487,59 @@ mod tests {
             handle.client_message(conn, local_source(), req(sub)).await;
             assert!(recv_outbound(&mut rx).await.contains("EOSE"));
         }
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_refusals_come_before_the_filters_are_read() {
+        // A disabled COUNT spends no COUNT budget, and the subscription cap
+        // and the connection's filter bytes refuse a REQ before its filters
+        // are parsed: this filter would fail parsing.
+        let (_dir, handle) = live_reload_relay(|cfg, _| {
+            cfg.relay.max_filter_limit_count = 0;
+            cfg.relay.abuse.per_connection.count_rate_per_second = 1;
+            cfg.relay.abuse.per_connection.count_burst = 1;
+            cfg.relay.max_subs_per_connection = 1;
+        });
+        let (conn, mut rx) = live_conn(&handle).await;
+        let count = json!(["COUNT", "n", {"kinds": [1]}]).to_string();
+        for _ in 0..3 {
+            handle
+                .client_message(conn, local_source(), count.clone())
+                .await;
+            assert_eq!(
+                recv_outbound(&mut rx).await,
+                r#"["CLOSED","n","blocked: bad req: COUNT disabled"]"#
+            );
+        }
+        assert_eq!(
+            handle
+                .metrics
+                .abuse_count_rate_rejections
+                .load(Ordering::Relaxed),
+            0
+        );
+        let open = json!(["REQ", "a", {"kinds": [1]}]).to_string();
+        handle.client_message(conn, local_source(), open).await;
+        assert!(recv_outbound(&mut rx).await.contains("EOSE"));
+        let malformed = json!(["REQ", "b", {"kinds": "x"}]).to_string();
+        handle
+            .client_message(conn, local_source(), malformed.clone())
+            .await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            r#"["CLOSED","b","blocked: too many concurrent REQs"]"#
+        );
+        {
+            let mut cfg = handle.config.write();
+            cfg.relay.max_subs_per_connection = 2;
+            cfg.relay.max_filter_bytes_per_connection = 1;
+        }
+        handle.client_message(conn, local_source(), malformed).await;
+        assert_eq!(
+            recv_outbound(&mut rx).await,
+            r#"["CLOSED","b","blocked: this connection's filters exceed 1 bytes"]"#
+        );
         handle.request_shutdown();
     }
 
@@ -6587,6 +7068,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_tightens_filter_validation_closes_what_it_refuses() {
+        // The rules were checked only at admission, so turning on
+        // require_scoped_filters left an enumerating subscription streaming
+        // every new event (#164).
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|_| {}).await;
+        let req = |sub: &str, filter: Value| json!(["REQ", sub, filter]).to_string();
+        conn.client_message(req("all", json!({"kinds": [1]}))).await;
+        assert!(recv_outbound(&mut rx).await.starts_with(r#"["EOSE","all""#));
+        conn.client_message(req("tagged", json!({"kinds": [1], "#t": ["wok"]})))
+            .await;
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EOSE","tagged""#));
+
+        let mut tightened = handle.config.read().clone();
+        tightened.relay.filter_validation.require_scoped_filters = true;
+        handle.config.write().apply_reload(tightened).unwrap();
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [["t", "wok"]], "content": "after",
+        }));
+        conn.client_message(json!(["EVENT", event]).to_string())
+            .await;
+        // The enumerating one is closed, with what its REQ gets now, and
+        // receives nothing more; the scoped one still streams.
+        let (mut closed, mut streamed) = (None, false);
+        while closed.is_none() || !streamed {
+            let frame: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
+            match (frame[0].as_str().unwrap(), frame[1].as_str().unwrap_or("")) {
+                ("CLOSED", "all") => closed = Some(frame[2].as_str().unwrap().to_string()),
+                ("EVENT", "tagged") => streamed = true,
+                ("EVENT", "all") => panic!("{frame}"),
+                _ => {}
+            }
+        }
+        let closed = closed.unwrap();
+        assert!(
+            closed.starts_with("blocked: bad req: filter validation failed: "),
+            "{closed}"
+        );
+        conn.client_message(req("again", json!({"kinds": [1]})))
+            .await;
+        let refused: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
+        assert_eq!(refused, json!(["CLOSED", "again", closed]));
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_tightens_filter_validation_frees_a_quiet_subscriptions_slot() {
+        // Only an event woke the monitor, so on a quiet relay a refused
+        // subscription past EOSE kept its slot, and a scoped REQ under a new
+        // id was refused as one too many.
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
+            cfg.relay.max_subs_per_connection = 1;
+        })
+        .await;
+        let req = |sub: &str, filter: Value| json!(["REQ", sub, filter]).to_string();
+        conn.client_message(req("all", json!({"kinds": [1]}))).await;
+        assert!(recv_outbound(&mut rx).await.starts_with(r#"["EOSE","all""#));
+
+        let mut tightened = handle.config.read().clone();
+        tightened.relay.filter_validation.require_scoped_filters = true;
+        handle.reload_config(tightened).unwrap();
+        // No event is published.
+        let closed = recv_outbound(&mut rx).await;
+        assert!(
+            closed.starts_with(r#"["CLOSED","all","blocked: bad req: filter validation failed: "#),
+            "{closed}"
+        );
+        conn.client_message(req("tagged", json!({"kinds": [1], "#t": ["wok"]})))
+            .await;
+        let eose = recv_outbound(&mut rx).await;
+        assert!(eose.starts_with(r#"["EOSE","tagged""#), "{eose}");
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reader_the_policy_refuses_is_refused_before_its_filters_are_read() {
         let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
             cfg.relay.auth.service_url = "wss://auth.example".into();
@@ -6606,6 +7163,159 @@ mod tests {
                 reply.contains("auth-required: this relay serves only members"),
                 "{reply}"
             );
+        }
+        handle.request_shutdown();
+    }
+
+    #[test]
+    fn a_req_slice_never_reads_a_reload_beside_the_logins_it_ended() {
+        let cfg = parking_lot::RwLock::new(Config::default());
+        let mut authed = HashMap::from([(1, vec![[7u8; 32]])]);
+        let mut seen = 0;
+        assert_eq!(slice_config(&cfg, &mut authed, &mut seen).auth_epoch, 0);
+        assert_eq!(authed.len(), 1);
+        // A reload that made AUTH unusable after the pass began: the next
+        // slice of it reads the reload and no login.
+        cfg.write().auth_epoch = 1;
+        assert_eq!(slice_config(&cfg, &mut authed, &mut seen).auth_epoch, 1);
+        assert!(authed.is_empty());
+        // A login from before it, taken later in the pass, is void.
+        add_login(&mut authed, &mut seen, 1, [7; 32], 0);
+        assert!(authed.is_empty());
+        add_login(&mut authed, &mut seen, 1, [7; 32], 1);
+        assert_eq!(authed.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_makes_auth_unusable_ends_every_login() {
+        // A login outlived a reload that turned AUTH off: the connection
+        // still read as its key while nobody could log in, and again once
+        // a reload turned AUTH back on (#164).
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
+            cfg.relay.auth.service_url = "wss://auth.example".into();
+        })
+        .await;
+        let challenge_of = |frame: String| {
+            let frame: Value = serde_json::from_str(&frame).unwrap();
+            frame[1].as_str().unwrap().to_string()
+        };
+        let challenge = challenge_of(recv_outbound(&mut rx).await);
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let recipient = hex::encode(key.x_only_public_key().0.serialize());
+        let login = |challenge: &str, created_at: u64| {
+            let auth = sign_event_with_key(
+                json!({
+                    "created_at": created_at,
+                    "kind": AUTH_KIND,
+                    "tags": [["relay", "wss://auth.example"], ["challenge", challenge]],
+                    "content": "",
+                }),
+                &key,
+            );
+            json!(["AUTH", auth]).to_string()
+        };
+        let publish = |kind: u64, content: &str| {
+            let tags = if kind == 1059 {
+                json!([["p", recipient]])
+            } else {
+                json!([])
+            };
+            let event = sign_event(json!({
+                "created_at": now_secs(), "kind": kind, "tags": tags, "content": content,
+            }));
+            json!(["EVENT", event]).to_string()
+        };
+        let req = |sub: &str, kind: u64| json!(["REQ", sub, {"kinds": [kind]}]).to_string();
+        let authenticated = || {
+            handle
+                .metrics
+                .authenticated_connections
+                .load(Ordering::Relaxed)
+        };
+        let reload = |enabled: bool| {
+            let mut new = handle.config.read().clone();
+            new.relay.auth.enabled = enabled;
+            handle.config.write().apply_reload(new).unwrap();
+        };
+
+        conn.client_message(login(&challenge, now_secs())).await;
+        assert!(recv_outbound(&mut rx).await.contains("true"));
+        conn.client_message(publish(1059, "first")).await;
+        assert!(recv_outbound(&mut rx).await.contains("true"));
+        // Logged in as its recipient, the connection reads the gift wrap.
+        conn.client_message(req("wrap", 1059)).await;
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EVENT","wrap""#));
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EOSE","wrap""#));
+        conn.client_message(req("public", 1)).await;
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EOSE","public""#));
+        assert_eq!(authenticated(), 1);
+
+        // While nobody can log in, nobody is logged in.
+        reload(false);
+        conn.client_message(req("off", 1059)).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["CLOSED","off","restricted: "#),
+            "{reply}"
+        );
+        assert_eq!(authenticated(), 0);
+        // Nor once AUTH is back: the history and the live subscription opened
+        // under the login read no gift wrap, and a public event stored after
+        // one is delivered alone.
+        reload(true);
+        conn.client_message(req("on", 1059)).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["CLOSED","on","auth-required: "#),
+            "{reply}"
+        );
+        // A filter that also matches public events is served, without it.
+        let mixed = json!(["REQ", "mixed", {"kinds": [1, 1059]}]).to_string();
+        conn.client_message(mixed).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(reply.starts_with(r#"["EOSE","mixed""#), "{reply}");
+        conn.client_message(publish(1059, "second")).await;
+        conn.client_message(publish(1, "public")).await;
+        loop {
+            let frame = recv_outbound(&mut rx).await;
+            assert!(!frame.starts_with(r#"["EVENT","wrap""#), "{frame}");
+            if frame.starts_with(r#"["EVENT","public""#) {
+                break;
+            }
+        }
+        // The challenge stands, so the client can log in again, and so can a
+        // connection opened since; each login holds.
+        conn.client_message(login(&challenge, now_secs() - 1)).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["OK""#) && reply.contains("true"),
+            "{reply}"
+        );
+        let (tx, mut rx2) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn2 = handle
+            .register_connection(
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                Outbound::new(tx, 0),
+            )
+            .await;
+        let challenge2 = challenge_of(recv_outbound(&mut rx2).await);
+        conn2
+            .client_message(login(&challenge2, now_secs() - 2))
+            .await;
+        assert!(recv_outbound(&mut rx2).await.contains("true"));
+        assert_eq!(authenticated(), 2);
+        for (conn, rx) in [(&conn, &mut rx), (&conn2, &mut rx2)] {
+            conn.client_message(req("again", 1059)).await;
+            for _ in 0..2 {
+                let frame = recv_outbound(rx).await;
+                assert!(frame.starts_with(r#"["EVENT","again""#), "{frame}");
+            }
         }
         handle.request_shutdown();
     }
@@ -7949,6 +8659,7 @@ mod tests {
         h.send(MonitorMsg::SetAuth {
             conn_id: 2,
             authed: [9; 32],
+            epoch: 0,
         });
         h.register(1, json!({"kinds": [1, 20001]}), 0);
         h.ephemeral("held");
@@ -7963,6 +8674,7 @@ mod tests {
         h.send(MonitorMsg::SetAuth {
             conn_id: 1,
             authed: [7; 32],
+            epoch: 0,
         });
         let (_, after) = h.store("after AUTH");
         h.sync();
@@ -7997,6 +8709,7 @@ mod tests {
             .apply(MonitorMsg::SetAuth {
                 conn_id: 1,
                 authed: pk,
+                epoch: 0,
             })
             .is_empty());
         assert_eq!(
@@ -8285,6 +8998,92 @@ mod tests {
         }
     }
 
+    /// A reload that tightens `relay.filter_validation` ends a REQ or COUNT
+    /// it now refuses at the scan's next slice, with the CLOSED a new one
+    /// would get, rather than once the rest of the history has gone out.
+    #[test]
+    fn a_reload_that_tightens_filter_validation_ends_a_running_scan() {
+        // Enough history that the scan spans many time slices.
+        let (dir, env, snapshot) = long_history();
+        for count in [false, true] {
+            let conns = Arc::new(ConnTable::new());
+            let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            let ns = if count { Ns::Count } else { Ns::Req };
+            conns.open_sub(1, ns, &SubId::new("all").unwrap(), 1, 0);
+            let (req_tx, req_rx) = bounded(8);
+            let (mon_tx, mon_rx) = bounded(8);
+            trace::record(env.path());
+            let sub = queued_sub(
+                "all",
+                json!({"kinds": [1], "limit": 50_000}),
+                1,
+                count,
+                snapshot,
+            );
+            req_tx
+                .send(if count {
+                    ReqMsg::Count(sub)
+                } else {
+                    ReqMsg::Scan(sub)
+                })
+                .unwrap();
+            let cfg = Arc::new(parking_lot::RwLock::new(slow_scan_config(dir.path())));
+            let worker = {
+                let (env, cfg, conns) = (env.clone(), cfg.clone(), conns.clone());
+                let metrics = Arc::new(Metrics::default());
+                thread::spawn(move || {
+                    run_req_worker(env, cfg, conns, metrics, req_rx, vec![mon_tx])
+                })
+            };
+            // Once the scan has had a slice, a reload turns the rule on. No
+            // event is published, so only the worker can notice.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while trace::slices(env.path()).is_empty() {
+                assert!(std::time::Instant::now() < deadline, "no slice");
+                thread::yield_now();
+            }
+            cfg.write().relay.filter_validation.require_scoped_filters = true;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut events = 0;
+            let closed = loop {
+                match outbound.try_recv() {
+                    Ok(frame) => {
+                        let frame = frame.into_text();
+                        if frame.starts_with(r#"["EVENT","all""#) {
+                            events += 1;
+                        } else {
+                            break frame;
+                        }
+                    }
+                    Err(_) => {
+                        assert!(std::time::Instant::now() < deadline, "no CLOSED");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            };
+            assert!(
+                closed.starts_with(
+                    r#"["CLOSED","all","blocked: bad req: filter validation failed: "#
+                ),
+                "{closed}"
+            );
+            assert!(events < 20_000, "the whole history went out first");
+            if !count {
+                assert!(matches!(
+                    mon_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    MonitorMsg::Remove { generation: 1, .. }
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+            assert!(outbound.try_recv().is_err(), "a frame followed CLOSED");
+            // A scan that kept going would report its history done.
+            assert!(mon_rx.try_recv().is_err(), "the scan kept running");
+            drop(req_tx);
+            worker.join().unwrap();
+        }
+    }
+
     /// A refused REQ ends the subscription it names at once: the gate closes
     /// the id and queues the CLOSED in one step, so nothing the old
     /// subscription's worker or monitor sends afterwards reaches the client,
@@ -8410,6 +9209,7 @@ mod tests {
         queue(ReqMsg::SetAuth {
             conn_id: 1,
             authed: [7; 32],
+            epoch: 0,
         });
         queue(ReqMsg::Scan(queued_sub(
             "b",

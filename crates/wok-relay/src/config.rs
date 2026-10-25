@@ -39,6 +39,13 @@ pub struct Config {
     /// translation. Logged at startup and on reload.
     #[serde(skip)]
     pub deprecations: Vec<String>,
+    /// How many reloads have made NIP-42 AUTH unusable. Each one ends every
+    /// connection's login: a thread that holds a connection's authenticated
+    /// identities drops those from an earlier epoch, so nobody stays logged
+    /// in while nobody can log in, nor after AUTH comes back. Not in the
+    /// file.
+    #[serde(skip)]
+    pub auth_epoch: u64,
 }
 
 /// A warning about settings, with the keys it is about, so the dashboard can
@@ -425,7 +432,7 @@ pub struct InfoConfig {
 
 /// Optional rules for REQ, COUNT and NEG-OPEN filters, each off at its zero
 /// or empty value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterValidationConfig {
     pub max_kinds_per_filter: u64,
@@ -610,6 +617,7 @@ impl Default for Config {
                 },
             },
             deprecations: Vec::new(),
+            auth_epoch: 0,
         }
     }
 }
@@ -655,6 +663,7 @@ impl From<TomlConfig> for Config {
             observability: config.observability,
             relay: config.relay,
             deprecations: Vec::new(),
+            auth_epoch: 0,
         }
     }
 }
@@ -984,9 +993,10 @@ impl Config {
         if !header.is_empty() && !trusted.is_empty() {
             let ranges: Vec<String> = trusted.iter().map(ToString::to_string).collect();
             return Some(format!(
-                "relay.real_ip_header = {header:?} is trusted as each client's address on \
-                 connections from relay.trusted_proxies ({}); any other connection is its own \
-                 address. Wok skips the addresses in those ranges from the header's end, so \
+                "relay.real_ip_header = {header:?} is trusted as each client's address, by \
+                 the per-address budgets, NIP-86 IP blocks and the write-policy plugin's \
+                 sourceInfo, on connections from relay.trusted_proxies ({}); any other \
+                 connection is its own address. Wok skips the addresses in those ranges from the header's end, so \
                  they must hold only your proxies: a client with an address in them could name \
                  any address as its own",
                 ranges.join(", ")
@@ -995,11 +1005,12 @@ impl Config {
         if !header.is_empty() {
             return Some(format!(
                 "relay.real_ip_header = {header:?} is trusted as each client's address by \
-                 every per-address budget. Set it only when every connection comes from a \
-                 proxy that writes the client's address as the header's last entry: a client \
-                 that reaches the relay directly could send a new address with each \
-                 connection to escape those budgets, or send another client's address to \
-                 spend that client's budgets. List the proxies in relay.trusted_proxies to make \
+                 every per-address budget, NIP-86 IP blocks and the write-policy plugin's \
+                 sourceInfo. Set it only when every connection comes from a proxy that writes \
+                 the client's address as the header's last entry: a client that reaches the \
+                 relay directly could send a new address with each connection to escape those \
+                 budgets and IP blocks, or send another client's address to spend that \
+                 client's budgets. List the proxies in relay.trusted_proxies to make \
                  any other connection its own address"
             ));
         }
@@ -1017,6 +1028,19 @@ impl Config {
              address",
             addrs.join(", ")
         ))
+    }
+
+    /// The [`real_ip_header_warning`](Self::real_ip_header_warning) a reload
+    /// from `previous` newly causes. Both settings are read for each
+    /// connection and request, so a reload changes whose address a client
+    /// is at once.
+    pub fn real_ip_header_reload_warning(
+        &self,
+        previous: &Config,
+        listening: &[SocketAddr],
+    ) -> Option<String> {
+        let now = self.real_ip_header_warning(listening)?;
+        (previous.real_ip_header_warning(listening).as_ref() != Some(&now)).then_some(now)
     }
 
     /// Who may read each kind: `relay.auth`'s read classes.
@@ -1486,9 +1510,9 @@ impl Config {
     }
 
     /// Describe changes to restart-safe security scopes (write-policy plugin,
-    /// filter validation, abuse budgets, NIP-42 read restriction scope,
-    /// NIP-62 vanish scope, negentropy enable switch) between this config and
-    /// a reload candidate. TOML loading merges the supplied file over its
+    /// client address header, filter validation, abuse budgets, NIP-42 read
+    /// restriction scope, NIP-62 vanish scope, negentropy enable switch,
+    /// admin settings) between this config and a reload candidate. TOML loading merges the supplied file over its
     /// preset and the factory defaults, so a valid-but-incomplete file (or a
     /// changed `preset`) silently changes omitted sections — these diffs are
     /// warn-logged on reload so the change is at least visible in the logs.
@@ -1679,6 +1703,50 @@ impl Config {
                 self.relay.search_enabled, new.relay.search_enabled,
             ));
         }
+        // Who may manage the relay, and how a request proves it.
+        let (prev_admin, new_admin) = (&self.admin, &new.admin);
+        if prev_admin.enabled != new_admin.enabled {
+            changes.push(format!(
+                "admin.enabled changed: {} -> {}",
+                prev_admin.enabled, new_admin.enabled,
+            ));
+        }
+        if prev_admin.public_url != new_admin.public_url {
+            changes.push(format!(
+                "admin.public_url changed: {:?} -> {:?}",
+                prev_admin.public_url, new_admin.public_url,
+            ));
+        }
+        let missing = |from: &[String], wanted: &[String]| -> Vec<String> {
+            from.iter()
+                .filter(|key| !wanted.contains(key))
+                .cloned()
+                .collect()
+        };
+        let added = missing(&new_admin.pubkeys, &prev_admin.pubkeys);
+        let removed = missing(&prev_admin.pubkeys, &new_admin.pubkeys);
+        if !added.is_empty() || !removed.is_empty() {
+            changes.push(format!(
+                "admin.pubkeys changed: added {added:?}, removed {removed:?}{}",
+                if added.is_empty() {
+                    ""
+                } else {
+                    " (each added key is an admin while admin.enabled is on)"
+                },
+            ));
+        }
+        if prev_admin.allow_config_writes != new_admin.allow_config_writes {
+            changes.push(format!(
+                "admin.allow_config_writes changed: {} -> {}",
+                prev_admin.allow_config_writes, new_admin.allow_config_writes,
+            ));
+        }
+        if prev_admin.auth_window_secs != new_admin.auth_window_secs {
+            changes.push(format!(
+                "admin.auth_window_secs changed: {} -> {}",
+                prev_admin.auth_window_secs, new_admin.auth_window_secs,
+            ));
+        }
         changes
     }
 
@@ -1759,6 +1827,29 @@ impl Config {
         (previous.inbox_kinds_warning().as_ref() != Some(&now)).then_some(now)
     }
 
+    /// Warn when `relay.abuse.min_pow_difficulty` asks for proof of work
+    /// that the relay does not check: `relay.abuse.enabled = false` turns it
+    /// off with the rest of abuse protection.
+    pub fn pow_warning(&self) -> Option<String> {
+        let abuse = &self.relay.abuse;
+        (!abuse.enabled && abuse.min_pow_difficulty > 0).then(|| {
+            format!(
+                "relay.abuse.min_pow_difficulty = {} is ignored: relay.abuse.enabled = false \
+                 turns proof of work off with the rest of abuse protection, so events are \
+                 accepted whatever their difficulty and NIP-11 advertises 0. Set \
+                 relay.abuse.enabled = true to require it, or remove min_pow_difficulty",
+                abuse.min_pow_difficulty
+            )
+        })
+    }
+
+    /// The [`pow_warning`](Self::pow_warning) a reload from `previous` newly
+    /// causes, such as by turning abuse protection off.
+    fn pow_reload_warning(&self, previous: &Config) -> Option<String> {
+        let now = self.pow_warning()?;
+        (previous.pow_warning().as_ref() != Some(&now)).then_some(now)
+    }
+
     /// The configuration this config's preset gives: the built-in defaults
     /// with the preset's overlay, before any file.
     pub fn preset_defaults(&self) -> Config {
@@ -1766,11 +1857,11 @@ impl Config {
             .expect("every built-in preset parses")
     }
 
-    /// Warnings for every zero-valued guard that silently means "unlimited"
-    /// (all editable live through the dashboard). Surfaced on reload so a
-    /// single zero can't silently disarm a guard. A guard that the preset
-    /// itself turns off, such as `relay.abuse.max_stored_events` in the
-    /// public preset, is not warned about.
+    /// Warnings for every zero-valued guard that silently means "unlimited".
+    /// Surfaced at startup, on reload, on the dashboard and by `wok doctor`
+    /// so a single zero can't silently disarm a guard. A guard that the
+    /// preset itself turns off, such as `relay.abuse.max_stored_events` in
+    /// the public preset, is not warned about.
     pub fn zero_guard_warnings(&self) -> Vec<String> {
         self.zero_guards()
             .into_iter()
@@ -1949,17 +2040,32 @@ impl Config {
                 "relay.message_read_timeout_secs is zero — whole-message trickle guard disabled",
             ));
         }
+        if zeroed(
+            r.max_live_buffer_bytes as u64,
+            pr.max_live_buffer_bytes as u64,
+        ) {
+            warnings.push(SettingWarning::new(
+                &["relay.max_live_buffer_bytes"],
+                "relay.max_live_buffer_bytes is zero — live matches held for a subscription while its history is sent are unlimited",
+            ));
+        }
+        if zeroed(self.db_min_free_disk_bytes, preset.db_min_free_disk_bytes) {
+            warnings.push(SettingWarning::new(
+                &["database.min_free_disk_bytes"],
+                "database.min_free_disk_bytes is zero — writes are no longer refused before the disk fills",
+            ));
+        }
         warnings
     }
 
     /// Warnings for each message cap too small for a limit behind it:
     /// `relay.max_websocket_payload_size`, and `relay.unix.max_frame_bytes`
     /// while the Unix socket is on, must hold an EVENT of
-    /// `events.max_event_size` and a REQ of `relay.max_req_filter_size`, each
-    /// in its shortest envelope. Otherwise such a message passes its own
-    /// limit but is cut off with its connection, so the client gets no `OK`
-    /// or `CLOSED` saying why. Both caps apply at restart; the limits reload
-    /// live.
+    /// `events.max_event_size`, and a REQ of `relay.max_req_filter_size` (and
+    /// a COUNT, while COUNT is on), each in its shortest envelope. Otherwise
+    /// such a message passes its own limit but is cut off with its
+    /// connection, so the client gets no `OK` or `CLOSED` saying why. Both
+    /// caps apply at restart; the limits reload live.
     pub fn message_cap_warnings(&self) -> Vec<String> {
         self.message_caps()
             .into_iter()
@@ -1973,6 +2079,18 @@ impl Config {
         // The bytes each message adds to what its limit counts, at least.
         const EVENT_ENVELOPE: usize = r#"["EVENT",]"#.len();
         const REQ_ENVELOPE: usize = r#"["REQ","x",]"#.len();
+        const COUNT_ENVELOPE: usize = r#"["COUNT","x",]"#.len();
+        let event = [("an EVENT whose event takes", EVENT_ENVELOPE)];
+        // A COUNT is held to the REQ's filter limit, in a longer envelope.
+        let filters = [
+            ("a REQ whose filters take", REQ_ENVELOPE),
+            ("a COUNT whose filters take", COUNT_ENVELOPE),
+        ];
+        let filters = if self.relay.max_filter_limit_count > 0 {
+            &filters[..]
+        } else {
+            &filters[..1]
+        };
         let mut caps = vec![(
             "relay.max_websocket_payload_size",
             self.relay.max_websocket_payload_size,
@@ -1987,32 +2105,42 @@ impl Config {
             (
                 "events.max_event_size",
                 self.events.max_event_size,
-                EVENT_ENVELOPE,
-                "an EVENT whose event takes",
+                &event[..],
             ),
             (
                 "relay.max_req_filter_size",
                 self.relay.max_req_filter_size,
-                REQ_ENVELOPE,
-                "a REQ whose filters take",
+                filters,
             ),
         ];
         let mut warnings = Vec::new();
         for (cap_key, cap) in caps {
-            for (limit_key, limit, envelope, message) in limits {
-                let needed = limit.saturating_add(envelope);
-                if cap < needed {
-                    warnings.push(SettingWarning::new(
-                        &[cap_key, limit_key],
-                        format!(
-                            "{cap_key} = {cap} is too small for {limit_key} = {limit}: {message} \
-                             more than {} bytes is cut off, and its connection closed, before the \
-                             relay can answer it. Raise {cap_key} to at least {needed} (it applies \
-                             at restart), or lower {limit_key}.",
-                            cap.saturating_sub(envelope)
-                        ),
-                    ));
-                }
+            for (limit_key, limit, messages) in limits {
+                // The messages the cap cuts off, each with the size past which
+                // it is.
+                let cut: Vec<String> = messages
+                    .iter()
+                    .filter(|&&(_, envelope)| cap < limit.saturating_add(envelope))
+                    .map(|&(message, envelope)| {
+                        format!("{message} more than {} bytes", cap.saturating_sub(envelope))
+                    })
+                    .collect();
+                let cut = match cut.len() {
+                    0 => continue,
+                    1 => cut.concat(),
+                    _ => format!("{},", cut.join(", or ")),
+                };
+                let envelope = messages.iter().map(|&(_, envelope)| envelope).max();
+                let needed = limit.saturating_add(envelope.unwrap_or_default());
+                warnings.push(SettingWarning::new(
+                    &[cap_key, limit_key],
+                    format!(
+                        "{cap_key} = {cap} is too small for {limit_key} = {limit}: {cut} is cut \
+                         off, and its connection closed, before the relay can answer it. Raise \
+                         {cap_key} to at least {needed} (it applies at restart), or lower \
+                         {limit_key}."
+                    ),
+                ));
             }
         }
         warnings
@@ -2047,16 +2175,17 @@ impl Config {
         for change in self.security_scope_changes(&new) {
             tracing::warn!("config reload: {change}");
         }
-        for warning in new.zero_guard_warnings() {
+        if let Some(warning) = new.inbox_kinds_reload_warning(self) {
             tracing::warn!("config reload: {warning}");
         }
-        if let Some(warning) = new.inbox_kinds_reload_warning(self) {
+        if let Some(warning) = new.pow_reload_warning(self) {
             tracing::warn!("config reload: {warning}");
         }
         for deprecation in &new.deprecations {
             tracing::warn!("config reload: {deprecation}");
         }
         let old = std::mem::replace(self, new);
+        self.auth_epoch = old.auth_epoch + u64::from(old.auth_usable() && !self.auth_usable());
         self.db = old.db;
         self.db_maxreaders = old.db_maxreaders;
         self.db_mapsize = old.db_mapsize;
@@ -2080,6 +2209,11 @@ impl Config {
         self.observability.log_format = old.observability.log_format;
         self.observability.log_filter = old.observability.log_filter;
         self.observability.metrics_listen = old.observability.metrics_listen;
+        // Of the guards as they run: a restart-only zero, such as
+        // `database.min_free_disk_bytes`, is warned about once it applies.
+        for warning in self.zero_guard_warnings() {
+            tracing::warn!("config reload: {warning}");
+        }
         // The caps stay as the relay started, and the limits change now.
         for warning in self.message_cap_warnings() {
             tracing::warn!("config reload: {warning}");
@@ -2133,9 +2267,14 @@ fn clamp_size_class(parsed: &mut TomlConfig) {
     }
 }
 
+/// The longest `admin.auth_window_secs` a configuration may set.
+pub const MAX_AUTH_WINDOW_SECS: u64 = 300;
+
 fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {
-    if admin.auth_window_secs == 0 || admin.auth_window_secs > 300 {
-        return Err("admin.auth_window_secs must be between 1 and 300".into());
+    if admin.auth_window_secs == 0 || admin.auth_window_secs > MAX_AUTH_WINDOW_SECS {
+        return Err(format!(
+            "admin.auth_window_secs must be between 1 and {MAX_AUTH_WINDOW_SECS}"
+        ));
     }
     if !admin.enabled {
         return Ok(());
@@ -2918,6 +3057,26 @@ mod tests {
     }
 
     #[test]
+    fn a_reload_that_makes_auth_unusable_starts_an_auth_epoch() {
+        let mut cfg = Config::default();
+        cfg.relay.auth.service_url = "wss://auth.example".into();
+        let mut reload = |enabled: bool| {
+            let mut new = cfg.clone();
+            new.relay.auth.enabled = enabled;
+            new.auth_epoch = 0;
+            cfg.apply_reload(new).unwrap();
+            cfg.auth_epoch
+        };
+        // Only a reload from usable to unusable ends the logins: AUTH that
+        // stays usable keeps them, and AUTH that stays off has none.
+        assert_eq!(reload(true), 0);
+        assert_eq!(reload(false), 1);
+        assert_eq!(reload(false), 1);
+        assert_eq!(reload(true), 1);
+        assert_eq!(reload(false), 2);
+    }
+
+    #[test]
     fn security_scope_changes_flag_silent_reversions() {
         let full = Config::parse_toml(
             r#"
@@ -3334,13 +3493,93 @@ negentropy_enabled = true
             assert!(
                 warning.ends_with(
                     "could send a new address with each connection to escape those \
-                     budgets, or send another client's address to spend that client's budgets. \
-                     List the proxies in relay.trusted_proxies to make any other connection its \
-                     own address"
+                     budgets and IP blocks, or send another client's address to spend that \
+                     client's budgets. List the proxies in relay.trusted_proxies to make any \
+                     other connection its own address"
+                ),
+                "{warning}"
+            );
+            assert!(
+                warning.contains(
+                    "every per-address budget, NIP-86 IP blocks and the write-policy plugin's \
+                     sourceInfo"
                 ),
                 "{warning}"
             );
         }
+    }
+
+    #[test]
+    fn a_reload_warns_about_the_client_address_header_it_sets() {
+        let listening: Vec<SocketAddr> = vec!["0.0.0.0:7777".parse().unwrap()];
+        let direct = Config::default();
+        let mut header = direct.clone();
+        header.relay.real_ip_header = "x-forwarded-for".into();
+        // The header is read on each request, so setting it is warned about
+        // as the reload makes it, naming who trusts it.
+        let warning = header
+            .real_ip_header_reload_warning(&direct, &listening)
+            .unwrap();
+        assert!(warning.contains("NIP-86 IP blocks"), "{warning}");
+        assert_eq!(
+            header.real_ip_header_reload_warning(&header, &listening),
+            None
+        );
+        assert_eq!(
+            direct.real_ip_header_reload_warning(&header, &listening),
+            None
+        );
+        // Narrowing it to listed proxies changes the warning, so that is
+        // named too.
+        let mut proxied = header.clone();
+        proxied.relay.trusted_proxies = vec!["10.0.0.0/8".parse().unwrap()];
+        let warning = proxied
+            .real_ip_header_reload_warning(&header, &listening)
+            .unwrap();
+        assert!(warning.contains("10.0.0.0/8"), "{warning}");
+    }
+
+    #[test]
+    fn security_scope_changes_flag_the_admin_settings() {
+        let key = |n: u8| hex::encode([n; 32]);
+        let base = Config::parse_toml(&format!(
+            "[admin]\nenabled = true\npublic_url = \"https://relay.example\"\npubkeys = [\"{}\"]\n",
+            key(1)
+        ))
+        .unwrap();
+        assert!(base.security_scope_changes(&base.clone()).is_empty());
+        let mut changed = base.clone();
+        changed.admin.enabled = false;
+        changed.admin.public_url = "https://other.example".into();
+        changed.admin.pubkeys = vec![key(2)];
+        changed.admin.allow_config_writes = true;
+        changed.admin.auth_window_secs = 300;
+        assert_eq!(
+            base.security_scope_changes(&changed),
+            [
+                "admin.enabled changed: true -> false".to_string(),
+                "admin.public_url changed: \"https://relay.example\" -> \"https://other.example\""
+                    .to_string(),
+                format!(
+                    "admin.pubkeys changed: added [\"{}\"], removed [\"{}\"] (each added key \
+                     is an admin while admin.enabled is on)",
+                    key(2),
+                    key(1)
+                ),
+                "admin.allow_config_writes changed: false -> true".to_string(),
+                "admin.auth_window_secs changed: 60 -> 300".to_string(),
+            ]
+        );
+        // Removing a key names no grant.
+        let mut fewer = base.clone();
+        fewer.admin.pubkeys.clear();
+        assert_eq!(
+            base.security_scope_changes(&fewer),
+            [format!(
+                "admin.pubkeys changed: added [], removed [\"{}\"]",
+                key(1)
+            )]
+        );
     }
 
     #[test]
@@ -3352,12 +3591,13 @@ negentropy_enabled = true
             assert_eq!(cfg.message_caps(), [], "preset {preset} with Unix on");
         }
 
+        // COUNT is on by default, and its envelope is two bytes longer.
         let mut cfg = Config::default();
         cfg.events.max_event_size = 1000;
         cfg.relay.max_req_filter_size = 1000;
-        cfg.relay.max_websocket_payload_size = 1012;
+        cfg.relay.max_websocket_payload_size = 1014;
         assert_eq!(cfg.message_caps(), []);
-        cfg.relay.max_websocket_payload_size = 1011;
+        cfg.relay.max_websocket_payload_size = 1013;
         let caps = cfg.message_caps();
         assert_eq!(caps.len(), 1, "{caps:?}");
         assert_eq!(
@@ -3367,6 +3607,32 @@ negentropy_enabled = true
                 "relay.max_req_filter_size"
             ]
         );
+        assert_eq!(
+            caps[0].warning,
+            "relay.max_websocket_payload_size = 1013 is too small for \
+             relay.max_req_filter_size = 1000: a COUNT whose filters take more than 999 bytes \
+             is cut off, and its connection closed, before the relay can answer it. Raise \
+             relay.max_websocket_payload_size to at least 1014 (it applies at restart), or \
+             lower relay.max_req_filter_size."
+        );
+        cfg.relay.max_websocket_payload_size = 1011;
+        let caps = cfg.message_caps();
+        assert_eq!(caps.len(), 1, "{caps:?}");
+        assert_eq!(
+            caps[0].warning,
+            "relay.max_websocket_payload_size = 1011 is too small for \
+             relay.max_req_filter_size = 1000: a REQ whose filters take more than 999 bytes, or \
+             a COUNT whose filters take more than 997 bytes, is cut off, and its connection \
+             closed, before the relay can answer it. Raise relay.max_websocket_payload_size to \
+             at least 1014 (it applies at restart), or lower relay.max_req_filter_size."
+        );
+        // With COUNT off, only a REQ has to fit.
+        cfg.relay.max_filter_limit_count = 0;
+        cfg.relay.max_websocket_payload_size = 1012;
+        assert_eq!(cfg.message_caps(), []);
+        cfg.relay.max_websocket_payload_size = 1011;
+        let caps = cfg.message_caps();
+        assert_eq!(caps.len(), 1, "{caps:?}");
         assert_eq!(
             caps[0].warning,
             "relay.max_websocket_payload_size = 1011 is too small for \
@@ -3413,6 +3679,29 @@ negentropy_enabled = true
         assert_eq!(running.relay.max_websocket_payload_size, 2 * 1024 * 1024);
         assert_eq!(running.events.max_event_size, 4 * 1024 * 1024);
         assert_eq!(running.message_caps().len(), 1);
+
+        // COUNT turns on live, and the cap the relay keeps must hold one.
+        let file = |count: u64, cap: usize| {
+            Config::parse_toml(&format!(
+                "[events]\nmax_event_size = 1000\n[relay]\nmax_req_filter_size = 1000\n\
+                 max_filter_limit_count = {count}\nmax_websocket_payload_size = {cap}\n"
+            ))
+            .unwrap()
+        };
+        let mut running = file(0, 1012);
+        assert_eq!(running.message_caps(), []);
+        let new = file(1000, 1014);
+        assert_eq!(new.message_caps(), []);
+        running.apply_reload(new).unwrap();
+        assert_eq!(running.relay.max_websocket_payload_size, 1012);
+        let keys: Vec<Vec<String>> = running.message_caps().into_iter().map(|w| w.keys).collect();
+        assert_eq!(
+            keys,
+            [[
+                "relay.max_websocket_payload_size",
+                "relay.max_req_filter_size"
+            ]]
+        );
     }
 
     #[test]
@@ -3461,8 +3750,9 @@ negentropy_enabled = true
         let warning = cfg.real_ip_header_warning(&listening).unwrap();
         assert!(
             warning.starts_with(
-                "relay.real_ip_header = \"x-forwarded-for\" is trusted as each client's address \
-                 on connections from relay.trusted_proxies (127.0.0.1, 192.0.2.0/24)"
+                "relay.real_ip_header = \"x-forwarded-for\" is trusted as each client's address, \
+                 by the per-address budgets, NIP-86 IP blocks and the write-policy plugin's \
+                 sourceInfo, on connections from relay.trusted_proxies (127.0.0.1, 192.0.2.0/24)"
             ),
             "{warning}"
         );
@@ -3552,6 +3842,7 @@ negentropy_enabled = true
             "handshake_timeout_secs",
             "frame_read_timeout_secs",
             "message_read_timeout_secs",
+            "max_live_buffer_bytes",
         ] {
             let cfg = Config::parse_toml(&format!("[relay]\n{field} = 0\n")).unwrap();
             assert!(
@@ -3559,10 +3850,32 @@ negentropy_enabled = true
                 "{field} = 0 should warn"
             );
         }
+        let cfg = Config::parse_toml("[database]\nmin_free_disk_bytes = 0\n").unwrap();
+        assert!(warns_about(&cfg, "database.min_free_disk_bytes"));
         // With abuse protection disabled entirely, zero budgets are moot.
         let cfg = Config::parse_toml("[relay.abuse]\nenabled = false\nevent_rate_per_second = 0\n")
             .unwrap();
         assert!(cfg.zero_guard_warnings().is_empty());
+    }
+
+    #[test]
+    fn proof_of_work_ignored_with_abuse_protection_off_warns() {
+        let parse = |abuse: &str| Config::parse_toml(&format!("[relay.abuse]\n{abuse}\n")).unwrap();
+        assert_eq!(Config::default().pow_warning(), None);
+        let required = parse("min_pow_difficulty = 20");
+        assert_eq!(required.pow_warning(), None);
+        assert_eq!(parse("enabled = false").pow_warning(), None);
+        let ignored = parse("enabled = false\nmin_pow_difficulty = 20");
+        let warning = ignored.pow_warning().unwrap();
+        assert!(
+            warning.starts_with("relay.abuse.min_pow_difficulty = 20 is ignored"),
+            "{warning}"
+        );
+        // A reload names it when it turns abuse protection off under a
+        // difficulty, and not again while nothing about it changes.
+        assert_eq!(ignored.pow_reload_warning(&required), Some(warning));
+        assert_eq!(ignored.pow_reload_warning(&ignored), None);
+        assert_eq!(required.pow_reload_warning(&ignored), None);
     }
 
     #[test]
@@ -3920,6 +4233,13 @@ negentropy_enabled = true
         assert_eq!(marmot.relay.max_filter_limit_count, 0);
         assert!(!marmot.relay.compression_enabled);
         assert!(!crate::supported_nips(&marmot).contains(&45));
+        // NIP-77 sized to MDK's syncs (#166).
+        assert_eq!(marmot.relay.max_sync_events, 65_536);
+        assert_eq!(marmot.relay.sync_memory_per_connection, 128 * 1024 * 1024);
+        assert_eq!(
+            marmot.relay.sync_memory_total,
+            Config::default().relay.sync_memory_total
+        );
         let auth = &marmot.relay.auth;
         assert_eq!(
             auth.accepted_kinds,
@@ -3957,6 +4277,36 @@ negentropy_enabled = true
         assert_eq!(
             entry(&explained, "relay.max_filter_limit").origin,
             Origin::Preset(Preset::Marmot)
+        );
+    }
+
+    #[test]
+    fn the_marmot_preset_holds_mdks_concurrent_syncs() {
+        // MDK's NEG-OPEN names one group or inbox with limit 16,385, and it
+        // runs at most eight on one relay connection. The negentropy worker
+        // reserves a view's rounds plus 256 bytes per event of its limit,
+        // capped at max_sync_events + 1, before its scan.
+        const MDK_LIMIT: u64 = 16_385;
+        let reserved = |limit: u64| {
+            wok_negentropy::ROUND_MEMORY_BYTES
+                + limit * wok_negentropy::memory_view_item_bytes(false)
+        };
+        let marmot = Config::parse_toml("preset = \"marmot\"\n").unwrap();
+        // Four times the 16,384 events MDK compares (its limit is one more,
+        // to see a full set), so the cap never cuts it.
+        assert_eq!(marmot.relay.max_sync_events, 4 * (MDK_LIMIT - 1));
+        // 15 of MDK's sessions fit in a connection's budget, nearly twice
+        // the eight it runs at once.
+        assert_eq!(
+            marmot.relay.sync_memory_per_connection / reserved(MDK_LIMIT),
+            15
+        );
+        // A sync without a limit reserves 20 MiB, not the public 248 MiB.
+        let mib = |bytes: u64| bytes / (1024 * 1024);
+        assert_eq!(mib(reserved(marmot.relay.max_sync_events + 1)), 20);
+        assert_eq!(
+            mib(reserved(Config::default().relay.max_sync_events + 1)),
+            248
         );
     }
 

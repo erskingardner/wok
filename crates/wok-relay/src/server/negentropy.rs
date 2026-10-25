@@ -76,6 +76,35 @@ struct Session {
     expires_at: u64,
     /// The serialized size of the filter it keeps.
     filter_bytes: usize,
+    /// The filter it was opened with, checked again when a reload changes
+    /// `relay.filter_validation`.
+    filter: NostrFilterGroup,
+}
+
+/// Close `conn_id`'s sessions and scans: its identities changed, and with
+/// them what it may see.
+fn reauthenticated(
+    sessions: &mut HashMap<(u64, String), Session>,
+    queries: &mut QueryScheduler,
+    conns: &ConnTable,
+    metrics: &Metrics,
+    conn_id: u64,
+) {
+    sessions.retain(|(conn, sid), _| {
+        if *conn == conn_id {
+            fail(
+                conns,
+                metrics,
+                *conn,
+                sid,
+                "closed: authentication changed; reopen synchronization",
+            );
+            false
+        } else {
+            true
+        }
+    });
+    queries.close_conn(conn_id);
 }
 
 fn fail(conns: &ConnTable, metrics: &Metrics, conn: u64, sid: &str, message: &str) {
@@ -177,8 +206,10 @@ pub(super) fn run_negentropy(
     queries.ensure_exists = false;
     let mut sessions: HashMap<(u64, String), Session> = HashMap::new();
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
+    let mut auth_epoch = 0;
     let mut policy = read_visibility(&initial_cfg, vec![]);
     let mut access = read_access(&initial_cfg);
+    let mut filters = FilterRules::new(&initial_cfg);
     let mut generation = None;
     let mut last_snapshot = Instant::now();
     loop {
@@ -216,6 +247,11 @@ pub(super) fn run_negentropy(
         }
         last_snapshot = Instant::now();
         let cfg = cfg.read().clone();
+        // A reload that made AUTH unusable ended every login, so a session
+        // opened since sees what its connection no longer may.
+        for conn_id in expire_logins(&mut authed, &mut auth_epoch, cfg.auth_epoch) {
+            reauthenticated(&mut sessions, &mut queries, &conns, &metrics, conn_id);
+        }
         let txn = match env.begin_ro() {
             Ok(txn) => txn,
             Err(_) => continue,
@@ -256,6 +292,20 @@ pub(super) fn run_negentropy(
                 true
             }
         });
+        // A reload that tightened the filter rules closes each session whose
+        // filter they now refuse, with the NEG-ERR its NEG-OPEN would get.
+        if filters.follow(&cfg) {
+            let validator = &filters.validator;
+            sessions.retain(|(conn, sid), session| {
+                let Err(error) = validator.validate(&session.filter) else {
+                    return true;
+                };
+                queries.remove_sub(*conn, &SubId::new(sid).unwrap());
+                count_filter_limit(&metrics, &error);
+                fail(&conns, &metrics, *conn, sid, &neg_filter_refusal(&error));
+                false
+            });
+        }
         policy = next_policy;
         access = next_access;
         generation = current_generation;
@@ -326,6 +376,13 @@ pub(super) fn run_negentropy(
                             &sid,
                             "closed: visibility changed; reopen synchronization",
                         );
+                        continue;
+                    }
+                    // And by the filter rules, which a reload may have
+                    // tightened since.
+                    if let Err(error) = filters.validator.validate(&sub.filter_group) {
+                        count_filter_limit(&metrics, &error);
+                        fail(&conns, &metrics, conn, &sid, &neg_filter_refusal(&error));
                         continue;
                     }
                     if sessions.keys().filter(|k| k.0 == conn).count()
@@ -404,6 +461,7 @@ pub(super) fn run_negentropy(
                             continue;
                         }
                     };
+                    let filter = sub.filter_group.clone();
                     let view = if let Some(tree_id) = tree_id {
                         View::Tree { sub, tree_id }
                     } else {
@@ -435,6 +493,7 @@ pub(super) fn run_negentropy(
                         waiting_since: None,
                         expires_at: u64::MAX,
                         filter_bytes: filter_str.len(),
+                        filter,
                     };
                     if let View::Tree { sub, tree_id } = &session.view {
                         if !reconcile_tree(
@@ -498,25 +557,18 @@ pub(super) fn run_negentropy(
                 NegMsg::SetAuth {
                     conn_id,
                     authed: pk,
+                    epoch,
                 } => {
-                    let identities = authed.entry(conn_id).or_default();
-                    if !identities.contains(&pk) {
-                        identities.push(pk);
-                        sessions.retain(|(conn, sid), _| {
-                            if *conn == conn_id {
-                                fail(
-                                    &conns,
-                                    &metrics,
-                                    *conn,
-                                    sid,
-                                    "closed: authentication changed; reopen synchronization",
-                                );
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                        queries.close_conn(conn_id);
+                    for conn_id in expire_logins(&mut authed, &mut auth_epoch, epoch) {
+                        reauthenticated(&mut sessions, &mut queries, &conns, &metrics, conn_id);
+                    }
+                    // A login from an epoch a reload already ended is void.
+                    if epoch == auth_epoch {
+                        let identities = authed.entry(conn_id).or_default();
+                        if !identities.contains(&pk) {
+                            identities.push(pk);
+                            reauthenticated(&mut sessions, &mut queries, &conns, &metrics, conn_id);
+                        }
                     }
                 }
                 NegMsg::CloseSub { conn_id, sub_id } => {
@@ -794,6 +846,7 @@ mod tests {
         tx.send(NegMsg::SetAuth {
             conn_id: 1,
             authed: member,
+            epoch: 0,
         })
         .unwrap();
         tx.send(open("member")).unwrap();
@@ -803,6 +856,150 @@ mod tests {
             (&json!("NEG-MSG"), &json!("member"))
         );
         assert_eq!(metrics.refusals.get(Setting::ReadPolicy), 1);
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// A reload that tightened `relay.filter_validation` closes each
+    /// session whose filter it refuses, and refuses a NEG-OPEN still queued.
+    #[test]
+    fn a_reload_that_tightens_filter_validation_closes_the_sessions_it_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let (cfg, conns) = (cfg.clone(), conns.clone());
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let open = |sub_id: &str, filter: Value| {
+            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        let served = |reply: Value, sub_id: &str| {
+            assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!(sub_id)));
+        };
+        let refused = |reply: Value, sub_id: &str| {
+            assert_eq!((&reply[0], &reply[1]), (&json!("NEG-ERR"), &json!(sub_id)));
+            let reason = reply[2].as_str().unwrap();
+            assert!(
+                reason.starts_with("blocked: filter validation failed: "),
+                "{reason}"
+            );
+        };
+
+        tx.send(open("all", json!({"kinds": [1]}))).unwrap();
+        served(next(&mut out_rx), "all");
+        tx.send(open("tagged", json!({"kinds": [1], "#t": ["wok"]})))
+            .unwrap();
+        served(next(&mut out_rx), "tagged");
+        cfg.write().relay.filter_validation.require_scoped_filters = true;
+        // Queued before the reload: admitted again by the rules it meets now.
+        tx.send(open("queued", json!({"kinds": [1]}))).unwrap();
+        refused(next(&mut out_rx), "all");
+        refused(next(&mut out_rx), "queued");
+        tx.send(open("tagged-again", json!({"kinds": [1], "#t": ["wok"]})))
+            .unwrap();
+        served(next(&mut out_rx), "tagged-again");
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// A reload that made AUTH unusable ended every login, so the sessions
+    /// a login opened are closed, and a login from before it is void.
+    #[test]
+    fn a_reload_that_makes_auth_unusable_closes_the_sessions_of_a_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let member = [7u8; 32];
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::allow_pubkey(&mut txn, &member, "").unwrap();
+        txn.commit().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.auth.read_policy = AccessPolicy::Members;
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let (cfg, conns) = (cfg.clone(), conns.clone());
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let open = |sub_id: &str| {
+            let filter = json!({"kinds": [1]});
+            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        let login = |epoch| NegMsg::SetAuth {
+            conn_id: 1,
+            authed: member,
+            epoch,
+        };
+        let refused = |sub_id: &str| {
+            json!([
+                "NEG-ERR",
+                sub_id,
+                "closed: visibility changed; reopen synchronization"
+            ])
+        };
+        let served = |reply: Value, sub_id: &str| {
+            assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!(sub_id)));
+        };
+
+        tx.send(login(0)).unwrap();
+        tx.send(open("member")).unwrap();
+        served(next(&mut out_rx), "member");
+        cfg.write().auth_epoch = 1;
+        tx.send(open("after")).unwrap();
+        assert_eq!(
+            next(&mut out_rx),
+            json!([
+                "NEG-ERR",
+                "member",
+                "closed: authentication changed; reopen synchronization"
+            ])
+        );
+        assert_eq!(next(&mut out_rx), refused("after"));
+        // A login from before the reload, still queued, is void.
+        tx.send(login(0)).unwrap();
+        tx.send(open("stale")).unwrap();
+        assert_eq!(next(&mut out_rx), refused("stale"));
+        tx.send(login(1)).unwrap();
+        tx.send(open("again")).unwrap();
+        served(next(&mut out_rx), "again");
         drop(tx);
         worker.join().unwrap();
     }

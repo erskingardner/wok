@@ -40,10 +40,13 @@ access settings and the client address header read-only, so a remote save
 cannot lock anyone out or move a trust boundary. Restart settings are
 file-only too.
 
-On reload, the relay logs a warning for each guard the file sets to zero,
-which turns it off, while its preset does not; the dashboard shows the same
-warning beside the setting. A guard the preset itself turns off, such as
-`max_stored_events` in `public`, is not warned about. Each refusal a setting
+At startup and on reload, the relay logs a warning for each guard the file
+sets to zero, which turns it off, while its preset does not; the dashboard
+shows the same warning beside the setting, and `wok doctor` reports it in
+its `zero-guards` check. A restart setting, such as
+`database.min_free_disk_bytes`, is warned about once it applies. A guard the
+preset itself turns off, such as `max_stored_events` in `public`, is not
+warned about. Each refusal a setting
 makes is counted by `wok_refusals_total{setting="<key>"}`; see
 [Refusals by setting](observability.md#refusals-by-setting).
 
@@ -62,7 +65,7 @@ on who it is for, what it changes and what it refuses.
 | Preset | Use |
 |---|---|
 | [`public`](presets/public.md) | A general public relay that any client can read from and write to. Its values are the built-in defaults, so its overlay is empty. |
-| [`marmot`](presets/marmot.md) | A relay dedicated to Marmot group messaging, such as one a Marmot app ships as a default: only the Marmot kinds, scoped filters, 4 MiB events, no COUNT or permessage-deflate, and open writes. It refuses to start without usable NIP-42 AUTH, or with gift wraps readable by anyone but their recipient. |
+| [`marmot`](presets/marmot.md) | A relay dedicated to Marmot group messaging, such as one a Marmot app ships as a default: only the Marmot kinds, scoped filters, 4 MiB events, no COUNT or permessage-deflate, NIP-77 limits sized to MDK's syncs, and open writes. It refuses to start without usable NIP-42 AUTH, or with gift wraps readable by anyone but their recipient. |
 
 A preset's requirements are checked when the relay starts and on every
 reload: a `marmot` file without a usable `relay.auth.service_url`, or one
@@ -107,8 +110,9 @@ keeps it. Set only what the relay needs and leave the rest to the preset.
   `events.max_event_size` at 1 MiB, `relay.max_websocket_payload_size` and
   `relay.unix.max_frame_bytes` at 2 MiB, COUNT
   (`relay.max_filter_limit_count`) and permessage-deflate
-  (`relay.compression_enabled`) on, and `relay.abuse.event_burst` at 100
-  when it moves to `preset = "marmot"`. None of those is a past default, and
+  (`relay.compression_enabled`) on, `relay.abuse.event_burst` at 100, and
+  `relay.max_sync_events` and `relay.sync_memory_per_connection` at their
+  `public` values when it moves to `preset = "marmot"`. None of those is a past default, and
   `minimize` keeps them because they differ from `marmot`'s. Delete the line to use the preset's value, or keep it if
   you chose that value.
 - **Deprecated settings** that a release replaced still load, as their
@@ -164,6 +168,13 @@ not offer`, decided by its kind before its signature is verified, and again
 by the writer, so one queued before a reload made AUTH unusable is refused
 too. NIP-62 vanish requests are accepted whatever their class. With
 `enabled = false` the relay refuses AUTH outright.
+
+A reload that makes AUTH unusable ends every login. Each connection is
+anonymous from then on, even after a reload makes AUTH usable again, until
+it authenticates again with the challenge it holds: its live subscriptions
+stop delivering what only its keys may read, and the NEG sessions it opened
+while logged in are closed with `closed: authentication changed; reopen
+synchronization`.
 
 ### Read classes
 
@@ -327,8 +338,9 @@ envelope, at least 10 bytes (`["EVENT",` and `]`). A message over the cap is
 cut off and its connection closed, with no `OK`, so Wok warns at startup, on
 reload, beside the field on the dashboard and in `wok doctor`'s
 `message-caps` check whenever a cap is too small for `events.max_event_size`
-or `relay.max_req_filter_size` (plus 12 bytes for a REQ's envelope). The
-caps apply at restart, and both limits reload live.
+or `relay.max_req_filter_size` (plus 12 bytes for a REQ's envelope, or 14
+for a COUNT's while COUNT is on). The caps apply at restart, and both limits
+reload live.
 
 Single-letter tag values longer than 255 bytes are indexed by their SHA-256,
 so up to `max_tag_val_size` a `#x` filter matches them, an addressable event
@@ -423,6 +435,13 @@ failed: ...`, so a sync cannot list the ids of events a REQ may not ask for.
 A filter with an empty list, which matches nothing, is not checked. The
 filters in one REQ are bounded by `relay.max_filters_per_req` alone.
 
+A reload that changes the rules applies them to what is already open: each
+REQ subscription or COUNT whose filters they now refuse is closed with the
+`CLOSED` it would get if sent now, and each NEG session with the `NEG-ERR`,
+so tightening them stops an enumerating subscription such as
+`{"kinds":[445]}` at once. One still sending its stored history stops at
+its next time slice, before the rest goes out.
+
 ### Query work
 
 Before a REQ, COUNT or NEG-OPEN opens a cursor, the relay estimates how many
@@ -494,7 +513,7 @@ counted under its `_burst` key.
 
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
-| `relay.abuse.enabled` | `true` | Turns every budget here, the storage quotas, the query work ceiling and proof of work on or off. | Off: none of them apply. | — |
+| `relay.abuse.enabled` | `true` | Turns every budget here, the storage quotas, the query work ceiling and proof of work on or off. | Off: none of them apply. A `min_pow_difficulty` above 0 is then ignored, which the relay warns about at startup and on reload, and `wok doctor` in its `abuse-limits` check. | — |
 | `relay.abuse.per_connection.req_rate_per_second` | `20` | Scan CPU and monitor churn from one connection: REQs, REQs that replace a subscription, and NEG-OPENs. | Apps lose subscriptions at startup. | — |
 | `relay.abuse.per_connection.req_burst` | `100` | The same, at once. A client's startup burst of about 60 REQs fits. | As above. | — |
 | `relay.abuse.per_connection.neg_msg_rate_per_second` | `50` | Sync worker time: NEG-MSG rounds of sessions already admitted by their NEG-OPEN. | Clients that sync many groups or inboxes at startup are cut off. | — |
@@ -516,7 +535,7 @@ counted under its `_burst` key.
 | `relay.abuse.invalid_rate_per_second` | `5` | Error replies to malformed messages from one address, including CLOSE and NEG-CLOSE with an invalid subscription id. Valid CLOSE and NEG-CLOSE are never budgeted. | Clients with bugs get fewer error replies to debug with. | — |
 | `relay.abuse.invalid_burst` | `20` | The same, at once. Once spent, the client gets one `rate-limited` NOTICE and further malformed messages are ignored until it refills. | As above. | — |
 | `relay.abuse.ipv6_prefix_len` | `64` | Leading bits of an IPv6 address that key its per-address budgets, from 1 to 128. IPv4 addresses are keyed one by one. | Unrelated users on one large network share a budget. (Too high: a host picks a new address in its /64 for each connection and escapes every per-address budget.) | — |
-| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
+| `relay.real_ip_header` | empty | The client address header: the header in which a reverse proxy passes each client's address, trusted by every per-address budget, NIP-86 IP blocks and the write-policy plugin's `sourceInfo`. Wok reads its last entry, and reads `forwarded` as RFC 7239. See [Addresses](#addresses). File-only. | Empty behind a proxy: every client has the proxy's address and shares one set of budgets. | — |
 | `relay.trusted_proxies` | empty | The proxies in front of the relay, as IP addresses or CIDR ranges such as `"192.0.2.0/24"`. With `relay.real_ip_header` set, only a connection from one of them may name a client, and their own addresses are skipped from the header's end, so a CDN in front of the proxy works. Empty: any connection may, and the client is the header's last entry. See [Addresses](#addresses). File-only. | Empty behind two proxies: every client of the first shares its budgets. Empty while clients can reach the relay directly: they can name any address. A range that holds clients lets them name any address. | — |
 
 Rate budgets have no standard NIP-11 field; clients learn them only from
@@ -629,11 +648,12 @@ An entry where the client's should be that names no IP address, such as
 counted by `wok_real_ip_header_unparsed_total`, and is warned about at most
 once a minute.
 
-**The header is fully trusted for every per-address budget.** Without
+**The header is fully trusted for every per-address budget**, and for
+NIP-86 IP blocks and the write-policy plugin's `sourceInfo`. Without
 `relay.trusted_proxies`, if the proxy passes a client's header on without
 adding the client's address last, or a client can reach the relay directly,
-any client can rotate fake addresses to escape the budgets or spend another
-address's. With it, a client can do so only from an address inside a
+any client can rotate fake addresses to escape the budgets and IP blocks or
+spend another address's. With it, a client can do so only from an address inside a
 trusted range, or through a listed proxy that passes the header on without
 appending the address it was reached from. So the ranges must hold only your
 proxies, and each of them must append. If a CDN adds
@@ -642,7 +662,9 @@ client, and that edge's clients share one set of budgets until the ranges are
 updated. The relay warns at startup whenever the header is set, when
 `relay.trusted_proxies` is set without it, and when the header is empty
 while the relay listens only on loopback or private addresses, as behind a
-proxy. See [production-deployment.md](production-deployment.md).
+proxy. Both settings are read for each connection and request, so a reload
+that changes either applies at once: it is logged as a security-scope
+change, and the warning it newly causes is logged with it. See [production-deployment.md](production-deployment.md).
 
 ## Storage
 
@@ -677,8 +699,8 @@ they are missing. All reload live and are on the dashboard.
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
 | `relay.negentropy_enabled` | `true` | Answering NEG-OPEN, and advertising NIP-77. | Off: Marmot clients, which require NIP-77, and other sync clients fall back or fail. | NIP-77 in `supported_nips` |
-| `relay.max_sync_events` | `1000000` | The size of one temporary sync view; direct trees do not build one. | Large syncs fail with `blocked: too many query results`, and clients fall back to slower REQs. | — |
-| `relay.sync_memory_per_connection` | `268435456` | Memory the sync sessions of one connection may reserve. `0` refuses every session. | Clients that sync many groups at once are refused. | — |
+| `relay.max_sync_events` | `1000000` | The size of one temporary sync view; direct trees do not build one. `marmot` uses 65,536, four times the 16,384 events an MDK session compares. | Large syncs fail with `blocked: too many query results`, and clients fall back to slower REQs. Below 16,385, MDK's `limit`, an MDK sync fails once its group or inbox holds more events than this. | — |
+| `relay.sync_memory_per_connection` | `268435456` | Memory the sync sessions of one connection may reserve. A session reserves 4 MiB, plus 256 bytes (1 KiB with `search`) per event of its `limit`, or of `max_sync_events` + 1 without one, unless a tree serves it. `0` refuses every session. `marmot` uses 128 MiB, 15 of MDK's 8 MiB sessions. | Clients that sync many groups at once are refused. At 64 MiB or less, the eighth of the syncs MDK runs at once is refused. | — |
 | `relay.sync_memory_total` | `1073741824` | Memory every sync session together may reserve. `0` refuses every session. | Syncs are refused while several clients sync at once; four full syncs use up the default pool. | — |
 | `relay.sync_idle_timeout_secs` | `60` | Memory held by abandoned sessions: the longest wait for the client's next round. Active construction has no fixed lifetime. `0` expires sessions at once. | Slow clients' syncs are closed between rounds. | — |
 
@@ -761,7 +783,7 @@ Restart settings, unless noted, and file-only.
 | `relay.bind` | `"127.0.0.1"` | TCP listen address: an IPv4 or IPv6 literal (`::1` or `[::1]`), or a hostname. A hostname listens on every address it resolves to (`localhost` → `127.0.0.1` and `::1`), skipping resolved addresses that are not assigned on this host or whose family it lacks, as long as one binds. |
 | `relay.port` | `7777` | TCP listen port. |
 | `relay.nofiles` | `524288` | Requested process file-descriptor limit. |
-| `relay.max_websocket_payload_size` | `2097152` | Largest reassembled WebSocket message; it must hold the largest event and its envelope, and the largest REQ. Too low: events and REQs that fit their own limits are cut off with their connection, and the `message-caps` warning says so. NIP-11 `max_message_length`. Shown read-only on the dashboard. |
+| `relay.max_websocket_payload_size` | `2097152` | Largest reassembled WebSocket message; it must hold the largest event and its envelope, and the largest REQ and COUNT. Too low: events, REQs and COUNTs that fit their own limits are cut off with their connection, and the `message-caps` warning says so. NIP-11 `max_message_length`. Shown read-only on the dashboard. |
 | `relay.auto_ping_seconds` | `55` | WebSocket ping interval; zero disables automatic pings. A ping unanswered for a full interval closes the connection. |
 | `relay.enable_tcp_keepalive` | `false` | Enable TCP keepalive on accepted sockets. |
 | `relay.handshake_timeout_secs` | `10` | Pre-upgrade HTTP header read deadline (slowloris guard); zero disables it. Live, for new connections. |
@@ -793,7 +815,12 @@ Restart settings, file-only. `database.map_size` and
 
 ## Admin
 
-Live, file-only.
+Live, file-only. A reload that changes any of them is logged as a
+security-scope change, naming the keys added to and removed from
+`admin.pubkeys`. A key taken out of `admin.pubkeys` that still holds the
+NIP-86 `admin` or `moderator` role keeps that level while `admin.enabled`
+is on, until the role is unassigned; the reload warns about each one. Each authorized
+NIP-86 request is logged at `info` with its signer, level and method.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -806,7 +833,10 @@ Live, file-only.
 The public URL must have no credentials, path, query, or fragment. Each API
 request needs a new kind-27235 event with empty content, exactly one matching
 `u` and `method` tag, and, when a body is present, a SHA-256 `payload` tag.
-Authorization events are single-use. The browser delegates signing to NIP-07;
+Authorization events are single-use: an event's ID is kept for 300 seconds,
+the longest `auth_window_secs` allows, whatever the current window, so a
+reload that narrows it and one that widens it again do not let a used event
+through twice. The browser delegates signing to NIP-07;
 Wok never receives private key material.
 
 ## Observability
@@ -858,10 +888,22 @@ All Unix-socket settings require restart and are file-only.
 | `relay.unix.mode` | `0o600` | Permission bits, as TOML octal or decimal. |
 | `relay.unix.owner` | empty | User applied with `chown` after bind. |
 | `relay.unix.group` | empty | Group applied with `chown` after bind. |
-| `relay.unix.auth_uids` | `[]` | Allowed peer UIDs; empty accepts any UID. |
-| `relay.unix.auth_gids` | `[]` | Allowed peer GIDs; empty accepts any GID. |
-| `relay.unix.max_frame_bytes` | `2097152` | Largest length-prefixed JSON frame. Like `relay.max_websocket_payload_size`, it must hold the largest event and REQ, and the `message-caps` warning says when it does not while the socket is on. `marmot` uses 8 MiB. |
+| `relay.unix.auth_uids` | `[]` | Allowed peer UIDs; empty accepts any UID. A peer must pass this list and `auth_gids` both. |
+| `relay.unix.auth_gids` | `[]` | Allowed peer GIDs; empty accepts any GID. Only the peer's effective GID is checked, not its supplementary groups. |
+| `relay.unix.max_frame_bytes` | `2097152` | Largest length-prefixed JSON frame. Like `relay.max_websocket_payload_size`, it must hold the largest event, REQ and COUNT, and the `message-caps` warning says when it does not while the socket is on. `marmot` uses 8 MiB. |
 | `relay.unix.max_pending_outbound_bytes` | `33554432` | Pending output budget before disconnect. |
+
+`auth_uids` and `auth_gids` combine with AND. With either set, the relay
+reads the connecting process's effective UID and GID as they were when it
+connected (`SO_PEERCRED` on Linux, `getpeereid` elsewhere) and admits it only
+if the UID is in `auth_uids` and the GID in `auth_gids`, an empty list
+matching anything. Any other peer, or one whose credentials cannot be read,
+is disconnected before its first frame is read. So `auth_uids = [1000]` with
+`auth_gids = [1001]` admits UID 1000 only while its effective group is 1001,
+not "UID 1000 or members of group 1001", and no supplementary group ever
+matches `auth_gids`. To admit every member of a group, leave both lists
+empty and set `group` with a `mode` such as `0o660`: Linux and macOS check
+the socket file's mode against all of a connecting process's groups.
 
 See [Unix socket protocol](unix-socket.md) for framing and peer authorization.
 

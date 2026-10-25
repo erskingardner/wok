@@ -38,6 +38,8 @@ with a reason beside each value, is [marmot.toml](marmot.toml).
 | `relay.max_filter_limit` | 2,000 | 5,000 | Directory batches with KeyPackage slots. |
 | `relay.max_filter_limit_count` | 1,000,000 | 0 | COUNT (NIP-45) off: MDK never sends it. A COUNT is priced at its index seeks, not its rows, so one filter may read up to a million rows. A COUNT is refused with `CLOSED` `blocked: bad req: COUNT disabled`, and NIP-11 no longer lists NIP-45. |
 | `relay.compression_enabled` | on | off | permessage-deflate off: MDK's WebSocket client never offers it, and MLS and NIP-44 ciphertext compresses poorly. A client that offers it gets an uncompressed connection. |
+| `relay.max_sync_events` | 1,000,000 | 65,536 | Four times the 16,384 events MDK compares in one NIP-77 session: each names one group or inbox with `limit` 16,385. A session without a `limit` reserves 20 MiB of sync memory, not 248 MiB, and scans at most 65,537 events before it is refused. |
+| `relay.sync_memory_per_connection` | 256 MiB | 128 MiB | A session reserves 4 MiB plus 256 bytes per event of its `limit`, about 8 MiB for MDK's, so a connection holds 15 of them. MDK runs at most eight at once on a relay connection. `relay.sync_memory_total` keeps its 1 GiB, the room for every client's syncs at once. |
 | `relay.abuse.event_burst` | 100 | 300 | One inviter's commit plus up to about 250 Welcomes from one address. |
 | `relay.abuse.per_connection.req_rate_per_second`, `relay.abuse.per_connection.req_burst` | 20, 100 | 50, 300 | About two REQs or NEG-OPENs per group at startup, plus `ids` fetches. |
 | `relay.abuse.per_connection.neg_msg_burst` | 200 | 500 | A NIP-77 pass per group and per inbox. |
@@ -57,18 +59,20 @@ write policies, no lower bound on `created_at`, the 900 s future tolerance,
 no proof of work, NIP-77 on, and the per-address backstops.
 
 A setting in the file still wins over the preset. A copy of the 0.7
-`docs/wok.toml`, which lists every 0.7 default, keeps six `public` values
+`docs/wok.toml`, which lists every 0.7 default, keeps eight `public` values
 after it adds `preset = "marmot"`: `events.max_event_size` at 1 MiB,
 `relay.max_websocket_payload_size` and `relay.unix.max_frame_bytes` at
 2 MiB, COUNT (`relay.max_filter_limit_count`) and permessage-deflate
-(`relay.compression_enabled`) on, and `relay.abuse.event_burst` at 100.
+(`relay.compression_enabled`) on, `relay.abuse.event_burst` at 100, and
+`relay.max_sync_events` and `relay.sync_memory_per_connection` at 1,000,000
+events and 256 MiB.
 `wok doctor` names those in its `config-public-values` check. The same
 file's `relay.max_filter_limit = 500` is the 0.7 default, so the relay stays
 at 500 and the `config-defaults` check names it instead. The sample sets no
 accepted kinds, scoped filters or per-connection budgets, so those take
 `marmot`'s values.
 
-To drop the six, delete their lines, or run `wok config minimize` while the
+To drop the eight, delete their lines, or run `wok config minimize` while the
 file still selects `public`: it removes every setting that repeats
 `public`'s value. It keeps `max_filter_limit = 500`, which differs from
 `public`'s 2,000; delete that line too unless you chose 500.

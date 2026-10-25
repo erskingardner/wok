@@ -1219,7 +1219,7 @@ mod tests {
         assert_eq!(kept.status, CheckStatus::Warn);
         assert!(
             kept.detail.starts_with(
-                "6 keys keep the public preset's value, so the relay does not get preset \
+                "8 keys keep the public preset's value, so the relay does not get preset \
                  marmot's: events.max_event_size = 1048576 (line 27, preset marmot: 4194304); \
                  relay.abuse.event_burst = 100 (line 139, preset marmot: 300); \
                  relay.compression_enabled = true (line 81, preset marmot: false); \

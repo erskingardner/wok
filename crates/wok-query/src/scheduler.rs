@@ -227,6 +227,24 @@ impl QueryScheduler {
         }
     }
 
+    /// Drop each query, running or waiting, that `refusal` gives a reason
+    /// for, returning its subscription and reason.
+    pub fn remove_refused<R>(
+        &mut self,
+        mut refusal: impl FnMut(&Subscription) -> Option<R>,
+    ) -> Vec<(Subscription, R)> {
+        let running = self.queries.iter().flatten().map(|query| &query.sub);
+        let waiting = self.waiting.values().flatten();
+        let refused: Vec<_> = running
+            .chain(waiting)
+            .filter_map(|sub| refusal(sub).map(|reason| (sub.clone(), reason)))
+            .collect();
+        for (sub, _) in &refused {
+            self.remove_query(sub.conn_id, &sub.sub_id, sub.count_only);
+        }
+        refused
+    }
+
     pub fn close_conn(&mut self, conn_id: u64) {
         self.waiting.remove(&conn_id);
         if let Some(map) = self.conns.remove(&conn_id) {

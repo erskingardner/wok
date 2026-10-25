@@ -115,6 +115,62 @@ pub fn stored_is_member(
         || is_admin_pubkey(cfg, pubkey))
 }
 
+/// Name each key a reload from `previous` takes out of `admin.pubkeys` that
+/// still holds the built-in `admin` or `moderator` role. The file no longer
+/// makes it an admin, but the role keeps its NIP-86 management level until
+/// the role is unassigned.
+pub fn removed_admin_roles_warning(
+    previous: &Config,
+    cfg: &Config,
+    snap: &ModerationSnapshot,
+) -> Option<String> {
+    let listed: Vec<[u8; 32]> = cfg
+        .admin
+        .pubkeys
+        .iter()
+        .filter_map(|key| admin_key(key))
+        .collect();
+    let held: Vec<String> = previous
+        .admin
+        .pubkeys
+        .iter()
+        .filter_map(|key| admin_key(key))
+        .filter(|pubkey| !listed.contains(pubkey))
+        .filter_map(|pubkey| {
+            let roles: Vec<&str> = snap
+                .roles_of(&pubkey)
+                .iter()
+                .map(String::as_str)
+                .filter(|role| [BUILTIN_ROLE_ADMIN, BUILTIN_ROLE_MODERATOR].contains(role))
+                .collect();
+            (!roles.is_empty()).then(|| format!("{} ({})", to_hex(&pubkey), roles.join(", ")))
+        })
+        .collect();
+    if held.is_empty() {
+        return None;
+    }
+    let reach = if cfg.admin.enabled {
+        "can still manage the relay through NIP-86"
+    } else {
+        "can manage the relay through NIP-86 once admin.enabled is on"
+    };
+    Some(format!(
+        "admin.pubkeys no longer lists {}; each still holds the NIP-86 role named, so it {reach} \
+         at that role's level. Unassign the role with the NIP-86 unassignrole method to revoke it",
+        held.join(", ")
+    ))
+}
+
+/// An `admin.pubkeys` entry as a key: lowercase hex, or an npub in a file
+/// whose admin section is off and so was not normalized.
+fn admin_key(key: &str) -> Option<[u8; 32]> {
+    if key.starts_with("npub1") {
+        wok_event::decode_npub(key).ok()
+    } else {
+        wok_event::from_lower_hex_exact(key).ok()?.try_into().ok()
+    }
+}
+
 /// What an event offers `relay.auth.write_policy`: whether its connection
 /// had authenticated, and the member, if any, that admits it. Bans and the
 /// kind policy are checked apart from it, and NIP-62 vanish requests skip it.
@@ -231,6 +287,56 @@ fn first_p_tag(event: PackedEventView<'_>) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use wok_db::BUILTIN_ROLE_MEMBER;
+
+    #[test]
+    fn a_key_removed_from_admin_pubkeys_that_keeps_a_role_is_named() {
+        let (kept, moderator, plain) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let config = |keys: &[[u8; 32]]| {
+            let mut cfg = Config::default();
+            cfg.admin.pubkeys = keys.iter().map(|key| to_hex(key)).collect();
+            cfg
+        };
+        let previous = config(&[kept, moderator, plain]);
+        let snap = snap_with(&[
+            (&kept, BUILTIN_ROLE_ADMIN),
+            (&moderator, BUILTIN_ROLE_MODERATOR),
+            (&plain, BUILTIN_ROLE_MEMBER),
+        ]);
+        // Keys still listed, and a removed one with no management role, are
+        // not named.
+        assert_eq!(
+            removed_admin_roles_warning(&previous, &previous, &snap),
+            None
+        );
+        assert_eq!(
+            removed_admin_roles_warning(&previous, &config(&[kept, moderator]), &snap),
+            None
+        );
+        let warning = removed_admin_roles_warning(&previous, &config(&[kept]), &snap).unwrap();
+        assert!(
+            warning.starts_with(&format!(
+                "admin.pubkeys no longer lists {} (moderator); each still holds",
+                to_hex(&moderator)
+            )),
+            "{warning}"
+        );
+        assert!(warning.contains("once admin.enabled is on"), "{warning}");
+        let mut enabled = config(&[kept]);
+        enabled.admin.enabled = true;
+        let warning = removed_admin_roles_warning(&previous, &enabled, &snap).unwrap();
+        assert!(
+            warning
+                .contains("so it can still manage the relay through NIP-86 at that role's level."),
+            "{warning}"
+        );
+        // An npub names the same key as its hex.
+        let mut npub = config(&[kept]);
+        npub.admin.pubkeys = vec![wok_event::encode_npub(&kept)];
+        assert_eq!(
+            removed_admin_roles_warning(&config(&[kept]), &npub, &snap),
+            None
+        );
+    }
 
     fn snap_with(assignments: &[(&[u8; 32], &str)]) -> ModerationSnapshot {
         let mut snap = ModerationSnapshot::default();

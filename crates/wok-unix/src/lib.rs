@@ -433,6 +433,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_allow_lists_both_apply_and_check_only_the_effective_gid() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        let gid = nix::unistd::getegid().as_raw();
+        let allowed = |uids: &[u32], gids: &[u32]| {
+            let mut cfg = wok_relay::Config::default();
+            cfg.relay.unix.auth_uids = uids.to_vec();
+            cfg.relay.unix.auth_gids = gids.to_vec();
+            super::peer_allowed(&stream, &cfg).unwrap()
+        };
+        assert!(allowed(&[], &[]));
+        assert!(allowed(&[uid], &[]));
+        assert!(allowed(&[], &[gid]));
+        assert!(allowed(&[uid], &[gid]));
+        // A peer must be in both lists: the right UID does not make up for
+        // another group, nor the right group for another UID.
+        assert!(!allowed(&[uid], &[gid.wrapping_add(1)]));
+        assert!(!allowed(&[uid.wrapping_add(1)], &[gid]));
+        // Supplementary groups are not checked.
+        #[cfg(target_os = "linux")]
+        if let Some(group) = nix::unistd::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|group| group.as_raw())
+            .find(|&group| group != gid)
+        {
+            assert!(!allowed(&[], &[group]));
+        }
+    }
+
+    #[tokio::test]
     async fn replaces_stale_socket() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stale.sock");

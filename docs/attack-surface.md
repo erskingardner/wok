@@ -101,7 +101,8 @@ same ingester. Before Wok reads a message's verb:
   size; one past its limit is refused before more of it is inflated. A text
   message that is not UTF-8 once whole and inflated closes the connection
   with 1007 before the relay sees it, and a frame or message the codec
-  refuses closes it with its RFC 6455 status code (1002, 1007 or 1009).
+  refuses, such as a Close frame whose body is invalid, closes it with its
+  RFC 6455 status code (1002, 1007 or 1009) and logs why.
   `relay.frame_read_timeout_secs` is the
   longest gap between reads while part of a frame or message is buffered,
   and `relay.message_read_timeout_secs` the longest a message or control

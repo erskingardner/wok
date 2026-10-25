@@ -25,6 +25,11 @@ it, the gate in front of it, and the work done before that gate.
   Stop the relay and all DB utilities first; promotion retains the original
   database as a sibling backup rather than modifying it in place.
 - Do not expose the Unix socket on a shared host without UID/GID policy and `0600` mode.
+- Database files (`data.mdb`, `lock.mdb`, `wok compact` output and the copy
+  `wok migrate strfry` takes) are created with mode `0640`, less the umask:
+  stored events include gift wraps and other recipient-only kinds. Files
+  created by earlier releases keep their mode, `0664` less the umask;
+  `chmod g-w,o= data.mdb lock.mdb` in the database directory narrows them.
 
 ## Memory-safety boundary
 

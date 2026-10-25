@@ -188,6 +188,12 @@ regression test. Differential parity alone is not a reason to retain it.
   pinned strfry still challenges and then rejects every AUTH. An authenticated
   COUNT that is not scoped to an authenticated key is `restricted:`, not
   another `auth-required:`. `relay.auth.enabled = false` now also refuses AUTH.
+- NIP-42: an AUTH event's `relay` tag is compared with `relay.auth.service_url`
+  scheme and path included. Pinned strfry compares only the host and port,
+  so on a host that serves several relays by path, each accepted an AUTH
+  signed for another, and `ws://host` matched `wss://host`. The path is
+  compared as written, case included; the host's case, a query, trailing
+  slashes and the port the scheme implies do not matter.
 - NIP-42: while AUTH is usable, the challenge is sent when the connection
   opens, not only after a restricted request is refused. A client can then
   authenticate before its first REQ, so a restricted live subscription such
@@ -418,7 +424,9 @@ regression test. Differential parity alone is not a reason to retain it.
   NIP-11, NIP-86 and the landing page. Other paths return 404, apart from
   `/admin` and, when they are on, the NodeInfo routes and `/metrics`. NodeInfo
   is off unless `relay.nodeinfo_enabled` is set; the pinned strfry always
-  serves it. The pinned strfry upgrades and serves NIP-11 on every path, so
+  serves it. Wok's discovery link names `relay.auth.service_url` or
+  `admin.public_url`, and discovery answers 404 with neither set; strfry's
+  names the request's `Host` header. The pinned strfry upgrades and serves NIP-11 on every path, so
   one relay answers under many URLs. A reverse proxy that serves the relay
   under a path prefix must strip it.
 - NIP-11 CORS: relay responses send `Access-Control-Allow-Origin`,

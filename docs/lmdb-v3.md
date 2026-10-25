@@ -34,8 +34,9 @@ normal `relay`, `info`, or database utility commands.
 | `rasgueadb_defaultDb__CompressionDictionary` | INTEGERKEY | default | dictId | FlatBuffer dict |
 | `negentropy` | REVERSEKEY | default | treeId \|\| nodeId (native u64) | Node / MetaData |
 
-Import/open environment: `max_dbs=64`, mode `0664`; named DBIs use their v3
-creation flags on the private snapshot.
+Import/open environment: `max_dbs=64`; named DBIs use their v3 creation flags
+on the private snapshot. Files Wok creates (`data.mdb`, `lock.mdb` and compact
+copies) get mode `0640`, less the umask; earlier releases used `0664`.
 
 ## PackedEvent
 

@@ -83,14 +83,40 @@ impl VanishPolicy {
     }
 }
 
-fn normalize_relay_url(url: &str) -> String {
-    let mut value = url.trim();
-    if let Some(rest) = value.strip_prefix("wss://") {
-        value = rest;
-    } else if let Some(rest) = value.strip_prefix("ws://") {
-        value = rest;
+/// A relay URL as NIP-42 AUTH and NIP-62 vanish requests compare it with the
+/// relay's service URL: without its query, fragment, trailing slashes, or
+/// the port its scheme implies, and with its scheme and host in lowercase.
+/// A URL without a scheme is `wss`, as clients take it, and `https` and
+/// `http` count as `wss` and `ws`. The scheme and the path are kept, so
+/// relays on another port or path of the same host, which proxies match
+/// case-sensitively, do not accept each other's URLs. An empty URL stays
+/// empty, so an unset service URL matches nothing.
+pub fn normalize_relay_url(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return String::new();
     }
-    value.trim_end_matches('/').to_ascii_lowercase()
+    let (scheme, rest) = url.split_once("://").unwrap_or(("wss", url));
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let scheme = match scheme.to_ascii_lowercase().as_str() {
+        "https" => "wss".to_string(),
+        "http" => "ws".to_string(),
+        other => other.to_string(),
+    };
+    let default_port = match scheme.as_str() {
+        "wss" => Some(":443"),
+        "ws" => Some(":80"),
+        _ => None,
+    };
+    let authority = default_port
+        .and_then(|port| authority.strip_suffix(port))
+        .unwrap_or(authority);
+    format!(
+        "{scheme}://{}{}",
+        authority.to_ascii_lowercase(),
+        path.trim_end_matches('/')
+    )
 }
 
 fn read_timestamp(raw: &[u8]) -> Option<u64> {
@@ -401,12 +427,13 @@ mod tests {
             service_url: "wss://Relay.Example.com/".into(),
         };
         let mut tags = PackedEventTagBuilder::default();
-        tags.add('r', b"ws://relay.example.com").unwrap();
+        tags.add('r', b"WSS://relay.example.com").unwrap();
         let event =
             PackedEventBuilder::build(&[1; 32], &[2; 32], 1, VANISH_KIND, 0, &tags).unwrap();
         assert!(policy.targets_this_relay(event.view()));
-        assert!(policy
-            .targets_this_relay_json(r#"{"kind":62,"tags":[["relay","ws://relay.example.com"]]}"#));
+        assert!(policy.targets_this_relay_json(
+            r#"{"kind":62,"tags":[["relay","WSS://relay.example.com"]]}"#
+        ));
         assert!(!policy.targets_this_relay_json(r#"{"kind":62,"tags":[["random","ALL_RELAYS"]]}"#));
         // The JSON is read as strictly as any event: stock serde_json would
         // keep the second `tags`.
@@ -423,5 +450,78 @@ mod tests {
         let event =
             PackedEventBuilder::build(&[1; 32], &[2; 32], 1, VANISH_KIND, 0, &tags).unwrap();
         assert!(policy.targets_this_relay(event.view()));
+    }
+
+    #[test]
+    fn relay_urls_differ_by_path_but_not_by_spelling() {
+        let same = [
+            ("wss://relay.example.com", "wss://relay.example.com/"),
+            ("wss://relay.example.com", "WSS://Relay.Example.COM//"),
+            ("wss://relay.example.com", "wss://relay.example.com:443"),
+            ("wss://relay.example.com", "https://relay.example.com:443/"),
+            ("ws://relay.example.com", "ws://relay.example.com:80/"),
+            (
+                "wss://relay.example.com",
+                "wss://relay.example.com/?client=x#y",
+            ),
+            ("wss://relay.example.com", " relay.example.com "),
+            (
+                "wss://host.example/relayA",
+                "wss://host.example:443/relayA/",
+            ),
+            ("wss://host.example/relayA", "wss://HOST.example/relayA?x=1"),
+            ("wss://[::1]:443/a", "wss://[::1]/a"),
+        ];
+        for (a, b) in same {
+            assert_eq!(normalize_relay_url(a), normalize_relay_url(b), "{a} vs {b}");
+        }
+        let different = [
+            ("wss://host.example/relayA", "wss://host.example/relayB"),
+            ("wss://host.example/relayA", "wss://host.example"),
+            ("wss://host.example/relayA", "wss://host.example/relayA/sub"),
+            ("wss://host.example/relayA", "wss://host.example/RelayA"),
+            ("wss://host.example", "wss://host.example:8443"),
+            ("wss://host.example", "wss://host.example:80"),
+            ("wss://host.example/relay", "ws://host.example/relay"),
+            ("wss://host.example:443/relay", "ws://host.example:80/relay"),
+            ("wss://host.example", "wss://other.example"),
+        ];
+        for (a, b) in different {
+            assert_ne!(normalize_relay_url(a), normalize_relay_url(b), "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn a_targeted_vanish_request_must_name_the_relay_path() {
+        let policy = VanishPolicy {
+            enabled: true,
+            service_url: "wss://host.example/relayA".into(),
+        };
+        let request = |relay: &str| {
+            policy.targets_this_relay_json(
+                &serde_json::json!({"kind": 62, "tags": [["relay", relay]]}).to_string(),
+            )
+        };
+        assert!(request("wss://host.example/relayA/"));
+        assert!(request("wss://host.example:443/relayA"));
+        assert!(!request("wss://host.example/relayB"));
+        assert!(!request("wss://host.example/relaya"));
+        assert!(!request("ws://host.example:80/relayA"));
+        assert!(!request("wss://host.example"));
+        assert!(request("ALL_RELAYS"));
+    }
+
+    #[test]
+    fn an_unset_service_url_matches_only_all_relays() {
+        let policy = VanishPolicy {
+            enabled: true,
+            service_url: String::new(),
+        };
+        for relay in ["", " ", "wss://", "wss:///"] {
+            let request = serde_json::json!({"kind": 62, "tags": [["relay", relay]]});
+            assert!(!policy.targets_this_relay_value(&request), "{relay:?}");
+        }
+        let all = serde_json::json!({"kind": 62, "tags": [["relay", "ALL_RELAYS"]]});
+        assert!(policy.targets_this_relay_value(&all));
     }
 }

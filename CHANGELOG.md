@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- NIP-42 AUTH compares the scheme and path of its `relay` tag with those of
+  `relay.auth.service_url` (#167). Only the host and port were compared, as
+  in strfry, so where one host serves several relays by path, a relay at
+  `wss://host/a` accepted an AUTH signed for `wss://host/b`: a co-tenant
+  relay could pass its own challenge to a user and sign in as them here.
+  The path is compared as written, case included, and `ws` differs from
+  `wss`; the host's case, a query, trailing slashes and the port the scheme
+  implies are ignored, and `https` and `http` count as `wss` and `ws`.
+  **Set `service_url` to the URL clients connect to, scheme and path
+  included**: a relay served at `wss://host/relay` whose `service_url` is
+  `wss://host`, or `ws://host/relay`, now refuses its clients' AUTH with
+  `incorrect or missing relay tag`. NIP-62 vanish requests' `relay` tags
+  are compared the same way: a default port or query no longer stops one
+  from matching, and the path's case and the scheme now do.
 - The relay warns at startup, and `wok doctor` in a new `unix-access` check,
   when the Unix socket's mode lets every local user connect, as `0o666` does,
   and `relay.unix.auth_uids` and `auth_gids` are both empty (#167). Unix
@@ -192,11 +206,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NodeInfo is off by default (#166). `/.well-known/nodeinfo` and
   `/nodeinfo/2.1` were served in every configuration, though no Nostr client
   or Marmot client uses them and NIP-11 already gives the software and its
-  version, and the discovery link repeats the request's `Host` header (#152).
+  version, and the discovery link repeated the request's `Host` header, which
+  a cache in front of the relay could hand to other clients (#152).
   `relay.nodeinfo_enabled` turns them on, and reloads live; while it is off
   both paths answer 404, and turning it on or off is logged as a
-  security-scope change. **Upgrading:** a relay that should stay listed by
-  NodeInfo crawlers must set `relay.nodeinfo_enabled = true`.
+  security-scope change. Discovery now links to `/nodeinfo/2.1` on the origin
+  of `relay.auth.service_url`, or else `admin.public_url`; with neither set it
+  answers 404, and the relay and `wok doctor` warn. **Upgrading:** a relay
+  that should stay listed by NodeInfo crawlers must set
+  `relay.nodeinfo_enabled = true`, and `relay.auth.service_url` or
+  `admin.public_url`.
 - With `relay.real_ip_header` set, a client could escape a NIP-86 `blockip`
   by sending its own X-Forwarded-For. A proxy that appends the client's
   address to that header (nginx's `$proxy_add_x_forwarded_for`) passed Wok a
@@ -322,6 +341,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Events print in the normalized form `wok export` writes.
   `--no-verify` skips the id and signature checks, like `wok import
   --no-verify`.
+- New database files are created with mode `0640`, less the umask, instead
+  of `0664` (#56): `data.mdb` and `lock.mdb`, `wok compact` output and the
+  copy `wok migrate strfry` takes. Stored events include gift wraps and
+  other recipient-only kinds, which any local user who could reach the
+  database directory could read unless the umask removed other users'
+  access. Existing files keep their mode: `chmod g-w,o= data.mdb lock.mdb`
+  in the database directory narrows them. The example systemd unit's
+  `UMask=0077` and `0700` state directory already kept other users out.
 
 ### Added
 
@@ -1164,6 +1191,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order hit it: live subscriptions catching up, `wok monitor`, the router,
   negentropy tree builds, and `wok migrate strfry`'s verification and
   fingerprints.
+- `wok compact <file>` writes the compact copy to that file, as `wok compact
+  -` writes it to standard output. It failed with `No such file or
+  directory`: LMDB took the path for a directory to write `data.mdb` in, and
+  the command refuses a path that exists.
 
 ## [0.7.0] - 2026-09-08
 

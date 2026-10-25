@@ -2,15 +2,17 @@
 
 #![allow(unsafe_code)]
 
+use crate::env::{create_copy_file, DB_FILE_MODE};
 use crate::{foreach_event_from, DbError, Decompressor, Env, EnvOptions, RoTxn};
 use lmdb_sys::{
-    mdb_env_close, mdb_env_copy2, mdb_env_create, mdb_env_open, MDB_CP_COMPACT, MDB_NORDAHEAD,
-    MDB_RDONLY, MDB_READERS_FULL,
+    mdb_env_close, mdb_env_copyfd2, mdb_env_create, mdb_env_open, mode_t, MDB_CP_COMPACT,
+    MDB_NORDAHEAD, MDB_RDONLY, MDB_READERS_FULL,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::CString;
+use std::os::unix::io::AsRawFd;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::ptr;
@@ -47,8 +49,6 @@ pub fn snapshot_lmdb_readonly(
 
     let source = CString::new(source.to_string_lossy().as_bytes())
         .map_err(|_| DbError::msg("source DB path contains NUL"))?;
-    let destination = CString::new(destination.to_string_lossy().as_bytes())
-        .map_err(|_| DbError::msg("snapshot destination path contains NUL"))?;
 
     let mut raw_env = ptr::null_mut();
     let result = (|| {
@@ -57,8 +57,11 @@ pub fn snapshot_lmdb_readonly(
         if no_read_ahead {
             flags |= MDB_NORDAHEAD;
         }
-        crate::error::check(unsafe { mdb_env_open(raw_env, source.as_ptr(), flags, 0o664) })?;
-        crate::error::check(unsafe { mdb_env_copy2(raw_env, destination.as_ptr(), MDB_CP_COMPACT) })
+        crate::error::check(unsafe {
+            mdb_env_open(raw_env, source.as_ptr(), flags, DB_FILE_MODE as mode_t)
+        })?;
+        let copy = create_copy_file(&destination.join("data.mdb"))?;
+        crate::error::check(unsafe { mdb_env_copyfd2(raw_env, copy.as_raw_fd(), MDB_CP_COMPACT) })
     })();
     if !raw_env.is_null() {
         unsafe { mdb_env_close(raw_env) };

@@ -503,6 +503,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         cfg.inbox_kinds_warning(),
         cfg.unix_socket_warning(),
         cfg.pow_warning(),
+        cfg.nodeinfo_warning(),
     ];
     for warning in warnings
         .into_iter()

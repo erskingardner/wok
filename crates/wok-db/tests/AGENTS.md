@@ -10,6 +10,7 @@ Storage integration tests. They open disposable LMDB environments.
 | `index_drift.rs` | Derived indexes stay consistent with primaries |
 | `tag_kind_index.rs` | `wok_Event__tagKind` through every write/delete path, reindex, drift reports |
 | `failure_recovery.rs` | Unclean shutdown / recovery |
+| `file_mode.rs` | Permission bits of new database files, compact copies and migration snapshots |
 | `state_integrity.rs` | Corrupt state detection and valid lazy/deleted-tail state |
 | `nip59_gift_wrap.rs` | Gift-wrap deletion / recipient semantics |
 | `nip62_vanish.rs` | Request to Vanish markers and sweep |

@@ -37,9 +37,9 @@ use std::time::Duration;
 use wok_db::{
     backfill_vanish_markers, is_event_vanished_ro, load_moderation_snapshot_ro,
     lookup_event_by_id_ro, moderation_reason_ignoring_author_ro, moderation_reason_ro,
-    most_recent_levid_ro, report_event, sweep_vanished_events, Decompressor, Env, EventToWrite,
-    EventWriteStatus, ModerationSnapshot, SearchTermSet, MAX_MODERATION_RECORDS, MAX_REASON_BYTES,
-    VANISH_KIND,
+    most_recent_levid_ro, normalize_relay_url, report_event, sweep_vanished_events, Decompressor,
+    Env, EventToWrite, EventWriteStatus, ModerationSnapshot, SearchTermSet, MAX_MODERATION_RECORDS,
+    MAX_REASON_BYTES, VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, AUTH_CHALLENGE_LEN, AUTH_KIND,
@@ -1931,17 +1931,6 @@ fn gen_challenge() -> String {
     (0..AUTH_CHALLENGE_LEN)
         .map(|_| AUTH_ALPHABET[rng.gen_range(0..AUTH_ALPHABET.len())] as char)
         .collect()
-}
-
-fn normalize_relay_url(url: &str) -> String {
-    let mut s = url;
-    if let Some(pos) = s.find("://") {
-        s = &s[pos + 3..];
-    }
-    if let Some(pos) = s.find(['/', '?', '#']) {
-        s = &s[..pos];
-    }
-    s.to_ascii_lowercase()
 }
 
 fn route_tx<T>(txs: &[Sender<T>], conn_id: u64) -> &Sender<T> {

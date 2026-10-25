@@ -205,6 +205,10 @@ regression test. Differential parity alone is not a reason to retain it.
   NEG-ERR closes the session. A NEG-OPEN with an invalid subscription
   id is refused with NEG-ERR too. Only a sub id that is not a string, or a
   NEG-MSG or NEG-CLOSE with an invalid one, still produces a NOTICE.
+- NIP-77: a NEG-OPEN or NEG-MSG whose negentropy message does not reconcile
+  gets one NEG-ERR, `error: invalid reconciliation message`, whether a tree
+  or a view built in memory serves the session. strfry sends
+  `PROTOCOL-ERROR`, which has no NIP-01 prefix.
 - NIP-70: a repost (kind 6 or 16) is refused with `blocked: reposts can't
   embed protected events` when its content parses as an event object with a
   tag named `-`. Content that starts as a JSON object but that the strict

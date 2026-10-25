@@ -197,6 +197,52 @@ async fn memory_view_survives_multiple_rounds() {
     handle.request_shutdown();
 }
 
+/// A NEG-MSG that does not reconcile closes its session with one NEG-ERR,
+/// the same from a tree-backed view as from a memory view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_neg_msg_that_does_not_reconcile_gets_one_neg_err_from_either_view() {
+    let dir = tempfile::tempdir().unwrap();
+    write_and_build_default_tree(dir.path());
+    let (handle, addr) = start_server(dir.path()).await;
+    let mut ws = ws_connect(addr).await;
+
+    let mut client_store = wok_negentropy::Vector::new();
+    client_store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(client_store, 60_000).unwrap();
+    let init = hex::encode(client.initiate().unwrap());
+
+    // "{}" is answered from its tree; no tree matches kind 1, so that view
+    // is built in memory.
+    for (sub_id, filter) in [("s", json!({})), ("m", json!({"kinds": [1]}))] {
+        let open = json!(["NEG-OPEN", sub_id, filter, init]);
+        ws.send(Message::Text(open.to_string().into()))
+            .await
+            .unwrap();
+        let msgs = recv_matching(&mut ws, "\"NEG-MSG\"").await;
+        assert!(msgs.iter().any(|t| t.contains("\"NEG-MSG\"")), "{msgs:?}");
+
+        // "00" has no protocol version byte. The reply to a handle never
+        // opened marks the end of the replies to it.
+        for msg in [
+            json!(["NEG-MSG", sub_id, "00"]),
+            json!(["NEG-MSG", "never", init]),
+        ] {
+            ws.send(Message::Text(msg.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let msgs = recv_matching(&mut ws, "\"never\"").await;
+        assert_eq!(
+            msgs,
+            [
+                json!(["NEG-ERR", sub_id, "error: invalid reconciliation message"]).to_string(),
+                json!(["NEG-ERR", "never", "closed: unknown subscription handle"]).to_string(),
+            ]
+        );
+    }
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_malformed_neg_msg_still_closes_its_session() {
     // A malformed NEG-MSG that names a session tears it down with NEG-ERR.

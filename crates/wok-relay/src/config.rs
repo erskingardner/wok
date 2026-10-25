@@ -425,7 +425,7 @@ pub struct InfoConfig {
 
 /// Optional rules for REQ, COUNT and NEG-OPEN filters, each off at its zero
 /// or empty value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterValidationConfig {
     pub max_kinds_per_filter: u64,

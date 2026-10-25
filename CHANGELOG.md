@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     writer, so one queued before a reload made AUTH unusable is refused too.
     Before, it was stored and every read of it refused. NIP-62 vanish
     requests are still accepted whatever their class.
+- A reload that tightens `relay.filter_validation` closes the REQ
+  subscriptions and NEG sessions whose filters it now refuses (#164). The
+  rules were checked only when a REQ or NEG-OPEN arrived, so turning on
+  `require_scoped_filters` to stop `{"kinds":[445]}` enumeration left those
+  subscriptions streaming every new event. Each is closed with the `CLOSED`
+  or `NEG-ERR` it would get if sent now.
 - A guard the file sets to zero, turning it off where its preset keeps it,
   is warned about when the relay starts and by `wok doctor` in a new
   `zero-guards` check, not only on reload and on the dashboard (#164). A

@@ -366,6 +366,30 @@ impl ActiveMonitors {
         self.release(slot);
     }
 
+    /// Remove each subscription, pending or live, that `refusal` gives a
+    /// reason for, returning its connection, id, generation and reason.
+    pub fn remove_refused<R>(
+        &mut self,
+        mut refusal: impl FnMut(&Subscription) -> Option<R>,
+    ) -> Vec<(u64, SubId, u64, R)> {
+        let mut refused = Vec::new();
+        for subs in self.conns.values() {
+            for &slot in subs.values() {
+                let Some(entry) = &self.slots[slot as usize] else {
+                    continue;
+                };
+                if let Some(reason) = refusal(&entry.sub) {
+                    let sub = &entry.sub;
+                    refused.push((sub.conn_id, sub.sub_id.clone(), sub.generation, reason));
+                }
+            }
+        }
+        for (conn_id, sub_id, _, _) in &refused {
+            self.remove_sub(*conn_id, sub_id);
+        }
+        refused
+    }
+
     pub fn close_conn(&mut self, conn_id: u64) {
         if let Some(subs) = self.conns.remove(&conn_id) {
             for slot in subs.into_values() {

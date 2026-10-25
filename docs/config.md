@@ -427,6 +427,11 @@ failed: ...`, so a sync cannot list the ids of events a REQ may not ask for.
 A filter with an empty list, which matches nothing, is not checked. The
 filters in one REQ are bounded by `relay.max_filters_per_req` alone.
 
+A reload that changes the rules applies them to what is already open: each
+REQ subscription whose filters they now refuse is closed with the `CLOSED`
+its REQ would get, and each NEG session with the `NEG-ERR`, so tightening
+them stops an enumerating subscription such as `{"kinds":[445]}` at once.
+
 ### Query work
 
 Before a REQ, COUNT or NEG-OPEN opens a cursor, the relay estimates how many

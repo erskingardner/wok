@@ -1743,6 +1743,35 @@ fn filter_validator(cfg: &Config) -> FilterValidator {
     }
 }
 
+/// The CLOSED reason for a REQ or COUNT whose filters `filter_validator`
+/// refuses.
+fn req_filter_refusal(error: &wok_query::QueryError) -> String {
+    format!("blocked: bad req: filter validation failed: {error}")
+}
+
+/// The NEG-ERR reason for a NEG-OPEN whose filter `filter_validator`
+/// refuses.
+fn neg_filter_refusal(error: &wok_query::QueryError) -> String {
+    format!("blocked: filter validation failed: {error}")
+}
+
+/// Close each REQ subscription, pending or live, whose filters `validator`
+/// refuses, with the CLOSED its REQ would get if sent now: a reload that
+/// tightened `relay.filter_validation` applies to what is already open.
+fn close_refused_subs(
+    monitors: &mut ActiveMonitors,
+    validator: &FilterValidator,
+    conns: &ConnTable,
+    metrics: &Metrics,
+) {
+    let refused = monitors.remove_refused(|sub| validator.validate(&sub.filter_group).err());
+    for (conn_id, sub_id, generation, error) in refused {
+        count_filter_limit(metrics, &error);
+        let closed = RelayMessage::closed_error(sub_id.as_str(), req_filter_refusal(&error));
+        conns.send_last(conn_id, Ns::Req, &sub_id, generation, closed, metrics);
+    }
+}
+
 fn gen_challenge() -> String {
     let mut rng = rand::thread_rng();
     (0..AUTH_CHALLENGE_LEN)
@@ -3228,7 +3257,7 @@ fn admit_req(
     })?;
     if let Err(e) = filter_validator(cfg).validate(&fg) {
         count_filter_limit(metrics, &e);
-        return Err(bad_req("blocked", format!("filter validation failed: {e}")));
+        return Err(req_filter_refusal(&e));
     }
     let costed = if count_only {
         CostedRequest::Count
@@ -3752,7 +3781,7 @@ fn ingest_neg(
     // The rules REQ and COUNT meet, so a sync cannot list what a REQ may not.
     filter_validator(cfg).validate(&fg).map_err(|e| {
         count_filter_limit(metrics, &e);
-        format!("blocked: filter validation failed: {e}")
+        neg_filter_refusal(&e)
     })?;
     let tag_kind_index = metrics.tag_kind_index_complete.load(Ordering::Relaxed) != 0;
     let query_cost = fg.estimated_cost(CostedRequest::NegOpen, tag_kind_index);
@@ -4436,6 +4465,9 @@ fn run_req_monitor(
     // The ingester caps subscriptions per connection before registering them.
     let mut monitors = ActiveMonitors::new(usize::MAX);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
+    // The filter rules the open subscriptions were last checked against.
+    let mut rules = cfg.read().relay.filter_validation.clone();
+    let mut validator = filter_validator(&cfg.read());
     // Newest local event id already matched against every subscription.
     let mut curr_event_id = u64::MAX;
     let mut decomp = Decompressor::new();
@@ -4484,6 +4516,11 @@ fn run_req_monitor(
             continue;
         }
         let cfg_snap = cfg.read();
+        if cfg_snap.relay.filter_validation != rules {
+            rules = cfg_snap.relay.filter_validation.clone();
+            validator = filter_validator(&cfg_snap);
+            close_refused_subs(&mut monitors, &validator, &conns, &metrics);
+        }
         let r = cfg_snap.read_restrictor();
         let global_visibility = read_visibility(&cfg_snap, vec![]);
         let max_event_size = cfg_snap.events.max_event_size;
@@ -4526,6 +4563,21 @@ fn run_req_monitor(
         for msg in control.drain(..) {
             match msg {
                 MonitorMsg::Register(mut sub) => {
+                    // Admitted under rules a reload has tightened since.
+                    if let Err(error) = validator.validate(&sub.filter_group) {
+                        count_filter_limit(&metrics, &error);
+                        let reason = req_filter_refusal(&error);
+                        let closed = RelayMessage::closed_error(sub.sub_id.as_str(), reason);
+                        conns.send_last(
+                            sub.conn_id,
+                            Ns::Req,
+                            &sub.sub_id,
+                            sub.generation,
+                            closed,
+                            &metrics,
+                        );
+                        continue;
+                    }
                     // Stored events after the REQ's history snapshot are the
                     // monitor's. Those it already matched are re-read when the
                     // history is done; everything it matches from here on is
@@ -6583,6 +6635,53 @@ mod tests {
             let reply = recv_outbound(&mut rx).await;
             assert!(reply.contains(refusal), "{reply}");
         }
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_tightens_filter_validation_closes_what_it_refuses() {
+        // The rules were checked only at admission, so turning on
+        // require_scoped_filters left an enumerating subscription streaming
+        // every new event (#164).
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|_| {}).await;
+        let req = |sub: &str, filter: Value| json!(["REQ", sub, filter]).to_string();
+        conn.client_message(req("all", json!({"kinds": [1]}))).await;
+        assert!(recv_outbound(&mut rx).await.starts_with(r#"["EOSE","all""#));
+        conn.client_message(req("tagged", json!({"kinds": [1], "#t": ["wok"]})))
+            .await;
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EOSE","tagged""#));
+
+        let mut tightened = handle.config.read().clone();
+        tightened.relay.filter_validation.require_scoped_filters = true;
+        handle.config.write().apply_reload(tightened).unwrap();
+        let event = sign_event(json!({
+            "created_at": now_secs(), "kind": 1, "tags": [["t", "wok"]], "content": "after",
+        }));
+        conn.client_message(json!(["EVENT", event]).to_string())
+            .await;
+        // The enumerating one is closed, with what its REQ gets now, and
+        // receives nothing more; the scoped one still streams.
+        let (mut closed, mut streamed) = (None, false);
+        while closed.is_none() || !streamed {
+            let frame: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
+            match (frame[0].as_str().unwrap(), frame[1].as_str().unwrap_or("")) {
+                ("CLOSED", "all") => closed = Some(frame[2].as_str().unwrap().to_string()),
+                ("EVENT", "tagged") => streamed = true,
+                ("EVENT", "all") => panic!("{frame}"),
+                _ => {}
+            }
+        }
+        let closed = closed.unwrap();
+        assert!(
+            closed.starts_with("blocked: bad req: filter validation failed: "),
+            "{closed}"
+        );
+        conn.client_message(req("again", json!({"kinds": [1]})))
+            .await;
+        let refused: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
+        assert_eq!(refused, json!(["CLOSED", "again", closed]));
         handle.request_shutdown();
     }
 

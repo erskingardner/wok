@@ -828,9 +828,15 @@ NIP-86 request is logged at `info` with its signer, level and method.
 |---|---|---|
 | `admin.enabled` | `false` | Serve the signed-out shell at `/admin`; APIs still require NIP-98. |
 | `admin.public_url` | empty | Exact public HTTP(S) origin used to verify the NIP-98 `u` tag. |
-| `admin.pubkeys` | `[]` | Allowed administrator npubs or lowercase hex public keys. |
+| `admin.pubkeys` | `[]` | Allowed administrator npubs or lowercase hex public keys. They are also [members](#read-and-write-policies) whether or not `admin.enabled` is on. |
 | `admin.auth_window_secs` | `60` | Accepted NIP-98 freshness window, from 1 through 300 seconds. |
 | `admin.allow_config_writes` | `false` | Permit typed, validated, atomic dashboard writes. |
+
+Each `admin.pubkeys` entry is read as lowercase hex, an npub converted,
+whether or not `admin.enabled` is on. While it is on, an entry that is no key
+refuses the file. While it is off, the file still loads and the entry grants
+nothing; the relay warns about it at startup and on reload, and `wok doctor`
+reports it in its `admin-pubkeys` check.
 
 The public URL must have no credentials, path, query, or fragment. Each API
 request needs a new kind-27235 event with empty content, exactly one matching

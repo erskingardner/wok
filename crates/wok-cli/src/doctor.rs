@@ -111,6 +111,14 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             "NodeInfo is off, or its discovery names the relay's public URL",
         ),
     }
+    match cfg.admin_pubkeys_warning() {
+        Some(detail) => report.add("admin-pubkeys", CheckStatus::Warn, detail),
+        None => report.add(
+            "admin-pubkeys",
+            CheckStatus::Pass,
+            "every admin.pubkeys entry is an npub or lowercase hex key",
+        ),
+    }
     check_read_classes(cfg, &mut report);
 
     // Hot-reload merges the file over factory defaults, so a truncated or
@@ -1045,6 +1053,22 @@ mod tests {
             "{}",
             tag_kind.detail
         );
+    }
+
+    #[test]
+    fn an_admin_pubkeys_entry_that_is_no_key_is_a_warning() {
+        let report = |text: &str| {
+            let cfg = Config::parse_toml(text).unwrap();
+            run(&cfg, Path::new("missing-test-config.toml"))
+        };
+        assert_eq!(
+            check(&report(""), "admin-pubkeys").status,
+            CheckStatus::Pass
+        );
+        let malformed = report("[admin]\npubkeys = [\"not-a-key\"]\n");
+        let admin = check(&malformed, "admin-pubkeys");
+        assert_eq!(admin.status, CheckStatus::Warn);
+        assert!(admin.detail.contains("\"not-a-key\""), "{}", admin.detail);
     }
 
     #[test]

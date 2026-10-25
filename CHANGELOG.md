@@ -908,6 +908,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An npub in `admin.pubkeys` makes its key a member under the `members`
+  policies while `admin.enabled` is off (#214). Only a file with admin on had
+  its `admin.pubkeys` converted to lowercase hex, which membership compares
+  them as, so with admin off an npub entry made nobody a member, and a
+  reload that rewrote a key from npub to hex logged it as one key added and
+  one removed. An entry that is no key still loads while admin is off, but
+  the relay now warns about it at startup and on reload, and `wok doctor`
+  reports it in a new `admin-pubkeys` check.
 - `wok_authenticated_connections` counts connections, as documented, not
   successful AUTHs (#214). A connection that authenticated a second key, or
   the same key again, added one each time but was taken out once when it

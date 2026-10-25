@@ -1904,6 +1904,29 @@ impl Config {
         })
     }
 
+    /// Name each `admin.pubkeys` entry that is no key. A file that lists one
+    /// while `admin.enabled` is off loads, as it did before, but the entry
+    /// makes nobody a member under `relay.auth`'s `members` policies, and
+    /// turning admin on would refuse the file. The relay logs this at startup
+    /// and on reload, and `wok doctor` reports it.
+    pub fn admin_pubkeys_warning(&self) -> Option<String> {
+        let malformed: Vec<&str> = self
+            .admin
+            .pubkeys
+            .iter()
+            .map(String::as_str)
+            .filter(|entry| admin_pubkey(entry).is_err())
+            .collect();
+        if malformed.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "admin.pubkeys entries {malformed:?} are not npubs or lowercase hex keys: they make \
+             nobody a member under relay.auth's members policies, and admin.enabled = true \
+             refuses them. Correct or remove them"
+        ))
+    }
+
     /// The [`pow_warning`](Self::pow_warning) a reload from `previous` newly
     /// causes, such as by turning abuse protection off.
     fn pow_reload_warning(&self, previous: &Config) -> Option<String> {
@@ -2245,6 +2268,9 @@ impl Config {
         if let Some(warning) = new.nodeinfo_warning() {
             tracing::warn!("config reload: {warning}");
         }
+        if let Some(warning) = new.admin_pubkeys_warning() {
+            tracing::warn!("config reload: {warning}");
+        }
         for deprecation in &new.deprecations {
             tracing::warn!("config reload: {deprecation}");
         }
@@ -2340,43 +2366,55 @@ fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {
             "admin.auth_window_secs must be between 1 and {MAX_AUTH_WINDOW_SECS}"
         ));
     }
-    if !admin.enabled {
-        return Ok(());
+    if admin.enabled {
+        let url = url::Url::parse(&admin.public_url)
+            .map_err(|error| format!("admin.public_url is invalid: {error}"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
+            return Err("admin.public_url must be an http(s) origin without credentials, path, query, or fragment".into());
+        }
+        // Bind NIP-98 to the browser-visible canonical origin: IDNs become
+        // punycode and default ports/trailing slashes are removed consistently.
+        admin.public_url = url.origin().ascii_serialization();
+        if admin.pubkeys.is_empty() {
+            return Err("admin.pubkeys must contain at least one admin when enabled".into());
+        }
     }
-    let url = url::Url::parse(&admin.public_url)
-        .map_err(|error| format!("admin.public_url is invalid: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || url.username() != ""
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || url.path() != "/"
-    {
-        return Err("admin.public_url must be an http(s) origin without credentials, path, query, or fragment".into());
-    }
-    // Bind NIP-98 to the browser-visible canonical origin: IDNs become
-    // punycode and default ports/trailing slashes are removed consistently.
-    admin.public_url = url.origin().ascii_serialization();
-    if admin.pubkeys.is_empty() {
-        return Err("admin.pubkeys must contain at least one admin when enabled".into());
-    }
+    // The `members` policies admit these keys whether or not admin is on,
+    // comparing them as lowercase hex, so an npub is converted either way.
+    // An entry that is no key refuses the file while admin is on. While it
+    // is off, the entry is kept as written, granting nothing, and
+    // `Config::admin_pubkeys_warning` names it: such a file loaded before.
     for pubkey in &mut admin.pubkeys {
-        let bytes = if pubkey.starts_with("npub1") {
-            wok_event::decode_npub(pubkey)
-                .map_err(|error| error.to_string())?
-                .to_vec()
-        } else {
-            wok_event::from_lower_hex_exact(pubkey).map_err(|error| error.to_string())?
-        };
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "admin pubkeys must be 32-byte lowercase hex or npub".to_string())?;
-        *pubkey = hex::encode(bytes);
+        match admin_pubkey(pubkey) {
+            Ok(key) => *pubkey = hex::encode(key),
+            Err(error) if admin.enabled => return Err(error),
+            Err(_) => {}
+        }
     }
     admin.pubkeys.sort();
     admin.pubkeys.dedup();
     Ok(())
+}
+
+/// An `admin.pubkeys` entry as a key: an npub, or lowercase hex.
+pub(crate) fn admin_pubkey(entry: &str) -> Result<[u8; 32], String> {
+    let bytes = if entry.starts_with("npub1") {
+        wok_event::decode_npub(entry)
+            .map_err(|error| error.to_string())?
+            .to_vec()
+    } else {
+        wok_event::from_lower_hex_exact(entry).map_err(|error| error.to_string())?
+    };
+    bytes
+        .try_into()
+        .map_err(|_| "admin pubkeys must be 32-byte lowercase hex or npub".to_string())
 }
 
 fn tracing_subscriber_filter_syntax(filter: &str) -> Result<(), String> {
@@ -4013,6 +4051,43 @@ negentropy_enabled = true
         )
         .unwrap_err()
         .contains("at least one admin"));
+    }
+
+    #[test]
+    fn admin_pubkeys_are_normalized_while_admin_is_off() {
+        // The members policies admit admin.pubkeys whatever admin.enabled
+        // says, but only a file with admin on had its npubs converted, so
+        // with admin off an npub made nobody a member (#214).
+        let key = [7u8; 32];
+        let admin = |pubkeys: &str| Config::parse_toml(&format!("[admin]\npubkeys = {pubkeys}\n"));
+        let npub = admin(&format!(
+            "[\"{}\", \"not-a-key\"]",
+            wok_event::encode_npub(&key)
+        ))
+        .unwrap();
+        // A file that loaded before still loads: the entry that is no key
+        // is kept, and named.
+        assert_eq!(npub.admin.pubkeys, [hex::encode(key), "not-a-key".into()]);
+        assert!(crate::moderation::is_member(
+            &npub,
+            &Default::default(),
+            &key
+        ));
+        let warning = npub.admin_pubkeys_warning().unwrap();
+        assert!(
+            warning.starts_with("admin.pubkeys entries [\"not-a-key\"] are not npubs"),
+            "{warning}"
+        );
+        assert_eq!(Config::default().admin_pubkeys_warning(), None);
+        // The same key as hex is no change to a reload.
+        let hex = admin(&format!("[\"not-a-key\", \"{}\"]", hex::encode(key))).unwrap();
+        assert!(npub.security_scope_changes(&hex).is_empty());
+        assert_eq!(hex.admin_pubkeys_warning(), npub.admin_pubkeys_warning());
+        // While admin is on, an entry that is no key refuses the file.
+        assert!(Config::parse_toml(
+            "[admin]\nenabled = true\npublic_url = \"https://relay.example\"\npubkeys = [\"not-a-key\"]\n"
+        )
+        .is_err());
     }
 
     #[test]

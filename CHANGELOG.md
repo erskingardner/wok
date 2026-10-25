@@ -616,6 +616,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since MDK never sends COUNT or offers compression (#166): a COUNT is
   refused with `blocked: bad req: COUNT disabled`, NIP-11 does not list
   NIP-45, and a client that offers deflate gets an uncompressed connection.
+  NIP-77 is sized to MDK's syncs (#166): `relay.max_sync_events = 65536`
+  and `relay.sync_memory_per_connection = 134217728` (128 MiB). Each MDK
+  session names one group or inbox with `limit` 16,385, about 8 MiB of sync
+  memory, and MDK runs at most eight at once per relay connection, so a
+  connection holds 15. A session without a `limit` reserves 20 MiB, not
+  248 MiB, and is refused past 65,536 events with `blocked: too many query
+  results`. `relay.sync_memory_total` stays 1 GiB.
 - `public`: `relay.nodeinfo_enabled` is `false` (new), so NodeInfo is not
   served (see Security).
 - `public`: `relay.auth.owner_only_kinds` is `[78, 30078]` (new), so NIP-78

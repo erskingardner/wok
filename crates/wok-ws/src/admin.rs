@@ -9,16 +9,19 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use wok_relay::config::MAX_AUTH_WINDOW_SECS;
 use wok_relay::{Config, EphemeralPersistence, RelayHandle};
 
 mod fields;
 mod posture;
 
 const MAX_ADMIN_BODY: usize = 64 * 1024;
-pub(crate) const MAX_REPLAY_IDS: usize = 4096;
+/// Five times the IDs a 60 s window held, as each is now kept for 300 s.
+pub(crate) const MAX_REPLAY_IDS: usize = 5 * 4096;
 
 #[derive(Default)]
 pub struct AdminState {
+    /// The NIP-98 events already used, each ID with its `created_at`.
     used_auth: Mutex<HashMap<[u8; 32], u64>>,
 }
 
@@ -395,7 +398,10 @@ pub(crate) fn authorize<'a>(
         }
     }
     let mut used = state.used_auth.lock();
-    used.retain(|_, created_at| created_at.abs_diff(now) <= cfg.admin.auth_window_secs);
+    // Kept for the longest window any configuration may set, not the current
+    // one: pruned by a window a reload narrowed, an event would be accepted
+    // again once a reload widened it back.
+    used.retain(|_, created_at| created_at.abs_diff(now) <= MAX_AUTH_WINDOW_SECS);
     if used.contains_key(&verified.id) {
         return Err("NIP-98 authorization event has already been used".into());
     }
@@ -1198,6 +1204,21 @@ mod tests {
         body: &[u8],
         nonce: Option<&str>,
     ) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        signed_auth_at(key, url, method, body, nonce, now)
+    }
+
+    fn signed_auth_at(
+        key: &Keypair,
+        url: &str,
+        method: &str,
+        body: &[u8],
+        nonce: Option<&str>,
+        created_at: u64,
+    ) -> String {
         let (pubkey, _) = key.x_only_public_key();
         let mut tags = vec![json!(["u", url]), json!(["method", method])];
         if let Some(nonce) = nonce {
@@ -1208,7 +1229,7 @@ mod tests {
         }
         let mut event = json!({
             "pubkey": hex::encode(pubkey.serialize()),
-            "created_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            "created_at": created_at,
             "kind": 27235,
             "tags": tags,
             "content": "",
@@ -1238,6 +1259,52 @@ mod tests {
 
     fn signed_auth(key: &Keypair, url: &str, method: &str, body: &[u8]) -> String {
         signed_auth_with_nonce(key, url, method, body, None)
+    }
+
+    #[test]
+    fn narrowing_then_widening_the_auth_window_does_not_reopen_replay() {
+        let mut rng = rand::thread_rng();
+        let key = Keypair::new(SECP256K1, &mut rng);
+        let (pubkey, _) = key.x_only_public_key();
+        let mut cfg = Config::default();
+        cfg.admin.enabled = true;
+        cfg.admin.public_url = "https://relay.example".into();
+        cfg.admin.pubkeys = vec![hex::encode(pubkey.serialize())];
+        cfg.admin.auth_window_secs = 300;
+        let state = AdminState::default();
+        let url = "https://relay.example/admin/api/overview";
+        let policy = AuthzPolicy {
+            url_ok: &|signed| signed == url,
+            signer_ok: &|signer| cfg.admin.pubkeys.iter().any(|allowed| allowed == signer),
+            require_payload: false,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // A captured header, signed 30 s ago, is used under a 300 s window.
+        let captured = signed_auth_at(&key, url, "GET", b"", None, now - 30);
+        let used = |cfg: &Config, state| {
+            check(&captured, &Method::GET, b"", cfg, state, &policy).map(|_| ())
+        };
+        used(&cfg, &state).unwrap();
+        // Reloads narrow the window to 1 s and to 5 s, and a request is
+        // checked under each: pruned by the current window, the cache used
+        // to drop the captured ID here. The widen below checks it is still
+        // there.
+        for secs in [1, 5] {
+            let mut narrow = cfg.clone();
+            narrow.admin.auth_window_secs = secs;
+            let nonce = secs.to_string();
+            let fresh = signed_auth_with_nonce(&key, url, "GET", b"", Some(&nonce));
+            check(&fresh, &Method::GET, b"", &narrow, &state, &policy).unwrap();
+            assert!(used(&narrow, &state).unwrap_err().contains("time window"));
+        }
+        // A reload back to 300 s: the captured event is in its window again,
+        // and still used.
+        assert!(used(&cfg, &state)
+            .unwrap_err()
+            .contains("already been used"));
     }
 
     #[test]

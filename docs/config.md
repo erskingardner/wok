@@ -817,7 +817,10 @@ Live, file-only.
 The public URL must have no credentials, path, query, or fragment. Each API
 request needs a new kind-27235 event with empty content, exactly one matching
 `u` and `method` tag, and, when a body is present, a SHA-256 `payload` tag.
-Authorization events are single-use. The browser delegates signing to NIP-07;
+Authorization events are single-use: an event's ID is kept for 300 seconds,
+the longest `auth_window_secs` allows, whatever the current window, so a
+reload that narrows it and one that widens it again do not let a used event
+through twice. The browser delegates signing to NIP-07;
 Wok never receives private key material.
 
 ## Observability

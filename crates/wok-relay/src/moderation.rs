@@ -2,7 +2,7 @@
 //! membership and write-policy decisions shared by the ingester, the writer
 //! thread and the HTTP endpoint.
 
-use crate::config::AccessPolicy;
+use crate::config::{admin_pubkey, AccessPolicy};
 use crate::Config;
 use wok_db::{ModerationSnapshot, BUILTIN_ROLE_ADMIN, BUILTIN_ROLE_MODERATOR};
 use wok_event::{to_hex, PackedEventView};
@@ -128,13 +128,13 @@ pub fn removed_admin_roles_warning(
         .admin
         .pubkeys
         .iter()
-        .filter_map(|key| admin_key(key))
+        .filter_map(|key| admin_pubkey(key).ok())
         .collect();
     let held: Vec<String> = previous
         .admin
         .pubkeys
         .iter()
-        .filter_map(|key| admin_key(key))
+        .filter_map(|key| admin_pubkey(key).ok())
         .filter(|pubkey| !listed.contains(pubkey))
         .filter_map(|pubkey| {
             let roles: Vec<&str> = snap
@@ -159,16 +159,6 @@ pub fn removed_admin_roles_warning(
          at that role's level. Unassign the role with the NIP-86 unassignrole method to revoke it",
         held.join(", ")
     ))
-}
-
-/// An `admin.pubkeys` entry as a key: lowercase hex, or an npub in a file
-/// whose admin section is off and so was not normalized.
-fn admin_key(key: &str) -> Option<[u8; 32]> {
-    if key.starts_with("npub1") {
-        wok_event::decode_npub(key).ok()
-    } else {
-        wok_event::from_lower_hex_exact(key).ok()?.try_into().ok()
-    }
 }
 
 /// What an event offers `relay.auth.write_policy`: whether its connection

@@ -504,6 +504,7 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         cfg.unix_socket_warning(),
         cfg.pow_warning(),
         cfg.nodeinfo_warning(),
+        cfg.admin_pubkeys_warning(),
     ];
     for warning in warnings
         .into_iter()

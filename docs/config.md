@@ -428,9 +428,11 @@ A filter with an empty list, which matches nothing, is not checked. The
 filters in one REQ are bounded by `relay.max_filters_per_req` alone.
 
 A reload that changes the rules applies them to what is already open: each
-REQ subscription whose filters they now refuse is closed with the `CLOSED`
-its REQ would get, and each NEG session with the `NEG-ERR`, so tightening
-them stops an enumerating subscription such as `{"kinds":[445]}` at once.
+REQ subscription or COUNT whose filters they now refuse is closed with the
+`CLOSED` it would get if sent now, and each NEG session with the `NEG-ERR`,
+so tightening them stops an enumerating subscription such as
+`{"kinds":[445]}` at once. One still sending its stored history stops at
+its next time slice, before the rest goes out.
 
 ### Query work
 

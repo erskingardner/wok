@@ -182,7 +182,7 @@ pub(super) fn run_negentropy(
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
     let mut policy = read_visibility(&initial_cfg, vec![]);
     let mut access = read_access(&initial_cfg);
-    let mut rules = initial_cfg.relay.filter_validation.clone();
+    let mut filters = FilterRules::new(&initial_cfg);
     let mut generation = None;
     let mut last_snapshot = Instant::now();
     loop {
@@ -262,9 +262,8 @@ pub(super) fn run_negentropy(
         });
         // A reload that tightened the filter rules closes each session whose
         // filter they now refuse, with the NEG-ERR its NEG-OPEN would get.
-        if cfg.relay.filter_validation != rules {
-            rules = cfg.relay.filter_validation.clone();
-            let validator = filter_validator(&cfg);
+        if filters.follow(&cfg) {
+            let validator = &filters.validator;
             sessions.retain(|(conn, sid), session| {
                 let Err(error) = validator.validate(&session.filter) else {
                     return true;
@@ -349,7 +348,7 @@ pub(super) fn run_negentropy(
                     }
                     // And by the filter rules, which a reload may have
                     // tightened since.
-                    if let Err(error) = filter_validator(&cfg).validate(&sub.filter_group) {
+                    if let Err(error) = filters.validator.validate(&sub.filter_group) {
                         count_filter_limit(&metrics, &error);
                         fail(&conns, &metrics, conn, &sid, &neg_filter_refusal(&error));
                         continue;

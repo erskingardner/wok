@@ -25,6 +25,11 @@ Multiple requests and asynchronous EVENT/EOSE/OK/COUNT/AUTH/NEG-* frames share o
 - No admin commands on this protocol.
 
 Connections on this transport report `sourceType: "unix"` (with empty `sourceInfo`) to write-policy plugins.
+That names the transport, not a trusted caller: every peer the socket's mode
+and allow-lists let in gets it, and none of the rate budgets applies to it.
+The relay at startup, and `wok doctor` in its `unix-access` check, warn when
+the mode lets every local user connect (others may write to the socket, as
+with `0o666`) while `relay.unix.auth_uids` and `auth_gids` are both empty.
 
 ## Client example (Python)
 

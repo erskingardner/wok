@@ -154,6 +154,20 @@ behind a separately sandboxed local service and keep the relay-side plugin as
 a minimal protocol adapter. Extend the unit's sandbox only for the exact path
 or address family that adapter requires.
 
+Each request is one JSON line with `type` (`"new"`), `event`, `receivedAt`,
+`sourceType` and `sourceInfo`: `IP4` or `IP6` with the client's address, or
+`unix` with an empty string. `unix` names the transport, not a trusted
+caller: any local user the socket's `mode`, `auth_uids` and `auth_gids` let in
+gets it (see [Unix socket](unix-socket.md)). `authed`, the author's pubkey in
+hex, is present only for a NIP-70 protected event or a kind in
+`relay.auth.owner_only_kinds`, which Wok accepts only from a connection
+authenticated as their author and checks before the plugin runs. It is absent
+for every other event, even from a connection that authenticated, so it does
+not tell a plugin who is logged in: a deny-list keyed on it would let every
+other event through. Decide on `event.pubkey`, which the signature proves.
+strfry's plugin documentation says `authed` is present whenever the connection
+authenticated, but pinned strfry also sets it only for protected events.
+
 A `reject` record's `msg` becomes the OK reason the client sees. Start it with
 a NIP-01 prefix such as `blocked:` or `rate-limited:`. Wok sends any other
 message as `blocked: <msg>`, and an empty one as

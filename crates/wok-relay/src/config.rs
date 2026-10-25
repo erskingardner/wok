@@ -1759,6 +1759,30 @@ impl Config {
         (previous.inbox_kinds_warning().as_ref() != Some(&now)).then_some(now)
     }
 
+    /// Warn when every local user may connect to the Unix socket: its mode
+    /// lets others write to it, and neither `auth_uids` nor `auth_gids`
+    /// limits who connects. Unix connections bypass every rate budget, so
+    /// each local user gets a channel no budget applies to. The settings
+    /// are restart-only; the relay logs this at startup and `wok doctor`
+    /// reports it.
+    pub fn unix_socket_warning(&self) -> Option<String> {
+        let unix = &self.relay.unix;
+        if !unix.enabled
+            || unix.mode & 0o002 == 0
+            || !unix.auth_uids.is_empty()
+            || !unix.auth_gids.is_empty()
+        {
+            return None;
+        }
+        Some(format!(
+            "relay.unix.mode = {:#o} lets every local user connect to the Unix socket, unless its \
+             directory keeps them out, and relay.unix.auth_uids and auth_gids are empty: each \
+             gets a connection that no rate budget applies to. Take write access from others \
+             (0o600 or 0o660), or list the peers that may connect",
+            unix.mode
+        ))
+    }
+
     /// The configuration this config's preset gives: the built-in defaults
     /// with the preset's overlay, before any file.
     pub fn preset_defaults(&self) -> Config {
@@ -4186,6 +4210,33 @@ negentropy_enabled = true
         assert_eq!(notes.inbox_kinds_reload_warning(&notes), None);
         assert_eq!(open.inbox_kinds_reload_warning(&notes), None);
         assert!(emptied.inbox_kinds_reload_warning(&notes).is_some());
+    }
+
+    #[test]
+    fn a_unix_socket_every_local_user_may_open_is_warned_about() {
+        let config = |unix: &str| {
+            Config::parse_toml(&format!("[relay.unix]\nenabled = true\n{unix}\n")).unwrap()
+        };
+        assert_eq!(config("").unix_socket_warning(), None);
+        assert_eq!(config("mode = 0o660").unix_socket_warning(), None);
+        let open = config("mode = 0o666").unix_socket_warning().unwrap();
+        assert!(
+            open.starts_with("relay.unix.mode = 0o666 lets every local user connect"),
+            "{open}"
+        );
+        assert!(config("mode = 0o602").unix_socket_warning().is_some());
+        // An allow-list decides who connects, whatever the mode.
+        assert_eq!(
+            config("mode = 0o666\nauth_uids = [1000]").unix_socket_warning(),
+            None
+        );
+        assert_eq!(
+            config("mode = 0o666\nauth_gids = [1000]").unix_socket_warning(),
+            None
+        );
+        let mut off = config("mode = 0o666");
+        off.relay.unix.enabled = false;
+        assert_eq!(off.unix_socket_warning(), None);
     }
 
     #[test]

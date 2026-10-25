@@ -563,7 +563,9 @@ Unix-socket connections carry no network address, so by design they bypass
 every rate bucket (connection, EVENT, REQ, COUNT, and the per-connection
 budgets) and the cap on open connections. Per-author publication, storage
 quotas, the query work ceiling and proof of work still apply to them. Keep
-the socket on a trusted host with tight `mode`, `auth_uids` and `auth_gids`.
+the socket on a trusted host with tight `mode`, `auth_uids` and `auth_gids`;
+the relay warns at startup, and `wok doctor` in its `unix-access` check, when
+the mode lets every local user connect and both allow-lists are empty.
 
 ### Throwaway keys
 

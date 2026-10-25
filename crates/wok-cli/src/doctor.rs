@@ -690,6 +690,15 @@ fn check_external_paths(cfg: &Config, report: &mut DoctorReport) {
         report.add("unix-socket", CheckStatus::Pass, "disabled");
         return;
     }
+    // The relay logs this at startup too.
+    match cfg.unix_socket_warning() {
+        Some(detail) => report.add("unix-access", CheckStatus::Warn, detail),
+        None => report.add(
+            "unix-access",
+            CheckStatus::Pass,
+            "other local users cannot open the socket, or the peer allow-lists decide who can",
+        ),
+    }
     let path = &cfg.relay.unix.path;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
@@ -1130,6 +1139,31 @@ mod tests {
         assert!(check
             .detail
             .ends_with("`wok config minimize` removes them."));
+    }
+
+    #[test]
+    fn a_unix_socket_every_local_user_may_open_is_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let access = |unix: &str| {
+            let mut cfg =
+                Config::parse_toml(&format!("[relay.unix]\nenabled = true\n{unix}\n")).unwrap();
+            cfg.relay.unix.path = temp.path().join("wok.sock");
+            let mut report = DoctorReport::new();
+            check_external_paths(&cfg, &mut report);
+            check(&report, "unix-access").clone()
+        };
+        assert_eq!(access("").status, CheckStatus::Pass);
+        let open = access("mode = 0o666");
+        assert_eq!(open.status, CheckStatus::Warn);
+        assert!(
+            open.detail.contains("auth_uids and auth_gids are empty"),
+            "{}",
+            open.detail
+        );
+        assert_eq!(
+            access("mode = 0o666\nauth_gids = [0]").status,
+            CheckStatus::Pass
+        );
     }
 
     /// Every check `check_config_defaults` reports for a file, by name.

@@ -48,6 +48,24 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
         ["a", format!("10002:{pubkey}:")],
         ["a", format!("030000:{pubkey}:x")]
     ],"content":""})));
+    // Tags strfry packs differently from Wok's ingest, whose records
+    // migration must accept: hex in either case or after `0x`, long values
+    // dropped, the first expiration, virtual d tags, kind 41 replaceable.
+    events.push(sign(json!({"kind":1,"created_at":1_800_000_300,"tags":[
+        ["p", "AB".repeat(32)],
+        ["e", format!("0x{}", "cd".repeat(31))],
+        ["t", "z".repeat(300)],
+        ["t"],
+        ["expiration", "04000000000"],
+        ["expiration", "never"]
+    ],"content":"strfry packing"})));
+    events.push(sign(json!({"kind":41,"created_at":1_800_000_301,"tags":[["e", "03".repeat(32)]],"content":"channel"})));
+    events.push(sign(
+        json!({"kind":30023,"created_at":1_800_000_302,"tags":[["d", "post"]],"content":"article"}),
+    ));
+    events.push(sign(
+        json!({"kind":20001,"created_at":1_800_000_303,"tags":[],"content":"ephemeral"}),
+    ));
     let mut cpp = Command::new(&reference)
         .arg("--config")
         .arg(&config)

@@ -7,7 +7,7 @@ Library modules. Public surface is re-exported from `lib.rs`.
 | `lib.rs` | Crate root, version/kind constants, re-exports |
 | `json.rs` | tao-compatible `parse_strict` / `to_tao_string`; NIP-01 id preimage writer |
 | `parse.rs` | Hex helpers, `ParsedEvent`, `EventLimits`, JSON → PackedEvent |
-| `validate.rs` | Size/timestamp/Schnorr checks; `parse_and_verify_event`; `verify_stored_event` (a stored payload against its PackedEvent) |
+| `validate.rs` | Size/timestamp/Schnorr checks; `parse_and_verify_event`; `verify_strfry_event` (a strfry v3 payload against its PackedEvent) |
 | `hash.rs` | NIP-01 and legacy event ids, `verify_id`, `verify_id_allowing_legacy`, `verify_sig` |
 | `packed.rs` | PackedEvent bytes, views, tag builder, ordering |
 | `kinds.rs` | Replaceable / param-replaceable / ephemeral; `a` tags |

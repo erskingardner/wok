@@ -51,7 +51,9 @@ passes.
 2. The copy must be strfry database version 3 and pass Wok's integrity checks.
 3. Every event in the copy must verify against its stored payload: the payload
    names the packed record's id, pubkey, kind and created_at, hashes to that
-   id, and carries a valid Schnorr signature by that pubkey. See
+   id, and carries a valid Schnorr signature by that pubkey, and the packed
+   record, from which every index is derived, indexes nothing the payload does
+   not carry. See
    [Events that do not verify](#events-that-do-not-verify).
 4. Every Event and EventPayload record is fingerprinted using its local event
    ID, exact packed bytes, and exact stored payload bytes.
@@ -72,24 +74,41 @@ serves its payload. strfry verifies an event's id and signature and packs it
 from its JSON as it accepts it, but `strfry import --no-verify` skips the
 verification and `--fried` takes the packed record as given. A database
 written by those, or edited by hand, can hold a record whose payload is
-another event, or no event its author signed. Migration does not trust the
-source on this. It checks every event's id and signature, accepting either id
+another event, a record that files a signed event under another recipient,
+address, deletion target or expiry, or no event its author signed. Migration
+does not trust the source on this. The payload must name the packed record's
+id, pubkey, kind and created_at, and the packed tags and expiration must come
+from the payload as strfry's database version 3 packs them:
+
+- Every packed tag is one of the payload's single-letter tags, an `e` or `p`
+  value as the bytes its 64 hex characters decode to and any other value as
+  written, up to 255 bytes. The exception is the empty `d` strfry adds to replaceable and
+  addressable kinds and kind 41. A payload tag the record leaves out is
+  accepted: it only keeps queries from finding the event by that tag.
+- The first packed `d`, which keys replacement, is the payload's address:
+  empty for a replaceable kind, and for an addressable kind the payload's
+  first `d` of up to 255 bytes, or empty when it has none.
+- The packed expiration is 0, 1 for an ephemeral kind, or the payload's first
+  `expiration` tag.
+
+Migration then checks the event's id and signature, accepting either id
 preimage a stored event may use (NIP-01, or the one strfry hashed for events
-containing U+007F), and reads hex as strfry read it, in either case. It checks
-nothing else about the event, so an event strfry verified fails only if Wok's
-JSON parser refuses its payload, for example for nesting deeper than 128
-levels (see [known differences](known-differences.md)).
+containing U+007F). Hex is read as strfry read it, in either case and after an
+optional `0x`, and no limit from strfry's config is applied, so an event
+strfry verified and packed fails only if Wok's JSON parser refuses its
+payload, for example for nesting deeper than 128 levels (see
+[known differences](known-differences.md)).
 
 Any event that fails refuses the migration. It is not skipped: migration
 copies every record or none. The error, like the preflight report, gives the
 number that failed and names up to 100 of them by local ID, the id the
-indexes hold, and the reason, such as `bad signature` or `payload id differs
-from the packed record`. To migrate, stop strfry, delete those events (for
+indexes hold, and the reason, such as `bad signature` or `packed p tag <hex> is
+not in the payload`. To migrate, stop strfry, delete those events (for
 example `strfry delete --filter '{"ids":["<id>"]}'`) or restore the database
 from a backup, and run the migration again.
 
-Verification costs a SHA-256 and a Schnorr signature check per event, spread
-over every core. The preflight, which may run beside strfry, uses half of
+Verification costs a pass over the tags, a SHA-256 and a Schnorr signature
+check per event, spread over every core. The preflight, which may run beside strfry, uses half of
 them. The migration verifies its own snapshot, not the database the preflight
 read, so what it promotes is what it verified.
 

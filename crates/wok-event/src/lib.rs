@@ -35,7 +35,7 @@ pub use parse::{
 };
 pub use validate::{
     parse_and_verify_event, parse_and_verify_event_with, require_canonical_addresses,
-    verify_event_json_size, verify_event_timestamp, verify_nostr_event, verify_stored_event,
+    verify_event_json_size, verify_event_timestamp, verify_nostr_event, verify_strfry_event,
     IdPreimage, TimestampPolicy, AUTH_TIMESTAMP_WINDOW_SECS, GIFT_WRAP_BACKDATE_SECS,
 };
 

@@ -174,9 +174,10 @@ impl EventVerificationReport {
 }
 
 /// Verify every stored event against its payload with
-/// [`wok_event::verify_stored_event`]: the payload names the PackedEvent's
+/// [`wok_event::verify_strfry_event`]: the payload names the PackedEvent's
 /// id, pubkey, kind and created_at, hashes to that id, and is signed by that
-/// pubkey.
+/// pubkey, and the PackedEvent, from which every index is derived, indexes
+/// nothing the payload does not carry.
 ///
 /// Up to `threads` workers, the calling thread among them, each open one
 /// read transaction and take runs of local ids from a shared counter. Each
@@ -314,7 +315,7 @@ fn verify_event(
         Err(error) => return Ok(Some(format!("payload: {error}"))),
     };
     Ok(wok_event::json::parse_strict(json)
-        .and_then(|event| wok_event::verify_stored_event(packed, &event))
+        .and_then(|event| wok_event::verify_strfry_event(packed, &event))
         .err()
         .map(|error| error.to_string()))
 }

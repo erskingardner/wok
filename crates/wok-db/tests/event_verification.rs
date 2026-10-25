@@ -7,12 +7,16 @@ use wok_db::{
 use wok_event::{EventLimits, PackedEventBuilder, PackedEventTagBuilder, PackedEventView};
 
 fn signed(content: &str, created_at: u64) -> Value {
+    signed_with(1, json!([["t", "verify"]]), content, created_at)
+}
+
+fn signed_with(kind: u64, tags: Value, content: &str, created_at: u64) -> Value {
     use secp256k1::{Keypair, SECP256K1};
     let kp = Keypair::new(SECP256K1, &mut rand::thread_rng());
     let mut ev = json!({
         "created_at": created_at,
-        "kind": 1,
-        "tags": [["t", "verify"]],
+        "kind": kind,
+        "tags": tags,
         "content": content,
         "pubkey": hex::encode(kp.x_only_public_key().0.serialize()),
     });
@@ -26,6 +30,26 @@ fn packed(ev: &Value) -> Vec<u8> {
     wok_event::nostr_json_to_packed_event(ev, &EventLimits::default())
         .unwrap()
         .into_bytes()
+}
+
+/// `ev`'s record with this kind, expiration and tags in place of its own.
+fn forged(ev: &Value, kind: u64, expiration: u64, tags: &[(char, &[u8])]) -> Vec<u8> {
+    let original = packed(ev);
+    let view = PackedEventView::new(&original).unwrap();
+    let mut builder = PackedEventTagBuilder::default();
+    for (name, value) in tags {
+        builder.add(*name, value).unwrap();
+    }
+    PackedEventBuilder::build(
+        view.id(),
+        view.pubkey(),
+        view.created_at(),
+        kind,
+        expiration,
+        &builder,
+    )
+    .unwrap()
+    .into_bytes()
 }
 
 /// Store each PackedEvent with its payload as given, as a crafted source
@@ -77,23 +101,17 @@ fn crafted_records_pass_integrity_but_not_verification() {
     let mut edited_json = edited.clone();
     edited_json["content"] = json!("edited later");
     let kind = signed("kind", 1_700_000_004);
-    // The packed record says kind 7; its payload says kind 1.
-    let kind_packed = {
-        let original = packed(&kind);
-        let view = PackedEventView::new(&original).unwrap();
-        let mut tags = PackedEventTagBuilder::default();
-        tags.add('t', b"verify").unwrap();
-        PackedEventBuilder::build(
-            view.id(),
-            view.pubkey(),
-            view.created_at(),
-            7,
-            view.expiration(),
-            &tags,
-        )
-        .unwrap()
-        .into_bytes()
-    };
+    // Records whose indexes put the payload where it does not belong: under
+    // kind 7, another recipient, another address, another expiry.
+    let recipient = [0x22; 32];
+    let dm = signed_with(
+        4,
+        json!([["p", hex::encode(recipient)]]),
+        "dm",
+        1_700_000_006,
+    );
+    let article = signed_with(30023, json!([["d", "post"]]), "article", 1_700_000_007);
+    let kept = signed_with(1, json!([]), "kept", 1_700_000_008);
     let tao = wok_event::json::to_tao_string;
     let lev_ids = store(
         &env,
@@ -103,7 +121,13 @@ fn crafted_records_pass_integrity_but_not_verification() {
             (packed(&signed("swapped", 1_700_000_005)), tao(&other)),
             (packed(&bad_sig), tao(&bad_sig)),
             (packed(&edited), tao(&edited_json)),
-            (kind_packed, tao(&kind)),
+            (forged(&kind, 7, 0, &[('t', b"verify")]), tao(&kind)),
+            (forged(&dm, 4, 0, &[('p', &[0x33; 32])]), tao(&dm)),
+            (
+                forged(&article, 30023, 0, &[('d', b""), ('d', b"post")]),
+                tao(&article),
+            ),
+            (forged(&kept, 1, 1_700_000_100, &[]), tao(&kept)),
         ],
     );
 
@@ -112,19 +136,29 @@ fn crafted_records_pass_integrity_but_not_verification() {
 
     for threads in [1, 3] {
         let report = verify_events(&env, threads).unwrap();
-        assert_eq!(report.events, 5);
-        assert_eq!(report.failed, 4);
+        assert_eq!(report.events, 8);
+        assert_eq!(report.failed, 7);
         assert!(!report.ok());
         let failures: Vec<_> = report
             .failures
             .iter()
             .map(|failure| (failure.lev_id, failure.reason.as_str()))
             .collect();
+        let forged_p = format!("packed p tag {} is not in the payload", "33".repeat(32));
         let mut expected = vec![
             (lev_ids[1], "payload id differs from the packed record"),
             (lev_ids[2], "bad signature"),
             (lev_ids[3], "bad event id"),
             (lev_ids[4], "payload kind differs from the packed record"),
+            (lev_ids[5], forged_p.as_str()),
+            (
+                lev_ids[6],
+                r#"packed address "" differs from the payload's "post""#,
+            ),
+            (
+                lev_ids[7],
+                "packed expiration 1700000100 differs from the payload's none",
+            ),
         ];
         expected.sort();
         assert_eq!(failures, expected);

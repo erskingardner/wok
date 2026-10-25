@@ -209,6 +209,8 @@ enum Command {
         url: String,
         #[arg(long)]
         filter: Option<String>,
+        #[arg(long)]
+        no_verify: bool,
     },
     Router {
         /// Router config file (taocpp::config format)
@@ -409,7 +411,11 @@ async fn main() -> Result<()> {
         Command::Integrity => cmd_integrity(&cfg),
         Command::Sync(options) => sync::run(&cfg, options).await,
         Command::Upload { url, pipeline } => cmd_upload(url, pipeline).await,
-        Command::Download { url, filter } => cmd_download(url, filter).await,
+        Command::Download {
+            url,
+            filter,
+            no_verify,
+        } => cmd_download(&cfg, url, filter, no_verify).await,
         Command::Router { router_config_file } => router::run_router(cfg, router_config_file).await,
     }
 }
@@ -1552,6 +1558,25 @@ fn downloaded_event_matches(
         .unwrap_or(false)
 }
 
+/// Normalized JSON of an event a relay sent `wok download`. Relays serve
+/// stored events, which strfry and earlier Wok releases hashed with the legacy
+/// id preimage.
+fn downloaded_event_json(
+    event: &serde_json::Value,
+    no_verify: bool,
+    limits: &EventLimits,
+) -> Result<String> {
+    let parsed = parse_and_verify_event_with(
+        event,
+        limits,
+        None,
+        !no_verify,
+        false,
+        IdPreimage::Nip01OrLegacy,
+    )?;
+    Ok(parsed.json)
+}
+
 fn most_recent_levid_ro_quiet(txn: &wok_db::RoTxn<'_>) -> u64 {
     wok_db::most_recent_levid_ro(txn).unwrap_or(0)
 }
@@ -1592,22 +1617,61 @@ async fn cmd_upload(url: String, pipeline: u64) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_download(url: String, filter: Option<String>) -> Result<()> {
+async fn cmd_download(
+    cfg: &Config,
+    url: String,
+    filter: Option<String>,
+    no_verify: bool,
+) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+    if no_verify {
+        tracing::warn!("not verifying event IDs or signatures!");
+    }
+    let limits = cfg.event_limits();
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
     let filter = filter.unwrap_or_else(|| "{}".into());
     let req = format!(r#"["REQ","_",{filter}]"#);
     ws.send(Message::Text(req.into())).await?;
+    let (mut printed, mut rejected, mut eose) = (0u64, 0u64, false);
     while let Some(msg) = ws.next().await {
-        let txt = msg?.to_text()?.to_string();
-        let v: serde_json::Value = serde_json::from_str(&txt)?;
+        // Reading on past a ping flushes tungstenite's queued pong.
+        let text = match msg? {
+            Message::Text(text) => text,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        let v = match wok_event::json::parse_strict(&text) {
+            Ok(v) => v,
+            Err(error) => {
+                rejected += 1;
+                tracing::warn!(%error, "download rejected unreadable message");
+                continue;
+            }
+        };
         if v[0] == "EOSE" {
+            eose = true;
             break;
         }
         if v[0] == "EVENT" {
-            cli_println!("{}", v[2]);
+            match downloaded_event_json(&v[2], no_verify, &limits) {
+                Ok(json) => {
+                    cli_println!("{json}");
+                    printed += 1;
+                }
+                Err(error) => {
+                    rejected += 1;
+                    let id = v[2]["id"].as_str().unwrap_or_default();
+                    tracing::warn!(id, %error, "download rejected event");
+                }
+            }
         }
+    }
+    if !eose {
+        bail!("download incomplete: connection closed before EOSE; {printed} printed, {rejected} rejected");
+    }
+    if rejected > 0 {
+        bail!("download incomplete: {printed} printed, {rejected} rejected");
     }
     Ok(())
 }
@@ -1872,5 +1936,48 @@ mod main_tests {
             &searchable,
             &EventLimits::default(),
         ));
+    }
+
+    #[test]
+    fn download_prints_verified_events_including_legacy_ids() {
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let mut event = json!({
+            "created_at": 1_700_000_000u64,
+            "kind": 1,
+            "tags": [],
+            "content": "del \u{7f}",
+            "pubkey": hex::encode(key.x_only_public_key().0.serialize()),
+        });
+        let limits = EventLimits::default();
+        for hash in [wok_event::legacy_event_id_hash, wok_event::event_id_hash] {
+            let id = hash(&event).unwrap();
+            event["id"] = json!(hex::encode(id));
+            event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+            assert_eq!(
+                downloaded_event_json(&event, false, &limits).unwrap(),
+                wok_event::json::to_tao_string(&event)
+            );
+        }
+    }
+
+    #[test]
+    fn download_rejects_forged_events_unless_verification_is_off() {
+        let event = signed_event(1_700_000_000);
+        let event = wok_event::json::parse_strict(&event.json).unwrap();
+        let limits = EventLimits::default();
+        let mut forged_content = event.clone();
+        forged_content["content"] = json!("forged");
+        let mut forged_sig = event.clone();
+        forged_sig["sig"] = json!("33".repeat(64));
+        for forged in [&forged_content, &forged_sig] {
+            assert!(downloaded_event_json(forged, false, &limits).is_err());
+            assert_eq!(
+                downloaded_event_json(forged, true, &limits).unwrap(),
+                wok_event::json::to_tao_string(forged)
+            );
+        }
+        // Verification off still refuses what is not an event.
+        assert!(downloaded_event_json(&json!(null), true, &limits).is_err());
+        assert!(downloaded_event_json(&json!({"kind": 1}), true, &limits).is_err());
     }
 }

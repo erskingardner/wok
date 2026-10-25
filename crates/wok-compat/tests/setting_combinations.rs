@@ -84,6 +84,10 @@ const SETTINGS: &[(&str, &str)] = &[
         "real_ip_header",
         r#"relay.real_ip_header = "X-Forwarded-For""#,
     ),
+    (
+        "trusted_proxies",
+        r#"relay.trusted_proxies = ["127.0.0.1", "::1"]"#,
+    ),
     // An admin the script never signs as, so this opens the endpoints
     // without making the script's author a member.
     (
@@ -105,6 +109,10 @@ admin.pubkeys = ["f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036
 const UNPROBED: &[(&str, &str)] = &[
     (
         "real_ip_header",
+        "the script sends no proxy header; proxied_client_address.rs covers it",
+    ),
+    (
+        "trusted_proxies",
         "the script sends no proxy header; proxied_client_address.rs covers it",
     ),
     (

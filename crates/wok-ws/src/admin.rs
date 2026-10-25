@@ -597,6 +597,13 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
         // settings show the running value.
         "file": {
             "real_ip_header": cfg.relay.real_ip_header,
+            "trusted_proxies": cfg
+                .relay
+                .trusted_proxies
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
             "max_websocket_payload_size": cfg.relay.max_websocket_payload_size,
             "min_free_disk_bytes": cfg.db_min_free_disk_bytes,
             "map_size": cfg.db_mapsize,

@@ -56,9 +56,13 @@ Every request on the listener passes these steps before Wok looks at its path:
    wrote. An entry may carry a port. In `Forwarded`, read as RFC 7239, it
    is the last element's `for`, and that element is found from the right,
    so nothing a client sends ahead of it, an unterminated quoted string
-   included, moves it. A last entry that names no IP address leaves the
-   connecting address and is counted in `wok_real_ip_header_unparsed_total`;
-   no header leaves it too.
+   included, moves it. With `relay.trusted_proxies` set, a connection from
+   outside its ranges keeps its own address and its header is not read; on
+   one from inside them, Wok skips each entry inside them from the end and
+   the first address outside them is the client's, or the first entry when
+   all are inside. An entry where the client's should be that names no IP
+   address leaves the connecting address and is counted in
+   `wok_real_ip_header_unparsed_total`; no header leaves it too.
 3. An address blocked with NIP-86 `blockip` gets 429, and so does one whose
    per-address connection budget (`relay.abuse.connection_*`) is spent.
 
@@ -196,7 +200,7 @@ does not list.
 | `wok integrity` | Database | |
 | `wok sync` | A remote relay | Parses its NIP-77 messages; verifies each downloaded event before storing it. |
 | `wok upload` | JSONL events on standard input, a remote relay | Sends the events to the URL. |
-| `wok download` | A remote relay | Prints the events it receives without verifying them. |
+| `wok download` | A remote relay | Checks each event as `wok import` does, ids and signatures unless `--no-verify`, and skips and reports those that fail. Exits nonzero if it skipped any or the connection closed before EOSE. |
 | `wok router` | Router config file, every relay it names | Verifies each downloaded event before storing it. Reloads the router config when it changes. |
 
 Outbound commands dial whatever URL they are given, including loopback and

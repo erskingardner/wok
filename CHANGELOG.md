@@ -15,11 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connections skip the connection, per-address and per-connection budgets,
   so such a socket gives each local user a channel that only proof of work,
   the storage quotas and the per-author EVENT budget limit, and an
-  unauthenticated connection starts that budget afresh with each new key. docs/production-deployment.md now says
-  what a write-policy plugin's request carries: `authed` is present only for
-  NIP-70 protected events and owner-only kinds, so a plugin cannot use it to
-  tell who is logged in, and `sourceType: "unix"` names the transport, not a
-  trusted caller.
+  unauthenticated connection starts that budget afresh with each new key.
+  docs/production-deployment.md now says what a write-policy plugin's
+  request carries: `authed` is present only for NIP-70 protected events and
+  owner-only kinds, so a plugin cannot use it to tell who is logged in, and
+  `sourceType: "unix"` names the transport, not a trusted caller.
 - `wok migrate strfry` verifies every event against its stored payload
   before it migrates the database (#55). The payload must name the packed
   record's id, pubkey, kind and created_at, hash to that id, and carry a

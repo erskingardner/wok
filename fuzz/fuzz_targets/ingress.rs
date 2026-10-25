@@ -82,7 +82,13 @@ fuzz_target!(|data: &[u8]| {
     let _ = InflateCtx::new(false).decompress(data, 2_097_152);
 
     // The client address header in both syntaxes, the input's lines as its
-    // lines.
+    // lines, from a proxy with no others trusted and from one behind a CDN
+    // whose addresses are skipped.
+    let cdn: Vec<wok_relay::config::IpRange> = ["127.0.0.1", "192.0.2.0/24", "2001:db8::/32"]
+        .iter()
+        .map(|range| range.parse().unwrap())
+        .collect();
+    let peer = std::net::IpAddr::from([127, 0, 0, 1]);
     for name in ["forwarded", "x-forwarded-for"] {
         let mut headers = hyper::HeaderMap::new();
         for line in data.split(|&b| b == b'\n').take(8) {
@@ -90,7 +96,8 @@ fuzz_target!(|data: &[u8]| {
                 headers.append(name, value);
             }
         }
-        let _ = wok_ws::forwarded::client(&headers, name);
+        let _ = wok_ws::forwarded::client(&headers, name, peer, &[]);
+        let _ = wok_ws::forwarded::client(&headers, name, peer, &cdn);
     }
 
     // Context takeover across an idle release, which the relay runs on a

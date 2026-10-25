@@ -532,6 +532,40 @@ async fn serving_peer(events: Vec<Value>) -> (String, tokio::task::JoinHandle<()
     (url, task)
 }
 
+fn printed_events(output: &Output) -> Vec<Value> {
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| wok_event::json::parse_strict(line).unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn download_prints_only_events_that_verify_unless_told_not_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "");
+    let good = event(1);
+    let mut forged = event(1);
+    forged["content"] = json!("forged");
+    let forged_id = forged["id"].as_str().unwrap().to_string();
+
+    let (url, task) = serving_peer(vec![good.clone(), forged.clone()]).await;
+    let output = cli(&cfg, &["download", &url]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(printed_events(&output), vec![good.clone()], "{stderr}");
+    assert!(stderr.contains(&forged_id), "{stderr}");
+    assert!(stderr.contains("1 events rejected"), "{stderr}");
+    task.await.unwrap();
+
+    let (url, task) = serving_peer(vec![good.clone(), forged.clone()]).await;
+    let output = cli(&cfg, &["download", &url, "--no-verify"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(printed_events(&output), vec![good, forged], "{stderr}");
+    task.await.unwrap();
+}
+
 struct KillOnDrop(std::process::Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {

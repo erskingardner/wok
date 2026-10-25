@@ -119,6 +119,17 @@ up-directions export your local DB to the configured URL. Treat router
 configs and sync/upload targets as trusted input. TLS verification is always
 on and cannot be disabled.
 
+## One-shot downloads
+
+`wok download <url> [--filter <json>]` sends one REQ and prints each event the
+relay returns before EOSE as a JSON line on stdout, in the normalized form
+`wok export` writes, ready for `wok import`. It verifies each event's id and
+signature first, accepting the legacy tao preimage as `wok import` does. An
+event that fails is skipped and logged on stderr with its id and reason, and
+the command exits nonzero after EOSE with the number skipped. `--no-verify`
+prints events without checking ids or signatures, like `wok import
+--no-verify`; it still skips anything that is not a well-formed event.
+
 ## Persistent mesh links
 
 Use `wok router` for new long-running replication setups. It supports multiple

@@ -394,8 +394,9 @@ regression test. Differential parity alone is not a reason to retain it.
   escapes it as `\u007f`, so a correctly signed event containing DEL was
   refused with `invalid: bad event id`. Stored payloads keep tao escaping, which
   is valid JSON for the same string. A published EVENT, AUTH or NIP-98 event
-  must use the NIP-01 id. `wok import` (with verification), `wok sync` and
-  `wok router` downloads also accept the legacy tao preimage, because strfry
+  must use the NIP-01 id. `wok import` and `wok download` (with
+  verification), and `wok sync` and `wok router` downloads, also accept the
+  legacy tao preimage, because strfry
   and earlier Wok releases stored events under it. Accepting both cannot give
   two different events one id: the preimages agree unless the event contains
   DEL, and then the NIP-01 preimage has a raw DEL byte that a tao preimage

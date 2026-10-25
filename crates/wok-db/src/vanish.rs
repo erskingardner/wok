@@ -89,9 +89,13 @@ impl VanishPolicy {
 /// A URL without a scheme is `wss`, as clients take it, and `https` and
 /// `http` count as `wss` and `ws`. The scheme and the path are kept, so
 /// relays on another port or path of the same host, which proxies match
-/// case-sensitively, do not accept each other's URLs.
+/// case-sensitively, do not accept each other's URLs. An empty URL stays
+/// empty, so an unset service URL matches nothing.
 pub fn normalize_relay_url(url: &str) -> String {
     let url = url.trim();
+    if url.is_empty() {
+        return String::new();
+    }
     let (scheme, rest) = url.split_once("://").unwrap_or(("wss", url));
     let rest = rest.split(['?', '#']).next().unwrap_or_default();
     let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
@@ -505,5 +509,19 @@ mod tests {
         assert!(!request("ws://host.example:80/relayA"));
         assert!(!request("wss://host.example"));
         assert!(request("ALL_RELAYS"));
+    }
+
+    #[test]
+    fn an_unset_service_url_matches_only_all_relays() {
+        let policy = VanishPolicy {
+            enabled: true,
+            service_url: String::new(),
+        };
+        for relay in ["", " ", "wss://", "wss:///"] {
+            let request = serde_json::json!({"kind": 62, "tags": [["relay", relay]]});
+            assert!(!policy.targets_this_relay_value(&request), "{relay:?}");
+        }
+        let all = serde_json::json!({"kind": 62, "tags": [["relay", "ALL_RELAYS"]]});
+        assert!(policy.targets_this_relay_value(&all));
     }
 }

@@ -908,6 +908,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wok_authenticated_connections` counts connections, as documented, not
+  successful AUTHs (#214). A connection that authenticated a second key, or
+  the same key again, added one each time but was taken out once when it
+  closed, so the gauge drifted upward, and `wok_active_connections -
+  wok_authenticated_connections` could go negative.
 - A NEG-MSG that crossed the `NEG-ERR` closing its session no longer gets a
   second `NEG-ERR`, `closed: unknown subscription handle` (#214). When a
   reload, a moderation change, a login, an idle timeout or an expiring event

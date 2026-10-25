@@ -69,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged-in connection still read its gift wraps and DMs, which nobody is
   meant to while AUTH is off, and went on reading them once a reload made
   AUTH usable again. The connection is now anonymous from that reload on:
-  the NEG sessions it opened logged in are closed with `closed:
+  the NEG sessions it opened while logged in are closed with `closed:
   authentication changed; reopen synchronization`, its live subscriptions
   deliver nothing only its keys may read, and once AUTH is back it
   authenticates again with the challenge it holds.

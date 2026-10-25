@@ -172,7 +172,7 @@ A reload that makes AUTH unusable ends every login. Each connection is
 anonymous from then on, even after a reload makes AUTH usable again, until
 it authenticates again with the challenge it holds: its live subscriptions
 stop delivering what only its keys may read, and the NEG sessions it opened
-logged in are closed with `closed: authentication changed; reopen
+while logged in are closed with `closed: authentication changed; reopen
 synchronization`.
 
 ### Read classes

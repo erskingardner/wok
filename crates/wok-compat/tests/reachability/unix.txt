@@ -1,7 +1,7 @@
 # Relay functions reached in the `unix` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 710
+## anonymous: 711
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -443,6 +443,7 @@
 <wok_ws::frame::ReadDeadlines>::new
 <wok_ws::frame::ReadDeadlines>::next
 <wok_ws::frame::ReadDeadlines>::resume
+<wok_ws::frame::WsEncoder>::encode_control
 <wok_ws::frame::WsEncoder>::encode_frame
 <wok_ws::frame::WsEncoder>::encode_message_into
 <wok_ws::frame::WsEncoder>::new

@@ -1,7 +1,7 @@
 # Relay functions reached in the `gated` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 438
+## anonymous: 439
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::is_member
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
@@ -144,7 +144,7 @@
 <wok_relay::server::ConnTable>::deliver
 <wok_relay::server::ConnTable>::deliver::{closure}
 <wok_relay::server::ConnTable>::entry
-<wok_relay::server::ConnTable>::insert
+<wok_relay::server::ConnTable>::insert_from
 <wok_relay::server::ConnTable>::refuse
 <wok_relay::server::ConnTable>::refuse::{closure}
 <wok_relay::server::ConnTable>::refuse::{closure}::{closure}
@@ -206,6 +206,7 @@
 <wok_relay::server::RelayHandle>::next_conn_id
 <wok_relay::server::RelayHandle>::register_connection
 <wok_relay::server::RelayHandle>::register_connection::{closure}
+<wok_relay::server::RelayHandle>::register_connection::{closure}::{closure}
 <wok_relay::server::RelayHandle>::supported_nips
 <wok_relay::server::StoredBatch as core::ops::drop::Drop>::drop
 <wok_relay::server::WriterMsg as wok_relay::server::Routed>::conn_id
@@ -279,6 +280,7 @@ wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 wok_db::vanish::is_event_vanished_ro
 wok_db::vanish::mark_vanished
 wok_db::vanish::normalize_relay_url
+wok_db::vanish::normalize_relay_url::{closure}
 wok_db::write::index_event
 wok_db::write::insert_event
 wok_db::write::lookup_event_by_id
@@ -366,7 +368,6 @@ wok_relay::server::kind_refusal::{closure}
 wok_relay::server::neg_err
 wok_relay::server::negentropy::fail
 wok_relay::server::negentropy::snapshot_due
-wok_relay::server::normalize_relay_url
 wok_relay::server::pow_refusal
 wok_relay::server::read_policy_refusal
 wok_relay::server::reader_admitted
@@ -441,7 +442,7 @@ wok_ws::upgrade_ws::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 298
+## authenticated: 302
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -619,10 +620,10 @@ wok_ws::ws_accept_key
 <wok_relay::server::ConnTable>::send_last
 <wok_relay::server::ConnTable>::send_last::{closure}
 <wok_relay::server::ConnTable>::send_sub
-<wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::send_last::{closure}>
 <wok_relay::server::ConnTable>::with::<(usize, usize), <wok_relay::server::ConnTable>::filter_bytes::{closure}>
 <wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::is_open::{closure}>
 <wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::push_sub::{closure}>
+<wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::send_last::{closure}>
 <wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::open_sub::{closure}>
 <wok_relay::server::ConnTable>::with::<usize, <wok_relay::server::ConnTable>::open_count::{closure}>
 <wok_relay::server::Dispatch>::monitor
@@ -723,15 +724,18 @@ wok_query::visibility::physical_tree_is_globally_visible::{closure}::{closure}
 wok_relay::moderation::stored_is_member
 wok_relay::protocol::push_json_str
 wok_relay::protocol::push_json_str::{closure}
+wok_relay::server::add_login
 wok_relay::server::admit_req::{closure}
 wok_relay::server::admit_req::{closure}::{closure}
 wok_relay::server::check_author_auth::{closure}
 wok_relay::server::check_query_work
-wok_relay::server::filter_validator
+wok_relay::server::close_refused_queries
 wok_relay::server::ingest_req::{closure}
+wok_relay::server::negentropy::answer::<wok_negentropy::error::NegError>
 wok_relay::server::negentropy::public_tree_allowed
 wok_relay::server::negentropy::public_tree_allowed::{closure}
 wok_relay::server::negentropy::public_tree_allowed::{closure}::{closure}
+wok_relay::server::negentropy::reauthenticated
 wok_relay::server::negentropy::run_negentropy::{closure}
 wok_relay::server::negentropy::run_negentropy::{closure}::{closure}
 wok_relay::server::negentropy::send_vector
@@ -739,9 +743,10 @@ wok_relay::server::negentropy::send_vector::{closure}
 wok_relay::server::reader_admitted::{closure}
 wok_relay::server::route_tx::<wok_relay::server::MonitorMsg>
 wok_relay::server::run_req_worker::{closure}
+wok_relay::server::slice_config
 wok_relay::server::stored_reader_admitted
 
-## admin: 112
+## admin: 113
 <wok_db::moderation::KindPolicy>::allow_all
 <wok_db::moderation::KindPolicy>::allows
 <wok_db::moderation::KindPolicy>::allows::{closure}
@@ -777,6 +782,7 @@ wok_relay::server::stored_reader_admitted
 <wok_relay::metrics::Refusals>::recent::{closure}
 <wok_relay::metrics::Setting>::key
 <wok_relay::moderation::ManagementCmd>::apply
+<wok_relay::server::ConnTable>::kill_blocked
 <wok_relay::server::RelayHandle>::config_path
 <wok_relay::server::RelayHandle>::manage
 <wok_relay::server::RelayHandle>::manage::{closure}

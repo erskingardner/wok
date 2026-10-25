@@ -1,7 +1,7 @@
 # Relay functions reached in the `minimal` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 609
+## anonymous: 611
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
 <wok_db::moderation::ModerationView>::hides
@@ -262,7 +262,7 @@
 <wok_relay::server::ConnTable>::entry
 <wok_relay::server::ConnTable>::filter_bytes
 <wok_relay::server::ConnTable>::filter_bytes::{closure}
-<wok_relay::server::ConnTable>::insert
+<wok_relay::server::ConnTable>::insert_from
 <wok_relay::server::ConnTable>::is_open
 <wok_relay::server::ConnTable>::is_open::{closure}
 <wok_relay::server::ConnTable>::open_count
@@ -350,6 +350,7 @@
 <wok_relay::server::RelayHandle>::next_conn_id
 <wok_relay::server::RelayHandle>::register_connection
 <wok_relay::server::RelayHandle>::register_connection::{closure}
+<wok_relay::server::RelayHandle>::register_connection::{closure}::{closure}
 <wok_relay::server::RelayHandle>::supported_nips
 <wok_relay::server::ReqMsg as wok_relay::server::Routed>::conn_id
 <wok_relay::server::ReqMsg as wok_relay::server::Routed>::is_close
@@ -537,11 +538,11 @@ wok_relay::server::bump_relay_metrics
 wok_relay::server::check_author_auth
 wok_relay::server::check_author_auth::{closure}
 wok_relay::server::check_query_work
+wok_relay::server::close_refused_queries
 wok_relay::server::close_req
 wok_relay::server::count_event_limit
 wok_relay::server::count_filter_limit
 wok_relay::server::count_read_class
-wok_relay::server::filter_validator
 wok_relay::server::handle_client
 wok_relay::server::ingest_auth
 wok_relay::server::ingest_auth::{closure}
@@ -562,6 +563,7 @@ wok_relay::server::refuse_req
 wok_relay::server::route_tx::<wok_relay::server::MonitorMsg>
 wok_relay::server::run_req_monitor::{closure}
 wok_relay::server::run_req_worker::{closure}
+wok_relay::server::slice_config
 wok_relay::server::stop_sub
 wok_relay::server::stop_sub::{closure}
 wok_relay::server::stored_reader_admitted

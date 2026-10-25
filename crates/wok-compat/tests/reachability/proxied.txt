@@ -1,7 +1,7 @@
 # Relay functions reached in the `proxied` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 721
+## anonymous: 724
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -319,7 +319,7 @@
 <wok_relay::server::ConnTable>::entry
 <wok_relay::server::ConnTable>::filter_bytes
 <wok_relay::server::ConnTable>::filter_bytes::{closure}
-<wok_relay::server::ConnTable>::insert
+<wok_relay::server::ConnTable>::insert_from
 <wok_relay::server::ConnTable>::is_open
 <wok_relay::server::ConnTable>::is_open::{closure}
 <wok_relay::server::ConnTable>::open_count
@@ -338,10 +338,10 @@
 <wok_relay::server::ConnTable>::send_sub
 <wok_relay::server::ConnTable>::shard
 <wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::deliver::{closure}>
-<wok_relay::server::ConnTable>::with::<(), <wok_relay::server::ConnTable>::send_last::{closure}>
 <wok_relay::server::ConnTable>::with::<(usize, usize), <wok_relay::server::ConnTable>::filter_bytes::{closure}>
 <wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::is_open::{closure}>
 <wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::push_sub::{closure}>
+<wok_relay::server::ConnTable>::with::<bool, <wok_relay::server::ConnTable>::send_last::{closure}>
 <wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::close_sub::{closure}>
 <wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::open_sub::{closure}>
 <wok_relay::server::ConnTable>::with::<core::option::Option<u64>, <wok_relay::server::ConnTable>::refuse::{closure}>
@@ -408,6 +408,7 @@
 <wok_relay::server::RelayHandle>::next_conn_id
 <wok_relay::server::RelayHandle>::register_connection
 <wok_relay::server::RelayHandle>::register_connection::{closure}
+<wok_relay::server::RelayHandle>::register_connection::{closure}::{closure}
 <wok_relay::server::RelayHandle>::supported_nips
 <wok_relay::server::ReqMsg as wok_relay::server::Routed>::conn_id
 <wok_relay::server::ReqMsg as wok_relay::server::Routed>::is_close
@@ -529,6 +530,7 @@ wok_db::vanish::is_event_vanished_rw
 wok_db::vanish::is_event_vanished_rw::{closure}
 wok_db::vanish::mark_vanished
 wok_db::vanish::normalize_relay_url
+wok_db::vanish::normalize_relay_url::{closure}
 wok_db::vanish::read_timestamp
 wok_db::vanish::vanish_timestamp_ro
 wok_db::vanish::vanish_timestamp_rw
@@ -629,11 +631,11 @@ wok_relay::server::bump_relay_metrics
 wok_relay::server::check_author_auth
 wok_relay::server::check_author_auth::{closure}
 wok_relay::server::check_query_work
+wok_relay::server::close_refused_queries
 wok_relay::server::close_req
 wok_relay::server::count_event_limit
 wok_relay::server::count_filter_limit
 wok_relay::server::count_read_class
-wok_relay::server::filter_validator
 wok_relay::server::gen_challenge
 wok_relay::server::gen_challenge::{closure}
 wok_relay::server::handle_client
@@ -653,6 +655,7 @@ wok_relay::server::issue_challenge
 wok_relay::server::kind_refusal
 wok_relay::server::kind_refusal::{closure}
 wok_relay::server::neg_err
+wok_relay::server::negentropy::answer::<wok_negentropy::error::NegError>
 wok_relay::server::negentropy::fail
 wok_relay::server::negentropy::public_tree_allowed
 wok_relay::server::negentropy::run_negentropy::{closure}
@@ -660,7 +663,6 @@ wok_relay::server::negentropy::run_negentropy::{closure}::{closure}
 wok_relay::server::negentropy::send_vector
 wok_relay::server::negentropy::send_vector::{closure}
 wok_relay::server::negentropy::snapshot_due
-wok_relay::server::normalize_relay_url
 wok_relay::server::pow_refusal
 wok_relay::server::read_gate_refusal
 wok_relay::server::read_gate_refusal::{closure}
@@ -669,6 +671,7 @@ wok_relay::server::refuse_req
 wok_relay::server::route_tx::<wok_relay::server::MonitorMsg>
 wok_relay::server::run_req_monitor::{closure}
 wok_relay::server::run_req_worker::{closure}
+wok_relay::server::slice_config
 wok_relay::server::stop_sub
 wok_relay::server::stop_sub::{closure}
 wok_relay::server::stored_reader_admitted
@@ -724,7 +727,7 @@ wok_ws::upgrade_ws::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 32
+## authenticated: 34
 <wok_db::payload::Decompressor>::decode
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 <wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}
@@ -754,9 +757,11 @@ wok_query::visibility::physical_tree_is_globally_visible::{closure}
 wok_query::visibility::physical_tree_is_globally_visible::{closure}::{closure}
 wok_relay::protocol::push_json_str
 wok_relay::protocol::push_json_str::{closure}
+wok_relay::server::add_login
 wok_relay::server::admit_req::{closure}::{closure}
 wok_relay::server::negentropy::public_tree_allowed::{closure}
 wok_relay::server::negentropy::public_tree_allowed::{closure}::{closure}
+wok_relay::server::negentropy::reauthenticated
 
 ## admin: 0
 

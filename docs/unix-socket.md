@@ -17,7 +17,10 @@ Multiple requests and asynchronous EVENT/EOSE/OK/COUNT/AUTH/NEG-* frames share o
 - Before replacing a path, confirm it is a socket and that `connect()` fails (no live listener).
 - Bind at a sibling temp path, apply the configured mode/ownership there, and
   atomically rename it into place before accept.
-- Optional UID/GID allow-lists via `getpeereid`.
+- Optional UID/GID allow-lists (`relay.unix.auth_uids`, `auth_gids`), both
+  checked against the peer's effective UID and GID from `SO_PEERCRED` (Linux)
+  or `getpeereid` (elsewhere); supplementary groups are not checked. See
+  [Unix socket settings](config.md#unix-socket).
 - On orderly shutdown, unlink only when the final pathname still has the
   filesystem device/inode recorded immediately before the atomic rename.
 - Per-connection outbound byte cap (`relay.unix.max_pending_outbound_bytes`);

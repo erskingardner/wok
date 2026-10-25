@@ -42,6 +42,16 @@
 # - [relay] compression_enabled = false: permessage-deflate off. MDK's
 #   WebSocket client never offers it, and MLS and NIP-44 ciphertext
 #   compresses poorly.
+# - [relay] max_sync_events = 65536, sync_memory_per_connection = 128 MiB:
+#   NIP-77 sized to MDK's syncs. Each MDK session names one group or inbox
+#   with limit 16,385, and MDK runs at most eight at once on a relay
+#   connection. A session reserves 4 MiB for its rounds plus 256 bytes per
+#   event of its limit, about 8 MiB for MDK's, so a connection holds 15 of
+#   them. max_sync_events is four times the 16,384 events MDK compares. The
+#   public values let one sync without a limit reserve 248 MiB; here it
+#   reserves 20 MiB.
+#   sync_memory_total keeps the public 1 GiB, the room for every client's
+#   syncs at once.
 # - [relay.abuse] event_burst = 300: one inviter's commit plus up to about 250
 #   Welcomes from one address.
 # - [relay.abuse.per_connection] req_rate_per_second = 50, req_burst = 300:
@@ -56,6 +66,8 @@ max_websocket_payload_size = 8388608
 max_filter_limit = 5000
 max_filter_limit_count = 0
 compression_enabled = false
+max_sync_events = 65536
+sync_memory_per_connection = 134217728
 
 [relay.unix]
 max_frame_bytes = 8388608

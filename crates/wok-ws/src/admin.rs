@@ -1289,8 +1289,9 @@ mod tests {
         };
         used(&cfg, &state).unwrap();
         // Reloads narrow the window to 1 s and to 5 s, and a request is
-        // checked under each, which would prune the cache by that window
-        // whatever came before it.
+        // checked under each: pruned by the current window, the cache used
+        // to drop the captured ID here. The widen below checks it is still
+        // there.
         for secs in [1, 5] {
             let mut narrow = cfg.clone();
             narrow.admin.auth_window_secs = secs;

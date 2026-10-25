@@ -2198,9 +2198,14 @@ fn clamp_size_class(parsed: &mut TomlConfig) {
     }
 }
 
+/// The longest `admin.auth_window_secs` a configuration may set.
+pub const MAX_AUTH_WINDOW_SECS: u64 = 300;
+
 fn validate_admin_config(admin: &mut AdminConfig) -> Result<(), String> {
-    if admin.auth_window_secs == 0 || admin.auth_window_secs > 300 {
-        return Err("admin.auth_window_secs must be between 1 and 300".into());
+    if admin.auth_window_secs == 0 || admin.auth_window_secs > MAX_AUTH_WINDOW_SECS {
+        return Err(format!(
+            "admin.auth_window_secs must be between 1 and {MAX_AUTH_WINDOW_SECS}"
+        ));
     }
     if !admin.enabled {
         return Ok(());

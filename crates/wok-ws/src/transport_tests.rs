@@ -1,5 +1,6 @@
 //! Per-connection transport costs: idle release of permessage-deflate state
-//! and coalesced outbound writes.
+//! and coalesced outbound writes; and how a client that breaks the protocol
+//! is closed.
 
 #![allow(clippy::field_reassign_with_default)]
 use super::*;
@@ -53,6 +54,14 @@ impl Client {
 
     /// The next server frame: its payload size on the wire and its text.
     async fn frame(&mut self) -> (usize, String) {
+        match self.event().await {
+            (len, WsEvent::Message(_, text)) => (len, String::from_utf8(text).unwrap()),
+            (_, other) => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    /// The next server frame: its payload size on the wire and its event.
+    async fn event(&mut self) -> (usize, WsEvent) {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut head = [0u8; 2];
             self.io.read_exact(&mut head).await.unwrap();
@@ -70,13 +79,34 @@ impl Client {
             let mut payload = vec![0u8; len];
             self.io.read_exact(&mut payload).await.unwrap();
             wire.extend_from_slice(&payload);
-            match self.parser.feed(&wire).unwrap().pop() {
-                Some(WsEvent::Message(_, text)) => (len, String::from_utf8(text).unwrap()),
-                other => panic!("expected a message, got {other:?}"),
-            }
+            let event = self.parser.feed(&wire).unwrap().pop();
+            (len, event.expect("a whole frame"))
         })
         .await
         .expect("no frame from the relay")
+    }
+
+    /// One frame as given, masked.
+    async fn raw(&mut self, fin: bool, rsv1: bool, opcode: u8, payload: &[u8]) {
+        let mut frame = Vec::new();
+        self.encoder
+            .encode_frame(fin, rsv1, opcode, payload, &mut frame);
+        self.io.write_all(&frame).await.unwrap();
+    }
+
+    /// The relay fails the connection: a Close frame with `code`, then the
+    /// end of the stream.
+    async fn closed_with(mut self, code: u16) {
+        match self.event().await {
+            (_, WsEvent::Close(payload)) => assert_eq!(payload, code.to_be_bytes()),
+            (_, other) => panic!("expected a close with {code}, got {other:?}"),
+        }
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), self.io.read_to_end(&mut rest))
+            .await
+            .expect("the relay keeps the stream open")
+            .unwrap();
+        assert!(rest.is_empty(), "{} bytes after the close", rest.len());
     }
 
     /// REQ then CLOSE; returns the EOSE frame's payload size on the wire.
@@ -313,6 +343,79 @@ async fn queued_frames_are_coalesced_into_few_writes() {
     );
 
     drop(client);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    handle.request_shutdown();
+}
+
+/// One permessage-deflate connection, with takeover both ways.
+fn deflate_connection(handle: &Arc<RelayHandle>) -> (Client, tokio::task::JoinHandle<()>) {
+    let (io, stream) = tokio::io::duplex(1 << 16);
+    let task = tokio::spawn(handle_ws(
+        stream,
+        handle.clone(),
+        "127.0.0.1:9000".parse().unwrap(),
+        1 << 20,
+        Some(Deflate {
+            server_takeover: true,
+            client_takeover: true,
+        }),
+        DEFLATE_IDLE_CHECK,
+    ));
+    (Client::new(io, true), task)
+}
+
+/// RFC 6455 §8.1: a text message is checked for UTF-8 once whole and
+/// inflated, and one that is not UTF-8 fails the connection with 1007. A
+/// character split across fragments is fine, and a binary message that is not
+/// UTF-8 is refused like any other message that is not JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_text_message_that_is_not_utf8_closes_with_1007() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = relay(dir.path());
+    let (mut client, task) = deflate_connection(&handle);
+
+    let req = "[\"REQ\",\"é\",{\"limit\":0}]".as_bytes();
+    let split = req.iter().position(|&b| b == 0xc3).unwrap() + 1;
+    client
+        .raw(false, false, frame::OP_TEXT, &req[..split])
+        .await;
+    client.raw(true, false, frame::OP_CONT, &req[split..]).await;
+    let (_, eose) = client.frame().await;
+    assert!(eose.starts_with("[\"EOSE\",\"é\""), "{eose}");
+
+    let binary = client
+        .encoder
+        .encode_message(MessageKind::Binary, b"\xff")
+        .unwrap();
+    client.io.write_all(&binary).await.unwrap();
+    let (_, notice) = client.frame().await;
+    assert!(notice.starts_with("[\"NOTICE\""), "{notice}");
+
+    let text = client
+        .encoder
+        .encode_message(MessageKind::Text, b"[\"REQ\",\"\xff\",{}]")
+        .unwrap();
+    client.io.write_all(&text).await.unwrap();
+    client.closed_with(1007).await;
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    handle.request_shutdown();
+}
+
+/// RFC 7692 §6: a control frame marked compressed fails the connection with
+/// 1002, as does any other breach of the framing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compressed_ping_closes_with_1002() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = relay(dir.path());
+    let (mut client, task) = deflate_connection(&handle);
+    client.raw(true, true, frame::OP_PING, b"").await;
+    client.closed_with(1002).await;
     tokio::time::timeout(Duration::from_secs(2), task)
         .await
         .unwrap()

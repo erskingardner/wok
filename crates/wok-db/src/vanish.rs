@@ -82,9 +82,10 @@ impl VanishPolicy {
 }
 
 /// A relay URL as NIP-42 AUTH and NIP-62 vanish requests compare it with the
-/// relay's service URL: in lowercase, without its scheme, query, fragment,
-/// trailing slashes, or the port its scheme implies. The path is kept, so
-/// relays that share a host by path do not accept each other's URLs.
+/// relay's service URL: without its scheme, query, fragment, trailing
+/// slashes, or the port its scheme implies, and with its host in lowercase.
+/// The path is kept as written, so relays that share a host by path, which
+/// proxies match case-sensitively, do not accept each other's URLs.
 pub fn normalize_relay_url(url: &str) -> String {
     let url = url.trim();
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
@@ -96,7 +97,11 @@ pub fn normalize_relay_url(url: &str) -> String {
         _ => None,
     }
     .unwrap_or(authority);
-    format!("{authority}{}", path.trim_end_matches('/')).to_ascii_lowercase()
+    format!(
+        "{}{}",
+        authority.to_ascii_lowercase(),
+        path.trim_end_matches('/')
+    )
 }
 
 fn read_timestamp(raw: &[u8]) -> Option<u64> {
@@ -438,7 +443,7 @@ mod tests {
                 "wss://host.example/relayA",
                 "wss://host.example:443/relayA/",
             ),
-            ("wss://host.example/relayA", "wss://host.example/RelayA?x=1"),
+            ("wss://host.example/relayA", "wss://HOST.example/relayA?x=1"),
             ("wss://[::1]:443/a", "wss://[::1]/a"),
         ];
         for (a, b) in same {
@@ -448,6 +453,7 @@ mod tests {
             ("wss://host.example/relayA", "wss://host.example/relayB"),
             ("wss://host.example/relayA", "wss://host.example"),
             ("wss://host.example/relayA", "wss://host.example/relayA/sub"),
+            ("wss://host.example/relayA", "wss://host.example/RelayA"),
             ("wss://host.example", "wss://host.example:8443"),
             ("wss://host.example", "wss://host.example:80"),
             ("wss://host.example", "wss://other.example"),
@@ -471,6 +477,7 @@ mod tests {
         assert!(request("wss://host.example/relayA/"));
         assert!(request("wss://host.example:443/relayA"));
         assert!(!request("wss://host.example/relayB"));
+        assert!(!request("wss://host.example/relaya"));
         assert!(!request("wss://host.example"));
         assert!(request("ALL_RELAYS"));
     }

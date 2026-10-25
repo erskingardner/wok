@@ -191,8 +191,9 @@ regression test. Differential parity alone is not a reason to retain it.
 - NIP-42: an AUTH event's `relay` tag is compared with `relay.auth.service_url`
   path included. Pinned strfry compares only the host and port, so on a host
   that serves several relays by path, each accepted an AUTH signed for
-  another. Case, the scheme, a query, trailing slashes and the port the
-  scheme implies still do not matter.
+  another. The path is compared as written, case included; the host's
+  case, the scheme, a query, trailing slashes and the port the scheme
+  implies do not matter.
 - NIP-42: while AUTH is usable, the challenge is sent when the connection
   opens, not only after a restricted request is refused. A client can then
   authenticate before its first REQ, so a restricted live subscription such

@@ -607,7 +607,9 @@ once a minute.
 adding the client's address last, or a client can reach the relay directly,
 any client can rotate fake addresses to escape the budgets or spend another
 address's. With it, a client can do so only from an address inside a
-trusted range, so the ranges must hold only your proxies. If a CDN adds
+trusted range, or through a listed proxy that passes the header on without
+appending the address it was reached from. So the ranges must hold only your
+proxies, and each of them must append. If a CDN adds
 addresses the ranges miss, its edge at such an address is taken for the
 client, and that edge's clients share one set of budgets until the ranges are
 updated. The relay warns at startup whenever the header is set, when

@@ -2556,7 +2556,8 @@ fn ingest_event(
         let identities = auth
             .get(&conn_id)
             .map_or(&[][..], |session| session.identities.as_slice());
-        let grant = WriteGrant::new(cfg, &snap, packed, identities);
+        let mut grant = WriteGrant::new(cfg, &snap, packed, identities);
+        grant.challenged = auth.contains_key(&conn_id);
         let mut id = [0u8; 32];
         id.copy_from_slice(packed.id());
         let mut pubkey = [0u8; 32];
@@ -2701,7 +2702,7 @@ fn ingest_event(
     }
 
     // The write-policy plugin is told the author's AUTH where it was required.
-    let authed = match check_author_auth(cfg, metrics, packed, &grant) {
+    let authed = match check_author_auth(cfg, metrics, packed, &grant, true) {
         Ok(required) => required.then(|| packed.pubkey().try_into().unwrap()),
         Err(message) => {
             if message.starts_with("auth-required:") {
@@ -2777,12 +2778,17 @@ fn ingest_event(
 /// move a kind into `owner_only_kinds`, while an event waits for the writer.
 /// NIP-62 vanish requests are exempt. A refused owner-only kind is counted
 /// under `owner_only_kinds` unless the event is protected, which NIP-70
-/// refuses whatever its kind.
+/// refuses whatever its kind. A refusal that AUTH could lift is
+/// `auth-required:` only when `challenge`: the caller will challenge the
+/// connection, as the ingester does, or it holds a challenge already. The
+/// writer cannot issue one, so it answers a connection without one
+/// `restricted:`, and the ingester challenges it if it sends the event again.
 fn check_author_auth(
     cfg: &Config,
     metrics: &Metrics,
     event: PackedEventView<'_>,
     grant: &WriteGrant,
+    challenge: bool,
 ) -> Result<bool, String> {
     let kind = event.kind();
     let mut protected = false;
@@ -2806,10 +2812,17 @@ fn check_author_auth(
         return Ok(true);
     } else if grant.authenticated {
         "restricted: must be published by the author".to_string()
-    } else if protected {
-        "auth-required: event marked as protected".to_string()
     } else {
-        format!("auth-required: kind {kind} is accepted only from its author")
+        let prefix = if challenge {
+            "auth-required"
+        } else {
+            "restricted"
+        };
+        if protected {
+            format!("{prefix}: event marked as protected")
+        } else {
+            format!("{prefix}: kind {kind} is accepted only from its author")
+        }
     };
     if !protected {
         metrics.refused(Setting::OwnerOnlyKinds);
@@ -4932,6 +4945,7 @@ mod tests {
                 grant: WriteGrant {
                     authenticated: false,
                     as_author: false,
+                    challenged: false,
                     member: Some(author),
                     inbox: false,
                 },
@@ -5029,6 +5043,7 @@ mod tests {
                     grant: WriteGrant {
                         authenticated: false,
                         as_author: false,
+                        challenged: false,
                         member: Some(recipient),
                         inbox: true,
                     },
@@ -5195,14 +5210,18 @@ mod tests {
         // configuration a reload changed: AUTH became unusable, or kind 7
         // became owner-only. A vanish request is honored whatever it carries.
         let author = [8u8; 32];
+        let challenged = WriteGrant {
+            challenged: true,
+            ..WriteGrant::default()
+        };
         let as_author = WriteGrant {
             authenticated: true,
             as_author: true,
-            ..WriteGrant::default()
+            ..challenged
         };
         let as_other = WriteGrant {
             authenticated: true,
-            ..WriteGrant::default()
+            ..challenged
         };
         // (AUTH usable, kind, protected, grant, refusal, owner-only refusals)
         for (auth_usable, kind, protected, grant, refusal, owner_refusals) in [
@@ -5230,8 +5249,18 @@ mod tests {
                 true,
                 7,
                 false,
-                WriteGrant::default(),
+                challenged,
                 Some("auth-required: kind 7 is accepted only from its author"),
+                1,
+            ),
+            // Opened while AUTH was unusable, so it holds no challenge to
+            // answer, and the writer cannot issue one.
+            (
+                true,
+                7,
+                false,
+                WriteGrant::default(),
+                Some("restricted: kind 7 is accepted only from its author"),
                 1,
             ),
             (

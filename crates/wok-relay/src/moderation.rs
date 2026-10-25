@@ -124,6 +124,9 @@ pub struct WriteGrant {
     /// The connection had authenticated as the event's author, which NIP-70
     /// protected events and `owner_only_kinds` require whatever the policy.
     pub as_author: bool,
+    /// The connection held a NIP-42 challenge, which a client told
+    /// `auth-required:` must answer. Only the ingester can issue one.
+    pub challenged: bool,
     pub member: Option<[u8; 32]>,
     /// The member is the recipient of one of `inbox_kinds`, which must
     /// still list the event's kind.

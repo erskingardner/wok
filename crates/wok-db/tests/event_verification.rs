@@ -171,12 +171,9 @@ fn compressed_payloads_are_verified() {
     assert_eq!(report.failures[0].reason, "bad event id");
 }
 
-#[test]
-fn workers_report_the_lowest_failures_across_runs() {
-    // More events than one run of local ids, none of them verifying: their
-    // ids hash nothing.
-    let (_tmp, env) = open();
-    let records = (0..10_000u64)
+/// `n` records that do not verify, cheaply: their ids hash nothing.
+fn unverifiable(n: u64) -> Vec<(Vec<u8>, String)> {
+    (0..n)
         .map(|n| {
             let ev = json!({
                 "id": hex::encode(wok_event::sha256(&n.to_be_bytes())),
@@ -189,8 +186,14 @@ fn workers_report_the_lowest_failures_across_runs() {
             });
             (packed(&ev), wok_event::json::to_tao_string(&ev))
         })
-        .collect();
-    let lev_ids = store(&env, records);
+        .collect()
+}
+
+#[test]
+fn workers_report_the_lowest_failures_across_runs() {
+    // More events than one run of local ids.
+    let (_tmp, env) = open();
+    let lev_ids = store(&env, unverifiable(10_000));
     for threads in [1, 4] {
         let report = verify_events(&env, threads).unwrap();
         assert_eq!(report.events, 10_000);
@@ -206,4 +209,64 @@ fn empty_database_verifies() {
     let report = verify_events(&env, 4).unwrap();
     assert_eq!((report.events, report.failed), (0, 0));
     assert!(report.ok());
+}
+
+#[test]
+fn sparse_local_ids_cost_their_events_not_the_id_space() {
+    // A source may store events at any local ids. Taking every run of 4,096
+    // ids in turn would need about 2^52 runs to reach the last of these.
+    let (_tmp, env) = open();
+    let lev_ids = [1, 2, 1 << 40, 1 << 60, u64::MAX];
+    let mut txn = env.begin_rw().unwrap();
+    for (n, lev_id) in lev_ids.into_iter().enumerate() {
+        let ev = signed(&format!("sparse {n}"), 1_700_000_000 + n as u64);
+        let mut json = ev.clone();
+        if lev_id == u64::MAX {
+            json["content"] = json!("edited");
+        }
+        txn.put_u64(env.dbis().event, lev_id, &packed(&ev), 0)
+            .unwrap();
+        let payload = wok_db::encode_raw_payload(&wok_event::json::to_tao_string(&json));
+        txn.put_u64(env.dbis().event_payload, lev_id, &payload, 0)
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    for threads in [1, 4] {
+        let report = verify_events(&env, threads).unwrap();
+        assert_eq!((report.events, report.failed), (5, 1));
+        assert_eq!(report.failures[0].lev_id, u64::MAX);
+    }
+}
+
+#[test]
+fn verification_fits_the_reader_slots_left() {
+    // Each worker holds a reader slot. With every slot but the caller's
+    // taken, the caller verifies alone.
+    let (_tmp, env) = open();
+    store(&env, unverifiable(5_000));
+    // The calling thread keeps its slot after the transaction ends.
+    drop(env.begin_ro().unwrap());
+    let max_readers = env.stats().unwrap().max_readers as usize;
+    let gate = std::sync::RwLock::new(());
+    let held = gate.write().unwrap();
+    std::thread::scope(|scope| {
+        let (began, results) = std::sync::mpsc::channel();
+        for _ in 0..max_readers {
+            let began = began.clone();
+            let (env, gate) = (&env, &gate);
+            scope.spawn(move || {
+                let txn = env.begin_ro();
+                began.send(txn.is_ok()).unwrap();
+                if txn.is_ok() {
+                    drop(gate.read().unwrap());
+                }
+            });
+        }
+        let holding = results.iter().take(max_readers).filter(|ok| *ok).count();
+        assert_eq!(holding, max_readers - 1);
+
+        let report = verify_events(&env, 8).unwrap();
+        assert_eq!((report.events, report.failed), (5_000, 5_000));
+        drop(held);
+    });
 }

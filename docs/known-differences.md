@@ -122,6 +122,23 @@ it is not a promise to reproduce upstream bugs.
   inflates past half of `relay.max_websocket_payload_size` plus 64 KiB and
   to more than 32 times its compressed size; strfry inflates any message up
   to its maximum size.
+- A WebSocket client that breaks RFC 6455 or RFC 7692 gets a Close frame
+  with the status code for the breach before the connection drops: 1002 for
+  a framing error, such as a ping, pong, close or continuation frame marked
+  compressed (RFC 7692 §6), 1007 for a text message that is not UTF-8 once
+  whole and inflated, or a compressed message that does not inflate, and
+  1009 for a message too large. The pinned strfry's uWebSockets drops the
+  connection with no Close frame, and accepts the compressed bit on control
+  and continuation frames once permessage-deflate is negotiated. A binary
+  message that is not UTF-8 is still refused with a NOTICE, like any other
+  message that is not JSON.
+- A client's Close frame is echoed only when its body is valid (RFC 6455
+  §5.5.1, §7.4). A 1-byte body, or a status code below 1000, 1004–1006,
+  1015, 1016–2999 or 5000 and above, fails the connection with 1002, and a
+  reason that is not UTF-8 with 1007. The IANA-registered 1012–1014 and all
+  of 3000–3999 are accepted. The pinned strfry's uWebSockets answers any
+  invalid Close body with an empty Close frame instead, and counts 1012–3999
+  as invalid.
 - `wok sync` classifies a peer's negative upload ACK as superseded only when
   its reason starts with `blocked: have a newer version` (Wok's reason) or
   `replaced:` (what strfry and earlier Wok releases send). A foreign peer

@@ -98,7 +98,12 @@ same ingester. Before Wok reads a message's verb:
   client negotiated permessage-deflate (`relay.compression_enabled`), inflates
   the message, up to `relay.max_websocket_payload_size`. Past half that size
   plus 64 KiB, a message may inflate to at most 32 times its compressed
-  size; one past its limit is refused before more of it is inflated. `relay.frame_read_timeout_secs` is the
+  size; one past its limit is refused before more of it is inflated. A text
+  message that is not UTF-8 once whole and inflated closes the connection
+  with 1007 before the relay sees it, and a frame or message the codec
+  refuses, such as a Close frame whose body is invalid, closes it with its
+  RFC 6455 status code (1002, 1007 or 1009) and logs why.
+  `relay.frame_read_timeout_secs` is the
   longest gap between reads while part of a frame or message is buffered,
   and `relay.message_read_timeout_secs` the longest a message or control
   frame may take from its first byte to its last; a pause while the relay
@@ -125,7 +130,7 @@ same ingester. Before Wok reads a message's verb:
 | `REQ` | anonymous | none | The connection's REQ budget, which is larger once authenticated, then the address's REQ backstop (see [rates](config.md#rates)); a connection over its own budget does not spend the backstop; subscription id; `relay.auth.read_policy`; filter count and bytes; filter parse and validation (`relay.filter_validation`); query-work estimate; AUTH when every filter asks only for restricted [read classes](config.md#read-classes); subscriptions and filter bytes per connection. Each matching event is then checked against the read classes before it is sent. |
 | `COUNT` | anonymous | `relay.max_filter_limit_count` above 0 | As `REQ`, with the COUNT budgets, and a COUNT that may count restricted kinds must name only what the connection may read. The gate is checked after the filter count and bytes. |
 | `CLOSE` | anonymous | none | A valid `CLOSE` is never budgeted; one with an invalid id spends the invalid-message budget. |
-| `NEG-OPEN` | anonymous | `relay.negentropy_enabled` | The REQ budgets, as for `REQ`; subscription id; the gate; `relay.auth.read_policy`; payload size; filter bytes (`relay.max_req_filter_size`); filter parse and validation; query-work estimate; AUTH for restricted kinds; hex decoding of the payload. The negentropy worker then checks the read policy again, sessions per connection, the connection's sessions' filter bytes (`relay.max_filter_bytes_per_connection`) and the sync memory budgets. |
+| `NEG-OPEN` | anonymous | `relay.negentropy_enabled` | The REQ budgets, as for `REQ`; subscription id; the gate; `relay.auth.read_policy`; payload size; filter bytes (`relay.max_req_filter_size`); filter parse and validation; query-work estimate, which counts index seeks and not rows, because a sync is meant to move many events, up to all the relay holds (see [Sync](config.md#sync)); AUTH for restricted kinds; hex decoding of the payload. The negentropy worker then checks the read policy again, sessions per connection, the connection's sessions' filter bytes (`relay.max_filter_bytes_per_connection`) and the sync memory budgets, reserved for the whole view before its scan. The view is at most `relay.max_sync_events`, and the connection's scans at once at most `relay.abuse.max_concurrent_historical_queries`. |
 | `NEG-MSG` | anonymous | `relay.negentropy_enabled` | The connection's NEG-MSG budget, then the address's REQ backstop; subscription id; the gate; payload size and hex decoding; the session lookup. |
 | `NEG-CLOSE` | anonymous | `relay.negentropy_enabled` | The gate first. It has no budget: the negentropy worker handles a run of them as one removal each, before the snapshot it takes for other messages. |
 
@@ -262,9 +267,12 @@ profile, each phase in a process of its own:
   admits.
 
 A phase the profile closes, such as admin without `admin.enabled`, sends
-nothing. The probe shares its process with the relay, so it signs events,
-frames Unix messages and builds its NIP-77 message without the relay's
-crates: every function counted is one the relay ran.
+nothing. Each phase hangs up its connections and waits until the relay has
+queued their teardown before it stops the relay, so a connection's teardown
+is counted in the phase that opened it. The probe shares its process with
+the relay, so it signs events, frames Unix messages and builds its NIP-77
+message without the relay's crates: every function counted is one the relay
+ran.
 
 From each run it keeps the functions of the relay crates (`wok-relay`,
 `wok-ws`, `wok-unix`, `wok-event`, `wok-query`, `wok-negentropy` and

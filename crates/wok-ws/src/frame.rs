@@ -17,6 +17,11 @@ pub const OP_CLOSE: u8 = 0x8;
 pub const OP_PING: u8 = 0x9;
 pub const OP_PONG: u8 = 0xA;
 
+/// RFC 6455 §7.4.1 status codes.
+pub const CLOSE_PROTOCOL_ERROR: u16 = 1002;
+pub const CLOSE_INVALID_DATA: u16 = 1007;
+pub const CLOSE_TOO_BIG: u16 = 1009;
+
 fn apply_mask(payload: &mut [u8], mask: [u8; 4]) {
     let mut chunks = payload.chunks_exact_mut(4);
     for chunk in &mut chunks {
@@ -33,17 +38,39 @@ fn apply_mask(payload: &mut [u8], mask: [u8; 4]) {
 #[derive(Debug)]
 pub enum WsError {
     Io(std::io::Error),
+    /// The peer closed the stream.
+    Eof,
+    /// Part of a frame or message outlived its read deadline.
+    Timeout(&'static str),
     Protocol(&'static str),
+    /// Text the peer sent is not UTF-8.
+    InvalidData(&'static str),
     MessageTooLarge,
     Inflate(String),
     Deflate(String),
+}
+
+impl WsError {
+    /// The RFC 6455 §7.4.1 status code to send in the Close frame that fails
+    /// the connection, when the peer broke the protocol and may still read.
+    pub fn close_code(&self) -> Option<u16> {
+        match self {
+            Self::Protocol(_) => Some(CLOSE_PROTOCOL_ERROR),
+            Self::InvalidData(_) | Self::Inflate(_) => Some(CLOSE_INVALID_DATA),
+            Self::MessageTooLarge => Some(CLOSE_TOO_BIG),
+            Self::Io(_) | Self::Eof | Self::Timeout(_) | Self::Deflate(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for WsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
+            Self::Eof => write!(f, "eof"),
+            Self::Timeout(e) => write!(f, "{e}"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
+            Self::InvalidData(e) => write!(f, "invalid data: {e}"),
             Self::MessageTooLarge => write!(f, "message too large"),
             Self::Inflate(e) => write!(f, "inflate: {e}"),
             Self::Deflate(e) => write!(f, "deflate: {e}"),
@@ -437,6 +464,13 @@ impl WsParser {
         if rsv1 && self.inflater.is_none() {
             return Err(WsError::Protocol("RSV1 set without negotiated extension"));
         }
+        // RFC 7692 §6: only the first frame of a data message may be marked
+        // compressed.
+        if rsv1 && (opcode == OP_CONT || opcode >= 0x8) {
+            return Err(WsError::Protocol(
+                "RSV1 set on a control or continuation frame",
+            ));
+        }
         let masked = b1 & 0x80 != 0;
         match self.role {
             Role::Server => {
@@ -510,7 +544,10 @@ impl WsParser {
         match frame.opcode {
             OP_PING => Ok(Some(WsEvent::Ping(frame.payload))),
             OP_PONG => Ok(Some(WsEvent::Pong(frame.payload))),
-            OP_CLOSE => Ok(Some(WsEvent::Close(frame.payload))),
+            OP_CLOSE => {
+                check_close(&frame.payload)?;
+                Ok(Some(WsEvent::Close(frame.payload)))
+            }
             OP_TEXT | OP_BINARY => {
                 if self.frag_opcode.is_some() {
                     return Err(WsError::Protocol("new message during fragmented message"));
@@ -575,6 +612,31 @@ impl WsParser {
             Ok(payload)
         }
     }
+}
+
+/// RFC 6455 §5.5.1: a Close frame's body is empty, or a status code followed
+/// by a UTF-8 reason. One the peer could not have sent fails the connection.
+fn check_close(payload: &[u8]) -> Result<(), WsError> {
+    match payload {
+        [] => Ok(()),
+        [_] => Err(WsError::Protocol("1-byte close body")),
+        [hi, lo, reason @ ..] => {
+            if !close_code_allowed(u16::from_be_bytes([*hi, *lo])) {
+                Err(WsError::Protocol("close status code not allowed"))
+            } else if std::str::from_utf8(reason).is_err() {
+                Err(WsError::InvalidData("close reason not UTF-8"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The status codes a Close frame may carry (RFC 6455 §7.4): those the IANA
+/// registry assigns, less 1004, which is reserved, and 1005, 1006 and 1015,
+/// which must not be sent; and 3000–4999, left to libraries and applications.
+fn close_code_allowed(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 /// How many times its compressed size a message may inflate to past
@@ -715,6 +777,11 @@ impl WsEncoder {
         self.encode_frame(true, false, opcode, payload, &mut out);
         out
     }
+
+    /// A Close frame with a status code and no reason (RFC 6455 §5.5.1).
+    pub fn encode_close(&self, code: u16) -> Vec<u8> {
+        self.encode_control(OP_CLOSE, &code.to_be_bytes())
+    }
 }
 
 /// Read events from an async stream until at least one is available.
@@ -853,13 +920,13 @@ pub async fn read_events_into<S: AsyncRead + Unpin>(
             Some((deadline, timeout)) => {
                 match tokio::time::timeout_at(deadline, stream.read_buf(&mut parser.buf)).await {
                     Ok(res) => res?,
-                    Err(_) => return Err(WsError::Protocol(timeout)),
+                    Err(_) => return Err(WsError::Timeout(timeout)),
                 }
             }
             None => stream.read_buf(&mut parser.buf).await?,
         };
         if n == 0 {
-            return Err(WsError::Protocol("eof"));
+            return Err(WsError::Eof);
         }
         parser.read_filled = n >= room;
         let completed = parser.completed;
@@ -1035,7 +1102,7 @@ mod tests {
         let start = Instant::now();
         let read = read_events_into(&mut rx, &mut parser, &mut events, &mut deadlines).await;
         assert!(
-            matches!(read, Err(WsError::Protocol("message read timeout"))),
+            matches!(read, Err(WsError::Timeout("message read timeout"))),
             "{read:?}"
         );
         assert_eq!(start.elapsed(), Duration::from_secs(9));
@@ -1096,7 +1163,7 @@ mod tests {
                 Err(e) => break e,
             }
         };
-        assert!(matches!(error, WsError::Protocol("message read timeout")));
+        assert!(matches!(error, WsError::Timeout("message read timeout")));
         assert_eq!(start.elapsed(), Duration::from_secs(9));
         writer.abort();
     }
@@ -1182,6 +1249,101 @@ mod tests {
         let mut f = Vec::new();
         WsEncoder::new(None).encode_frame(true, false, OP_TEXT, b"x", &mut f);
         assert!(c.feed(&f).is_err());
+    }
+
+    /// RFC 7692 §6: with permessage-deflate negotiated, a control frame or a
+    /// continuation frame marked compressed fails the connection with 1002.
+    #[test]
+    fn rsv1_is_refused_on_control_and_continuation_frames() {
+        let refused = |frames: &[Vec<u8>]| {
+            let mut parser = WsParser::new(1 << 20, Some(InflateCtx::new(true)));
+            let error = frames
+                .iter()
+                .find_map(|frame| parser.feed(frame).err())
+                .expect("the frames are refused");
+            assert_eq!(error.close_code(), Some(CLOSE_PROTOCOL_ERROR), "{error}");
+        };
+        for opcode in [OP_PING, OP_PONG, OP_CLOSE] {
+            refused(&[masked_frame(true, true, opcode, b"")]);
+        }
+        refused(&[
+            masked_frame(false, false, OP_TEXT, b"hel"),
+            masked_frame(true, true, OP_CONT, b"lo"),
+        ]);
+        let compressed = DeflateCtx::new(false).compress(b"hello").unwrap();
+        let (first, rest) = compressed.split_at(2);
+        refused(&[
+            masked_frame(false, true, OP_TEXT, first),
+            masked_frame(true, true, OP_CONT, rest),
+        ]);
+    }
+
+    /// RFC 6455 §5.5.1, §7.4: a Close body that is one byte, or whose status
+    /// code may not be sent, fails the connection with 1002, and one whose
+    /// reason is not UTF-8 with 1007. The rest are passed on to be echoed.
+    #[test]
+    fn a_close_body_is_checked() {
+        let close = |body: &[u8]| {
+            let mut parser = WsParser::new(1 << 20, None);
+            parser
+                .feed(&masked_frame(true, false, OP_CLOSE, body))
+                .map(|mut events| match events.pop() {
+                    Some(WsEvent::Close(echo)) => echo,
+                    other => panic!("{other:?}"),
+                })
+                .map_err(|e| e.close_code().unwrap())
+        };
+        let with = |code: u16, reason: &[u8]| [&code.to_be_bytes()[..], reason].concat();
+        assert_eq!(close(b""), Ok(Vec::new()));
+        for code in [
+            1000, 1001, 1002, 1003, 1007, 1011, 1012, 1014, 3000, 3999, 4000, 4999,
+        ] {
+            assert_eq!(close(&with(code, b"")), Ok(with(code, b"")), "{code}");
+        }
+        assert_eq!(
+            close(&with(1000, "bye é".as_bytes())),
+            Ok(with(1000, "bye é".as_bytes()))
+        );
+        assert_eq!(close(b"\x03"), Err(CLOSE_PROTOCOL_ERROR));
+        for code in [0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, u16::MAX] {
+            assert_eq!(close(&with(code, b"")), Err(CLOSE_PROTOCOL_ERROR), "{code}");
+        }
+        assert_eq!(close(&with(1000, b"\xff")), Err(CLOSE_INVALID_DATA));
+        // A character cut short at the end of the frame.
+        assert_eq!(
+            close(&with(1000, &"é".as_bytes()[..1])),
+            Err(CLOSE_INVALID_DATA)
+        );
+    }
+
+    /// A compressed message marks only its first frame, and is inflated once
+    /// whole.
+    #[test]
+    fn a_compressed_message_may_be_fragmented() {
+        let mut parser = WsParser::new(1 << 20, Some(InflateCtx::new(true)));
+        let compressed = DeflateCtx::new(false).compress(b"hello").unwrap();
+        let (first, rest) = compressed.split_at(2);
+        assert!(parser
+            .feed(&masked_frame(false, true, OP_TEXT, first))
+            .unwrap()
+            .is_empty());
+        let events = parser
+            .feed(&masked_frame(true, false, OP_CONT, rest))
+            .unwrap();
+        assert!(matches!(
+            &events[..],
+            [WsEvent::Message(MessageKind::Text, p)] if p == b"hello"
+        ));
+    }
+
+    #[test]
+    fn only_protocol_breaches_have_a_close_code() {
+        assert_eq!(WsError::Protocol("x").close_code(), Some(1002));
+        assert_eq!(WsError::InvalidData("x").close_code(), Some(1007));
+        assert_eq!(WsError::Inflate("x".into()).close_code(), Some(1007));
+        assert_eq!(WsError::MessageTooLarge.close_code(), Some(1009));
+        assert_eq!(WsError::Eof.close_code(), None);
+        assert_eq!(WsError::Timeout("frame read timeout").close_code(), None);
     }
 
     #[test]

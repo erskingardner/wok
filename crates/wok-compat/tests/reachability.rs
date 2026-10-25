@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -34,7 +35,7 @@ async fn reach_startup() {
     let (_, cfg) = profile();
     let relay = Relay::start(cfg.clone()).await;
     let _unix = unix_listener(&relay, &cfg, my_uid()).await;
-    relay.stop().await;
+    stop(relay).await;
 }
 
 /// Everything a client that never authenticates can send.
@@ -45,6 +46,7 @@ async fn reach_anonymous() {
     let relay = Relay::start(cfg.clone()).await;
     let mut conn = Conn::Ws(Box::new(Wire::connect(relay.addr).await));
     anonymous_messages(&mut conn, &cfg).await;
+    conn.close().await;
     deflated_messages(&relay).await;
     anonymous_http(&relay, &cfg).await;
     // A local peer the Unix socket does not admit.
@@ -54,7 +56,7 @@ async fn reach_anonymous() {
         let mut rest = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
     }
-    relay.stop().await;
+    stop(relay).await;
 }
 
 /// A client that authenticates, then sends what AUTH unlocks.
@@ -112,8 +114,8 @@ async fn reach_authenticated() {
     wire.send(json!(["NEG-OPEN", "neg", {"kinds": [1], "authors": [me]}, NEG_INITIAL]))
         .await;
     until_end(&mut wire, "neg").await;
-    drop(wire);
-    relay.stop().await;
+    wire.close().await;
+    stop(relay).await;
 }
 
 /// An admin of the `gated` profile, using the dashboard API and NIP-86.
@@ -196,7 +198,7 @@ async fn reach_admin() {
             "{method}: {status} {reply}"
         );
     }
-    relay.stop().await;
+    stop(relay).await;
 }
 
 /// A local peer the Unix socket admits, sending what an anonymous client
@@ -210,8 +212,9 @@ async fn reach_local() {
         let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         let mut conn = Conn::Unix(stream, Vec::new());
         anonymous_messages(&mut conn, &cfg).await;
+        conn.close().await;
     }
-    relay.stop().await;
+    stop(relay).await;
 }
 
 /// Every client message, valid and not, from a connection that never
@@ -510,6 +513,21 @@ impl Conn {
         }
     }
 
+    /// Hang up, and read until the relay closes the connection too.
+    async fn close(self) {
+        match self {
+            Self::Ws(wire) => wire.close().await,
+            Self::Unix(mut stream, _) => {
+                stream.shutdown().await.unwrap();
+                let mut rest = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+                    .await
+                    .expect("the relay closes a connection whose client closed")
+                    .unwrap();
+            }
+        }
+    }
+
     /// The NIP-42 challenge the relay sent on connect.
     async fn challenge(&mut self) -> String {
         let seen = match self {
@@ -558,6 +576,23 @@ async fn unix_listener(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("the Unix socket was not bound within 5 s");
+}
+
+/// Stop the relay once every connection the phase opened has queued its
+/// teardown, so the teardown runs in this phase on every run. A connection
+/// still open when the relay stops is closed by the stop itself, and its
+/// `Close` races the ingester's `Stop`: the workers drain their queues before
+/// they exit, but get the connection's `Close` only if it reached the
+/// ingester first. The gauge drops once `Close` is queued.
+async fn stop(relay: Relay) {
+    let metrics = relay.handle.metrics.clone();
+    for _ in 0..500 {
+        if metrics.active_connections.load(Ordering::Relaxed) == 0 {
+            return relay.stop().await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the relay still holds a connection 5 s after the probe closed its last");
 }
 
 /// The probe's own user ID, read from a file it creates.

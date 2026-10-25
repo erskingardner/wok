@@ -993,6 +993,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `database.min_free_disk_bytes` get `error: disk reserve requires N free
   bytes` instead of `blocked:`. A low disk is the relay's own failure, not a
   policy decision about the event or its author.
+- A WebSocket text message that is not UTF-8, checked once the message is
+  whole and inflated, closes the connection with status 1007, as RFC 6455
+  §8.1 requires (#53). Before, the relay read it as the message `x` and
+  answered with a NOTICE. A ping, pong, close or continuation frame marked
+  compressed (RSV1) closes it with 1002, as RFC 7692 §6 requires; before, a
+  compressed ping got a pong. Every frame or message the codec refuses now
+  gets a Close frame with its status code before the connection drops: 1002
+  for a framing error, 1007 for a compressed message that does not inflate
+  and 1009 for one too large. Before, the connection dropped with no Close
+  frame, as a read timeout still does.
+- A client's WebSocket Close frame is checked before the relay echoes it, as
+  RFC 6455 §5.5.1 and §7.4 require. A 1-byte body or a status code that may
+  not be sent, such as 1005 or 1016, closes the connection with 1002, and a
+  reason that is not UTF-8 with 1007. Before, any body was echoed as sent.
+  Each connection failed for breaking the protocol is now logged as `client
+  terminated` with the `reason` and `close_code`, as a pong timeout is.
 
 ## [0.7.0] - 2026-09-08
 

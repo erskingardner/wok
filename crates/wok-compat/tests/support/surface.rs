@@ -220,6 +220,17 @@ impl Wire {
         }
     }
 
+    /// Send a close frame and read until the relay closes the connection, so
+    /// it sees the close rather than a reset over frames left unread.
+    pub async fn close(mut self) {
+        self.ws.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(_)) = self.ws.next().await {}
+        })
+        .await
+        .expect("the relay closes a connection whose client closed");
+    }
+
     /// The NIP-42 challenge the relay sent on connect.
     pub async fn challenge(&mut self) -> String {
         let is_challenge = |frame: &Value| frame[0] == "AUTH";

@@ -581,6 +581,19 @@ const DEFLATE_IDLE_CHECK: Duration = Duration::from_secs(30);
 /// coalescing never delays the first frame of a response.
 const COALESCE_BYTES: usize = 16 * 1024;
 
+/// How long the Close frame that fails a connection may take to write. The
+/// client broke the protocol, so a full send buffer is not waited out.
+const FAIL_CLOSE_WRITE: Duration = Duration::from_secs(1);
+
+/// Fail the connection (RFC 6455 §7.1.7): send its `close` frame, as far as
+/// it goes, before the stream is dropped.
+async fn send_close<W>(wr: &mut W, close: Vec<u8>)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let _ = tokio::time::timeout(FAIL_CLOSE_WRITE, write_bytes(wr, &close)).await;
+}
+
 fn nip_description(nip: u64) -> Option<&'static str> {
     match nip {
         1 => Some("Defines the core event format, filters, and client-relay message flow."),
@@ -1062,9 +1075,23 @@ async fn handle_ws<S>(
                         Ok(()) => {
                             for ev in incoming_events.drain(..) {
                                 match ev {
-                                    WsEvent::Message(_, bytes) => {
+                                    WsEvent::Message(kind, bytes) => {
                                         let wire_len = bytes.len();
-                                        let text = String::from_utf8(bytes).unwrap_or_else(|_| "x".into());
+                                        let text = match String::from_utf8(bytes) {
+                                            Ok(text) => text,
+                                            // RFC 6455 §8.1, checked once the
+                                            // message is whole and inflated.
+                                            Err(_) if kind == MessageKind::Text => {
+                                                connection.hand_over_rest(&mut held).await;
+                                                tracing::info!(conn_id, peer = %peer, reason = "text message not UTF-8", close_code = frame::CLOSE_INVALID_DATA, "client terminated");
+                                                send_close(&mut wr, encoder.encode_close(frame::CLOSE_INVALID_DATA)).await;
+                                                break 'outer;
+                                            }
+                                            // A binary message that is not
+                                            // UTF-8 is not JSON either: this
+                                            // stand-in gets the relay's NOTICE.
+                                            Err(_) => "x".into(),
+                                        };
                                         if !connection.receive(&mut held, text, wire_len).await {
                                             tracing::info!(conn_id, peer = %peer, reason = "ingress_paused_overflow", "client terminated");
                                             break 'outer;
@@ -1084,14 +1111,20 @@ async fn handle_ws<S>(
                                         // pause is dropped, as the close drops
                                         // the parked work ahead of it.
                                         connection.hand_over_rest(&mut held).await;
+                                        // Echoed as sent: the parser has
+                                        // checked its body.
                                         let _ = write_bytes(&mut wr, &encoder.encode_control(frame::OP_CLOSE, &c)).await;
                                         break 'outer;
                                     }
                                 }
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
                             connection.hand_over_rest(&mut held).await;
+                            if let Some(code) = e.close_code() {
+                                tracing::info!(conn_id, peer = %peer, reason = %e, close_code = code, "client terminated");
+                                send_close(&mut wr, encoder.encode_close(code)).await;
+                            }
                             break;
                         }
                     }

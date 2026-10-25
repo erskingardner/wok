@@ -55,6 +55,9 @@ it is not a promise to reproduce upstream bugs.
   strfry cannot parse. When the value names no address both fall back to the
   connecting address; strfry logs every such request, and Wok counts them in
   `wok_real_ip_header_unparsed_total` and warns at most once a minute.
+  strfry trusts the header from any connection; Wok's
+  `relay.trusted_proxies` limits it to the listed proxies and skips their
+  addresses, for a chain of proxies.
 
 - Latest-only replaceable reads are enforced independently of physical
   cleanup. Retained source versions cannot reappear through historical REQ,

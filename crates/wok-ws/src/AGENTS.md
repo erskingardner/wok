@@ -3,7 +3,7 @@
 | File | Role |
 | --- | --- |
 | `lib.rs` | TCP listener, HTTP dispatch (relay on `/` only), WS upgrade, NIP-11, landing HTML |
-| `forwarded.rs` | The client address in `relay.real_ip_header`: an address list's last entry, or RFC 7239 `Forwarded`'s last `for` (`pub mod forwarded`, for the fuzz target) |
+| `forwarded.rs` | The client address in `relay.real_ip_header`: an address list's last entry, or RFC 7239 `Forwarded`'s last `for`, skipping `relay.trusted_proxies` from the end (`pub mod forwarded`, for the fuzz target) |
 | `frame.rs` | RFC 6455 frames + RFC 7692 inflate/deflate (`pub mod frame`) |
 | `admin.rs` | `/admin` UI and `/admin/api/*` (NIP-98-style signed auth) |
 | `nip86.rs` | NIP-86 management RPC on `POST /` (shares admin NIP-98 auth) |

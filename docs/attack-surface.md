@@ -56,9 +56,13 @@ Every request on the listener passes these steps before Wok looks at its path:
    wrote. An entry may carry a port. In `Forwarded`, read as RFC 7239, it
    is the last element's `for`, and that element is found from the right,
    so nothing a client sends ahead of it, an unterminated quoted string
-   included, moves it. A last entry that names no IP address leaves the
-   connecting address and is counted in `wok_real_ip_header_unparsed_total`;
-   no header leaves it too.
+   included, moves it. With `relay.trusted_proxies` set, a connection from
+   outside its ranges keeps its own address and its header is not read; on
+   one from inside them, Wok skips each entry inside them from the end and
+   the first address outside them is the client's, or the first entry when
+   all are inside. An entry where the client's should be that names no IP
+   address leaves the connecting address and is counted in
+   `wok_real_ip_header_unparsed_total`; no header leaves it too.
 3. An address blocked with NIP-86 `blockip` gets 429, and so does one whose
    per-address connection budget (`relay.abuse.connection_*`) is spent.
 

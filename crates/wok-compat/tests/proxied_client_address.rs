@@ -6,7 +6,9 @@
 //! not an address leaves the connecting address, and is counted. The cap on
 //! the connections an address holds open counts the client's address too.
 //! An RFC 7239 `Forwarded` header names the client in its last element's
-//! `for`.
+//! `for`. Behind more than one proxy, `relay.trusted_proxies` skips the
+//! proxies' own addresses, and a connection from elsewhere is its own
+//! address.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -181,6 +183,64 @@ async fn an_obfuscated_forwarded_client_leaves_the_connecting_address_and_is_cou
     let metrics = handle.metrics.render();
     assert!(
         metrics.contains("\nwok_real_ip_header_unparsed_total 1\n"),
+        "{metrics}"
+    );
+}
+
+/// A CDN, then the local proxy in front of Wok, both trusted: the local
+/// proxy appends the CDN edge's address, and the client is the address the
+/// CDN wrote, whatever the client sent ahead of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn behind_trusted_proxies_the_client_is_the_address_the_first_one_wrote() {
+    let (_dir, handle, addr) = start().await;
+    handle.config.write().relay.trusted_proxies = vec![
+        "127.0.0.1".parse().unwrap(),
+        "192.0.2.0/24".parse().unwrap(),
+    ];
+    let edge = "192.0.2.10";
+    for lines in [
+        vec![format!("{BLOCKED}, {edge}")],
+        vec![format!("{CLAIMED}, {BLOCKED}, {edge}")],
+        vec![format!("{CLAIMED}, {BLOCKED}"), edge.to_string()],
+        // Claiming to be the CDN does not help.
+        vec![format!("192.0.2.11, {BLOCKED}, {edge}")],
+    ] {
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(
+            upgrade_status(addr, &lines).await,
+            429,
+            "a blocked client behind the CDN: {lines:?} must be refused"
+        );
+    }
+    // Another client of the same CDN edge is not.
+    assert_eq!(
+        upgrade_status(addr, &[&format!("198.51.100.10, {edge}")]).await,
+        101
+    );
+}
+
+/// A connection from outside `relay.trusted_proxies` is its own address: a
+/// blocked client that reaches Wok directly cannot claim another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_from_outside_the_trusted_proxies_is_its_own_address() {
+    let (_dir, handle, addr) = start().await;
+    handle.config.write().relay.trusted_proxies = vec!["192.0.2.0/24".parse().unwrap()];
+    // The test connects from 127.0.0.1, which is not a trusted proxy.
+    handle
+        .manage(ManagementCmd::BlockIp {
+            ip: "127.0.0.1".into(),
+            reason: "abuse".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(upgrade_status(addr, &[CLAIMED]).await, 429);
+    assert_eq!(
+        upgrade_status(addr, &[&format!("{CLAIMED}, 192.0.2.10")]).await,
+        429
+    );
+    let metrics = handle.metrics.render();
+    assert!(
+        metrics.contains("\nwok_real_ip_header_unparsed_total 0\n"),
         "{metrics}"
     );
 }

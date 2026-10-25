@@ -489,10 +489,13 @@ pub(super) const SECTIONS: &[Section] = &[
             ),
             field(
                 "Client address header",
-                "The header in which a reverse proxy passes each client's address, such as X-Forwarded-For. Wok reads its last entry, the one the proxy wrote, with or without a port; in Forwarded (RFC 7239), the last element's for. When that entry names no address, the connecting address stands in, and wok_real_ip_header_unparsed_total counts the request. Empty: each client is the address that connected. Set in wok.toml, because every per-address budget trusts it.",
-                "Left empty behind a proxy, every client has the proxy's address and shares one set of budgets.",
-                "Set while clients can reach the relay directly, a client can send any address, to escape its budgets or spend another's.",
-                &[Input::new("file", "real_ip_header", "relay.real_ip_header", Unit::Text).file_only()],
+                "The header in which a reverse proxy passes each client's address, such as X-Forwarded-For, and the trusted proxies. Wok reads the header's last entry, the one the proxy wrote, with or without a port; in Forwarded (RFC 7239), the last element's for. With trusted proxies, only their connections may set it, and Wok skips their own addresses from the header's end, for a CDN in front of the proxy. When the entry it reaches names no address, the connecting address stands in, and wok_real_ip_header_unparsed_total counts the request. Empty: each client is the address that connected. Set in wok.toml, because every per-address budget trusts them.",
+                "Left empty behind a proxy, every client has the proxy's address and shares one set of budgets. Behind two proxies without the first one trusted, every client of it shares one.",
+                "Set while clients can reach the relay directly and no trusted proxies are listed, a client can send any address, to escape its budgets or spend another's. A trusted range that holds clients lets them do the same.",
+                &[
+                    Input::new("file", "real_ip_header", "relay.real_ip_header", Unit::Text).file_only(),
+                    Input::new("file", "trusted_proxies", "relay.trusted_proxies", Unit::Text).file_only(),
+                ],
             ),
         ],
     },

@@ -21,11 +21,13 @@ preset = "public"
 # port = 7777
 
 # The header in which the proxy passes the client's address. Wok reads its
-# last entry, which the proxy writes; "forwarded" is read as RFC 7239. Set it
-# only if every connection comes through that proxy: a client that reaches
-# the relay directly could send a new address each time and escape every
-# per-address rate limit.
+# last entry, which the proxy writes; "forwarded" is read as RFC 7239. List
+# the proxies in trusted_proxies so that any other connection is its own
+# address. Without them, set the header only if every connection comes
+# through the proxy: a client that reaches the relay directly could send a
+# new address each time and escape every per-address rate limit.
 # real_ip_header = "x-real-ip"
+# trusted_proxies = ["127.0.0.1", "::1"]
 
 [relay.auth]
 # The relay's public URL, exactly as clients open it: NIP-42 AUTH events must

@@ -262,16 +262,18 @@ async fn dispatch(
 ) -> Response<Full<Bytes>> {
     // Honor relay.real_ip_header for reverse-proxied deployments. C++ strfry
     // reads the whole value as one address; Wok reads the last entry, the
-    // one the proxy wrote, and reads `Forwarded` as RFC 7239.
+    // one the proxy wrote, or the last one outside relay.trusted_proxies,
+    // and reads `Forwarded` as RFC 7239.
     let peer = {
         let cfg = handle.config.read();
         let header = cfg.relay.real_ip_header.as_str();
         if header.is_empty() {
             peer
         } else {
-            match forwarded::client(req.headers(), header) {
+            let trusted = &cfg.relay.trusted_proxies;
+            match forwarded::client(req.headers(), header, peer.ip(), trusted) {
                 Forwarded::Client(ip) => SocketAddr::new(ip, 0),
-                Forwarded::Absent => peer,
+                Forwarded::Absent | Forwarded::Untrusted => peer,
                 Forwarded::Unparsed(entry) => {
                     handle
                         .metrics
@@ -282,10 +284,11 @@ async fn dispatch(
                         tracing::warn!(
                             header,
                             entry = ?entry,
-                            "relay.real_ip_header ends in an entry that names no IP \
-                             address, so the connecting address stands in for the client's; \
-                             check that the proxy writes the client's address last (warned \
-                             at most once a minute, counted by \
+                            "relay.real_ip_header names no IP address where the client's \
+                             should be, its last entry or the last one outside \
+                             relay.trusted_proxies, so the connecting address stands in for \
+                             the client's; check that each proxy appends the address it was \
+                             reached from (warned at most once a minute, counted by \
                              wok_real_ip_header_unparsed_total)"
                         );
                     }

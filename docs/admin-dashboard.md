@@ -83,8 +83,9 @@ low and too high. Sizes take B, KiB, MiB or GiB, and durations seconds to
 years. A limit that zero turns off has an **Off** switch. A token bucket
 shows its rate per second and its burst together. A few values set only in
 the file are shown with their running value and marked `wok.toml`: the
-client address header (`relay.real_ip_header`), which every per-address
-budget trusts, and three restart-only values, the largest WebSocket message,
+client address header (`relay.real_ip_header`) and the trusted proxies
+(`relay.trusted_proxies`), which every per-address budget trusts, and three
+restart-only values, the largest WebSocket message,
 the disk reserve and the database size limit.
 When writes are disabled, values remain visible but inputs and the save
 button are disabled.

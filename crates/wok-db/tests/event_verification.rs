@@ -102,7 +102,7 @@ fn crafted_records_pass_integrity_but_not_verification() {
     edited_json["content"] = json!("edited later");
     let kind = signed("kind", 1_700_000_004);
     // Records whose indexes put the payload where it does not belong: under
-    // kind 7, another recipient, another address, another expiry.
+    // kind 7, another recipient, another address, another expiry or none.
     let recipient = [0x22; 32];
     let dm = signed_with(
         4,
@@ -112,6 +112,22 @@ fn crafted_records_pass_integrity_but_not_verification() {
     );
     let article = signed_with(30023, json!([["d", "post"]]), "article", 1_700_000_007);
     let kept = signed_with(1, json!([]), "kept", 1_700_000_008);
+    let expiring = signed_with(
+        1,
+        json!([["expiration", "1700000100"]]),
+        "expiring",
+        1_700_000_009,
+    );
+    let other_recipient = [0x44; 32];
+    let group_dm = signed_with(
+        4,
+        json!([
+            ["p", hex::encode(recipient)],
+            ["p", hex::encode(other_recipient)]
+        ]),
+        "group dm",
+        1_700_000_010,
+    );
     let tao = wok_event::json::to_tao_string;
     let lev_ids = store(
         &env,
@@ -128,6 +144,16 @@ fn crafted_records_pass_integrity_but_not_verification() {
                 tao(&article),
             ),
             (forged(&kept, 1, 1_700_000_100, &[]), tao(&kept)),
+            (forged(&expiring, 1, 0, &[]), tao(&expiring)),
+            (
+                forged(
+                    &group_dm,
+                    4,
+                    0,
+                    &[('p', &other_recipient), ('p', &recipient)],
+                ),
+                tao(&group_dm),
+            ),
         ],
     );
 
@@ -136,8 +162,8 @@ fn crafted_records_pass_integrity_but_not_verification() {
 
     for threads in [1, 3] {
         let report = verify_events(&env, threads).unwrap();
-        assert_eq!(report.events, 8);
-        assert_eq!(report.failed, 7);
+        assert_eq!(report.events, 10);
+        assert_eq!(report.failed, 9);
         assert!(!report.ok());
         let failures: Vec<_> = report
             .failures
@@ -145,6 +171,11 @@ fn crafted_records_pass_integrity_but_not_verification() {
             .map(|failure| (failure.lev_id, failure.reason.as_str()))
             .collect();
         let forged_p = format!("packed p tag {} is not in the payload", "33".repeat(32));
+        let swapped_p = format!(
+            "packed recipient {} differs from the payload's {}",
+            "44".repeat(32),
+            "22".repeat(32)
+        );
         let mut expected = vec![
             (lev_ids[1], "payload id differs from the packed record"),
             (lev_ids[2], "bad signature"),
@@ -157,8 +188,13 @@ fn crafted_records_pass_integrity_but_not_verification() {
             ),
             (
                 lev_ids[7],
-                "packed expiration 1700000100 differs from the payload's none",
+                "packed expiration 1700000100 differs from the 0 strfry packs from the payload",
             ),
+            (
+                lev_ids[8],
+                "packed expiration 0 differs from the 1700000100 strfry packs from the payload",
+            ),
+            (lev_ids[9], swapped_p.as_str()),
         ];
         expected.sort();
         assert_eq!(failures, expected);

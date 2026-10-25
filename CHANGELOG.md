@@ -16,17 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recipient-only read, replacement, deletion and expiry uses, must index
   nothing the payload does not carry: each packed tag is one of the
   payload's (or the empty `d` strfry adds), a replaceable or addressable
-  event keeps the payload's address, and the expiration is 0, 1 for an
-  ephemeral kind, or the payload's own. Integrity checked only that the
-  indexes match the packed records, so a strfry database written by
-  `strfry import --no-verify` or `--fried`, or edited by hand, could
-  migrate an event the relay then served for queries it does not match,
-  filed under a recipient, address, deletion target or expiry its author
-  did not sign, or not signed at all. A source holding such an event is
-  refused, and up to 100 of them are named by local ID, id and reason;
-  `--check` reports the same. Verification spreads over every core, or half
-  of them for `--check`, which may run beside strfry: a million events took
-  about 4 s on a 14-core Apple M4 Max.
+  event keeps the payload's address, the first recipient is the payload's,
+  and the expiration is the one strfry writes. Integrity checked only that
+  the indexes match the packed records, so a strfry database written by
+  `strfry import --no-verify` or `--fried`, or edited by hand, could migrate
+  an event the relay then served for queries it does not match, filed under
+  a recipient, address, deletion target or expiry its author did not sign,
+  or not signed at all. A source holding such an event is refused, and up to
+  100 of them are named by local ID, id and reason; `--check` reports the
+  same. Verification spreads over every core, or half of them for `--check`,
+  which may run beside strfry: a million events took about 4 s on a 14-core
+  Apple M4 Max.
 - A file that gives a kind more readers than its preset does is warned about
   when the relay starts, and by `wok doctor` in a new `read-classes` check
   (#163). `relay.auth.recipient_only_kinds = []`, `owner_only_kinds = []` or

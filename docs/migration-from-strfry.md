@@ -91,8 +91,10 @@ from the payload as strfry's database version 3 packs them:
   empty for a replaceable kind, and for an addressable kind the payload's
   first `d`, or empty when it has none. strfry skipped a `d` longer than 255
   bytes, so for one the next `d`, or empty, is accepted as well as its hash.
-- The packed expiration is 0, 1 for an ephemeral kind, or the payload's first
-  `expiration` tag.
+- The first packed `p` of 32 bytes, the only one recipient-only reads admit,
+  is the payload's first `p` that decodes to 32 bytes, or neither has one.
+- The packed expiration is the one strfry writes: 1 for an ephemeral kind,
+  otherwise the payload's first `expiration` tag, or 0 when it has none.
 
 Migration then checks the event's id and signature, accepting either id
 preimage a stored event may use (NIP-01, or the one strfry hashed for events

@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the Unix socket's mode lets every local user connect, as `0o666` does,
   and `relay.unix.auth_uids` and `auth_gids` are both empty (#167). Unix
   connections skip the connection, per-address and per-connection budgets,
-  so such a socket gives each local user a channel only the per-author
-  EVENT budget limits, which fresh keys evade. docs/production-deployment.md now says
+  so such a socket gives each local user a channel that only proof of work,
+  the storage quotas and the per-author EVENT budget limit, and an
+  unauthenticated connection starts that budget afresh with each new key. docs/production-deployment.md now says
   what a write-policy plugin's request carries: `authed` is present only for
   NIP-70 protected events and owner-only kinds, so a plugin cannot use it to
   tell who is logged in, and `sourceType: "unix"` names the transport, not a

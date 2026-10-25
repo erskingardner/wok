@@ -1763,9 +1763,10 @@ impl Config {
     /// lets others write to it, and neither `auth_uids` nor `auth_gids`
     /// limits who connects. Unix connections skip the connection,
     /// per-address and per-connection budgets, so each local user gets a
-    /// channel only the per-author EVENT budget limits, which fresh keys
-    /// evade. The settings are restart-only; the relay logs this at startup
-    /// and `wok doctor` reports it.
+    /// channel that only proof of work, the storage quotas and the
+    /// per-author EVENT budget limit, which an unauthenticated connection
+    /// starts afresh with each new key. The settings are restart-only; the
+    /// relay logs this at startup and `wok doctor` reports it.
     pub fn unix_socket_warning(&self) -> Option<String> {
         let unix = &self.relay.unix;
         if !unix.enabled

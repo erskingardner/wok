@@ -11,6 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::CString;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::ptr;
 use std::sync::{Mutex, PoisonError};
@@ -194,18 +195,25 @@ pub fn verify_events(env: &Env, threads: usize) -> Result<EventVerificationRepor
     let spare = stats.max_readers.saturating_sub(stats.readers) as usize;
     let spawned = threads.saturating_sub(1).min(spare);
     let reports = std::thread::scope(|scope| {
+        // A worker the OS cannot start leaves its runs to the others, and
+        // the ones already started are still joined below.
         let workers: Vec<_> = (0..spawned)
-            .map(|_| scope.spawn(|| verify_runs(env, &runs)))
-            .collect();
-        let mine = verify_runs(env, &runs);
-        workers
-            .into_iter()
-            .map(|worker| {
-                worker
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .map_while(|_| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, || verify_runs(env, &runs))
+                    .ok()
             })
+            .collect();
+        let mine = std::panic::catch_unwind(AssertUnwindSafe(|| verify_runs(env, &runs)));
+        // Join every worker before any result can return. A scope waits only
+        // for a worker's closure: LMDB frees its reader slot later, as the
+        // thread exits, and would write to the environment's lock file
+        // after the caller had closed it.
+        let joined: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+        joined
+            .into_iter()
             .chain([mine])
+            .map(|report| report.unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
             .collect::<Result<Vec<_>, _>>()
     })?;
     let mut total = EventVerificationReport::default();

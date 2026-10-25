@@ -14,7 +14,7 @@ mod preset;
 mod provenance;
 
 pub use edit::{write_file, Minimized};
-pub use history::StaleDefault;
+pub use history::{PublicValue, StaleDefault};
 pub use preset::Preset;
 pub use provenance::{ConfigEntry, ConfigExplanation, Origin};
 

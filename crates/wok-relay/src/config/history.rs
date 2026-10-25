@@ -1,7 +1,9 @@
 //! Built-in defaults that later releases replaced, and the keys of an
-//! operator's file still pinned to one.
+//! operator's file still pinned to one, or to a built-in default its preset
+//! replaces.
 
-use super::provenance::{ConfigEntry, ConfigExplanation, Origin};
+use super::provenance::{leaf, ConfigEntry, ConfigExplanation, Origin};
+use super::{encode, Config, Preset};
 
 /// Built-in defaults a later release replaced, oldest first: the dotted key,
 /// the old value encoded as TOML, and the last release whose default it was.
@@ -52,11 +54,56 @@ pub struct StaleDefault {
     pub line: Option<usize>,
 }
 
+/// A key the operator's file pins to the public preset's value, the built-in
+/// default, where the file's own preset gives another. A file written for
+/// the public preset, such as a copy of the 0.7 sample that listed every
+/// default, keeps these when it selects another preset, so the relay does
+/// not get that preset's values. None is a past default, so
+/// [`ConfigExplanation::stale_defaults`] does not list them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicValue {
+    /// Dotted key path, such as `events.max_event_size`.
+    pub key: String,
+    /// The pinned value, encoded as TOML: the public preset's.
+    pub value: String,
+    /// The value the file's preset gives.
+    pub preset_value: String,
+    /// The 1-based line of the key in the file, when it could be located.
+    pub line: Option<usize>,
+}
+
 impl ConfigExplanation {
     /// The keys the file pins to a past built-in default that the preset no
     /// longer uses, in key order.
     pub fn stale_defaults(&self) -> Vec<StaleDefault> {
         self.entries.iter().filter_map(stale_default).collect()
+    }
+
+    /// The keys the file pins to the public preset's value that its own
+    /// preset replaces, in key order. Empty under the public preset.
+    pub fn public_values(&self) -> Vec<PublicValue> {
+        if self.config.preset == Preset::Public {
+            return Vec::new();
+        }
+        let Ok(public) = encode(&Config::default()) else {
+            return Vec::new();
+        };
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let Origin::File { line } = entry.origin else {
+                    return None;
+                };
+                let preset_value = entry.preset_value.clone()?;
+                let path: Vec<&str> = entry.key.split('.').collect();
+                (leaf(&public, &path)?.to_string() == entry.value).then(|| PublicValue {
+                    key: entry.key.clone(),
+                    value: entry.value.clone(),
+                    preset_value,
+                    line,
+                })
+            })
+            .collect()
     }
 
     /// The keys the file sets to the value its preset already gives. They
@@ -165,5 +212,59 @@ mod tests {
             .map(|entry| entry.key.as_str())
             .collect();
         assert_eq!(repeated, ["events.max_num_tags"]);
+    }
+
+    #[test]
+    fn a_0_7_0_sample_moved_to_marmot_names_the_public_values_it_keeps() {
+        let explained =
+            Config::explain_toml(&format!("preset = \"marmot\"\n{SAMPLE_0_7_0}")).unwrap();
+        let kept = |key: &str, value: &str, preset_value: &str, line| PublicValue {
+            key: key.into(),
+            value: value.into(),
+            preset_value: preset_value.into(),
+            line: Some(line),
+        };
+        assert_eq!(
+            explained.public_values(),
+            [
+                kept("events.max_event_size", "1048576", "4194304", 27),
+                kept("relay.abuse.event_burst", "100", "300", 139),
+                kept("relay.compression_enabled", "true", "false", 81),
+                kept("relay.max_filter_limit_count", "1000000", "0", 73),
+                kept("relay.max_websocket_payload_size", "2097152", "8388608", 53),
+                kept("relay.unix.max_frame_bytes", "2097152", "8388608", 163),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_override_of_a_0_7_0_sample_is_named_under_each_preset() {
+        for &preset in Preset::ALL {
+            let explained =
+                Config::explain_toml(&format!("preset = \"{preset}\"\n{SAMPLE_0_7_0}")).unwrap();
+            let stale = explained.stale_defaults();
+            let kept = explained.public_values();
+            for entry in explained.entries.iter().filter(|entry| entry.is_override()) {
+                let named = stale.iter().filter(|stale| stale.key == entry.key).count()
+                    + kept.iter().filter(|kept| kept.key == entry.key).count();
+                assert_eq!(
+                    named, 1,
+                    "preset {preset}: {} = {} keeps the file from the preset's {:?}; \
+                     stale_defaults or public_values must name it, once",
+                    entry.key, entry.value, entry.preset_value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_values_skip_the_public_preset_and_other_values() {
+        let file = "[relay]\ncompression_enabled = true\n[relay.abuse]\nevent_burst = 500\n";
+        let public = Config::explain_toml(file).unwrap();
+        assert_eq!(public.public_values(), []);
+        let marmot = Config::explain_toml(&format!("preset = \"marmot\"\n{file}")).unwrap();
+        let kept = marmot.public_values();
+        let keys: Vec<&str> = kept.iter().map(|kept| kept.key.as_str()).collect();
+        assert_eq!(keys, ["relay.compression_enabled"]);
     }
 }

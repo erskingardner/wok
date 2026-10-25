@@ -56,6 +56,14 @@ Everything else keeps its `public` value: the read classes, open read and
 write policies, no lower bound on `created_at`, the 900 s future tolerance,
 no proof of work, NIP-77 on, and the per-address backstops.
 
+A setting in the file still wins over the preset. A file written for
+`public` that lists the settings above, as a copy of the 0.7
+`docs/wok.toml` does, keeps their `public` values after it adds
+`preset = "marmot"`. `wok doctor` names each one in its
+`config-public-values` check; delete those lines, or run
+`wok config minimize` before changing the preset, which removes every
+setting that repeats `public`'s value.
+
 ## What it deliberately refuses
 
 - **Kinds outside the Marmot set.** Notes, reactions, DMs and every other

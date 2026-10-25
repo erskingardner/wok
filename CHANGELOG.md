@@ -220,6 +220,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wok doctor` has a `config-public-values` check under any preset but
+  `public` (#97). It names each setting the file pins to the `public`
+  preset's value where its own preset gives another. A copy of the 0.7
+  `docs/wok.toml` with `preset = "marmot"` kept 1 MiB events, 2 MiB
+  WebSocket messages and Unix frames, COUNT, permessage-deflate and
+  `relay.abuse.event_burst = 100` without a word: none of those is a past
+  default, so `config-defaults` passed them, and `wok config minimize` keeps
+  them because they differ from `marmot`'s.
 - Operator documentation in the dashboard's order (#97 §5). `docs/config.md`
   now runs preset, access, events accepted, queries, rates, storage, sync,
   relay information and advanced, then the restart-only infrastructure, and

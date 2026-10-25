@@ -6,7 +6,7 @@
 | `migrate.rs` | Read-only v3 snapshot, integrity, v5 marker, TOML translation, checksummed manifest |
 | `config_show.rs` | `wok config show`: effective values with their origin, `--overrides`, `--defaults` |
 | `config_minimize.rs` | `wok config minimize`: drop keys equal to the preset, `--dry-run` diff or `.bak` backup |
-| `doctor.rs` | Config (including pinned past defaults), storage, index, payload, negentropy, capacity, runtime-path report (`--json`) |
+| `doctor.rs` | Config (including pinned past defaults, and public values kept under another preset), storage, index, payload, negentropy, capacity, runtime-path report (`--json`) |
 | `reindex.rs` | Stage rebuilt indexes, verify fingerprint, atomic promote, keep backup + manifest |
 | `sync.rs` | NIP-77 operator client, transfer outcomes, JSON and missing-ID checks |
 | `router.rs` | Multi-connection mesh client, hot-reload of tao-config router file |

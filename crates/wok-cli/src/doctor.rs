@@ -8,7 +8,8 @@ use wok_db::{
     EnvironmentStats, IntegrityReport, TagKindIndexReport, TAG_KIND_SCHEMA_VERSION,
 };
 use wok_event::PackedEventView;
-use wok_relay::Config;
+use wok_relay::config::ConfigExplanation;
+use wok_relay::{Config, Preset};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -470,6 +471,16 @@ fn check_config_defaults(path: &Path, report: &mut DoctorReport) {
              they change; `wok config minimize` removes them."
         ),
     };
+    check_stale_defaults(&explanation, &minimize, report);
+    check_public_values(&explanation, report);
+}
+
+fn check_stale_defaults(
+    explanation: &ConfigExplanation,
+    minimize: &str,
+    report: &mut DoctorReport,
+) {
+    let preset = explanation.config.preset;
     let stale = explanation.stale_defaults();
     if stale.is_empty() {
         report.add(
@@ -502,6 +513,54 @@ fn check_config_defaults(path: &Path, report: &mut DoctorReport) {
                 "key pins"
             } else {
                 "keys pin"
+            },
+            pinned.join("; "),
+        ),
+    );
+}
+
+/// Keys pinned to the public preset's value under another preset, as a file
+/// written for `public`, such as a copy of the 0.7 sample, keeps them. None
+/// is a past default, so the `config-defaults` check does not name them.
+fn check_public_values(explanation: &ConfigExplanation, report: &mut DoctorReport) {
+    let preset = explanation.config.preset;
+    if preset == Preset::Public {
+        return;
+    }
+    let kept = explanation.public_values();
+    if kept.is_empty() {
+        report.add(
+            "config-public-values",
+            CheckStatus::Pass,
+            format!("no key keeps a public value that preset {preset} replaces"),
+        );
+        return;
+    }
+    let pinned: Vec<String> = kept
+        .iter()
+        .map(|kept| {
+            let line = kept
+                .line
+                .map_or_else(String::new, |line| format!("line {line}, "));
+            format!(
+                "{} = {} ({line}preset {preset}: {})",
+                kept.key, kept.value, kept.preset_value
+            )
+        })
+        .collect();
+    report.add(
+        "config-public-values",
+        CheckStatus::Warn,
+        format!(
+            "{} {} the public preset's value, so the relay does not get preset {preset}'s: {}. \
+             A file written for the public preset, such as a copy of an earlier release's \
+             sample, sets these. Delete a line to use the preset's value, or keep it if you \
+             chose that value.",
+            kept.len(),
+            if kept.len() == 1 {
+                "key keeps"
+            } else {
+                "keys keep"
             },
             pinned.join("; "),
         ),
@@ -1031,6 +1090,63 @@ mod tests {
         assert!(check
             .detail
             .ends_with("`wok config minimize` removes them."));
+    }
+
+    /// Every check `check_config_defaults` reports for a file, by name.
+    fn all_config_checks(text: &str) -> Vec<DoctorCheck> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wok.toml");
+        std::fs::write(&path, text).unwrap();
+        let mut report = DoctorReport::new();
+        check_config_defaults(&path, &mut report);
+        report.checks
+    }
+
+    #[test]
+    fn public_values_kept_under_another_preset_are_a_warning() {
+        let sample = include_str!("../../wok-relay/src/config/testdata/wok-0.7.0.toml");
+        let checks = all_config_checks(&format!("preset = \"marmot\"\n{sample}"));
+        let names: Vec<&str> = checks.iter().map(|check| check.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "config-deprecations",
+                "config-defaults",
+                "config-public-values"
+            ]
+        );
+        // The replaced defaults are still the config-defaults check's.
+        assert!(
+            checks[1].detail.starts_with("13 keys pin"),
+            "{}",
+            checks[1].detail
+        );
+        let kept = &checks[2];
+        assert_eq!(kept.status, CheckStatus::Warn);
+        assert!(
+            kept.detail.starts_with(
+                "6 keys keep the public preset's value, so the relay does not get preset \
+                 marmot's: events.max_event_size = 1048576 (line 27, preset marmot: 4194304); \
+                 relay.abuse.event_burst = 100 (line 139, preset marmot: 300); \
+                 relay.compression_enabled = true (line 81, preset marmot: false); \
+                 relay.max_filter_limit_count = 1000000 (line 73, preset marmot: 0);"
+            ),
+            "{}",
+            kept.detail
+        );
+        assert!(kept.detail.ends_with(
+            "Delete a line to use the preset's value, or keep it if you chose that value."
+        ));
+
+        let checks = all_config_checks(
+            "preset = \"marmot\"\n[relay.auth]\nservice_url = \"wss://relay.example.com\"\n",
+        );
+        assert_eq!(checks[2].name, "config-public-values");
+        assert_eq!(checks[2].status, CheckStatus::Pass);
+        assert_eq!(
+            checks[2].detail,
+            "no key keeps a public value that preset marmot replaces"
+        );
     }
 
     #[test]

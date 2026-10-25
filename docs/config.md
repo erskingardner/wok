@@ -100,6 +100,14 @@ keeps it. Set only what the relay needs and leave the rest to the preset.
   preset's value, or keep it if you chose that value; `minimize` leaves such
   settings alone because removing them changes behavior. The check also
   counts the settings that `minimize` would remove.
+- **`wok doctor`** warns, in its `config-public-values` check, about
+  settings pinned to the `public` preset's value when the file selects
+  another preset that replaces it. A file written for `public`, such as a
+  copy of the 0.7 sample that lists every default, keeps 1 MiB events,
+  COUNT and permessage-deflate when it moves to `preset = "marmot"`. None of
+  those is a past default, and `minimize` keeps them because they differ
+  from `marmot`'s. Delete the line to use the preset's value, or keep it if
+  you chose that value.
 - **Deprecated settings** that a release replaced still load, as their
   translation, so the relay behaves as before; see
   [Files from 0.7 and earlier](#files-from-07-and-earlier).

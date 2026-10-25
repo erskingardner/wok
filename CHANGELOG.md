@@ -106,8 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     filters are sized, parsed or priced and, for NEG-OPEN, before the payload
     is decoded (#149).
   - **COUNT** is refused while disabled before it spends the COUNT budgets,
-    and a REQ or COUNT over the connection's subscriptions or filter bytes
-    before its filters are parsed, validated and priced (#165).
+    and a REQ over the connection's subscriptions, or a REQ or COUNT over its
+    filter bytes, before its filters are parsed, validated and priced (#165).
   - **EVENT** is refused for its kind, by `relay.auth.accepted_kinds`, the
     NIP-86 kind policy or as an AUTH event, before it is verified (#150). The
     author ban and `write_policy` still wait for the signature, so an

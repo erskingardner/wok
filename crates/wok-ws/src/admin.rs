@@ -9,28 +9,20 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use wok_relay::config::MAX_AUTH_WINDOW_SECS;
 use wok_relay::{Config, EphemeralPersistence, RelayHandle};
 
 mod fields;
 mod posture;
 
 const MAX_ADMIN_BODY: usize = 64 * 1024;
-pub(crate) const MAX_REPLAY_IDS: usize = 4096;
+/// Five times the IDs a 60 s window held, as each is now kept for 300 s.
+pub(crate) const MAX_REPLAY_IDS: usize = 5 * 4096;
 
 #[derive(Default)]
 pub struct AdminState {
-    used_auth: Mutex<ReplayCache>,
-}
-
-/// The NIP-98 events already used, each ID with its `created_at`.
-#[derive(Default)]
-struct ReplayCache {
-    ids: HashMap<[u8; 32], u64>,
-    /// The longest `admin.auth_window_secs` an event has been checked under
-    /// since the relay started, which an ID is kept for. Pruned by the
-    /// current window instead, a reload that narrowed it would drop an event
-    /// that a reload widening it again lets through a second time.
-    window: u64,
+    /// The NIP-98 events already used, each ID with its `created_at`.
+    used_auth: Mutex<HashMap<[u8; 32], u64>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -292,7 +284,7 @@ pub(crate) struct ReplayReservation<'a> {
 
 impl ReplayReservation<'_> {
     pub(crate) fn release(self) {
-        self.state.used_auth.lock().ids.remove(&self.id);
+        self.state.used_auth.lock().remove(&self.id);
     }
 }
 
@@ -406,19 +398,19 @@ pub(crate) fn authorize<'a>(
         }
     }
     let mut used = state.used_auth.lock();
-    used.window = used.window.max(cfg.admin.auth_window_secs);
-    let window = used.window;
-    used.ids
-        .retain(|_, created_at| created_at.abs_diff(now) <= window);
-    if used.ids.contains_key(&verified.id) {
+    // Kept for the longest window any configuration may set, not the current
+    // one: pruned by a window a reload narrowed, an event would be accepted
+    // again once a reload widened it back.
+    used.retain(|_, created_at| created_at.abs_diff(now) <= MAX_AUTH_WINDOW_SECS);
+    if used.contains_key(&verified.id) {
         return Err("NIP-98 authorization event has already been used".into());
     }
-    if used.ids.len() >= MAX_REPLAY_IDS {
+    if used.len() >= MAX_REPLAY_IDS {
         return Err("NIP-98 replay cache is full".into());
     }
     // Reserve under the same lock as the check, so two concurrent requests
     // carrying one signed event cannot both pass it.
-    used.ids.insert(verified.id, verified.created_at);
+    used.insert(verified.id, verified.created_at);
     Ok((
         verified.pubkey,
         ReplayReservation {
@@ -1296,14 +1288,18 @@ mod tests {
             check(&captured, &Method::GET, b"", cfg, state, &policy).map(|_| ())
         };
         used(&cfg, &state).unwrap();
-        // A reload narrows the window to 5 s, and any request prunes the
-        // cache by it, past the captured event.
-        let mut narrow = cfg.clone();
-        narrow.admin.auth_window_secs = 5;
-        let fresh = signed_auth(&key, url, "GET", b"");
-        check(&fresh, &Method::GET, b"", &narrow, &state, &policy).unwrap();
-        assert!(used(&narrow, &state).unwrap_err().contains("time window"));
-        // A reload back to 300 s: the captured event is still in its window,
+        // Reloads narrow the window to 1 s and to 5 s, and a request is
+        // checked under each, which would prune the cache by that window
+        // whatever came before it.
+        for secs in [1, 5] {
+            let mut narrow = cfg.clone();
+            narrow.admin.auth_window_secs = secs;
+            let nonce = secs.to_string();
+            let fresh = signed_auth_with_nonce(&key, url, "GET", b"", Some(&nonce));
+            check(&fresh, &Method::GET, b"", &narrow, &state, &policy).unwrap();
+            assert!(used(&narrow, &state).unwrap_err().contains("time window"));
+        }
+        // A reload back to 300 s: the captured event is in its window again,
         // and still used.
         assert!(used(&cfg, &state)
             .unwrap_err()

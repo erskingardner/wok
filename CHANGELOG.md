@@ -908,6 +908,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A NEG-MSG that crossed the `NEG-ERR` closing its session no longer gets a
+  second `NEG-ERR`, `closed: unknown subscription handle` (#214). When a
+  reload, a moderation change, a login, an idle timeout or an expiring event
+  closed a sync session, a NEG-MSG the client had already sent for it was
+  answered as for a handle it never opened, which could hide the reason the
+  first `NEG-ERR` gave. A NEG-MSG sent after the relay sent that `NEG-ERR` is
+  still answered with `closed: unknown subscription handle`.
 - Decoding a zstd-compressed payload no longer zeroes a buffer as large as
   its size bound first. Reindex, search backfill and integrity bound it at
   16 MiB and spent about 75 µs per compressed event zeroing it, more than a

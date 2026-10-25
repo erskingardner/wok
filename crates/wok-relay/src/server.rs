@@ -747,6 +747,8 @@ enum ReqMsg {
     SetAuth {
         conn_id: u64,
         authed: [u8; 32],
+        /// The `Config::auth_epoch` the connection authenticated in.
+        epoch: u64,
     },
     /// Stop this generation's REQ history scan or COUNT, after CLOSE, a
     /// refusal or a replacement the client no longer waits for. Cleanup only:
@@ -794,6 +796,8 @@ enum MonitorMsg {
     SetAuth {
         conn_id: u64,
         authed: [u8; 32],
+        /// The `Config::auth_epoch` the connection authenticated in.
+        epoch: u64,
     },
     Close {
         conn_id: u64,
@@ -862,6 +866,8 @@ enum NegMsg {
     SetAuth {
         conn_id: u64,
         authed: [u8; 32],
+        /// The `Config::auth_epoch` the connection authenticated in.
+        epoch: u64,
     },
     CloseSub {
         conn_id: u64,
@@ -883,6 +889,20 @@ struct AuthSession {
     challenge: String,
     authed: Option<[u8; 32]>,
     identities: Vec<[u8; 32]>,
+}
+
+impl AuthSession {
+    /// Forget its identities: a reload that made AUTH unusable ended them.
+    /// The challenge stays, so the client can authenticate again once AUTH
+    /// is back.
+    fn expire(&mut self, metrics: &Metrics) {
+        self.identities.clear();
+        if self.authed.take().is_some() {
+            metrics
+                .authenticated_connections
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The most messages one connection may have waiting for the ingester.
@@ -2232,6 +2252,7 @@ fn run_ingester(
     neg_txs: Vec<Sender<NegMsg>>,
 ) {
     let mut auth: HashMap<u64, AuthSession> = HashMap::new();
+    let mut auth_epoch = cfg.read().auth_epoch;
     let mut budgets: HashMap<u64, ConnectionBudgets> = HashMap::new();
     let mut generations = Generations::default();
     let mut dispatch = Dispatch::new(writer_tx, req_txs, mon_txs, neg_txs);
@@ -2288,6 +2309,13 @@ fn run_ingester(
                 // Cloning Config here copied every String, PathBuf, and Vec on
                 // the hottest ingress path even though reloads are rare.
                 let cfg_snap = cfg.read();
+                // A reload that made AUTH unusable ended every login.
+                if cfg_snap.auth_epoch > auth_epoch {
+                    auth_epoch = cfg_snap.auth_epoch;
+                    for session in auth.values_mut() {
+                        session.expire(&metrics);
+                    }
+                }
                 handle_client(
                     &env,
                     &cfg_snap,
@@ -3111,17 +3139,21 @@ fn ingest_auth_inner(
     // Keep admission accounting pinned to the first identity; authenticating
     // another key must not reset the connection's abuse budget.
     asess.authed.get_or_insert(pk);
+    let epoch = cfg.auth_epoch;
     dispatch.req(ReqMsg::SetAuth {
         conn_id,
         authed: pk,
+        epoch,
     });
     dispatch.monitor(MonitorMsg::SetAuth {
         conn_id,
         authed: pk,
+        epoch,
     });
     dispatch.neg(NegMsg::SetAuth {
         conn_id,
         authed: pk,
+        epoch,
     });
     let mut id = [0u8; 32];
     id.copy_from_slice(packed.id());
@@ -3880,6 +3912,50 @@ fn scheduler_refusal(cfg: &Config) -> Setting {
     }
 }
 
+/// Forget the identities a worker holds, by connection, from before
+/// `epoch`: a reload that made AUTH unusable ended them
+/// (`Config::auth_epoch`). `seen` is the epoch they are from. Returns the
+/// connections it forgot identities of.
+fn expire_logins(authed: &mut HashMap<u64, Vec<[u8; 32]>>, seen: &mut u64, epoch: u64) -> Vec<u64> {
+    if epoch <= *seen {
+        return Vec::new();
+    }
+    *seen = epoch;
+    authed.drain().map(|(conn_id, _)| conn_id).collect()
+}
+
+/// The configuration for a REQ worker's slice, with the logins a reload
+/// since ended forgotten. A slice reads identities beside the configuration,
+/// so one that sees a reload making AUTH unusable must not see the logins
+/// it ended, however late in the worker's pass the reload came.
+fn slice_config<'a>(
+    cfg: &'a parking_lot::RwLock<Config>,
+    authed: &mut HashMap<u64, Vec<[u8; 32]>>,
+    seen: &mut u64,
+) -> parking_lot::RwLockReadGuard<'a, Config> {
+    let cfg = cfg.read();
+    expire_logins(authed, seen, cfg.auth_epoch);
+    cfg
+}
+
+/// Record that a connection authenticated as `pubkey` in `epoch`, unless a
+/// later reload already ended that epoch's logins.
+fn add_login(
+    authed: &mut HashMap<u64, Vec<[u8; 32]>>,
+    seen: &mut u64,
+    conn_id: u64,
+    pubkey: [u8; 32],
+    epoch: u64,
+) {
+    expire_logins(authed, seen, epoch);
+    if epoch == *seen {
+        let identities = authed.entry(conn_id).or_default();
+        if !identities.contains(&pubkey) {
+            identities.push(pubkey);
+        }
+    }
+}
+
 fn read_visibility(cfg: &Config, identities: Vec<[u8; 32]>) -> crate::restrict::ReadVisibility {
     crate::restrict::ReadVisibility {
         restrictor: cfg.read_restrictor(),
@@ -4050,6 +4126,7 @@ fn run_req_worker(
     drop(initial_cfg);
     queries.set_completeness(true);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
+    let mut auth_epoch = 0;
     let mut decomp = Decompressor::new();
     let mut pass = Vec::with_capacity(REQ_PASS_MAX);
     let worker = ReqWorker {
@@ -4080,7 +4157,7 @@ fn run_req_worker(
             }
         }
         {
-            let cfg_snap = cfg.read();
+            let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
             queries.set_max_subs_per_connection(
                 cfg_snap.relay.abuse.max_concurrent_historical_queries,
             );
@@ -4110,7 +4187,7 @@ fn run_req_worker(
                     let reason = match &txn {
                         Some(txn) => {
                             if queries.has_running() && share.due(true, std::time::Instant::now()) {
-                                let cfg_snap = cfg.read();
+                                let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
                                 share.slice(|| {
                                     worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp)
                                 });
@@ -4120,7 +4197,7 @@ fn run_req_worker(
                             match queries.add_sub(txn, sub) {
                                 Ok(Scheduled::Running) => {
                                     // The new query is first in the run queue.
-                                    let cfg_snap = cfg.read();
+                                    let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
                                     let mut first = || {
                                         worker.slice(
                                             &mut queries,
@@ -4174,12 +4251,8 @@ fn run_req_worker(
                 ReqMsg::SetAuth {
                     conn_id,
                     authed: pk,
-                } => {
-                    let identities = authed.entry(conn_id).or_default();
-                    if !identities.contains(&pk) {
-                        identities.push(pk);
-                    }
-                }
+                    epoch,
+                } => add_login(&mut authed, &mut auth_epoch, conn_id, pk, epoch),
                 ReqMsg::Cancel {
                     conn_id,
                     sub_id,
@@ -4197,7 +4270,7 @@ fn run_req_worker(
         if let Some(txn) = &txn {
             let waiting = !rx.is_empty();
             if open && queries.has_running() && share.due(waiting, std::time::Instant::now()) {
-                let cfg_snap = cfg.read();
+                let cfg_snap = slice_config(&cfg, &mut authed, &mut auth_epoch);
                 share.slice(|| worker.slice(&mut queries, txn, &cfg_snap, &authed, &mut decomp));
             }
         }
@@ -4525,6 +4598,7 @@ fn run_req_monitor(
     // The ingester caps subscriptions per connection before registering them.
     let mut monitors = ActiveMonitors::new(usize::MAX);
     let mut authed: HashMap<u64, Vec<[u8; 32]>> = HashMap::new();
+    let mut auth_epoch = 0;
     // Newest local event id already matched against every subscription.
     let mut curr_event_id = u64::MAX;
     let mut decomp = Decompressor::new();
@@ -4573,6 +4647,7 @@ fn run_req_monitor(
             continue;
         }
         let cfg_snap = cfg.read();
+        expire_logins(&mut authed, &mut auth_epoch, cfg_snap.auth_epoch);
         let r = cfg_snap.read_restrictor();
         let global_visibility = read_visibility(&cfg_snap, vec![]);
         let max_event_size = cfg_snap.events.max_event_size;
@@ -4727,12 +4802,8 @@ fn run_req_monitor(
                 MonitorMsg::SetAuth {
                     conn_id,
                     authed: pk,
-                } => {
-                    let identities = authed.entry(conn_id).or_default();
-                    if !identities.contains(&pk) {
-                        identities.push(pk);
-                    }
-                }
+                    epoch,
+                } => add_login(&mut authed, &mut auth_epoch, conn_id, pk, epoch),
                 MonitorMsg::Close { conn_id } => {
                     authed.remove(&conn_id);
                     monitors.close_conn(conn_id);
@@ -6864,6 +6935,159 @@ mod tests {
         handle.request_shutdown();
     }
 
+    #[test]
+    fn a_req_slice_never_reads_a_reload_beside_the_logins_it_ended() {
+        let cfg = parking_lot::RwLock::new(Config::default());
+        let mut authed = HashMap::from([(1, vec![[7u8; 32]])]);
+        let mut seen = 0;
+        assert_eq!(slice_config(&cfg, &mut authed, &mut seen).auth_epoch, 0);
+        assert_eq!(authed.len(), 1);
+        // A reload that made AUTH unusable after the pass began: the next
+        // slice of it reads the reload and no login.
+        cfg.write().auth_epoch = 1;
+        assert_eq!(slice_config(&cfg, &mut authed, &mut seen).auth_epoch, 1);
+        assert!(authed.is_empty());
+        // A login from before it, taken later in the pass, is void.
+        add_login(&mut authed, &mut seen, 1, [7; 32], 0);
+        assert!(authed.is_empty());
+        add_login(&mut authed, &mut seen, 1, [7; 32], 1);
+        assert_eq!(authed.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_makes_auth_unusable_ends_every_login() {
+        // A login outlived a reload that turned AUTH off: the connection
+        // still read as its key while nobody could log in, and again once
+        // a reload turned AUTH back on (#164).
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
+            cfg.relay.auth.service_url = "wss://auth.example".into();
+        })
+        .await;
+        let challenge_of = |frame: String| {
+            let frame: Value = serde_json::from_str(&frame).unwrap();
+            frame[1].as_str().unwrap().to_string()
+        };
+        let challenge = challenge_of(recv_outbound(&mut rx).await);
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let recipient = hex::encode(key.x_only_public_key().0.serialize());
+        let login = |challenge: &str, created_at: u64| {
+            let auth = sign_event_with_key(
+                json!({
+                    "created_at": created_at,
+                    "kind": AUTH_KIND,
+                    "tags": [["relay", "wss://auth.example"], ["challenge", challenge]],
+                    "content": "",
+                }),
+                &key,
+            );
+            json!(["AUTH", auth]).to_string()
+        };
+        let publish = |kind: u64, content: &str| {
+            let tags = if kind == 1059 {
+                json!([["p", recipient]])
+            } else {
+                json!([])
+            };
+            let event = sign_event(json!({
+                "created_at": now_secs(), "kind": kind, "tags": tags, "content": content,
+            }));
+            json!(["EVENT", event]).to_string()
+        };
+        let req = |sub: &str, kind: u64| json!(["REQ", sub, {"kinds": [kind]}]).to_string();
+        let authenticated = || {
+            handle
+                .metrics
+                .authenticated_connections
+                .load(Ordering::Relaxed)
+        };
+        let reload = |enabled: bool| {
+            let mut new = handle.config.read().clone();
+            new.relay.auth.enabled = enabled;
+            handle.config.write().apply_reload(new).unwrap();
+        };
+
+        conn.client_message(login(&challenge, now_secs())).await;
+        assert!(recv_outbound(&mut rx).await.contains("true"));
+        conn.client_message(publish(1059, "first")).await;
+        assert!(recv_outbound(&mut rx).await.contains("true"));
+        // Logged in as its recipient, the connection reads the gift wrap.
+        conn.client_message(req("wrap", 1059)).await;
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EVENT","wrap""#));
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EOSE","wrap""#));
+        conn.client_message(req("public", 1)).await;
+        assert!(recv_outbound(&mut rx)
+            .await
+            .starts_with(r#"["EOSE","public""#));
+        assert_eq!(authenticated(), 1);
+
+        // While nobody can log in, nobody is logged in.
+        reload(false);
+        conn.client_message(req("off", 1059)).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["CLOSED","off","restricted: "#),
+            "{reply}"
+        );
+        assert_eq!(authenticated(), 0);
+        // Nor once AUTH is back: the history and the live subscription opened
+        // under the login read no gift wrap, and a public event stored after
+        // one is delivered alone.
+        reload(true);
+        conn.client_message(req("on", 1059)).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["CLOSED","on","auth-required: "#),
+            "{reply}"
+        );
+        // A filter that also matches public events is served, without it.
+        let mixed = json!(["REQ", "mixed", {"kinds": [1, 1059]}]).to_string();
+        conn.client_message(mixed).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(reply.starts_with(r#"["EOSE","mixed""#), "{reply}");
+        conn.client_message(publish(1059, "second")).await;
+        conn.client_message(publish(1, "public")).await;
+        loop {
+            let frame = recv_outbound(&mut rx).await;
+            assert!(!frame.starts_with(r#"["EVENT","wrap""#), "{frame}");
+            if frame.starts_with(r#"["EVENT","public""#) {
+                break;
+            }
+        }
+        // The challenge stands, so the client can log in again, and so can a
+        // connection opened since; each login holds.
+        conn.client_message(login(&challenge, now_secs() - 1)).await;
+        let reply = recv_outbound(&mut rx).await;
+        assert!(
+            reply.starts_with(r#"["OK""#) && reply.contains("true"),
+            "{reply}"
+        );
+        let (tx, mut rx2) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let conn2 = handle
+            .register_connection(
+                TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                Outbound::new(tx, 0),
+            )
+            .await;
+        let challenge2 = challenge_of(recv_outbound(&mut rx2).await);
+        conn2
+            .client_message(login(&challenge2, now_secs() - 2))
+            .await;
+        assert!(recv_outbound(&mut rx2).await.contains("true"));
+        assert_eq!(authenticated(), 2);
+        for (conn, rx) in [(&conn, &mut rx), (&conn2, &mut rx2)] {
+            conn.client_message(req("again", 1059)).await;
+            for _ in 0..2 {
+                let frame = recv_outbound(rx).await;
+                assert!(frame.starts_with(r#"["EVENT","again""#), "{frame}");
+            }
+        }
+        handle.request_shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_neg_open_meets_the_filter_size_limit_and_its_filter_before_its_payload() {
         let (_dir, handle, conn, mut rx) =
@@ -8203,6 +8427,7 @@ mod tests {
         h.send(MonitorMsg::SetAuth {
             conn_id: 2,
             authed: [9; 32],
+            epoch: 0,
         });
         h.register(1, json!({"kinds": [1, 20001]}), 0);
         h.ephemeral("held");
@@ -8217,6 +8442,7 @@ mod tests {
         h.send(MonitorMsg::SetAuth {
             conn_id: 1,
             authed: [7; 32],
+            epoch: 0,
         });
         let (_, after) = h.store("after AUTH");
         h.sync();
@@ -8251,6 +8477,7 @@ mod tests {
             .apply(MonitorMsg::SetAuth {
                 conn_id: 1,
                 authed: pk,
+                epoch: 0,
             })
             .is_empty());
         assert_eq!(
@@ -8664,6 +8891,7 @@ mod tests {
         queue(ReqMsg::SetAuth {
             conn_id: 1,
             authed: [7; 32],
+            epoch: 0,
         });
         queue(ReqMsg::Scan(queued_sub(
             "b",

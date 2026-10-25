@@ -396,7 +396,9 @@ impl ConnTable {
     }
 
     /// A generation's last frame (a CLOSED from a worker, a COUNT result):
-    /// queued if the generation is current, which then ends.
+    /// queued if the generation is current, which then ends. Returns whether
+    /// it did: a REQ still sending its history is held by both its req worker
+    /// and its monitor, and only the first to end it may count a refusal.
     fn send_last(
         &self,
         conn_id: u64,
@@ -405,16 +407,18 @@ impl ConnTable {
         generation: u64,
         msg: RelayMessage,
         metrics: &Metrics,
-    ) {
+    ) -> bool {
         let json = msg.to_json();
         self.with(conn_id, |out, state| {
             if state.subs.admit(ns, sub_id, generation).is_none() {
-                return;
+                return false;
             }
             state.subs.close(ns, sub_id);
             bump_relay_metrics(&msg, metrics);
             state.push(out, json, None, metrics);
-        });
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// Build the EVENT frame once (pre-sized) and queue it.
@@ -1897,15 +1901,16 @@ fn close_refused_queries(
     let validator = &filters.validator;
     let refused = queries.remove_refused(|sub| validator.validate(&sub.filter_group).err());
     for (sub, error) in refused {
-        count_filter_limit(worker.metrics, &error);
         let reason = req_filter_refusal(&error);
-        worker.refuse(
+        if worker.refuse(
             sub.conn_id,
             sub.sub_id,
             sub.generation,
             sub.count_only,
             &reason,
-        );
+        ) {
+            count_filter_limit(worker.metrics, &error);
+        }
     }
 }
 
@@ -1920,9 +1925,10 @@ fn close_refused_subs(
 ) {
     let refused = monitors.remove_refused(|sub| validator.validate(&sub.filter_group).err());
     for (conn_id, sub_id, generation, error) in refused {
-        count_filter_limit(metrics, &error);
         let closed = RelayMessage::closed_error(sub_id.as_str(), req_filter_refusal(&error));
-        conns.send_last(conn_id, Ns::Req, &sub_id, generation, closed, metrics);
+        if conns.send_last(conn_id, Ns::Req, &sub_id, generation, closed, metrics) {
+            count_filter_limit(metrics, &error);
+        }
     }
 }
 
@@ -4276,14 +4282,15 @@ fn run_req_worker(
                             // with it, as `add_sub` would have ended it.
                             if let Err(error) = filters.validator.validate(&sub.filter_group) {
                                 queries.remove_query(conn, &sub_id, count_only);
-                                count_filter_limit(&metrics, &error);
-                                worker.refuse(
+                                if worker.refuse(
                                     conn,
                                     sub_id,
                                     generation,
                                     count_only,
                                     &req_filter_refusal(&error),
-                                );
+                                ) {
+                                    count_filter_limit(&metrics, &error);
+                                }
                                 continue;
                             }
                             // With nothing running, this slice starts the share.
@@ -4388,11 +4395,19 @@ struct ReqWorker<'a> {
 impl ReqWorker<'_> {
     /// A REQ or COUNT that will send no (more) history: its CLOSED goes through
     /// the gate as the generation's last frame, and a REQ's registration with
-    /// the monitor is dropped.
-    fn refuse(&self, conn_id: u64, sub_id: SubId, generation: u64, count_only: bool, reason: &str) {
+    /// the monitor is dropped. Returns whether this CLOSED ended it.
+    fn refuse(
+        &self,
+        conn_id: u64,
+        sub_id: SubId,
+        generation: u64,
+        count_only: bool,
+        reason: &str,
+    ) -> bool {
         let ns = if count_only { Ns::Count } else { Ns::Req };
         let closed = RelayMessage::closed_error(sub_id.as_str(), reason);
-        self.conns
+        let ended = self
+            .conns
             .send_last(conn_id, ns, &sub_id, generation, closed, self.metrics);
         if !count_only {
             let _ = route_tx(self.mon_txs, conn_id).send(MonitorMsg::Remove {
@@ -4401,6 +4416,7 @@ impl ReqWorker<'_> {
                 generation,
             });
         }
+        ended
     }
 
     /// Give the first query in the run queue one time slice, and answer it if
@@ -4814,17 +4830,18 @@ fn run_req_monitor(
                 MonitorMsg::Register(mut sub) => {
                     // Admitted under rules a reload has tightened since.
                     if let Err(error) = filters.validator.validate(&sub.filter_group) {
-                        count_filter_limit(&metrics, &error);
                         let reason = req_filter_refusal(&error);
                         let closed = RelayMessage::closed_error(sub.sub_id.as_str(), reason);
-                        conns.send_last(
+                        if conns.send_last(
                             sub.conn_id,
                             Ns::Req,
                             &sub.sub_id,
                             sub.generation,
                             closed,
                             &metrics,
-                        );
+                        ) {
+                            count_filter_limit(&metrics, &error);
+                        }
                         // The older generation it replaced at the gate goes
                         // with it, as `add_pending` would have replaced it.
                         if monitors
@@ -9070,6 +9087,83 @@ mod tests {
             assert!(mon_rx.try_recv().is_err(), "the scan kept running");
             drop(req_tx);
             worker.join().unwrap();
+        }
+    }
+
+    /// A REQ whose history is still going out is held by both its req worker
+    /// and its monitor, and after a reload that tightens the filter rules
+    /// each one's sweep refuses it. The client gets one CLOSED, from
+    /// whichever sweep runs first, and the refusal is counted once.
+    #[test]
+    fn a_reload_that_cuts_a_req_mid_history_counts_one_refusal() {
+        let (dir, env, snapshot) = long_history();
+        let cfg = slow_scan_config(dir.path());
+        let mut tightened = cfg.clone();
+        tightened.relay.filter_validation.require_scoped_filters = true;
+        let validator = filter_validator(&tightened);
+        let all = SubId::new("all").unwrap();
+        let sub = || {
+            queued_sub(
+                "all",
+                json!({"kinds": [1], "limit": 50_000}),
+                1,
+                false,
+                snapshot,
+            )
+        };
+        for worker_first in [true, false] {
+            let conns = ConnTable::new();
+            let (out_tx, mut outbound) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(1, Outbound::new(out_tx, 0));
+            conns.open_sub(1, Ns::Req, &all, 1, 0);
+            let metrics = Metrics::default();
+            let (mon_tx, _mon_rx) = unbounded();
+            let mon_txs = vec![mon_tx];
+            let worker = ReqWorker {
+                conns: &conns,
+                metrics: &metrics,
+                mon_txs: &mon_txs,
+            };
+            let mut monitors = ActiveMonitors::new(usize::MAX);
+            monitors.add_pending(
+                sub(),
+                PendingBuffer::new(snapshot, cfg.relay.max_live_buffer_bytes),
+            );
+            let mut queries = QueryScheduler::new(1, 0, 1_000_001);
+            let txn = env.begin_ro().unwrap();
+            queries.add_sub(&txn, sub()).unwrap();
+            let mut decomp = Decompressor::new();
+            let mut frames = Vec::new();
+            while frames.is_empty() {
+                worker.slice(&mut queries, &txn, &cfg, &HashMap::new(), &mut decomp);
+                frames.extend(std::iter::from_fn(|| outbound.try_recv().ok()));
+            }
+            assert!(queries.has_running(), "the history went out in one slice");
+
+            let mut filters = FilterRules::new(&cfg);
+            if worker_first {
+                close_refused_queries(&mut queries, &mut filters, &tightened, &worker);
+                close_refused_subs(&mut monitors, &validator, &conns, &metrics);
+            } else {
+                close_refused_subs(&mut monitors, &validator, &conns, &metrics);
+                close_refused_queries(&mut queries, &mut filters, &tightened, &worker);
+            }
+            frames.extend(std::iter::from_fn(|| outbound.try_recv().ok()));
+            let closed: Vec<String> = frames
+                .into_iter()
+                .map(OutboundFrame::into_text)
+                .filter(|frame| !frame.starts_with(r#"["EVENT","all""#))
+                .collect();
+            assert_eq!(closed.len(), 1, "{closed:?}");
+            assert!(
+                closed[0].starts_with(
+                    r#"["CLOSED","all","blocked: bad req: filter validation failed: "#
+                ),
+                "{closed:?}"
+            );
+            assert_eq!(metrics.refusals.get(Setting::RequireScopedFilters), 1);
+            assert!(!queries.has_running());
+            assert!(monitors.subscription(1, &all).is_none());
         }
     }
 

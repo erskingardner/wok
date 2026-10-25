@@ -1083,6 +1083,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason that is not UTF-8 with 1007. Before, any body was echoed as sent.
   Each connection failed for breaking the protocol is now logged as `client
   terminated` with the `reason` and `close_code`, as a pong timeout is.
+- An `Event` table key that is not 8 bytes long, which only at-rest
+  corruption produces, is reported as a database error instead of panicking
+  the thread that read it (#56). The scans that walk events in local-id
+  order hit it: live subscriptions catching up, `wok monitor`, the router,
+  negentropy tree builds, and `wok migrate strfry`'s verification and
+  fingerprints.
 
 ## [0.7.0] - 2026-09-08
 

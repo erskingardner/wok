@@ -98,7 +98,11 @@ same ingester. Before Wok reads a message's verb:
   client negotiated permessage-deflate (`relay.compression_enabled`), inflates
   the message, up to `relay.max_websocket_payload_size`. Past half that size
   plus 64 KiB, a message may inflate to at most 32 times its compressed
-  size; one past its limit is refused before more of it is inflated. `relay.frame_read_timeout_secs` is the
+  size; one past its limit is refused before more of it is inflated. A text
+  message that is not UTF-8 once whole and inflated closes the connection
+  with 1007 before the relay sees it, and a frame or message the codec
+  refuses closes it with its RFC 6455 status code (1002, 1007 or 1009).
+  `relay.frame_read_timeout_secs` is the
   longest gap between reads while part of a frame or message is buffered,
   and `relay.message_read_timeout_secs` the longest a message or control
   frame may take from its first byte to its last; a pause while the relay

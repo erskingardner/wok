@@ -103,6 +103,14 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             "NIP-42 authentication is usable, or nothing needs it",
         ),
     }
+    match cfg.nodeinfo_warning() {
+        Some(detail) => report.add("nodeinfo", CheckStatus::Warn, detail),
+        None => report.add(
+            "nodeinfo",
+            CheckStatus::Pass,
+            "NodeInfo is off, or its discovery names the relay's public URL",
+        ),
+    }
     check_read_classes(cfg, &mut report);
 
     // Hot-reload merges the file over factory defaults, so a truncated or
@@ -1059,6 +1067,28 @@ mod tests {
             preset.detail
         );
         assert_eq!(check(&marmot, "read-classes").status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn nodeinfo_without_a_public_url_is_a_warning() {
+        let report = |text: &str| {
+            let cfg = Config::parse_toml(text).unwrap();
+            run(&cfg, Path::new("missing-test-config.toml"))
+        };
+        assert_eq!(check(&report(""), "nodeinfo").status, CheckStatus::Pass);
+        let on = "[relay]\nnodeinfo_enabled = true\n";
+        let unnamed = report(on);
+        let nodeinfo = check(&unnamed, "nodeinfo");
+        assert_eq!(nodeinfo.status, CheckStatus::Warn);
+        assert!(
+            nodeinfo.detail.contains("answers 404"),
+            "{}",
+            nodeinfo.detail
+        );
+        let named = report(&format!(
+            "{on}[relay.auth]\nservice_url = \"wss://relay.example.com\"\n"
+        ));
+        assert_eq!(check(&named, "nodeinfo").status, CheckStatus::Pass);
     }
 
     #[test]

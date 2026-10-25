@@ -235,7 +235,8 @@ pub struct RelayConfig {
     pub auth: AuthConfig,
     pub info: InfoConfig,
     /// Serve NodeInfo discovery (`/.well-known/nodeinfo`) and its document
-    /// (`/nodeinfo/2.1`). No Nostr client needs them.
+    /// (`/nodeinfo/2.1`). No Nostr client needs them. Discovery also needs
+    /// a public URL to name ([`Config::nodeinfo_href`]).
     pub nodeinfo_enabled: bool,
     pub max_websocket_payload_size: usize,
     /// Maximum combined compact-JSON bytes across all filter objects in one
@@ -875,6 +876,39 @@ impl Config {
     /// the same condition, and every AUTH challenge is gated on it.
     pub fn auth_usable(&self) -> bool {
         self.relay.auth.enabled && !self.relay.auth.service_url.is_empty()
+    }
+
+    /// The link NodeInfo discovery serves: `/nodeinfo/2.1` on the origin of
+    /// `relay.auth.service_url` (`ws` read as `http`, `wss` as `https`), or
+    /// else of `admin.public_url`. Never the request's `Host`, which a cache
+    /// in front of the relay could hand to other clients, so with neither
+    /// set discovery answers 404.
+    pub fn nodeinfo_href(&self) -> Option<String> {
+        fn http_origin(url: &str) -> Option<String> {
+            let mut url = url::Url::parse(url).ok()?;
+            let scheme = match url.scheme() {
+                "ws" | "http" => "http",
+                "wss" | "https" => "https",
+                _ => return None,
+            };
+            url.host_str()?;
+            url.set_scheme(scheme).ok()?;
+            Some(url.origin().ascii_serialization())
+        }
+        [&self.relay.auth.service_url, &self.admin.public_url]
+            .into_iter()
+            .find_map(|url| http_origin(url))
+            .map(|origin| format!("{origin}/nodeinfo/2.1"))
+    }
+
+    /// Warn when NodeInfo is on but its discovery answers 404 for want of a
+    /// public URL ([`nodeinfo_href`](Self::nodeinfo_href)).
+    pub fn nodeinfo_warning(&self) -> Option<String> {
+        (self.relay.nodeinfo_enabled && self.nodeinfo_href().is_none()).then(|| {
+            "relay.nodeinfo_enabled is on, but /.well-known/nodeinfo answers 404 until \
+             relay.auth.service_url or admin.public_url names the relay's public URL"
+                .to_string()
+        })
     }
 
     /// The read class that keeps every reader from events of `kind` while
@@ -2181,6 +2215,9 @@ impl Config {
         if let Some(warning) = new.pow_reload_warning(self) {
             tracing::warn!("config reload: {warning}");
         }
+        if let Some(warning) = new.nodeinfo_warning() {
+            tracing::warn!("config reload: {warning}");
+        }
         for deprecation in &new.deprecations {
             tracing::warn!("config reload: {deprecation}");
         }
@@ -3265,6 +3302,40 @@ negentropy_enabled = true
         );
         running.apply_reload(on).unwrap();
         assert!(running.relay.nodeinfo_enabled);
+    }
+
+    #[test]
+    fn nodeinfo_names_the_public_url_and_warns_without_one() {
+        let href = |toml: &str| Config::parse_toml(toml).unwrap().nodeinfo_href();
+        assert_eq!(href(""), None);
+        assert_eq!(
+            href("[relay.auth]\nservice_url = \"wss://Relay.Example/path\"\n").as_deref(),
+            Some("https://relay.example/nodeinfo/2.1")
+        );
+        assert_eq!(
+            href("[relay.auth]\nservice_url = \"ws://relay.example:7777\"\n").as_deref(),
+            Some("http://relay.example:7777/nodeinfo/2.1")
+        );
+        // The relay's own URL wins over the dashboard's, and one that names
+        // no web origin is passed over.
+        let both = "[admin]\npublic_url = \"https://admin.example\"\n[relay.auth]\n";
+        assert_eq!(
+            href(&format!("{both}service_url = \"wss://relay.example\"\n")).as_deref(),
+            Some("https://relay.example/nodeinfo/2.1")
+        );
+        assert_eq!(
+            href(&format!("{both}service_url = \"relay.example\"\n")).as_deref(),
+            Some("https://admin.example/nodeinfo/2.1")
+        );
+
+        let mut running = Config::default();
+        assert_eq!(running.nodeinfo_warning(), None);
+        running.relay.nodeinfo_enabled = true;
+        assert!(running
+            .nodeinfo_warning()
+            .is_some_and(|warning| warning.contains("relay.auth.service_url")));
+        running.admin.public_url = "https://relay.example".into();
+        assert_eq!(running.nodeinfo_warning(), None);
     }
 
     #[test]

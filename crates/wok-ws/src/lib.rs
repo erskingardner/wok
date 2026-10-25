@@ -328,13 +328,18 @@ async fn dispatch(
     }
     // `/metrics` and the NodeInfo paths are routes only while the relay
     // listener serves them, so a relay without them answers them, preflight
-    // included, like any path.
+    // included, like any path. NodeInfo discovery also needs a public URL to
+    // name.
     let (metrics_here, nodeinfo_here) = {
         let cfg = handle.config.read();
         (
             path == "/metrics" && cfg.metrics_on_relay_listener(),
-            matches!(path.as_str(), "/.well-known/nodeinfo" | "/nodeinfo/2.1")
-                && cfg.relay.nodeinfo_enabled,
+            cfg.relay.nodeinfo_enabled
+                && match path.as_str() {
+                    "/.well-known/nodeinfo" => cfg.nodeinfo_href().is_some(),
+                    "/nodeinfo/2.1" => true,
+                    _ => false,
+                },
         )
     };
     if !metrics_here && !nodeinfo_here && !matches!(path.as_str(), "/" | "/favicon.ico") {
@@ -362,7 +367,7 @@ async fn dispatch(
         return text_response(METRICS_CONTENT_TYPE, handle.metrics.render());
     }
     if nodeinfo_here {
-        return nodeinfo(&path, req.headers());
+        return nodeinfo(&path, &cfg);
     }
     if path == "/favicon.ico" {
         return with_cors(
@@ -389,17 +394,18 @@ async fn dispatch(
 
 /// NodeInfo discovery (`/.well-known/nodeinfo`) or its document
 /// (`/nodeinfo/2.1`), served while `relay.nodeinfo_enabled` is on. The
-/// discovery link's host is the request's `Host` header.
-fn nodeinfo(path: &str, headers: &hyper::HeaderMap) -> Response<Full<Bytes>> {
+/// discovery link names the relay's configured public URL
+/// ([`Config::nodeinfo_href`]), never the request's `Host`.
+fn nodeinfo(path: &str, cfg: &Config) -> Response<Full<Bytes>> {
     if path == "/.well-known/nodeinfo" {
-        let host = headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        // A reload may have taken the URL away since the route was chosen.
+        let Some(href) = cfg.nodeinfo_href() else {
+            return not_found();
+        };
         return json_response(&serde_json::json!({
             "links": [{
                 "rel": "http://nodeinfo.diaspora.software/ns/schema/2.1",
-                "href": format!("https://{host}/nodeinfo/2.1"),
+                "href": href,
             }]
         }));
     }
@@ -1593,9 +1599,16 @@ mod metrics_tests {
             }
         }
         served.handle.config.write().relay.nodeinfo_enabled = true;
-        let (status, _, body) = request(served.relay, "GET", "/.well-known/nodeinfo").await;
-        assert_eq!(status, 200);
-        assert!(body.contains("https://localhost/nodeinfo/2.1"), "{body}");
+        // Without a public URL, discovery has only the request's Host to
+        // name, so it answers 404; the document needs no URL.
+        for method in ["GET", "OPTIONS"] {
+            assert_eq!(
+                request(served.relay, method, "/.well-known/nodeinfo")
+                    .await
+                    .0,
+                404
+            );
+        }
         let (status, _, body) = request(served.relay, "GET", "/nodeinfo/2.1").await;
         assert_eq!(status, 200);
         assert!(body.contains("\"protocols\":[\"nostr\"]"), "{body}");
@@ -1603,8 +1616,18 @@ mod metrics_tests {
             request(served.relay, "OPTIONS", "/nodeinfo/2.1").await.0,
             204
         );
+        served.handle.config.write().relay.auth.service_url = "wss://relay.example".into();
+        let (status, _, body) = request(served.relay, "GET", "/.well-known/nodeinfo").await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("\"href\":\"https://relay.example/nodeinfo/2.1\""),
+            "{body}"
+        );
+        assert!(!body.contains("localhost"), "{body}");
         served.handle.config.write().relay.nodeinfo_enabled = false;
-        assert_eq!(request(served.relay, "GET", "/nodeinfo/2.1").await.0, 404);
+        for path in ["/.well-known/nodeinfo", "/nodeinfo/2.1"] {
+            assert_eq!(request(served.relay, "GET", path).await.0, 404);
+        }
     }
 }
 

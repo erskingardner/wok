@@ -1,6 +1,6 @@
 //! What `wok relay` warns about when it starts with a file, before any
-//! reload: read classes wider than the preset's, and inbox kinds outsiders
-//! could publish for others to read.
+//! reload: read classes wider than the preset's, inbox kinds outsiders could
+//! publish for others to read, and a message cap too small for its limits.
 use std::{
     path::Path,
     process::{Child, Command, Stdio},
@@ -21,8 +21,8 @@ const WIDENED: &str = "relay.auth lets more readers read kinds than preset publi
 const INBOX: &str = "relay.auth.inbox_kinds lists kinds [1059, 21059], which are not \
                      recipient-only";
 
-/// Start the relay with `auth` as its `[relay.auth]` table and return what
-/// it logged by the time it listens.
+/// Start the relay with `auth` after its `[relay.auth]` header, which may
+/// open further tables, and return what it logged by the time it listens.
 fn startup_log(dir: &Path, auth: &str) -> String {
     let cfg = dir.join("wok.toml");
     std::fs::write(
@@ -73,4 +73,21 @@ fn a_file_that_widens_read_classes_is_warned_about_at_startup() {
     let log = startup_log(dir.path(), "");
     assert!(!log.contains("relay.auth lets more readers"), "{log}");
     assert!(!log.contains("relay.auth.inbox_kinds"), "{log}");
+}
+
+#[test]
+fn a_message_cap_too_small_for_its_limits_is_warned_about_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = startup_log(dir.path(), "[events]\nmax_event_size = 4194304");
+    assert!(
+        log.contains(
+            "relay.max_websocket_payload_size = 2097152 is too small for \
+             events.max_event_size = 4194304"
+        ),
+        "{log}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = startup_log(dir.path(), "");
+    assert!(!log.contains("is too small for"), "{log}");
 }

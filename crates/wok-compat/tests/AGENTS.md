@@ -15,6 +15,7 @@
 | `req_lifecycle.rs` | Live-before-history REQs: no loss, exactly once, replacement, cap, COUNT ids, scans queued over the concurrency cap |
 | `eose_latency.rs` | Ignored benchmark: REQ→EOSE latency under monitor fan-out |
 | `ws_deflate.rs` | permessage-deflate negotiation/frames |
+| `message_caps.rs` | The WebSocket message cap against `events.max_event_size` and `relay.max_req_filter_size`: a message at the cap is read, one byte over closes with 1009, exactly where `Config::message_caps` warns |
 | `ws_timeouts.rs` | Handshake/frame-read/pong liveness timeouts |
 | `negentropy_e2e.rs` | NEG-* sessions against a live relay |
 | `plugin_e2e.rs` | Write-policy plugin child process |

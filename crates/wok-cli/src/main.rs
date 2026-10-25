@@ -514,7 +514,11 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
         cfg.read_class_warning(),
         cfg.inbox_kinds_warning(),
     ];
-    for warning in warnings.into_iter().flatten() {
+    for warning in warnings
+        .into_iter()
+        .flatten()
+        .chain(cfg.message_cap_warnings())
+    {
         tracing::warn!("{warning}");
     }
     for deprecation in &cfg.deprecations {

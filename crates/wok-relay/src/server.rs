@@ -4625,6 +4625,11 @@ fn send_buffered_stored(
     }
 }
 
+/// How often a monitor holding subscriptions checks for filter rules a
+/// reload has changed when no traffic wakes it, as often as the negentropy
+/// worker re-checks its sessions.
+const FILTER_RULES_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
 fn run_req_monitor(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -4653,6 +4658,14 @@ fn run_req_monitor(
         } else {
             crossbeam_channel::never()
         };
+        // A reload wakes no monitor, so one holding subscriptions also looks
+        // for changed filter rules on a timer: a refused subscription past
+        // EOSE would otherwise keep its slot until the next event.
+        let rules_timer = if monitors.is_empty() {
+            crossbeam_channel::never()
+        } else {
+            crossbeam_channel::after(FILTER_RULES_CHECK_INTERVAL)
+        };
         crossbeam_channel::select! {
             recv(rx) -> msg => match msg {
                 Ok(msg) => control.push(msg),
@@ -4663,6 +4676,7 @@ fn run_req_monitor(
                 Err(_) => data_open = false,
             },
             recv(retry_timer) -> _ => {}
+            recv(rules_timer) -> _ => {}
         }
         // A closed queue never wakes the monitor again; it stops once both are.
         if !control_open {
@@ -4683,6 +4697,9 @@ fn run_req_monitor(
         control.extend(rx.try_iter());
         if control.is_empty() && data.is_empty() {
             retry = false;
+            if filters.follow(&cfg.read()) {
+                close_refused_subs(&mut monitors, &filters.validator, &conns, &metrics);
+            }
             continue;
         }
         let cfg_snap = cfg.read();
@@ -4744,6 +4761,14 @@ fn run_req_monitor(
                             closed,
                             &metrics,
                         );
+                        // The older generation it replaced at the gate goes
+                        // with it, as `add_pending` would have replaced it.
+                        if monitors
+                            .subscription(sub.conn_id, &sub.sub_id)
+                            .is_some_and(|old| old.generation < sub.generation)
+                        {
+                            monitors.remove_sub(sub.conn_id, &sub.sub_id);
+                        }
                         continue;
                     }
                     // Stored events after the REQ's history snapshot are the
@@ -7015,6 +7040,35 @@ mod tests {
             .await;
         let refused: Value = serde_json::from_str(&recv_outbound(&mut rx).await).unwrap();
         assert_eq!(refused, json!(["CLOSED", "again", closed]));
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_tightens_filter_validation_frees_a_quiet_subscriptions_slot() {
+        // Only an event woke the monitor, so on a quiet relay a refused
+        // subscription past EOSE kept its slot, and a scoped REQ under a new
+        // id was refused as one too many.
+        let (_dir, handle, conn, mut rx) = relay_with_connection(|cfg| {
+            cfg.relay.max_subs_per_connection = 1;
+        })
+        .await;
+        let req = |sub: &str, filter: Value| json!(["REQ", sub, filter]).to_string();
+        conn.client_message(req("all", json!({"kinds": [1]}))).await;
+        assert!(recv_outbound(&mut rx).await.starts_with(r#"["EOSE","all""#));
+
+        let mut tightened = handle.config.read().clone();
+        tightened.relay.filter_validation.require_scoped_filters = true;
+        handle.reload_config(tightened).unwrap();
+        // No event is published.
+        let closed = recv_outbound(&mut rx).await;
+        assert!(
+            closed.starts_with(r#"["CLOSED","all","blocked: bad req: filter validation failed: "#),
+            "{closed}"
+        );
+        conn.client_message(req("tagged", json!({"kinds": [1], "#t": ["wok"]})))
+            .await;
+        let eose = recv_outbound(&mut rx).await;
+        assert!(eose.starts_with(r#"["EOSE","tagged""#), "{eose}");
         handle.request_shutdown();
     }
 

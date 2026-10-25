@@ -300,6 +300,11 @@ impl ActiveMonitors {
         }
     }
 
+    /// Whether no connection holds a subscription.
+    pub fn is_empty(&self) -> bool {
+        self.conns.is_empty()
+    }
+
     /// Apply a reloaded per-connection cap. Subscriptions over a lowered cap
     /// stay and can still be replaced; new ids are refused until the count
     /// drops.

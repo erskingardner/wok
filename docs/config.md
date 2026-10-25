@@ -858,10 +858,22 @@ All Unix-socket settings require restart and are file-only.
 | `relay.unix.mode` | `0o600` | Permission bits, as TOML octal or decimal. |
 | `relay.unix.owner` | empty | User applied with `chown` after bind. |
 | `relay.unix.group` | empty | Group applied with `chown` after bind. |
-| `relay.unix.auth_uids` | `[]` | Allowed peer UIDs; empty accepts any UID. |
-| `relay.unix.auth_gids` | `[]` | Allowed peer GIDs; empty accepts any GID. |
+| `relay.unix.auth_uids` | `[]` | Allowed peer UIDs; empty accepts any UID. A peer must pass this list and `auth_gids` both. |
+| `relay.unix.auth_gids` | `[]` | Allowed peer GIDs; empty accepts any GID. Only the peer's effective GID is checked, not its supplementary groups. |
 | `relay.unix.max_frame_bytes` | `2097152` | Largest length-prefixed JSON frame. Like `relay.max_websocket_payload_size`, it must hold the largest event and REQ, and the `message-caps` warning says when it does not while the socket is on. `marmot` uses 8 MiB. |
 | `relay.unix.max_pending_outbound_bytes` | `33554432` | Pending output budget before disconnect. |
+
+`auth_uids` and `auth_gids` combine with AND. With either set, the relay
+reads the connecting process's effective UID and GID as they were when it
+connected (`SO_PEERCRED` on Linux, `getpeereid` elsewhere) and admits it only
+if the UID is in `auth_uids` and the GID in `auth_gids`, an empty list
+matching anything. Any other peer, or one whose credentials cannot be read,
+is disconnected before its first frame is read. So `auth_uids = [1000]` with
+`auth_gids = [1001]` admits UID 1000 only while its effective group is 1001,
+not "UID 1000 or members of group 1001", and no supplementary group ever
+matches `auth_gids`. To admit every member of a group, leave both lists
+empty and set `group` with a `mode` such as `0o660`: Linux and macOS check
+the socket file's mode against all of a connecting process's groups.
 
 See [Unix socket protocol](unix-socket.md) for framing and peer authorization.
 

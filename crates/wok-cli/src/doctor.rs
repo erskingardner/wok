@@ -122,6 +122,20 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
     );
     let (status, detail) = filter_rules_check(&cfg.relay.filter_validation);
     report.add("filter-validation", status, detail);
+    let caps = cfg.message_cap_warnings();
+    report.add(
+        "message-caps",
+        if caps.is_empty() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        },
+        if caps.is_empty() {
+            "each message cap holds the largest EVENT and REQ its limits accept".to_string()
+        } else {
+            caps.join(" ")
+        },
+    );
     report.add(
         "abuse-limits",
         if cfg.relay.abuse.enabled {
@@ -763,6 +777,32 @@ mod tests {
         let report = run(&cfg, Path::new("missing-test-config.toml"));
         assert!(report.ok, "{}", report.render_human());
         assert!(report.integrity.unwrap().ok());
+    }
+
+    #[test]
+    fn a_message_cap_too_small_for_its_limits_is_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        drop(env);
+        let mut cfg = Config {
+            db: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let report = run(&cfg, Path::new("missing-test-config.toml"));
+        assert_eq!(check(&report, "message-caps").status, CheckStatus::Pass);
+        cfg.events.max_event_size = 4 * 1024 * 1024;
+        let report = run(&cfg, Path::new("missing-test-config.toml"));
+        let caps = check(&report, "message-caps");
+        assert_eq!(caps.status, CheckStatus::Warn);
+        assert!(
+            caps.detail.starts_with(
+                "relay.max_websocket_payload_size = 2097152 is too small for \
+                 events.max_event_size = 4194304"
+            ),
+            "{}",
+            caps.detail
+        );
     }
 
     #[test]

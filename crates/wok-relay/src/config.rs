@@ -39,16 +39,18 @@ pub struct Config {
     pub deprecations: Vec<String>,
 }
 
-/// A guard the configuration sets to zero, which disables it, while its
-/// preset does not.
+/// A warning about settings, with the keys it is about, so the dashboard can
+/// show it beside them: a guard set to zero while the preset is not
+/// ([`Config::zero_guards`]), or a message cap too small for the limits
+/// behind it ([`Config::message_caps`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZeroGuard {
+pub struct SettingWarning {
     /// The keys it is about.
     pub keys: Vec<String>,
     pub warning: String,
 }
 
-impl ZeroGuard {
+impl SettingWarning {
     fn new(keys: &[&str], warning: impl Into<String>) -> Self {
         Self {
             keys: keys.iter().map(|key| key.to_string()).collect(),
@@ -1718,7 +1720,7 @@ impl Config {
 
     /// [`zero_guard_warnings`](Self::zero_guard_warnings), each with the
     /// keys it is about, so the dashboard can show it beside them.
-    pub fn zero_guards(&self) -> Vec<ZeroGuard> {
+    pub fn zero_guards(&self) -> Vec<SettingWarning> {
         let preset = self.preset_defaults();
         // Zero here, but not in the preset.
         let zeroed = |value: u64, preset: u64| value == 0 && preset != 0;
@@ -1804,7 +1806,7 @@ impl Config {
                             format!("relay.abuse.{name}_burst"),
                         )
                     };
-                    warnings.push(ZeroGuard::new(
+                    warnings.push(SettingWarning::new(
                         &[&rate, &burst],
                         format!(
                             "relay.abuse {name} budget is zero — that token bucket is disabled (unlimited)"
@@ -1816,19 +1818,19 @@ impl Config {
                 a.max_connections_per_address.into(),
                 p.max_connections_per_address.into(),
             ) {
-                warnings.push(ZeroGuard::new(
+                warnings.push(SettingWarning::new(
                     &["relay.abuse.max_connections_per_address"],
                     "relay.abuse.max_connections_per_address is zero — unlimited",
                 ));
             }
             if zeroed(a.max_query_work, p.max_query_work) {
-                warnings.push(ZeroGuard::new(
+                warnings.push(SettingWarning::new(
                     &["relay.abuse.max_query_work"],
                     "relay.abuse.max_query_work is zero — unlimited",
                 ));
             }
             if zeroed(a.max_stored_events, p.max_stored_events) {
-                warnings.push(ZeroGuard::new(
+                warnings.push(SettingWarning::new(
                     &["relay.abuse.max_stored_events"],
                     "relay.abuse.max_stored_events is zero — unlimited",
                 ));
@@ -1837,7 +1839,7 @@ impl Config {
                 a.max_stored_events_per_pubkey,
                 p.max_stored_events_per_pubkey,
             ) {
-                warnings.push(ZeroGuard::new(
+                warnings.push(SettingWarning::new(
                     &["relay.abuse.max_stored_events_per_pubkey"],
                     "relay.abuse.max_stored_events_per_pubkey is zero — unlimited",
                 ));
@@ -1846,7 +1848,7 @@ impl Config {
         let r = &self.relay;
         let pr = &preset.relay;
         if zeroed(r.max_total_events_per_req, pr.max_total_events_per_req) {
-            warnings.push(ZeroGuard::new(
+            warnings.push(SettingWarning::new(
                 &["relay.max_total_events_per_req"],
                 "relay.max_total_events_per_req is zero — unlimited",
             ));
@@ -1855,7 +1857,7 @@ impl Config {
             r.max_filter_bytes_per_connection as u64,
             pr.max_filter_bytes_per_connection as u64,
         ) {
-            warnings.push(ZeroGuard::new(
+            warnings.push(SettingWarning::new(
                 &["relay.max_filter_bytes_per_connection"],
                 "relay.max_filter_bytes_per_connection is zero — live filter memory per connection is unlimited",
             ));
@@ -1864,28 +1866,94 @@ impl Config {
             r.max_pending_outbound_bytes as u64,
             pr.max_pending_outbound_bytes as u64,
         ) {
-            warnings.push(ZeroGuard::new(
+            warnings.push(SettingWarning::new(
                 &["relay.max_pending_outbound_bytes"],
                 "relay.max_pending_outbound_bytes is zero — slow-client queue is unlimited",
             ));
         }
         if zeroed(r.handshake_timeout_secs, pr.handshake_timeout_secs) {
-            warnings.push(ZeroGuard::new(
+            warnings.push(SettingWarning::new(
                 &["relay.handshake_timeout_secs"],
                 "relay.handshake_timeout_secs is zero — pre-upgrade header read deadline disabled",
             ));
         }
         if zeroed(r.frame_read_timeout_secs, pr.frame_read_timeout_secs) {
-            warnings.push(ZeroGuard::new(
+            warnings.push(SettingWarning::new(
                 &["relay.frame_read_timeout_secs"],
                 "relay.frame_read_timeout_secs is zero — partial-frame trickle guard disabled",
             ));
         }
         if zeroed(r.message_read_timeout_secs, pr.message_read_timeout_secs) {
-            warnings.push(ZeroGuard::new(
+            warnings.push(SettingWarning::new(
                 &["relay.message_read_timeout_secs"],
                 "relay.message_read_timeout_secs is zero — whole-message trickle guard disabled",
             ));
+        }
+        warnings
+    }
+
+    /// Warnings for each message cap too small for a limit behind it:
+    /// `relay.max_websocket_payload_size`, and `relay.unix.max_frame_bytes`
+    /// while the Unix socket is on, must hold an EVENT of
+    /// `events.max_event_size` and a REQ of `relay.max_req_filter_size`, each
+    /// in its shortest envelope. Otherwise such a message passes its own
+    /// limit but is cut off with its connection, so the client gets no `OK`
+    /// or `CLOSED` saying why. Both caps apply at restart; the limits reload
+    /// live.
+    pub fn message_cap_warnings(&self) -> Vec<String> {
+        self.message_caps()
+            .into_iter()
+            .map(|warning| warning.warning)
+            .collect()
+    }
+
+    /// [`message_cap_warnings`](Self::message_cap_warnings), each with the
+    /// keys it is about, so the dashboard can show it beside them.
+    pub fn message_caps(&self) -> Vec<SettingWarning> {
+        // The bytes each message adds to what its limit counts, at least.
+        const EVENT_ENVELOPE: usize = r#"["EVENT",]"#.len();
+        const REQ_ENVELOPE: usize = r#"["REQ","x",]"#.len();
+        let mut caps = vec![(
+            "relay.max_websocket_payload_size",
+            self.relay.max_websocket_payload_size,
+        )];
+        if self.relay.unix.enabled {
+            caps.push((
+                "relay.unix.max_frame_bytes",
+                self.relay.unix.max_frame_bytes,
+            ));
+        }
+        let limits = [
+            (
+                "events.max_event_size",
+                self.events.max_event_size,
+                EVENT_ENVELOPE,
+                "an EVENT whose event takes",
+            ),
+            (
+                "relay.max_req_filter_size",
+                self.relay.max_req_filter_size,
+                REQ_ENVELOPE,
+                "a REQ whose filters take",
+            ),
+        ];
+        let mut warnings = Vec::new();
+        for (cap_key, cap) in caps {
+            for (limit_key, limit, envelope, message) in limits {
+                let needed = limit.saturating_add(envelope);
+                if cap < needed {
+                    warnings.push(SettingWarning::new(
+                        &[cap_key, limit_key],
+                        format!(
+                            "{cap_key} = {cap} is too small for {limit_key} = {limit}: {message} \
+                             more than {} bytes is cut off, and its connection closed, before the \
+                             relay can answer it. Raise {cap_key} to at least {needed} (it applies \
+                             at restart), or lower {limit_key}.",
+                            cap.saturating_sub(envelope)
+                        ),
+                    ));
+                }
+            }
         }
         warnings
     }
@@ -1952,6 +2020,10 @@ impl Config {
         self.observability.log_format = old.observability.log_format;
         self.observability.log_filter = old.observability.log_filter;
         self.observability.metrics_listen = old.observability.metrics_listen;
+        // The caps stay as the relay started, and the limits change now.
+        for warning in self.message_cap_warnings() {
+            tracing::warn!("config reload: {warning}");
+        }
         Ok(())
     }
 }
@@ -3194,6 +3266,78 @@ negentropy_enabled = true
                 "{warning}"
             );
         }
+    }
+
+    #[test]
+    fn message_caps_hold_each_preset_and_warn_one_byte_short() {
+        for &preset in Preset::ALL {
+            let mut cfg = Config::parse_toml(&format!("preset = \"{preset}\"\n")).unwrap();
+            assert_eq!(cfg.message_caps(), [], "preset {preset}");
+            cfg.relay.unix.enabled = true;
+            assert_eq!(cfg.message_caps(), [], "preset {preset} with Unix on");
+        }
+
+        let mut cfg = Config::default();
+        cfg.events.max_event_size = 1000;
+        cfg.relay.max_req_filter_size = 1000;
+        cfg.relay.max_websocket_payload_size = 1012;
+        assert_eq!(cfg.message_caps(), []);
+        cfg.relay.max_websocket_payload_size = 1011;
+        let caps = cfg.message_caps();
+        assert_eq!(caps.len(), 1, "{caps:?}");
+        assert_eq!(
+            caps[0].keys,
+            [
+                "relay.max_websocket_payload_size",
+                "relay.max_req_filter_size"
+            ]
+        );
+        assert_eq!(
+            caps[0].warning,
+            "relay.max_websocket_payload_size = 1011 is too small for \
+             relay.max_req_filter_size = 1000: a REQ whose filters take more than 999 bytes is \
+             cut off, and its connection closed, before the relay can answer it. Raise \
+             relay.max_websocket_payload_size to at least 1012 (it applies at restart), or \
+             lower relay.max_req_filter_size."
+        );
+        cfg.relay.max_websocket_payload_size = 1009;
+        let caps = cfg.message_caps();
+        assert_eq!(caps.len(), 2, "{caps:?}");
+        assert_eq!(
+            caps[0].keys,
+            ["relay.max_websocket_payload_size", "events.max_event_size"]
+        );
+        assert!(caps[0]
+            .warning
+            .contains("an EVENT whose event takes more than 999 bytes"));
+
+        // The Unix frame cap counts only while the socket is on.
+        let mut cfg = Config::default();
+        cfg.events.max_event_size = 4 * 1024 * 1024;
+        cfg.relay.max_websocket_payload_size = 8 * 1024 * 1024;
+        assert_eq!(cfg.message_caps(), []);
+        cfg.relay.unix.enabled = true;
+        let keys: Vec<Vec<String>> = cfg.message_caps().into_iter().map(|w| w.keys).collect();
+        assert_eq!(
+            keys,
+            [["relay.unix.max_frame_bytes", "events.max_event_size"]]
+        );
+        assert_eq!(cfg.message_cap_warnings().len(), 1);
+    }
+
+    #[test]
+    fn a_reload_warns_about_the_caps_the_relay_keeps() {
+        let mut running = Config::default();
+        // The file raises both, but the payload cap waits for a restart.
+        let new = Config::parse_toml(
+            "[events]\nmax_event_size = 4194304\n[relay]\nmax_websocket_payload_size = 8388608\n",
+        )
+        .unwrap();
+        assert_eq!(new.message_caps(), []);
+        running.apply_reload(new).unwrap();
+        assert_eq!(running.relay.max_websocket_payload_size, 2 * 1024 * 1024);
+        assert_eq!(running.events.max_event_size, 4 * 1024 * 1024);
+        assert_eq!(running.message_caps().len(), 1);
     }
 
     #[test]

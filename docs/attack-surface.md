@@ -262,9 +262,12 @@ profile, each phase in a process of its own:
   admits.
 
 A phase the profile closes, such as admin without `admin.enabled`, sends
-nothing. The probe shares its process with the relay, so it signs events,
-frames Unix messages and builds its NIP-77 message without the relay's
-crates: every function counted is one the relay ran.
+nothing. Each phase hangs up its connections and waits until the relay has
+queued their teardown before it stops the relay, so a connection's teardown
+is counted in the phase that opened it. The probe shares its process with
+the relay, so it signs events, frames Unix messages and builds its NIP-77
+message without the relay's crates: every function counted is one the relay
+ran.
 
 From each run it keeps the functions of the relay crates (`wok-relay`,
 `wok-ws`, `wok-unix`, `wok-event`, `wok-query`, `wok-negentropy` and

@@ -10,8 +10,8 @@ use crate::parse::{
     EventLimits, ParsedEvent,
 };
 use crate::{
-    is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind, parse_canonical_a_tag,
-    EventError, EventLimit, DELETION_KIND, MAX_INDEXED_TAG_VAL_SIZE,
+    indexed_tag_value, is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind,
+    parse_canonical_a_tag, EventError, EventLimit, DELETION_KIND, MAX_INDEXED_TAG_VAL_SIZE,
 };
 
 // Re-export helper used by validate; keep json_get_string crate-private in parse
@@ -157,17 +157,21 @@ pub fn verify_strfry_event(packed: PackedEventView<'_>, orig: &Value) -> Result<
 ///
 /// - Every packed tag is a single-letter payload tag: `e` and `p` values as
 ///   the bytes their 64 hex characters decode to (either case, after an
-///   optional `0x`), others as written up to 255 bytes. The exception is the empty `d` strfry adds to kinds 0, 3, 41,
-///   10000-19999 and 30000-39999. A payload tag may be left out.
+///   optional `0x`), others as written up to 255 bytes, or longer ones as
+///   [`indexed_tag_value`] hashes them. The exception is the empty `d`
+///   strfry adds to kinds 0, 3, 41, 10000-19999 and 30000-39999. A payload
+///   tag may be left out, as strfry left out values longer than 255 bytes.
 /// - The first packed `d`, which keys replacement, is the payload's address:
-///   empty for replaceable kinds, and for addressable kinds the first `d`
-///   strfry packs, or empty when there is none.
+///   empty for replaceable kinds, and for addressable kinds the first `d`,
+///   hashed when long. strfry skipped a long one, so then the next `d` of up
+///   to 255 bytes, or empty, is accepted too.
 /// - The expiration is 0, 1 for ephemeral kinds, or the payload's first
 ///   `expiration` tag.
 fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), EventError> {
     let kind = packed.kind();
     let mut carried = HashSet::new();
-    let mut address = None;
+    // The first `d` as Wok packs it, and as strfry did.
+    let (mut address, mut strfry_address) = (None, None);
     let tags = orig.get("tags").and_then(Value::as_array);
     for tag in tags.into_iter().flatten().filter_map(Value::as_array) {
         let Some(name) = tag.first().and_then(Value::as_str) else {
@@ -185,7 +189,7 @@ fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), Ev
             continue;
         };
         let name = name as char;
-        let value = if name == 'e' || name == 'p' {
+        let packed_value = if name == 'e' || name == 'p' {
             if value.len() != 64 {
                 continue;
             }
@@ -193,15 +197,16 @@ fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), Ev
                 continue;
             };
             Cow::Owned(raw)
-        } else if value.len() <= MAX_INDEXED_TAG_VAL_SIZE {
-            Cow::Borrowed(value.as_bytes())
         } else {
-            continue;
+            indexed_tag_value(value.as_bytes())
         };
-        if name == 'd' && address.is_none() {
-            address = Some(value.clone());
+        if name == 'd' {
+            address.get_or_insert_with(|| packed_value.clone());
+            if strfry_address.is_none() && value.len() <= MAX_INDEXED_TAG_VAL_SIZE {
+                strfry_address = Some(packed_value.clone());
+            }
         }
-        carried.insert((name, value));
+        carried.insert((name, packed_value));
     }
 
     let virtual_d = kind == 41 || is_replaceable_kind(kind) || is_param_replaceable_kind(kind);
@@ -230,15 +235,20 @@ fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), Ev
         return Err(EventError::msg(stray));
     }
 
-    let expected = if is_replaceable_kind(kind) {
-        Some(Cow::Borrowed(&b""[..]))
+    let empty = Cow::Borrowed(&b""[..]);
+    let addresses = if is_replaceable_kind(kind) {
+        Some((empty.clone(), empty))
     } else if is_param_replaceable_kind(kind) {
-        Some(address.unwrap_or(Cow::Borrowed(b"")))
+        Some((
+            strfry_address.unwrap_or_else(|| empty.clone()),
+            address.unwrap_or(empty),
+        ))
     } else {
         None
     };
-    if let Some(expected) = expected {
-        if first_d.as_deref() != Some(&expected[..]) {
+    if let Some((strfry, wok)) = addresses {
+        let first_d = first_d.as_deref();
+        if first_d != Some(&strfry[..]) && first_d != Some(&wok[..]) {
             let shown = |d: Option<&[u8]>| {
                 d.map_or("none".into(), |d| {
                     format!("{:?}", String::from_utf8_lossy(d))
@@ -246,8 +256,8 @@ fn check_packed_tags(packed: PackedEventView<'_>, orig: &Value) -> Result<(), Ev
             };
             return Err(EventError::msg(format!(
                 "packed address {} differs from the payload's {}",
-                shown(first_d.as_deref()),
-                shown(Some(&expected)),
+                shown(first_d),
+                shown(Some(&strfry)),
             )));
         }
     }
@@ -646,13 +656,16 @@ mod tests {
             &[('p', &p), ('e', &forged)],
             format!("packed e tag {} is not in the payload", "33".repeat(32)),
         );
-        // A value the payload does not carry, or carries only too long to pack.
+        // A value the payload does not carry.
         stray(
             &[('t', b"wok")],
             r#"packed t tag "wok" is not in the payload"#.into(),
         );
-        let hashed = indexed_tag_value(long.as_bytes());
-        assert!(verify(200, &[('t', &hashed)])
+        // A long value as Wok's ingest packs it, hashed, but not another's
+        // hash.
+        verify(200, &[('t', &indexed_tag_value(long.as_bytes()))]).unwrap();
+        let other = indexed_tag_value(&[b'z'; MAX_INDEXED_TAG_VAL_SIZE + 2]).into_owned();
+        assert!(verify(200, &[('t', &other)])
             .unwrap_err()
             .starts_with("packed t tag "));
         // A multi-letter tag is not indexed.
@@ -710,6 +723,14 @@ mod tests {
         }
         // Kind 41 is regular to Wok, so its empty d is allowed, not needed.
         verify(&event(41, tagged.clone()), 0, &[('d', b"x")]).unwrap();
+        // Wok's ingest packs a long first d hashed, as the address.
+        let hashed = indexed_tag_value(long.as_bytes());
+        verify(
+            &event(30023, tagged.clone()),
+            1000,
+            &[('d', &hashed), ('d', b"x"), ('d', b"")],
+        )
+        .unwrap();
         // Without a d of its own, an addressable event's address is empty.
         verify(&event(30023, json!([])), 0, &[('d', b"")]).unwrap();
         // A payload d listed first moves a replaceable event's address, and

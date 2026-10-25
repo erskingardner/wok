@@ -82,12 +82,15 @@ from the payload as strfry's database version 3 packs them:
 
 - Every packed tag is one of the payload's single-letter tags, an `e` or `p`
   value as the bytes its 64 hex characters decode to and any other value as
-  written, up to 255 bytes. The exception is the empty `d` strfry adds to replaceable and
-  addressable kinds and kind 41. A payload tag the record leaves out is
-  accepted: it only keeps queries from finding the event by that tag.
+  written up to 255 bytes, or hashed as Wok packs a longer one. The exception
+  is the empty `d` strfry adds to replaceable and addressable kinds and kind
+  41. A payload tag the record leaves out is accepted, as strfry left out
+  values longer than 255 bytes: it only keeps queries from finding the event
+  by that tag.
 - The first packed `d`, which keys replacement, is the payload's address:
   empty for a replaceable kind, and for an addressable kind the payload's
-  first `d` of up to 255 bytes, or empty when it has none.
+  first `d`, or empty when it has none. strfry skipped a `d` longer than 255
+  bytes, so for one the next `d`, or empty, is accepted as well as its hash.
 - The packed expiration is 0, 1 for an ephemeral kind, or the payload's first
   `expiration` tag.
 

@@ -800,8 +800,8 @@ Restart settings, file-only. `database.map_size` and
 Live, file-only. A reload that changes any of them is logged as a
 security-scope change, naming the keys added to and removed from
 `admin.pubkeys`. A key taken out of `admin.pubkeys` that still holds the
-NIP-86 `admin` or `moderator` role keeps that level, and membership, until
-the role is unassigned; the reload warns about each one. Each authorized
+NIP-86 `admin` or `moderator` role keeps that level while `admin.enabled`
+is on, until the role is unassigned; the reload warns about each one. Each authorized
 NIP-86 request is logged at `info` with its signer, level and method.
 
 | Key | Default | Meaning |

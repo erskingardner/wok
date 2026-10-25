@@ -1722,7 +1722,7 @@ impl Config {
                 if added.is_empty() {
                     ""
                 } else {
-                    " (each added key is an admin while admin.enabled is on, and a member)"
+                    " (each added key is an admin while admin.enabled is on)"
                 },
             ));
         }
@@ -3484,7 +3484,7 @@ negentropy_enabled = true
                     .to_string(),
                 format!(
                     "admin.pubkeys changed: added [\"{}\"], removed [\"{}\"] (each added key \
-                     is an admin while admin.enabled is on, and a member)",
+                     is an admin while admin.enabled is on)",
                     key(2),
                     key(1)
                 ),

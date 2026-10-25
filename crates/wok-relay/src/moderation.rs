@@ -149,10 +149,14 @@ pub fn removed_admin_roles_warning(
     if held.is_empty() {
         return None;
     }
+    let reach = if cfg.admin.enabled {
+        "can still manage the relay through NIP-86"
+    } else {
+        "can manage the relay through NIP-86 once admin.enabled is on"
+    };
     Some(format!(
-        "admin.pubkeys no longer lists {}; each still holds the NIP-86 role named, so it can \
-         still manage the relay through NIP-86 at that role's level, and is a member. Unassign \
-         the role with the NIP-86 unassignrole method to revoke it",
+        "admin.pubkeys no longer lists {}; each still holds the NIP-86 role named, so it {reach} \
+         at that role's level. Unassign the role with the NIP-86 unassignrole method to revoke it",
         held.join(", ")
     ))
 }
@@ -314,6 +318,15 @@ mod tests {
                 "admin.pubkeys no longer lists {} (moderator); each still holds",
                 to_hex(&moderator)
             )),
+            "{warning}"
+        );
+        assert!(warning.contains("once admin.enabled is on"), "{warning}");
+        let mut enabled = config(&[kept]);
+        enabled.admin.enabled = true;
+        let warning = removed_admin_roles_warning(&previous, &enabled, &snap).unwrap();
+        assert!(
+            warning
+                .contains("so it can still manage the relay through NIP-86 at that role's level."),
             "{warning}"
         );
         // An npub names the same key as its hex.

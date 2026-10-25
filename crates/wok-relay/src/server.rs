@@ -481,12 +481,22 @@ pub struct RelayHandle {
     shutdown_notify: Arc<tokio::sync::Notify>,
     abuse: Arc<AbuseController>,
     config_path: Arc<parking_lot::RwLock<Option<std::path::PathBuf>>>,
+    bound: Arc<parking_lot::RwLock<BoundAddresses>>,
     writer_tx: Sender<WriterMsg>,
     threads: Arc<RelayThreads>,
     /// Each connection's share of the ingest queue, in bytes: the largest
     /// message a transport accepts, as configured at start. A message larger
     /// than the share after a reload takes all of it.
     inbound_share: usize,
+}
+
+/// The addresses the relay's listeners bound at startup, which a reload
+/// cannot change. The warnings a reload logs about who can reach the relay
+/// are checked against them.
+#[derive(Debug, Clone, Default)]
+pub struct BoundAddresses {
+    pub relay: Vec<std::net::SocketAddr>,
+    pub metrics: Option<std::net::SocketAddr>,
 }
 
 /// How long dropping the last `RelayHandle` waits for the relay threads.
@@ -1369,6 +1379,39 @@ impl RelayHandle {
     pub fn config_path(&self) -> Option<std::path::PathBuf> {
         self.config_path.read().clone()
     }
+
+    pub fn set_bound_addresses(&self, bound: BoundAddresses) {
+        *self.bound.write() = bound;
+    }
+
+    /// Install `new` as the running configuration, as the file watcher and
+    /// every dashboard or NIP-86 configuration save do, through
+    /// [`Config::apply_reload`]. Then log the warnings the change newly
+    /// causes that depend on the listeners or the moderation state, so a
+    /// save that installs a pending file edit before the watcher sees it
+    /// logs them too.
+    pub fn reload_config(&self, new: Config) -> Result<(), String> {
+        let (previous, now) = {
+            let mut cfg = self.config.write();
+            let previous = cfg.clone();
+            cfg.apply_reload(new)?;
+            (previous, cfg.clone())
+        };
+        let bound = self.bound.read().clone();
+        let warnings = [
+            now.metrics_reload_warning(&previous, &bound.relay, bound.metrics),
+            now.real_ip_header_reload_warning(&previous, &bound.relay),
+            crate::moderation::removed_admin_roles_warning(
+                &previous,
+                &now,
+                &self.moderation.read(),
+            ),
+        ];
+        for warning in warnings.into_iter().flatten() {
+            tracing::warn!("config reload: {warning}");
+        }
+        Ok(())
+    }
 }
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
@@ -1437,6 +1480,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
         shutdown_notify: shutdown_notify.clone(),
         abuse: abuse.clone(),
         config_path: Arc::new(parking_lot::RwLock::new(None)),
+        bound: Arc::new(parking_lot::RwLock::new(BoundAddresses::default())),
         writer_tx: writer_tx.clone(),
         inbound_share,
         threads: Arc::new(RelayThreads {

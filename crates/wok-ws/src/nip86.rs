@@ -535,21 +535,6 @@ mod tests {
         )
     }
 
-    /// What `execute` logs, as `tracing_subscriber::fmt` writes it.
-    #[derive(Clone, Default)]
-    struct Logs(Arc<parking_lot::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Logs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn each_authorized_request_is_logged_with_its_method() {
         use tracing::instrument::WithSubscriber;
@@ -569,12 +554,7 @@ mod tests {
             // One that runs nothing is logged too.
             (&b"not json"[..], "method=None"),
         ] {
-            let logs = Logs::default();
-            let writer = logs.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
+            let logs = admin::Logs::default();
             let mut reached_writer = false;
             let _ = execute(
                 &handle,
@@ -583,9 +563,9 @@ mod tests {
                 body,
                 &mut reached_writer,
             )
-            .with_subscriber(subscriber)
+            .with_subscriber(logs.subscriber())
             .await;
-            let logs = String::from_utf8(logs.0.lock().clone()).unwrap();
+            let logs = logs.text();
             let line = logs
                 .lines()
                 .find(|line| line.contains("authorized NIP-86 management request"))

@@ -676,8 +676,9 @@ measures:
 `FIO_SECONDS`, `IPERF_SECONDS` and `STEAL_SECONDS` set the durations (60 each).
 `OUT` (default `qualify-<UTC time>`) receives `summary.txt` with the headline
 numbers, next to the raw fio, iperf3 and mpstat output. The script fails when
-either host's average steal is above `STEAL_LIMIT` (1 percent), or mpstat
-recorded none: a host lending its CPUs out does not give repeatable numbers.
+a measurement gives no result, when the CPU load behind the steal check did not
+run, and when either host's average steal is above `STEAL_LIMIT` (1 percent):
+a host lending its CPUs out does not give repeatable numbers.
 Set `BASELINE` to an earlier run's directory, and it also fails when the
 `fdatasync` p99 has moved by more than 2x since then: results from before and
 after do not compare. Both hosts need fio, iperf3, sysstat, numactl, openssl and jq, and

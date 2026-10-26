@@ -58,10 +58,13 @@ validate_settings() {
 
 # Sets SCRATCH to a new directory under DISK_DIR on the relay host.
 create_scratch() {
-    local parent
-    printf -v parent '%q' "${DISK_DIR%/}"
-    SCRATCH=$(remote "$RELAY_SSH" "mkdir -p -- $parent && mktemp -d -- $parent/qualify.XXXXXX")
-    [[ $SCRATCH == "${DISK_DIR%/}"/qualify.?????? ]] || die "unexpected scratch directory: $SCRATCH"
+    local parent=${DISK_DIR%/} quoted scratch
+    printf -v quoted '%q' "$parent"
+    scratch=$(remote "$RELAY_SSH" "mkdir -p -- $quoted && mktemp -d -- $quoted/qualify.XXXXXX")
+    # Only a name mktemp makes, since cleanup removes it.
+    [[ $scratch == "$parent/qualify."* && ${scratch#"$parent/qualify."} =~ ^[A-Za-z0-9]{6}$ ]] ||
+        die "unexpected scratch directory: $scratch"
+    SCRATCH=$scratch
 }
 
 cleanup() {
@@ -90,6 +93,14 @@ host_facts() {
         curl -s --max-time 3 http://169.254.169.254/hetzner/v1/metadata || true' 2>&1
 }
 
+# Records a host's facts in FILE, and shows why when that fails.
+record_facts() {
+    host_facts "$1" >"$2" || {
+        tail -n 3 "$2" >&2
+        die "could not collect facts from $1; see $2"
+    }
+}
+
 fio_job() {
     local name=$1
     shift
@@ -103,10 +114,15 @@ fio_job() {
 steal_check() {
     local host=$1
     local label=$2
+    # Unloaded, the host would show no steal and pass.
     remote "$host" "openssl speed -multi \$(nproc) -seconds $STEAL_SECONDS -bytes 16384 sha256 \
-        >/dev/null 2>&1 &
-        LC_ALL=C S_TIME_FORMAT=ISO mpstat -P ALL 1 $STEAL_SECONDS; status=\$?; wait; exit \$status" \
-        >"$OUT/mpstat-steal-$label.txt"
+            >/dev/null &
+        stress=\$!
+        LC_ALL=C S_TIME_FORMAT=ISO mpstat -P ALL 1 $STEAL_SECONDS
+        sampled=\$?
+        wait \$stress || { echo 'openssl speed failed' >&2; exit 1; }
+        exit \$sampled" >"$OUT/mpstat-steal-$label.txt" 2>"$OUT/steal-$label.log" ||
+        die "the steal check failed on $host; see $OUT/steal-$label.log"
 }
 
 # Prints the average and the largest per-CPU %steal from mpstat output.
@@ -135,22 +151,67 @@ check_steal() {
 }
 
 check_baseline() {
-    local before after
-    before=$(jq '.jobs[0].sync.lat_ns.percentile["99.000000"]' "$BASELINE/fio-fdatasync.json")
-    after=$(jq '.jobs[0].sync.lat_ns.percentile["99.000000"]' "$OUT/fio-fdatasync.json")
+    local p99='.jobs[0].sync.lat_ns.percentile["99.000000"]' before after
+    before=$(number "$BASELINE/fio-fdatasync.json" "$p99") || return
+    after=$(number "$OUT/fio-fdatasync.json" "$p99") || return
     echo "fdatasync p99 against $BASELINE: $before ns then, $after ns now" | tee -a "$OUT/summary.txt"
     ((after <= 2 * before && before <= 2 * after)) ||
         die "fdatasync p99 moved by more than 2x since $BASELINE; see #226 on dedicated hardware"
 }
 
+# Prints the number a jq FILTER gives for FILE, or fails.
+number() {
+    jq -e "$2 | numbers" "$1" 2>/dev/null || {
+        echo "benchmark-qualify: no number for $2 in $1" >&2
+        return 1
+    }
+}
+
 percentile_ms() {
-    jq -r "$1 | (.[\"50.000000\"] / 1e6 | tostring) + \" ms p50, \" +
-        (.[\"99.000000\"] / 1e6 | tostring) + \" ms p99, \" +
-        (.[\"99.900000\"] / 1e6 | tostring) + \" ms p99.9\"" "$2"
+    local p50 p99 p999
+    p50=$(number "$2" "$1[\"50.000000\"] / 1e6") || return
+    p99=$(number "$2" "$1[\"99.000000\"] / 1e6") || return
+    p999=$(number "$2" "$1[\"99.900000\"] / 1e6") || return
+    echo "$p50 ms p50, $p99 ms p99, $p999 ms p99.9"
 }
 
 iperf_line() {
-    jq -r '"\(.end.sum_received.bits_per_second / 1e9 * 100 | round / 100) Gbit/s, \(.end.sum_sent.retransmits // 0) retransmits"' "$1"
+    local rate retransmits
+    rate=$(number "$1" '.end.sum_received.bits_per_second / 1e9 * 100 | round / 100') || return
+    retransmits=$(number "$1" '.end.sum_sent.retransmits // 0') || return
+    echo "$rate Gbit/s, $retransmits retransmits"
+}
+
+# Writes summary.txt from the raw output, failing on any value it lacks.
+write_summary() {
+    local fsync fsync_rate qd1 qd1_iops qd128 qd128_iops ping streams direction line
+    local -a network=()
+    fsync=$(percentile_ms '.jobs[0].sync.lat_ns.percentile' "$OUT/fio-fdatasync.json")
+    fsync_rate=$(number "$OUT/fio-fdatasync.json" '.jobs[0].write.iops | round')
+    qd1=$(percentile_ms '.jobs[0].read.clat_ns.percentile' "$OUT/fio-randread-qd1.json")
+    qd1_iops=$(number "$OUT/fio-randread-qd1.json" '.jobs[0].read.iops | round')
+    qd128=$(percentile_ms '.jobs[0].read.clat_ns.percentile' "$OUT/fio-randread-qd128.json")
+    qd128_iops=$(number "$OUT/fio-randread-qd128.json" '.jobs[0].read.iops | round')
+    ping=$(tail -n 1 "$OUT/ping.txt")
+    [[ $ping == rtt* ]] || die "no round-trip times in $OUT/ping.txt"
+    for streams in 1 8; do
+        for direction in load-to-relay relay-to-load; do
+            line=$(iperf_line "$OUT/iperf3-$direction-p$streams.json")
+            network+=("iperf3 $direction, $streams stream(s): $line")
+        done
+    done
+    {
+        echo "qualification $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "relay $RELAY_SSH, load $LOAD_SSH, relay address $RELAY_HOST"
+        echo
+        echo "fdatasync 4 KiB writes: $fsync, $fsync_rate writes/s"
+        echo "random 4 KiB reads, depth 1: $qd1_iops IOPS, $qd1"
+        echo "random 4 KiB reads, 4x32: $qd128_iops IOPS, $qd128"
+        echo "ping: $ping"
+        printf '%s\n' "${network[@]}"
+        echo "steal on the relay host: $(steal_summary "$OUT/mpstat-steal-relay.txt")"
+        echo "steal on the load host: $(steal_summary "$OUT/mpstat-steal-load.txt")"
+    } | tee "$OUT/summary.txt"
 }
 
 main() {
@@ -161,8 +222,8 @@ main() {
     trap 'exit 130' INT TERM
 
     echo "host facts"
-    host_facts "$RELAY_SSH" >"$OUT/relay-host.txt"
-    host_facts "$LOAD_SSH" >"$OUT/load-host.txt"
+    record_facts "$RELAY_SSH" "$OUT/relay-host.txt"
+    record_facts "$LOAD_SSH" "$OUT/load-host.txt"
 
     echo "disk: ${FIO_SECONDS}s each of 4 KiB fdatasync writes, and 4 KiB random reads at depth 1 and 4x32"
     create_scratch
@@ -193,23 +254,7 @@ main() {
     steal_check "$RELAY_SSH" relay
     steal_check "$LOAD_SSH" load
 
-    {
-        echo "qualification $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "relay $RELAY_SSH, load $LOAD_SSH, relay address $RELAY_HOST"
-        echo
-        echo "fdatasync 4 KiB writes: $(percentile_ms '.jobs[0].sync.lat_ns.percentile' "$OUT/fio-fdatasync.json"), $(jq -r '.jobs[0].write.iops | round' "$OUT/fio-fdatasync.json") writes/s"
-        echo "random 4 KiB reads, depth 1: $(jq -r '.jobs[0].read.iops | round' "$OUT/fio-randread-qd1.json") IOPS, $(percentile_ms '.jobs[0].read.clat_ns.percentile' "$OUT/fio-randread-qd1.json")"
-        echo "random 4 KiB reads, 4x32: $(jq -r '.jobs[0].read.iops | round' "$OUT/fio-randread-qd128.json") IOPS, $(percentile_ms '.jobs[0].read.clat_ns.percentile' "$OUT/fio-randread-qd128.json")"
-        echo "ping: $(tail -1 "$OUT/ping.txt")"
-        for streams in 1 8; do
-            for direction in load-to-relay relay-to-load; do
-                echo "iperf3 $direction, $streams stream(s): $(iperf_line "$OUT/iperf3-$direction-p$streams.json")"
-            done
-        done
-        echo "steal on the relay host: $(steal_summary "$OUT/mpstat-steal-relay.txt")"
-        echo "steal on the load host: $(steal_summary "$OUT/mpstat-steal-load.txt")"
-    } | tee "$OUT/summary.txt"
-
+    write_summary
     check_steal
     if [[ -n $BASELINE ]]; then
         check_baseline

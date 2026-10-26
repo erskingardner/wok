@@ -100,6 +100,14 @@ class Scratch(unittest.TestCase):
         self.assertFalse(scratch.exists())
         self.assertTrue(self.unrelated.exists())
 
+    def test_an_unexpected_scratch_path_is_never_removed(self):
+        result = qualify('remote() { echo "$DISK_DIR/qualify.a/../b"; }; '
+                         'trap \'echo "scratch=[$SCRATCH]"\' EXIT; create_scratch',
+                         DISK_DIR=str(self.parent))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unexpected scratch directory', result.stderr)
+        self.assertEqual(result.stdout, 'scratch=[]\n')
+
     def test_early_failure_leaves_the_disk_alone(self):
         fail_host_facts = ('remote() { shift; [[ $1 == *"missing tool"* ]] && return 1; '
                            'bash -c "$1"; }; ssh() { :; }; ')
@@ -155,6 +163,105 @@ class Gates(unittest.TestCase):
                     self.assertIn('moved by more than 2x', result.stderr)
 
 
+class StealCheck(unittest.TestCase):
+    """steal_check against this machine, with openssl, mpstat and nproc faked."""
+
+    def run_check(self, openssl_status, mpstat_status):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp)/'bin'
+            bin_dir.mkdir()
+            fixture = Path(tmp)/'mpstat.txt'
+            fixture.write_text(MPSTAT)
+            for name, body in [('openssl', f'exit {openssl_status}'),
+                               ('mpstat', f'cat "{fixture}"; exit {mpstat_status}'),
+                               ('nproc', 'echo 2')]:
+                (bin_dir/name).write_text(f'#!/bin/sh\n{body}\n')
+                (bin_dir/name).chmod(0o755)
+            result = qualify('remote() { bash -c "$2"; }; steal_check root@load load',
+                             OUT=tmp, PATH=f'{bin_dir}:{os.environ["PATH"]}')
+            sampled = (Path(tmp)/'mpstat-steal-load.txt').read_text()
+        return result, sampled
+
+    def test_loaded_and_sampled_passes(self):
+        result, sampled = self.run_check(0, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sampled, MPSTAT)
+
+    def test_failed_stress_or_sampling_fails(self):
+        for openssl_status, mpstat_status in [(1, 0), (0, 1)]:
+            with self.subTest(openssl=openssl_status, mpstat=mpstat_status):
+                result, _ = self.run_check(openssl_status, mpstat_status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('the steal check failed on root@load', result.stderr)
+
+
+class Summary(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+        percentiles = {'50.000000': 765952, '99.000000': 1417216, '99.900000': 3358720}
+        self.write('fio-fdatasync.json', {'jobs': [{
+            'sync': {'lat_ns': {'percentile': percentiles}}, 'write': {'iops': 1416.8}}]})
+        for name in ['randread-qd1', 'randread-qd128']:
+            self.write(f'fio-{name}.json', {'jobs': [{
+                'read': {'iops': 6981.2, 'clat_ns': {'percentile': percentiles}}}]})
+        for streams in [1, 8]:
+            for direction in ['load-to-relay', 'relay-to-load']:
+                self.write(f'iperf3-{direction}-p{streams}.json', {'end': {
+                    'sum_received': {'bits_per_second': 7.434e9},
+                    'sum_sent': {'retransmits': 2139}}})
+        (self.out/'ping.txt').write_text(
+            '100 packets transmitted, 100 received, 0% packet loss, time 20189ms\n'
+            'rtt min/avg/max/mdev = 0.543/0.810/4.074/0.449 ms\n')
+        for host in ['relay', 'load']:
+            (self.out/f'mpstat-steal-{host}.txt').write_text(MPSTAT)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, value):
+        (self.out/name).write_text(json.dumps(value))
+
+    def test_summary_lines(self):
+        result = qualify('write_summary', OUT=str(self.out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = (self.out/'summary.txt').read_text().splitlines()
+        self.assertEqual(lines[3:], [
+            'fdatasync 4 KiB writes: 0.765952 ms p50, 1.417216 ms p99, 3.35872 ms p99.9, '
+            '1417 writes/s',
+            'random 4 KiB reads, depth 1: 6981 IOPS, 0.765952 ms p50, 1.417216 ms p99, '
+            '3.35872 ms p99.9',
+            'random 4 KiB reads, 4x32: 6981 IOPS, 0.765952 ms p50, 1.417216 ms p99, '
+            '3.35872 ms p99.9',
+            'ping: rtt min/avg/max/mdev = 0.543/0.810/4.074/0.449 ms',
+            'iperf3 load-to-relay, 1 stream(s): 7.43 Gbit/s, 2139 retransmits',
+            'iperf3 relay-to-load, 1 stream(s): 7.43 Gbit/s, 2139 retransmits',
+            'iperf3 load-to-relay, 8 stream(s): 7.43 Gbit/s, 2139 retransmits',
+            'iperf3 relay-to-load, 8 stream(s): 7.43 Gbit/s, 2139 retransmits',
+            'steal on the relay host: average 1.00%, worst CPU-second 2.5%',
+            'steal on the load host: average 1.00%, worst CPU-second 2.5%',
+        ])
+
+    def test_a_missing_value_fails(self):
+        cases = {
+            'percentile': ('fio-randread-qd128.json', {'jobs': [{'read': {'iops': 1}}]}),
+            'rate': ('iperf3-relay-to-load-p8.json', {'end': {}}),
+            'invalid json': ('fio-fdatasync.json', None),
+        }
+        for case, (name, value) in cases.items():
+            with self.subTest(case=case):
+                original = (self.out/name).read_text()
+                if value is None:
+                    (self.out/name).write_text('{')
+                else:
+                    self.write(name, value)
+                result = qualify('write_summary', OUT=str(self.out))
+                (self.out/name).write_text(original)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('no number for', result.stderr)
+                self.assertIn(name, result.stderr)
+
+
 class Summaries(unittest.TestCase):
     def test_steal_reads_the_steal_column(self):
         with tempfile.NamedTemporaryFile('w', suffix='.txt') as mpstat:
@@ -163,23 +270,6 @@ class Summaries(unittest.TestCase):
             result = qualify('steal_summary "$1"', mpstat.name)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, 'average 1.00%, worst CPU-second 2.5%')
-
-    def test_fio_and_iperf_lines(self):
-        fio = {'jobs': [{'sync': {'lat_ns': {'percentile': {
-            '50.000000': 765952, '99.000000': 1417216, '99.900000': 3358720}}}}]}
-        iperf = {'end': {'sum_received': {'bits_per_second': 7.434e9},
-                         'sum_sent': {'retransmits': 2139}}}
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp)/'fio.json').write_text(json.dumps(fio))
-            (Path(tmp)/'iperf.json').write_text(json.dumps(iperf))
-            result = qualify(
-                'percentile_ms ".jobs[0].sync.lat_ns.percentile" "$1/fio.json"; '
-                'iperf_line "$1/iperf.json"', tmp)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            '0.765952 ms p50, 1.417216 ms p99, 3.35872 ms p99.9',
-            '7.43 Gbit/s, 2139 retransmits',
-        ])
 
     def test_cpu_stress_lasts_as_long_as_the_sampling(self):
         # openssl speed spends -seconds on each buffer size it tries.

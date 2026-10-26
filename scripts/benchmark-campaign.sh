@@ -91,7 +91,8 @@ validate_settings() {
     local -a steps
     read -r -a steps <<<"$RATE_STEPS"
     local step previous=0
-    for step in "${steps[@]}"; do
+    # Bash before 4.4 calls an empty array unbound under set -u.
+    for step in ${steps[@]+"${steps[@]}"}; do
         if [[ ! $step =~ ^[1-9][0-9]*$ ]] || ((step <= previous)); then
             die "RATE_STEPS must list rising positive integers"
         fi

@@ -311,6 +311,20 @@ class CampaignSettings(unittest.TestCase):
                                RATE_STEPS='1000 2000  5000')
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    @unittest.skipUnless(
+        Path('/bin/bash').exists() and subprocess.run(
+            ['/bin/bash', '-c', 'echo ${BASH_VERSINFO[0]}'],
+            capture_output=True, text=True).stdout.strip() == '3',
+        'needs Bash 3.2 at /bin/bash, as on macOS')
+    def test_settings_validate_under_bash_3_without_rate_steps(self):
+        # The operator host may be a Mac, whose system Bash is 3.2.
+        env = {**os.environ, **self.REQUIRED}
+        env.pop('RATE_STEPS', None)
+        result = subprocess.run(
+            ['/bin/bash', '-c', 'source "$1"; validate_settings', 'bash', str(CAMPAIGN)],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     # Commands sent to either host run here instead.
     LOCAL_HOSTS = 'remote_command() { shift; "$@"; }; '
 

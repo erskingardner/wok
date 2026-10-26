@@ -37,9 +37,9 @@ Ask of every feature an anonymous client can reach in the `default` and
 client, need it? If not, put it behind a setting that is off by default, or
 off in the preset.
 
-Evidence: `scripts/attack-surface-reach.py` (needs `cargo-llvm-cov` and the
-`llvm-tools-preview` component) lists the relay functions each caller
-reaches, per profile, in `crates/wok-compat/tests/reachability/`.
+Evidence: `scripts/attack-surface-reach.py` (needs `cargo-llvm-cov`,
+`rustfilt` and the `llvm-tools-preview` component) lists the relay functions
+each caller reaches, per profile, in `crates/wok-compat/tests/reachability/`.
 
 ```bash
 scripts/attack-surface-reach.py --check    # fails on new reach, an emptied phase, or a missing baseline

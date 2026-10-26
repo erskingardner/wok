@@ -55,10 +55,12 @@ def run(cmd, **kwargs):
     try:
         return subprocess.run(cmd, check=True, cwd=ROOT, **kwargs)
     except subprocess.CalledProcessError as failed:
-        # A captured stderr is otherwise lost, and with it why the command failed.
-        if failed.stderr:
-            err = failed.stderr
-            sys.stderr.write(err if isinstance(err, str) else err.decode(errors="replace"))
+        # Captured output is otherwise lost, and with it why the command failed:
+        # cargo writes its errors to stderr, libtest a failing test's to stdout.
+        for captured in (failed.stdout, failed.stderr):
+            if captured:
+                text = captured if isinstance(captured, str) else captured.decode(errors="replace")
+                sys.stderr.write(text)
         raise
 
 

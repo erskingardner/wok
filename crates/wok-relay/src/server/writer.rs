@@ -12,11 +12,10 @@ pub(super) struct TagKindStep {
 }
 
 /// A step stops after 10 ms of indexing, plus its commit, so publications
-/// during a backfill are acknowledged about as fast as without one. An
-/// entry cap alone let a step that hit cold pages run for most of a second.
+/// during a backfill are acknowledged about as fast as without one.
 pub(super) const TAG_KIND_STEP: TagKindStep = TagKindStep {
-    max_entries: 5_000,
-    budget: Duration::from_millis(10),
+    max_entries: wok_db::TAG_KIND_STEP_ENTRIES,
+    budget: wok_db::TAG_KIND_STEP_BUDGET,
 };
 /// How often a running backfill logs its progress.
 const TAG_KIND_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
@@ -570,11 +569,13 @@ pub(super) fn run_writer(
 /// Builds `wok_Event__tagKind` in the background, one bounded write
 /// transaction at a time: by a key-ordered pass for a database from before
 /// the index, and in local-id order for the events an earlier release
-/// inserted.
+/// inserted. While a `wok import` holds the build with its lease, it waits,
+/// and each maintenance tick checks again.
 pub(super) struct TagKindBackfill {
     step: TagKindStep,
     pending: bool,
     paused_for_disk: bool,
+    leased: bool,
     run: Option<TagKindBackfillRun>,
 }
 
@@ -591,6 +592,7 @@ impl TagKindBackfill {
             step,
             pending: false,
             paused_for_disk: false,
+            leased: false,
             run: None,
         }
     }
@@ -611,7 +613,10 @@ impl TagKindBackfill {
         match state {
             Ok(Some((state, tag_entries))) => {
                 publish_tag_kind_state(metrics, state, tag_entries);
-                if state.schema == Some(wok_db::TAG_KIND_SCHEMA_VERSION) && !state.complete() {
+                if state.schema == Some(wok_db::TAG_KIND_SCHEMA_VERSION)
+                    && !state.complete()
+                    && !self.wait_for_lease(state)
+                {
                     self.pending = true;
                 }
             }
@@ -673,6 +678,11 @@ impl TagKindBackfill {
             }
         };
         let state = step.state;
+        if self.wait_for_lease(state) {
+            publish_tag_kind_state(metrics, state, step.tag_entries);
+            self.pending = false;
+            return;
+        }
         tracing::debug!(
             entries = step.entries,
             prepared = step.prepared,
@@ -739,6 +749,22 @@ impl TagKindBackfill {
             }
         }
         self.pending = !complete;
+    }
+}
+
+impl TagKindBackfill {
+    /// Whether a `wok import` holds the build, logging when it starts and
+    /// stops holding it.
+    fn wait_for_lease(&mut self, state: wok_db::TagKindIndexState) -> bool {
+        let leased = state.leased();
+        if leased && !self.leased {
+            tracing::info!(
+                high_water = state.high_water,
+                "a `wok import` is loading events and will build the (tag, kind, created_at) index itself; the background build waits until it lets go"
+            );
+        }
+        self.leased = leased;
+        leased
     }
 }
 
@@ -1217,6 +1243,74 @@ mod tests {
         let txn = env.begin_ro().unwrap();
         assert_eq!(txn.entries(env.dbis().event).unwrap(), 50);
         assert_eq!(txn.entries(env.dbis().event_tag_kind.unwrap()).unwrap(), 2);
+    }
+
+    #[test]
+    fn backfill_leaves_the_build_to_an_import_that_holds_the_lease() {
+        // An import batch that left its events' entries to a key-ordered
+        // pass, as `wok import` writes into a new database.
+        let import_batch = |env: &Env, from: u64| {
+            let mut events: Vec<_> = (from..from + 20)
+                .map(|n| {
+                    let (packed, json) = gift_wrap(n);
+                    EventToWrite::new(packed, json)
+                })
+                .collect();
+            let mut txn = env.begin_rw().unwrap();
+            let deferred = wok_db::defer_tag_kind_postings(&mut txn).unwrap();
+            wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false)
+                .unwrap();
+            txn.commit().unwrap();
+            deferred
+        };
+        let run = |env: &Env, metrics: &Arc<Metrics>| {
+            let (writer_tx, writer_rx) = bounded(4);
+            writer_tx.send(WriterMsg::Maintenance).unwrap();
+            drop(writer_tx);
+            run_writer(
+                env.clone(),
+                Arc::new(parking_lot::RwLock::new(Config {
+                    db: env.path().to_path_buf(),
+                    ..Config::default()
+                })),
+                Arc::new(ConnTable::new()),
+                metrics.clone(),
+                writer_rx,
+                Vec::new(),
+                moderation(env),
+                TEN_ENTRIES,
+            );
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        assert!(import_batch(&env, 0));
+        let metrics = Arc::new(Metrics::default());
+
+        // At startup and on the maintenance tick the index is incomplete,
+        // but the writer starts no pass under the import.
+        run(&env, &metrics);
+        let held = tag_kind_state(&env);
+        assert!(held.leased() && held.bulk_pass.is_none());
+        assert_eq!(
+            metrics
+                .tag_kind_backfill_entries_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        // So the import's next batch defers too.
+        assert!(import_batch(&env, 20));
+
+        // Once the import gives the lease up, the writer builds again: a step
+        // before the maintenance message and one after it.
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::release_tag_kind_lease(&mut txn).unwrap();
+        txn.commit().unwrap();
+        run(&env, &metrics);
+        assert_eq!(
+            tag_kind_state(&env).bulk_pass.map(|pass| pass.visited),
+            Some(20)
+        );
     }
 
     #[test]

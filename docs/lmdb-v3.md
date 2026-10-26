@@ -204,13 +204,15 @@ kinds:
   high-water mark once it reaches the newest.
 
 A key-ordered pass keeps its progress in `wok_Event__tagKindBuild`, a Wok
-table with the default comparator and no flags, empty when no pass runs:
+table with the default comparator and no flags, empty when no pass runs and
+no import holds the build:
 
 | key | value |
 |---|---|
 | `target` | u64 local ID: the high-water mark when the pass began |
 | `visited` | u64: `Event__tag` entries visited so far |
 | `cursor` | the last `Event__tag` key visited, then its local ID as a u64 |
+| `lease` | u64 Unix time in milliseconds: until when a `wok import` holds the build (see [After an import](#after-an-import)) |
 
 Values are native-endian. The pass resumes after the cursor, so a restart
 loses at most the step it interrupted. Emptying `wok_Event__tagKind` (a new
@@ -225,14 +227,24 @@ writes its events without their entries and leaves the marker at 0. That is
 the state in which the next step begins a key-ordered pass, and a pass that
 begins after the batch commits covers its events. Deletions in the batch
 still remove entries. Once the last batch is written, the import runs that
-pass to the end, in transactions of up to a million postings, so the index
-is complete when it exits; a database that already held events at marker 0
-gets their entries too. Building in key order after the load writes a
-fraction of the pages that entries put in arrival order rewrite. An import
-stopped before then leaves the index incomplete, and the relay's writer
-finishes it in the background. Batches that find the index complete, a pass
-running, or a gap above a nonzero marker write their entries as above, and
-the import builds nothing.
+pass to the end, in the writer's steps of 5,000 postings or 10 ms, so the
+index is complete when it exits and a relay writing to the same database
+waits no longer for a step than it does for its own; a database that already
+held events at marker 0 gets their entries too. Building in key order after
+the load writes a fraction of the pages that entries put in arrival order
+rewrite. Batches that find the index complete, a pass running, or a gap above
+a nonzero marker write their entries as above, and the import builds nothing.
+
+A batch that leaves its entries out also sets `lease` two minutes ahead as it
+finishes writing, and the import renews it every 30 seconds while it waits
+for input. While the lease holds, the relay's writer takes no step: a pass it
+began after the first batch would make every later batch write its entries,
+and leave their events to local-ID steps once it ended. The import deletes
+the lease when its own pass begins. An import stopped before then leaves the
+index incomplete with a lease that runs out within two minutes; the writer
+then deletes it and builds the index in the background. One stopped during
+its pass leaves the pass for the writer to resume. A lease more than two
+minutes ahead, as a clock set back would leave, counts as run out.
 
 A batch never moves the marker past events whose entries it left out, and
 never changes a running pass's target: a pass covers exactly the events

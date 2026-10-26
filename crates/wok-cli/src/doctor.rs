@@ -446,6 +446,7 @@ fn check_tag_kind_index(tag_kind: Option<&TagKindIndexReport>, report: &mut Doct
             status = CheckStatus::Warn;
         }
         details.push(match state.bulk_pass {
+            _ if state.leased() => "a `wok import` is loading events and builds the index once they are written".to_string(),
             Some(pass) => format!(
                 "being built in key order: {} of {} tag entries visited; the relay continues in the background, or {REINDEX} builds it now",
                 pass.visited, tag_kind.tag_entries
@@ -1031,6 +1032,25 @@ mod tests {
             tag_kind
                 .detail
                 .starts_with("1 missing and 0 mismatched entry"),
+            "{}",
+            tag_kind.detail
+        );
+
+        // An import loading into the emptied index holds its build.
+        let env = reopen();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::reset_tag_kind_index(&mut txn).unwrap();
+        assert!(wok_db::defer_tag_kind_postings(&mut txn).unwrap());
+        txn.commit().unwrap();
+        drop(env);
+        let report = run(&cfg, Path::new("missing-test-config.toml"));
+        assert_eq!(check(&report, "integrity").status, CheckStatus::Pass);
+        let tag_kind = check(&report, "tag-kind-index");
+        assert_eq!(tag_kind.status, CheckStatus::Warn);
+        assert!(
+            tag_kind
+                .detail
+                .starts_with("a `wok import` is loading events"),
             "{}",
             tag_kind.detail
         );

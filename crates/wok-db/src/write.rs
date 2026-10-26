@@ -8,7 +8,8 @@ use crate::keys::{
 use crate::payload::{encode_raw_payload, Decompressor};
 use crate::search::{index_event_search, note_search_indexed_through, remove_event_search};
 use crate::tag_kind::{
-    del_tag_kind_entries, note_tag_kind_indexed, put_tag_kind_entries, tag_kind_keys,
+    del_tag_kind_entries, note_tag_kind_indexed, put_tag_kind_entries, renew_tag_kind_lease,
+    tag_kind_keys,
 };
 use crate::txn::RwTxn;
 use crate::vanish::{is_event_vanished_rw, mark_vanished, VanishPolicy, VANISH_KIND};
@@ -951,12 +952,13 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
     if let Some(lev_id) = indexed_through {
         note_search_indexed_through(txn, lev_id)?;
     }
-    if let (Some(first), Some(last)) = (first_inserted, indexed_through) {
+    if txn.defer_tag_kind {
         // Moving the marker past events whose postings were deferred would
-        // mark the table complete without them.
-        if !txn.defer_tag_kind {
-            note_tag_kind_indexed(txn, first, last)?;
-        }
+        // mark the table complete without them. The lease runs from here,
+        // not from the batch's start, so a long batch does not use it up.
+        renew_tag_kind_lease(txn)?;
+    } else if let (Some(first), Some(last)) = (first_inserted, indexed_through) {
+        note_tag_kind_indexed(txn, first, last)?;
     }
 
     Ok(())

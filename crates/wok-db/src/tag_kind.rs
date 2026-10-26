@@ -29,7 +29,10 @@
 //!
 //! A bulk load into a table that such a pass would build anyway, at marker 0
 //! with no pass running, may leave its events' postings to the pass
-//! ([`defer_tag_kind_postings`]); `wok import` does, then runs the pass.
+//! ([`defer_tag_kind_postings`]); `wok import` does, then runs the pass. While
+//! it loads, a lease in `wok_Event__tagKindBuild` keeps other writers'
+//! backfill from starting the pass under it: once a pass runs, the load's
+//! later batches post their own events again.
 //!
 //! An earlier Wok release does not open these tables. The events it inserts take
 //! ids above the marker, so the index stays incomplete until they are indexed.
@@ -42,7 +45,7 @@ use crate::keys::make_key_string_u64_u64;
 use crate::{DbError, RoTxn, RwTxn};
 use lmdb_sys::MDB_dbi;
 use serde::Serialize;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wok_event::PackedEventView;
 
 /// Marker keys are shorter than the 16 bytes of a posting's two integers, so
@@ -51,10 +54,25 @@ const SCHEMA_KEY: &[u8] = b"\0schema";
 const INDEXED_THROUGH_KEY: &[u8] = b"\0through";
 
 /// Keys of `wok_Event__tagKindBuild`, which holds a key-ordered pass while
-/// one runs and nothing otherwise.
+/// one runs, a bulk load's lease while one holds the build, and nothing
+/// otherwise.
 const PASS_TARGET_KEY: &[u8] = b"target";
 const PASS_VISITED_KEY: &[u8] = b"visited";
 const PASS_CURSOR_KEY: &[u8] = b"cursor";
+const LEASE_KEY: &[u8] = b"lease";
+
+/// How long a bulk load holds the build after it last renewed its lease. A
+/// load renews it as each batch commits and while it waits for input, so this
+/// covers one commit; a load that died holds the build up for at most this.
+pub const TAG_KIND_LEASE: Duration = Duration::from_secs(120);
+
+/// Bounds on one backfill transaction, which publications wait behind: it
+/// stops after this many postings or this much indexing, whichever comes
+/// first. Ten milliseconds keeps publications during a build acknowledged
+/// about as fast as without one; an entry cap alone let a step that hit cold
+/// pages run for most of a second.
+pub const TAG_KIND_STEP_ENTRIES: usize = 5_000;
+pub const TAG_KIND_STEP_BUDGET: Duration = Duration::from_millis(10);
 
 /// The key layout this release reads and writes.
 pub const TAG_KIND_SCHEMA_VERSION: u64 = 1;
@@ -100,6 +118,9 @@ pub struct TagKindIndexState {
     pub high_water: u64,
     /// The key-ordered pass that builds the table, while one runs.
     pub bulk_pass: Option<TagKindBulkPass>,
+    /// Unix time in milliseconds until which a bulk load holds the build, as
+    /// stored; [`TagKindIndexState::leased`] says whether that is now.
+    pub lease_until: Option<u64>,
 }
 
 /// A key-ordered pass over `Event__tag` that builds the table from marker 0.
@@ -117,6 +138,28 @@ impl TagKindIndexState {
     pub fn complete(&self) -> bool {
         self.schema == Some(TAG_KIND_SCHEMA_VERSION) && self.indexed_through >= self.high_water
     }
+
+    /// Whether a bulk load holds the build now, so that backfill steps leave
+    /// the table to it.
+    pub fn leased(&self) -> bool {
+        lease_holds(self.lease_until, unix_millis())
+    }
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Whether a lease that runs until `until` holds at `now`. One further ahead
+/// than [`TAG_KIND_LEASE`], which only a clock set back leaves, has lapsed, so
+/// that the clock cannot hold the build up for longer than a lease.
+fn lease_holds(until: Option<u64>, now: u64) -> bool {
+    let longest = u64::try_from(TAG_KIND_LEASE.as_millis()).unwrap_or(u64::MAX);
+    until.is_some_and(|until| now < until && until <= now.saturating_add(longest))
 }
 
 fn marker(value: Option<&[u8]>) -> Option<u64> {
@@ -134,18 +177,22 @@ pub fn tag_kind_index_state_ro(txn: &RoTxn<'_>) -> Result<Option<TagKindIndexSta
         None => None,
     };
     let high_water = high_water(sequence, txn.largest_integer_key(txn.env().dbis().event)?);
-    let bulk_pass = match txn.env().dbis().event_tag_kind_build {
-        Some(build) => read_pass(
-            txn.get(build, PASS_TARGET_KEY)?,
-            txn.get(build, PASS_VISITED_KEY)?,
+    let (bulk_pass, lease_until) = match txn.env().dbis().event_tag_kind_build {
+        Some(build) => (
+            read_pass(
+                txn.get(build, PASS_TARGET_KEY)?,
+                txn.get(build, PASS_VISITED_KEY)?,
+            ),
+            marker(txn.get(build, LEASE_KEY)?),
         ),
-        None => None,
+        None => (None, None),
     };
     Ok(Some(TagKindIndexState {
         schema: marker(txn.get(dbi, SCHEMA_KEY)?),
         indexed_through: marker(txn.get(dbi, INDEXED_THROUGH_KEY)?).unwrap_or(0),
         high_water,
         bulk_pass,
+        lease_until,
     }))
 }
 
@@ -265,8 +312,14 @@ pub(crate) fn note_tag_kind_indexed(
 /// theirs. Returns whether `txn` defers; in any other state it posts as usual.
 ///
 /// For a bulk load, which in key order writes a fraction of the pages that
-/// postings in arrival order rewrite. `wok import` runs the pass before it
-/// exits; stopped earlier, the relay's writer finishes it.
+/// postings in arrival order rewrite. A deferring transaction holds the build
+/// for [`TAG_KIND_LEASE`] from its commit: until then, backfill steps leave
+/// the table alone, so the load's next batch still finds no pass and defers
+/// too. Without the lease, a relay on the same database would start the pass
+/// after the first batch, and the later ones would post in arrival order. A
+/// transaction that writes no events only renews the lease. `wok import` runs
+/// the pass before it exits ([`release_tag_kind_lease`]); stopped earlier,
+/// the relay's writer finishes it once the lease lapses.
 pub fn defer_tag_kind_postings(txn: &mut RwTxn<'_>) -> Result<bool, DbError> {
     let dbis = txn.env().dbis();
     let (Some(dbi), Some(build)) = (dbis.event_tag_kind, dbis.event_tag_kind_build) else {
@@ -280,7 +333,31 @@ pub fn defer_tag_kind_postings(txn: &mut RwTxn<'_>) -> Result<bool, DbError> {
         )
         .is_none();
     txn.defer_tag_kind = unbuilt;
+    if unbuilt {
+        renew_tag_kind_lease(txn)?;
+    }
     Ok(unbuilt)
+}
+
+/// Hold the build for [`TAG_KIND_LEASE`] from now. The write path renews it
+/// again as a deferring transaction ends, so the lease runs from its commit.
+pub(crate) fn renew_tag_kind_lease(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
+    let Some(build) = txn.env().dbis().event_tag_kind_build else {
+        return Ok(());
+    };
+    let longest = u64::try_from(TAG_KIND_LEASE.as_millis()).unwrap_or(u64::MAX);
+    let until = unix_millis().saturating_add(longest);
+    txn.put(build, LEASE_KEY, &until.to_ne_bytes(), 0)?;
+    Ok(())
+}
+
+/// Give up a bulk load's hold on the build, as the load's own pass begins, so
+/// that backfill steps from any writer may continue the pass.
+pub fn release_tag_kind_lease(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
+    if let Some(build) = txn.env().dbis().event_tag_kind_build {
+        txn.del(build, LEASE_KEY, None)?;
+    }
+    Ok(())
 }
 
 /// Empty the table and restart its marker at 0, so that the backfill indexes
@@ -309,7 +386,8 @@ pub struct TagKindBackfillStep {
 
 /// Do one bounded step of the backfill in `txn`. A table at marker 0 with
 /// events stored is built by a key-ordered pass over `Event__tag`; anything
-/// else above the marker is indexed in local-id order. A step stops after
+/// else above the marker is indexed in local-id order. While a bulk load's
+/// lease holds, the step does nothing and its state says so. A step stops after
 /// `max_entries` postings, or once it has run for `budget`, whichever comes
 /// first, and always makes some progress. It reads ahead in chunks of
 /// [`STEP_CHUNK`], so the budget bounds preparing postings too. `None` when
@@ -346,6 +424,26 @@ pub fn backfill_tag_kind_index(
             txn.get(build, PASS_TARGET_KEY)?,
             txn.get(build, PASS_VISITED_KEY)?,
         );
+        let lease_until = marker(txn.get(build, LEASE_KEY)?);
+        if lease_holds(lease_until, unix_millis()) {
+            // A bulk load holds the build; it runs the pass itself.
+            return Ok(Some(TagKindBackfillStep {
+                entries: 0,
+                prepared: 0,
+                tag_entries,
+                state: TagKindIndexState {
+                    schema: Some(TAG_KIND_SCHEMA_VERSION),
+                    indexed_through: through,
+                    high_water,
+                    bulk_pass: pass,
+                    lease_until,
+                },
+            }));
+        }
+        if lease_until.is_some() {
+            // Lapsed: the load that took it stopped before its pass.
+            txn.del(build, LEASE_KEY, None)?;
+        }
         if pass.is_none() && through == 0 && txn.entries(dbis.event)? != 0 {
             // A new pass covers every event stored when it begins.
             txn.clear(build)?;
@@ -373,6 +471,7 @@ pub fn backfill_tag_kind_index(
             indexed_through,
             high_water,
             bulk_pass: pass,
+            lease_until: None,
         },
     }))
 }
@@ -580,7 +679,7 @@ fn read_cursor(raw: &[u8]) -> Option<(Vec<u8>, u64)> {
 /// Whether `wok_Event__tagKindBuild` holds `key` with a value of this shape.
 pub(crate) fn is_valid_pass_record(key: &[u8], value: &[u8]) -> bool {
     match key {
-        PASS_TARGET_KEY | PASS_VISITED_KEY => value.len() == 8,
+        PASS_TARGET_KEY | PASS_VISITED_KEY | LEASE_KEY => value.len() == 8,
         PASS_CURSOR_KEY => read_cursor(value).is_some(),
         _ => false,
     }
@@ -1031,10 +1130,25 @@ mod tests {
         deferred
     }
 
+    /// Give up the lease as `wok import` does when its own pass begins.
+    fn release(env: &Env) {
+        let mut txn = env.begin_rw().unwrap();
+        release_tag_kind_lease(&mut txn).unwrap();
+        txn.commit().unwrap();
+    }
+
     fn build(env: &Env) {
+        release(env);
         while !state(env).complete() {
             step(env, 7);
         }
+    }
+
+    fn set_lease(env: &Env, until: u64) {
+        let build = env.dbis().event_tag_kind_build.unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        txn.put(build, LEASE_KEY, &until.to_ne_bytes(), 0).unwrap();
+        txn.commit().unwrap();
     }
 
     #[test]
@@ -1050,9 +1164,11 @@ mod tests {
         assert_eq!((deferred.indexed_through, deferred.high_water), (0, 20));
         assert!(!deferred.complete());
         assert_eq!(postings(&env), 0);
-        // Integrity expects no entries above the marker.
+        // Integrity expects no entries above the marker, and accepts the lease.
+        assert!(deferred.leased());
         assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
 
+        release(&env);
         assert_eq!(progress(step(&env, 7)), (7, 0, Some(7)));
         build(&env);
         assert_eq!(state(&env).indexed_through, 20);
@@ -1110,6 +1226,58 @@ mod tests {
         build(&env);
         assert_eq!(postings(&env), 3);
         assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn a_lease_keeps_backfill_from_starting_the_pass_under_a_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        assert!(write_deferred(&env, 100..110));
+        // Another writer's backfill, such as a relay's, leaves the table to
+        // the load, so that its next batch still finds no pass and defers.
+        let held = step(&env, 7);
+        assert_eq!(progress(held), (0, 0, None));
+        assert!(held.state.leased());
+        assert!(write_deferred(&env, 110..120));
+        assert_eq!(postings(&env), 0);
+        // The load's own pass begins once it gives the lease up, and any
+        // writer may continue it.
+        release(&env);
+        assert_eq!(state(&env).lease_until, None);
+        assert_eq!(progress(step(&env, 7)), (7, 0, Some(7)));
+        build(&env);
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn a_lapsed_lease_leaves_the_build_to_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        assert!(write_deferred(&env, 100..110));
+        // The load stopped before its pass, and its lease ran out.
+        set_lease(&env, unix_millis() - 1);
+        assert!(!state(&env).leased());
+        let first = step(&env, 7);
+        assert_eq!(progress(first), (7, 0, Some(7)));
+        assert_eq!(first.state.lease_until, None);
+        while !state(&env).complete() {
+            step(&env, 7);
+        }
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn a_lease_holds_only_until_it_runs_out() {
+        let now = 1_800_000_000_000;
+        let longest = TAG_KIND_LEASE.as_millis() as u64;
+        assert!(lease_holds(Some(now + 1), now));
+        assert!(lease_holds(Some(now + longest), now));
+        assert!(!lease_holds(Some(now), now));
+        assert!(!lease_holds(None, now));
+        // Only a clock set back leaves one further ahead; it has lapsed.
+        assert!(!lease_holds(Some(now + longest + 1), now));
     }
 
     #[test]

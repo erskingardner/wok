@@ -20,6 +20,8 @@ STEAL_SECONDS=${STEAL_SECONDS:-60}
 # An earlier run's output directory: fail when the sync-write p99 has moved
 # by more than 2x since then.
 BASELINE=${BASELINE:-}
+# Fail when either host's average steal, in percent, is above this.
+STEAL_LIMIT=${STEAL_LIMIT:-1}
 OUT=${OUT:-qualify-$(date -u +%Y%m%dT%H%M%SZ)}
 SCRATCH=
 SSH_OPTIONS=(
@@ -48,6 +50,7 @@ validate_settings() {
         [[ ${!name} =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
     done
     [[ $DISK_DIR == /* && $DISK_DIR != *..* ]] || die "DISK_DIR must be an absolute path"
+    [[ $STEAL_LIMIT =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "STEAL_LIMIT must be a percentage"
     [[ -z $BASELINE || -f $BASELINE/fio-fdatasync.json ]] ||
         die "BASELINE has no fio-fdatasync.json"
     command -v jq >/dev/null || die "missing local tool: jq"
@@ -102,7 +105,8 @@ steal_check() {
     local label=$2
     remote "$host" "openssl speed -multi \$(nproc) -seconds $STEAL_SECONDS -bytes 16384 sha256 \
         >/dev/null 2>&1 &
-        LC_ALL=C S_TIME_FORMAT=ISO mpstat -P ALL 1 $STEAL_SECONDS; wait" >"$OUT/mpstat-steal-$label.txt"
+        LC_ALL=C S_TIME_FORMAT=ISO mpstat -P ALL 1 $STEAL_SECONDS; status=\$?; wait; exit \$status" \
+        >"$OUT/mpstat-steal-$label.txt"
 }
 
 # Prints the average and the largest per-CPU %steal from mpstat output.
@@ -111,6 +115,32 @@ steal_summary() {
         $1 == "Average:" && $2 == "all" { avg = $col }
         $1 != "Average:" && $2 ~ /^[0-9]+$/ && col && $col + 0 > max { max = $col + 0 }
         END { printf "average %s%%, worst CPU-second %s%%", avg, max + 0 }' "$1"
+}
+
+# Prints the average %steal over every CPU, or fails when mpstat gave none.
+steal_average() {
+    awk '$2 == "CPU" { for (i = 1; i <= NF; i++) if ($i == "%steal") col = i; next }
+        $1 == "Average:" && $2 == "all" && col { avg = $col }
+        END { if (avg == "") exit 1; print avg }' "$1"
+}
+
+check_steal() {
+    local label average
+    for label in relay load; do
+        average=$(steal_average "$OUT/mpstat-steal-$label.txt") ||
+            die "no %steal in $OUT/mpstat-steal-$label.txt"
+        awk -v average="$average" -v limit="$STEAL_LIMIT" 'BEGIN { exit !(average <= limit) }' ||
+            die "average steal on the $label host is $average%, above STEAL_LIMIT=$STEAL_LIMIT; see #226 on dedicated hardware"
+    done
+}
+
+check_baseline() {
+    local before after
+    before=$(jq '.jobs[0].sync.lat_ns.percentile["99.000000"]' "$BASELINE/fio-fdatasync.json")
+    after=$(jq '.jobs[0].sync.lat_ns.percentile["99.000000"]' "$OUT/fio-fdatasync.json")
+    echo "fdatasync p99 against $BASELINE: $before ns then, $after ns now" | tee -a "$OUT/summary.txt"
+    ((after <= 2 * before && before <= 2 * after)) ||
+        die "fdatasync p99 moved by more than 2x since $BASELINE; see #226 on dedicated hardware"
 }
 
 percentile_ms() {
@@ -145,7 +175,8 @@ main() {
 
     echo "network: ping, then iperf3 with 1 and 8 streams each way for ${IPERF_SECONDS}s"
     remote "$LOAD_SSH" "ping -c 100 -i 0.2 -q $(printf '%q' "$RELAY_HOST")" >"$OUT/ping.txt"
-    remote "$RELAY_SSH" "iperf3 -s -p 5299 -D"
+    # Only on the address under test; pkill matches this command line's start.
+    remote "$RELAY_SSH" "iperf3 -s -p 5299 -B $(printf '%q' "$RELAY_HOST") -D"
     sleep 1
     local streams direction flag
     for streams in 1 8; do
@@ -179,13 +210,9 @@ main() {
         echo "steal on the load host: $(steal_summary "$OUT/mpstat-steal-load.txt")"
     } | tee "$OUT/summary.txt"
 
+    check_steal
     if [[ -n $BASELINE ]]; then
-        local before after
-        before=$(jq '.jobs[0].sync.lat_ns.percentile["99.000000"]' "$BASELINE/fio-fdatasync.json")
-        after=$(jq '.jobs[0].sync.lat_ns.percentile["99.000000"]' "$OUT/fio-fdatasync.json")
-        echo "fdatasync p99 against $BASELINE: $before ns then, $after ns now" | tee -a "$OUT/summary.txt"
-        ((after <= 2 * before && before <= 2 * after)) ||
-            die "fdatasync p99 moved by more than 2x since $BASELINE; see #226 on dedicated hardware"
+        check_baseline
     fi
 }
 

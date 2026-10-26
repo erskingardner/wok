@@ -52,6 +52,7 @@ class Settings(unittest.TestCase):
             'relative disk dir': dict(DISK_DIR='var/lib/q'),
             'disk dir with ..': dict(DISK_DIR='/var/lib/../q'),
             'baseline without fio output': dict(BASELINE='/nonexistent'),
+            'steal limit': dict(STEAL_LIMIT='1%'),
         }
         for case, env in cases.items():
             with self.subTest(case=case):
@@ -109,6 +110,51 @@ class Scratch(unittest.TestCase):
         self.assertTrue(self.unrelated.exists())
 
 
+class Gates(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def steal(self, relay, load=MPSTAT, **env):
+        (self.out/'mpstat-steal-relay.txt').write_text(relay)
+        (self.out/'mpstat-steal-load.txt').write_text(load)
+        return qualify('check_steal', OUT=str(self.out), **env)
+
+    def test_steal_within_the_limit_passes(self):
+        result = self.steal(MPSTAT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_steal_above_the_limit_fails(self):
+        result = self.steal(MPSTAT, STEAL_LIMIT='0.5')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('average steal on the relay host is 1.00%', result.stderr)
+
+    def test_missing_steal_fails(self):
+        # What mpstat leaves when it fails: the stress ran, nothing was sampled.
+        result = self.steal('', load=MPSTAT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('no %steal in', result.stderr)
+
+    def test_baseline_allows_up_to_twice_either_way(self):
+        def fio(directory, p99):
+            directory.mkdir(exist_ok=True)
+            (directory/'fio-fdatasync.json').write_text(json.dumps(
+                {'jobs': [{'sync': {'lat_ns': {'percentile': {'99.000000': p99}}}}]}))
+        before = self.out/'before'
+        fio(before, 1_000_000)
+        for p99, passes in [(2_000_000, True), (500_000, True), (2_000_001, False),
+                            (499_999, False)]:
+            with self.subTest(p99=p99):
+                fio(self.out, p99)
+                result = qualify('check_baseline', OUT=str(self.out), BASELINE=str(before))
+                self.assertEqual(result.returncode == 0, passes, result.stderr)
+                if not passes:
+                    self.assertIn('moved by more than 2x', result.stderr)
+
+
 class Summaries(unittest.TestCase):
     def test_steal_reads_the_steal_column(self):
         with tempfile.NamedTemporaryFile('w', suffix='.txt') as mpstat:
@@ -153,7 +199,7 @@ class Summaries(unittest.TestCase):
         self.assertEqual(len(patterns), 2)
         for pattern in patterns:
             with self.subTest(pattern=pattern):
-                self.assertRegex('iperf3 -s -p 5299 -D', pattern)
+                self.assertRegex('iperf3 -s -p 5299 -B 10.0.0.2 -D', pattern)
                 self.assertNotRegex(f"bash -c pkill -f '{pattern}' || true", pattern)
 
 if __name__ == '__main__':

@@ -353,6 +353,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wok-bench --event-mix social --generate-corpus-only` writes a public
+  social relay's history at the scale of a large benchmark database: 100,000
+  authors with Zipf activity over two years, a reaction-, note- and
+  list-heavy kind mix, and real event sizes, such as follow lists of up to
+  2,000 follows and Marmot Welcomes (#226). Profiles and lists are replaced
+  and deletion requests delete, and the manifest gives the number of events a
+  relay keeps, which strfry 1.1.3 and Wok match on import.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,

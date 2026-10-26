@@ -14,6 +14,7 @@
 mod author_kinds;
 mod clients;
 mod live;
+mod social;
 mod tag_kinds;
 mod transport;
 
@@ -120,8 +121,12 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     marmot_invitees: usize,
     /// Largest outbox follow list; sizes are log-uniform from 100 up to this.
+    /// Also the largest follow list in an `--event-mix social` corpus.
     #[arg(long, default_value_t = 2_000)]
     max_follows: usize,
+    /// Authors in an `--event-mix social` corpus.
+    #[arg(long, default_value_t = 100_000)]
+    social_authors: usize,
     /// Seconds of activity in --scenario clients, before a 2 s delivery drain.
     #[arg(long, default_value_t = 15)]
     clients_duration_secs: u64,
@@ -274,6 +279,8 @@ struct CorpusManifest {
     bytes: u64,
     sha256: String,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    social: Option<social::Summary>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
@@ -287,6 +294,11 @@ enum EventMix {
     /// Notes plus deletion requests and ephemeral events. Intended for live
     /// publication workloads, not retained-count comparisons.
     Lifecycle,
+    /// A public social relay's history (see `social.rs`): `--social-authors`
+    /// authors over two years, with replacements, deletions and real event
+    /// sizes. Only written to disk, with `--generate-corpus-only`; the
+    /// manifest gives the count a relay keeps.
+    Social,
 }
 
 #[derive(Serialize)]
@@ -453,12 +465,18 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--event-mix lifecycle is only valid for live publication scenarios");
     }
+    // The query oracles assume every corpus event is kept, which replacements
+    // and deletions break.
+    if args.event_mix == EventMix::Social && !args.generate_corpus_only {
+        anyhow::bail!("--event-mix social only writes a corpus; pass --generate-corpus-only");
+    }
 
     let default_event_count = if args.profile == "smoke" {
         2_000
     } else {
         20_000
     };
+    let mut social_summary = None;
     let (corpus_path, event_count) = if args.scenario.as_deref() == Some("author_kinds") {
         anyhow::ensure!(
             args.corpus.is_none() && !args.has_external_target(),
@@ -492,17 +510,30 @@ fn main() -> Result<()> {
     } else {
         let count = args.events.unwrap_or(default_event_count);
         let path = args.out.join("corpus.jsonl");
-        generate_events(&path, count, args.seed, base_timestamp, args.event_mix)?;
+        if args.event_mix == EventMix::Social {
+            let opts = social::Options {
+                events: count,
+                authors: args.social_authors,
+                seed: args.seed,
+                anchor: base_timestamp,
+                max_follows: args.max_follows,
+            };
+            social_summary = Some(social::generate(&path, &opts)?);
+        } else {
+            generate_events(&path, count, args.seed, base_timestamp, args.event_mix)?;
+        }
         (path, count)
     };
     args.events = Some(event_count);
-    let corpus = corpus_manifest(
+    let mut corpus = corpus_manifest(
         &corpus_path,
         event_count,
         args.seed,
         base_timestamp,
         args.event_mix,
     )?;
+    corpus.social = social_summary;
+    let retained = corpus.social.as_ref().map(|summary| summary.retained);
     let corpus_sha256 = corpus.sha256.clone();
     let wok_manifest = binary_manifest(&args.wok);
     let strfry_manifest = binary_manifest(&args.strfry);
@@ -527,8 +558,9 @@ fn main() -> Result<()> {
     )?;
     if args.generate_corpus_only {
         println!(
-            "wrote corpus manifest for {} events at {}",
+            "wrote corpus manifest for {} events{} at {}",
             event_count,
+            retained.map_or(String::new(), |kept| format!(" ({kept} kept by a relay)")),
             corpus_path.display()
         );
         return Ok(());
@@ -1170,6 +1202,7 @@ impl EventFactory {
                 1 if self.last_note.is_some() => 5,
                 _ => 1,
             },
+            EventMix::Social => unreachable!("social corpora come from social::generate"),
         };
         let mut actor_index = (i as usize) % self.actors.len();
         if kind == 5 {
@@ -1334,6 +1367,7 @@ fn corpus_manifest(
         bytes: std::fs::metadata(path)?.len(),
         sha256: sha256_file(path)?,
         path: std::fs::canonicalize(path)?.display().to_string(),
+        social: None,
     })
 }
 
@@ -2441,7 +2475,9 @@ fn live_fanout_trial(
             let mut ws = connect_retry(&url).await?;
             let filter = match workload.mix {
                 EventMix::Kind1 => json!({"kinds":[1], "limit":0}),
-                EventMix::Realistic | EventMix::Lifecycle => json!({"limit":0}),
+                EventMix::Realistic | EventMix::Lifecycle | EventMix::Social => {
+                    json!({"limit":0})
+                }
             };
             ws.send(Message::Text(
                 json!(["REQ", format!("s{i}"), filter]).to_string().into(),

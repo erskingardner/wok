@@ -42,6 +42,42 @@ size. `--event-mix lifecycle` adds kind 5 deletion requests and kind 20001
 ephemeral events for live publication tests where retained counts are not the
 correct assertion.
 
+`--event-mix social` writes the history of a public social relay, to build
+the large databases a campaign reads. `--social-authors` authors (default
+100,000) post in proportion to a Zipf law over author rank, across the two
+years before `--base-timestamp`, at a rate that grows over that window.
+Replies, reactions, reposts, zaps and follows name popular authors more
+often. Of every hundred events, about:
+
+| Events | Kinds |
+|---:|---|
+| 30 | reactions (7) |
+| 27 | notes and replies (1) |
+| 12 | profiles, follow lists, relay lists and mute lists (0, 3, 10002, 10050, 10000) |
+| 8 | gift wraps (1059), one in twenty a Marmot Welcome |
+| 6 | reposts (6) |
+| 6 | zap receipts (9735) |
+| 3 | comments (1111) |
+| 5 | articles, pictures, follow sets and bookmarks (30023, 20, 30000, 10003) |
+| 1 | deletion requests (5) |
+| 2 | Marmot group messages and KeyPackages, highlights, reports, live events (445, 30443, 9802, 1984, 30311) |
+
+Sizes follow real clients:
+- follow lists are log-normal around 150 follows, up to `--max-follows`;
+- zap receipts carry their request, and reposts carry the note;
+- Marmot Welcomes grow with the group.
+
+Profiles, lists, articles and KeyPackages are replaced, and deletion requests
+delete their author's earlier events. So a relay keeps fewer events than the
+corpus holds, and `corpus.social.retained` in `manifest.json` gives that
+count. The manifest also records `largest_event_bytes`, `most_tags` and
+`largest_tag_value_bytes` (single-letter tags), the limits a relay needs to
+accept every event. strfry's default `events.maxEventSize` of 64 KiB refuses
+the largest follow lists and Welcomes. The query scenarios assume every
+corpus event is kept, so this mix is only written with
+`--generate-corpus-only`. The corpus streams to disk and is signed in
+parallel, and its bytes depend only on the options.
+
 Generate a signed corpus without running a relay, or reuse one verbatim:
 
 ```bash

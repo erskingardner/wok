@@ -687,37 +687,38 @@ fn cmd_import(
     }
     let env = open_env(cfg)?;
     let batch_size = write_batch.unwrap_or(if fried { 100_000 } else { 10_000 }) as usize;
-    let stdin = std::io::stdin();
-    let mut batch = Vec::new();
+    let limits = cfg.event_limits();
+    let max_event_size = cfg.events.max_event_size;
+    // A reader thread parses and verifies lines while this one writes the
+    // batch before, as strfry verifies on a thread of its own. At most two
+    // batches are held. A reader left blocked on stdin when a write fails
+    // ends with the process.
+    let (sender, batches) = std::sync::mpsc::sync_channel(0);
+    let reader = std::thread::Builder::new()
+        .name("import-reader".into())
+        .spawn(move || {
+            read_import_batches(
+                std::io::stdin().lock(),
+                batch_size,
+                max_event_size,
+                |line| parse_import_line(line, fried, no_verify, &limits),
+                |batch| sender.send(batch).is_ok(),
+            )
+        })
+        .context("start the import reader")?;
     let mut total_processed = 0u64;
     let mut total_written = 0u64;
     let mut total_rejected = 0u64;
     let mut total_dups = 0u64;
-    let limits = cfg.event_limits();
-    let mut stdin = stdin.lock();
-    let mut line = String::new();
-    let mut i = 0u64;
-    while read_line_bounded(&mut stdin, &mut line, cfg.events.max_event_size)? {
-        i += 1;
-        total_processed += 1;
-        // C++ counts the newline in its getline length check, so a line of
-        // exactly maxEventSize chars is rejected there.
-        if line.len() + 1 > cfg.events.max_event_size {
-            bail!("Line larger than configured maxEventSize on line {i}");
-        }
-        match parse_import_line(&line, fried, no_verify, &limits) {
-            Ok(ev) => batch.push(ev),
-            Err(e) => {
-                total_rejected += 1;
-                tracing::warn!("Unable to parse JSON on line {i}: {e}");
-                continue;
-            }
-        }
-        if batch.len() >= batch_size {
+    for batch in batches {
+        let mut batch = batch?;
+        total_processed += batch.lines;
+        total_rejected += batch.rejected;
+        if !batch.events.is_empty() {
             commit_import(
                 cfg,
                 &env,
-                &mut batch,
+                &mut batch.events,
                 &mut total_written,
                 &mut total_rejected,
                 &mut total_dups,
@@ -725,17 +726,11 @@ fn cmd_import(
             )?;
         }
     }
-    if !batch.is_empty() {
-        commit_import(
-            cfg,
-            &env,
-            &mut batch,
-            &mut total_written,
-            &mut total_rejected,
-            &mut total_dups,
-            show_rejected,
-        )?;
-    }
+    // The channel also closes if the reader panicked; don't report that as
+    // the end of the input.
+    reader
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     tracing::info!(
         "Done. Processed {total_processed} lines. {total_written} added, {total_rejected} rejected, {total_dups} dups"
     );
@@ -743,6 +738,65 @@ fn cmd_import(
         bail!("import incomplete: {total_rejected} records rejected; {total_written} written, {total_dups} duplicates");
     }
     Ok(())
+}
+
+/// Events read from `wok import`'s input to write in one transaction.
+#[derive(Default)]
+struct ImportBatch {
+    events: Vec<EventToWrite>,
+    /// Lines read for the batch, rejected ones included.
+    lines: u64,
+    rejected: u64,
+}
+
+/// Read `input` into batches of `batch_size` parsed events and `send` each,
+/// until the input ends, a line fails to read or is too long, or `send`
+/// returns false. A line that fails ends the import without the events read
+/// since the last batch.
+fn read_import_batches(
+    mut input: impl BufRead,
+    batch_size: usize,
+    max_event_size: usize,
+    parse: impl Fn(&str) -> Result<EventToWrite>,
+    mut send: impl FnMut(Result<ImportBatch>) -> bool,
+) {
+    let mut batch = ImportBatch::default();
+    let mut line = String::new();
+    let mut i = 0u64;
+    loop {
+        match read_line_bounded(&mut input, &mut line, max_event_size) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                send(Err(error.into()));
+                return;
+            }
+        }
+        i += 1;
+        batch.lines += 1;
+        // C++ counts the newline in its getline length check, so a line of
+        // exactly maxEventSize chars is rejected there.
+        if line.len() + 1 > max_event_size {
+            send(Err(anyhow::anyhow!(
+                "Line larger than configured maxEventSize on line {i}"
+            )));
+            return;
+        }
+        match parse(&line) {
+            Ok(ev) => batch.events.push(ev),
+            Err(e) => {
+                batch.rejected += 1;
+                tracing::warn!("Unable to parse JSON on line {i}: {e}");
+                continue;
+            }
+        }
+        if batch.events.len() >= batch_size && !send(Ok(std::mem::take(&mut batch))) {
+            return;
+        }
+    }
+    if batch.lines != 0 {
+        send(Ok(batch));
+    }
 }
 
 /// NIP-42 forbids broadcasting kind 22242. The relay refuses it as EVENT, and
@@ -1744,6 +1798,49 @@ mod main_tests {
         assert_eq!(
             wok_negentropy::verify_tree(&env.begin_ro().unwrap(), 1, "{}").unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn import_batches_hold_their_events_and_the_lines_read_for_them() {
+        // Lines starting with x are rejected. Each batch holds two events
+        // and the lines read to find them, sent here as
+        // "events/lines/rejected".
+        fn batches(input: &str) -> Vec<String> {
+            let parse = |line: &str| {
+                if line.starts_with('x') {
+                    bail!("rejected");
+                }
+                Ok(EventToWrite::new(Vec::new(), line.to_owned()))
+            };
+            let mut sent = Vec::new();
+            read_import_batches(input.as_bytes(), 2, 8, parse, |batch| {
+                sent.push(match batch {
+                    Ok(batch) => {
+                        let events: Vec<_> = batch.events.into_iter().map(|e| e.json).collect();
+                        format!("{}/{}/{}", events.join(","), batch.lines, batch.rejected)
+                    }
+                    Err(error) => error.to_string(),
+                });
+                true
+            });
+            sent
+        }
+        assert_eq!(
+            batches("a\nx\nb\nc\nx\nx\nd\ne\n"),
+            ["a,b/3/1", "c,d/4/2", "e/1/0"]
+        );
+        assert_eq!(batches("a\nb\n"), ["a,b/2/0"]);
+        assert_eq!(batches("x\n"), ["/1/1"]);
+        assert!(batches("").is_empty());
+        // A line too long ends the import; the events read since the last
+        // batch are not written.
+        assert_eq!(
+            batches("a\nb\nc\ntoo-long\nd\n"),
+            [
+                "a,b/2/0",
+                "Line larger than configured maxEventSize on line 4"
+            ]
         );
     }
 

@@ -880,6 +880,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"authors":[2000 keys],"kinds":[50 kinds]}` cost 5 and opened 100,000
   cursors. Those now cost 170, 61, 10,045 and 102,000, against a ceiling of
   20,000. `docs/config.md` lists how each filter is priced.
+- `wok import` parses and verifies the next batch on a thread of its own
+  while it writes the current one, as strfry does, instead of between write
+  transactions. Importing a million events of a social relay's history took
+  489 s instead of 555 s on a 48-vCPU host, and 273 s instead of 334 s with
+  `--write-batch 100000`. The same transactions write the database.
 
 ### Removed
 

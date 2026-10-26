@@ -41,8 +41,11 @@ jobs:
           cargo --version
       # Pinned: cargo-llvm-cov 0.7 dropped the `demangle` subcommand the script
       # used, and `show-env --export-prefix` is now an alias that may go.
+      # install-action has no rustfilt release to fetch, so build it from its
+      # crates.io source rather than take a third-party prebuilt binary.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov@0.9.1,rustfilt@0.2.2
+          fallback: cargo-install
       - name: Check relay functions reached per profile and phase
         run: python3 scripts/attack-surface-reach.py --check

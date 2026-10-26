@@ -617,7 +617,7 @@ preserve the result directories.
 Before a campaign, and at the start of each day of runs,
 `scripts/benchmark-qualify.sh` checks that the relay and load hosts are fit to
 measure on. Run it from the operator host while both hosts are idle. With the
-default durations it takes about nine minutes:
+default durations it takes about ten minutes:
 
 ```bash
 RELAY_SSH=root@RELAY LOAD_SSH=root@LOAD RELAY_HOST=10.0.0.2 \
@@ -628,10 +628,10 @@ It records each host's CPU topology, NUMA layout, memory, disks, root
 filesystem, transparent huge pages, swap and network interfaces. Then it
 measures:
 
-- on the relay's database filesystem (`DISK_DIR`, default
-  `/var/lib/relay-bench/qualify`, removed afterwards): 4 KiB writes with
-  `fdatasync`, which every LMDB commit waits on, and 4 KiB direct random reads
-  at depth 1 and 4×32;
+- on the relay's database filesystem: 4 KiB writes with `fdatasync`, which
+  every LMDB commit waits on, and 4 KiB direct random reads at depth 1 and
+  4×32. They run in a new `qualify.XXXXXX` directory under `DISK_DIR` (default
+  `/var/lib/relay-bench`), and only that directory is removed afterwards;
 - between the hosts, from the load host to `RELAY_HOST`: ping, and iperf3 with
   1 and 8 streams each way on port 5299;
 - on each host: steal time while every CPU is busy.

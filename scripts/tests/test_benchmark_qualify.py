@@ -50,7 +50,6 @@ class Settings(unittest.TestCase):
             'iperf seconds': dict(IPERF_SECONDS='x'),
             'steal seconds': dict(STEAL_SECONDS='-1'),
             'relative disk dir': dict(DISK_DIR='var/lib/q'),
-            'disk dir at the root': dict(DISK_DIR='/q'),
             'disk dir with ..': dict(DISK_DIR='/var/lib/../q'),
             'baseline without fio output': dict(BASELINE='/nonexistent'),
         }
@@ -73,6 +72,41 @@ class Settings(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('RELAY_SSH is required', result.stderr)
             self.assertFalse(calls.exists())
+
+
+class Scratch(unittest.TestCase):
+    # The relay host's commands run on this machine.
+    LOCAL = 'remote() { shift; bash -c "$1"; }; ssh() { :; }; '
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.parent = Path(self.tmp.name)/'relay-bench'
+        self.parent.mkdir()
+        self.unrelated = self.parent/'wok-master/db/data.mdb'
+        self.unrelated.parent.mkdir(parents=True)
+        self.unrelated.write_text('database')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_disk_checks_remove_only_their_own_directory(self):
+        result = qualify(self.LOCAL + 'create_scratch; touch "$SCRATCH/fio-file"; '
+                         'echo "$SCRATCH"; cleanup', DISK_DIR=f'{self.parent}/')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scratch = Path(result.stdout.strip())
+        self.assertEqual(scratch.parent, self.parent)
+        self.assertTrue(scratch.name.startswith('qualify.'))
+        self.assertFalse(scratch.exists())
+        self.assertTrue(self.unrelated.exists())
+
+    def test_early_failure_leaves_the_disk_alone(self):
+        fail_host_facts = ('remote() { shift; [[ $1 == *"missing tool"* ]] && return 1; '
+                           'bash -c "$1"; }; ssh() { :; }; ')
+        result = qualify(fail_host_facts + 'main', DISK_DIR=str(self.parent),
+                         OUT=f'{self.tmp.name}/out')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sorted(path.name for path in self.parent.iterdir()), ['wok-master'])
+        self.assertTrue(self.unrelated.exists())
 
 
 class Summaries(unittest.TestCase):
@@ -100,6 +134,16 @@ class Summaries(unittest.TestCase):
             '0.765952 ms p50, 1.417216 ms p99, 3.35872 ms p99.9',
             '7.43 Gbit/s, 2139 retransmits',
         ])
+
+    def test_cpu_stress_lasts_as_long_as_the_sampling(self):
+        # openssl speed spends -seconds on each buffer size it tries.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = qualify('remote() { printf "%s" "$2"; }; steal_check root@load load',
+                             OUT=tmp, STEAL_SECONDS='45')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            sent = (Path(tmp)/'mpstat-steal-load.txt').read_text()
+        self.assertIn('-seconds 45 -bytes 16384 sha256', sent)
+        self.assertIn('mpstat -P ALL 1 45', sent)
 
     def test_stopping_iperf3_spares_the_shell_that_stops_it(self):
         # Linux pkill -f matches each process's whole command line, and the

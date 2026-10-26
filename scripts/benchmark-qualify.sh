@@ -11,8 +11,9 @@ RELAY_SSH=${RELAY_SSH:-}
 LOAD_SSH=${LOAD_SSH:-}
 # The relay host's address as the load host reaches it.
 RELAY_HOST=${RELAY_HOST:-}
-# A scratch directory on the filesystem that will hold the relay databases.
-DISK_DIR=${DISK_DIR:-/var/lib/relay-bench/qualify}
+# A directory on the filesystem that will hold the relay databases. The disk
+# checks run in a new directory of their own inside it, which is all they remove.
+DISK_DIR=${DISK_DIR:-/var/lib/relay-bench}
 FIO_SECONDS=${FIO_SECONDS:-60}
 IPERF_SECONDS=${IPERF_SECONDS:-60}
 STEAL_SECONDS=${STEAL_SECONDS:-60}
@@ -20,6 +21,7 @@ STEAL_SECONDS=${STEAL_SECONDS:-60}
 # by more than 2x since then.
 BASELINE=${BASELINE:-}
 OUT=${OUT:-qualify-$(date -u +%Y%m%dT%H%M%SZ)}
+SCRATCH=
 SSH_OPTIONS=(
     -o ControlMaster=auto
     -o ControlPersist=300
@@ -45,15 +47,26 @@ validate_settings() {
     for name in FIO_SECONDS IPERF_SECONDS STEAL_SECONDS; do
         [[ ${!name} =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
     done
-    [[ $DISK_DIR == /*/* && $DISK_DIR != *..* ]] || die "DISK_DIR must be an absolute scratch path"
+    [[ $DISK_DIR == /* && $DISK_DIR != *..* ]] || die "DISK_DIR must be an absolute path"
     [[ -z $BASELINE || -f $BASELINE/fio-fdatasync.json ]] ||
         die "BASELINE has no fio-fdatasync.json"
     command -v jq >/dev/null || die "missing local tool: jq"
 }
 
+# Sets SCRATCH to a new directory under DISK_DIR on the relay host.
+create_scratch() {
+    local parent
+    printf -v parent '%q' "${DISK_DIR%/}"
+    SCRATCH=$(remote "$RELAY_SSH" "mkdir -p -- $parent && mktemp -d -- $parent/qualify.XXXXXX")
+    [[ $SCRATCH == "${DISK_DIR%/}"/qualify.?????? ]] || die "unexpected scratch directory: $SCRATCH"
+}
+
 cleanup() {
-    remote "$RELAY_SSH" "pkill -f '^iperf3 -s -p 5299' || true; rm -rf -- $(printf '%q' "$DISK_DIR")" \
-        >/dev/null 2>&1 || true
+    local stop="pkill -f '^iperf3 -s -p 5299' || true"
+    if [[ -n $SCRATCH ]]; then
+        stop+="; rm -rf -- $(printf '%q' "$SCRATCH")"
+    fi
+    remote "$RELAY_SSH" "$stop" >/dev/null 2>&1 || true
     ssh "${SSH_OPTIONS[@]}" -O exit "$RELAY_SSH" >/dev/null 2>&1 || true
     ssh "${SSH_OPTIONS[@]}" -O exit "$LOAD_SSH" >/dev/null 2>&1 || true
 }
@@ -77,16 +90,18 @@ host_facts() {
 fio_job() {
     local name=$1
     shift
-    remote "$RELAY_SSH" "fio --name=$name --directory=$(printf '%q' "$DISK_DIR") \
+    remote "$RELAY_SSH" "fio --name=$name --directory=$(printf '%q' "$SCRATCH") \
         --runtime=$FIO_SECONDS --time_based --output-format=json $*" >"$OUT/fio-$name.json"
 }
 
 # Saturates every CPU while mpstat samples, so steal shows up if the
-# hypervisor lends this host's CPUs to another.
+# hypervisor lends this host's CPUs to another. One buffer size, since
+# -seconds applies to each size openssl tries.
 steal_check() {
     local host=$1
     local label=$2
-    remote "$host" "openssl speed -multi \$(nproc) -seconds $STEAL_SECONDS sha256 >/dev/null 2>&1 &
+    remote "$host" "openssl speed -multi \$(nproc) -seconds $STEAL_SECONDS -bytes 16384 sha256 \
+        >/dev/null 2>&1 &
         LC_ALL=C S_TIME_FORMAT=ISO mpstat -P ALL 1 $STEAL_SECONDS; wait" >"$OUT/mpstat-steal-$label.txt"
 }
 
@@ -111,19 +126,22 @@ iperf_line() {
 main() {
     validate_settings
     mkdir -p "$OUT"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    # A trapped signal would otherwise resume the script once cleanup ran.
+    trap 'exit 130' INT TERM
 
     echo "host facts"
     host_facts "$RELAY_SSH" >"$OUT/relay-host.txt"
     host_facts "$LOAD_SSH" >"$OUT/load-host.txt"
 
     echo "disk: ${FIO_SECONDS}s each of 4 KiB fdatasync writes, and 4 KiB random reads at depth 1 and 4x32"
-    remote "$RELAY_SSH" "rm -rf -- $(printf '%q' "$DISK_DIR") && mkdir -p -- $(printf '%q' "$DISK_DIR")"
+    create_scratch
     fio_job fdatasync --rw=write --bs=4k --size=256M --ioengine=sync --fdatasync=1
     fio_job randread-qd1 --rw=randread --bs=4k --size=8G --direct=1 --ioengine=libaio --iodepth=1
     fio_job randread-qd128 --rw=randread --bs=4k --size=8G --direct=1 --ioengine=libaio \
         --iodepth=32 --numjobs=4 --group_reporting
-    remote "$RELAY_SSH" "rm -rf -- $(printf '%q' "$DISK_DIR")"
+    remote "$RELAY_SSH" "rm -rf -- $(printf '%q' "$SCRATCH")"
+    SCRATCH=
 
     echo "network: ping, then iperf3 with 1 and 8 streams each way for ${IPERF_SECONDS}s"
     remote "$LOAD_SSH" "ping -c 100 -i 0.2 -q $(printf '%q' "$RELAY_HOST")" >"$OUT/ping.txt"

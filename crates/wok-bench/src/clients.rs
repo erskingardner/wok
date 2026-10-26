@@ -44,7 +44,7 @@ use rand::{Rng, SeedableRng};
 use secp256k1::{Keypair, SECP256K1};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -72,6 +72,12 @@ const NEG_LIMIT: u64 = 16_385;
 const GLOBAL_KINDS: [u64; 11] = [1, 6, 7, 9735, 30023, 1063, 20, 21, 22, 1111, 9802];
 const MAX_MESSAGE: usize = 32 << 20;
 const DRAIN: Duration = Duration::from_millis(2_000);
+/// How long a Marmot receiver waits for a connect-time AUTH challenge, well
+/// under the 1.5 s before its group's burst.
+const CHALLENGE_WAIT: Duration = Duration::from_millis(250);
+/// A write that cannot finish for this long means the relay stopped reading:
+/// the connection is given up and counted as a disconnect.
+const WRITE_STALL: Duration = Duration::from_secs(10);
 /// Header that carries each simulated client's address.
 pub const FORWARDED_HEADER: &str = "x-forwarded-for";
 
@@ -1288,8 +1294,9 @@ struct Stats {
     /// From when a scheduled action was due to when the harness started it.
     lag: Histogram<u64>,
     publish_due: u64,
+    /// Background publications written to the socket.
     publish_sent: u64,
-    /// When the last background publication was sent, after the start.
+    /// When the last of them was written, after the start.
     publish_last: Duration,
 }
 
@@ -1369,8 +1376,19 @@ impl Stats {
 
 enum Out {
     Text(String),
+    /// A publication's first send, counted in [`Written`] once it is on the
+    /// socket.
+    Event(String),
     Pong(Vec<u8>),
     Close,
+}
+
+/// Publications the writer has put on the socket, and when it last did: a
+/// relay that stops reading holds them in the queue instead.
+#[derive(Default)]
+struct Written {
+    events: u64,
+    last: Option<Instant>,
 }
 
 enum In {
@@ -1383,6 +1401,7 @@ struct WsConn {
     out: mpsc::UnboundedSender<Out>,
     inbound: mpsc::UnboundedReceiver<In>,
     deflate: bool,
+    written: Arc<Mutex<Written>>,
 }
 
 pub(crate) enum ConnectFailure {
@@ -1544,27 +1563,50 @@ async fn ws_connect(
     let (mut reader, mut writer) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Out>();
     let (in_tx, in_rx) = mpsc::unbounded_channel::<In>();
+    let written = Arc::new(Mutex::new(Written::default()));
+    let writes = written.clone();
+    let stalled = in_tx.clone();
     tokio::spawn(async move {
         let mut encoder =
             WsEncoder::with_role(deflate.then(|| DeflateCtx::new(true)), Role::Client);
         while let Some(out) = out_rx.recv().await {
-            let frame = match out {
-                Out::Text(text) => match encoder.encode_message(MessageKind::Text, text.as_bytes())
-                {
-                    Ok(frame) => frame,
-                    Err(_) => break,
-                },
-                Out::Pong(payload) => encoder.encode_control(OP_PONG, &payload),
+            let (frame, event) = match out {
+                Out::Text(text) => (
+                    encoder.encode_message(MessageKind::Text, text.as_bytes()),
+                    false,
+                ),
+                Out::Event(text) => (
+                    encoder.encode_message(MessageKind::Text, text.as_bytes()),
+                    true,
+                ),
+                Out::Pong(payload) => (Ok(encoder.encode_control(OP_PONG, &payload)), false),
                 Out::Close => {
-                    let _ = writer
-                        .write_all(&encoder.encode_control(OP_CLOSE, &[]))
-                        .await;
-                    let _ = writer.shutdown().await;
+                    let close = encoder.encode_control(OP_CLOSE, &[]);
+                    let _ = tokio::time::timeout(WRITE_STALL, async {
+                        let _ = writer.write_all(&close).await;
+                        let _ = writer.shutdown().await;
+                    })
+                    .await;
                     break;
                 }
             };
-            if writer.write_all(&frame).await.is_err() {
-                break;
+            let Ok(frame) = frame else { break };
+            match tokio::time::timeout(WRITE_STALL, writer.write_all(&frame)).await {
+                Ok(Ok(())) => {
+                    if event {
+                        let mut written = writes.lock().unwrap_or_else(|e| e.into_inner());
+                        written.events += 1;
+                        written.last = Some(Instant::now());
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    let _ = stalled.send(In::Gone(format!(
+                        "write stalled for {} s: the relay stopped reading",
+                        WRITE_STALL.as_secs()
+                    )));
+                    break;
+                }
             }
         }
     });
@@ -1632,6 +1674,7 @@ async fn ws_connect(
         out: out_tx,
         inbound: in_rx,
         deflate,
+        written,
     })
 }
 
@@ -1722,6 +1765,8 @@ struct NegState {
     started: Instant,
     first: Option<Instant>,
     client: wok_negentropy::Negentropy<wok_negentropy::Vector>,
+    /// What the client holds, to open the pass again.
+    items: Vec<(u64, [u8; 32])>,
     held: HashSet<[u8; 32]>,
     have: Vec<Vec<u8>>,
     need: Vec<Vec<u8>>,
@@ -2002,7 +2047,10 @@ impl Session {
                 retry,
             },
         );
-        self.send(json!(["EVENT", event]));
+        let _ = self
+            .conn
+            .out
+            .send(Out::Event(json!(["EVENT", event]).to_string()));
     }
 
     fn next_timer(&self) -> Option<Instant> {
@@ -2123,7 +2171,15 @@ impl Session {
                     text(&frame, 1).unwrap_or_default(),
                     text(&frame, 2).unwrap_or_default(),
                 );
-                if self.negs.remove(&sid).is_some() {
+                if reason.starts_with("closed: authentication changed") {
+                    // Wok closes open passes when the connection
+                    // authenticates, and the client opens them again,
+                    // timed from the first open. One it already finished
+                    // needs nothing.
+                    if let Some(neg) = self.negs.remove(&sid) {
+                        self.send_neg_open(&sid, neg.group, neg.items, neg.started);
+                    }
+                } else if self.negs.remove(&sid).is_some() {
                     let mut stats = self.ctx.stats();
                     stats.refusal("marmot.neg", &reason);
                     stats.class("marmot.neg").refused += 1;
@@ -2433,8 +2489,19 @@ impl Session {
     }
 
     fn open_neg(&mut self, sid: &str, group: usize, held: &[(u64, [u8; 32])]) {
+        self.ctx.stats().class("marmot.neg").sent += 1;
+        self.send_neg_open(sid, group, held.to_vec(), Instant::now());
+    }
+
+    fn send_neg_open(
+        &mut self,
+        sid: &str,
+        group: usize,
+        items: Vec<(u64, [u8; 32])>,
+        started: Instant,
+    ) {
         let mut store = wok_negentropy::Vector::new();
-        for (created_at, id) in held {
+        for (created_at, id) in &items {
             store.insert(*created_at, id).expect("insert held event");
         }
         store.seal().expect("seal negentropy store");
@@ -2442,15 +2509,16 @@ impl Session {
         let init = client.initiate().expect("negentropy initiate");
         let gid = &self.ctx.plan.groups[group].gid;
         self.send(json!(["NEG-OPEN", sid, {"kinds":[445],"#h":[gid],"limit":NEG_LIMIT}, hex::encode(init)]));
-        self.ctx.stats().class("marmot.neg").sent += 1;
+        let held = items.iter().map(|(_, id)| *id).collect();
         self.negs.insert(
             sid.to_owned(),
             NegState {
                 group,
-                started: Instant::now(),
+                started,
                 first: None,
                 client,
-                held: held.iter().map(|(_, id)| *id).collect(),
+                items,
+                held,
                 have: Vec::new(),
                 need: Vec::new(),
             },
@@ -2872,47 +2940,70 @@ async fn outbox_client(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<LiveRec
     for (sid, class, mode, filters) in outbox_startup(user, plan.anchor) {
         s.req(&sid, class, mode, filters);
     }
+    // Every interval, each replaced subscription (r0–r2 scroll, r3–r4
+    // rotate) is due a re-REQ with the same id. One due while its last REQ
+    // is unfinished waits for it and keeps its due time, so a slow relay
+    // builds a backlog that the latency shows instead of being offered less.
     let interval = Duration::from_millis(ctx.opts.replace_interval_ms.max(1));
     let mut next = visit.due + interval;
+    let mut queued: [VecDeque<Instant>; 5] = Default::default();
+    let sid = |k: usize| format!("r{k}");
+    let replace_class = |k: usize| {
+        if k < 3 {
+            "w6.scroll_replace"
+        } else {
+            "w6.profile_replace"
+        }
+    };
     let mut until = [plan.anchor - 15 * DAY; 3];
     let mut step = 2;
     while !s.gone && Instant::now() < visit.until {
-        s.pump_until(next.min(visit.until), |_| false).await;
-        if Instant::now() < next || Instant::now() >= visit.until {
-            continue;
+        let ready = |s: &Session| (0..5).any(|k| !queued[k].is_empty() && s.finished(&sid(k)));
+        s.pump_until(next.min(visit.until), ready).await;
+        let now = Instant::now();
+        if s.gone || now >= visit.until {
+            break;
         }
-        let due = next;
-        next += interval;
-        ctx.stats().lag(due);
-        for (k, until) in until.iter_mut().enumerate() {
-            let sid = format!("r{k}");
-            if s.finished(&sid) {
+        if now >= next {
+            ctx.stats().lag(next);
+            for slots in &mut queued {
+                slots.push_back(next);
+            }
+            next += interval;
+        }
+        for (k, slots) in queued.iter_mut().enumerate() {
+            let id = sid(k);
+            if !s.finished(&id) {
+                continue;
+            }
+            let Some(due) = slots.pop_front() else {
+                continue;
+            };
+            let filter = if k < 3 {
                 // Page further back from the oldest event of the last page.
-                *until = s.subs[&sid].oldest.map_or(*until - 3 * DAY, |t| t - 1);
-                s.req_due(
-                    &sid,
-                    "w6.scroll_replace",
-                    Mode::Replace,
-                    vec![scroll_filter(user, *until)],
-                    due,
-                );
-            }
-        }
-        for k in 0..2 {
-            let sid = format!("r{}", 3 + k);
-            if s.finished(&sid) {
+                until[k] = s.subs[&id].oldest.map_or(until[k] - 3 * DAY, |t| t - 1);
+                scroll_filter(user, until[k])
+            } else {
                 step += 1;
-                s.req_due(
-                    &sid,
-                    "w6.profile_replace",
-                    Mode::Replace,
-                    vec![rotation_filter(user, step)],
-                    due,
-                );
-            }
+                rotation_filter(user, step)
+            };
+            s.req_due(&id, replace_class(k), Mode::Replace, vec![filter], due);
         }
     }
     s.pump_until(visit.until + DRAIN, |_| false).await;
+    // Re-REQs still waiting when the session stopped reading were due and
+    // never answered, unless the relay ended the session.
+    if !s.gone {
+        let now = Instant::now();
+        let mut stats = ctx.stats();
+        for (k, slots) in queued.iter().enumerate() {
+            for due in slots {
+                let row = stats.class(replace_class(k));
+                row.unanswered += 1;
+                record_us(&mut row.done, micros(now.saturating_duration_since(*due)));
+            }
+        }
+    }
     s.finish()
 }
 
@@ -2936,11 +3027,14 @@ async fn marmot_receiver(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<LiveR
         return Vec::new();
     };
     // MDK authenticates its receive connection with the account key before
-    // it subscribes. Wok challenges on connect whenever AUTH can complete,
-    // and resets open NIP-77 sessions when a connection authenticates.
-    let wait = (Instant::now() + Duration::from_secs(2)).min(visit.until);
+    // it subscribes. Wok challenges on connect whenever AUTH can complete;
+    // strfry, and Wok with AUTH off, never do, so the wait is short and
+    // the subscriptions exist before the group's burst. A pass a late
+    // AUTH closes is opened again.
+    let wait = (Instant::now() + CHALLENGE_WAIT).min(visit.until);
     s.pump_until(wait, |s| s.challenge.is_some()).await;
     if s.start_auth() {
+        let wait = (Instant::now() + CHALLENGE_WAIT).min(visit.until);
         s.pump_until(wait, |s| !matches!(s.auth, Auth::Pending(..)))
             .await;
     }
@@ -3094,6 +3188,9 @@ async fn background_publisher(ctx: Arc<Ctx>, index: usize) -> Vec<LiveRecord> {
     let mut next = ctx.start + interval.mul_f64(index as f64 / publishers as f64);
     let mut n = index as u64;
     let mut session = 0;
+    // What each connection put on the socket: a publication still queued
+    // behind a relay that stopped reading was not sent.
+    let mut writes = Vec::new();
     while next < ctx.end {
         let visit = Visit {
             session,
@@ -3108,6 +3205,18 @@ async fn background_publisher(ctx: Arc<Ctx>, index: usize) -> Vec<LiveRecord> {
         else {
             break;
         };
+        writes.push(s.conn.written.clone());
+        if visit.session > 0 {
+            // As in `rate.rs`, what fell due while the relay had dropped
+            // the connection is due and not sent; the schedule resumes
+            // with the next slot instead of flushing the backlog.
+            let now = Instant::now();
+            let mut stats = ctx.stats();
+            while next < now && next < ctx.end {
+                stats.publish_due += 1;
+                next += interval;
+            }
+        }
         while !s.gone && next < ctx.end {
             s.pump_until(next, |_| false).await;
             if Instant::now() < next {
@@ -3121,18 +3230,26 @@ async fn background_publisher(ctx: Arc<Ctx>, index: usize) -> Vec<LiveRecord> {
                 let mut stats = ctx.stats();
                 stats.lag(due);
                 stats.publish_due += 1;
-                stats.publish_sent += 1;
-                stats.publish_last = ctx.start.elapsed();
             }
             s.publish(event, "publish.background", false, due);
         }
         s.pump_until(ctx.drain_end, |s| s.pending.is_empty()).await;
         s.finish();
     }
+    let mut stats = ctx.stats();
     // Publications due once the relay no longer took the connection.
     while next < ctx.end {
-        ctx.stats().publish_due += 1;
+        stats.publish_due += 1;
         next += interval;
+    }
+    for written in writes {
+        let written = written.lock().unwrap_or_else(|e| e.into_inner());
+        stats.publish_sent += written.events;
+        if let Some(last) = written.last {
+            stats.publish_last = stats
+                .publish_last
+                .max(last.saturating_duration_since(ctx.start));
+        }
     }
     Vec::new()
 }
@@ -3272,6 +3389,8 @@ pub struct ClientsReport {
     pub lag_p99_ms: f64,
     pub lag_max_ms: f64,
     pub publish_due: u64,
+    /// Background publications written to the socket; one still queued
+    /// behind a relay that stopped reading is not sent.
     pub publish_sent: u64,
     /// Background publications sent per second over the run, or to the last
     /// send if that was later.
@@ -4455,9 +4574,35 @@ mod tests {
         assert!(defaults.effective.relay.real_ip_header.is_empty());
     }
 
+    /// A run's shared state for `plan`, against `corpus`, ending in `secs`.
+    fn test_ctx(
+        addr: SocketAddr,
+        plan: Plan,
+        corpus: Vec<Value>,
+        opts: ClientsOptions,
+        secs: u64,
+    ) -> Arc<Ctx> {
+        let start = Instant::now();
+        let end = start + Duration::from_secs(secs);
+        Arc::new(Ctx {
+            addr,
+            service_url: format!("ws://{addr}"),
+            opts,
+            nodelay: true,
+            plan: Arc::new(plan),
+            oracle: Oracle::new(corpus),
+            policy: open_policy(),
+            caps: NO_CAPS,
+            published: Mutex::new(HashMap::new()),
+            stats: Mutex::new(Stats::default()),
+            start,
+            end,
+            drain_end: end + DRAIN,
+        })
+    }
+
     /// A session over channels instead of a socket, against `corpus`.
     fn offline_session(corpus: Vec<Value>, groups: Vec<Group>, keys: Option<Keypair>) -> Session {
-        let start = Instant::now();
         let plan = Plan {
             events: Vec::new(),
             anchor: 1_800_000_000,
@@ -4469,27 +4614,15 @@ mod tests {
             marmot: Vec::new(),
             groups,
         };
-        let ctx = Arc::new(Ctx {
-            addr: SocketAddr::from(([127, 0, 0, 1], 9)),
-            service_url: "ws://127.0.0.1:9".into(),
-            opts: small_options(),
-            nodelay: true,
-            plan: Arc::new(plan),
-            oracle: Oracle::new(corpus),
-            policy: open_policy(),
-            caps: NO_CAPS,
-            published: Mutex::new(HashMap::new()),
-            stats: Mutex::new(Stats::default()),
-            start,
-            end: start + Duration::from_secs(60),
-            drain_end: start + Duration::from_secs(62),
-        });
+        let addr = SocketAddr::from(([127, 0, 0, 1], 9));
+        let ctx = test_ctx(addr, plan, corpus, small_options(), 60);
         let (out, _) = mpsc::unbounded_channel();
         let (_, inbound) = mpsc::unbounded_channel();
         let conn = WsConn {
             out,
             inbound,
             deflate: false,
+            written: Arc::default(),
         };
         let until = ctx.end;
         Session::new(&ctx, "test".into(), "outbox", conn, keys, 1, until)
@@ -4586,6 +4719,7 @@ mod tests {
                 started: Instant::now(),
                 first: None,
                 client: wok_negentropy::Negentropy::new(store, 60_000).unwrap(),
+                items: vec![(10, [1; 32])],
                 held: HashSet::from([[1u8; 32]]),
                 have: Vec::new(),
                 need: need.iter().map(|b| vec![*b; 32]).collect(),
@@ -4883,9 +5017,13 @@ mod tests {
         );
     }
 
+    const UPGRADE: &[u8] =
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
     /// A relay that answers every WebSocket handshake with `response`, then
-    /// closes its side.
-    async fn scripted_relay(response: Vec<u8>) -> SocketAddr {
+    /// closes its side, or with `hold` keeps the connection open and never
+    /// reads from it again.
+    async fn scripted_relay(response: Vec<u8>, hold: bool) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4901,6 +5039,9 @@ mod tests {
                         head.push(byte[0]);
                     }
                     let _ = stream.write_all(&response).await;
+                    if hold {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
                     let _ = stream.shutdown().await;
                 });
             }
@@ -4910,16 +5051,15 @@ mod tests {
 
     #[tokio::test]
     async fn refusals_and_disconnects_come_back_with_the_relays_reason() {
-        let upgrade = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
-        let mut closing = upgrade.to_vec();
+        let mut closing = UPGRADE.to_vec();
         closing.extend([0x88, 12]);
         closing.extend(1013u16.to_be_bytes());
         closing.extend(b"overloaded");
         for (response, expected) in [
             (closing, "close 1013: overloaded"),
-            (upgrade.to_vec(), "closed without a close frame"),
+            (UPGRADE.to_vec(), "closed without a close frame"),
         ] {
-            let addr = scripted_relay(response).await;
+            let addr = scripted_relay(response, false).await;
             let Ok(mut conn) = ws_connect(addr, None, false, true).await else {
                 panic!("handshake with the scripted relay failed");
             };
@@ -4938,7 +5078,7 @@ mod tests {
                 "slow down",
             ),
         ] {
-            let addr = scripted_relay(response.as_bytes().to_vec()).await;
+            let addr = scripted_relay(response.as_bytes().to_vec(), false).await;
             match ws_connect(addr, None, false, true).await {
                 Err(ConnectFailure::Refused(reason)) => assert_eq!(reason, expected),
                 Err(other) => panic!("not a refusal: {other}"),
@@ -4971,10 +5111,11 @@ mod tests {
     }
 
     /// An in-process relay with default limits, abuse controls and AUTH on,
-    /// holding `events`.
+    /// holding `events`, as `configure` leaves it.
     async fn spawn_relay(
         dir: &Path,
         events: &[Value],
+        configure: impl FnOnce(&mut wok_relay::Config),
     ) -> (SocketAddr, wok_relay::RelayHandle, wok_relay::Config) {
         let env = wok_db::Env::open(dir, wok_db::EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
@@ -5006,6 +5147,7 @@ mod tests {
         cfg.relay.port = addr.port();
         cfg.relay.real_ip_header = FORWARDED_HEADER.into();
         cfg.relay.auth.service_url = format!("ws://{addr}");
+        configure(&mut cfg);
         let handle = wok_relay::start(env, cfg.clone()).unwrap();
         let server = handle.clone();
         tokio::spawn(async move {
@@ -5022,7 +5164,7 @@ mod tests {
         let opts = small_options();
         let anchor = unix_now() - 5;
         let plan = Plan::generate(&opts, 11, anchor);
-        let (addr, handle, cfg) = spawn_relay(dir.path(), &plan.events).await;
+        let (addr, handle, cfg) = spawn_relay(dir.path(), &plan.events, |_| {}).await;
         let (report, _) = run(RunInput {
             addr,
             plan,
@@ -5125,7 +5267,7 @@ mod tests {
         let background: Vec<Value> = (0..4).map(note).collect();
         let mut stored = plan.events.clone();
         stored.extend(background.iter().cloned());
-        let (addr, handle, cfg) = spawn_relay(dir.path(), &stored).await;
+        let (addr, handle, cfg) = spawn_relay(dir.path(), &stored, |_| {}).await;
         let url = format!("ws://{addr}");
         let facts = || {
             RelayFacts::remote(
@@ -5193,5 +5335,226 @@ mod tests {
             "{refused}"
         );
         handle.request_shutdown();
+    }
+    #[tokio::test]
+    async fn a_publication_is_sent_once_written_and_a_stalled_write_ends_the_connection() {
+        let addr = scripted_relay(UPGRADE.to_vec(), true).await;
+        let Ok(mut conn) = ws_connect(addr, None, false, true).await else {
+            panic!("handshake with the scripted relay failed");
+        };
+        // Far more than the socket buffers hold.
+        let frame = format!(r#"["EVENT",{{"content":"{}"}}]"#, "x".repeat(64 << 10));
+        for _ in 0..1_024 {
+            let _ = conn.out.send(Out::Event(frame.clone()));
+        }
+        let ended = tokio::time::timeout(WRITE_STALL * 2, conn.inbound.recv()).await;
+        match ended {
+            Ok(Some(In::Gone(reason))) => {
+                assert!(reason.starts_with("write stalled"), "{reason}")
+            }
+            _ => panic!("a relay that stops reading must end the connection"),
+        }
+        let written = conn.written.lock().unwrap().events;
+        assert!(written > 0 && written < 1_024, "{written} written");
+    }
+
+    /// An outbox client against a relay whose first EOSE for `r0` comes late:
+    /// the re-REQs due meanwhile wait, keep their due times and all go out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacements_due_behind_a_slow_req_keep_their_schedule() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let late = Duration::from_millis(900);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut stream) = ws.split();
+            let mut held: Option<(tokio::time::Instant, String)> = None;
+            let mut first = true;
+            loop {
+                let wake = held.as_ref().map(|(at, _)| *at);
+                tokio::select! {
+                    message = stream.next() => {
+                        let Some(Ok(Message::Text(text))) = message else { break };
+                        let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                        if frame[0] != "REQ" {
+                            continue;
+                        }
+                        let eose = json!(["EOSE", frame[1]]).to_string();
+                        if frame[1] == "r0" && std::mem::take(&mut first) {
+                            held = Some((tokio::time::Instant::now() + late, eose));
+                        } else if sink.send(Message::Text(eose.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(wake.unwrap_or_else(tokio::time::Instant::now)), if wake.is_some() => {
+                        let (_, eose) = held.take().unwrap();
+                        let _ = sink.send(Message::Text(eose.into())).await;
+                    }
+                }
+            }
+        });
+        let opts = ClientsOptions {
+            outbox_clients: 1,
+            marmot_clients: 0,
+            replace_interval_ms: 250,
+            deflate: false,
+            ..small_options()
+        };
+        let plan = Plan::generate(&opts, 3, 1_800_000_000);
+        let ctx = test_ctx(addr, plan, Vec::new(), opts, 60);
+        let due = Instant::now();
+        // Re-REQs are due at 0.25, 0.5, ... 1.5 s: six per subscription.
+        let visit = Visit {
+            session: 0,
+            due,
+            until: due + Duration::from_millis(1_600),
+        };
+        outbox_client(ctx.clone(), 0, visit).await;
+        let mut stats = ctx.stats();
+        assert_eq!(stats.mismatches, 0, "{:?}", stats.mismatch_samples);
+        assert_eq!(stats.errors, 0, "{:?}", stats.error_samples);
+        let scroll = stats.class("w6.scroll_replace");
+        assert_eq!(scroll.sent, 3 + 3 * 6, "every scheduled re-REQ goes out");
+        assert_eq!(scroll.completed, scroll.sent);
+        assert_eq!(scroll.unanswered, 0);
+        // The 0.25 s re-REQ of r0 waited for the 0.9 s EOSE.
+        assert!(
+            scroll.done.max() >= 600_000,
+            "latency counts from the due time: {} us",
+            scroll.done.max()
+        );
+        let rotation = stats.class("w6.profile_replace");
+        assert_eq!(rotation.sent, 2 + 2 * 6);
+    }
+    #[test]
+    fn a_pass_closed_by_a_late_auth_is_opened_again() {
+        let groups = vec![Group {
+            gid: "ab".repeat(32),
+            members: vec![0],
+        }];
+        let mut s = offline_session(Vec::new(), groups, None);
+        s.open_neg("n0", 0, &[(10, [1; 32])]);
+        let started = s.negs["n0"].started;
+        let reset = "closed: authentication changed; reopen synchronization";
+        s.on_message(Instant::now(), json!(["NEG-ERR", "n0", reset]));
+        // The client had already closed this one.
+        s.on_message(Instant::now(), json!(["NEG-ERR", "n1", reset]));
+        assert_eq!(s.negs["n0"].started, started, "timed from the first open");
+        let mut stats = s.ctx.stats();
+        assert_eq!(stats.mismatches, 0, "{:?}", stats.mismatch_samples);
+        let row = stats.class("marmot.neg");
+        assert_eq!((row.sent, row.refused), (1, 0));
+    }
+
+    /// Engine mode: a relay that never challenges still has the Marmot
+    /// receiver subscribed before its group's burst, so the commit is a
+    /// live delivery there too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_is_delivered_live_on_a_relay_that_never_challenges() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ClientsOptions {
+            outbox_clients: 0,
+            marmot_clients: 1,
+            marmot_groups: 2,
+            duration_secs: 4,
+            publish_rate: 0.0,
+            ..small_options()
+        };
+        let plan = Plan::generate(&opts, 17, unix_now() - 5);
+        let (addr, handle, cfg) = spawn_relay(dir.path(), &plan.events, |cfg| {
+            cfg.relay.auth.enabled = false;
+            cfg.relay.auth.recipient_only_kinds.clear();
+        })
+        .await;
+        let (report, _) = run(RunInput {
+            addr,
+            plan,
+            background: Vec::new(),
+            facts: RelayFacts::from_config(&cfg),
+            relay_config: "AUTH off".into(),
+            config_overrides: Vec::new(),
+            opts,
+            nodelay: true,
+        })
+        .await
+        .unwrap();
+        handle.request_shutdown();
+        assert_eq!(report.mismatches, 0, "{:#?}", report.mismatch_samples);
+        assert_eq!(report.errors, 0, "{:#?}", report.error_samples);
+        assert_eq!(report.auth_round_trips, 0);
+        let delivery = report
+            .classes
+            .iter()
+            .find(|row| row.class == "delivery.marmot")
+            .unwrap_or_else(|| panic!("no live Marmot deliveries: {:#?}", report.classes));
+        assert!(
+            delivery.sent > 0 && delivery.completed == delivery.sent,
+            "{delivery:#?}"
+        );
+    }
+
+    /// A relay that drops the publisher and takes a second to accept it
+    /// again: the slots due meanwhile are not sent in a burst on reconnect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconnected_publisher_resumes_its_schedule_without_a_burst() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let gap = Duration::from_secs(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let log = received.clone();
+        tokio::spawn(async move {
+            for connection in 0.. {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut events = 0;
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                    log.lock().unwrap().push(Instant::now());
+                    let ok = json!(["OK", frame[1]["id"], true, ""]).to_string();
+                    let _ = ws.send(Message::Text(ok.into())).await;
+                    events += 1;
+                    if connection == 0 && events == 5 {
+                        let _ = ws.close(None).await;
+                        tokio::time::sleep(gap).await;
+                        break;
+                    }
+                }
+            }
+        });
+        let opts = ClientsOptions {
+            outbox_clients: 1,
+            marmot_clients: 0,
+            publish_rate: 10.0,
+            publishers: 1,
+            deflate: false,
+            ..small_options()
+        };
+        let plan = Plan::generate(&opts, 19, unix_now() - 5);
+        let ctx = test_ctx(addr, plan, Vec::new(), opts, 3);
+        background_publisher(ctx.clone(), 0).await;
+        let stats = ctx.stats();
+        assert_eq!(stats.errors, 0, "{:?}", stats.error_samples);
+        assert_eq!(stats.publish_due, 30);
+        assert_eq!(stats.publish_sent, received.lock().unwrap().len() as u64);
+        assert!(
+            stats.publish_sent + 5 <= stats.publish_due,
+            "{} of {} sent: the gap's slots were flushed",
+            stats.publish_sent,
+            stats.publish_due
+        );
+        let times = received.lock().unwrap();
+        assert!(
+            times
+                .windows(3)
+                .all(|w| w[2] - w[0] >= Duration::from_millis(100)),
+            "no three publications within 100 ms"
+        );
     }
 }

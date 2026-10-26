@@ -261,19 +261,30 @@ The schedule does not wait for the relay. Connect latency counts from when
 the session was due; re-REQs of replaced subscriptions are due every
 `--replace-interval-ms`; background publications are due every
 `1 / --publish-rate` seconds, spread over the publishers; and a Marmot burst
-is due at a fixed offset into its session. Each of those counts its latency
-from when it was due, as `ws_publish_rate` does, so time spent waiting behind
-a slow relay counts. A request still unanswered when its session stops
-reading counts as unanswered, with its latency up to then, so with
-unanswered requests the percentiles are lower bounds. The harness's own
-lateness in starting scheduled work is reported as the lag; a large lag means
-the load host, not the relay, is the bottleneck.
+is due 1.5 s into its session. Each of those counts its latency from when it
+was due, as `ws_publish_rate` does, so time spent waiting behind a slow relay
+counts. A re-REQ due while the subscription's last REQ is still unfinished
+waits for it and keeps its due time, so a slow relay builds a backlog rather
+than being offered less. A request still unanswered when its session stops
+reading counts as unanswered, with its latency up to then, as does a re-REQ
+still waiting; with unanswered requests the percentiles are lower bounds.
+The harness's own lateness in starting scheduled work is reported as the
+lag; a large lag means the load host, not the relay, is the bottleneck.
 
-Background publishing is held to its rate as in `ws_publish_rate`: sends over
+Background publishing is held to its rate as in `ws_publish_rate`. A
+publication counts as sent once it is written to the socket, and sends over
 the run, or to the last send if that was later, must reach 99% of the
-publications due, or the trial is `ok=false`. A publisher the relay
-disconnects reconnects and keeps the schedule; slots it could not send count
-as due but not sent.
+publications due, or the trial is `ok=false`. A write that cannot finish for
+10 s means the relay stopped reading: the connection is given up and counted
+as a disconnect (`write stalled`). A publisher the relay disconnects
+reconnects and resumes with the next slot; the slots due while it had no
+connection count as due but not sent, and are not flushed in a burst.
+
+A Marmot receiver waits up to 250 ms for a connect-time AUTH challenge and
+authenticates before it subscribes, as MDK does. strfry, and Wok with AUTH
+off, never challenge, so the wait is short and the subscriptions exist before
+the group's burst on every relay. A NIP-77 pass that Wok closes because the
+connection authenticated late is opened again, timed from the first open.
 
 ### Against a remote relay
 

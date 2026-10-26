@@ -393,8 +393,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both corpora and nothing an earlier run published. With
   `--client-arrival-rate` and `--client-session-secs`, client sessions start
   and end on a fixed schedule. Connections, re-REQs, background publications
-  and Marmot bursts count their latency from when they were due, and the
-  background publishers must hold their rate. Requests left unanswered,
+  and Marmot bursts count their latency from when they were due; a re-REQ
+  due behind an unfinished one waits and keeps its due time. Background
+  publishers must hold their rate, counting a publication as sent once it is
+  written to the socket, and a reconnecting publisher skips the slots it
+  missed instead of sending them in a burst. Requests left unanswered,
   duplicate live deliveries, and connections the relay closed are counted,
   each by reason for the closes; like refusals, they fail the trial only with
   `--expect-no-refusals`. Background publishers now also send

@@ -147,6 +147,9 @@ addressable kinds has its entry too. The writer puts and deletes an event's
 entries in the transaction that inserts or deletes the event, on every path:
 replacement, NIP-09 deletion, NIP-40 expiry, the NIP-62 sweep,
 `wok purge-superseded`, `wok delete` and the deletions reindex applies.
+`wok import` is the exception: into a table that a key-ordered pass would
+build anyway, it leaves the entries to that pass (see
+[After an import](#after-an-import)).
 
 Two markers share the table. Their keys are shorter than the 16 bytes of a
 posting's integers, so the comparator sorts them before every posting, and
@@ -161,7 +164,8 @@ their values are native-endian u64s:
   that inserts events moves it past them only when it already covered every
   earlier ID, so a gap of unindexed events stops it.
 
-A new database is complete from its first open. One written before this
+A new database is complete from its first open, and again once an import
+into it ends. One written before this
 table existed, or migrated from strfry, gets an empty table at marker 0 on
 its first writable open. The relay's writer then builds it in the background,
 one bounded transaction at a time (see
@@ -212,6 +216,28 @@ Values are native-endian. The pass resumes after the cursor, so a restart
 loses at most the step it interrupted. Emptying `wok_Event__tagKind` (a new
 layout, `wok reindex`) empties this table too. A record that does not decode
 is a malformed record in integrity, and the next step starts the pass again.
+
+### After an import
+
+A batch of `wok import` that finds the table in this layout, at marker 0, with
+no pass running (a new database, or one whose index has not been built)
+writes its events without their entries and leaves the marker at 0. That is
+the state in which the next step begins a key-ordered pass, and a pass that
+begins after the batch commits covers its events. Deletions in the batch
+still remove entries. Once the last batch is written, the import runs that
+pass to the end, in transactions of up to a million postings, so the index
+is complete when it exits; a database that already held events at marker 0
+gets their entries too. Building in key order after the load writes a
+fraction of the pages that entries put in arrival order rewrite. An import
+stopped before then leaves the index incomplete, and the relay's writer
+finishes it in the background. Batches that find the index complete, a pass
+running, or a gap above a nonzero marker write their entries as above, and
+the import builds nothing.
+
+A batch never moves the marker past events whose entries it left out, and
+never changes a running pass's target: a pass covers exactly the events
+stored when it began, and raising its target would claim events whose
+`Event__tag` entries sort before its cursor.
 
 ## EventPayload
 

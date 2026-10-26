@@ -27,6 +27,10 @@
 //! walk ends, the marker takes the target. Any other gap above the marker is
 //! indexed in local-id order.
 //!
+//! A bulk load into a table that such a pass would build anyway, at marker 0
+//! with no pass running, may leave its events' postings to the pass
+//! ([`defer_tag_kind_postings`]); `wok import` does, then runs the pass.
+//!
 //! An earlier Wok release does not open these tables. The events it inserts take
 //! ids above the marker, so the index stays incomplete until they are indexed.
 //! The events it deletes leave their entries behind. Local ids are never
@@ -249,6 +253,34 @@ pub(crate) fn note_tag_kind_indexed(
         set_marker(txn, dbi, INDEXED_THROUGH_KEY, last)?;
     }
     Ok(())
+}
+
+/// Leave the postings of the events `txn` inserts to a key-ordered pass, when
+/// the next backfill step would begin one: the table is in this layout, at
+/// marker 0, and no pass runs. A pass begins only after this transaction
+/// commits, so its target covers these events and its walk visits each of
+/// their `Event__tag` entries. The write path then puts no postings for them
+/// and leaves the marker at 0, which keeps the table incomplete until that
+/// pass ends. Deletions still remove postings, and backfill steps still put
+/// theirs. Returns whether `txn` defers; in any other state it posts as usual.
+///
+/// For a bulk load, which in key order writes a fraction of the pages that
+/// postings in arrival order rewrite. `wok import` runs the pass before it
+/// exits; stopped earlier, the relay's writer finishes it.
+pub fn defer_tag_kind_postings(txn: &mut RwTxn<'_>) -> Result<bool, DbError> {
+    let dbis = txn.env().dbis();
+    let (Some(dbi), Some(build)) = (dbis.event_tag_kind, dbis.event_tag_kind_build) else {
+        return Ok(false);
+    };
+    let unbuilt = marker(txn.get(dbi, SCHEMA_KEY)?) == Some(TAG_KIND_SCHEMA_VERSION)
+        && marker(txn.get(dbi, INDEXED_THROUGH_KEY)?).unwrap_or(0) == 0
+        && read_pass(
+            txn.get(build, PASS_TARGET_KEY)?,
+            txn.get(build, PASS_VISITED_KEY)?,
+        )
+        .is_none();
+    txn.defer_tag_kind = unbuilt;
+    Ok(unbuilt)
 }
 
 /// Empty the table and restart its marker at 0, so that the backfill indexes
@@ -985,6 +1017,98 @@ mod tests {
         assert_eq!(state(&env).bulk_pass, None);
 
         assert_eq!(progress(step(&env, 10)), (5, 5, None));
+        assert_complete_and_consistent(&env);
+    }
+
+    /// Write one event per time in one transaction that defers its postings
+    /// if it may, as an import batch does. Returns whether it deferred.
+    fn write_deferred(env: &Env, times: impl IntoIterator<Item = u64>) -> bool {
+        let mut events: Vec<_> = times.into_iter().map(event).collect();
+        let mut txn = env.begin_rw().unwrap();
+        let deferred = defer_tag_kind_postings(&mut txn).unwrap();
+        crate::write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        deferred
+    }
+
+    fn build(env: &Env) {
+        while !state(env).complete() {
+            step(env, 7);
+        }
+    }
+
+    #[test]
+    fn deferred_postings_are_left_to_a_key_ordered_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        // The first batch of a new database starts at local id 1, which a
+        // marker at 0 covers: noting it would mark the empty table complete.
+        assert!(write_deferred(&env, 100..110));
+        assert!(write_deferred(&env, 110..120));
+        let deferred = state(&env);
+        assert_eq!((deferred.indexed_through, deferred.high_water), (0, 20));
+        assert!(!deferred.complete());
+        assert_eq!(postings(&env), 0);
+        // Integrity expects no entries above the marker.
+        assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
+
+        assert_eq!(progress(step(&env, 7)), (7, 0, Some(7)));
+        build(&env);
+        assert_eq!(state(&env).indexed_through, 20);
+        assert_eq!(postings(&env), 20);
+        assert_complete_and_consistent(&env);
+        // Once built, writes post again.
+        assert!(!write_deferred(&env, [200]));
+        assert_eq!(state(&env).indexed_through, 21);
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn a_pass_over_a_database_from_before_the_table_covers_deferred_writes() {
+        let (_dir, env) = unindexed(5);
+        assert!(write_deferred(&env, 200..205));
+        let unbuilt = state(&env);
+        assert_eq!((unbuilt.indexed_through, unbuilt.high_water), (0, 10));
+        assert_eq!(postings(&env), 0);
+        build(&env);
+        assert_eq!(postings(&env), 10);
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn postings_are_deferred_only_before_a_pass_begins() {
+        // While a pass runs, its target is below the new events and its
+        // cursor may be past their keys, so they are posted as usual.
+        let (_dir, env) = unindexed(10);
+        step(&env, 4);
+        assert!(!write_deferred(&env, [200]));
+        assert_eq!(postings(&env), 5);
+        build(&env);
+        assert_complete_and_consistent(&env);
+        // Behind a nonzero marker, as an earlier release leaves it.
+        let earlier = write(&env, 201);
+        as_if_inserted_by_an_earlier_release(&env, &earlier, earlier.lev_id - 1);
+        assert!(!write_deferred(&env, [202]));
+        build(&env);
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn a_deferring_transaction_still_deletes_postings() {
+        // A write while no pass runs posts its event without moving the
+        // marker; a deferring batch that then deletes that event must
+        // remove its posting, or the pass would leave it stale.
+        let (_dir, env) = unindexed(3);
+        let posted = write(&env, 50);
+        assert_eq!(postings(&env), 1);
+        let mut txn = env.begin_rw().unwrap();
+        assert!(defer_tag_kind_postings(&mut txn).unwrap());
+        crate::delete_events(&mut txn, &mut NoopNegentropy, [posted.lev_id]).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(postings(&env), 0);
+        build(&env);
+        assert_eq!(postings(&env), 3);
         assert_complete_and_consistent(&env);
     }
 

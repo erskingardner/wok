@@ -254,8 +254,9 @@ NEG-MSG fits the 131,072-byte WebSocket payload limit of strfry 1.1.3, Wok
 0.7.0 and Wok's `public` preset; relays answer with up to 500,000 bytes.
 `--sync-concurrency` syncs (default 1) run at once, `--sync-per-conn`
 (default 1; MDK runs up to 8) on each connection, and a connection that
-finishes one sync starts the next. Connections open before the clock starts.
-Each sends an `X-Forwarded-For` address in 10.64.0.0/10, one for every
+finishes one sync starts the next. The client builds each sync's first
+message and opens its connections before the clock starts. Each connection
+sends an `X-Forwarded-For` address in 10.64.0.0/10, one for every
 `--clients-per-address` connections (0 sends none), which a relay uses only
 when it trusts the header from the load host.
 
@@ -284,11 +285,13 @@ classes (`relay.auth.recipient_only_kinds`, `owner_only_kinds` and
 while strfry serves them. Each such kind must therefore be served in full or
 left out in full, and the table lists the kinds left out. A relay's refusal,
 a `NEG-ERR` or a `CLOSED` for a fetch, ends that sync and is counted by
-reason; refusals fail the trial only with `--expect-no-refusals`, which
-engine-mode runs should pass. A connection that closes, or that has syncs
-open and receives nothing for 120 s, fails its syncs. The oracle works out
-what a relay keeps of the corpus, after replacements and deletions, and holds
-that in memory, as the query scenarios hold their corpus.
+reason. A sync refused during its fetch is still checked as far as it got:
+its reconciliation and the events it received. Refusals fail the trial only
+with `--expect-no-refusals`, which engine-mode runs should pass. A
+connection that closes, or that has syncs open and receives nothing for
+120 s, fails its syncs. The oracle works out what a relay keeps of the
+corpus, after replacements and deletions, and holds that in memory, as the
+query scenarios hold their corpus.
 
 ## Client-realistic scenario (`clients`)
 

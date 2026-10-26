@@ -26,8 +26,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -374,6 +373,9 @@ pub struct Run {
     pub done: Vec<SessionLog>,
     /// `(job, reason)` of each sync the relay refused.
     pub refused: Vec<(usize, String)>,
+    /// Refused syncs that had finished reconciling, as far as they got. The
+    /// oracle checks them, but they are neither timed nor completed.
+    pub fetch_refused: Vec<SessionLog>,
     /// `(job, error)` of each sync that failed or never started.
     pub failed: Vec<(usize, String)>,
     /// Protocol errors not tied to one sync.
@@ -423,9 +425,38 @@ async fn connect(url: &str, address: Option<IpAddr>, nodelay: bool) -> Result<So
     }
 }
 
-/// Runs every sync of `plan` against `url`. Connections open before the
-/// clock starts.
+/// A sync's initiator and the message it opens with.
+type Initiated = (Negentropy<Vector>, Vec<u8>);
+
+/// Syncs not yet started, in job order.
+type Queue = Arc<Mutex<std::vec::IntoIter<(usize, Result<Initiated, String>)>>>;
+
+fn initiate(job: &Job) -> Result<Initiated, wok_negentropy::NegError> {
+    let mut store = Vector::new();
+    for (created_at, id) in &job.held {
+        store.insert(*created_at, id)?;
+    }
+    store.seal()?;
+    let mut neg = Negentropy::new(store, FRAME_LIMIT)?;
+    let initial = neg.initiate()?;
+    Ok((neg, initial))
+}
+
+fn pop(queue: &Queue) -> Option<(usize, Result<Initiated, String>)> {
+    queue.lock().unwrap_or_else(|e| e.into_inner()).next()
+}
+
+/// Runs every sync of `plan` against `url`. Each sync's first message is
+/// built and its connection opened before the clock starts.
 pub async fn run(url: &str, plan: Arc<Plan>, opts: &Options) -> Result<Run> {
+    let queue: Queue = Arc::new(Mutex::new(
+        plan.jobs
+            .iter()
+            .map(|job| initiate(job).map_err(|e| format!("negentropy initiate: {e}")))
+            .enumerate()
+            .collect::<Vec<_>>()
+            .into_iter(),
+    ));
     let concurrency = opts.concurrency.min(plan.jobs.len());
     let conns = concurrency.div_ceil(opts.per_conn);
     let mut sockets = Vec::with_capacity(conns);
@@ -433,7 +464,6 @@ pub async fn run(url: &str, plan: Arc<Plan>, opts: &Options) -> Result<Run> {
         let address = address(conn, opts.clients_per_address);
         sockets.push(connect(url, address, opts.nodelay).await?);
     }
-    let next = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
     let tasks: Vec<_> = sockets
         .into_iter()
@@ -443,7 +473,7 @@ pub async fn run(url: &str, plan: Arc<Plan>, opts: &Options) -> Result<Run> {
             let driver = Driver {
                 socket,
                 plan: plan.clone(),
-                next: next.clone(),
+                queue: queue.clone(),
                 live: HashMap::new(),
                 run: Run::default(),
             };
@@ -458,15 +488,17 @@ pub async fn run(url: &str, plan: Arc<Plan>, opts: &Options) -> Result<Run> {
         let part = task.await.context("sync connection task")?;
         run.done.extend(part.done);
         run.refused.extend(part.refused);
+        run.fetch_refused.extend(part.fetch_refused);
         run.failed.extend(part.failed);
         run.errors.extend(part.errors);
         run.notices.extend(part.notices);
     }
     run.wall = started.elapsed();
     // Syncs left unstarted because every connection failed.
-    let unstarted = next.load(Ordering::Relaxed)..plan.jobs.len();
-    run.failed
-        .extend(unstarted.map(|job| (job, "not started: its connection failed".to_owned())));
+    while let Some((job, _)) = pop(&queue) {
+        run.failed
+            .push((job, "not started: its connection failed".to_owned()));
+    }
     Ok(run)
 }
 
@@ -494,12 +526,23 @@ impl Session {
             self.log.problem_samples.push(message);
         }
     }
+
+    fn into_log(self) -> SessionLog {
+        let now = Instant::now();
+        let reconciled = self.reconciled.unwrap_or(now);
+        let mut log = self.log;
+        log.reconcile = reconciled - self.opened;
+        log.fetch = now - reconciled;
+        log.have = self.have.iter().map(|id| to_id(id)).collect();
+        log.need = self.need.iter().map(|id| to_id(id)).collect();
+        log
+    }
 }
 
 struct Driver {
     socket: Socket,
     plan: Arc<Plan>,
-    next: Arc<AtomicUsize>,
+    queue: Queue,
     /// Syncs in progress, by job.
     live: HashMap<usize, Session>,
     run: Run,
@@ -574,33 +617,20 @@ impl Driver {
 
     /// Opens the next unstarted sync, or returns false when none is left.
     async fn start_next(&mut self) -> Result<bool> {
-        let job = self.next.fetch_add(1, Ordering::Relaxed);
-        let Some(planned) = self.plan.jobs.get(job) else {
+        let Some((job, initiated)) = pop(&self.queue) else {
             return Ok(false);
         };
-        let initiated = (|| {
-            let mut store = Vector::new();
-            for (created_at, id) in &planned.held {
-                store.insert(*created_at, id)?;
-            }
-            store.seal()?;
-            let mut neg = Negentropy::new(store, FRAME_LIMIT)?;
-            let initial = neg.initiate()?;
-            Ok::<_, wok_negentropy::NegError>((neg, initial))
-        })();
         let (neg, initial) = match initiated {
             Ok(initiated) => initiated,
             Err(e) => {
-                self.run
-                    .failed
-                    .push((job, format!("negentropy initiate: {e}")));
+                self.run.failed.push((job, e));
                 return Ok(true);
             }
         };
         let frame = json!([
             "NEG-OPEN",
             neg_sid(job),
-            planned.filter,
+            self.plan.jobs[job].filter,
             hex::encode(initial)
         ]);
         // Live before the send, so a failed send fails this sync too.
@@ -643,10 +673,11 @@ impl Driver {
                 (Some(sid), Some(payload)) => self.on_neg_msg(sid, payload, len).await?,
                 _ => self.error(format!("malformed NEG-MSG: {}", clip(text))),
             },
-            (Some("NEG-ERR"), 3) => {
+            // strfry adds its `maxSyncEvents` to a "too many" refusal.
+            (Some("NEG-ERR"), 3..) => {
                 let reason = str_at(2).unwrap_or_default();
                 match str_at(1).and_then(parse_neg_sid) {
-                    Some(job) if self.live.contains_key(&job) => {
+                    Some(job) if self.live.get(&job).is_some_and(|s| s.neg.is_some()) => {
                         self.live.remove(&job);
                         self.run.refused.push((job, format!("NEG-ERR {reason}")));
                     }
@@ -664,10 +695,16 @@ impl Driver {
             (Some("CLOSED"), 3) => {
                 // A CLOSED for a REQ this client closed itself needs nothing.
                 if let Some((job, batch)) = str_at(1).and_then(parse_ids_sid) {
-                    if self.live.get(&job).is_some_and(|s| s.batch_no == batch) {
+                    if self
+                        .live
+                        .get(&job)
+                        .is_some_and(|s| s.batch_no == batch && s.neg.is_none())
+                    {
                         let reason = str_at(2).unwrap_or_default();
-                        self.live.remove(&job);
+                        let mut session = self.live.remove(&job).expect("live sync");
+                        session.log.fetch_down += len;
                         self.run.refused.push((job, format!("CLOSED {reason}")));
+                        self.run.fetch_refused.push(session.into_log());
                     }
                 }
             }
@@ -794,14 +831,7 @@ impl Driver {
     }
 
     fn finish(&mut self, session: Session) {
-        let now = Instant::now();
-        let reconciled = session.reconciled.unwrap_or(now);
-        let mut log = session.log;
-        log.reconcile = reconciled - session.opened;
-        log.fetch = now - reconciled;
-        log.have = session.have.iter().map(|id| to_id(id)).collect();
-        log.need = session.need.iter().map(|id| to_id(id)).collect();
-        self.run.done.push(log);
+        self.run.done.push(session.into_log());
     }
 }
 
@@ -912,7 +942,8 @@ struct KindTally {
 }
 
 /// Checks a run against the plan, records each completed sync's time in
-/// `hist` and summarizes.
+/// `hist` and summarizes. A sync refused during its fetch is checked as far
+/// as it got.
 pub fn report(plan: &Plan, run: &Run, opts: &Options, hist: &mut Histogram<u64>) -> Result<Report> {
     let policy = wok_relay::Config::default().read_restrictor();
     let mut mismatches = 0u64;
@@ -924,7 +955,7 @@ pub fn report(plan: &Plan, run: &Run, opts: &Options, hist: &mut Histogram<u64>)
         }
     };
     let mut kinds: BTreeMap<u64, KindTally> = BTreeMap::new();
-    for log in &run.done {
+    for log in run.done.iter().chain(&run.fetch_refused) {
         let job = &plan.jobs[log.job];
         let filter = &job.filter;
         let need: HashSet<Id> = log.need.iter().copied().collect();
@@ -1002,6 +1033,8 @@ pub fn report(plan: &Plan, run: &Run, opts: &Options, hist: &mut Histogram<u64>)
             log.problems,
             format!("{filter}: {}", log.problem_samples.join("; ")),
         );
+    }
+    for log in &run.done {
         hist.record((log.reconcile + log.fetch).as_micros().max(1) as u64)?;
     }
     let mut withheld_kinds = Vec::new();
@@ -1356,24 +1389,48 @@ mod tests {
         assert_eq!(checked(&plan, &[5, 6, 7, 8], &[0xdd]).mismatches, 1);
     }
 
-    /// A relay that refuses every NEG-OPEN, as strfry does past
-    /// `maxSyncEvents`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn refusals_are_counted_and_fail_only_when_unexpected() {
+    /// Serves each connection to a listener on a free port with `relay`,
+    /// which maps a client message to the replies, and returns its URL.
+    async fn mock_relay<R>(relay: impl Fn() -> R + Send + 'static) -> String
+    where
+        R: FnMut(Value) -> Vec<Value> + Send + 'static,
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                let mut replies = relay();
                 tokio::spawn(async move {
                     let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
                     while let Some(Ok(Message::Text(text))) = socket.next().await {
-                        let frame: Value = serde_json::from_str(text.as_str()).unwrap();
-                        let reply = json!(["NEG-ERR", frame[1], "blocked: too many query results"]);
-                        let _ = socket.send(Message::Text(reply.to_string().into())).await;
+                        let frame = serde_json::from_str(text.as_str()).unwrap();
+                        for reply in replies(frame) {
+                            let _ = socket.send(Message::Text(reply.to_string().into())).await;
+                        }
                     }
                 });
             }
         });
+        url
+    }
+
+    /// A relay that refuses every NEG-OPEN, as strfry does past
+    /// `maxSyncEvents`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refusals_are_counted_and_fail_only_when_unexpected() {
+        let url = mock_relay(|| {
+            let mut opened = 0;
+            move |frame: Value| {
+                let mut reply = json!(["NEG-ERR", frame[1], "blocked: too many query results"]);
+                // strfry 1.1.3 adds its limit; a relay may also send three.
+                opened += 1;
+                if opened % 2 == 1 {
+                    reply.as_array_mut().unwrap().push(json!(1_000_000));
+                }
+                vec![reply]
+            }
+        })
+        .await;
         let opts = Options {
             windows: 3,
             concurrency: 2,
@@ -1396,6 +1453,79 @@ mod tests {
             ..report
         };
         assert!(!strict.ok());
+    }
+
+    /// A relay that reconciles honestly, alters an event in the first
+    /// fetch and refuses the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_fetch_keeps_what_it_saw() {
+        let events: Vec<Value> = (0..800u16)
+            .map(|i| {
+                let mut event = event(i.into(), 0, 1, json!([]));
+                let mut id = [0; 32];
+                id[..2].copy_from_slice(&i.to_be_bytes());
+                event["id"] = json!(hex::encode(id));
+                event
+            })
+            .collect();
+        let corpus: Arc<HashMap<String, Value>> = Arc::new(
+            events
+                .iter()
+                .map(|e| (e["id"].as_str().unwrap().to_owned(), e.clone()))
+                .collect(),
+        );
+        let url = mock_relay(move || {
+            let corpus = corpus.clone();
+            let mut neg = None;
+            move |frame: Value| match frame[0].as_str().unwrap() {
+                "NEG-OPEN" | "NEG-MSG" => {
+                    let neg = neg.get_or_insert_with(|| {
+                        let mut store = Vector::new();
+                        for event in corpus.values() {
+                            let id = hex::decode(event["id"].as_str().unwrap()).unwrap();
+                            store
+                                .insert(event["created_at"].as_u64().unwrap(), &id)
+                                .unwrap();
+                        }
+                        store.seal().unwrap();
+                        Negentropy::new(store, 0).unwrap()
+                    });
+                    let query =
+                        hex::decode(frame.as_array().unwrap().last().unwrap().as_str().unwrap())
+                            .unwrap();
+                    vec![json!([
+                        "NEG-MSG",
+                        frame[1],
+                        hex::encode(neg.reconcile(&query).unwrap())
+                    ])]
+                }
+                "REQ" if frame[1].as_str().unwrap().ends_with("-1") => {
+                    let mut replies: Vec<Value> = frame[2]["ids"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| json!(["EVENT", frame[1], corpus[id.as_str().unwrap()]]))
+                        .collect();
+                    replies[0][2]["content"] = json!("altered");
+                    replies.push(json!(["EOSE", frame[1]]));
+                    replies
+                }
+                "REQ" => vec![json!(["CLOSED", frame[1], "error: shutting down"])],
+                _ => Vec::new(),
+            }
+        })
+        .await;
+        let opts = options(Filters::All, Missing::Newest, 100.0);
+        let plan = Arc::new(plan(events, &opts).unwrap());
+        let run = run(&url, plan.clone(), &opts).await.unwrap();
+        assert_eq!(run.fetch_refused.len(), 1, "{run:#?}");
+        let report = report(&plan, &run, &opts, &mut Histogram::new(3).unwrap()).unwrap();
+        assert_eq!((report.completed, report.refused), (0, 1), "{report:#?}");
+        // The altered event counts; the 300 the refused fetch never
+        // returned do not.
+        assert_eq!(report.mismatches, 1, "{:?}", report.mismatch_samples);
+        assert!(report.mismatch_samples[0].contains("returned altered"));
+        assert!(!report.ok());
     }
 
     /// Imports `events` into a Wok started in process, with the `{}` tree

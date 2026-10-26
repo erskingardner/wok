@@ -20,8 +20,7 @@ BENCH_BIN=${BENCH_BIN:-/opt/wok-load/bin/current/wok-bench}
 RELAY_BENCH_BIN=${RELAY_BENCH_BIN:-/opt/relay-bench/bin/wok-bench/wok-bench}
 EVENTS=${EVENTS:-100000}
 # realistic, or social: a public social relay's history, of which a relay
-# keeps only part. The query phases assume a relay keeps every corpus
-# event, so a social campaign skips them.
+# keeps only part. The query phases read either.
 CORPUS_MIX=${CORPUS_MIX:-realistic}
 SOCIAL_AUTHORS=${SOCIAL_AUTHORS:-100000}
 QUERIES=${QUERIES:-400}
@@ -346,22 +345,20 @@ run_target() {
         ${CAP_ARGS[@]+"${CAP_ARGS[@]}"}
 
     local status=0
-    if [[ $CORPUS_MIX == realistic ]]; then
-        if ! run_bench "$target" "$repetition" "$url" query \
-            --scenario ws_query_latency --corpus "$LOAD_CORPUS" --events "$EVENTS" \
-            --queries "$QUERIES" --event-mix realistic; then
-            status=1
-        fi
-        if [[ $status -eq 0 ]] && ! run_bench "$target" "$repetition" "$url" deep-history \
-            --scenario deep_history_pagination --corpus "$LOAD_CORPUS" --events "$EVENTS" \
-            --queries "$DEEP_PAGES" --event-mix realistic; then
-            status=1
-        fi
-        if [[ $status -eq 0 ]] && ! run_bench "$target" "$repetition" "$url" mixed-read-write \
-            --scenario mixed_read_write --corpus "$LOAD_CORPUS" --events "$EVENTS" \
-            --queries "$QUERIES" --event-mix realistic; then
-            status=1
-        fi
+    if ! run_bench "$target" "$repetition" "$url" query \
+        --scenario ws_query_latency --corpus "$LOAD_CORPUS" --events "$EVENTS" \
+        --queries "$QUERIES" --event-mix "$CORPUS_MIX"; then
+        status=1
+    fi
+    if [[ $status -eq 0 ]] && ! run_bench "$target" "$repetition" "$url" deep-history \
+        --scenario deep_history_pagination --corpus "$LOAD_CORPUS" --events "$EVENTS" \
+        --queries "$DEEP_PAGES" --event-mix "$CORPUS_MIX"; then
+        status=1
+    fi
+    if [[ $status -eq 0 ]] && ! run_bench "$target" "$repetition" "$url" mixed-read-write \
+        --scenario mixed_read_write --corpus "$LOAD_CORPUS" --events "$EVENTS" \
+        --queries "$QUERIES" --event-mix "$CORPUS_MIX"; then
+        status=1
     fi
     if [[ $status -eq 0 ]] && ! run_bench "$target" "$repetition" "$url" load \
         --profile load --corpus "$LOAD_CORPUS" --events "$EVENTS" \

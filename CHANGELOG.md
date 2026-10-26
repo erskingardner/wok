@@ -370,6 +370,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2,000 follows and Marmot Welcomes (#226). Profiles and lists are replaced
   and deletion requests delete, and the manifest gives the number of events a
   relay keeps, which strfry 1.1.3 and Wok match on import.
+- `scripts/benchmark-qualify.sh` checks that two benchmark hosts are fit to
+  measure on (#226). It records their hardware, and measures sync-write
+  latency and random reads on the relay's database filesystem, the network
+  between the hosts, and steal time with every CPU busy. It fails when
+  either host's average steal is above 1 percent and, given an earlier run,
+  when the sync-write p99 has moved by more than 2x.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,

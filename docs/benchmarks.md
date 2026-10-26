@@ -657,10 +657,11 @@ target, and each relay and its import can write only under its own
 run, such as `strfry-1.1.3`, `wok-0.7.0` and `wok-master`. Two configurations
 of one binary, such as limits off and a preset as shipped, are two targets
 with two databases. strfry raises its open-file limit to `relay.nofiles`
-(1,000,000 by default) whenever it starts, imports included, and exits when
-that is above the unit's limit (`NOFILE_LIMIT`, default 524288). So set
-`relay { nofiles = 0 }` in a strfry target's config, or raise
-`NOFILE_LIMIT`. The relay host needs systemd with cgroup v2, sysstat
+(1,000,000 by default) whenever it starts, imports and exports included, and
+exits when that is above the unit's limit (`NOFILE_LIMIT`, default 524288).
+The helper applies that limit to the relay, its import and the export that
+counts what it kept. So set `relay { nofiles = 0 }` in a strfry target's
+config, or raise `NOFILE_LIMIT`. The relay host needs systemd with cgroup v2, sysstat
 (`pidstat`, `mpstat`, `iostat`), iproute2, curl, GNU time and util-linux's
 `fincore`. The load host needs systemd, `wok-bench`, GNU time, jq and
 sysstat. The relay-side helper refuses

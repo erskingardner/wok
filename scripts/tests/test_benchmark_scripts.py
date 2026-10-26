@@ -174,6 +174,22 @@ METRICS_URL=http://10.0.0.2:7777/metrics
                 result = self.control('uncached_database_files "$1"', listing)
                 self.assertEqual(result.stdout.strip(), expected, result.stderr)
 
+    def test_import_and_export_run_under_the_requested_file_limit(self):
+        self.write_target('strfry-1.1.3', self.valid(KIND='strfry'))
+        calls = self.prefix/'calls'
+        result = self.control(
+            f'systemd-run() {{ printf "%s\\n" "$*" >>"{calls}"; }}; systemctl() {{ :; }}; '
+            'load_target strfry-1.1.3; parse_run_options nofile --nofile 1048576; '
+            'mkdir -p "$DB_ROOT/db"; echo x >"$DB_ROOT/db/data.mdb"; '
+            'import_corpus /dev/null "$1"; count_retained', str(self.prefix))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        units = calls.read_text().splitlines()
+        self.assertEqual(len(units), 2, units)
+        self.assertIn('--unit=relay-bench-import-strfry-1.1.3.service', units[0])
+        self.assertIn('--unit=relay-bench-export-strfry-1.1.3.service', units[1])
+        for unit in units:
+            self.assertIn('-p LimitNOFILE=1048576', unit)
+
     def test_rejects_target_names(self):
         for name in ['', 'Wok', '.hidden', '-wok', 'a/b', 'snapshots', 'x' * 64]:
             with self.subTest(name=name):
@@ -273,6 +289,20 @@ class CampaignSettings(unittest.TestCase):
                     self.assertEqual('AllowedCPUs=16-47' in bench, pinned)
                     stop = "root@load systemctl stop 'relay-bench-load-*.service'"
                     self.assertTrue(any(stop in command for command in sent), sent)
+
+    def test_file_limit_reaches_import_and_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp)/'calls'
+            result = self.campaign(
+                f'remote_command() {{ printf "%s\\n" "$*" >>"{calls}"; echo 7777; }}; '
+                'run_bench() { return 1; }; scp() { :; }; '
+                'LOAD_ROOT=/l RELAY_ROOT=/r RELAY_CORPUS=/r/c LOAD_CORPUS=/l/c CAP_ARGS=(); '
+                'run_target strfry-1.1.3 1 || true', NOFILE_LIMIT='1048576')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            sent = calls.read_text().splitlines()
+            for command in ['prepare', 'start']:
+                line = next(line for line in sent if f'control {command} ' in line)
+                self.assertIn('--nofile 1048576', line)
 
     def test_rejects_incomplete_or_invalid_settings(self):
         cases = {

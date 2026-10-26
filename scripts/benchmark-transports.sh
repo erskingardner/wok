@@ -106,7 +106,7 @@ run_target() {
     local server_artifacts=$run_root/server
 
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" prepare "$relay" "$CORPUS" "$EVENTS" \
-        "$server_artifacts"
+        "$server_artifacts" --nofile "$NOFILE_LIMIT"
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" start "$relay" "$server_artifacts" \
         --nofile "$NOFILE_LIMIT"
     if [[ $target == wok-unix ]]; then

@@ -114,6 +114,7 @@ load_target() {
     DB_ROOT=$STATE_ROOT/$name
     UNIT=${UNIT_PREFIX}target-$name.service
     IMPORT_UNIT=${UNIT_PREFIX}import-$name.service
+    EXPORT_UNIT=${UNIT_PREFIX}export-$name.service
     SNAPSHOT_DIR=$SNAPSHOT_ROOT/$name
 }
 
@@ -327,8 +328,12 @@ import_corpus() {
         die "$TARGET import wrote no $DB_ROOT/db/data.mdb; CONFIG must put the database there"
 }
 
+# Under the import's limits: strfry applies its open-file limit to every
+# command.
 count_retained() {
-    runuser -u "$SERVICE_USER" -- "$BINARY" --config "$CONFIG" export |
+    unit_properties
+    systemd-run --quiet --wait --pipe --collect --unit="$EXPORT_UNIT" "${UNIT_PROPS[@]}" \
+        -- "$BINARY" --config "$CONFIG" export |
         awk 'NF { count += 1 } END { print count + 0 }'
 }
 

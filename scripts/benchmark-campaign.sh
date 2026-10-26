@@ -181,7 +181,7 @@ run_target() {
     remote_command "$LOAD_SSH" mkdir -p "$run_root/load" "$run_root/server"
 
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" prepare "$target" "$RELAY_CORPUS" \
-        "$EVENTS" "$server_artifacts" --snapshot "$snapshot" \
+        "$EVENTS" "$server_artifacts" --snapshot "$snapshot" --nofile "$NOFILE_LIMIT" \
         ${CAP_ARGS[@]+"${CAP_ARGS[@]}"}
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" start "$target" "$server_artifacts" \
         --cache "$CACHE" --ready-timeout "$READY_TIMEOUT" --nofile "$NOFILE_LIMIT" \

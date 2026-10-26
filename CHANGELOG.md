@@ -400,6 +400,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acknowledged but lost, refused (counted by reason), or unanswered and then
   stored or not. A relay the harness starts is reconciled when the run ends,
   and a lost write or a stored refusal fails the trial.
+- `wok-bench --scenario clients` drives any relay by `--target-url`, such as
+  strfry or a Wok release, not only a Wok the harness starts (#226).
+  `--target-max-filter-limit`, `--target-max-events-per-req` and
+  `--target-recipient-kinds` give it the remote relay's limits, and
+  `--generate-corpus-only --scenario clients` writes the corpus that relay
+  must hold. Before the clock starts, the run checks that the relay holds
+  both corpora and nothing an earlier run published. With
+  `--client-arrival-rate` and `--client-session-secs`, client sessions start
+  and end on a fixed schedule. Connections, re-REQs, background publications
+  and Marmot bursts count their latency from when they were due; a re-REQ
+  due behind an unfinished one waits and keeps its due time. Background
+  publishers must hold their rate, counting a publication as sent once it is
+  written to the socket, and a reconnecting publisher skips the slots it
+  missed instead of sending them in a burst. A session sends nothing new
+  after its visit ends. Requests left unanswered, duplicate live deliveries,
+  and connections the relay refused, dropped or closed are counted, by
+  reason for refusals and closes. Like refusals, they fail the trial only
+  with `--expect-no-refusals`. Errors are kept for failures of the load host
+  itself. Background publishers now also send
+  `X-Forwarded-For`, and `--clients-per-address 0` turns it off for them as
+  for clients.
 - `scripts/benchmark-campaign.sh` can import the social corpus
   (`CORPUS_MIX=social`) and measure publication capacity (#226). With
   `RATE_STEPS`, each relay publishes at fixed rates that rise step by step

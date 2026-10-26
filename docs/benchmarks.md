@@ -74,10 +74,66 @@ count. The manifest also records the limits a relay needs to accept every
 event: `needed_max_event_size`, the smallest `max_event_size` (strfry:
 `maxEventSize`) that imports the longest line with its newline, `most_tags`,
 and `largest_tag_value_bytes` (single-letter tags). strfry's default
-`events.maxEventSize` of 64 KiB refuses the largest follow lists and Welcomes. The query scenarios assume every
-corpus event is kept, so this mix is only written with
-`--generate-corpus-only`. The corpus streams to disk and is signed in
-parallel, and its bytes depend only on the options.
+`events.maxEventSize` of 64 KiB refuses the largest follow lists and Welcomes.
+The corpus streams to disk and is signed in parallel, and its bytes depend
+only on the options. Besides `--generate-corpus-only`, the mix runs only the
+read scenarios below.
+
+### Reading a social corpus
+
+`ws_query_latency`, `deep_history_pagination` and `mixed_read_write` read a
+social corpus with `--event-mix social`, whether the run generated it or
+`--corpus` names it. Their expected results are what a relay keeps of the
+corpus:
+
+- each id once, and no ephemeral event;
+- the newest version of each replaceable and addressable address: the later
+  `created_at`, and on a tie the lower id;
+- no event its author deleted with a kind 5 `e` tag. A deletion of a
+  deletion does nothing, as in Wok; no generated corpus has one.
+
+The harness checks this count against `corpus.social.retained` when it
+generated the corpus, and against the export of a relay it started. It
+checks the export, not import's exit status: both relays write an import
+batch in `created_at` order, then by id, so a deletion in the same second as
+its target, with the lower id, refuses the target instead of deleting it.
+The relay ends with the same events either way, but `wok import` exits
+nonzero when it refuses any line, and strfry exits 0. A relay the harness
+starts also gets `max_event_size`, `max_num_tags` and `max_tag_val_size`
+(strfry: `maxEventSize`, `maxNumTags`, `maxTagValSize`) raised to what the
+corpus needs, where that is more than strfry's defaults.
+
+Where a `limit` cuts through a second, a reply may hold any of that
+second's events. NIP-01 says the lowest id comes first, but strfry and Wok
+send a second's events in arrival order
+([known-differences.md](known-differences.md)). This holds for every mix.
+
+`ws_query_latency` takes turns between the archive reads of #226 scenario
+B:
+
+| Shape | Filter |
+|---|---|
+| Id lookup | `ids`: one event, which may since have been replaced or deleted |
+| Profiles | `authors`: the first 500 of a follow list, `kinds` 0, 3 and 10002 |
+| Follow feed | the same authors, `kinds` 1 and 6 |
+| Notifications | `#p`: a pubkey a reaction names, `kinds` 1, 6, 7 and 9735 |
+| Followers | that `#p`, `kinds` 3 |
+| Thread | `#e`: a note a reaction names, `kinds` 1, 6, 7, 9735 and 1111 |
+| Newest notes | `kinds` 1, `since`, `limit` 20 |
+
+Ids and pubkeys are always 64 hex characters; Wok refuses prefixes. Every
+`limit` is at most 500, strfry's and Wok 0.7's `maxFilterLimit`, and 500
+authors fit every relay's default filter size. No filter reads gift wraps
+or DMs: Wok serves kinds 4, 1059 and 21059 only to their authenticated
+recipient, and strfry serves them to anyone (#226 §8). The corpus has no
+ephemeral events, which strfry keeps for a while and Wok never stores.
+
+`deep_history_pagination` pages through the busiest author's history, every
+kind, as a mirror reads it; other mixes page notes only. Each page asks for
+events older than the last page's oldest, so where a page ends inside a
+second, the rest of that second is skipped, as it is for a client paging
+that way. `mixed_read_write` reads the first note's author while it
+publishes notes by authors of its own.
 
 Generate a signed corpus without running a relay, or reuse one verbatim:
 
@@ -95,7 +151,13 @@ Generate a signed corpus without running a relay, or reuse one verbatim:
 When `--corpus` and `--events` are both supplied, the harness rejects a count
 mismatch. Remote historical query scenarios assume the identical corpus has
 already been imported into the target relay; they verify parsed EOSE/subscription envelopes, exact expected historical
-sets, publication IDs/boolean acceptance, and complete per-subscriber deliveries.
+sets (where a `limit` cuts through a second, any of its events; see
+[Reading a social corpus](#reading-a-social-corpus)),
+publication IDs/boolean acceptance, and complete per-subscriber deliveries.
+`ws_query_latency`, `deep_history_pagination` and `mixed_read_write` work out
+each expected reply before the clock starts, since on a large corpus that can
+take longer than the relay takes to answer. A latency sample runs from the REQ
+to its EOSE, and throughput leaves out the time spent checking replies.
 Local publication trials also export and compare the final stored state, including
 replacement, deletion and ephemeral semantics; remote storage is explicitly not
 inspected, except by `--reconcile` after `ws_publish_rate`.
@@ -103,8 +165,9 @@ inspected, except by `--reconcile` after `ws_publish_rate`.
 Scenarios: `import` (signature-verifying bulk import), `export`,
 `negentropy_build`, `ws_publish_1conn`/`ws_publish_8conn` (per-publish OK
 latency + rate), `ws_query_latency` (mixed REQs: id, author+kind, time
-window, tag), `deep_history_pagination` (progressively older 500-event
-author+kind+until pages), `mixed_read_write` (historical REQs while another
+window, tag; on a social corpus, the shapes above), `deep_history_pagination`
+(progressively older 500-event author+kind+until pages), `mixed_read_write`
+(historical REQs while another
 connection continuously publishes), `live_fanout` (configurable publisher and
 subscriber delivery completeness), `ws_publish_scaled` (configurable
 connection count), `ws_publish_rate` (fixed-rate publication with a

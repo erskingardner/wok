@@ -1521,12 +1521,13 @@ fn io_failure(stage: &str, e: std::io::Error) -> ConnectFailure {
     use std::io::ErrorKind::{
         AddrInUse, AddrNotAvailable, InvalidInput, OutOfMemory, PermissionDenied, Unsupported,
     };
-    // ENFILE and EMFILE are 23 and 24 on Linux and the BSDs; ENOBUFS is not.
+    // ENOMEM, ENFILE and EMFILE are 12, 23 and 24 on Linux and the BSDs;
+    // ENOBUFS is not.
     const ENOBUFS: i32 = if cfg!(target_os = "linux") { 105 } else { 55 };
     let local = matches!(
         e.kind(),
         AddrInUse | AddrNotAvailable | InvalidInput | OutOfMemory | PermissionDenied | Unsupported
-    ) || matches!(e.raw_os_error(), Some(23 | 24 | ENOBUFS));
+    ) || matches!(e.raw_os_error(), Some(12 | 23 | 24 | ENOBUFS));
     if local {
         ConnectFailure::Failed(format!("{stage}: {e}"))
     } else {
@@ -5374,6 +5375,7 @@ mod tests {
         for local in [
             Error::from(ErrorKind::AddrNotAvailable),
             Error::from(ErrorKind::PermissionDenied),
+            Error::from_raw_os_error(12),
             Error::from_raw_os_error(24),
         ] {
             let shown = local.to_string();

@@ -74,10 +74,76 @@ count. The manifest also records the limits a relay needs to accept every
 event: `needed_max_event_size`, the smallest `max_event_size` (strfry:
 `maxEventSize`) that imports the longest line with its newline, `most_tags`,
 and `largest_tag_value_bytes` (single-letter tags). strfry's default
-`events.maxEventSize` of 64 KiB refuses the largest follow lists and Welcomes. The query scenarios assume every
-corpus event is kept, so this mix is only written with
-`--generate-corpus-only`. The corpus streams to disk and is signed in
-parallel, and its bytes depend only on the options.
+`events.maxEventSize` of 64 KiB refuses the largest follow lists and Welcomes.
+The corpus streams to disk and is signed in parallel, and its bytes depend
+only on the options. Besides `--generate-corpus-only`, the mix runs only the
+read scenarios below.
+
+### Reading a social corpus
+
+`ws_query_latency`, `deep_history_pagination` and `mixed_read_write` read a
+social corpus with `--event-mix social`, whether the run generated it or
+`--corpus` names it. Their expected results are what a relay keeps of the
+corpus:
+
+- each id once, and no ephemeral event;
+- the newest version of each replaceable and addressable address: the later
+  `created_at`, and on a tie the lower id;
+- no event its author deleted with a kind 5 `e` tag. A deletion of a
+  deletion does nothing, as in Wok; no generated corpus has one.
+
+The harness checks this count against `corpus.social.retained` when it
+generated the corpus, and against the export of a relay it started. It
+checks the export, not import's exit status: both relays write an import
+batch in `created_at` order, then by id, so a deletion in the same second as
+its target, with the lower id, refuses the target instead of deleting it.
+The relay ends with the same events either way, but `wok import` exits
+nonzero when it refuses any line, and strfry exits 0. A relay the harness
+starts also gets `max_event_size`, `max_num_tags` and `max_tag_val_size`
+(strfry: `maxEventSize`, `maxNumTags`, `maxTagValSize`) raised to what the
+corpus needs, where that is more than strfry's defaults.
+
+Where a `limit` cuts through a second, a reply may hold any of that
+second's events. NIP-01 says the lowest id comes first, but strfry and Wok
+send a second's events in arrival order
+([known-differences.md](known-differences.md)). This holds for every mix.
+
+`ws_query_latency` takes turns between the archive reads of #226 scenario
+B:
+
+| Shape | Filter |
+|---|---|
+| Id lookup | `ids`: one event, which may since have been replaced or deleted |
+| Profiles | `authors`: the first 500 of a follow list, `kinds` 0, 3 and 10002 |
+| Follow feed | the same authors, `kinds` 1 and 6 |
+| Notifications | `#p`: a pubkey a reaction names, `kinds` 1, 6, 7 and 9735 |
+| Followers | that `#p`, `kinds` 3 |
+| Thread | `#e`: a note a reaction names, `kinds` 1, 6, 7, 9735 and 1111 |
+| Newest notes | `kinds` 1, `since`, `limit` 20 |
+
+Ids and pubkeys are always 64 hex characters; Wok refuses prefixes. Every
+`limit` is at most 500, strfry's and Wok 0.7's `maxFilterLimit`, and 500
+authors fit every relay's default filter size. No filter reads gift wraps
+or DMs: Wok serves kinds 4, 1059 and 21059 only to their authenticated
+recipient, and strfry serves them to anyone (#226 §8). The corpus has no
+ephemeral events, which strfry keeps for a while and Wok never stores.
+
+`deep_history_pagination` pages through the busiest author's history, every
+kind, as a mirror reads it; other mixes page notes only. Each page asks for
+events older than the last page's oldest, so where a page ends inside a
+second, the rest of that second is skipped, as it is for a client paging
+that way. `mixed_read_write` reads the first note's author while it
+publishes notes by authors of its own.
+
+The harness reads the corpus once, parsing it on every core, and keeps only
+what the oracle needs of each event: its id, author, kind and `created_at`,
+a hash of the whole event to check replies against, and its single-letter
+tags as numbers. Each line must hold exactly the seven NIP-01 fields, with
+ids and pubkeys in lowercase hex. On the load host, a 1M-event social
+corpus peaks at 0.55 GB and 10M at 2.7 GB, about 250 bytes an event; 50M
+comes to about 13 GB. Keeping each event whole took 5.6 GB at 1M, so 50M
+would have needed about 285 GB. A historical REQ may take up to 120 s to
+reach its EOSE, since deep pages on a large store can take tens of seconds.
 
 Generate a signed corpus without running a relay, or reuse one verbatim:
 
@@ -95,7 +161,13 @@ Generate a signed corpus without running a relay, or reuse one verbatim:
 When `--corpus` and `--events` are both supplied, the harness rejects a count
 mismatch. Remote historical query scenarios assume the identical corpus has
 already been imported into the target relay; they verify parsed EOSE/subscription envelopes, exact expected historical
-sets, publication IDs/boolean acceptance, and complete per-subscriber deliveries.
+sets (where a `limit` cuts through a second, any of its events; see
+[Reading a social corpus](#reading-a-social-corpus)),
+publication IDs/boolean acceptance, and complete per-subscriber deliveries.
+`ws_query_latency`, `deep_history_pagination` and `mixed_read_write` work out
+each expected reply before the clock starts, since on a large corpus that can
+take longer than the relay takes to answer. A latency sample runs from the REQ
+to its EOSE, and throughput leaves out the time spent checking replies.
 Local publication trials also export and compare the final stored state, including
 replacement, deletion and ephemeral semantics; remote storage is explicitly not
 inspected, except by `--reconcile` after `ws_publish_rate`.
@@ -103,8 +175,9 @@ inspected, except by `--reconcile` after `ws_publish_rate`.
 Scenarios: `import` (signature-verifying bulk import), `export`,
 `negentropy_build`, `ws_publish_1conn`/`ws_publish_8conn` (per-publish OK
 latency + rate), `ws_query_latency` (mixed REQs: id, author+kind, time
-window, tag), `deep_history_pagination` (progressively older 500-event
-author+kind+until pages), `mixed_read_write` (historical REQs while another
+window, tag; on a social corpus, the shapes above), `deep_history_pagination`
+(progressively older 500-event author+kind+until pages), `mixed_read_write`
+(historical REQs while another
 connection continuously publishes), `live_fanout` (configurable publisher and
 subscriber delivery completeness), `ws_publish_scaled` (configurable
 connection count), `ws_publish_rate` (fixed-rate publication with a
@@ -113,7 +186,8 @@ per-event outcome log), `idle_connections` (open-and-hold connection capacity),
 `nip50_search` (rare, intersected, and full-corpus ranked searches with
 result/limit verification). Wok-only `clients`, `author_kinds`,
 `monitor_index` and `live_subscriptions` have their own sections below, as
-does `ws_publish_rate`. Use `--scenario <name>` to isolate one scenario.
+do `ws_publish_rate` and `nip77_catchup` (NIP-77 catch-up, then fetching
+what the client lacks). Use `--scenario <name>` to isolate one scenario.
 
 ## Fixed-rate publication (`ws_publish_rate`)
 
@@ -197,6 +271,100 @@ Each run signs its events from `--seed`, the repetition and
 `--base-timestamp`, which defaults to the start time. Rerun all three against
 one database and the relay already has the events: it accepts them as
 duplicates, which the table counts.
+
+## NIP-77 catch-up (`nip77_catchup`)
+
+A client that holds part of what a relay has catches up with NIP-77, then
+fetches the events it lacks. An archive mirror does this, and so does a
+Marmot app for each of its groups when it starts. The relay must hold the
+corpus and nothing else: a relay the harness starts imports `--corpus` first,
+and a remote one must have been loaded with the same file.
+
+```bash
+# An archive mirror: the whole corpus in eight time windows, four at once,
+# lacking the newest 10%.
+./target/release/wok-bench --scenario nip77_catchup \
+  --target-url ws://10.0.0.3:7777 --target-label wok-master \
+  --corpus social/corpus.jsonl --sync-filter all --sync-windows 8 \
+  --sync-concurrency 4 --out catchup-mirror
+
+# Marmot apps starting: one sync per group, 256 at once, 8 to a connection,
+# each lacking a random 20% of the messages.
+./target/release/wok-bench --scenario nip77_catchup \
+  --target-url ws://10.0.0.3:7777 --target-label wok-master-marmot \
+  --corpus social/corpus.jsonl --sync-filter groups \
+  --sync-concurrency 256 --sync-per-conn 8 \
+  --sync-missing random --sync-missing-pct 20 --out catchup-marmot
+```
+
+What it syncs:
+
+- `--sync-filter all` (default) syncs the whole corpus, split into
+  `--sync-windows` (default 1) time windows of about equal event counts.
+  Windows split at whole seconds; the first has no `since` and the last no
+  `until`, and a single window sends `{}`.
+- `--sync-filter groups` sends one `{"kinds":[445],"#h":[group]}` filter per
+  Marmot group in the corpus, as MDK does at start. It needs a corpus written
+  with `--event-mix social`. The `marmot` preset refuses `all`, whose filters
+  name no author or tag.
+- `--sync-limit` puts a `limit` in every NEG-OPEN filter. The default is
+  MDK's 16,385 for groups and none for `all`. No filter may match more
+  events than its limit, since relays break ties at the limit differently;
+  the run stops before it starts if one does.
+
+The client lacks `--sync-missing-pct` percent (default 10) of the events the
+filters match, rounded: the newest ones with `--sync-missing newest`
+(default), as after time offline, or a random set with
+`--sync-missing random`, drawn from `--seed` and the repetition. It holds the
+rest. At 100 it starts empty, as a new mirror does.
+
+Each sync sends NEG-OPEN with the `(created_at, id)` pairs the client holds,
+answers each NEG-MSG until the client has nothing more to send, and sends
+NEG-CLOSE. It then asks for the ids it lacks in REQs of up to 500 ids, the
+`maxFilterLimit` of strfry 1.1.3 and Wok 0.7.0, closing each after its EOSE.
+The client's messages stay under 60,000 bytes before hex encoding, so a
+NEG-MSG fits the 131,072-byte WebSocket payload limit of strfry 1.1.3, Wok
+0.7.0 and Wok's `public` preset; relays answer with up to 500,000 bytes.
+`--sync-concurrency` syncs (default 1) run at once, `--sync-per-conn`
+(default 1; MDK runs up to 8) on each connection, and a connection that
+finishes one sync starts the next. The client builds each sync's first
+message and opens its connections before the clock starts. Each connection
+sends an `X-Forwarded-For` address in 10.64.0.0/10, one for every
+`--clients-per-address` connections (0 sends none), which a relay uses only
+when it trusts the header from the load host.
+
+Relays limit what one sync may match. strfry 1.1.3 and Wok refuse a sync
+that matches more than 1,000,000 events (`maxSyncEvents`,
+`relay.max_sync_events`; 65,536 under the `marmot` preset) unless they answer
+it from a stored negentropy tree. Wok master also reserves 256 bytes per
+event of a sync's limit, capped at `max_sync_events` and the events it
+stores, against `relay.sync_memory_per_connection` and `sync_memory_total`
+before it scans.
+Windows and `--sync-limit` keep a sync inside these limits.
+
+The trial's throughput is the events fetched per second, from the first
+NEG-OPEN to the end of the last sync, and its latency columns give the time
+per sync. The catch-up table splits that time into reconciling (NEG-OPEN to
+the last NEG-MSG) and fetching (from there to the last EOSE), and counts
+events fetched, fetch REQs, NEG-MSG rounds in all and the most in one sync,
+and the JSON text sent and received for the NEG and fetch messages, without
+WebSocket framing.
+
+A sync is correct when the relay names exactly the events the client lacks,
+names none that only the client holds, and returns every event a REQ asks for
+once and unchanged. Wok serves gift wraps and its other restricted read
+classes (`relay.auth.recipient_only_kinds`, `owner_only_kinds` and
+`authenticated_kinds`) only after AUTH, and so leaves them out of a sync,
+while strfry serves them. Each such kind must therefore be served in full or
+left out in full, and the table lists the kinds left out. A relay's refusal,
+a `NEG-ERR` or a `CLOSED` for a fetch, ends that sync and is counted by
+reason. A sync refused during its fetch is still checked as far as it got:
+its reconciliation and the events it received. Refusals fail the trial only
+with `--expect-no-refusals`, which engine-mode runs should pass. A
+connection that closes, or that has syncs open and receives nothing for
+120 s, fails its syncs. The oracle works out what a relay keeps of the
+corpus, after replacements and deletions, and holds that in memory, as the
+query scenarios hold their corpus.
 
 ## Client-realistic scenario (`clients`)
 
@@ -913,18 +1081,27 @@ the operator host needs jq.
 Any number of relay targets take turns on one relay host, and a second host
 generates the load. It:
 
-1. generates one signed realistic corpus on the load host;
+1. generates one signed corpus on the load host: realistic, or with
+   `CORPUS_MIX=social` a public social relay's history of `SOCIAL_AUTHORS`
+   authors;
 2. copies and checksum-verifies that exact file on the relay host;
 3. for each target, stops every benchmark relay, then restores the target's
    database snapshot or resets the database, imports with signature
-   verification and confirms the exported retained count;
+   verification and confirms the exported retained count: the whole
+   realistic corpus, or the `corpus.social.retained` count from the social
+   corpus's `manifest.json`;
 4. starts only that target, on an emptied page cache, and captures provenance,
    per-thread process, per-CPU, disk, socket, network, Prometheus, journal,
    binary/config hash, import and database-size evidence;
-5. runs query latency, deep pagination, mixed reads/writes, scaled publication,
-   live fanout, idle connections and lifecycle publication, recording the load
-   host's per-CPU utilization for each phase; and
-6. rotates the target order each repetition, so over as many repetitions as
+5. runs query latency, deep pagination and mixed reads/writes against the
+   corpus (on a social corpus, the reads in
+   [Reading a social corpus](#reading-a-social-corpus)), then scaled
+   publication, live fanout, idle connections and lifecycle publication, and
+   then the fixed-rate steps of `RATE_STEPS`, recording the load host's
+   per-CPU utilization for each phase;
+6. stops the relay and reconciles each fixed-rate step's outcome log with
+   one export of its database; and
+7. rotates the target order each repetition, so over as many repetitions as
    targets each target runs once in each position, and leaves every relay
    stopped.
 
@@ -1027,11 +1204,47 @@ RELAY_SSH=root@RELAY_SSH_IP LOAD_SSH=root@LOAD_SSH_IP RELAY_HOST=RELAY_PRIVATE_I
 `RELAY_SSH`, `LOAD_SSH`, `RELAY_HOST` (the relay host's address as the load
 host reaches it) and `TARGETS` are required. The other settings are
 `RELAY_CPUS`, `RELAY_MEMORY`, `CACHE`, `SNAPSHOTS`, `READY_TIMEOUT`,
-`LOAD_CPUS`, `BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`, `QUERIES`, `DEEP_PAGES`,
-`REPETITIONS`, `PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
+`LOAD_CPUS`, `BENCH_BIN`, `RELAY_BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`,
+`CORPUS_MIX`, `SOCIAL_AUTHORS`, `QUERIES`, `DEEP_PAGES`, `REPETITIONS`,
+`PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
 `IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`,
-`LIFECYCLE_CONNECTIONS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED` and
-`BASE_TIMESTAMP`.
+`LIFECYCLE_CONNECTIONS`, `RATE_STEPS`, `RATE_SECS`, `RATE_DRAIN_SECS`,
+`RATE_CONNECTIONS`, `RATE_P99_MS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED`
+and `BASE_TIMESTAMP`.
+
+A social corpus needs targets that accept its largest events: its manifest
+gives `needed_max_event_size`, and strfry's default `events.maxEventSize` of
+64 KiB is too small. A target that refuses some fails the retained-count
+check at import.
+
+#### Fixed-rate capacity steps
+
+`RATE_STEPS` lists rising rates in events per second, for example
+`"1000 2000 5000 10000 20000"`. After the other phases, each target runs
+`ws_publish_rate` at each rate in turn for `RATE_SECS` (default 180) over
+`RATE_CONNECTIONS` connections (default 64), waiting up to `RATE_DRAIN_SECS`
+(default 10) for the last replies. Each step signs fresh realistic events from
+its own seed, `SEED` plus the step's position. A step meets its targets when
+the relay kept up with the whole schedule: every event was sent at the
+intended rate on connections that stayed open, and each was accepted, none
+refused or left unanswered, with publish-to-OK p99 within `RATE_P99_MS`
+(default 250). The sweep stops after the first step that misses, and
+`rate-capacity.txt` beside the phases records the last step that met its
+targets (`capacity`, 0 for none) and the first that missed. A missed step is a
+result, not a failed campaign. A step that left no fixed-rate report, and so
+no complete outcome log, fails the campaign, as does an OK that names no event
+its connection sent.
+
+Once the relay has stopped, the campaign copies each step's outcome log to
+the relay host. `benchmark-relay-control reconcile` exports the database
+once, under the import's limits, and runs the relay host's `wok-bench`
+(`RELAY_BENCH_BIN`, default `/opt/relay-bench/bin/wok-bench/wok-bench`)
+with `--reconcile` against each log. Each step's `reconciliation.json` is
+copied back beside its results. The campaign fails when a step it started
+has no outcome log, when a log holds fewer events than its step planned, or
+when an acknowledged event is missing from the export or a refused one was
+stored. This runs even when the relay stopped on its own during the run. The relay host's `wok-bench` must
+include `--reconcile`.
 
 Lifecycle publication defaults to one ordered connection because a deletion
 request must follow the event it references. Scaled publication is measured in

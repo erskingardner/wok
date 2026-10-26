@@ -13,6 +13,6 @@ Operator/CI helper scripts. Not on the relay runtime path.
 | `benchmark-campaign.sh` | Two-host `wok-bench` campaign over any number of relay targets, rotating their order each repetition |
 | `benchmark-transports.sh` | Same-host Unix vs WebSocket comparison |
 | `benchmark-qualify.sh` | Checks two benchmark hosts before a campaign: hardware facts, relay disk sync latency and random reads, network, steal; `BASELINE` compares the sync-write p99 |
-| `benchmark-relay-control.sh` | Relay-host helper: target files, transient systemd units with CPU and memory caps, cache drops, database snapshots, evidence |
+| `benchmark-relay-control.sh` | Relay-host helper: target files, transient systemd units with CPU and memory caps, cache drops, database snapshots, evidence, reconciling fixed-rate outcome logs with a relay's export |
 
 Release process is documented in `docs/releases.md`. Benchmark methodology is `docs/benchmarks.md`. `tests/` holds unit tests for `lab.py` and the benchmark shell scripts (`python3 -m unittest discover -s scripts/tests`). GitHub release workflow calls the release scripts from `.github/workflows/release.yml`.

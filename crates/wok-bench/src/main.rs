@@ -12,7 +12,9 @@
 #![forbid(unsafe_code)]
 
 mod author_kinds;
+mod catchup;
 mod clients;
+mod corpus;
 mod live;
 mod rate;
 mod social;
@@ -34,6 +36,16 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 static CLIENT_NODELAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// The limits a read scenario's corpus needs, which the relays this harness
+/// starts raise where they exceed strfry's defaults.
+static CORPUS_LIMITS: std::sync::OnceLock<social::Limits> = std::sync::OnceLock::new();
+/// Scenarios that read a corpus a relay imported, checked against
+/// `corpus::Corpus`.
+const READ_SCENARIOS: [&str; 3] = [
+    "ws_query_latency",
+    "deep_history_pagination",
+    "mixed_read_write",
+];
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -163,8 +175,8 @@ struct Args {
     /// Offer permessage-deflate from --scenario clients connections.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     client_deflate: bool,
-    /// Fail --scenario clients when any request is refused or unanswered, or
-    /// the relay disconnects a client.
+    /// Fail --scenario clients or nip77_catchup when any request is refused;
+    /// clients also when one is unanswered or the relay disconnects a client.
     #[arg(long)]
     expect_no_refusals: bool,
     /// Client sessions --scenario clients starts per second, cycling through
@@ -258,6 +270,32 @@ struct Args {
     /// Seconds after which a shape stops its warm runs (it keeps at least 3).
     #[arg(long, default_value_t = 30)]
     shape_secs: u64,
+    /// What --scenario nip77_catchup syncs: `all`, the whole corpus in
+    /// --sync-windows time windows, or `groups`, one kind 445 `#h` filter per
+    /// Marmot group in the corpus.
+    #[arg(long, value_enum, default_value_t = catchup::Filters::All)]
+    sync_filter: catchup::Filters,
+    /// Time windows of about equal event counts, one sync each, that
+    /// `--sync-filter all` splits the corpus into.
+    #[arg(long, default_value_t = 1)]
+    sync_windows: usize,
+    /// Which matched events the nip77_catchup client lacks: the newest, or a
+    /// random set.
+    #[arg(long, value_enum, default_value_t = catchup::Missing::Newest)]
+    sync_missing: catchup::Missing,
+    /// Percent of the matched events the nip77_catchup client lacks.
+    #[arg(long, default_value_t = 10.0)]
+    sync_missing_pct: f64,
+    /// NIP-77 syncs in flight at once.
+    #[arg(long, default_value_t = 1)]
+    sync_concurrency: usize,
+    /// NIP-77 syncs in flight on one connection (MDK runs up to 8).
+    #[arg(long, default_value_t = 1)]
+    sync_per_conn: usize,
+    /// `limit` in every NEG-OPEN filter. Default: MDK's 16,385 for
+    /// `--sync-filter groups`, none for `all`.
+    #[arg(long)]
+    sync_limit: Option<u64>,
 }
 
 impl Args {
@@ -313,6 +351,8 @@ struct Trial {
     tag_kinds: Option<tag_kinds::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     publish_rate: Option<rate::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nip77_catchup: Option<catchup::Report>,
 }
 
 #[derive(Serialize)]
@@ -342,8 +382,8 @@ enum EventMix {
     Lifecycle,
     /// A public social relay's history (see `social.rs`): `--social-authors`
     /// authors over two years, with replacements, deletions and real event
-    /// sizes. Only written to disk, with `--generate-corpus-only`; the
-    /// manifest gives the count a relay keeps.
+    /// sizes. Written with `--generate-corpus-only`, or read back by the
+    /// read scenarios; the manifest gives the count a relay keeps.
     Social,
 }
 
@@ -458,6 +498,7 @@ fn main() -> Result<()> {
         "live_subscriptions",
         "author_kinds",
         "tag_kinds",
+        "nip77_catchup",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -518,11 +559,12 @@ fn main() -> Result<()> {
                     | "live_fanout"
                     | "idle_connections"
                     | "clients"
+                    | "nip77_catchup"
             )
         })
     {
         anyhow::bail!(
-            "external targets support scaled and fixed-rate publication, query, mixed read/write, fanout, idle-connection and clients scenarios"
+            "external targets support scaled and fixed-rate publication, query, mixed read/write, fanout, idle-connection, clients and NIP-77 catch-up scenarios"
         );
     }
 
@@ -531,6 +573,9 @@ fn main() -> Result<()> {
     }
     if args.target_unix.is_some() && scenarios.contains(&"clients") {
         anyhow::bail!("--scenario clients drives a relay over WebSocket only");
+    }
+    if args.target_unix.is_some() && scenarios.contains(&"nip77_catchup") {
+        anyhow::bail!("--scenario nip77_catchup syncs over WebSocket only");
     }
 
     if args.event_mix == EventMix::Lifecycle
@@ -547,10 +592,17 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--event-mix lifecycle is only valid for live publication scenarios");
     }
-    // The query oracles assume every corpus event is kept, which replacements
-    // and deletions break.
-    if args.event_mix == EventMix::Social && !args.generate_corpus_only {
-        anyhow::bail!("--event-mix social only writes a corpus; pass --generate-corpus-only");
+    // Only the read scenarios check a social corpus's import against what a
+    // relay keeps of it.
+    if args.event_mix == EventMix::Social
+        && !args.generate_corpus_only
+        && scenarios
+            .iter()
+            .any(|scenario| !READ_SCENARIOS.contains(scenario))
+    {
+        anyhow::bail!(
+            "--event-mix social runs only ws_query_latency, deep_history_pagination and mixed_read_write, or --generate-corpus-only"
+        );
     }
 
     let default_event_count = if args.profile == "smoke" {
@@ -664,6 +716,24 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let corpus = if scenarios
+        .iter()
+        .any(|scenario| READ_SCENARIOS.contains(scenario))
+    {
+        let corpus = corpus::Corpus::load(&corpus_path)
+            .with_context(|| format!("load corpus {}", corpus_path.display()))?;
+        if let Some(kept) = retained {
+            anyhow::ensure!(
+                corpus.retained() == kept,
+                "the read oracle keeps {} of the corpus's events, the generator {kept}",
+                corpus.retained()
+            );
+        }
+        CORPUS_LIMITS.get_or_init(|| corpus.limits());
+        Some(corpus)
+    } else {
+        None
+    };
     let mut trials = Vec::new();
     for repetition in 1..=args.repetitions {
         for scenario in &scenarios {
@@ -694,6 +764,7 @@ fn main() -> Result<()> {
                     scenario,
                     repetition,
                     &corpus_path,
+                    corpus.as_ref(),
                     &corpus_sha256,
                 );
                 match t {
@@ -733,6 +804,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_trial(
     rt: &tokio::runtime::Runtime,
     args: &Args,
@@ -740,6 +812,7 @@ fn run_trial(
     scenario: &str,
     repetition: u32,
     corpus_path: &Path,
+    corpus: Option<&corpus::Corpus>,
     corpus_sha256: &str,
 ) -> Result<Trial> {
     let dir = TempDir::new()?;
@@ -757,6 +830,7 @@ fn run_trial(
     let mut author_kinds_report = None;
     let mut tag_kinds_report = None;
     let mut rate_report = None;
+    let mut catchup_report = None;
 
     let bin = if args.has_external_target() || scenario == "monitor_index" {
         // monitor_index runs the index compiled into this binary.
@@ -798,6 +872,7 @@ fn run_trial(
     };
     let local_bin =
         || bin.ok_or_else(|| anyhow::anyhow!("{scenario} requires locally managed relay binaries"));
+    let read_corpus = || corpus.context("read scenarios load the corpus first");
     let target_endpoint = args.target_endpoint();
     let target = RelayTarget {
         bin,
@@ -904,7 +979,15 @@ fn run_trial(
                 }
             }
         }
-        "ws_query_latency" => match ws_query_trial(rt, target, corpus_path, n_queries, &mut hist) {
+        "ws_query_latency" => match ws_query_trial(
+            rt,
+            target,
+            corpus_path,
+            read_corpus()?,
+            args.event_mix,
+            n_queries,
+            &mut hist,
+        ) {
             Ok((qps, nts, good, miss)) => {
                 throughput = qps;
                 notes = nts;
@@ -918,7 +1001,15 @@ fn run_trial(
             }
         },
         "deep_history_pagination" => {
-            match deep_history_trial(rt, target, corpus_path, n_queries, &mut hist) {
+            match deep_history_trial(
+                rt,
+                target,
+                corpus_path,
+                read_corpus()?,
+                args.event_mix,
+                n_queries,
+                &mut hist,
+            ) {
                 Ok((qps, nts, good, miss)) => {
                     throughput = qps;
                     notes = nts;
@@ -933,7 +1024,15 @@ fn run_trial(
             }
         }
         "mixed_read_write" => {
-            match mixed_read_write_trial(rt, target, corpus_path, workload, n_queries, &mut hist) {
+            match mixed_read_write_trial(
+                rt,
+                target,
+                corpus_path,
+                read_corpus()?,
+                workload,
+                n_queries,
+                &mut hist,
+            ) {
                 Ok((qps, nts, good, miss)) => {
                     throughput = qps;
                     notes = nts;
@@ -1010,6 +1109,23 @@ fn run_trial(
                     ok = report.ok();
                     notes = report.notes();
                     rate_report = Some(report);
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e:#}");
+                }
+            }
+        }
+        "nip77_catchup" => {
+            match catchup_trial(rt, args, target, corpus_path, workload_seed, &mut hist) {
+                Ok(report) => {
+                    throughput = report.events_per_s;
+                    errors += report.errors;
+                    mismatches += report.mismatches;
+                    ok = report.ok();
+                    notes = report.notes();
+                    catchup_report = Some(report);
                 }
                 Err(e) => {
                     ok = false;
@@ -1178,6 +1294,7 @@ fn run_trial(
         author_kinds: author_kinds_report,
         tag_kinds: tag_kinds_report,
         publish_rate: rate_report,
+        nip77_catchup: catchup_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1222,6 +1339,7 @@ fn failed_trial(
         author_kinds: None,
         tag_kinds: None,
         publish_rate: None,
+        nip77_catchup: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1514,7 +1632,33 @@ fn generate_values(workload: EventWorkload) -> Result<Vec<Value>> {
 fn write_conf(bin: &Path, dbdir: &Path, port: u16) -> PathBuf {
     let conf = dbdir.join("strfry.conf");
     let is_wok = bin.file_name().and_then(|name| name.to_str()) == Some("wok");
-    let rendered = if is_wok {
+    // Raised where the corpus needs more than strfry's defaults, the
+    // strictest of the relays compared.
+    let raised: Vec<(&str, &str, u64)> = CORPUS_LIMITS
+        .get()
+        .map(|limits| {
+            [
+                (
+                    "max_event_size",
+                    "maxEventSize",
+                    limits.needed_max_event_size,
+                    65_536,
+                ),
+                ("max_num_tags", "maxNumTags", limits.most_tags, 2_000),
+                (
+                    "max_tag_val_size",
+                    "maxTagValSize",
+                    limits.largest_tag_value_bytes,
+                    1_024,
+                ),
+            ]
+            .into_iter()
+            .filter(|&(.., needed, default)| needed > default)
+            .map(|(wok, strfry, needed, _)| (wok, strfry, needed))
+            .collect()
+        })
+        .unwrap_or_default();
+    let mut rendered = if is_wok {
         format!(
             "[database]\npath = \"{}\"\n\n[relay]\nbind = \"127.0.0.1\"\nport = {port}\n\n[relay.auth]\nenabled = false\n\n[relay.abuse]\nenabled = false\n",
             dbdir.display()
@@ -1525,6 +1669,23 @@ fn write_conf(bin: &Path, dbdir: &Path, port: u16) -> PathBuf {
             dbdir.display()
         )
     };
+    if !raised.is_empty() {
+        let lines: String = raised
+            .iter()
+            .map(|(wok, strfry, needed)| {
+                if is_wok {
+                    format!("{wok} = {needed}\n")
+                } else {
+                    format!("    {strfry} = {needed}\n")
+                }
+            })
+            .collect();
+        if is_wok {
+            rendered.push_str(&format!("\n[events]\n{lines}"));
+        } else {
+            rendered.push_str(&format!("events {{\n{lines}}}\n"));
+        }
+    }
     let _ = std::fs::write(&conf, rendered);
     conf
 }
@@ -1565,52 +1726,14 @@ fn export_values(bin: &Path, dbdir: &Path) -> Result<Vec<Value>> {
         .collect()
 }
 
-/// Independent final-state oracle for generated publication mixes. Ephemerals
-/// are live-only; replacements retain the latest address; kind-5 e tags delete
-/// only the same author's target. The generator uses only these lifecycle forms.
+/// The events a relay keeps of `events` (see `corpus::retention`).
 fn retained_events(events: &[Value]) -> Vec<Value> {
-    let mut retained: Vec<Value> = Vec::new();
-    let mut ordered = events.to_vec();
-    ordered.sort_by_key(|e| e["created_at"].as_u64().unwrap());
-    // A relay stores each id once.
-    let mut seen = std::collections::HashSet::new();
-    for event in ordered {
-        let kind = event["kind"].as_u64().unwrap();
-        let id = event["id"].as_str().unwrap().to_owned();
-        if (20_000..30_000).contains(&kind) || !seen.insert(id) {
-            continue;
-        }
-        if kind == 5 {
-            for tag in event["tags"].as_array().unwrap() {
-                if tag[0] == "e" {
-                    retained.retain(|old| old["id"] != tag[1] || old["pubkey"] != event["pubkey"]);
-                }
-            }
-        }
-        if kind == 0
-            || kind == 3
-            || (10_000..20_000).contains(&kind)
-            || (30_000..40_000).contains(&kind)
-        {
-            let address = |e: &Value| {
-                e["tags"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|t| t[0] == "d")
-                    .and_then(|t| t[1].as_str())
-                    .unwrap_or("")
-                    .to_owned()
-            };
-            retained.retain(|old| {
-                old["pubkey"] != event["pubkey"]
-                    || old["kind"] != event["kind"]
-                    || (kind >= 30_000 && address(old) != address(&event))
-            });
-        }
-        retained.push(event);
-    }
-    retained
+    events
+        .iter()
+        .zip(corpus::retention(events))
+        .filter(|(_, kept)| *kept)
+        .map(|(event, _)| event.clone())
+        .collect()
 }
 
 fn export_count(bin: &Path, dbdir: &Path) -> u64 {
@@ -1836,47 +1959,51 @@ async fn read_ack(socket: &mut ClientConnection, event: &Value) -> Result<bool> 
     .context("publication acknowledgement deadline")?
 }
 
+/// Whether `event` matches `filter`, as NIP-01 defines it for the filter
+/// elements this harness sends.
+fn matches_filter(event: &Value, filter: &Value) -> bool {
+    for (key, condition) in filter.as_object().unwrap() {
+        match key.as_str() {
+            "limit" => {}
+            "since" => {
+                if event["created_at"].as_u64().unwrap() < condition.as_u64().unwrap() {
+                    return false;
+                }
+            }
+            "until" => {
+                if event["created_at"].as_u64().unwrap() > condition.as_u64().unwrap() {
+                    return false;
+                }
+            }
+            "ids" | "authors" | "kinds" => {
+                let field = match key.as_str() {
+                    "ids" => "id",
+                    "authors" => "pubkey",
+                    _ => "kind",
+                };
+                if !condition.as_array().unwrap().contains(&event[field]) {
+                    return false;
+                }
+            }
+            tag if tag.starts_with('#') => {
+                if !event["tags"].as_array().unwrap().iter().any(|t| {
+                    t[0].as_str() == Some(&tag[1..])
+                        && condition.as_array().unwrap().contains(&t[1])
+                }) {
+                    return false;
+                }
+            }
+            _ => panic!("unsupported benchmark oracle filter: {key}"),
+        }
+    }
+    true
+}
+
 /// Independent NIP-01 oracle for this harness's historical filter workloads.
 fn expected_history(events: &[Value], filter: &Value) -> Vec<Value> {
     let mut matches: Vec<Value> = events
         .iter()
-        .filter(|event| {
-            for (key, condition) in filter.as_object().unwrap() {
-                match key.as_str() {
-                    "limit" => {}
-                    "since" => {
-                        if event["created_at"].as_u64().unwrap() < condition.as_u64().unwrap() {
-                            return false;
-                        }
-                    }
-                    "until" => {
-                        if event["created_at"].as_u64().unwrap() > condition.as_u64().unwrap() {
-                            return false;
-                        }
-                    }
-                    "ids" | "authors" | "kinds" => {
-                        let field = match key.as_str() {
-                            "ids" => "id",
-                            "authors" => "pubkey",
-                            _ => "kind",
-                        };
-                        if !condition.as_array().unwrap().contains(&event[field]) {
-                            return false;
-                        }
-                    }
-                    tag if tag.starts_with('#') => {
-                        if !event["tags"].as_array().unwrap().iter().any(|t| {
-                            t[0].as_str() == Some(&tag[1..])
-                                && condition.as_array().unwrap().contains(&t[1])
-                        }) {
-                            return false;
-                        }
-                    }
-                    _ => panic!("unsupported benchmark oracle filter: {key}"),
-                }
-            }
-            true
-        })
+        .filter(|event| matches_filter(event, filter))
         .cloned()
         .collect();
     matches.sort_by(|a, b| {
@@ -1894,8 +2021,13 @@ fn expected_history(events: &[Value], filter: &Value) -> Vec<Value> {
     matches
 }
 
+/// How long a historical REQ may take to reach its EOSE. Deep pages on a
+/// production-sized store can take tens of seconds (strfry #157), and the
+/// campaign records them rather than failing.
+const HISTORY_DEADLINE: Duration = Duration::from_secs(120);
+
 async fn read_history(socket: &mut ClientConnection, sid: &str) -> Result<Vec<Value>> {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(HISTORY_DEADLINE, async {
         let mut events = Vec::new();
         loop {
             let message = socket.next().await.context("closed before EOSE")??;
@@ -2187,6 +2319,29 @@ fn reconcile_outcomes(out: &Path, log: &Path, export: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Import the corpus into a relay this harness starts, and check that the
+/// relay kept what the oracle expects.
+///
+/// The export decides, not import's exit status. Both relays write a batch
+/// in `created_at` order, then id, so a deletion in the same second as its
+/// target, with the lower id, refuses the target instead of deleting it.
+/// `wok import` exits nonzero on any refused line; strfry exits 0.
+fn preload(target: RelayTarget<'_>, corpus_path: &Path, corpus: &corpus::Corpus) -> Result<()> {
+    if let Some(bin) = target.bin {
+        let imported = import_with(bin, target.dbdir, corpus_path, false);
+        let retained = export_count(bin, target.dbdir);
+        if retained != corpus.retained() {
+            anyhow::bail!(
+                "pre-import {}kept {retained} of {} corpus events, not {}",
+                if imported { "" } else { "failed and " },
+                corpus.lines(),
+                corpus.retained()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run `queries` REQs of mixed shapes against an exact corpus. Local targets
 /// are preloaded automatically; remote targets must already contain the
 /// supplied `--corpus`.
@@ -2194,34 +2349,21 @@ fn ws_query_trial(
     rt: &tokio::runtime::Runtime,
     target: RelayTarget<'_>,
     corpus_path: &Path,
+    corpus: &corpus::Corpus,
+    mix: EventMix,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    let events = read_event_values(corpus_path)?;
-    if events.is_empty() {
+    if corpus.lines() == 0 {
         anyhow::bail!("query corpus is empty");
-    }
-    let note_events: Vec<&Value> = events
-        .iter()
-        .filter(|event| event.get("kind").and_then(Value::as_u64) == Some(1))
-        .collect();
-    if note_events.is_empty() {
-        anyhow::bail!("query corpus has no kind 1 events");
     }
     let measured_queries = queries.max(1);
     let total_queries = measured_queries.saturating_add(20);
-    if let Some(bin) = target.bin {
-        if !import_with(bin, target.dbdir, corpus_path, false) {
-            anyhow::bail!("pre-import failed");
-        }
-        let retained = export_count(bin, target.dbdir);
-        if retained != events.len() as u64 {
-            anyhow::bail!(
-                "pre-import retained {retained}/{} corpus events",
-                events.len()
-            );
-        }
-    }
+    let filters = corpus.filters(total_queries, mix)?;
+    // Work out every reply before the clock starts: on a large corpus that
+    // takes longer than the relay does.
+    let expected: Vec<_> = filters.iter().map(|f| corpus.expected(f)).collect();
+    preload(target, corpus_path, corpus)?;
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use tokio_tungstenite::tungstenite::Message;
@@ -2229,22 +2371,8 @@ fn ws_query_trial(
         for _ in 0..4 {
             sockets.push(connect_retry(&url).await?);
         }
-        let filters: Vec<Value> = (0..total_queries)
-            .map(|q| {
-                let ev = &events[(q as usize * 7) % events.len()];
-                let note = note_events[(q as usize * 11) % note_events.len()];
-                let id = ev["id"].as_str().unwrap_or("");
-                let pk = note["pubkey"].as_str().unwrap_or("");
-                match q % 4 {
-                    0 => json!({"ids":[id]}),
-                    1 => json!({"authors":[pk],"kinds":[1],"limit":50}),
-                    2 => json!({"kinds":[1],"since":note["created_at"].as_u64().unwrap_or(0),"limit":20}),
-                    _ => json!({"#t":[format!("tag-{}", q % 64)],"limit":50}),
-                }
-            })
-            .collect();
         // Warm-up.
-        for (i, f) in filters.iter().take(20).enumerate() {
+        for (i, (f, expected)) in filters.iter().zip(&expected).take(20).enumerate() {
             let ws = &mut sockets[i % 4];
             let subscription = format!("warm-{i}");
             ws.send(Message::Text(
@@ -2252,17 +2380,21 @@ fn ws_query_trial(
             ))
             .await?;
             let actual = read_history(ws, &subscription).await?;
-            anyhow::ensure!(same_event_set(&actual, &expected_history(&events,f)), "warmup returned wrong events");
+            anyhow::ensure!(
+                expected.matches(&actual),
+                "warmup returned wrong events for {f}"
+            );
             ws.send(Message::Text(
                 json!(["CLOSE", subscription]).to_string().into(),
             ))
             .await?;
         }
         let start = Instant::now();
+        let mut checking = Duration::ZERO;
         let mut done = 0u64;
         let mut results = 0u64;
         let mut mismatches = 0u64;
-        for (i, f) in filters.iter().skip(20).enumerate() {
+        for (i, (f, expected)) in filters.iter().zip(&expected).skip(20).enumerate() {
             let ws = &mut sockets[i % 4];
             let subscription = format!("query-{i}");
             let t0 = Instant::now();
@@ -2270,21 +2402,22 @@ fn ws_query_trial(
                 json!(["REQ", subscription, f]).to_string().into(),
             ))
             .await?;
-            let actual = read_history(ws,&subscription).await?;
+            let actual = read_history(ws, &subscription).await?;
+            hist.record(t0.elapsed().as_micros().max(1) as u64)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let checked = Instant::now();
             results += actual.len() as u64;
-            let correct = same_event_set(&actual,&expected_history(&events,f));
+            if !expected.matches(&actual) {
+                mismatches += 1;
+            }
+            checking += checked.elapsed();
             ws.send(Message::Text(
                 json!(["CLOSE", subscription]).to_string().into(),
             ))
             .await?;
-            hist.record(t0.elapsed().as_micros().max(1) as u64)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if !correct {
-                mismatches += 1;
-            }
             done += 1;
         }
-        let elapsed = start.elapsed();
+        let elapsed = start.elapsed().saturating_sub(checking);
         for ws in &mut sockets {
             let _ = ws.close(None).await;
         }
@@ -2300,79 +2433,71 @@ fn ws_query_trial(
 /// Repeated author+kind+until pagination into progressively older history.
 /// This is the workload from strfry issue #157, where later pages can degrade
 /// from sub-second to tens of seconds on fragmented, production-sized stores.
+/// On a social corpus a page holds every kind, as an archive's mirror reads
+/// an author; otherwise notes only.
+///
+/// Each page asks for what is older than the last page's oldest event. Where
+/// a page ends inside a second, that second's other events are skipped, as
+/// they are for a client paging this way.
 fn deep_history_trial(
     rt: &tokio::runtime::Runtime,
     target: RelayTarget<'_>,
     corpus_path: &Path,
+    corpus: &corpus::Corpus,
+    mix: EventMix,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    use std::collections::HashMap;
-
-    let events = read_event_values(corpus_path)?;
-    let mut authors = HashMap::<String, u64>::new();
-    for event in &events {
-        if event.get("kind").and_then(Value::as_u64) == Some(1) {
-            if let Some(author) = event.get("pubkey").and_then(Value::as_str) {
-                *authors.entry(author.to_string()).or_default() += 1;
-            }
-        }
-    }
-    let (author, n) = authors
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .context("deep-history corpus has no kind 1 author")?;
-    if let Some(bin) = target.bin {
-        if !import_with(bin, target.dbdir, corpus_path, false) {
-            anyhow::bail!("deep-history import failed");
-        }
-        let imported = export_count(bin, target.dbdir);
-        if imported != events.len() as u64 {
-            anyhow::bail!(
-                "deep-history import retained {imported}/{} events",
-                events.len()
-            );
-        }
-    }
+    let kinds = (mix != EventMix::Social).then_some(1);
+    let (author, n) = corpus
+        .busiest_author(kinds)
+        .context("deep-history corpus has no author to page")?;
+    preload(target, corpus_path, corpus)?;
     let page_size = 500u64;
+    let page = |until: u64| {
+        let mut filter = json!({"authors":[author],"until":until,"limit":page_size});
+        if let Some(kind) = kinds {
+            filter["kinds"] = json!([kind]);
+        }
+        filter
+    };
     let available_pages = n.div_ceil(page_size);
-    let pages = queries.max(1).min(available_pages);
+    // Plan the pages and their replies before the clock starts. A correct
+    // page's oldest second is the same whichever of its events it holds.
+    // Skipped seconds can end the history a page early.
+    let mut plan = Vec::new();
+    let mut until = u64::MAX;
+    while (plan.len() as u64) < queries.max(1).min(available_pages) {
+        let filter = page(until);
+        let expected = corpus.expected(&filter);
+        let Some(oldest) = expected.oldest() else {
+            break;
+        };
+        until = oldest.saturating_sub(1);
+        plan.push((filter, expected));
+    }
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use std::collections::HashSet;
         use tokio_tungstenite::tungstenite::Message;
 
         let mut socket = connect_retry(&url).await?;
-        let mut until = u64::MAX;
         let mut seen = HashSet::new();
         let mut mismatches = 0u64;
         let mut latencies = Vec::new();
+        let mut checking = Duration::ZERO;
         let started_all = Instant::now();
-        for _page in 0..pages {
+        for (filter, expected) in &plan {
             let started = Instant::now();
             socket
                 .send(Message::Text(
-                    json!(["REQ", "deep", {
-                        "authors":[author],
-                        "kinds":[1],
-                        "until":until,
-                        "limit":page_size
-                    }])
-                    .to_string()
-                    .into(),
+                    json!(["REQ", "deep", filter]).to_string().into(),
                 ))
                 .await?;
             let actual = read_history(&mut socket, "deep").await?;
-            let expected = expected_history(
-                &events,
-                &json!({"authors":[author],"kinds":[1],"until":until,"limit":page_size}),
-            );
-            let oldest = actual
-                .iter()
-                .filter_map(|e| e["created_at"].as_u64())
-                .min()
-                .unwrap_or(u64::MAX);
-            if !same_event_set(&actual, &expected) || oldest == u64::MAX {
+            latencies.push(started.elapsed().as_micros().max(1) as u64);
+            let checked = Instant::now();
+            if !expected.matches(&actual) {
                 mismatches += 1;
                 break;
             }
@@ -2381,22 +2506,18 @@ fn deep_history_trial(
                     mismatches += 1;
                 }
             }
-            latencies.push(started.elapsed().as_micros().max(1) as u64);
-            until = oldest.saturating_sub(1);
+            checking += checked.elapsed();
         }
-        let elapsed = started_all.elapsed();
+        let elapsed = started_all.elapsed().saturating_sub(checking);
         let _ = socket.close(None).await;
         Ok::<_, anyhow::Error>((seen.len() as u64, mismatches, elapsed, latencies))
     });
     stop_target(&mut child, &url);
-    let (seen, mut mismatches, elapsed, latencies) = out?;
+    let (seen, mismatches, elapsed, latencies) = out?;
+    let pages = latencies.len();
     for latency in latencies {
         hist.record(latency)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
-    let expected = n.min(pages * page_size);
-    if seen != expected {
-        mismatches += 1;
     }
     let qps = pages as f64 / elapsed.as_secs_f64();
     let notes = format!(
@@ -2408,33 +2529,24 @@ fn deep_history_trial(
 /// Measure historical REQ latency while a second connection continuously
 /// publishes accepted events. This catches cursor/refill regressions that are
 /// invisible in a read-only corpus.
+#[allow(clippy::too_many_arguments)]
 fn mixed_read_write_trial(
     rt: &tokio::runtime::Runtime,
     target: RelayTarget<'_>,
     corpus_path: &Path,
+    corpus: &corpus::Corpus,
     workload: EventWorkload,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    let base_events = read_event_values(corpus_path)?;
-    let n = base_events.len() as u64;
+    let n = corpus.lines();
     if n == 0 {
         anyhow::bail!("mixed-load corpus is empty");
     }
-    if let Some(bin) = target.bin {
-        if !import_with(bin, target.dbdir, corpus_path, false) {
-            anyhow::bail!("mixed-load import failed");
-        }
-        let imported = export_count(bin, target.dbdir);
-        if imported != n {
-            anyhow::bail!("mixed-load import retained {imported}/{n} events");
-        }
-    }
-    let query_author = base_events
-        .iter()
-        .find(|e| e["kind"] == 1)
-        .context("mixed corpus has no kind 1")?["pubkey"]
-        .clone();
+    let query_author = corpus
+        .first_author(1)
+        .context("mixed corpus has no kind 1")?;
+    preload(target, corpus_path, corpus)?;
     let query_count = queries.max(1);
     let write_count = query_count.max(50).min(n);
     let new_events = generate_values(EventWorkload {
@@ -2443,8 +2555,24 @@ fn mixed_read_write_trial(
         // Keep concurrent writes recent but never push them into the future.
         // The distinct workload seed is sufficient to avoid corpus IDs.
         base_timestamp: workload.base_timestamp,
-        ..workload
+        // A social corpus's writes are notes by authors of their own.
+        mix: match workload.mix {
+            EventMix::Social => EventMix::Kind1,
+            mix => mix,
+        },
     })?;
+    // Work out every reply before the clock starts.
+    let plan: Vec<_> = (0..query_count)
+        .map(|query_number| {
+            let filter = json!({
+                "kinds":[1], "authors":[query_author],
+                "limit":100,
+                "until":u64::MAX.saturating_sub(query_number)
+            });
+            let expected = corpus.expected(&filter);
+            (filter, expected)
+        })
+        .collect();
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use tokio_tungstenite::tungstenite::Message;
@@ -2453,38 +2581,35 @@ fn mixed_read_write_trial(
         let mut write_socket = connect_retry(&url).await?;
         let query_future = async {
             let started_all = Instant::now();
+            let mut checking = Duration::ZERO;
             let mut completed = 0u64;
             let mut results = 0u64;
             let mut mismatches = 0u64;
             let mut latencies = Vec::new();
-            for query_number in 0..query_count {
+            for (query_number, (filter, expected)) in plan.iter().enumerate() {
                 let started = Instant::now();
                 let subscription_id = format!("mixed-{query_number}");
                 query_socket
                     .send(Message::Text(
-                        json!(["REQ", subscription_id, {
-                            "kinds":[1], "authors":[query_author],
-                            "limit":100,
-                            "until":u64::MAX.saturating_sub(query_number)
-                        }])
-                        .to_string()
-                        .into(),
+                        json!(["REQ", subscription_id, filter]).to_string().into(),
                     ))
                     .await?;
                 let actual = read_history(&mut query_socket, &subscription_id).await?;
-                let expected = expected_history(&base_events, &json!({"kinds":[1], "authors":[query_author], "limit":100, "until":u64::MAX.saturating_sub(query_number)}));
-                let query_results = actual.len() as u64;
-                if !same_event_set(&actual, &expected) { mismatches += 1; }
+                latencies.push(started.elapsed().as_micros().max(1) as u64);
+                let checked = Instant::now();
+                if !expected.matches(&actual) {
+                    mismatches += 1;
+                }
+                checking += checked.elapsed();
                 query_socket
                     .send(Message::Text(
                         json!(["CLOSE", subscription_id]).to_string().into(),
                     ))
                     .await?;
-                latencies.push(started.elapsed().as_micros().max(1) as u64);
-                results += query_results;
+                results += actual.len() as u64;
                 completed += 1;
             }
-            let elapsed = started_all.elapsed();
+            let elapsed = started_all.elapsed().saturating_sub(checking);
             let _ = query_socket.close(None).await;
             Ok::<_, anyhow::Error>((completed, results, mismatches, elapsed, latencies))
         };
@@ -2864,6 +2989,50 @@ fn cold_start_trial(
     out?;
     hist.record(ms.saturating_mul(1000))?;
     Ok(ms)
+}
+
+/// NIP-77 catch-up against the target. The target must hold the corpus: a
+/// relay the harness starts imports it first; a remote one must have been
+/// loaded with it and nothing else.
+fn catchup_trial(
+    rt: &tokio::runtime::Runtime,
+    args: &Args,
+    target: RelayTarget<'_>,
+    corpus_path: &Path,
+    seed: u64,
+    hist: &mut Histogram<u64>,
+) -> Result<catchup::Report> {
+    let opts = catchup::Options {
+        filters: args.sync_filter,
+        windows: args.sync_windows,
+        missing: args.sync_missing,
+        missing_pct: args.sync_missing_pct,
+        concurrency: args.sync_concurrency,
+        per_conn: args.sync_per_conn,
+        limit: args.sync_limit,
+        clients_per_address: args.clients_per_address,
+        expect_no_refusals: args.expect_no_refusals,
+        seed,
+        nodelay: args.tcp_nodelay,
+    };
+    let kept = catchup::kept(read_event_values(corpus_path)?);
+    let kept_count = kept.len() as u64;
+    let plan = std::sync::Arc::new(catchup::plan(kept, &opts)?);
+    if let Some(bin) = target.bin {
+        anyhow::ensure!(
+            import_with(bin, target.dbdir, corpus_path, false),
+            "pre-import failed"
+        );
+        let stored = export_count(bin, target.dbdir);
+        anyhow::ensure!(
+            stored == kept_count,
+            "pre-import stored {stored} events where a relay keeps {kept_count}"
+        );
+    }
+    let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
+    let run = rt.block_on(catchup::run(&url, plan.clone(), &opts));
+    stop_target(&mut child, &url);
+    catchup::report(&plan, &run?, &opts, hist)
 }
 
 fn live_options(args: &Args) -> live::Options {
@@ -3301,6 +3470,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.publish_rate {
             s.push_str(&rate::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.nip77_catchup {
+            s.push_str(&catchup::render_markdown(report, &t.relay, t.repetition));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -3369,6 +3541,24 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             " --send-rate {} --send-secs {} --publish-connections {} --drain-secs {}",
             args.send_rate, args.send_secs, args.publish_connections, args.drain_secs,
         ));
+    }
+    if args.scenario.as_deref() == Some("nip77_catchup") {
+        selection.push_str(&format!(
+            " --sync-filter {} --sync-windows {} --sync-missing {} --sync-missing-pct {} --sync-concurrency {} --sync-per-conn {} --clients-per-address {}",
+            args.sync_filter.to_possible_value().expect("value enum").get_name(),
+            args.sync_windows,
+            args.sync_missing.to_possible_value().expect("value enum").get_name(),
+            args.sync_missing_pct,
+            args.sync_concurrency,
+            args.sync_per_conn,
+            args.clients_per_address,
+        ));
+        if let Some(limit) = args.sync_limit {
+            selection.push_str(&format!(" --sync-limit {limit}"));
+        }
+        if args.expect_no_refusals {
+            selection.push_str(" --expect-no-refusals");
+        }
     }
     if matches!(
         args.scenario.as_deref(),

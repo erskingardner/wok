@@ -105,13 +105,59 @@ pub struct Summary {
     pub max_follows: usize,
     /// Events a relay keeps after replacements and deletions.
     pub retained: u64,
+    #[serde(flatten)]
+    pub limits: Limits,
+    pub kinds: BTreeMap<u16, KindCount>,
+}
+
+/// The limits a relay must allow to import every line of a corpus.
+#[derive(Serialize, Default, Clone, Copy, Debug, PartialEq)]
+pub struct Limits {
     /// The smallest `max_event_size` (strfry: `maxEventSize`) that imports
     /// every event: import counts a line's newline against the limit.
     pub needed_max_event_size: u64,
     pub most_tags: u64,
     /// Longest value of a single-letter tag, the tags relays index and limit.
     pub largest_tag_value_bytes: u64,
-    pub kinds: BTreeMap<u16, KindCount>,
+}
+
+impl Limits {
+    /// Account for one corpus line and its event's tags.
+    pub fn observe(&mut self, line: &str, tags: &[Value]) {
+        self.observe_tags(
+            line,
+            tags.len(),
+            tags.iter()
+                .map(|tag| (tag[0].as_str().unwrap_or_default(), tag[1].as_str())),
+        );
+    }
+
+    /// [`Limits::observe`], given the event's `count` tags as their names
+    /// and values.
+    pub fn observe_tags<'a>(
+        &mut self,
+        line: &str,
+        count: usize,
+        tags: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+    ) {
+        self.needed_max_event_size = self.needed_max_event_size.max(line.len() as u64 + 1);
+        self.most_tags = self.most_tags.max(count as u64);
+        for (name, value) in tags {
+            if name.len() == 1 {
+                let bytes = value.map_or(0, str::len) as u64;
+                self.largest_tag_value_bytes = self.largest_tag_value_bytes.max(bytes);
+            }
+        }
+    }
+
+    /// Limits that admit what both admit.
+    pub fn merge(&mut self, other: Limits) {
+        self.needed_max_event_size = self.needed_max_event_size.max(other.needed_max_event_size);
+        self.most_tags = self.most_tags.max(other.most_tags);
+        self.largest_tag_value_bytes = self
+            .largest_tag_value_bytes
+            .max(other.largest_tag_value_bytes);
+    }
 }
 
 fn author_key(seed: u64, rank: usize) -> Keypair {
@@ -802,9 +848,7 @@ fn generate_over(path: &Path, opts: &Options, span: u64) -> Result<Summary> {
         span_secs: span,
         max_follows: opts.max_follows,
         retained: 0,
-        needed_max_event_size: 0,
-        most_tags: 0,
-        largest_tag_value_bytes: 0,
+        limits: Limits::default(),
         kinds: BTreeMap::new(),
     };
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -830,18 +874,10 @@ fn generate_over(path: &Path, opts: &Options, span: u64) -> Result<Summary> {
             let entry = summary.kinds.entry(kind).or_default();
             entry.events += 1;
             entry.bytes += line.len() as u64;
-            summary.needed_max_event_size =
-                summary.needed_max_event_size.max(line.len() as u64 + 1);
             let tags = unsigned.event["tags"]
                 .as_array()
                 .map_or(&[][..], Vec::as_slice);
-            summary.most_tags = summary.most_tags.max(tags.len() as u64);
-            for tag in tags {
-                if tag[0].as_str().is_some_and(|name| name.len() == 1) {
-                    let bytes = tag[1].as_str().map_or(0, str::len) as u64;
-                    summary.largest_tag_value_bytes = summary.largest_tag_value_bytes.max(bytes);
-                }
-            }
+            summary.limits.observe(&line, tags);
             out.write_all(line.as_bytes())?;
             out.write_all(b"\n")?;
             builder.absorb(kind, &line);
@@ -1033,7 +1069,7 @@ mod tests {
         assert!(events
             .iter()
             .all(|e| e["created_at"].as_u64().unwrap() <= ANCHOR + 1));
-        assert!(summary.most_tags >= follows as u64);
+        assert!(summary.limits.most_tags >= follows as u64);
     }
 
     #[test]
@@ -1041,6 +1077,6 @@ mod tests {
         let (_, summary, bytes) = corpus(4_000, 100, 9);
         let longest = bytes.split(|&b| b == b'\n').map(<[u8]>::len).max().unwrap();
         assert!(longest > 10_000, "longest line {longest}");
-        assert_eq!(summary.needed_max_event_size, longest as u64 + 1);
+        assert_eq!(summary.limits.needed_max_event_size, longest as u64 + 1);
     }
 }

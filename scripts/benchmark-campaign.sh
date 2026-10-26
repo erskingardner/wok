@@ -15,7 +15,14 @@ RELAY_HOST=${RELAY_HOST:-}
 # /etc/relay-bench/targets/<name>.env (see benchmark-relay-control.sh).
 TARGETS=${TARGETS:-}
 BENCH_BIN=${BENCH_BIN:-/opt/wok-load/bin/current/wok-bench}
+# The relay host's wok-bench, which reconciles fixed-rate outcome logs with
+# each relay's export.
+RELAY_BENCH_BIN=${RELAY_BENCH_BIN:-/opt/relay-bench/bin/wok-bench/wok-bench}
 EVENTS=${EVENTS:-100000}
+# realistic, or social: a public social relay's history, of which a relay
+# keeps only part. The query phases read either.
+CORPUS_MIX=${CORPUS_MIX:-realistic}
+SOCIAL_AUTHORS=${SOCIAL_AUTHORS:-100000}
 QUERIES=${QUERIES:-400}
 DEEP_PAGES=${DEEP_PAGES:-20}
 REPETITIONS=${REPETITIONS:-3}
@@ -28,6 +35,14 @@ LIFECYCLE_EVENTS=${LIFECYCLE_EVENTS:-10000}
 LIFECYCLE_CONNECTIONS=${LIFECYCLE_CONNECTIONS:-1}
 NOFILE_LIMIT=${NOFILE_LIMIT:-524288}
 COOLDOWN_SECONDS=${COOLDOWN_SECONDS:-10}
+# Fixed-rate publication steps in events per second, rising, run after the
+# other phases. A target's sweep stops at the first step that misses its
+# targets (see rate_sweep). Empty runs none.
+RATE_STEPS=${RATE_STEPS:-}
+RATE_SECS=${RATE_SECS:-180}
+RATE_DRAIN_SECS=${RATE_DRAIN_SECS:-10}
+RATE_CONNECTIONS=${RATE_CONNECTIONS:-64}
+RATE_P99_MS=${RATE_P99_MS:-250}
 # Relay caps: a CPU list for AllowedCPUs and a size for MemoryMax.
 RELAY_CPUS=${RELAY_CPUS:-}
 RELAY_MEMORY=${RELAY_MEMORY:-}
@@ -67,6 +82,21 @@ validate_settings() {
         die "CAMPAIGN_ID may hold only letters, digits, dot, underscore and hyphen"
     [[ $CACHE == cold || $CACHE == warm ]] || die "CACHE must be cold or warm"
     [[ $SNAPSHOTS == 0 || $SNAPSHOTS == 1 ]] || die "SNAPSHOTS must be 0 or 1"
+    [[ $CORPUS_MIX == realistic || $CORPUS_MIX == social ]] ||
+        die "CORPUS_MIX must be realistic or social"
+    for name in SOCIAL_AUTHORS RATE_SECS RATE_DRAIN_SECS RATE_CONNECTIONS RATE_P99_MS; do
+        [[ ${!name} =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
+    done
+    local -a steps
+    read -r -a steps <<<"$RATE_STEPS"
+    local step previous=0
+    # Bash before 4.4 calls an empty array unbound under set -u.
+    for step in ${steps[@]+"${steps[@]}"}; do
+        if [[ ! $step =~ ^[1-9][0-9]*$ ]] || ((step <= previous)); then
+            die "RATE_STEPS must list rising positive integers"
+        fi
+        previous=$step
+    done
     local -a targets
     read -r -a targets <<<"$TARGETS"
     local i j
@@ -124,12 +154,16 @@ load_unit_command() {
     )
 }
 
-run_bench() {
+# Runs one phase on the load host, signing its workload from the given seed,
+# and returns wok-bench's status. Its results go to
+# $LOAD_ROOT/runs/r<repetition>-<target>/load/<phase>.
+launch_bench() {
     local target=$1
     local repetition=$2
     local url=$3
     local phase=$4
-    shift 4
+    local seed=$5
+    shift 5
     local output=$LOAD_ROOT/runs/r${repetition}-${target}/load/$phase
     local phase_timestamp=$BASE_TIMESTAMP
     if [[ $phase == lifecycle ]]; then
@@ -142,7 +176,7 @@ run_bench() {
         "$BENCH_BIN" \
         --target-url "$url" \
         --target-label "$target-r$repetition" \
-        --seed "$SEED" \
+        --seed "$seed" \
         --base-timestamp "$phase_timestamp" \
         --repetitions 1 \
         --out "$output" \
@@ -162,8 +196,130 @@ $rendered_bench
 rc=\$?
 systemctl stop $LOAD_UNIT-mpstat.service
 exit \$rc"
+}
+
+# Runs one phase and fails unless every trial passed: ok, with no errors or
+# mismatches.
+run_bench() {
+    local target=$1
+    local repetition=$2
+    local url=$3
+    local phase=$4
+    shift 4
+    # The results decide; a failed trial also makes wok-bench exit non-zero.
+    launch_bench "$target" "$repetition" "$url" "$phase" "$SEED" "$@" || true
     remote_command "$LOAD_SSH" jq -e -s 'all(.ok and (.errors == 0) and (.mismatches == 0))' \
-        "$output/results.jsonl" >/dev/null
+        "$LOAD_ROOT/runs/r${repetition}-${target}/load/$phase/results.jsonl" >/dev/null
+}
+
+# A fixed-rate step meets its targets when the relay kept up with the whole
+# schedule: every event sent at the intended rate on connections that stayed
+# open, each accepted, none refused or unanswered, and publish-to-OK p99
+# within RATE_P99_MS.
+# shellcheck disable=SC2016 # $p99 is jq's.
+RATE_TARGETS='all(.ok and .errors == 0 and .latency_p99_ms <= $p99
+    and .publish_rate.unsent == 0 and .publish_rate.no_reply == 0
+    and (.publish_rate.refused | length) == 0)'
+
+# Publishes at each of RATE_STEPS in turn, RATE_SECS each, and stops after
+# the first step that misses its targets. Each step signs fresh events from
+# its own seed, so no step repeats another's. Writes rate-capacity.txt beside
+# the phases: the last step that met its targets (0 for none) and the first
+# that missed. A missed step is a result. This fails when a step left no
+# fixed-rate report, which also means no complete outcome log, or an OK
+# named no event its connection sent. RATE_LAUNCHED lists the steps it
+# started, for reconcile_rate_steps.
+rate_sweep() {
+    local target=$1
+    local repetition=$2
+    local url=$3
+    local load=$LOAD_ROOT/runs/r${repetition}-${target}/load
+    local -a steps
+    read -r -a steps <<<"$RATE_STEPS"
+    local capacity=0
+    local missed=
+    local index rate results
+    RATE_LAUNCHED=()
+    for index in "${!steps[@]}"; do
+        rate=${steps[index]}
+        RATE_LAUNCHED+=("$rate")
+        launch_bench "$target" "$repetition" "$url" "rate-$rate" "$((SEED + index + 1))" \
+            --scenario ws_publish_rate --send-rate "$rate" --send-secs "$RATE_SECS" \
+            --drain-secs "$RATE_DRAIN_SECS" --publish-connections "$RATE_CONNECTIONS" \
+            --event-mix realistic || true
+        results=$load/rate-$rate/results.jsonl
+        if ! remote_command "$LOAD_SSH" jq -e -s \
+            'length > 0 and all(.publish_rate != null and .mismatches == 0)' \
+            "$results" >/dev/null; then
+            echo "$target step $rate left no fixed-rate report, or an OK named no sent event" >&2
+            return 1
+        fi
+        if remote_command "$LOAD_SSH" jq -e -s --argjson p99 "$RATE_P99_MS" "$RATE_TARGETS" \
+            "$results" >/dev/null; then
+            capacity=$rate
+        else
+            missed=$rate
+            break
+        fi
+    done
+    # shellcheck disable=SC2016 # The load host's shell expands them.
+    remote_command "$LOAD_SSH" sh -c 'printf "capacity=%s\nfirst_missed=%s\n" "$1" "$2" >"$3"' \
+        sh "$capacity" "$missed" "$load/rate-capacity.txt"
+}
+
+# Copies the outcome log of each step the sweep started (RATE_LAUNCHED) to
+# the relay host, reconciles them all against one export of the stopped
+# relay's database, and copies each step's reconciliation.json back beside
+# its results. Fails when a started step has no outcome log, when a log does
+# not account for every event its step planned, or when a step has an
+# acknowledged event missing or a refused event stored.
+reconcile_rate_steps() {
+    local target=$1
+    local repetition=$2
+    local load=$LOAD_ROOT/runs/r${repetition}-${target}/load
+    local relay=$RELAY_ROOT/runs/r${repetition}-${target}/rate
+    local -a ran=()
+    local rate log
+    local status=0
+    # The helper reconciles every log under $relay, so none may be left from
+    # an earlier run with this campaign ID.
+    remote_command "$RELAY_SSH" rm -rf -- "$relay"
+    for rate in ${RATE_LAUNCHED[@]+"${RATE_LAUNCHED[@]}"}; do
+        # wok-bench names the log for the trial's label and its repetition,
+        # which is always 1 here.
+        log=$load/rate-$rate/outcomes-$target-r$repetition-r1.jsonl
+        if ! remote_command "$LOAD_SSH" test -s "$log"; then
+            echo "$target step $rate ran but its outcome log $log is missing" >&2
+            status=1
+            continue
+        fi
+        if ! remote_command "$RELAY_SSH" mkdir -p "$relay/rate-$rate" ||
+            ! scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$log" \
+                "$RELAY_SSH:$relay/rate-$rate/outcomes.jsonl"; then
+            echo "$target step $rate: could not copy its outcome log to the relay host" >&2
+            remote_command "$RELAY_SSH" rm -rf -- "$relay/rate-$rate" || true
+            status=1
+            continue
+        fi
+        ran+=("$rate")
+    done
+    [[ ${#ran[@]} -gt 0 ]] || return "$status"
+    remote_command "$RELAY_SSH" "$CONTROL_REMOTE" reconcile "$target" "$RELAY_BENCH_BIN" \
+        "$relay" --nofile "$NOFILE_LIMIT" || status=1
+    for rate in "${ran[@]}"; do
+        if ! scp "${SSH_OPTIONS[@]}" -3 -q "$RELAY_SSH:$relay/rate-$rate/reconciliation.json" \
+            "$LOAD_SSH:$load/rate-$rate/reconciliation.json"; then
+            status=1
+            continue
+        fi
+        # A log cut short would reconcile only the events it holds.
+        if ! remote_command "$LOAD_SSH" jq -e -s '.[0].publish_rate.events == .[1].events' \
+            "$load/rate-$rate/results.jsonl" "$load/rate-$rate/reconciliation.json" >/dev/null; then
+            echo "$target step $rate: the outcome log does not hold every planned event" >&2
+            status=1
+        fi
+    done
+    return "$status"
 }
 
 run_target() {
@@ -179,9 +335,10 @@ run_target() {
         snapshot=keep
     fi
     remote_command "$LOAD_SSH" mkdir -p "$run_root/load" "$run_root/server"
+    RATE_LAUNCHED=()
 
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" prepare "$target" "$RELAY_CORPUS" \
-        "$EVENTS" "$server_artifacts" --snapshot "$snapshot" --nofile "$NOFILE_LIMIT" \
+        "$RETAINED" "$server_artifacts" --snapshot "$snapshot" --nofile "$NOFILE_LIMIT" \
         ${CAP_ARGS[@]+"${CAP_ARGS[@]}"}
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" start "$target" "$server_artifacts" \
         --cache "$CACHE" --ready-timeout "$READY_TIMEOUT" --nofile "$NOFILE_LIMIT" \
@@ -190,17 +347,17 @@ run_target() {
     local status=0
     if ! run_bench "$target" "$repetition" "$url" query \
         --scenario ws_query_latency --corpus "$LOAD_CORPUS" --events "$EVENTS" \
-        --queries "$QUERIES" --event-mix realistic; then
+        --queries "$QUERIES" --event-mix "$CORPUS_MIX"; then
         status=1
     fi
     if [[ $status -eq 0 ]] && ! run_bench "$target" "$repetition" "$url" deep-history \
         --scenario deep_history_pagination --corpus "$LOAD_CORPUS" --events "$EVENTS" \
-        --queries "$DEEP_PAGES" --event-mix realistic; then
+        --queries "$DEEP_PAGES" --event-mix "$CORPUS_MIX"; then
         status=1
     fi
     if [[ $status -eq 0 ]] && ! run_bench "$target" "$repetition" "$url" mixed-read-write \
         --scenario mixed_read_write --corpus "$LOAD_CORPUS" --events "$EVENTS" \
-        --queries "$QUERIES" --event-mix realistic; then
+        --queries "$QUERIES" --event-mix "$CORPUS_MIX"; then
         status=1
     fi
     if [[ $status -eq 0 ]] && ! run_bench "$target" "$repetition" "$url" load \
@@ -215,15 +372,38 @@ run_target() {
         --publish-connections "$LIFECYCLE_CONNECTIONS"; then
         status=1
     fi
+    if [[ $status -eq 0 && -n $RATE_STEPS ]] && ! rate_sweep "$target" "$repetition" "$url"; then
+        status=1
+    fi
 
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" collect-stop "$target" "$server_artifacts" ||
         status=1
+    # After the stop, so the export holds everything the relay wrote, even
+    # when it failed.
+    if [[ -n $RATE_STEPS ]] && ! reconcile_rate_steps "$target" "$repetition"; then
+        status=1
+    fi
     scp "${SSH_OPTIONS[@]}" -3 -q -r "$RELAY_SSH:$server_artifacts/." "$LOAD_SSH:$run_root/server/" ||
         status=1
     if [[ $status -ne 0 ]]; then
         echo "campaign phase failed for $target repetition $repetition" >&2
         return "$status"
     fi
+}
+
+# Prints how many corpus events each relay must keep: all of a realistic
+# corpus, and of a social one the count its manifest gives.
+retained_events() {
+    if [[ $CORPUS_MIX == realistic ]]; then
+        echo "$EVENTS"
+        return
+    fi
+    local retained
+    retained=$(remote_command "$LOAD_SSH" jq -er .corpus.social.retained \
+        "$LOAD_CORPUS_DIR/manifest.json") || retained=
+    [[ $retained =~ ^[1-9][0-9]*$ ]] ||
+        die "$LOAD_CORPUS_DIR/manifest.json gives no retained count for the social corpus"
+    echo "$retained"
 }
 
 write_campaign_metadata() {
@@ -235,7 +415,11 @@ write_campaign_metadata() {
         "relay_host=$RELAY_HOST"
         "targets=$TARGETS"
         "bench_bin=$BENCH_BIN"
+        "relay_bench_bin=$RELAY_BENCH_BIN"
+        "corpus_mix=$CORPUS_MIX"
+        "social_authors=$SOCIAL_AUTHORS"
         "events=$EVENTS"
+        "retained=$RETAINED"
         "queries=$QUERIES"
         "deep_pages=$DEEP_PAGES"
         "repetitions=$REPETITIONS"
@@ -246,6 +430,11 @@ write_campaign_metadata() {
         "hold_seconds=$HOLD_SECONDS"
         "lifecycle_events=$LIFECYCLE_EVENTS"
         "lifecycle_connections=$LIFECYCLE_CONNECTIONS"
+        "rate_steps=$RATE_STEPS"
+        "rate_secs=$RATE_SECS"
+        "rate_drain_secs=$RATE_DRAIN_SECS"
+        "rate_connections=$RATE_CONNECTIONS"
+        "rate_p99_ms=$RATE_P99_MS"
         "relay_cpus=$RELAY_CPUS"
         "relay_memory=$RELAY_MEMORY"
         "cache=$CACHE"
@@ -301,13 +490,22 @@ main() {
         die "the load host needs mpstat (sysstat)"
     remote_command "$LOAD_SSH" sh -c 'command -v systemd-run >/dev/null' ||
         die "the load host needs systemd-run"
+    if [[ -n $RATE_STEPS ]]; then
+        remote_command "$RELAY_SSH" test -x "$RELAY_BENCH_BIN" ||
+            die "RATE_STEPS needs wok-bench on the relay host at $RELAY_BENCH_BIN"
+    fi
     stop_load_units
-    write_campaign_metadata
 
+    local corpus_args=(--event-mix "$CORPUS_MIX")
+    if [[ $CORPUS_MIX == social ]]; then
+        corpus_args+=(--social-authors "$SOCIAL_AUTHORS")
+    fi
     load_unit_command "$BENCH_BIN" \
-        --generate-corpus-only --events "$EVENTS" --event-mix realistic \
+        --generate-corpus-only --events "$EVENTS" "${corpus_args[@]}" \
         --seed "$SEED" --base-timestamp "$BASE_TIMESTAMP" --out "$LOAD_CORPUS_DIR"
     remote_command "$LOAD_SSH" "${LOAD_UNIT_COMMAND[@]}"
+    RETAINED=$(retained_events)
+    write_campaign_metadata
     scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$LOAD_CORPUS" "$RELAY_SSH:$RELAY_CORPUS"
 
     local load_sha relay_sha

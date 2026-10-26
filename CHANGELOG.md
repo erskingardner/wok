@@ -370,6 +370,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2,000 follows and Marmot Welcomes (#226). Profiles and lists are replaced
   and deletion requests delete, and the manifest gives the number of events a
   relay keeps, which strfry 1.1.3 and Wok match on import.
+- `wok-bench` reads a social corpus (#226): `ws_query_latency`,
+  `deep_history_pagination` and `mixed_read_write` take `--event-mix
+  social`, and expect what a relay keeps of the corpus after replacements
+  and deletions, which strfry 1.1.3, Wok 0.7.0 and Wok master all match.
+  `ws_query_latency` then sends #226's archive reads: id lookups, profiles
+  and feeds of 500 followed authors, `#p` notifications and followers, and
+  `#e` threads. Every read scenario now accepts any of a second's events
+  where a `limit` cuts through it, since strfry and Wok send a second's
+  events in arrival order rather than lowest id first; a social corpus has
+  many such seconds. A relay the harness starts is checked by its export
+  rather than by import's exit status, and gets the event limits the corpus
+  needs. The read scenarios now work out expected replies before timing,
+  time each REQ to its EOSE, and leave reply checks out of throughput. The
+  harness streams the corpus and keeps about 250 bytes of each event, so a
+  50M-event corpus needs about 13 GB rather than 285 GB, and a historical
+  REQ may take 120 s rather than 10 s to reach its EOSE.
 - `scripts/benchmark-qualify.sh` checks that two benchmark hosts are fit to
   measure on (#226). It records their hardware, and measures sync-write
   latency and random reads on the relay's database filesystem, the network
@@ -405,6 +421,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself. Background publishers now also send
   `X-Forwarded-For`, and `--clients-per-address 0` turns it off for them as
   for clients.
+- `scripts/benchmark-campaign.sh` can import the social corpus
+  (`CORPUS_MIX=social`) and measure publication capacity (#226). With
+  `RATE_STEPS`, each relay publishes at fixed rates that rise step by step
+  until one misses its targets: everything sent on time, accepted and
+  answered within `RATE_P99_MS`. The last step that met them is recorded as
+  the relay's capacity. Once the relay stops, every step's outcome log is
+  reconciled with its exported database, and a lost write or a stored
+  refusal fails the campaign. The query phases read the social corpus too.
+- `wok-bench --scenario nip77_catchup` measures NIP-77 catch-up against a
+  relay that holds a corpus (#226): an archive mirror syncing the corpus in
+  time windows, or a Marmot app syncing each group's 445 messages at start.
+  The client holds all but the newest or a random share of the events, runs
+  the NEG-MSG rounds, then fetches what it lacks. It reports rounds, bytes
+  each way, time to reconcile and to fetch, and events per second, with many
+  syncs at once if asked, and fails when the relay names an event the client
+  does not lack, misses one it does, or returns one altered. It runs against
+  strfry 1.1.3, Wok 0.7.0 and Wok master.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,

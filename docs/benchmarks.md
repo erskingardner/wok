@@ -612,6 +612,38 @@ Run the same command against one clean relay at a time, changing only the URL
 and label. Reset the relay database between Wok and strfry campaigns and
 preserve the result directories.
 
+### Qualifying the hosts
+
+Before a campaign, and at the start of each day of runs,
+`scripts/benchmark-qualify.sh` checks that the relay and load hosts are fit to
+measure on. Run it from the operator host while both hosts are idle. With the
+default durations it takes about nine minutes:
+
+```bash
+RELAY_SSH=root@RELAY LOAD_SSH=root@LOAD RELAY_HOST=10.0.0.2 \
+  scripts/benchmark-qualify.sh
+```
+
+It records each host's CPU topology, NUMA layout, memory, disks, root
+filesystem, transparent huge pages, swap and network interfaces. Then it
+measures:
+
+- on the relay's database filesystem (`DISK_DIR`, default
+  `/var/lib/relay-bench/qualify`, removed afterwards): 4 KiB writes with
+  `fdatasync`, which every LMDB commit waits on, and 4 KiB direct random reads
+  at depth 1 and 4×32;
+- between the hosts, from the load host to `RELAY_HOST`: ping, and iperf3 with
+  1 and 8 streams each way on port 5299;
+- on each host: steal time while every CPU is busy.
+
+`FIO_SECONDS`, `IPERF_SECONDS` and `STEAL_SECONDS` set the durations (60 each).
+`OUT` (default `qualify-<UTC time>`) receives `summary.txt` with the headline
+numbers, next to the raw fio, iperf3 and mpstat output. Set `BASELINE` to an
+earlier run's directory, and the script fails when the `fdatasync` p99 has
+moved by more than 2x since then: results from before and after do not
+compare. Both hosts need fio, iperf3, sysstat, numactl, openssl and jq, and
+the operator host needs jq.
+
 ### Reproducible two-host campaign
 
 `scripts/benchmark-campaign.sh` runs a campaign from an operator host over SSH.

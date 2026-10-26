@@ -363,6 +363,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pins the load generator, so it can run beside the relay over loopback. The
   relay and load hosts are required settings: the scripts no longer default
   to the old benchmark hosts' addresses.
+- `scripts/benchmark-qualify.sh` checks that two benchmark hosts are fit to
+  measure on (#226). It records their hardware, and measures sync-write
+  latency and random reads on the relay's database filesystem, the network
+  between the hosts, and steal time with every CPU busy. Given an earlier
+  run, it fails when the sync-write p99 has moved by more than 2x.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,

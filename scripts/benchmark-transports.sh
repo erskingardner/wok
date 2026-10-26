@@ -5,11 +5,16 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-RELAY_SSH=${RELAY_SSH:-root@62.238.59.22}
-LOAD_SSH=${LOAD_SSH:-root@62.238.50.254}
+RELAY_SSH=${RELAY_SSH:-}
+LOAD_SSH=${LOAD_SSH:-}
+# Both targets listen here, one at a time; the clients run on the relay host.
+WS_URL=${WS_URL:-}
+# Relay targets (benchmark-relay-control.sh); the Wok target's config must
+# enable the Unix socket at WOK_UNIX_SOCKET.
+WOK_TARGET=${WOK_TARGET:-wok}
+STRFRY_TARGET=${STRFRY_TARGET:-strfry}
 BENCH_BIN=${BENCH_BIN:-/opt/relay-bench/bin/wok-bench/current/wok-bench}
-WOK_UNIX_SOCKET=${WOK_UNIX_SOCKET:-/var/lib/relay-bench/wok/wok.sock}
-WS_URL=${WS_URL:-ws://10.0.0.3:7777}
+WOK_UNIX_SOCKET=${WOK_UNIX_SOCKET:-/var/lib/relay-bench/$WOK_TARGET/wok.sock}
 EVENTS=${EVENTS:-100000}
 QUERIES=${QUERIES:-400}
 DEEP_PAGES=${DEEP_PAGES:-20}
@@ -40,7 +45,6 @@ cleanup() {
     ssh "${SSH_OPTIONS[@]}" -O exit "$RELAY_SSH" >/dev/null 2>&1 || true
     ssh "${SSH_OPTIONS[@]}" -O exit "$LOAD_SSH" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
 
 remote_command() {
     local host=$1
@@ -52,8 +56,8 @@ remote_command() {
 
 target_relay() {
     case "$1" in
-        wok-ws | wok-unix) echo wok ;;
-        strfry-ws) echo strfry ;;
+        wok-ws | wok-unix) echo "$WOK_TARGET" ;;
+        strfry-ws) echo "$STRFRY_TARGET" ;;
         *) echo "unknown transport target: $1" >&2; return 2 ;;
     esac
 }
@@ -101,10 +105,10 @@ run_target() {
     local run_root=$CAMPAIGN_ROOT/runs/r${repetition}-${target}
     local server_artifacts=$run_root/server
 
-    ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" \
-        "$CONTROL_REMOTE reset-import $relay $CORPUS $EVENTS $server_artifacts"
-    ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" \
-        "$CONTROL_REMOTE start $relay $server_artifacts"
+    remote_command "$RELAY_SSH" "$CONTROL_REMOTE" prepare "$relay" "$CORPUS" "$EVENTS" \
+        "$server_artifacts" --nofile "$NOFILE_LIMIT"
+    remote_command "$RELAY_SSH" "$CONTROL_REMOTE" start "$relay" "$server_artifacts" \
+        --nofile "$NOFILE_LIMIT"
     if [[ $target == wok-unix ]]; then
         local socket_path
         printf -v socket_path '%q' "$WOK_UNIX_SOCKET"
@@ -134,14 +138,17 @@ run_target() {
             --connections "$IDLE_CONNECTIONS" --hold-seconds "$HOLD_SECONDS" || rc=1
     fi
 
-    ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" \
-        "$CONTROL_REMOTE collect-stop $relay $server_artifacts" || rc=1
+    remote_command "$RELAY_SSH" "$CONTROL_REMOTE" collect-stop "$relay" "$server_artifacts" ||
+        rc=1
     if [[ $rc -ne 0 ]]; then
         echo "transport phase failed for $target repetition $repetition" >&2
         return "$rc"
     fi
 }
 
+for name in RELAY_SSH LOAD_SSH WS_URL; do
+    [[ -n ${!name} ]] || { echo "$name is required" >&2; exit 1; }
+done
 for tool in ssh scp; do
     command -v "$tool" >/dev/null || { echo "missing local tool: $tool" >&2; exit 1; }
 done
@@ -150,9 +157,15 @@ done
     echo "EVENTS and REPETITIONS must be positive integers" >&2
     exit 1
 }
+# Only once the settings are complete: cleanup stops relays on RELAY_SSH.
+trap cleanup EXIT
+# A trapped signal would otherwise resume the script once cleanup ran.
+trap 'exit 130' INT TERM
 
+remote_command "$RELAY_SSH" mkdir -p "$(dirname -- "$CONTROL_REMOTE")"
 scp "${SSH_OPTIONS[@]}" -q "$CONTROL_LOCAL" "$RELAY_SSH:$CONTROL_REMOTE"
 remote_command "$RELAY_SSH" chmod 0755 "$CONTROL_REMOTE"
+remote_command "$RELAY_SSH" "$CONTROL_REMOTE" check "$WOK_TARGET" "$STRFRY_TARGET"
 remote_command "$RELAY_SSH" test -x "$BENCH_BIN"
 remote_command "$RELAY_SSH" test -x /usr/bin/time
 remote_command "$RELAY_SSH" test -x /usr/bin/jq
@@ -175,6 +188,8 @@ metadata=(
     "hold_seconds=$HOLD_SECONDS"
     "seed=$SEED"
     "base_timestamp=$BASE_TIMESTAMP"
+    "wok_target=$WOK_TARGET"
+    "strfry_target=$STRFRY_TARGET"
     "wok_unix_socket=$WOK_UNIX_SOCKET"
     "ws_url=$WS_URL"
 )

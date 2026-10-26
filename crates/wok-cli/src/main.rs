@@ -838,8 +838,9 @@ fn commit_import(
     Ok(deferred_tag_kind)
 }
 
-/// Postings in one transaction of an import's closing index build. In key
-/// order, a million of them dirty about 130 MB of pages.
+/// Postings in one transaction of an import's closing index build. No
+/// publication waits behind it, as one does behind the relay's steps, so it is
+/// large: a million postings in key order commit in about 1.5 s.
 const IMPORT_TAG_KIND_STEP: usize = 1_000_000;
 
 /// Build the `(tag, kind, created_at)` index that import batches left to a

@@ -593,9 +593,9 @@ pub(super) fn run_negentropy(
                     // Sent before the NEG-ERR of the sweep that closed its
                     // session reached the client, so it is not answered.
                     let swept_handle = !sessions.contains_key(&key) && swept.crossed(&key);
-                    // Whether a session answered with its NEG-MSG, or with
-                    // the NEG-ERR that closes it; `None` when none could.
-                    let answered = sessions.get_mut(&key).and_then(|session| {
+                    // Whether its session answered with its NEG-MSG, or with
+                    // the NEG-ERR that closes it; `None` when it has none.
+                    let answered = sessions.get_mut(&key).map(|session| {
                         let answered = match &mut session.view {
                             View::Memory { items, .. } if items.is_sealed() => send_vector(
                                 &conns,
@@ -623,12 +623,24 @@ pub(super) fn run_negentropy(
                                     }
                                 }
                             }
-                            View::Memory { .. } => return None,
+                            // NIP-77 has the two sides take turns, and the
+                            // relay has not yet answered the NEG-OPEN, so
+                            // this message answers nothing.
+                            View::Memory { .. } => {
+                                fail(
+                                    &conns,
+                                    &metrics,
+                                    conn_id,
+                                    sub_id.as_str(),
+                                    "invalid: NEG-MSG sent before the reply to NEG-OPEN",
+                                );
+                                false
+                            }
                         };
                         if answered {
                             session.waiting_since = Some(Instant::now());
                         }
-                        Some(answered)
+                        answered
                     });
                     match answered {
                         Some(true) => {}
@@ -1374,6 +1386,111 @@ mod tests {
             tree_refusal(Err(wok_db::DbError::msg("read failed"))),
             Some("error: synchronization visibility check failed")
         );
+    }
+
+    /// A NEG-MSG sent while its session's view is still being built, before
+    /// the reply to its NEG-OPEN, answers nothing: NIP-77 has the two sides
+    /// take turns. Its session is closed with one NEG-ERR that says so, and
+    /// no reply to the NEG-OPEN follows.
+    #[test]
+    fn a_neg_msg_before_the_reply_to_neg_open_closes_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = wok_db::EnvOptions {
+            map_size: 1 << 30,
+            ..wok_db::EnvOptions::default()
+        };
+        let env = Env::open(dir.path(), options).unwrap();
+        env.ensure_initialized().unwrap();
+        // Enough notes that a scan over them takes many timeslices.
+        let mut events: Vec<wok_db::EventToWrite> = (0..5_000u64)
+            .map(|i| {
+                let mut id = [0xCCu8; 32];
+                id[..8].copy_from_slice(&i.to_be_bytes());
+                let event = json!({
+                    "id": hex::encode(id), "pubkey": "ab".repeat(32),
+                    "created_at": 1_700_000_000 + i, "kind": 1, "tags": [],
+                    "content": "note", "sig": "00".repeat(64),
+                });
+                let parsed = wok_event::parse_and_verify_event(
+                    &event,
+                    &wok_event::EventLimits::default(),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+                wok_db::EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        cfg.relay.query_timeslice_budget_us = 1;
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let conns = conns.clone();
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        // No tree has `{"kinds":[1]}`, so its view is built in memory.
+        let open = |sub_id: &str| {
+            let filter = json!({"kinds": [1]});
+            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        let msg = |sub_id: &str| NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new(sub_id).unwrap(),
+            payload: init.clone(),
+        };
+        let err = |sub_id: &str, reason: &str| json!(["NEG-ERR", sub_id, reason]);
+
+        // The worker takes the NEG-MSG on its pass after the NEG-OPEN's,
+        // while the scan has had one timeslice.
+        tx.send(open("early")).unwrap();
+        tx.send(msg("early")).unwrap();
+        assert_eq!(
+            next(&mut out_rx),
+            err(
+                "early",
+                "invalid: NEG-MSG sent before the reply to NEG-OPEN"
+            )
+        );
+        tx.send(msg("early")).unwrap();
+        assert_eq!(
+            next(&mut out_rx),
+            err("early", "closed: unknown subscription handle")
+        );
+        // Scans take timeslices in turn, so a reply to "early" would come
+        // before the reply to this one.
+        tx.send(open("later")).unwrap();
+        let reply = next(&mut out_rx);
+        assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!("later")));
+        // Sent after the reply, a NEG-MSG is answered.
+        tx.send(msg("later")).unwrap();
+        let reply = next(&mut out_rx);
+        assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!("later")));
+        drop(tx);
+        worker.join().unwrap();
+        assert!(out_rx.try_recv().is_err(), "a reply to the closed session");
     }
 
     /// A reload that made AUTH unusable ended every login, so the sessions

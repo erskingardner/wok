@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CONTROL = ROOT/'scripts/benchmark-relay-control.sh'
 CAMPAIGN = ROOT/'scripts/benchmark-campaign.sh'
+TRANSPORTS = ROOT/'scripts/benchmark-transports.sh'
 
 
 def bash(script, body, *args, env=None):
@@ -79,6 +81,7 @@ METRICS_URL=http://10.0.0.2:7777/metrics
             'port too large': self.valid(PORT='70000'),
             'no port': self.valid(PORT=None),
             'user': self.valid(USER='Root;rm'),
+            'inline comment': self.valid(KIND='wok   # wok or strfry'),
         }
         for case, text in cases.items():
             with self.subTest(case=case):
@@ -86,6 +89,73 @@ METRICS_URL=http://10.0.0.2:7777/metrics
                 result = self.control('load_target target')
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('benchmark-relay-control:', result.stderr)
+
+    def documented_examples(self):
+        docs = (ROOT/'docs/benchmarks.md').read_text()
+        block = re.search(r'Each target is a file on the relay host,.*?```sh\n(.*?)```', docs, re.S)
+        header = re.search(r'# Each relay under test.*?\n#\n(.*?)\n#\n', CONTROL.read_text(), re.S)
+        lines = [line.removeprefix('#   ') for line in header.group(1).splitlines()]
+        return {'docs': block.group(1), 'script header': '\n'.join(lines) + '\n'}
+
+    def test_documented_target_files_parse(self):
+        for source, text in self.documented_examples().items():
+            with self.subTest(source=source):
+                text = re.sub(r'(?m)^BINARY=.*$', f'BINARY={self.binary}', text)
+                text = re.sub(r'(?m)^CONFIG=.*$', f'CONFIG={self.config}', text)
+                self.write_target('wok-master', text)
+                result = self.control(
+                    'load_target wok-master; printf "%s\\n" "$KIND" "$PORT" "$METRICS_URL" '
+                    '"$SOURCE_CHECKOUT" "$SERVICE_USER"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [
+                    'wok', '7777', 'http://10.0.0.2:7777/metrics',
+                    '/opt/relay-bench/src/wok-master', 'relay-bench'])
+
+    def test_database_setting_is_read_from_the_config(self):
+        db = f'{self.prefix}/var/lib/relay-bench/wok/db'
+        other = f'{self.prefix}/var/lib/relay-bench/other/db'
+        wok = {
+            'table': (f'[database]\npath = "{db}"\n', True),
+            'trailing slash and comment': (f'[ database ]\npath = "{db}/"  # here\n', True),
+            'root dotted key': (f"database.path = '{db}'\n", True),
+            'socket path in a later table': (
+                f'[database]\npath = "{db}"\n\n[relay.unix]\npath = "{db}/../wok.sock"\n', True),
+            'expected path only in a comment': (
+                f'# path = "{db}"\n[database]\npath = "{other}"\n', False),
+            'commented out': (f'[database]\n# path = "{db}"\n', False),
+            'path in another table': (f'[relay.unix]\npath = "{db}"\n', False),
+            'relative': ('[database]\npath = "./db"\n', False),
+        }
+        strfry = {
+            'top level': (f'db = "{db}/"\nrelay {{\n    port = 7777\n}}\n', True),
+            'only in a block': (f'db = "./strfry-db/"\nrelay {{\n    db = "{db}"\n}}\n', False),
+            'commented out': (f'# db = "{db}/"\ndb = "{other}/"\n', False),
+        }
+        for kind, cases in [('wok', wok), ('strfry', strfry)]:
+            for case, (config, ok) in cases.items():
+                with self.subTest(kind=kind, case=case):
+                    self.config.write_text(config)
+                    self.write_target('wok', self.valid(KIND=kind))
+                    result = self.control('load_target wok; assert_db_config')
+                    self.assertEqual(result.returncode == 0, ok, result.stderr)
+
+    def test_memory_sizes_and_effective_cap(self):
+        for size, expected in [('64G', 68719476736), ('512M', 536870912), ('1T', 1 << 40),
+                               ('2K', 2048), ('4096', 4096)]:
+            with self.subTest(size=size):
+                self.assertEqual(self.control('memory_bytes "$1"', size).stdout.strip(),
+                                 str(expected))
+        cgroups = self.prefix/'cgroup'
+        unit = cgroups/'relay.slice/relay-bench.slice/relay-bench-target-wok.service'
+        unit.mkdir(parents=True)
+        (cgroups/'memory.max').write_text('1\n')
+        effective = 'effective_memory_max "$1" "$2"'
+        self.assertEqual(self.control(effective, unit, cgroups).stdout.strip(), 'max')
+        (unit/'memory.max').write_text('68719476736\n')
+        (unit.parent/'memory.max').write_text('max\n')
+        self.assertEqual(self.control(effective, unit, cgroups).stdout.strip(), '68719476736')
+        (unit.parent.parent/'memory.max').write_text('8589934592\n')
+        self.assertEqual(self.control(effective, unit, cgroups).stdout.strip(), '8589934592')
 
     def test_rejects_target_names(self):
         for name in ['', 'Wok', '.hidden', '-wok', 'a/b', 'snapshots', 'x' * 64]:
@@ -196,6 +266,23 @@ class CampaignSettings(unittest.TestCase):
                                     env={**os.environ, **env})
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('RELAY_SSH is required', result.stderr)
+            self.assertFalse(calls.exists())
+
+
+class TransportSettings(unittest.TestCase):
+    def test_refuses_to_contact_hosts_without_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp)/'calls'
+            for tool in ['ssh', 'scp']:
+                fake = Path(tmp)/tool
+                fake.write_text(f'#!/bin/sh\necho {tool} >> "{calls}"\nexit 1\n')
+                fake.chmod(0o755)
+            env = {**os.environ, 'RELAY_SSH': 'root@relay', 'LOAD_SSH': 'root@load',
+                   'WS_URL': '', 'PATH': f'{tmp}:{os.environ["PATH"]}'}
+            result = subprocess.run(['bash', str(TRANSPORTS)], capture_output=True, text=True,
+                                    env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('WS_URL is required', result.stderr)
             self.assertFalse(calls.exists())
 
 

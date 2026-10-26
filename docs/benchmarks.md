@@ -637,17 +637,23 @@ Each target is a file on the relay host,
 `/etc/relay-bench/targets/<name>.env`:
 
 ```sh
-KIND=wok                                    # wok or strfry
+# wok or strfry
+KIND=wok
 BINARY=/opt/relay-bench/bin/wok-master/wok
 CONFIG=/etc/relay-bench/wok-master.toml
 PORT=7777
-METRICS_URL=http://10.0.0.2:7777/metrics   # optional
-SOURCE=/opt/relay-bench/src/wok-master      # optional: records its commit
-USER=relay-bench                            # optional service account, created if missing
+# Optional: Prometheus endpoint, checkout whose commit is recorded, and
+# service account (created if missing).
+METRICS_URL=http://10.0.0.2:7777/metrics
+SOURCE=/opt/relay-bench/src/wok-master
+USER=relay-bench
 ```
 
-`CONFIG` must put the database in `/var/lib/relay-bench/<name>/db`; the
-campaign checks every target before it starts. Name targets for what they
+Comments go on their own lines. `CONFIG` must put the database in
+`/var/lib/relay-bench/<name>/db`: Wok's `[database] path`, or strfry's `db`.
+The helper reads that setting before it checks, imports into or starts a
+target, and each relay and its import can write only under its own
+`/var/lib/relay-bench/<name>`. Name targets for what they
 run, such as `strfry-1.1.3`, `wok-0.7.0` and `wok-master`. Two configurations
 of one binary, such as limits off and a preset as shipped, are two targets
 with two databases. The relay host needs systemd with cgroup v2, sysstat
@@ -666,13 +672,17 @@ and its import runs under the same limits:
   v2 the cap includes the page cache the relay reads through, so a database
   larger than the cap stays disk-bound on a host with more memory.
 - The helper records the cgroup's `cpuset.cpus.effective` and `memory.max`
-  beside each run, and fails the start when a requested limit is not in
-  effect.
+  beside each run, and fails the start unless the CPU set is the requested
+  one and the smallest `memory.max` of the unit and its parent cgroups is
+  the requested size.
 
 Every start drops the page cache first. With `CACHE=cold` (the default) the
 relay starts on an empty cache. `CACHE=warm` reads the database files inside
 the relay's unit before the relay starts, so warmed pages count against its
-cap; raise `READY_TIMEOUT` (seconds, default 120) for a large database.
+cap; raise `READY_TIMEOUT` (seconds, default 120) for a large database. A
+warm start fails when the database is at least `RELAY_MEMORY`, or when the
+unit's page cache is smaller than the database once the relay listens: a
+database larger than the cap can only be measured cold.
 
 With `SNAPSHOTS=1` (the default), a target's first import is copied to
 `/var/lib/relay-bench/snapshots/<name>`, reflinked where the filesystem

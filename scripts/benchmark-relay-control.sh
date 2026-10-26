@@ -4,18 +4,23 @@
 # Each relay under test is a named target, described by
 # /etc/relay-bench/targets/<name>.env:
 #
-#   KIND=wok                  # wok or strfry
+#   # wok or strfry
+#   KIND=wok
 #   BINARY=/opt/relay-bench/bin/wok-master/wok
 #   CONFIG=/etc/relay-bench/wok-master.toml
 #   PORT=7777
-#   METRICS_URL=http://10.0.0.2:7777/metrics   # optional
-#   SOURCE=/opt/relay-bench/src/wok-master      # optional, records the commit
-#   USER=relay-bench          # optional service account, created if missing
+#   # Optional: Prometheus endpoint, checkout whose commit is recorded, and
+#   # service account (created if missing).
+#   METRICS_URL=http://10.0.0.2:7777/metrics
+#   SOURCE=/opt/relay-bench/src/wok-master
+#   USER=relay-bench
 #
-# CONFIG must put the database in /var/lib/relay-bench/<name>/db. The relay
-# runs as the transient unit relay-bench-target-<name>.service, so --cpus
-# (AllowedCPUs) and --memory (MemoryMax, which under cgroup v2 includes the
-# page cache the relay reads through) bound the relay process alone.
+# Comments go on their own lines. CONFIG must put the database in
+# /var/lib/relay-bench/<name>/db: Wok's [database] path, or strfry's db. The
+# relay runs as the transient unit relay-bench-target-<name>.service, so
+# --cpus (AllowedCPUs) and --memory (MemoryMax, which under cgroup v2
+# includes the page cache the relay reads through) bound the relay process
+# alone, and it can write only under its own /var/lib/relay-bench/<name>.
 set -euo pipefail
 
 # Tests relocate every root under RELAY_BENCH_PREFIX.
@@ -84,7 +89,9 @@ load_target() {
         [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
         [[ $line =~ ^([A-Z_]+)=(.*)$ ]] || die "$TARGET_FILE: expected KEY=VALUE: $line"
         key=${BASH_REMATCH[1]}
-        value=$(unquote "${BASH_REMATCH[2]}")
+        value=${BASH_REMATCH[2]}
+        [[ $value =~ [[:space:]]# ]] && die "$TARGET_FILE: comments go on their own line: $line"
+        value=$(unquote "$value")
         case $key in
             KIND) KIND=$value ;;
             BINARY) BINARY=$value ;;
@@ -154,6 +161,9 @@ unit_properties() {
         -p MemoryAccounting=yes
         -p IOAccounting=yes
         -p "LimitNOFILE=$RUN_NOFILE"
+        # Whatever CONFIG says, the relay writes only its own target's files.
+        -p ProtectSystem=strict
+        -p "ReadWritePaths=$DB_ROOT"
     )
     if [[ -n $RUN_CPUS ]]; then
         UNIT_PROPS+=(-p "AllowedCPUs=$RUN_CPUS")
@@ -161,6 +171,86 @@ unit_properties() {
     if [[ -n $RUN_MEMORY ]]; then
         UNIT_PROPS+=(-p "MemoryMax=$RUN_MEMORY" -p MemorySwapMax=0)
     fi
+}
+
+# Prints the database path CONFIG sets: Wok's TOML [database] path (or a
+# root database.path), or strfry's top-level db. Comments, other tables and
+# nested blocks are skipped; a later setting wins, as it would for the relay.
+config_db_path() {
+    local config=$1
+    local line table='' depth=0 found='' opens closes
+    local key='[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$'
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%%#*}
+        if [[ $KIND == wok ]]; then
+            if [[ $line =~ ^[[:space:]]*\[+[[:space:]]*([^]]*[^][:space:]])[[:space:]]*\]+[[:space:]]*$ ]]; then
+                table=${BASH_REMATCH[1]}
+            elif [[ $table == database && $line =~ ^[[:space:]]*path$key ]] ||
+                [[ -z $table && $line =~ ^[[:space:]]*database\.path$key ]]; then
+                found=$(unquote "${BASH_REMATCH[1]}")
+            fi
+        else
+            if [[ $depth -eq 0 && $line =~ ^[[:space:]]*db[[:space:]]*[=:][[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]]; then
+                found=$(unquote "${BASH_REMATCH[1]}")
+            fi
+            opens=${line//[^\{]/}
+            closes=${line//[^\}]/}
+            depth=$((depth + ${#opens} - ${#closes}))
+        fi
+    done <"$config"
+    printf '%s' "$found"
+}
+
+# Fails unless CONFIG puts the database where this helper resets, snapshots
+# and measures it.
+assert_db_config() {
+    local path
+    path=$(config_db_path "$CONFIG")
+    while [[ $path == */ ]]; do
+        path=${path%/}
+    done
+    [[ $path == "$DB_ROOT/db" ]] ||
+        die "$CONFIG puts $TARGET's database in '${path:-its default}', not $DB_ROOT/db"
+}
+
+# Bytes in a size such as 64G, with systemd's 1024-based suffixes.
+memory_bytes() {
+    [[ $1 =~ ^([1-9][0-9]*)([KMGT]?)$ ]] || die "not a size: $1"
+    local bytes=${BASH_REMATCH[1]}
+    case ${BASH_REMATCH[2]} in
+        K) bytes=$((bytes << 10)) ;;
+        M) bytes=$((bytes << 20)) ;;
+        G) bytes=$((bytes << 30)) ;;
+        T) bytes=$((bytes << 40)) ;;
+    esac
+    echo "$bytes"
+}
+
+# Prints the smallest memory.max of a cgroup and its ancestors below ROOT,
+# or max when none is set.
+effective_memory_max() {
+    local dir=$1
+    local root=$2
+    local value lowest=max
+    while [[ $dir == "$root"/* ]]; do
+        if [[ -f $dir/memory.max ]]; then
+            value=$(<"$dir/memory.max")
+            if [[ $value != max ]] && [[ $lowest == max || $value -lt $lowest ]]; then
+                lowest=$value
+            fi
+        fi
+        dir=${dir%/*}
+    done
+    echo "$lowest"
+}
+
+# Apparent size of the database files a warm start reads.
+database_bytes() {
+    local file total=0
+    for file in "$DB_ROOT"/db/*.mdb; do
+        total=$((total + $(stat -c %s -- "$file")))
+    done
+    echo "$total"
 }
 
 assert_benchmark_path() {
@@ -294,6 +384,7 @@ prepare() {
     parse_run_options "snapshot cpus memory nofile" "$@"
     assert_benchmark_path "$corpus"
     assert_benchmark_path "$artifacts"
+    assert_db_config
     [[ -f $corpus && $expected =~ ^[1-9][0-9]*$ ]] || die "invalid corpus or expected event count"
 
     stop_all
@@ -390,9 +481,11 @@ expand_cpu_list() {
     done | sort -n -u | paste -s -d ' ' -
 }
 
-# Records the cgroup limits the relay actually runs under, and fails when a
-# requested cap is not in effect. systemd enables the cpuset controller for
-# the unit only when it sets AllowedCPUs.
+# Records the cgroup limits the relay actually runs under, and what a warm
+# start left cached, and fails when either differs from what was requested.
+# systemd enables the cpuset controller for the unit only when it sets
+# AllowedCPUs; cpuset.cpus.effective already accounts for ancestors, while
+# memory.max does not.
 check_limits() {
     local artifacts=$1
     local cgroup
@@ -405,14 +498,29 @@ check_limits() {
     if [[ -f $cgroup/memory.max ]]; then
         memory=$(<"$cgroup/memory.max")
     fi
-    printf 'cpuset.cpus.effective=%s\nmemory.max=%s\n' "$cpus" "$memory" \
-        >"$artifacts/cgroup-limits.txt"
-    if [[ -n $RUN_MEMORY && $memory == max ]]; then
-        stop_and_die "$UNIT runs without the requested memory cap $RUN_MEMORY"
+    local effective cached
+    effective=$(effective_memory_max "$cgroup" /sys/fs/cgroup)
+    cached=$(awk '$1 == "file" { print $2 }' "$cgroup/memory.stat" 2>/dev/null)
+    cached=${cached:-0}
+    printf 'cpuset.cpus.effective=%s\nmemory.max=%s\nmemory.max.effective=%s\n' \
+        "$cpus" "$memory" "$effective" >"$artifacts/cgroup-limits.txt"
+    printf 'database_bytes=%s\nmemory.stat.file=%s\n' "$(database_bytes)" "$cached" \
+        >"$artifacts/cache-at-start.txt"
+    if [[ -n $RUN_MEMORY ]]; then
+        local page wanted
+        page=$(getconf PAGESIZE)
+        wanted=$(memory_bytes "$RUN_MEMORY")
+        # The kernel rounds memory.max down to whole pages.
+        wanted=$((wanted / page * page))
+        [[ $effective == "$wanted" ]] ||
+            stop_and_die "$UNIT runs under a memory cap of $effective bytes, not the requested $RUN_MEMORY ($wanted)"
     fi
     if [[ -n $RUN_CPUS && ( $cpus == unrestricted ||
         $(expand_cpu_list "$cpus") != "$(expand_cpu_list "$RUN_CPUS")" ) ]]; then
         stop_and_die "$UNIT runs on CPUs $cpus, not the requested $RUN_CPUS"
+    fi
+    if [[ $RUN_CACHE == warm && $cached -lt $(database_bytes) ]]; then
+        stop_and_die "$UNIT holds $cached bytes of page cache, less than its $(database_bytes)-byte database; it is not warm"
     fi
 }
 
@@ -424,6 +532,11 @@ start_measurement() {
     parse_run_options "cache cpus memory nofile ready-timeout" "$@"
     assert_benchmark_path "$artifacts"
     [[ -s $DB_ROOT/db/data.mdb ]] || die "$TARGET has no database; run prepare first"
+    assert_db_config
+    if [[ $RUN_CACHE == warm && -n $RUN_MEMORY ]] &&
+        (($(database_bytes) >= $(memory_bytes "$RUN_MEMORY"))); then
+        die "the $(database_bytes)-byte database does not fit in --memory $RUN_MEMORY; it cannot start warm"
+    fi
     install -d -m 0750 "$artifacts"
     stop_all
     systemctl reset-failed "$UNIT" 2>/dev/null || true
@@ -507,8 +620,7 @@ check_targets() {
     local target
     for target in "$@"; do
         load_target "$target"
-        grep -qF -- "$DB_ROOT/db" "$CONFIG" ||
-            die "$CONFIG does not put $TARGET's database in $DB_ROOT/db"
+        assert_db_config
         printf '%s kind=%s port=%s binary=%s config=%s\n' \
             "$TARGET" "$KIND" "$PORT" "$BINARY" "$CONFIG"
     done

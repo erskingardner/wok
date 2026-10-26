@@ -45,7 +45,6 @@ cleanup() {
     ssh "${SSH_OPTIONS[@]}" -O exit "$RELAY_SSH" >/dev/null 2>&1 || true
     ssh "${SSH_OPTIONS[@]}" -O exit "$LOAD_SSH" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
 
 remote_command() {
     local host=$1
@@ -158,6 +157,8 @@ done
     echo "EVENTS and REPETITIONS must be positive integers" >&2
     exit 1
 }
+# Only once the settings are complete: cleanup stops relays on RELAY_SSH.
+trap cleanup EXIT INT TERM
 
 remote_command "$RELAY_SSH" mkdir -p "$(dirname -- "$CONTROL_REMOTE")"
 scp "${SSH_OPTIONS[@]}" -q "$CONTROL_LOCAL" "$RELAY_SSH:$CONTROL_REMOTE"

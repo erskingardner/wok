@@ -710,12 +710,13 @@ fn cmd_import(
     let mut total_written = 0u64;
     let mut total_rejected = 0u64;
     let mut total_dups = 0u64;
+    let mut deferred_tag_kind = false;
     for batch in batches {
         let mut batch = batch?;
         total_processed += batch.lines;
         total_rejected += batch.rejected;
         if !batch.events.is_empty() {
-            commit_import(
+            deferred_tag_kind |= commit_import(
                 cfg,
                 &env,
                 &mut batch.events,
@@ -731,6 +732,9 @@ fn cmd_import(
     reader
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    if deferred_tag_kind {
+        build_tag_kind_index(&env)?;
+    }
     tracing::info!(
         "Done. Processed {total_processed} lines. {total_written} added, {total_rejected} rejected, {total_dups} dups"
     );
@@ -856,6 +860,9 @@ fn parse_fried(line: &str) -> Result<(Vec<u8>, String)> {
     Ok((packed, json))
 }
 
+/// Write `batch` in one transaction. Returns whether it left its events'
+/// `(tag, kind, created_at)` postings to a key-ordered pass: it does while
+/// the index is unbuilt, a new database's included, and no pass runs.
 fn commit_import(
     cfg: &Config,
     env: &Env,
@@ -864,8 +871,9 @@ fn commit_import(
     rejected: &mut u64,
     dups: &mut u64,
     show_rejected: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let mut txn = env.begin_rw()?;
+    let deferred_tag_kind = wok_db::defer_tag_kind_postings(&mut txn)?;
     let mut sink = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
     write_events_with_policy(&mut txn, &mut sink, batch, false, &cfg.vanish_policy())?;
     txn.commit()?;
@@ -881,6 +889,63 @@ fn commit_import(
             }
         }
     }
+    Ok(deferred_tag_kind)
+}
+
+/// Build the `(tag, kind, created_at)` index that import batches left to a
+/// key-ordered pass, so that the database is complete when the import
+/// exits. Built after the load, it writes a fraction of the pages that
+/// postings in arrival order rewrite. Its steps are the relay's, and it
+/// leaves the rest to the relay's writer once another process has the
+/// database open, so a relay on it acknowledges publications as fast as
+/// during its own build. An import stopped before it ends leaves the index
+/// incomplete, and the relay's writer finishes it.
+fn build_tag_kind_index(env: &Env) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut last_log = started;
+    let mut entries = 0u64;
+    tracing::info!("Building the (tag, kind, created_at) index");
+    loop {
+        if env.open_in_another_process()? {
+            tracing::info!(
+                "Another process has the database open; a relay on it builds the rest of the (tag, kind, created_at) index in the background"
+            );
+            return Ok(());
+        }
+        let mut txn = env.begin_rw()?;
+        let step = wok_db::backfill_tag_kind_index(
+            &mut txn,
+            wok_db::TAG_KIND_STEP_ENTRIES,
+            wok_db::TAG_KIND_STEP_BUDGET,
+        )?;
+        txn.commit()?;
+        let Some(step) = step else {
+            return Ok(());
+        };
+        entries += step.entries;
+        if step.state.complete() {
+            break;
+        }
+        if last_log.elapsed() >= std::time::Duration::from_secs(10) {
+            last_log = std::time::Instant::now();
+            match step.state.bulk_pass {
+                Some(pass) => tracing::info!(
+                    "(tag, kind, created_at) index: {} of {} tag entries visited",
+                    pass.visited,
+                    step.tag_entries
+                ),
+                None => tracing::info!(
+                    "(tag, kind, created_at) index: indexed through {} of {}",
+                    step.state.indexed_through,
+                    step.state.high_water
+                ),
+            }
+        }
+    }
+    tracing::info!(
+        "Built the (tag, kind, created_at) index: {entries} entries in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -1943,6 +2008,106 @@ mod main_tests {
         let parsed =
             parse_and_verify_event(&event, &EventLimits::default(), None, true, false).unwrap();
         EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+    }
+
+    #[test]
+    fn import_builds_the_tag_kind_index_its_batches_left_out() {
+        // One author's notes, reactions and follow lists, each list
+        // replacing the one before, so that batches delete postings too.
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let events: Vec<_> = (0..40u64)
+            .map(|i| {
+                let kind = [1u64, 7, 3][i as usize % 3];
+                let mut event = json!({
+                    "created_at": 1_700_000_000 + i,
+                    "kind": kind,
+                    "tags": [["p", format!("{:064x}", i % 5)], ["e", format!("{:064x}", i % 4)]],
+                    "content": "",
+                    "pubkey": hex::encode(key.x_only_public_key().0.serialize()),
+                });
+                let id = wok_event::event_id_hash(&event).unwrap();
+                event["id"] = json!(hex::encode(id));
+                event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+                let parsed =
+                    parse_and_verify_event(&event, &EventLimits::default(), None, true, false)
+                        .unwrap();
+                EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let postings = |env: &Env| {
+            let txn = env.begin_ro().unwrap();
+            let mut postings = Vec::new();
+            txn.foreach_full(
+                env.dbis().event_tag_kind.unwrap(),
+                &[],
+                &[],
+                false,
+                |key, value| {
+                    postings.push((key.to_vec(), value.to_vec()));
+                    true
+                },
+            )
+            .unwrap();
+            postings
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            db: dir.path().join("db"),
+            ..Config::default()
+        };
+        let env = open_env(&cfg).unwrap();
+        let (mut written, mut rejected, mut duplicates) = (0, 0, 0);
+        for chunk in events.chunks(16) {
+            let deferred = commit_import(
+                &cfg,
+                &env,
+                &mut chunk.to_vec(),
+                &mut written,
+                &mut rejected,
+                &mut duplicates,
+                false,
+            )
+            .unwrap();
+            assert!(deferred);
+        }
+        assert_eq!((written, rejected, duplicates), (40, 0, 0));
+        // Stopped here, the index is incomplete and the relay finishes it.
+        let unbuilt = wok_db::tag_kind_index_state_ro(&env.begin_ro().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!((unbuilt.indexed_through, unbuilt.high_water), (0, 40));
+        build_tag_kind_index(&env).unwrap();
+        let report = check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:#?}", report.issues);
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert!(tag_kind.complete && tag_kind.stale_entries == 0);
+
+        // The same batches written as the relay writes them, posting each
+        // event's entries, give the same table, markers included.
+        let posted_dir = tempfile::tempdir().unwrap();
+        let posted = Env::open(posted_dir.path(), EnvOptions::for_tests()).unwrap();
+        posted.ensure_initialized().unwrap();
+        for chunk in events.chunks(16) {
+            let mut txn = posted.begin_rw().unwrap();
+            write_events(&mut txn, &mut NoopNegentropy, &mut chunk.to_vec(), false).unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(postings(&env), postings(&posted));
+        // A later import into the built index posts as it writes.
+        let mut later = vec![signed_event(1_800_000_000)];
+        let deferred = commit_import(
+            &cfg,
+            &env,
+            &mut later,
+            &mut written,
+            &mut rejected,
+            &mut duplicates,
+            false,
+        )
+        .unwrap();
+        assert!(!deferred);
+        assert!(wok_db::tag_kind_index_complete_ro(&env.begin_ro().unwrap()).unwrap());
     }
 
     #[test]

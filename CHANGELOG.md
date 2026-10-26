@@ -908,6 +908,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A NEG-MSG sent before the relay replied to its session's NEG-OPEN, while
+  the view built in memory is still being scanned, gets `invalid: NEG-MSG
+  sent before the reply to NEG-OPEN`, and the session and its scan close
+  (#222). NIP-77 has the client and relay take turns, so the message
+  answers nothing. **Clients see a new reason**: it got `closed: unknown
+  subscription handle`, which named the wrong cause.
 - A NEG-MSG to a session served from a negentropy tree that no longer
   proves public what it holds gets `closed: visibility changed; reopen
   synchronization`, the reason a visibility sweep gives, and the session

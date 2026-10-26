@@ -34,6 +34,9 @@ use crate::{connect_retry, read_ack, ClientConnection, EventFactory, EventMix};
 const RATE_HELD: f64 = 0.99;
 /// Acknowledged but missing events a reconciliation lists by id.
 const LISTED: usize = 20;
+/// How long a connection keeps reading once every event it sent is answered,
+/// so a repeated or malformed OK queued behind the last one still counts.
+const TAIL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -179,6 +182,8 @@ pub struct Run {
     /// or repeated an earlier OK.
     misrouted: u64,
     notices: u64,
+    /// When each connection stopped reading, by connection.
+    ended_us: Vec<u64>,
 }
 
 /// Connect and warm up every lane, then send on schedule until the last
@@ -218,6 +223,7 @@ pub async fn run(url: &str, lanes: Vec<Lane>, opts: &Options) -> Result<Run> {
         errors: Vec::new(),
         misrouted: 0,
         notices: 0,
+        ended_us: Vec::new(),
     };
     for task in tasks {
         let log = task.await.context("publisher task panicked")?;
@@ -225,6 +231,7 @@ pub async fn run(url: &str, lanes: Vec<Lane>, opts: &Options) -> Result<Run> {
         run.errors.extend(log.error);
         run.misrouted += log.misrouted;
         run.notices += log.notices;
+        run.ended_us.push(log.ended_us);
     }
     run.records.sort_unstable_by_key(|record| record.seq);
     Ok(run)
@@ -235,6 +242,7 @@ struct LaneLog {
     error: Option<String>,
     misrouted: u64,
     notices: u64,
+    ended_us: u64,
 }
 
 fn micros(duration: Duration) -> u64 {
@@ -337,32 +345,45 @@ where
         let mut error = None;
         let (mut misrouted, mut notices, mut answered) = (0u64, 0u64, 0usize);
         let mut finished: Option<(Instant, usize)> = None;
+        // When every sent event had its answer.
+        let mut settled: Option<Instant> = None;
         loop {
-            if finished.is_some_and(|(_, count)| answered >= count) {
-                break;
+            if settled.is_none() && finished.is_some_and(|(_, count)| answered >= count) {
+                settled = Some(Instant::now());
             }
+            let deadline = finished.map(|(at, _)| {
+                let drained = at + opts.drain;
+                settled.map_or(drained, |settled| drained.min(settled + TAIL))
+            });
             tokio::select! {
                 _ = done_rx.changed(), if finished.is_none() => {
                     finished = *done_rx.borrow_and_update();
                 }
-                () = until(finished.map(|(at, _)| at + opts.drain)) => break,
+                () = until(deadline) => break,
                 message = stream.next() => {
+                    // Once every sent event is answered, a close loses nothing.
                     let text = match message {
                         Some(Ok(Message::Text(text))) => text,
                         Some(Ok(Message::Close(frame))) => {
                             let why = frame.map_or_else(String::new, |frame| {
                                 format!(" ({} {})", u16::from(frame.code), frame.reason)
                             });
-                            error = Some(failure(conn, start, &format!("relay closed the connection{why}")));
+                            if settled.is_none() {
+                                error = Some(failure(conn, start, &format!("relay closed the connection{why}")));
+                            }
                             break;
                         }
                         Some(Ok(_)) => continue,
                         Some(Err(e)) => {
-                            error = Some(failure(conn, start, &e.to_string()));
+                            if settled.is_none() {
+                                error = Some(failure(conn, start, &e.to_string()));
+                            }
                             break;
                         }
                         None => {
-                            error = Some(failure(conn, start, "relay closed the connection"));
+                            if settled.is_none() {
+                                error = Some(failure(conn, start, "relay closed the connection"));
+                            }
                             break;
                         }
                     };
@@ -399,10 +420,10 @@ where
                 }
             }
         }
-        (error, misrouted, notices)
+        (error, misrouted, notices, since(start))
     };
 
-    let (send_error, (receive_error, misrouted, notices)) = tokio::join!(send, receive);
+    let (send_error, (receive_error, misrouted, notices, ended_us)) = tokio::join!(send, receive);
     let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
     let records = records
         .into_iter()
@@ -421,6 +442,7 @@ where
         error: receive_error.or(send_error),
         misrouted,
         notices,
+        ended_us,
     }
 }
 
@@ -463,7 +485,9 @@ pub struct Report {
     pub misrouted: u64,
     pub notices: u64,
     pub connection_errors: Vec<String>,
-    /// From when an event was due to its accepting OK.
+    /// From when an event was due to its accepting OK. A sent event never
+    /// answered counts until its connection stopped reading, a lower bound;
+    /// refusals are left out.
     pub ok_p50_ms: f64,
     pub ok_p99_ms: f64,
     pub ok_max_ms: f64,
@@ -518,7 +542,8 @@ impl Report {
 }
 
 /// Summarize a run. Accepting OKs' latencies, in microseconds from when
-/// each event was due, go into `hist`.
+/// each event was due, go into `hist`, with every sent event never answered
+/// at the time its connection stopped reading.
 pub fn report(run: &Run, opts: &Options, log: &Path, hist: &mut Histogram<u64>) -> Result<Report> {
     let mut lag = Histogram::<u64>::new(3)?;
     let mut report = Report {
@@ -563,7 +588,11 @@ pub fn report(run: &Run, opts: &Options, log: &Path, hist: &mut Histogram<u64>) 
                 hist.record(reply.at_us.saturating_sub(record.due_us).max(1))?;
             }
             Some(reply) => *report.refused.entry(prefix(&reply.message)).or_default() += 1,
-            None if record.sent_us.is_some() => report.no_reply += 1,
+            None if record.sent_us.is_some() => {
+                report.no_reply += 1;
+                let ended = run.ended_us.get(record.conn).copied().unwrap_or_default();
+                hist.record(ended.saturating_sub(record.due_us).max(1))?;
+            }
             None => {}
         }
     }
@@ -575,7 +604,7 @@ pub fn report(run: &Run, opts: &Options, log: &Path, hist: &mut Histogram<u64>) 
         report.send_lag_p99_ms = lag.value_at_percentile(99.0) as f64 / 1000.0;
         report.send_lag_max_ms = lag.max() as f64 / 1000.0;
     }
-    if report.accepted > 0 {
+    if !hist.is_empty() {
         report.ok_p50_ms = hist.value_at_percentile(50.0) as f64 / 1000.0;
         report.ok_p99_ms = hist.value_at_percentile(99.0) as f64 / 1000.0;
         report.ok_max_ms = hist.max() as f64 / 1000.0;
@@ -741,7 +770,7 @@ pub fn reconcile_files(log: &Path, export: &Path) -> Result<Reconciliation> {
 pub fn render_markdown(report: &Report, relay: &str, repetition: u32) -> String {
     let mut s = format!("\n### Fixed-rate publication: {relay}, repetition {repetition}\n\n");
     s.push_str(&format!(
-        "{} events due at {}/s for {} s over {} connection(s). Sent {} at {:.1}/s ({}); send lag p99 {:.2} ms, max {:.1} ms. Accepted {} at {:.1}/s over the schedule, or to the last accepting OK if later. Latency from when an event was due to its accepting OK: p50 {:.2} ms, p99 {:.2} ms, max {:.1} ms. Outcome log: `{}`.\n\n",
+        "{} events due at {}/s for {} s over {} connection(s). Sent {} at {:.1}/s ({}); send lag p99 {:.2} ms, max {:.1} ms. Accepted {} at {:.1}/s over the schedule, or to the last accepting OK if later. Latency from when an event was due to its accepting OK, an unanswered event counting until the drain ended: p50 {:.2} ms, p99 {:.2} ms, max {:.1} ms. Outcome log: `{}`.\n\n",
         report.events,
         report.intended_rate,
         report.secs,
@@ -1099,6 +1128,7 @@ mod tests {
             errors: Vec::new(),
             misrouted: 0,
             notices: 0,
+            ended_us: vec![3_000_000],
         };
         let summarize = |run: &Run| {
             report(
@@ -1129,6 +1159,74 @@ mod tests {
             at_us: due_us + 1_000_000,
         }));
         assert!((late.accepted_rate - 100.0 / 1.99).abs() < 0.1, "{late:#?}");
+    }
+
+    #[test]
+    fn unanswered_events_count_in_the_latency_until_the_drain_ended() {
+        let opts = options(100.0, 1.0, 1);
+        let run = Run {
+            records: (0..100)
+                .map(|seq| {
+                    let due_us = seq * 10_000;
+                    Record {
+                        seq,
+                        conn: 0,
+                        id: [seq as u8; 32],
+                        kind: 1,
+                        due_us,
+                        sent_us: Some(due_us + 50),
+                        // The last two are never answered.
+                        reply: (seq < 98).then(|| Reply {
+                            accepted: true,
+                            message: String::new(),
+                            at_us: due_us + 10_000,
+                        }),
+                    }
+                })
+                .collect(),
+            errors: Vec::new(),
+            misrouted: 0,
+            notices: 0,
+            ended_us: vec![2_000_000],
+        };
+        let mut hist = Histogram::new(3).unwrap();
+        let report = report(&run, &opts, Path::new("unused"), &mut hist).unwrap();
+        assert_eq!((report.accepted, report.no_reply), (98, 2));
+        assert!((report.ok_p50_ms - 10.0).abs() < 0.1, "{report:#?}");
+        // 2 s less the last due time, 0.99 s.
+        assert!((report.ok_p99_ms - 1010.0).abs() < 2.0, "{report:#?}");
+        assert!(report.ok_max_ms >= 1020.0, "{report:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_final_ok_is_still_caught() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        // OK the warm-up and twenty events, the last one twice.
+        let relay = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut n = 0;
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                let ok = json!(["OK", frame[1]["id"], true, ""]).to_string();
+                for _ in 0..if n == 20 { 2 } else { 1 } {
+                    socket.send(Message::Text(ok.clone().into())).await.unwrap();
+                }
+                n += 1;
+            }
+        });
+        let opts = options(100.0, 0.2, 1);
+        let run = run(&url, plan(&opts).unwrap(), &opts).await.unwrap();
+        relay.await.unwrap();
+        let mut hist = Histogram::new(3).unwrap();
+        let report = report(&run, &opts, Path::new("unused"), &mut hist).unwrap();
+        assert_eq!((report.accepted, report.misrouted), (20, 1), "{report:#?}");
+        assert!(report.connection_errors.is_empty(), "{report:#?}");
+        assert!(!report.ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

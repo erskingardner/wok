@@ -140,7 +140,11 @@ The options are `--send-rate`, events per second over all connections
 send (default 10).
 
 Latency runs from when an event was due to its accepting OK, so time an event
-waited behind a slow relay counts. The fixed-rate table also gives the
+waited behind a slow relay counts. A sent event never answered counts until
+the drain ended, so with unanswered events the percentiles are lower bounds;
+refusals are left out. Once every event a connection sent is answered, it
+reads for another half second, so a repeated or malformed OK queued behind the
+last one still fails the trial. The fixed-rate table also gives the
 achieved send rate; the send lag, from when an event was due to the end of its
 send; and the accepted rate, which is the trial's throughput. Both rates
 divide by the schedule's length, or by the time to the last send or the last

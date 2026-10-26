@@ -397,6 +397,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acknowledged but lost, refused (counted by reason), or unanswered and then
   stored or not. A relay the harness starts is reconciled when the run ends,
   and a lost write or a stored refusal fails the trial.
+- `wok-bench --scenario nip77_catchup` measures NIP-77 catch-up against a
+  relay that holds a corpus (#226): an archive mirror syncing the corpus in
+  time windows, or a Marmot app syncing each group's 445 messages at start.
+  The client holds all but the newest or a random share of the events, runs
+  the NEG-MSG rounds, then fetches what it lacks. It reports rounds, bytes
+  each way, time to reconcile and to fetch, and events per second, with many
+  syncs at once if asked, and fails when the relay names an event the client
+  does not lack, misses one it does, or returns one altered. It runs against
+  strfry 1.1.3, Wok 0.7.0 and Wok master.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,

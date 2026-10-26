@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod author_kinds;
+mod catchup;
 mod clients;
 mod corpus;
 mod live;
@@ -174,7 +175,7 @@ struct Args {
     /// Offer permessage-deflate from --scenario clients connections.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     client_deflate: bool,
-    /// Fail --scenario clients when any request is refused.
+    /// Fail --scenario clients or nip77_catchup when any request is refused.
     #[arg(long)]
     expect_no_refusals: bool,
     /// Events per history burst in --scenario ws_transport.
@@ -245,6 +246,32 @@ struct Args {
     /// Seconds after which a shape stops its warm runs (it keeps at least 3).
     #[arg(long, default_value_t = 30)]
     shape_secs: u64,
+    /// What --scenario nip77_catchup syncs: `all`, the whole corpus in
+    /// --sync-windows time windows, or `groups`, one kind 445 `#h` filter per
+    /// Marmot group in the corpus.
+    #[arg(long, value_enum, default_value_t = catchup::Filters::All)]
+    sync_filter: catchup::Filters,
+    /// Time windows of about equal event counts, one sync each, that
+    /// `--sync-filter all` splits the corpus into.
+    #[arg(long, default_value_t = 1)]
+    sync_windows: usize,
+    /// Which matched events the nip77_catchup client lacks: the newest, or a
+    /// random set.
+    #[arg(long, value_enum, default_value_t = catchup::Missing::Newest)]
+    sync_missing: catchup::Missing,
+    /// Percent of the matched events the nip77_catchup client lacks.
+    #[arg(long, default_value_t = 10.0)]
+    sync_missing_pct: f64,
+    /// NIP-77 syncs in flight at once.
+    #[arg(long, default_value_t = 1)]
+    sync_concurrency: usize,
+    /// NIP-77 syncs in flight on one connection (MDK runs up to 8).
+    #[arg(long, default_value_t = 1)]
+    sync_per_conn: usize,
+    /// `limit` in every NEG-OPEN filter. Default: MDK's 16,385 for
+    /// `--sync-filter groups`, none for `all`.
+    #[arg(long)]
+    sync_limit: Option<u64>,
 }
 
 impl Args {
@@ -300,6 +327,8 @@ struct Trial {
     tag_kinds: Option<tag_kinds::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     publish_rate: Option<rate::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nip77_catchup: Option<catchup::Report>,
 }
 
 #[derive(Serialize)]
@@ -445,6 +474,7 @@ fn main() -> Result<()> {
         "live_subscriptions",
         "author_kinds",
         "tag_kinds",
+        "nip77_catchup",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -481,16 +511,20 @@ fn main() -> Result<()> {
                     | "mixed_read_write"
                     | "live_fanout"
                     | "idle_connections"
+                    | "nip77_catchup"
             )
         })
     {
         anyhow::bail!(
-            "external targets support scaled and fixed-rate publication, query, mixed read/write, fanout, and idle-connection scenarios"
+            "external targets support scaled and fixed-rate publication, query, mixed read/write, fanout, idle-connection and NIP-77 catch-up scenarios"
         );
     }
 
     if args.target_unix.is_some() && scenarios.contains(&"ws_publish_rate") {
         anyhow::bail!("--scenario ws_publish_rate publishes over WebSocket only");
+    }
+    if args.target_unix.is_some() && scenarios.contains(&"nip77_catchup") {
+        anyhow::bail!("--scenario nip77_catchup syncs over WebSocket only");
     }
 
     if args.event_mix == EventMix::Lifecycle
@@ -729,6 +763,7 @@ fn run_trial(
     let mut author_kinds_report = None;
     let mut tag_kinds_report = None;
     let mut rate_report = None;
+    let mut catchup_report = None;
 
     let bin = if args.has_external_target() || scenario == "monitor_index" {
         // monitor_index runs the index compiled into this binary.
@@ -1015,6 +1050,23 @@ fn run_trial(
                 }
             }
         }
+        "nip77_catchup" => {
+            match catchup_trial(rt, args, target, corpus_path, workload_seed, &mut hist) {
+                Ok(report) => {
+                    throughput = report.events_per_s;
+                    errors += report.errors;
+                    mismatches += report.mismatches;
+                    ok = report.ok();
+                    notes = report.notes();
+                    catchup_report = Some(report);
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e:#}");
+                }
+            }
+        }
         "idle_connections" => {
             match idle_connections_trial(
                 rt,
@@ -1186,6 +1238,7 @@ fn run_trial(
         author_kinds: author_kinds_report,
         tag_kinds: tag_kinds_report,
         publish_rate: rate_report,
+        nip77_catchup: catchup_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1230,6 +1283,7 @@ fn failed_trial(
         author_kinds: None,
         tag_kinds: None,
         publish_rate: None,
+        nip77_catchup: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -2876,6 +2930,50 @@ fn cold_start_trial(
     Ok(ms)
 }
 
+/// NIP-77 catch-up against the target. The target must hold the corpus: a
+/// relay the harness starts imports it first; a remote one must have been
+/// loaded with it and nothing else.
+fn catchup_trial(
+    rt: &tokio::runtime::Runtime,
+    args: &Args,
+    target: RelayTarget<'_>,
+    corpus_path: &Path,
+    seed: u64,
+    hist: &mut Histogram<u64>,
+) -> Result<catchup::Report> {
+    let opts = catchup::Options {
+        filters: args.sync_filter,
+        windows: args.sync_windows,
+        missing: args.sync_missing,
+        missing_pct: args.sync_missing_pct,
+        concurrency: args.sync_concurrency,
+        per_conn: args.sync_per_conn,
+        limit: args.sync_limit,
+        clients_per_address: args.clients_per_address,
+        expect_no_refusals: args.expect_no_refusals,
+        seed,
+        nodelay: args.tcp_nodelay,
+    };
+    let kept = catchup::kept(read_event_values(corpus_path)?);
+    let kept_count = kept.len() as u64;
+    let plan = std::sync::Arc::new(catchup::plan(kept, &opts)?);
+    if let Some(bin) = target.bin {
+        anyhow::ensure!(
+            import_with(bin, target.dbdir, corpus_path, false),
+            "pre-import failed"
+        );
+        let stored = export_count(bin, target.dbdir);
+        anyhow::ensure!(
+            stored == kept_count,
+            "pre-import stored {stored} events where a relay keeps {kept_count}"
+        );
+    }
+    let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
+    let run = rt.block_on(catchup::run(&url, plan.clone(), &opts));
+    stop_target(&mut child, &url);
+    catchup::report(&plan, &run?, &opts, hist)
+}
+
 fn live_options(args: &Args) -> live::Options {
     live::Options {
         authors: args.live_authors.max(2 * args.live_max_authors).max(2),
@@ -3260,6 +3358,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.publish_rate {
             s.push_str(&rate::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.nip77_catchup {
+            s.push_str(&catchup::render_markdown(report, &t.relay, t.repetition));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -3305,6 +3406,24 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             " --send-rate {} --send-secs {} --publish-connections {} --drain-secs {}",
             args.send_rate, args.send_secs, args.publish_connections, args.drain_secs,
         ));
+    }
+    if args.scenario.as_deref() == Some("nip77_catchup") {
+        selection.push_str(&format!(
+            " --sync-filter {} --sync-windows {} --sync-missing {} --sync-missing-pct {} --sync-concurrency {} --sync-per-conn {} --clients-per-address {}",
+            args.sync_filter.to_possible_value().expect("value enum").get_name(),
+            args.sync_windows,
+            args.sync_missing.to_possible_value().expect("value enum").get_name(),
+            args.sync_missing_pct,
+            args.sync_concurrency,
+            args.sync_per_conn,
+            args.clients_per_address,
+        ));
+        if let Some(limit) = args.sync_limit {
+            selection.push_str(&format!(" --sync-limit {limit}"));
+        }
+        if args.expect_no_refusals {
+            selection.push_str(" --expect-no-refusals");
+        }
     }
     if matches!(
         args.scenario.as_deref(),

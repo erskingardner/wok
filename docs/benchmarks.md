@@ -113,7 +113,8 @@ per-event outcome log), `idle_connections` (open-and-hold connection capacity),
 `nip50_search` (rare, intersected, and full-corpus ranked searches with
 result/limit verification). Wok-only `clients`, `author_kinds`,
 `monitor_index` and `live_subscriptions` have their own sections below, as
-does `ws_publish_rate`. Use `--scenario <name>` to isolate one scenario.
+do `ws_publish_rate` and `nip77_catchup` (NIP-77 catch-up, then fetching
+what the client lacks). Use `--scenario <name>` to isolate one scenario.
 
 ## Fixed-rate publication (`ws_publish_rate`)
 
@@ -197,6 +198,100 @@ Each run signs its events from `--seed`, the repetition and
 `--base-timestamp`, which defaults to the start time. Rerun all three against
 one database and the relay already has the events: it accepts them as
 duplicates, which the table counts.
+
+## NIP-77 catch-up (`nip77_catchup`)
+
+A client that holds part of what a relay has catches up with NIP-77, then
+fetches the events it lacks. An archive mirror does this, and so does a
+Marmot app for each of its groups when it starts. The relay must hold the
+corpus and nothing else: a relay the harness starts imports `--corpus` first,
+and a remote one must have been loaded with the same file.
+
+```bash
+# An archive mirror: the whole corpus in eight time windows, four at once,
+# lacking the newest 10%.
+./target/release/wok-bench --scenario nip77_catchup \
+  --target-url ws://10.0.0.3:7777 --target-label wok-master \
+  --corpus social/corpus.jsonl --sync-filter all --sync-windows 8 \
+  --sync-concurrency 4 --out catchup-mirror
+
+# Marmot apps starting: one sync per group, 256 at once, 8 to a connection,
+# each lacking a random 20% of the messages.
+./target/release/wok-bench --scenario nip77_catchup \
+  --target-url ws://10.0.0.3:7777 --target-label wok-master-marmot \
+  --corpus social/corpus.jsonl --sync-filter groups \
+  --sync-concurrency 256 --sync-per-conn 8 \
+  --sync-missing random --sync-missing-pct 20 --out catchup-marmot
+```
+
+What it syncs:
+
+- `--sync-filter all` (default) syncs the whole corpus, split into
+  `--sync-windows` (default 1) time windows of about equal event counts.
+  Windows split at whole seconds; the first has no `since` and the last no
+  `until`, and a single window sends `{}`.
+- `--sync-filter groups` sends one `{"kinds":[445],"#h":[group]}` filter per
+  Marmot group in the corpus, as MDK does at start. It needs a corpus written
+  with `--event-mix social`. The `marmot` preset refuses `all`, whose filters
+  name no author or tag.
+- `--sync-limit` puts a `limit` in every NEG-OPEN filter. The default is
+  MDK's 16,385 for groups and none for `all`. No filter may match more
+  events than its limit, since relays break ties at the limit differently;
+  the run stops before it starts if one does.
+
+The client lacks `--sync-missing-pct` percent (default 10) of the events the
+filters match, rounded: the newest ones with `--sync-missing newest`
+(default), as after time offline, or a random set with
+`--sync-missing random`, drawn from `--seed` and the repetition. It holds the
+rest. At 100 it starts empty, as a new mirror does.
+
+Each sync sends NEG-OPEN with the `(created_at, id)` pairs the client holds,
+answers each NEG-MSG until the client has nothing more to send, and sends
+NEG-CLOSE. It then asks for the ids it lacks in REQs of up to 500 ids, the
+`maxFilterLimit` of strfry 1.1.3 and Wok 0.7.0, closing each after its EOSE.
+The client's messages stay under 60,000 bytes before hex encoding, so a
+NEG-MSG fits the 131,072-byte WebSocket payload limit of strfry 1.1.3, Wok
+0.7.0 and Wok's `public` preset; relays answer with up to 500,000 bytes.
+`--sync-concurrency` syncs (default 1) run at once, `--sync-per-conn`
+(default 1; MDK runs up to 8) on each connection, and a connection that
+finishes one sync starts the next. The client builds each sync's first
+message and opens its connections before the clock starts. Each connection
+sends an `X-Forwarded-For` address in 10.64.0.0/10, one for every
+`--clients-per-address` connections (0 sends none), which a relay uses only
+when it trusts the header from the load host.
+
+Relays limit what one sync may match. strfry 1.1.3 and Wok refuse a sync
+that matches more than 1,000,000 events (`maxSyncEvents`,
+`relay.max_sync_events`; 65,536 under the `marmot` preset) unless they answer
+it from a stored negentropy tree. Wok master also reserves 256 bytes per
+event of a sync's limit, capped at `max_sync_events` and the events it
+stores, against `relay.sync_memory_per_connection` and `sync_memory_total`
+before it scans.
+Windows and `--sync-limit` keep a sync inside these limits.
+
+The trial's throughput is the events fetched per second, from the first
+NEG-OPEN to the end of the last sync, and its latency columns give the time
+per sync. The catch-up table splits that time into reconciling (NEG-OPEN to
+the last NEG-MSG) and fetching (from there to the last EOSE), and counts
+events fetched, fetch REQs, NEG-MSG rounds in all and the most in one sync,
+and the JSON text sent and received for the NEG and fetch messages, without
+WebSocket framing.
+
+A sync is correct when the relay names exactly the events the client lacks,
+names none that only the client holds, and returns every event a REQ asks for
+once and unchanged. Wok serves gift wraps and its other restricted read
+classes (`relay.auth.recipient_only_kinds`, `owner_only_kinds` and
+`authenticated_kinds`) only after AUTH, and so leaves them out of a sync,
+while strfry serves them. Each such kind must therefore be served in full or
+left out in full, and the table lists the kinds left out. A relay's refusal,
+a `NEG-ERR` or a `CLOSED` for a fetch, ends that sync and is counted by
+reason. A sync refused during its fetch is still checked as far as it got:
+its reconciliation and the events it received. Refusals fail the trial only
+with `--expect-no-refusals`, which engine-mode runs should pass. A
+connection that closes, or that has syncs open and receives nothing for
+120 s, fails its syncs. The oracle works out what a relay keeps of the
+corpus, after replacements and deletions, and holds that in memory, as the
+query scenarios hold their corpus.
 
 ## Client-realistic scenario (`clients`)
 

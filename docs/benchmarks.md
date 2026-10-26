@@ -135,6 +135,16 @@ second, the rest of that second is skipped, as it is for a client paging
 that way. `mixed_read_write` reads the first note's author while it
 publishes notes by authors of its own.
 
+The harness reads the corpus once, parsing it on every core, and keeps only
+what the oracle needs of each event: its id, author, kind and `created_at`,
+a hash of the whole event to check replies against, and its single-letter
+tags as numbers. Each line must hold exactly the seven NIP-01 fields, with
+ids and pubkeys in lowercase hex. On the load host, a 1M-event social
+corpus peaks at 0.55 GB and 10M at 2.7 GB, about 250 bytes an event; 50M
+comes to about 13 GB. Keeping each event whole took 5.6 GB at 1M, so 50M
+would have needed about 285 GB. A historical REQ may take up to 120 s to
+reach its EOSE, since deep pages on a large store can take tens of seconds.
+
 Generate a signed corpus without running a relay, or reuse one verbatim:
 
 ```bash

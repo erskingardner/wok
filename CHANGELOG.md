@@ -382,7 +382,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   many such seconds. A relay the harness starts is checked by its export
   rather than by import's exit status, and gets the event limits the corpus
   needs. The read scenarios now work out expected replies before timing,
-  time each REQ to its EOSE, and leave reply checks out of throughput.
+  time each REQ to its EOSE, and leave reply checks out of throughput. The
+  harness streams the corpus and keeps about 250 bytes of each event, so a
+  50M-event corpus needs about 13 GB rather than 285 GB, and a historical
+  REQ may take 120 s rather than 10 s to reach its EOSE.
 - `scripts/benchmark-qualify.sh` checks that two benchmark hosts are fit to
   measure on (#226). It records their hardware, and measures sync-write
   latency and random reads on the relay's database filesystem, the network

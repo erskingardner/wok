@@ -142,12 +142,15 @@ send (default 10).
 Latency runs from when an event was due to its accepting OK, so time an event
 waited behind a slow relay counts. The fixed-rate table also gives the
 achieved send rate; the send lag, from when an event was due to the end of its
-send; and the accepted rate, counted up to the last accepting OK, which is
-the trial's throughput. An accepted rate below the send rate means the relay
-fell behind or refused events. A trial is `ok=false` when the achieved rate is below 99% of
+send; and the accepted rate, which is the trial's throughput. Both rates
+divide by the schedule's length, or by the time to the last send or the last
+accepting OK if that was later, so a backlog and refusals both lower the
+accepted rate. A trial is `ok=false` when the achieved rate is below 99% of
 `--send-rate`, when a connection fails, when an OK is malformed, names no
 event of its connection's or repeats one, or when reconciliation finds a
-mismatch.
+mismatch. A connection fails when the relay closes it, or when a send is still
+pending once `--send-secs` and `--drain-secs` have passed, because the relay
+stopped reading.
 
 Each event gets one line, in due order, in `outcomes-<relay>-r<repetition>.jsonl`
 under `--out`. Times are microseconds from the start:

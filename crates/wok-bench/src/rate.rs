@@ -15,7 +15,7 @@
 //! connection failed counts as unanswered.
 
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,7 +28,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{connect_retry, read_ack, ClientConnection, EventFactory, EventMix, WebSocketClient};
+use crate::{connect_retry, read_ack, ClientConnection, EventFactory, EventMix};
 
 /// Share of the intended rate the sends must reach for a run to count.
 const RATE_HELD: f64 = 0.99;
@@ -209,7 +209,8 @@ pub async fn run(url: &str, lanes: Vec<Lane>, opts: &Options) -> Result<Run> {
         .zip(lanes)
         .enumerate()
         .map(|(conn, (socket, lane))| {
-            tokio::spawn(drive(socket, lane.events, conn, start, opts.clone()))
+            let (sink, stream) = socket.split();
+            tokio::spawn(drive(sink, stream, lane.events, conn, start, opts.clone()))
         })
         .collect();
     let mut run = Run {
@@ -259,15 +260,23 @@ async fn until(deadline: Option<Instant>) {
 }
 
 /// One connection: a sender that keeps the schedule and a reader that takes
-/// the replies, on the two halves of the socket.
-async fn drive(
-    socket: WebSocketClient,
+/// the replies, on the two halves of the socket. A send still pending once
+/// the schedule and the drain are over is abandoned, so a relay that stops
+/// reading cannot hold the run open.
+async fn drive<S, R>(
+    mut sink: S,
+    mut stream: R,
     events: Vec<Planned>,
     conn: usize,
     start: Instant,
     opts: Arc<Options>,
-) -> LaneLog {
-    let (mut sink, mut stream) = socket.split();
+) -> LaneLog
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+    R: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let stalled = start + Duration::from_secs_f64(opts.secs) + opts.drain;
     let index: HashMap<[u8; 32], usize> = events
         .iter()
         .enumerate()
@@ -302,9 +311,20 @@ async fn drive(
             if due > Instant::now() {
                 tokio::time::sleep_until(due).await;
             }
-            if let Err(e) = sink.send(Message::Text(frame.into())).await {
-                error = Some(failure(conn, start, &format!("send failed: {e}")));
-                break;
+            match tokio::time::timeout_at(stalled, sink.send(Message::Text(frame.into()))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error = Some(failure(conn, start, &format!("send failed: {e}")));
+                    break;
+                }
+                Err(_) => {
+                    error = Some(failure(
+                        conn,
+                        start,
+                        "send stalled: the relay stopped reading",
+                    ));
+                    break;
+                }
             }
             sent[k] = Some(since(start));
             count += 1;
@@ -420,10 +440,12 @@ fn prefix(message: &str) -> String {
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub intended_rate: f64,
-    /// Events sent per second, from the start to the last send.
+    /// Events sent per second over the offered window: the schedule, or to
+    /// the last send if that was later.
     pub achieved_rate: f64,
-    /// Events accepted per second, from the start to the last accepting OK:
-    /// what the relay took in, backlog included.
+    /// Events accepted per second over the offered window, or to the last
+    /// accepting OK if that was later: what the relay took in, backlog
+    /// included.
     pub accepted_rate: f64,
     pub secs: f64,
     pub connections: usize,
@@ -545,15 +567,15 @@ pub fn report(run: &Run, opts: &Options, log: &Path, hist: &mut Histogram<u64>) 
             None => {}
         }
     }
+    // The last send closes an interval of 1 / rate.
+    let window = (report.events as f64 / opts.rate).max(last_sent as f64 / 1e6 + 1.0 / opts.rate);
+    report.achieved_rate = report.sent as f64 / window;
+    report.accepted_rate = report.accepted as f64 / window.max(last_accepted as f64 / 1e6);
     if report.sent > 0 {
-        // The last send closes an interval of 1 / rate.
-        let window = last_sent as f64 / 1e6 + 1.0 / opts.rate;
-        report.achieved_rate = report.sent as f64 / window;
         report.send_lag_p99_ms = lag.value_at_percentile(99.0) as f64 / 1000.0;
         report.send_lag_max_ms = lag.max() as f64 / 1000.0;
     }
     if report.accepted > 0 {
-        report.accepted_rate = report.accepted as f64 / (last_accepted.max(1) as f64 / 1e6);
         report.ok_p50_ms = hist.value_at_percentile(50.0) as f64 / 1000.0;
         report.ok_p99_ms = hist.value_at_percentile(99.0) as f64 / 1000.0;
         report.ok_max_ms = hist.max() as f64 / 1000.0;
@@ -719,7 +741,7 @@ pub fn reconcile_files(log: &Path, export: &Path) -> Result<Reconciliation> {
 pub fn render_markdown(report: &Report, relay: &str, repetition: u32) -> String {
     let mut s = format!("\n### Fixed-rate publication: {relay}, repetition {repetition}\n\n");
     s.push_str(&format!(
-        "{} events due at {}/s for {} s over {} connection(s). Sent {} at {:.1}/s ({}); send lag p99 {:.2} ms, max {:.1} ms. Accepted {} at {:.1}/s, up to the last accepting OK. Latency from when an event was due to its accepting OK: p50 {:.2} ms, p99 {:.2} ms, max {:.1} ms. Outcome log: `{}`.\n\n",
+        "{} events due at {}/s for {} s over {} connection(s). Sent {} at {:.1}/s ({}); send lag p99 {:.2} ms, max {:.1} ms. Accepted {} at {:.1}/s over the schedule, or to the last accepting OK if later. Latency from when an event was due to its accepting OK: p50 {:.2} ms, p99 {:.2} ms, max {:.1} ms. Outcome log: `{}`.\n\n",
         report.events,
         report.intended_rate,
         report.secs,
@@ -1022,6 +1044,91 @@ mod tests {
             (0..400).collect::<Vec<_>>(),
             "the log is in due order"
         );
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_stops_reading_cannot_hold_the_run_open() {
+        let opts = Options {
+            drain: Duration::from_millis(200),
+            ..options(50.0, 0.2, 1)
+        };
+        let events = plan(&opts).unwrap().remove(0).events;
+        // Full socket buffers: no send completes and nothing arrives.
+        let sink = futures_util::sink::unfold((), |(), _: Message| {
+            std::future::pending::<Result<(), std::io::Error>>()
+        });
+        let stream = futures_util::stream::pending();
+        let begun = std::time::Instant::now();
+        let log = drive(
+            Box::pin(sink),
+            stream,
+            events,
+            0,
+            Instant::now(),
+            Arc::new(opts),
+        )
+        .await;
+        assert!(begun.elapsed() < Duration::from_secs(3), "the run hung");
+        let error = log.error.unwrap();
+        assert!(
+            error.ends_with("send stalled: the relay stopped reading"),
+            "{error}"
+        );
+        assert_eq!(log.records.len(), 10);
+        assert!(log.records.iter().all(|record| record.sent_us.is_none()));
+    }
+
+    #[test]
+    fn accepted_throughput_counts_the_whole_offered_window() {
+        let opts = options(100.0, 1.0, 1);
+        let run_with = |reply: &dyn Fn(u64, u64) -> Reply| Run {
+            records: (0..100)
+                .map(|seq| {
+                    let due_us = seq * 10_000;
+                    Record {
+                        seq,
+                        conn: 0,
+                        id: [seq as u8; 32],
+                        kind: 1,
+                        due_us,
+                        sent_us: Some(due_us + 50),
+                        reply: Some(reply(seq, due_us)),
+                    }
+                })
+                .collect(),
+            errors: Vec::new(),
+            misrouted: 0,
+            notices: 0,
+        };
+        let summarize = |run: &Run| {
+            report(
+                run,
+                &opts,
+                Path::new("unused"),
+                &mut Histogram::new(3).unwrap(),
+            )
+            .unwrap()
+        };
+        // Ten accepted in a burst, then refusals.
+        let burst = summarize(&run_with(&|seq, due_us| Reply {
+            accepted: seq < 10,
+            message: if seq < 10 {
+                ""
+            } else {
+                "rate-limited: slow down"
+            }
+            .to_owned(),
+            at_us: due_us + 1_000,
+        }));
+        assert!((burst.accepted_rate - 10.0).abs() < 0.1, "{burst:#?}");
+        assert!((burst.achieved_rate - 100.0).abs() < 0.1, "{burst:#?}");
+        // All accepted, each a second late: the backlog counts.
+        let late = summarize(&run_with(&|_, due_us| Reply {
+            accepted: true,
+            message: String::new(),
+            at_us: due_us + 1_000_000,
+        }));
+        assert!((late.accepted_rate - 100.0 / 1.99).abs() < 0.1, "{late:#?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

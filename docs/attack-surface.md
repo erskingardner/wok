@@ -322,19 +322,23 @@ component. CI runs `--check` (`.github/workflows/reachability.yml`) on every
 pull request and push to master that changes a crate, the script or the
 toolchain. Run it locally too on a change that adds a path, a message or a
 setting, or moves a check, so a baseline rewrite lands in the same pull
-request. A function the
-anonymous phase newly reaches is code an unauthenticated client can now run:
-it belongs after the cheapest check that can refuse the request, or the
-baseline is rewritten with the reason in the pull request. A phase whose
-baseline lists functions and that now reaches none also fails, and so does a
-profile with no baseline. An emptied phase is intended when the profile now
-closes that caller, since the probe skips a closed caller, or when what that
-caller added was removed or now runs for anonymous callers: rewrite the
-baseline with the reason. When the caller is still open and the probe did not
-send, the probe is broken. A function no longer reached is listed but does not
-fail. Some functions run on some runs and not others, such as a query path
-that depends on timing, so `--bless` keeps the union of three runs, and the
-database watcher, which runs on a timer, is left out.
+request. A function the anonymous phase newly reaches is code an
+unauthenticated client can now run: it belongs after the cheapest check that
+can refuse the request, or the baseline is rewritten with the reason in the
+pull request. A phase whose baseline lists functions and that now reaches none
+also fails, and so does a profile with no baseline. An emptied phase is
+intended when the profile now closes that caller, since the probe skips a
+closed caller, or when what that caller added was removed or now runs for
+anonymous callers: rewrite the baseline with the reason. When the caller is
+still open and the probe did not send, the probe is broken. A function no
+longer reached is listed but does not fail. The baselines are blessed on
+macOS. On Linux, where CI runs, each profile's anonymous phase lists
+`wok_db::env::statvfs_u64::<u32>` as no longer reached: that copy exists only
+where `f_bavail` is a `u32`. Bless on macOS, or the Linux rewrite drops that
+line and the next `--check` on macOS fails. Some functions run on some runs
+and not others, such as a query path that depends on timing, so `--bless`
+keeps the union of three runs, and the database watcher, which runs on a
+timer, is left out.
 
 ## Setting combinations
 

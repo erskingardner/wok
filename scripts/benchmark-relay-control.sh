@@ -1,216 +1,570 @@
 #!/usr/bin/env bash
+# Relay-host helper for benchmark campaigns. Runs as root.
+#
+# Each relay under test is a named target, described by
+# /etc/relay-bench/targets/<name>.env:
+#
+#   KIND=wok                  # wok or strfry
+#   BINARY=/opt/relay-bench/bin/wok-master/wok
+#   CONFIG=/etc/relay-bench/wok-master.toml
+#   PORT=7777
+#   METRICS_URL=http://10.0.0.2:7777/metrics   # optional
+#   SOURCE=/opt/relay-bench/src/wok-master      # optional, records the commit
+#   USER=relay-bench          # optional service account, created if missing
+#
+# CONFIG must put the database in /var/lib/relay-bench/<name>/db. The relay
+# runs as the transient unit relay-bench-target-<name>.service, so --cpus
+# (AllowedCPUs) and --memory (MemoryMax, which under cgroup v2 includes the
+# page cache the relay reads through) bound the relay process alone.
 set -euo pipefail
 
-WOK_SERVICE='relay-bench-wok.service'
-STRFRY_SERVICE='relay-bench-strfry.service'
-WOK_DB_ROOT=/var/lib/relay-bench/wok
-STRFRY_DB_ROOT=/var/lib/relay-bench/strfry
-WOK_CONFIG=/etc/relay-bench/wok.toml
-STRFRY_CONFIG=/etc/relay-bench/strfry.conf
-PRIVATE_ENDPOINT=10.0.0.3:7777
+# Tests relocate every root under RELAY_BENCH_PREFIX.
+PREFIX=${RELAY_BENCH_PREFIX:-}
+TARGETS_ROOT=$PREFIX/etc/relay-bench/targets
+STATE_ROOT=$PREFIX/var/lib/relay-bench
+SNAPSHOT_ROOT=$STATE_ROOT/snapshots
+OPT_ROOT=$PREFIX/opt/relay-bench
+UNIT_PREFIX=relay-bench-
+SLICE=relay-bench.slice
+DEFAULT_USER=relay-bench
 
-require_root() {
-    if [[ ${EUID} -ne 0 ]]; then
-        echo "benchmark relay control must run as root" >&2
-        exit 1
+die() {
+    echo "benchmark-relay-control: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: benchmark-relay-control check TARGET...
+       benchmark-relay-control port TARGET
+       benchmark-relay-control prepare TARGET CORPUS EVENTS ARTIFACTS
+           [--snapshot keep|none] [--cpus LIST] [--memory SIZE] [--nofile N]
+       benchmark-relay-control start TARGET ARTIFACTS [--cache cold|warm]
+           [--cpus LIST] [--memory SIZE] [--nofile N] [--ready-timeout SECS]
+       benchmark-relay-control collect-stop TARGET ARTIFACTS
+       benchmark-relay-control drop-snapshot TARGET
+       benchmark-relay-control stop-all
+       benchmark-relay-control status
+EOF
+    exit 2
+}
+
+validate_target_name() {
+    # "snapshots" is the snapshot directory beside the targets' databases.
+    [[ $1 =~ ^[a-z0-9][a-z0-9._-]{0,62}$ && $1 != snapshots ]] ||
+        die "invalid target name: $1"
+}
+
+unquote() {
+    local value=$1
+    if [[ ${#value} -ge 2 && ( ( ${value:0:1} == '"' && ${value: -1} == '"' ) ||
+        ( ${value:0:1} == "'" && ${value: -1} == "'" ) ) ]]; then
+        value=${value:1:${#value}-2}
     fi
+    printf '%s' "$value"
 }
 
-select_relay() {
-    local relay=$1
-    case "$relay" in
-        wok)
-            SERVICE=$WOK_SERVICE
-            DB_ROOT=$WOK_DB_ROOT
-            CONFIG=$WOK_CONFIG
-            SERVICE_USER=wokbench
-            SOURCE_CHECKOUT=/opt/relay-bench/src/wok
-            BINARY=$(service_binary "$SERVICE")
-            ;;
-        strfry)
-            SERVICE=$STRFRY_SERVICE
-            DB_ROOT=$STRFRY_DB_ROOT
-            CONFIG=$STRFRY_CONFIG
-            SERVICE_USER=strfrybench
-            SOURCE_CHECKOUT=/opt/relay-bench/src/strfry
-            BINARY=$(service_binary "$SERVICE")
-            ;;
-        *)
-            echo "relay must be wok or strfry" >&2
-            exit 2
-            ;;
-    esac
-    if [[ ! -x $BINARY || ! -f $CONFIG ]]; then
-        echo "missing benchmark binary or config for $relay" >&2
-        exit 1
+# Reads a target file as KEY=VALUE lines rather than sourcing it, so it holds
+# only the keys below.
+load_target() {
+    local name=$1
+    validate_target_name "$name"
+    TARGET_FILE=$TARGETS_ROOT/$name.env
+    [[ -f $TARGET_FILE ]] || die "no target file $TARGET_FILE"
+    TARGET=$name
+    KIND=
+    BINARY=
+    CONFIG=
+    PORT=
+    METRICS_URL=
+    SOURCE_CHECKOUT=
+    SERVICE_USER=$DEFAULT_USER
+    local line key value
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        [[ $line =~ ^([A-Z_]+)=(.*)$ ]] || die "$TARGET_FILE: expected KEY=VALUE: $line"
+        key=${BASH_REMATCH[1]}
+        value=$(unquote "${BASH_REMATCH[2]}")
+        case $key in
+            KIND) KIND=$value ;;
+            BINARY) BINARY=$value ;;
+            CONFIG) CONFIG=$value ;;
+            PORT) PORT=$value ;;
+            METRICS_URL) METRICS_URL=$value ;;
+            SOURCE) SOURCE_CHECKOUT=$value ;;
+            USER) SERVICE_USER=$value ;;
+            *) die "$TARGET_FILE: unknown key $key" ;;
+        esac
+    done <"$TARGET_FILE"
+    [[ $KIND == wok || $KIND == strfry ]] || die "$TARGET_FILE: KIND must be wok or strfry"
+    [[ $BINARY == /* && -x $BINARY ]] ||
+        die "$TARGET_FILE: BINARY must be the absolute path of an executable"
+    [[ $CONFIG == /* && -f $CONFIG ]] ||
+        die "$TARGET_FILE: CONFIG must be the absolute path of a file"
+    [[ $PORT =~ ^[1-9][0-9]{0,4}$ && $PORT -le 65535 ]] || die "$TARGET_FILE: PORT must be a TCP port"
+    [[ $SERVICE_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
+        die "$TARGET_FILE: USER must be an account name"
+    DB_ROOT=$STATE_ROOT/$name
+    UNIT=${UNIT_PREFIX}target-$name.service
+    IMPORT_UNIT=${UNIT_PREFIX}import-$name.service
+    SNAPSHOT_DIR=$SNAPSHOT_ROOT/$name
+}
+
+# The first argument lists the options the command takes.
+parse_run_options() {
+    local allowed=" $1 "
+    shift
+    RUN_CPUS=
+    RUN_MEMORY=
+    RUN_CACHE=cold
+    RUN_NOFILE=524288
+    READY_TIMEOUT=120
+    SNAPSHOT_POLICY=none
+    while [[ $# -gt 0 ]]; do
+        [[ $allowed == *" ${1#--} "* ]] || die "unknown option $1"
+        [[ $# -ge 2 ]] || die "option $1 needs a value"
+        case $1 in
+            --cpus) RUN_CPUS=$2 ;;
+            --memory) RUN_MEMORY=$2 ;;
+            --cache) RUN_CACHE=$2 ;;
+            --nofile) RUN_NOFILE=$2 ;;
+            --ready-timeout) READY_TIMEOUT=$2 ;;
+            --snapshot) SNAPSHOT_POLICY=$2 ;;
+        esac
+        shift 2
+    done
+    [[ -z $RUN_CPUS || $RUN_CPUS =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] ||
+        die "--cpus takes a CPU list such as 0-7,24-31"
+    [[ -z $RUN_MEMORY || $RUN_MEMORY =~ ^[1-9][0-9]*[KMGT]?$ ]] ||
+        die "--memory takes a size such as 64G"
+    [[ $RUN_CACHE == cold || $RUN_CACHE == warm ]] || die "--cache takes cold or warm"
+    [[ $RUN_NOFILE =~ ^[1-9][0-9]*$ ]] || die "--nofile takes a positive integer"
+    [[ $READY_TIMEOUT =~ ^[1-9][0-9]*$ ]] || die "--ready-timeout takes seconds"
+    [[ $SNAPSHOT_POLICY == keep || $SNAPSHOT_POLICY == none ]] ||
+        die "--snapshot takes keep or none"
+}
+
+unit_properties() {
+    UNIT_PROPS=(
+        --slice="$SLICE"
+        --uid="$SERVICE_USER"
+        --gid="$SERVICE_USER"
+        --working-directory="$DB_ROOT"
+        -p CPUAccounting=yes
+        -p MemoryAccounting=yes
+        -p IOAccounting=yes
+        -p "LimitNOFILE=$RUN_NOFILE"
+    )
+    if [[ -n $RUN_CPUS ]]; then
+        UNIT_PROPS+=(-p "AllowedCPUs=$RUN_CPUS")
     fi
-}
-
-service_binary() {
-    local service=$1
-    systemctl show "$service" -p ExecStart --value | \
-        sed -n 's/^.*path=\([^ ;}]*\).*$/\1/p'
-}
-
-stop_all() {
-    systemctl stop "$WOK_SERVICE" "$STRFRY_SERVICE"
+    if [[ -n $RUN_MEMORY ]]; then
+        UNIT_PROPS+=(-p "MemoryMax=$RUN_MEMORY" -p MemorySwapMax=0)
+    fi
 }
 
 assert_benchmark_path() {
     local path=$1
-    case "$path" in
-        /opt/relay-bench/campaigns/* | /opt/relay-bench/results/*) ;;
-        *)
-            echo "refusing non-benchmark path: $path" >&2
-            exit 1
-            ;;
+    case /$path/ in
+        */../* | */./*) die "refusing a path with . or .. components: $path" ;;
+    esac
+    case $path in
+        "$OPT_ROOT"/campaigns/?* | "$OPT_ROOT"/results/?*) ;;
+        *) die "refusing non-benchmark path: $path" ;;
     esac
 }
 
-reset_import() {
-    local relay=$1
-    local corpus=$2
-    local expected=$3
-    local artifacts=$4
-    select_relay "$relay"
-    assert_benchmark_path "$corpus"
-    assert_benchmark_path "$artifacts"
-    if [[ ! -f $corpus || ! $expected =~ ^[1-9][0-9]*$ ]]; then
-        echo "invalid corpus or expected event count" >&2
-        exit 1
-    fi
+sha_of() {
+    local sum
+    read -r sum _ < <(sha256sum -- "$1")
+    printf '%s' "$sum"
+}
 
-    local source_checkout_commit
-    source_checkout_commit=$(git -c "safe.directory=$SOURCE_CHECKOUT" \
-        -C "$SOURCE_CHECKOUT" rev-parse HEAD 2>/dev/null || true)
+ensure_service_user() {
+    id -u "$SERVICE_USER" >/dev/null 2>&1 ||
+        useradd --system --user-group --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin "$SERVICE_USER"
+}
 
-    stop_all
+stop_all() {
+    # Also stops units named by earlier versions of this script, such as
+    # relay-bench-wok.service.
+    systemctl stop "${UNIT_PREFIX}*.service"
+}
+
+reset_db() {
+    ensure_service_user
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DB_ROOT"
     find "$DB_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-    # Both benchmark configs place LMDB inside a `db` child. Wok creates it,
-    # while strfry requires the directory to exist before mdb_env_open.
+    # Both relays keep LMDB in a db child. Wok creates it, while strfry
+    # requires the directory to exist before mdb_env_open.
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DB_ROOT/db"
-    install -d -m 0750 "$artifacts"
+}
 
+import_corpus() {
+    local corpus=$1
+    local artifacts=$2
+    systemctl reset-failed "$IMPORT_UNIT" 2>/dev/null || true
+    unit_properties
+    # systemd opens the corpus and output files as root before it drops to
+    # the service user. With --wait, systemd-run reports the unit's runtime,
+    # CPU, peak memory and I/O.
+    if ! systemd-run --wait --unit="$IMPORT_UNIT" "${UNIT_PROPS[@]}" \
+        -p "StandardInput=file:$corpus" \
+        -p "StandardOutput=truncate:$artifacts/import.stdout" \
+        -p "StandardError=truncate:$artifacts/import.stderr" \
+        -- /usr/bin/time -v "$BINARY" --config "$CONFIG" import \
+        >"$artifacts/import-unit.txt" 2>&1; then
+        die "$TARGET import failed; see $artifacts/import.stderr"
+    fi
+    [[ -s $DB_ROOT/db/data.mdb ]] ||
+        die "$TARGET import wrote no $DB_ROOT/db/data.mdb; CONFIG must put the database there"
+}
+
+count_retained() {
+    runuser -u "$SERVICE_USER" -- "$BINARY" --config "$CONFIG" export |
+        awk 'NF { count += 1 } END { print count + 0 }'
+}
+
+snapshot_matches() {
+    local identity=$1
+    [[ -f $SNAPSHOT_DIR/identity && -f $SNAPSHOT_DIR/retained && -d $SNAPSHOT_DIR/db ]] &&
+        [[ $(<"$SNAPSHOT_DIR/identity") == "$identity" ]]
+}
+
+take_snapshot() {
+    local identity=$1
+    local retained=$2
+    # Names cannot start with a dot, so staging never collides with a target.
+    local staging=$SNAPSHOT_ROOT/.staging-$TARGET
+    rm -rf -- "$staging"
+    install -d -m 0750 "$staging"
+    cp -a --reflink=auto -- "$DB_ROOT/db" "$staging/db"
+    printf '%s\n' "$identity" >"$staging/identity"
+    printf '%s\n' "$retained" >"$staging/retained"
+    rm -rf -- "$SNAPSHOT_DIR"
+    mv -- "$staging" "$SNAPSHOT_DIR"
+}
+
+restore_snapshot() {
+    reset_db
+    rm -rf -- "$DB_ROOT/db"
+    cp -a --reflink=auto -- "$SNAPSHOT_DIR/db" "$DB_ROOT/db"
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$DB_ROOT"
+}
+
+write_provenance() {
+    local artifacts=$1
+    local corpus=$2
+    local expected=$3
+    local source_commit=
+    if [[ -n $SOURCE_CHECKOUT ]]; then
+        source_commit=$(git -c "safe.directory=$SOURCE_CHECKOUT" \
+            -C "$SOURCE_CHECKOUT" rev-parse HEAD 2>/dev/null || true)
+    fi
+    cp -- "$TARGET_FILE" "$artifacts/target.env"
+    cp -- "$CONFIG" "$artifacts/relay-config"
     {
-        echo "relay=$relay"
-        echo "service=$SERVICE"
+        echo "target=$TARGET"
+        echo "kind=$KIND"
+        echo "unit=$UNIT"
         echo "binary=$BINARY"
         echo "config=$CONFIG"
         echo "corpus=$corpus"
         echo "expected_events=$expected"
         echo "source_checkout=$SOURCE_CHECKOUT"
-        echo "source_checkout_commit=$source_checkout_commit"
+        echo "source_checkout_commit=$source_commit"
         uname -a
         lscpu
         free -b
         lsblk -b -o NAME,TYPE,SIZE,ROTA,MODEL,MOUNTPOINTS
     } >"$artifacts/provenance.txt"
-    sha256sum "$BINARY" "$CONFIG" "$corpus" >"$artifacts/sha256.txt"
+}
 
-    /usr/bin/time -v -o "$artifacts/import-time.txt" \
-        runuser -u "$SERVICE_USER" -- "$BINARY" --config "$CONFIG" import \
-        <"$corpus" >"$artifacts/import.stdout" 2>"$artifacts/import.stderr"
+# Restores the target's snapshot when it was taken from the same kind,
+# binary, config, corpus and event count; otherwise resets the database and
+# imports the corpus with signature verification.
+prepare() {
+    local target=$1
+    local corpus=$2
+    local expected=$3
+    local artifacts=$4
+    shift 4
+    load_target "$target"
+    parse_run_options "snapshot cpus memory nofile" "$@"
+    assert_benchmark_path "$corpus"
+    assert_benchmark_path "$artifacts"
+    [[ -f $corpus && $expected =~ ^[1-9][0-9]*$ ]] || die "invalid corpus or expected event count"
+
+    stop_all
+    install -d -m 0750 "$artifacts"
+    write_provenance "$artifacts" "$corpus" "$expected"
+    local binary_sha config_sha corpus_sha
+    binary_sha=$(sha_of "$BINARY")
+    config_sha=$(sha_of "$CONFIG")
+    corpus_sha=$(sha_of "$corpus")
+    printf '%s  %s\n' "$binary_sha" "$BINARY" "$config_sha" "$CONFIG" \
+        "$corpus_sha" "$corpus" >"$artifacts/sha256.txt"
+    local identity
+    identity=$(printf 'kind=%s\nbinary_sha256=%s\nconfig_sha256=%s\ncorpus_sha256=%s\nevents=%s' \
+        "$KIND" "$binary_sha" "$config_sha" "$corpus_sha" "$expected")
 
     local retained
-    retained=$(runuser -u "$SERVICE_USER" -- "$BINARY" --config "$CONFIG" export | awk 'NF { count += 1 } END { print count + 0 }')
+    if [[ $SNAPSHOT_POLICY == keep ]] && snapshot_matches "$identity"; then
+        restore_snapshot
+        retained=$(<"$SNAPSHOT_DIR/retained")
+        echo "database=restored-snapshot" >"$artifacts/prepare.txt"
+    else
+        reset_db
+        import_corpus "$corpus" "$artifacts"
+        retained=$(count_retained)
+        echo "database=imported" >"$artifacts/prepare.txt"
+    fi
     echo "$retained" >"$artifacts/retained-events.txt"
-    if [[ $retained -ne $expected ]]; then
-        echo "$relay retained $retained/$expected events" >&2
-        exit 1
+    [[ $retained -eq $expected ]] || die "$TARGET retained $retained/$expected events"
+    if [[ $SNAPSHOT_POLICY == keep ]] && ! snapshot_matches "$identity"; then
+        take_snapshot "$identity" "$retained"
+        echo "snapshot=taken" >>"$artifacts/prepare.txt"
     fi
     sync
     du -sb "$DB_ROOT" >"$artifacts/database-size-after-import.txt"
 }
 
-start_measurement() {
-    local relay=$1
-    local artifacts=$2
-    select_relay "$relay"
-    assert_benchmark_path "$artifacts"
-    install -d -m 0750 "$artifacts"
-    stop_all
-    # Some systemd versions report an inactive, never-failed unit as not
-    # loaded here. Clearing stale failure state is useful but not required.
-    systemctl reset-failed "$SERVICE" 2>/dev/null || true
-    systemctl start "$SERVICE"
-
-    local ready=0
-    for _ in $(seq 1 100); do
-        if ss -ltn | grep -Fq "$PRIVATE_ENDPOINT"; then
-            ready=1
-            break
-        fi
-        sleep 0.1
-    done
-    if [[ $ready -ne 1 ]]; then
-        systemctl status "$SERVICE" --no-pager -l >&2 || true
-        exit 1
-    fi
-
-    local main_pid
-    main_pid=$(systemctl show "$SERVICE" -p MainPID --value)
-    echo "$main_pid" >"$artifacts/main.pid"
-    systemctl show "$SERVICE" >"$artifacts/systemd-before.properties"
-    nstat -az >"$artifacts/nstat-before.txt"
-    curl --fail --silent --show-error http://127.0.0.1:9100/metrics \
-        >"$artifacts/node-metrics-before.prom" || true
-    nohup pidstat -h -r -u -d -w -p "$main_pid" 1 \
-        >"$artifacts/pidstat.txt" 2>&1 &
-    echo $! >"$artifacts/pidstat.pid"
+drop_page_cache() {
+    local artifacts=$1
+    grep -E '^(MemFree|Cached|Dirty):' /proc/meminfo >"$artifacts/meminfo-before-drop.txt"
+    sync
+    echo 3 >/proc/sys/vm/drop_caches
+    grep -E '^(MemFree|Cached|Dirty):' /proc/meminfo >"$artifacts/meminfo-after-drop.txt"
 }
 
-collect_stop() {
-    local relay=$1
-    local artifacts=$2
-    select_relay "$relay"
-    assert_benchmark_path "$artifacts"
-    if [[ -f $artifacts/pidstat.pid ]]; then
-        kill "$(<"$artifacts/pidstat.pid")" 2>/dev/null || true
+# Samplers run as transient units too, so stop-all ends them even when a
+# campaign is interrupted.
+start_sampler() {
+    local name=$1
+    local output=$2
+    shift 2
+    systemctl reset-failed "${UNIT_PREFIX}sampler-$name.service" 2>/dev/null || true
+    systemd-run --quiet --collect --unit="${UNIT_PREFIX}sampler-$name" \
+        -p "StandardOutput=truncate:$output" -p StandardError=journal \
+        -E LC_ALL=C -E S_TIME_FORMAT=ISO -- "$@"
+}
+
+# For failures after the relay unit started: stop it rather than leave a
+# half-started relay running.
+stop_and_die() {
+    systemctl stop "$UNIT" || true
+    die "$@"
+}
+
+listening() {
+    [[ -n $(ss -Hltn "sport = :$PORT") ]]
+}
+
+wait_ready() {
+    local deadline=$((SECONDS + READY_TIMEOUT))
+    until listening; do
+        if ! systemctl is-active --quiet "$UNIT"; then
+            systemctl status "$UNIT" --no-pager -l >&2 || true
+            die "$UNIT exited before it listened on port $PORT"
+        fi
+        if ((SECONDS >= deadline)); then
+            systemctl status "$UNIT" --no-pager -l >&2 || true
+            stop_and_die "$UNIT did not listen on port $PORT within $READY_TIMEOUT s"
+        fi
+        sleep 0.2
+    done
+}
+
+# Prints each CPU of a list such as 0-3,8 once, in order.
+expand_cpu_list() {
+    local part first last cpu
+    local -a parts
+    IFS=, read -r -a parts <<<"$1"
+    for part in "${parts[@]}"; do
+        first=${part%-*}
+        last=${part#*-}
+        for ((cpu = first; cpu <= last; cpu++)); do
+            echo "$cpu"
+        done
+    done | sort -n -u | paste -s -d ' ' -
+}
+
+# Records the cgroup limits the relay actually runs under, and fails when a
+# requested cap is not in effect. systemd enables the cpuset controller for
+# the unit only when it sets AllowedCPUs.
+check_limits() {
+    local artifacts=$1
+    local cgroup
+    cgroup=/sys/fs/cgroup$(systemctl show "$UNIT" -p ControlGroup --value)
+    local cpus=unrestricted
+    local memory=max
+    if [[ -f $cgroup/cpuset.cpus.effective ]]; then
+        cpus=$(<"$cgroup/cpuset.cpus.effective")
     fi
-    curl --fail --silent --show-error "http://$PRIVATE_ENDPOINT/metrics" \
-        >"$artifacts/relay-metrics.prom" || true
-    curl --fail --silent --show-error http://127.0.0.1:9100/metrics \
+    if [[ -f $cgroup/memory.max ]]; then
+        memory=$(<"$cgroup/memory.max")
+    fi
+    printf 'cpuset.cpus.effective=%s\nmemory.max=%s\n' "$cpus" "$memory" \
+        >"$artifacts/cgroup-limits.txt"
+    if [[ -n $RUN_MEMORY && $memory == max ]]; then
+        stop_and_die "$UNIT runs without the requested memory cap $RUN_MEMORY"
+    fi
+    if [[ -n $RUN_CPUS && ( $cpus == unrestricted ||
+        $(expand_cpu_list "$cpus") != "$(expand_cpu_list "$RUN_CPUS")" ) ]]; then
+        stop_and_die "$UNIT runs on CPUs $cpus, not the requested $RUN_CPUS"
+    fi
+}
+
+start_measurement() {
+    local target=$1
+    local artifacts=$2
+    shift 2
+    load_target "$target"
+    parse_run_options "cache cpus memory nofile ready-timeout" "$@"
+    assert_benchmark_path "$artifacts"
+    [[ -s $DB_ROOT/db/data.mdb ]] || die "$TARGET has no database; run prepare first"
+    install -d -m 0750 "$artifacts"
+    stop_all
+    systemctl reset-failed "$UNIT" 2>/dev/null || true
+    drop_page_cache "$artifacts"
+
+    local command=("$BINARY" --config "$CONFIG" relay)
+    if [[ $RUN_CACHE == warm ]]; then
+        # Read the database inside the relay's own unit, so the warmed pages
+        # count against its memory cap.
+        # shellcheck disable=SC2016
+        command=(/bin/sh -c 'for file in "$1"/*.mdb; do cat -- "$file" >/dev/null || exit 1; done; shift; exec "$@"'
+            warm "$DB_ROOT/db" "${command[@]}")
+    fi
+    unit_properties
+    systemd-run --unit="$UNIT" "${UNIT_PROPS[@]}" -- "${command[@]}" \
+        >"$artifacts/unit-start.txt" 2>&1 ||
+        die "could not start $UNIT; see $artifacts/unit-start.txt"
+    # Recorded now, so a relay that fails before it is ready still has its
+    # journal collected.
+    systemctl show "$UNIT" -p InvocationID --value >"$artifacts/invocation-id.txt"
+    printf 'cpus=%s\nmemory=%s\ncache=%s\nnofile=%s\n' "${RUN_CPUS:-all}" \
+        "${RUN_MEMORY:-unlimited}" "$RUN_CACHE" "$RUN_NOFILE" >"$artifacts/run-options.txt"
+    wait_ready
+    check_limits "$artifacts"
+
+    local main_pid
+    main_pid=$(systemctl show "$UNIT" -p MainPID --value)
+    echo "$main_pid" >"$artifacts/main.pid"
+    systemctl show "$UNIT" >"$artifacts/systemd-before.properties"
+    nstat -az >"$artifacts/nstat-before.txt"
+    # node_exporter is optional.
+    curl --fail --silent http://127.0.0.1:9100/metrics \
+        >"$artifacts/node-metrics-before.prom" || true
+    start_sampler pidstat "$artifacts/pidstat.txt" pidstat -h -t -r -u -d -w -p "$main_pid" 1
+    start_sampler mpstat "$artifacts/mpstat.txt" mpstat -P ALL 1
+    start_sampler iostat "$artifacts/iostat.txt" iostat -x -m -t 1
+}
+
+# Collects evidence even after a failed run, then fails if the relay was no
+# longer running when the run ended.
+collect_stop() {
+    local target=$1
+    local artifacts=$2
+    load_target "$target"
+    assert_benchmark_path "$artifacts"
+    install -d -m 0750 "$artifacts"
+    local state
+    state=$(systemctl show "$UNIT" -p ActiveState --value)
+    systemctl stop "${UNIT_PREFIX}sampler-*.service" || true
+    if [[ -n $METRICS_URL ]]; then
+        curl --fail --silent --show-error "$METRICS_URL" >"$artifacts/relay-metrics.prom" || true
+    fi
+    curl --fail --silent http://127.0.0.1:9100/metrics \
         >"$artifacts/node-metrics-after.prom" || true
     nstat -az >"$artifacts/nstat-after.txt"
     ss -s >"$artifacts/socket-summary.txt"
-    systemctl show "$SERVICE" >"$artifacts/systemd-after.properties"
-    journalctl -u "$SERVICE" --since "$(systemctl show "$SERVICE" -p ExecMainStartTimestamp --value)" \
-        --no-pager >"$artifacts/journal.log"
+    systemctl show "$UNIT" >"$artifacts/systemd-after.properties"
+    local invocation=
+    if [[ -f $artifacts/invocation-id.txt ]]; then
+        invocation=$(<"$artifacts/invocation-id.txt")
+    fi
+    if [[ -n $invocation ]]; then
+        # The relay's own lines, and systemd's about the unit, such as how
+        # its process exited.
+        journalctl "_SYSTEMD_INVOCATION_ID=$invocation" + "INVOCATION_ID=$invocation" \
+            -o short-iso --no-pager >"$artifacts/journal.log" || true
+    fi
     du -sb "$DB_ROOT" >"$artifacts/database-size-final.txt"
-    systemctl stop "$SERVICE"
-    systemctl show "$SERVICE" >"$artifacts/systemd-stopped.properties"
+    systemctl stop "$UNIT" || true
+    [[ $state == active ]] || die "$UNIT was $state, not active, when the run ended"
+}
+
+check_targets() {
+    local tool
+    for tool in systemd-run systemctl journalctl ss nstat pidstat mpstat iostat runuser \
+        sha256sum curl lscpu lsblk; do
+        command -v "$tool" >/dev/null || die "missing tool on the relay host: $tool"
+    done
+    [[ -x /usr/bin/time ]] || die "missing /usr/bin/time"
+    [[ -f /sys/fs/cgroup/cgroup.controllers ]] || die "the relay host must use cgroup v2"
+    local target
+    for target in "$@"; do
+        load_target "$target"
+        grep -qF -- "$DB_ROOT/db" "$CONFIG" ||
+            die "$CONFIG does not put $TARGET's database in $DB_ROOT/db"
+        printf '%s kind=%s port=%s binary=%s config=%s\n' \
+            "$TARGET" "$KIND" "$PORT" "$BINARY" "$CONFIG"
+    done
 }
 
 status_report() {
-    systemctl is-active "$WOK_SERVICE" 2>/dev/null || true
-    systemctl is-active "$STRFRY_SERVICE" 2>/dev/null || true
-    ss -ltnp | grep -F "$PRIVATE_ENDPOINT" || true
+    systemctl list-units --all --no-legend --plain "${UNIT_PREFIX}*" || true
+    ss -ltnp || true
 }
 
-require_root
-command=${1:-}
-case "$command" in
-    reset-import)
-        [[ $# -eq 5 ]] || { echo "usage: $0 reset-import RELAY CORPUS EVENTS ARTIFACTS" >&2; exit 2; }
-        reset_import "$2" "$3" "$4" "$5"
-        ;;
-    start)
-        [[ $# -eq 3 ]] || { echo "usage: $0 start RELAY ARTIFACTS" >&2; exit 2; }
-        start_measurement "$2" "$3"
-        ;;
-    collect-stop)
-        [[ $# -eq 3 ]] || { echo "usage: $0 collect-stop RELAY ARTIFACTS" >&2; exit 2; }
-        collect_stop "$2" "$3"
-        ;;
-    stop-all)
-        stop_all
-        ;;
-    status)
-        status_report
-        ;;
-    *)
-        echo "usage: $0 {reset-import|start|collect-stop|stop-all|status}" >&2
-        exit 2
-        ;;
-esac
+main() {
+    [[ $# -ge 1 ]] || usage
+    local action=$1
+    shift
+    [[ ${EUID} -eq 0 ]] || die "benchmark relay control must run as root"
+    case $action in
+        check)
+            [[ $# -ge 1 ]] || usage
+            check_targets "$@"
+            ;;
+        port)
+            [[ $# -eq 1 ]] || usage
+            load_target "$1"
+            echo "$PORT"
+            ;;
+        prepare)
+            [[ $# -ge 4 ]] || usage
+            prepare "$@"
+            ;;
+        start)
+            [[ $# -ge 2 ]] || usage
+            start_measurement "$@"
+            ;;
+        collect-stop)
+            [[ $# -eq 2 ]] || usage
+            collect_stop "$@"
+            ;;
+        drop-snapshot)
+            [[ $# -eq 1 ]] || usage
+            load_target "$1"
+            rm -rf -- "$SNAPSHOT_DIR"
+            ;;
+        stop-all)
+            [[ $# -eq 0 ]] || usage
+            stop_all
+            ;;
+        status)
+            [[ $# -eq 0 ]] || usage
+            status_report
+            ;;
+        *)
+            usage
+            ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

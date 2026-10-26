@@ -533,12 +533,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database, so the index is complete when the import exits. A million events
   of a social relay's history took 429 s and left a 6.4 GB file, against
   411 s and 6.4 GB without the index and 556 s and 8.0 GB when the import
-  kept it event by event. While it loads, the import holds a lease, a
-  `lease` record in `wok_Event__tagKindBuild`, so a relay writing to the
-  same database does not start building the index under it; it builds in
-  the relay's bounded steps, so the relay's publications do not wait behind
-  it. An import stopped before it builds the index leaves it for the relay
-  to finish once the lease runs out, within two minutes. A new database is
+  kept it event by event. It builds in the relay's bounded steps. While
+  another process has the database open, as a running relay does, batches
+  keep the index as they go and the import leaves any build to the relay,
+  which would otherwise begin it under the load. An import stopped before
+  it builds the index leaves it for the relay to finish. A new database is
   complete from the start.
   On the first start after the upgrade, and after a strfry migration, the
   relay builds the index for the stored events in the background, without

@@ -711,21 +711,7 @@ fn cmd_import(
     let mut total_rejected = 0u64;
     let mut total_dups = 0u64;
     let mut deferred_tag_kind = false;
-    loop {
-        let batch = match batches.recv_timeout(TAG_KIND_LEASE_RENEWAL) {
-            Ok(batch) => batch,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Slow input: keep the lease the batches took, so that a
-                // relay on the database still leaves the build to this import.
-                if deferred_tag_kind {
-                    let mut txn = env.begin_rw()?;
-                    wok_db::defer_tag_kind_postings(&mut txn)?;
-                    txn.commit()?;
-                }
-                continue;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
+    for batch in batches {
         let mut batch = batch?;
         total_processed += batch.lines;
         total_rejected += batch.rejected;
@@ -906,17 +892,13 @@ fn commit_import(
     Ok(deferred_tag_kind)
 }
 
-/// How often an import waiting on its input renews its lease on the
-/// `(tag, kind, created_at)` index build, well within the lease.
-const TAG_KIND_LEASE_RENEWAL: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Build the `(tag, kind, created_at)` index that import batches left to a
 /// key-ordered pass, so that the database is complete when the import
 /// exits. Built after the load, it writes a fraction of the pages that
-/// postings in arrival order rewrite. Its steps are the relay's, so that
-/// a relay serving the database acknowledges publications as fast as during
-/// its own build, and each gives up the batches' lease, so that the relay
-/// may continue the pass. An import stopped before it ends leaves the index
+/// postings in arrival order rewrite. Its steps are the relay's, and it
+/// leaves the rest to the relay's writer once another process has the
+/// database open, so a relay on it acknowledges publications as fast as
+/// during its own build. An import stopped before it ends leaves the index
 /// incomplete, and the relay's writer finishes it.
 fn build_tag_kind_index(env: &Env) -> Result<()> {
     let started = std::time::Instant::now();
@@ -924,8 +906,13 @@ fn build_tag_kind_index(env: &Env) -> Result<()> {
     let mut entries = 0u64;
     tracing::info!("Building the (tag, kind, created_at) index");
     loop {
+        if env.open_in_another_process()? {
+            tracing::info!(
+                "Another process has the database open; a relay on it builds the rest of the (tag, kind, created_at) index in the background"
+            );
+            return Ok(());
+        }
         let mut txn = env.begin_rw()?;
-        wok_db::release_tag_kind_lease(&mut txn)?;
         let step = wok_db::backfill_tag_kind_index(
             &mut txn,
             wok_db::TAG_KIND_STEP_ENTRIES,

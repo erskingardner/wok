@@ -51,16 +51,13 @@ The `(tag, kind, created_at)` index, `wok_Event__tagKind`, records how far it
 covers the stored events. Integrity JSON reports it as `tag_kind_index`:
 `schema`, `indexed_through` and `high_water` (the greatest local ID
 allocated), `complete`, `bulk_pass` (the `target` and `visited` entries of a
-key-ordered build in progress), `lease_until` (the Unix time in milliseconds
-until which a `wok import` holds the build), `tag_entries` (the `Event__tag`
-entries such a build visits), and its expected, actual, missing, unexpected
-and stale entries. Doctor's `tag-kind-index` check passes when the index is
-complete and every entry matches its event. It warns while the index is
-incomplete,
+key-ordered build in progress), `tag_entries` (the `Event__tag` entries such a
+build visits), and its expected, actual, missing, unexpected and stale
+entries. Doctor's `tag-kind-index` check passes when the index is complete
+and every entry matches its event. It warns while the index is incomplete,
 with the build's progress: a database from before the index, which the relay
-builds in key order on its first start, an import still loading, which builds
-it once its events are written, an import stopped before it built the index,
-which the relay finishes the same way, or events an earlier Wok release
+builds in key order on its first start, an import stopped before it built the
+index, which the relay finishes the same way, or events an earlier Wok release
 inserted, which it indexes in local-ID order. It also warns when stale
 entries remain: entries an earlier release left behind when it deleted their
 events. Readers skip those. It fails on missing entries, which a query using

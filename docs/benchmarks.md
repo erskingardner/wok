@@ -70,10 +70,11 @@ Sizes follow real clients:
 Profiles, lists, articles and KeyPackages are replaced, and deletion requests
 delete their author's earlier events. So a relay keeps fewer events than the
 corpus holds, and `corpus.social.retained` in `manifest.json` gives that
-count. The manifest also records `largest_event_bytes`, `most_tags` and
-`largest_tag_value_bytes` (single-letter tags), the limits a relay needs to
-accept every event. strfry's default `events.maxEventSize` of 64 KiB refuses
-the largest follow lists and Welcomes. The query scenarios assume every
+count. The manifest also records the limits a relay needs to accept every
+event: `needed_max_event_size`, the smallest `max_event_size` (strfry:
+`maxEventSize`) that imports the longest line with its newline, `most_tags`,
+and `largest_tag_value_bytes` (single-letter tags). strfry's default
+`events.maxEventSize` of 64 KiB refuses the largest follow lists and Welcomes. The query scenarios assume every
 corpus event is kept, so this mix is only written with
 `--generate-corpus-only`. The corpus streams to disk and is signed in
 parallel, and its bytes depend only on the options.

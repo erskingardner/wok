@@ -105,7 +105,9 @@ pub struct Summary {
     pub max_follows: usize,
     /// Events a relay keeps after replacements and deletions.
     pub retained: u64,
-    pub largest_event_bytes: u64,
+    /// The smallest `max_event_size` (strfry: `maxEventSize`) that imports
+    /// every event: import counts a line's newline against the limit.
+    pub needed_max_event_size: u64,
     pub most_tags: u64,
     /// Longest value of a single-letter tag, the tags relays index and limit.
     pub largest_tag_value_bytes: u64,
@@ -190,6 +192,7 @@ struct Builder {
     rng: StdRng,
     total: u64,
     anchor: u64,
+    span: u64,
     max_follows: usize,
     keys: Vec<Keypair>,
     pubkeys: Vec<String>,
@@ -210,11 +213,15 @@ struct Builder {
     addresses: HashMap<(u32, u16, String), u64>,
     /// Addressable identifiers in use per author and kind.
     identifiers: HashMap<(u32, u16), Vec<String>>,
+    /// Ids of the regular events in the current second. Identical events
+    /// share a second, and a relay stores one of them.
+    second: u64,
+    second_ids: HashSet<[u8; 32]>,
     retained: u64,
 }
 
 impl Builder {
-    fn new(opts: &Options) -> Self {
+    fn new(opts: &Options, span: u64) -> Self {
         let keys: Vec<_> = (0..opts.authors)
             .map(|rank| author_key(opts.seed, rank))
             .collect();
@@ -231,6 +238,7 @@ impl Builder {
             rng,
             total: opts.events,
             anchor: opts.anchor,
+            span,
             max_follows: opts.max_follows,
             keys,
             pubkeys,
@@ -245,6 +253,8 @@ impl Builder {
             deletable: HashMap::new(),
             addresses: HashMap::new(),
             identifiers: HashMap::new(),
+            second: 0,
+            second_ids: HashSet::new(),
             retained: 0,
         }
     }
@@ -253,7 +263,7 @@ impl Builder {
     /// `sqrt(i / n)` of it.
     fn timestamp(&self, index: u64) -> u64 {
         let position = ((index as f64 + 0.5) / self.total as f64).sqrt();
-        self.anchor - SPAN + (position * SPAN as f64) as u64
+        self.anchor - self.span + (position * self.span as f64) as u64
     }
 
     fn pick_kind(&mut self) -> u16 {
@@ -292,6 +302,10 @@ impl Builder {
 
     fn next(&mut self, index: u64) -> Unsigned {
         let created_at = self.timestamp(index);
+        if created_at != self.second {
+            self.second = created_at;
+            self.second_ids.clear();
+        }
         let author = self.popular();
         let mut kind = self.pick_kind();
         // Kinds that point at earlier events fall back to a note until there
@@ -346,6 +360,11 @@ impl Builder {
         let addressable = (30_000..40_000).contains(&kind);
         if replaceable || addressable {
             // Counted once per address by `replace`.
+            return;
+        }
+        // Only gift wraps move off the second, and their random content
+        // never repeats.
+        if !self.second_ids.insert(id) {
             return;
         }
         self.retained += 1;
@@ -584,7 +603,7 @@ impl Builder {
         let content = b64(&mut self.rng, bytes);
         let created_at = created_at
             .saturating_sub(self.rng.gen_range(0..2 * DAY))
-            .max(self.anchor - SPAN);
+            .max(self.anchor - self.span);
         let keys = self.fresh_key();
         let tags = vec![json!(["p", self.pubkeys[recipient as usize]])];
         (Signer::Own(keys), created_at, tags, content)
@@ -762,23 +781,28 @@ impl Builder {
 
 /// Write the corpus to `path`, one signed event per line.
 pub fn generate(path: &Path, opts: &Options) -> Result<Summary> {
+    generate_over(path, opts, SPAN)
+}
+
+fn generate_over(path: &Path, opts: &Options, span: u64) -> Result<Summary> {
     anyhow::ensure!(opts.authors > 0, "--social-authors must be at least 1");
+    anyhow::ensure!(opts.max_follows > 0, "--max-follows must be at least 1");
     anyhow::ensure!(
-        opts.anchor >= SPAN,
-        "--base-timestamp must be at least {SPAN}"
+        opts.anchor >= span,
+        "--base-timestamp must be at least {span}"
     );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut builder = Builder::new(opts);
+    let mut builder = Builder::new(opts, span);
     let mut out = BufWriter::new(std::fs::File::create(path)?);
     let mut summary = Summary {
         format: FORMAT,
         authors: opts.authors,
-        span_secs: SPAN,
+        span_secs: span,
         max_follows: opts.max_follows,
         retained: 0,
-        largest_event_bytes: 0,
+        needed_max_event_size: 0,
         most_tags: 0,
         largest_tag_value_bytes: 0,
         kinds: BTreeMap::new(),
@@ -806,7 +830,8 @@ pub fn generate(path: &Path, opts: &Options) -> Result<Summary> {
             let entry = summary.kinds.entry(kind).or_default();
             entry.events += 1;
             entry.bytes += line.len() as u64;
-            summary.largest_event_bytes = summary.largest_event_bytes.max(line.len() as u64);
+            summary.needed_max_event_size =
+                summary.needed_max_event_size.max(line.len() as u64 + 1);
             let tags = unsigned.event["tags"]
                 .as_array()
                 .map_or(&[][..], Vec::as_slice);
@@ -846,6 +871,15 @@ mod tests {
     const ANCHOR: u64 = 1_760_000_000;
 
     fn corpus(events: u64, authors: usize, seed: u64) -> (Vec<Value>, Summary, Vec<u8>) {
+        corpus_over(events, authors, seed, SPAN)
+    }
+
+    fn corpus_over(
+        events: u64,
+        authors: usize,
+        seed: u64,
+        span: u64,
+    ) -> (Vec<Value>, Summary, Vec<u8>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corpus.jsonl");
         let opts = Options {
@@ -855,10 +889,27 @@ mod tests {
             anchor: ANCHOR,
             max_follows: 300,
         };
-        let summary = generate(&path, &opts).unwrap();
+        let summary = generate_over(&path, &opts, span).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let events = crate::read_event_values(&path).unwrap();
         (events, summary, bytes)
+    }
+
+    #[test]
+    fn rejects_options_it_cannot_honour() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corpus.jsonl");
+        let opts = |anchor, max_follows| Options {
+            events: 10,
+            authors: 10,
+            seed: 1,
+            anchor,
+            max_follows,
+        };
+        let early = generate_over(&path, &opts(599, 300), 600).unwrap_err();
+        assert_eq!(early.to_string(), "--base-timestamp must be at least 600");
+        let none = generate(&path, &opts(ANCHOR, 0)).unwrap_err();
+        assert_eq!(none.to_string(), "--max-follows must be at least 1");
     }
 
     #[test]
@@ -895,6 +946,19 @@ mod tests {
         for event in events.iter().filter(|e| e["kind"] == 5) {
             assert!(!kept.contains(event["tags"][0][1].as_str().unwrap()));
         }
+    }
+
+    #[test]
+    fn identical_events_in_one_second_are_kept_once() {
+        // 30 events a second from five authors: some react to the same note
+        // with the same content in the same second, so their ids repeat.
+        let (events, summary, _) = corpus_over(18_000, 5, 11, 600);
+        let ids: HashSet<&str> = events.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.len() < events.len(), "no repeated ids");
+        let retained = crate::retained_events(&events);
+        let kept: HashSet<&str> = retained.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(kept.len(), retained.len());
+        assert_eq!(summary.retained, retained.len() as u64);
     }
 
     #[test]
@@ -969,6 +1033,14 @@ mod tests {
         assert!(events
             .iter()
             .all(|e| e["created_at"].as_u64().unwrap() <= ANCHOR + 1));
-        assert!(summary.largest_event_bytes > 10_000 && summary.most_tags >= follows as u64);
+        assert!(summary.most_tags >= follows as u64);
+    }
+
+    #[test]
+    fn needed_size_limit_counts_the_newline() {
+        let (_, summary, bytes) = corpus(4_000, 100, 9);
+        let longest = bytes.split(|&b| b == b'\n').map(<[u8]>::len).max().unwrap();
+        assert!(longest > 10_000, "longest line {longest}");
+        assert_eq!(summary.needed_max_event_size, longest as u64 + 1);
     }
 }

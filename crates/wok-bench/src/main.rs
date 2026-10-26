@@ -1462,9 +1462,12 @@ fn retained_events(events: &[Value]) -> Vec<Value> {
     let mut retained: Vec<Value> = Vec::new();
     let mut ordered = events.to_vec();
     ordered.sort_by_key(|e| e["created_at"].as_u64().unwrap());
+    // A relay stores each id once.
+    let mut seen = std::collections::HashSet::new();
     for event in ordered {
         let kind = event["kind"].as_u64().unwrap();
-        if (20_000..30_000).contains(&kind) {
+        let id = event["id"].as_str().unwrap().to_owned();
+        if (20_000..30_000).contains(&kind) || !seen.insert(id) {
             continue;
         }
         if kind == 5 {

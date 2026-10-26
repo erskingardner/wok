@@ -282,6 +282,9 @@ reconcile_rate_steps() {
     local -a ran=()
     local rate log
     local status=0
+    # The helper reconciles every log under $relay, so none may be left from
+    # an earlier run with this campaign ID.
+    remote_command "$RELAY_SSH" rm -rf -- "$relay"
     for rate in ${RATE_LAUNCHED[@]+"${RATE_LAUNCHED[@]}"}; do
         # wok-bench names the log for the trial's label and its repetition,
         # which is always 1 here.
@@ -291,8 +294,14 @@ reconcile_rate_steps() {
             status=1
             continue
         fi
-        remote_command "$RELAY_SSH" mkdir -p "$relay/rate-$rate"
-        scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$log" "$RELAY_SSH:$relay/rate-$rate/outcomes.jsonl"
+        if ! remote_command "$RELAY_SSH" mkdir -p "$relay/rate-$rate" ||
+            ! scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$log" \
+                "$RELAY_SSH:$relay/rate-$rate/outcomes.jsonl"; then
+            echo "$target step $rate: could not copy its outcome log to the relay host" >&2
+            remote_command "$RELAY_SSH" rm -rf -- "$relay/rate-$rate" || true
+            status=1
+            continue
+        fi
         ran+=("$rate")
     done
     [[ ${#ran[@]} -gt 0 ]] || return "$status"

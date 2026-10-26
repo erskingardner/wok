@@ -398,10 +398,11 @@ class CampaignSettings(unittest.TestCase):
                     self.assertIn('left no fixed-rate report', result.stderr)
             self.assertFalse((load/'rate-capacity.txt').exists())
 
-    def reconcile(self, root, launched, log_lines):
+    def reconcile(self, root, launched, log_lines, fail_copy=''):
         """Runs reconcile_rate_steps for repetition 2 of target wok, with
         the steps in launched started and each step's outcome log holding
-        log_lines[rate] of its 10 planned events (none when absent)."""
+        log_lines[rate] of its 10 planned events (none when absent). Copying
+        step fail_copy's log to the relay host fails."""
         load = root/'l/runs/r2-wok/load'
         for rate in launched:
             self.write_rate_results(load, rate)
@@ -419,6 +420,7 @@ class CampaignSettings(unittest.TestCase):
                 'echo "{\\"events\\":$(wc -l <"$d/outcomes.jsonl")}" >"$d/reconciliation.json"; '
                 'done; else "$@"; fi; }; '
                 'scp() { local from=${*: -2:1} to=${*: -1}; '
+                f'[[ $from == *"/rate-{fail_copy}/outcomes"* ]] && return 1; '
                 f'echo "scp $from $to" >>"{calls}"; cp "${{from#*:}}" "${{to#*:}}"; }}; '
                 f'LOAD_ROOT={root}/l RELAY_ROOT={root}/r; '
                 f'RATE_LAUNCHED=({" ".join(map(str, launched))}); reconcile_rate_steps wok 2')
@@ -462,6 +464,24 @@ class CampaignSettings(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('step 2000: the outcome log does not hold every planned event',
                           result.stderr)
+
+    def test_reconciliation_uses_only_this_runs_copied_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Logs left on the relay host by an earlier run with this
+            # campaign ID, one for a step this run never reached.
+            stale = root/'r/runs/r2-wok/rate'
+            for rate in [2000, 4000]:
+                (stale/f'rate-{rate}').mkdir(parents=True)
+                (stale/f'rate-{rate}/outcomes.jsonl').write_text('{}\n' * 10)
+            result, sent, load, relay = self.reconcile(
+                root, [1000, 2000], {1000: 10, 2000: 10}, fail_copy='2000')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('step 2000: could not copy its outcome log', result.stderr)
+            self.assertEqual(sorted(path.name for path in stale.iterdir()), ['rate-1000'])
+            self.assertTrue((load/'rate-1000/reconciliation.json').exists())
+            self.assertFalse((load/'rate-2000/reconciliation.json').exists())
+            self.assertTrue(any(line.startswith('control reconcile') for line in sent))
 
     def test_social_campaign_skips_query_phases_and_expects_the_retained_count(self):
         for mix, phases in [

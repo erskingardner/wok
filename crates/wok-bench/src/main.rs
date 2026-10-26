@@ -13,6 +13,7 @@
 
 mod author_kinds;
 mod clients;
+mod corpus;
 mod live;
 mod rate;
 mod social;
@@ -34,6 +35,16 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 static CLIENT_NODELAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// The limits a read scenario's corpus needs, which the relays this harness
+/// starts raise where they exceed strfry's defaults.
+static CORPUS_LIMITS: std::sync::OnceLock<social::Limits> = std::sync::OnceLock::new();
+/// Scenarios that read a corpus a relay imported, checked against
+/// `corpus::Corpus`.
+const READ_SCENARIOS: [&str; 3] = [
+    "ws_query_latency",
+    "deep_history_pagination",
+    "mixed_read_write",
+];
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -318,8 +329,8 @@ enum EventMix {
     Lifecycle,
     /// A public social relay's history (see `social.rs`): `--social-authors`
     /// authors over two years, with replacements, deletions and real event
-    /// sizes. Only written to disk, with `--generate-corpus-only`; the
-    /// manifest gives the count a relay keeps.
+    /// sizes. Written with `--generate-corpus-only`, or read back by the
+    /// read scenarios; the manifest gives the count a relay keeps.
     Social,
 }
 
@@ -496,10 +507,17 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--event-mix lifecycle is only valid for live publication scenarios");
     }
-    // The query oracles assume every corpus event is kept, which replacements
-    // and deletions break.
-    if args.event_mix == EventMix::Social && !args.generate_corpus_only {
-        anyhow::bail!("--event-mix social only writes a corpus; pass --generate-corpus-only");
+    // Only the read scenarios check a social corpus's import against what a
+    // relay keeps of it.
+    if args.event_mix == EventMix::Social
+        && !args.generate_corpus_only
+        && scenarios
+            .iter()
+            .any(|scenario| !READ_SCENARIOS.contains(scenario))
+    {
+        anyhow::bail!(
+            "--event-mix social runs only ws_query_latency, deep_history_pagination and mixed_read_write, or --generate-corpus-only"
+        );
     }
 
     let default_event_count = if args.profile == "smoke" {
@@ -597,6 +615,24 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let corpus = if scenarios
+        .iter()
+        .any(|scenario| READ_SCENARIOS.contains(scenario))
+    {
+        let corpus = corpus::Corpus::load(&corpus_path)
+            .with_context(|| format!("load corpus {}", corpus_path.display()))?;
+        if let Some(kept) = retained {
+            anyhow::ensure!(
+                corpus.retained() == kept,
+                "the read oracle keeps {} of the corpus's events, the generator {kept}",
+                corpus.retained()
+            );
+        }
+        CORPUS_LIMITS.get_or_init(|| corpus.limits());
+        Some(corpus)
+    } else {
+        None
+    };
     let mut trials = Vec::new();
     for repetition in 1..=args.repetitions {
         for scenario in &scenarios {
@@ -627,6 +663,7 @@ fn main() -> Result<()> {
                     scenario,
                     repetition,
                     &corpus_path,
+                    corpus.as_ref(),
                     &corpus_sha256,
                 );
                 match t {
@@ -666,6 +703,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_trial(
     rt: &tokio::runtime::Runtime,
     args: &Args,
@@ -673,6 +711,7 @@ fn run_trial(
     scenario: &str,
     repetition: u32,
     corpus_path: &Path,
+    corpus: Option<&corpus::Corpus>,
     corpus_sha256: &str,
 ) -> Result<Trial> {
     let dir = TempDir::new()?;
@@ -731,6 +770,7 @@ fn run_trial(
     };
     let local_bin =
         || bin.ok_or_else(|| anyhow::anyhow!("{scenario} requires locally managed relay binaries"));
+    let read_corpus = || corpus.context("read scenarios load the corpus first");
     let target_endpoint = args.target_endpoint();
     let target = RelayTarget {
         bin,
@@ -837,7 +877,15 @@ fn run_trial(
                 }
             }
         }
-        "ws_query_latency" => match ws_query_trial(rt, target, corpus_path, n_queries, &mut hist) {
+        "ws_query_latency" => match ws_query_trial(
+            rt,
+            target,
+            corpus_path,
+            read_corpus()?,
+            args.event_mix,
+            n_queries,
+            &mut hist,
+        ) {
             Ok((qps, nts, good, miss)) => {
                 throughput = qps;
                 notes = nts;
@@ -851,7 +899,15 @@ fn run_trial(
             }
         },
         "deep_history_pagination" => {
-            match deep_history_trial(rt, target, corpus_path, n_queries, &mut hist) {
+            match deep_history_trial(
+                rt,
+                target,
+                corpus_path,
+                read_corpus()?,
+                args.event_mix,
+                n_queries,
+                &mut hist,
+            ) {
                 Ok((qps, nts, good, miss)) => {
                     throughput = qps;
                     notes = nts;
@@ -866,7 +922,15 @@ fn run_trial(
             }
         }
         "mixed_read_write" => {
-            match mixed_read_write_trial(rt, target, corpus_path, workload, n_queries, &mut hist) {
+            match mixed_read_write_trial(
+                rt,
+                target,
+                corpus_path,
+                read_corpus()?,
+                workload,
+                n_queries,
+                &mut hist,
+            ) {
                 Ok((qps, nts, good, miss)) => {
                     throughput = qps;
                     notes = nts;
@@ -1458,7 +1522,33 @@ fn generate_values(workload: EventWorkload) -> Result<Vec<Value>> {
 fn write_conf(bin: &Path, dbdir: &Path, port: u16) -> PathBuf {
     let conf = dbdir.join("strfry.conf");
     let is_wok = bin.file_name().and_then(|name| name.to_str()) == Some("wok");
-    let rendered = if is_wok {
+    // Raised where the corpus needs more than strfry's defaults, the
+    // strictest of the relays compared.
+    let raised: Vec<(&str, &str, u64)> = CORPUS_LIMITS
+        .get()
+        .map(|limits| {
+            [
+                (
+                    "max_event_size",
+                    "maxEventSize",
+                    limits.needed_max_event_size,
+                    65_536,
+                ),
+                ("max_num_tags", "maxNumTags", limits.most_tags, 2_000),
+                (
+                    "max_tag_val_size",
+                    "maxTagValSize",
+                    limits.largest_tag_value_bytes,
+                    1_024,
+                ),
+            ]
+            .into_iter()
+            .filter(|&(.., needed, default)| needed > default)
+            .map(|(wok, strfry, needed, _)| (wok, strfry, needed))
+            .collect()
+        })
+        .unwrap_or_default();
+    let mut rendered = if is_wok {
         format!(
             "[database]\npath = \"{}\"\n\n[relay]\nbind = \"127.0.0.1\"\nport = {port}\n\n[relay.auth]\nenabled = false\n\n[relay.abuse]\nenabled = false\n",
             dbdir.display()
@@ -1469,6 +1559,23 @@ fn write_conf(bin: &Path, dbdir: &Path, port: u16) -> PathBuf {
             dbdir.display()
         )
     };
+    if !raised.is_empty() {
+        let lines: String = raised
+            .iter()
+            .map(|(wok, strfry, needed)| {
+                if is_wok {
+                    format!("{wok} = {needed}\n")
+                } else {
+                    format!("    {strfry} = {needed}\n")
+                }
+            })
+            .collect();
+        if is_wok {
+            rendered.push_str(&format!("\n[events]\n{lines}"));
+        } else {
+            rendered.push_str(&format!("events {{\n{lines}}}\n"));
+        }
+    }
     let _ = std::fs::write(&conf, rendered);
     conf
 }
@@ -1509,52 +1616,14 @@ fn export_values(bin: &Path, dbdir: &Path) -> Result<Vec<Value>> {
         .collect()
 }
 
-/// Independent final-state oracle for generated publication mixes. Ephemerals
-/// are live-only; replacements retain the latest address; kind-5 e tags delete
-/// only the same author's target. The generator uses only these lifecycle forms.
+/// The events a relay keeps of `events` (see `corpus::retention`).
 fn retained_events(events: &[Value]) -> Vec<Value> {
-    let mut retained: Vec<Value> = Vec::new();
-    let mut ordered = events.to_vec();
-    ordered.sort_by_key(|e| e["created_at"].as_u64().unwrap());
-    // A relay stores each id once.
-    let mut seen = std::collections::HashSet::new();
-    for event in ordered {
-        let kind = event["kind"].as_u64().unwrap();
-        let id = event["id"].as_str().unwrap().to_owned();
-        if (20_000..30_000).contains(&kind) || !seen.insert(id) {
-            continue;
-        }
-        if kind == 5 {
-            for tag in event["tags"].as_array().unwrap() {
-                if tag[0] == "e" {
-                    retained.retain(|old| old["id"] != tag[1] || old["pubkey"] != event["pubkey"]);
-                }
-            }
-        }
-        if kind == 0
-            || kind == 3
-            || (10_000..20_000).contains(&kind)
-            || (30_000..40_000).contains(&kind)
-        {
-            let address = |e: &Value| {
-                e["tags"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|t| t[0] == "d")
-                    .and_then(|t| t[1].as_str())
-                    .unwrap_or("")
-                    .to_owned()
-            };
-            retained.retain(|old| {
-                old["pubkey"] != event["pubkey"]
-                    || old["kind"] != event["kind"]
-                    || (kind >= 30_000 && address(old) != address(&event))
-            });
-        }
-        retained.push(event);
-    }
-    retained
+    events
+        .iter()
+        .zip(corpus::retention(events))
+        .filter(|(_, kept)| *kept)
+        .map(|(event, _)| event.clone())
+        .collect()
 }
 
 fn export_count(bin: &Path, dbdir: &Path) -> u64 {
@@ -1780,47 +1849,51 @@ async fn read_ack(socket: &mut ClientConnection, event: &Value) -> Result<bool> 
     .context("publication acknowledgement deadline")?
 }
 
+/// Whether `event` matches `filter`, as NIP-01 defines it for the filter
+/// elements this harness sends.
+fn matches_filter(event: &Value, filter: &Value) -> bool {
+    for (key, condition) in filter.as_object().unwrap() {
+        match key.as_str() {
+            "limit" => {}
+            "since" => {
+                if event["created_at"].as_u64().unwrap() < condition.as_u64().unwrap() {
+                    return false;
+                }
+            }
+            "until" => {
+                if event["created_at"].as_u64().unwrap() > condition.as_u64().unwrap() {
+                    return false;
+                }
+            }
+            "ids" | "authors" | "kinds" => {
+                let field = match key.as_str() {
+                    "ids" => "id",
+                    "authors" => "pubkey",
+                    _ => "kind",
+                };
+                if !condition.as_array().unwrap().contains(&event[field]) {
+                    return false;
+                }
+            }
+            tag if tag.starts_with('#') => {
+                if !event["tags"].as_array().unwrap().iter().any(|t| {
+                    t[0].as_str() == Some(&tag[1..])
+                        && condition.as_array().unwrap().contains(&t[1])
+                }) {
+                    return false;
+                }
+            }
+            _ => panic!("unsupported benchmark oracle filter: {key}"),
+        }
+    }
+    true
+}
+
 /// Independent NIP-01 oracle for this harness's historical filter workloads.
 fn expected_history(events: &[Value], filter: &Value) -> Vec<Value> {
     let mut matches: Vec<Value> = events
         .iter()
-        .filter(|event| {
-            for (key, condition) in filter.as_object().unwrap() {
-                match key.as_str() {
-                    "limit" => {}
-                    "since" => {
-                        if event["created_at"].as_u64().unwrap() < condition.as_u64().unwrap() {
-                            return false;
-                        }
-                    }
-                    "until" => {
-                        if event["created_at"].as_u64().unwrap() > condition.as_u64().unwrap() {
-                            return false;
-                        }
-                    }
-                    "ids" | "authors" | "kinds" => {
-                        let field = match key.as_str() {
-                            "ids" => "id",
-                            "authors" => "pubkey",
-                            _ => "kind",
-                        };
-                        if !condition.as_array().unwrap().contains(&event[field]) {
-                            return false;
-                        }
-                    }
-                    tag if tag.starts_with('#') => {
-                        if !event["tags"].as_array().unwrap().iter().any(|t| {
-                            t[0].as_str() == Some(&tag[1..])
-                                && condition.as_array().unwrap().contains(&t[1])
-                        }) {
-                            return false;
-                        }
-                    }
-                    _ => panic!("unsupported benchmark oracle filter: {key}"),
-                }
-            }
-            true
-        })
+        .filter(|event| matches_filter(event, filter))
         .cloned()
         .collect();
     matches.sort_by(|a, b| {
@@ -2131,6 +2204,29 @@ fn reconcile_outcomes(out: &Path, log: &Path, export: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Import the corpus into a relay this harness starts, and check that the
+/// relay kept what the oracle expects.
+///
+/// The export decides, not import's exit status. Both relays write a batch
+/// in `created_at` order, then id, so a deletion in the same second as its
+/// target, with the lower id, refuses the target instead of deleting it.
+/// `wok import` exits nonzero on any refused line; strfry exits 0.
+fn preload(target: RelayTarget<'_>, corpus_path: &Path, corpus: &corpus::Corpus) -> Result<()> {
+    if let Some(bin) = target.bin {
+        let imported = import_with(bin, target.dbdir, corpus_path, false);
+        let retained = export_count(bin, target.dbdir);
+        if retained != corpus.retained() {
+            anyhow::bail!(
+                "pre-import {}kept {retained} of {} corpus events, not {}",
+                if imported { "" } else { "failed and " },
+                corpus.lines(),
+                corpus.retained()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run `queries` REQs of mixed shapes against an exact corpus. Local targets
 /// are preloaded automatically; remote targets must already contain the
 /// supplied `--corpus`.
@@ -2138,34 +2234,18 @@ fn ws_query_trial(
     rt: &tokio::runtime::Runtime,
     target: RelayTarget<'_>,
     corpus_path: &Path,
+    corpus: &corpus::Corpus,
+    mix: EventMix,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    let events = read_event_values(corpus_path)?;
-    if events.is_empty() {
+    if corpus.lines() == 0 {
         anyhow::bail!("query corpus is empty");
-    }
-    let note_events: Vec<&Value> = events
-        .iter()
-        .filter(|event| event.get("kind").and_then(Value::as_u64) == Some(1))
-        .collect();
-    if note_events.is_empty() {
-        anyhow::bail!("query corpus has no kind 1 events");
     }
     let measured_queries = queries.max(1);
     let total_queries = measured_queries.saturating_add(20);
-    if let Some(bin) = target.bin {
-        if !import_with(bin, target.dbdir, corpus_path, false) {
-            anyhow::bail!("pre-import failed");
-        }
-        let retained = export_count(bin, target.dbdir);
-        if retained != events.len() as u64 {
-            anyhow::bail!(
-                "pre-import retained {retained}/{} corpus events",
-                events.len()
-            );
-        }
-    }
+    let filters = corpus.filters(total_queries, mix)?;
+    preload(target, corpus_path, corpus)?;
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use tokio_tungstenite::tungstenite::Message;
@@ -2173,20 +2253,6 @@ fn ws_query_trial(
         for _ in 0..4 {
             sockets.push(connect_retry(&url).await?);
         }
-        let filters: Vec<Value> = (0..total_queries)
-            .map(|q| {
-                let ev = &events[(q as usize * 7) % events.len()];
-                let note = note_events[(q as usize * 11) % note_events.len()];
-                let id = ev["id"].as_str().unwrap_or("");
-                let pk = note["pubkey"].as_str().unwrap_or("");
-                match q % 4 {
-                    0 => json!({"ids":[id]}),
-                    1 => json!({"authors":[pk],"kinds":[1],"limit":50}),
-                    2 => json!({"kinds":[1],"since":note["created_at"].as_u64().unwrap_or(0),"limit":20}),
-                    _ => json!({"#t":[format!("tag-{}", q % 64)],"limit":50}),
-                }
-            })
-            .collect();
         // Warm-up.
         for (i, f) in filters.iter().take(20).enumerate() {
             let ws = &mut sockets[i % 4];
@@ -2196,7 +2262,10 @@ fn ws_query_trial(
             ))
             .await?;
             let actual = read_history(ws, &subscription).await?;
-            anyhow::ensure!(same_event_set(&actual, &expected_history(&events,f)), "warmup returned wrong events");
+            anyhow::ensure!(
+                corpus.expected(f).matches(&actual),
+                "warmup returned wrong events for {f}"
+            );
             ws.send(Message::Text(
                 json!(["CLOSE", subscription]).to_string().into(),
             ))
@@ -2214,9 +2283,9 @@ fn ws_query_trial(
                 json!(["REQ", subscription, f]).to_string().into(),
             ))
             .await?;
-            let actual = read_history(ws,&subscription).await?;
+            let actual = read_history(ws, &subscription).await?;
             results += actual.len() as u64;
-            let correct = same_event_set(&actual,&expected_history(&events,f));
+            let correct = corpus.expected(f).matches(&actual);
             ws.send(Message::Text(
                 json!(["CLOSE", subscription]).to_string().into(),
             ))
@@ -2244,41 +2313,34 @@ fn ws_query_trial(
 /// Repeated author+kind+until pagination into progressively older history.
 /// This is the workload from strfry issue #157, where later pages can degrade
 /// from sub-second to tens of seconds on fragmented, production-sized stores.
+/// On a social corpus a page holds every kind, as an archive's mirror reads
+/// an author; otherwise notes only.
+///
+/// Each page asks for what is older than the last page's oldest event. Where
+/// a page ends inside a second, that second's other events are skipped, as
+/// they are for a client paging this way.
 fn deep_history_trial(
     rt: &tokio::runtime::Runtime,
     target: RelayTarget<'_>,
     corpus_path: &Path,
+    corpus: &corpus::Corpus,
+    mix: EventMix,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    use std::collections::HashMap;
-
-    let events = read_event_values(corpus_path)?;
-    let mut authors = HashMap::<String, u64>::new();
-    for event in &events {
-        if event.get("kind").and_then(Value::as_u64) == Some(1) {
-            if let Some(author) = event.get("pubkey").and_then(Value::as_str) {
-                *authors.entry(author.to_string()).or_default() += 1;
-            }
-        }
-    }
-    let (author, n) = authors
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .context("deep-history corpus has no kind 1 author")?;
-    if let Some(bin) = target.bin {
-        if !import_with(bin, target.dbdir, corpus_path, false) {
-            anyhow::bail!("deep-history import failed");
-        }
-        let imported = export_count(bin, target.dbdir);
-        if imported != events.len() as u64 {
-            anyhow::bail!(
-                "deep-history import retained {imported}/{} events",
-                events.len()
-            );
-        }
-    }
+    let kinds = (mix != EventMix::Social).then_some(1);
+    let (author, n) = corpus
+        .busiest_author(kinds)
+        .context("deep-history corpus has no author to page")?;
+    preload(target, corpus_path, corpus)?;
     let page_size = 500u64;
+    let page = |until: u64| {
+        let mut filter = json!({"authors":[author],"until":until,"limit":page_size});
+        if let Some(kind) = kinds {
+            filter["kinds"] = json!([kind]);
+        }
+        filter
+    };
     let available_pages = n.div_ceil(page_size);
     let pages = queries.max(1).min(available_pages);
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
@@ -2294,32 +2356,21 @@ fn deep_history_trial(
         let started_all = Instant::now();
         for _page in 0..pages {
             let started = Instant::now();
+            let filter = page(until);
             socket
                 .send(Message::Text(
-                    json!(["REQ", "deep", {
-                        "authors":[author],
-                        "kinds":[1],
-                        "until":until,
-                        "limit":page_size
-                    }])
-                    .to_string()
-                    .into(),
+                    json!(["REQ", "deep", filter]).to_string().into(),
                 ))
                 .await?;
             let actual = read_history(&mut socket, "deep").await?;
-            let expected = expected_history(
-                &events,
-                &json!({"authors":[author],"kinds":[1],"until":until,"limit":page_size}),
-            );
-            let oldest = actual
-                .iter()
-                .filter_map(|e| e["created_at"].as_u64())
-                .min()
-                .unwrap_or(u64::MAX);
-            if !same_event_set(&actual, &expected) || oldest == u64::MAX {
+            if !corpus.expected(&filter).matches(&actual) {
                 mismatches += 1;
                 break;
             }
+            // Skipped seconds can end the history a page early.
+            let Some(oldest) = actual.iter().filter_map(|e| e["created_at"].as_u64()).min() else {
+                break;
+            };
             for event in &actual {
                 if !seen.insert(event["id"].as_str().unwrap().to_owned()) {
                     mismatches += 1;
@@ -2333,14 +2384,11 @@ fn deep_history_trial(
         Ok::<_, anyhow::Error>((seen.len() as u64, mismatches, elapsed, latencies))
     });
     stop_target(&mut child, &url);
-    let (seen, mut mismatches, elapsed, latencies) = out?;
+    let (seen, mismatches, elapsed, latencies) = out?;
+    let pages = latencies.len();
     for latency in latencies {
         hist.record(latency)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
-    let expected = n.min(pages * page_size);
-    if seen != expected {
-        mismatches += 1;
     }
     let qps = pages as f64 / elapsed.as_secs_f64();
     let notes = format!(
@@ -2352,33 +2400,24 @@ fn deep_history_trial(
 /// Measure historical REQ latency while a second connection continuously
 /// publishes accepted events. This catches cursor/refill regressions that are
 /// invisible in a read-only corpus.
+#[allow(clippy::too_many_arguments)]
 fn mixed_read_write_trial(
     rt: &tokio::runtime::Runtime,
     target: RelayTarget<'_>,
     corpus_path: &Path,
+    corpus: &corpus::Corpus,
     workload: EventWorkload,
     queries: u64,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
-    let base_events = read_event_values(corpus_path)?;
-    let n = base_events.len() as u64;
+    let n = corpus.lines();
     if n == 0 {
         anyhow::bail!("mixed-load corpus is empty");
     }
-    if let Some(bin) = target.bin {
-        if !import_with(bin, target.dbdir, corpus_path, false) {
-            anyhow::bail!("mixed-load import failed");
-        }
-        let imported = export_count(bin, target.dbdir);
-        if imported != n {
-            anyhow::bail!("mixed-load import retained {imported}/{n} events");
-        }
-    }
-    let query_author = base_events
-        .iter()
-        .find(|e| e["kind"] == 1)
-        .context("mixed corpus has no kind 1")?["pubkey"]
-        .clone();
+    let query_author = corpus
+        .first_author(1)
+        .context("mixed corpus has no kind 1")?;
+    preload(target, corpus_path, corpus)?;
     let query_count = queries.max(1);
     let write_count = query_count.max(50).min(n);
     let new_events = generate_values(EventWorkload {
@@ -2387,7 +2426,11 @@ fn mixed_read_write_trial(
         // Keep concurrent writes recent but never push them into the future.
         // The distinct workload seed is sufficient to avoid corpus IDs.
         base_timestamp: workload.base_timestamp,
-        ..workload
+        // A social corpus's writes are notes by authors of their own.
+        mix: match workload.mix {
+            EventMix::Social => EventMix::Kind1,
+            mix => mix,
+        },
     })?;
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
@@ -2416,9 +2459,9 @@ fn mixed_read_write_trial(
                     ))
                     .await?;
                 let actual = read_history(&mut query_socket, &subscription_id).await?;
-                let expected = expected_history(&base_events, &json!({"kinds":[1], "authors":[query_author], "limit":100, "until":u64::MAX.saturating_sub(query_number)}));
+                let expected = corpus.expected(&json!({"kinds":[1], "authors":[query_author], "limit":100, "until":u64::MAX.saturating_sub(query_number)}));
                 let query_results = actual.len() as u64;
-                if !same_event_set(&actual, &expected) { mismatches += 1; }
+                if !expected.matches(&actual) { mismatches += 1; }
                 query_socket
                     .send(Message::Text(
                         json!(["CLOSE", subscription_id]).to_string().into(),

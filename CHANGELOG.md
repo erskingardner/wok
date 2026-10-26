@@ -370,6 +370,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2,000 follows and Marmot Welcomes (#226). Profiles and lists are replaced
   and deletion requests delete, and the manifest gives the number of events a
   relay keeps, which strfry 1.1.3 and Wok match on import.
+- `wok-bench` reads a social corpus (#226): `ws_query_latency`,
+  `deep_history_pagination` and `mixed_read_write` take `--event-mix
+  social`, and expect what a relay keeps of the corpus after replacements
+  and deletions, which strfry 1.1.3, Wok 0.7.0 and Wok master all match.
+  `ws_query_latency` then sends #226's archive reads: id lookups, profiles
+  and feeds of 500 followed authors, `#p` notifications and followers, and
+  `#e` threads. Every read scenario now accepts any of a second's events
+  where a `limit` cuts through it, since strfry and Wok send a second's
+  events in arrival order rather than lowest id first; a social corpus has
+  many such seconds. A relay the harness starts is checked by its export
+  rather than by import's exit status, and gets the event limits the corpus
+  needs.
 - `scripts/benchmark-qualify.sh` checks that two benchmark hosts are fit to
   measure on (#226). It records their hardware, and measures sync-write
   latency and random reads on the relay's database filesystem, the network

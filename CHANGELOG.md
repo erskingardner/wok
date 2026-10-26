@@ -393,6 +393,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconciled with its exported database, and a lost write or a stored
   refusal fails the campaign. The query phases still need the realistic
   corpus.
+- `wok-bench --scenario nip77_catchup` measures NIP-77 catch-up against a
+  relay that holds a corpus (#226): an archive mirror syncing the corpus in
+  time windows, or a Marmot app syncing each group's 445 messages at start.
+  The client holds all but the newest or a random share of the events, runs
+  the NEG-MSG rounds, then fetches what it lacks. It reports rounds, bytes
+  each way, time to reconcile and to fetch, and events per second, with many
+  syncs at once if asked, and fails when the relay names an event the client
+  does not lack, misses one it does, or returns one altered. It runs against
+  strfry 1.1.3, Wok 0.7.0 and Wok master.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,
@@ -535,8 +544,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and 0.24 s instead of 7.7 ms and 2.1 s. Shapes where most of the value's
   events match, such as notifications, are unchanged. The writer keeps an entry for every
   single-letter tag of every event it stores, so the database grows by about
-  14% once every event is indexed, and imports and writes take about 18%
-  longer (measured at 5M events). A new database is complete from the start.
+  14% once every event is indexed, and writes take about 18% longer
+  (measured at 5M events). `wok import` into a new database, or one whose
+  index is not built yet, leaves the entries out and builds the index in key
+  order once its events are written, as the relay builds it for an upgraded
+  database, so the index is complete when the import exits. A million events
+  of a social relay's history took 368 s and left a 6.4 GB file, the size
+  without the index, against 496 s and 8.0 GB when the import kept it event
+  by event. It builds in the relay's bounded steps. While another process
+  has the database open, as a running relay does, batches keep the index as
+  they go and the import leaves any build to the relay, which would
+  otherwise begin it under the load. An import stopped before it builds the
+  index leaves it for the relay to finish. A new database is complete from
+  its first open, and again once an import into it ends.
   On the first start after the upgrade, and after a strfry migration, the
   relay builds the index for the stored events in the background, without
   delaying startup: a key-ordered pass over the tag index, in steps of at

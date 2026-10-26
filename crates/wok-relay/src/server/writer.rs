@@ -12,11 +12,10 @@ pub(super) struct TagKindStep {
 }
 
 /// A step stops after 10 ms of indexing, plus its commit, so publications
-/// during a backfill are acknowledged about as fast as without one. An
-/// entry cap alone let a step that hit cold pages run for most of a second.
+/// during a backfill are acknowledged about as fast as without one.
 pub(super) const TAG_KIND_STEP: TagKindStep = TagKindStep {
-    max_entries: 5_000,
-    budget: Duration::from_millis(10),
+    max_entries: wok_db::TAG_KIND_STEP_ENTRIES,
+    budget: wok_db::TAG_KIND_STEP_BUDGET,
 };
 /// How often a running backfill logs its progress.
 const TAG_KIND_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);

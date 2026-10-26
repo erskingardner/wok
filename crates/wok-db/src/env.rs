@@ -533,6 +533,35 @@ impl Env {
         Ok(available_blocks.saturating_mul(fragment_size))
     }
 
+    /// Whether another process has this environment open, as its reader
+    /// table shows. A thread holds a slot there from its first read
+    /// transaction until it exits or the process closes the environment, so
+    /// a running relay, whose writer reads as it starts, is seen. A writable
+    /// environment first clears the slots of processes that have died. A
+    /// process that has opened the environment but not read from it holds no
+    /// slot and is not seen.
+    pub fn open_in_another_process(&self) -> Result<bool, DbError> {
+        if !self.inner.read_only {
+            let mut dead: i32 = 0;
+            check(unsafe { mdb_reader_check(self.inner.env, &mut dead) })?;
+        }
+        let mut scan = ReaderScan {
+            pid: std::process::id(),
+            other: false,
+        };
+        let rc = unsafe {
+            mdb_reader_list(
+                self.inner.env,
+                reader_slot as *mut MDB_msg_func,
+                (&mut scan as *mut ReaderScan).cast(),
+            )
+        };
+        if rc < 0 {
+            return Err(DbError::msg("unable to list LMDB reader slots"));
+        }
+        Ok(scan.other)
+    }
+
     pub fn compact_to_fd(&self, fd: i32) -> Result<(), DbError> {
         check(unsafe { mdb_env_copyfd2(self.inner.env, fd, MDB_CP_COMPACT) })
     }
@@ -542,6 +571,32 @@ impl Env {
         let file = create_copy_file(path)?;
         self.compact_to_fd(file.as_raw_fd())
     }
+}
+
+struct ReaderScan {
+    pid: u32,
+    other: bool,
+}
+
+/// `mdb_reader_list` calls this with a header line, then a `pid thread
+/// txnid` line per occupied slot; no other line starts with a number.
+extern "C" fn reader_slot(msg: *const libc::c_char, ctx: *mut libc::c_void) -> libc::c_int {
+    // LMDB passes a NUL-terminated line and the `ReaderScan` it was given.
+    let (line, scan) = unsafe {
+        (
+            std::ffi::CStr::from_ptr(msg),
+            &mut *ctx.cast::<ReaderScan>(),
+        )
+    };
+    let pid = line
+        .to_str()
+        .ok()
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|pid| pid.parse::<u32>().ok());
+    if pid.is_some_and(|pid| pid != scan.pid) {
+        scan.other = true;
+    }
+    0
 }
 
 fn statvfs_u64<T>(value: T, field: &str) -> Result<u64, DbError>

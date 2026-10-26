@@ -376,6 +376,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between the hosts, and steal time with every CPU busy. It fails when
   either host's average steal is above 1 percent and, given an earlier run,
   when the sync-write p99 has moved by more than 2x.
+- `wok-bench --scenario ws_publish_rate` publishes at a fixed rate without
+  waiting for replies (#226), so a relay that falls behind builds a backlog
+  that its latency shows, instead of slowing the sender. Every event's send
+  time and reply go to an outcome log, and `--reconcile` compares the log
+  with the relay's export: each event was acknowledged and stored,
+  acknowledged but lost, refused (counted by reason), or unanswered and then
+  stored or not. A relay the harness starts is reconciled when the run ends,
+  and a lost write or a stored refusal fails the trial.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,
@@ -880,6 +888,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"authors":[2000 keys],"kinds":[50 kinds]}` cost 5 and opened 100,000
   cursors. Those now cost 170, 61, 10,045 and 102,000, against a ceiling of
   20,000. `docs/config.md` lists how each filter is priced.
+- `wok import` parses and verifies the next batch on a thread of its own
+  while it writes the current one, as strfry does, instead of between write
+  transactions. Importing a million events of a social relay's history took
+  489 s instead of 555 s on a 48-vCPU host, and 273 s instead of 334 s with
+  `--write-batch 100000`. The same transactions write the database.
 
 ### Removed
 
@@ -992,6 +1005,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   16 MiB and spent about 75 µs per compressed event zeroing it, more than a
   Schnorr signature check takes; relay reads bound it by
   `events.max_event_size`.
+- `wok integrity` derives each event's NIP-50 search postings and
+  `wok_Event__tagKind` entries once, not once per posting. A note with N
+  search terms was decompressed and tokenized N times, and a follow list
+  with N `p` tags had its tag-kind keys built N times: on a 1M-event social
+  database the check had not finished after 25 minutes. Each posting of the
+  two tables is now checked by looking up the event it names, and balanced
+  against the entries the event pass found, in 16 MiB of counters whatever
+  the size of the database. Reports are unchanged, except that a table's
+  unexpected entries are listed after its other issues.
 - An `authors` and `kinds` filter past 1,000 (author, kind) pairs under a
   small `limit` no longer reads every event the authors wrote when they
   rarely publish those kinds. A picture feed (`kinds [20,21]`, `limit 50`) of

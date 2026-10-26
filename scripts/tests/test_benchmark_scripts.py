@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import re
@@ -190,6 +191,46 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         for unit in units:
             self.assertIn('-p LimitNOFILE=1048576', unit)
 
+    def test_reconcile_exports_once_and_reconciles_every_step(self):
+        self.write_target('wok', self.valid())
+        (self.prefix/'var/lib/relay-bench/wok').mkdir(parents=True)
+        steps = self.prefix/'opt/relay-bench/campaigns/c1/runs/r1-wok/rate'
+        for rate in ['1000', '2000']:
+            (steps/f'rate-{rate}').mkdir(parents=True)
+            (steps/f'rate-{rate}/outcomes.jsonl').write_text(f'{rate}\n')
+        # Called as: --reconcile LOG --relay-export EXPORT --out DIR. The
+        # 2000 step lost a write.
+        bench = self.prefix/'opt/relay-bench/bin/wok-bench'
+        bench.write_text('#!/bin/sh\n'
+                         'cat "$4" >"$6/export-seen"\n'
+                         'echo "{}" >"$6/reconciliation.json"\n'
+                         'grep -q 2000 "$2" && exit 1\n'
+                         'exit 0\n')
+        bench.chmod(0o755)
+        calls = self.prefix/'calls'
+        reconcile = (f'systemd-run() {{ printf "%s\\n" "$*" >>"{calls}"; echo exported; }}; '
+                     'reconcile_steps wok "$1" "$2" --nofile 1024')
+        result = self.control('systemctl() { echo inactive; }; ' + reconcile,
+                              str(bench), str(steps))
+        self.assertNotEqual(result.returncode, 0)
+        exports = calls.read_text().splitlines()
+        self.assertEqual(len(exports), 1, exports)
+        self.assertIn('--unit=relay-bench-export-wok.service', exports[0])
+        self.assertIn('-p LimitNOFILE=1024', exports[0])
+        for rate in ['1000', '2000']:
+            self.assertEqual((steps/f'rate-{rate}/export-seen').read_text(), 'exported\n')
+            self.assertTrue((steps/f'rate-{rate}/reconciliation.json').exists())
+        self.assertFalse((self.prefix/'var/lib/relay-bench/wok/reconcile-export.jsonl').exists())
+
+        (steps/'rate-2000/outcomes.jsonl').write_text('kept\n')
+        result = self.control('systemctl() { echo inactive; }; ' + reconcile,
+                              str(bench), str(steps))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.control('systemctl() { echo active; }; ' + reconcile,
+                              str(bench), str(steps))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('stop wok before reconciling', result.stderr)
+
     def test_rejects_target_names(self):
         for name in ['', 'Wok', '.hidden', '-wok', 'a/b', 'snapshots', 'x' * 64]:
             with self.subTest(name=name):
@@ -266,6 +307,140 @@ class CampaignSettings(unittest.TestCase):
     def test_accepts_complete_settings(self):
         result = self.campaign('validate_settings')
         self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.campaign('validate_settings', CORPUS_MIX='social',
+                               RATE_STEPS='1000 2000  5000')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # Commands sent to either host run here instead.
+    LOCAL_HOSTS = 'remote_command() { shift; "$@"; }; '
+
+    def write_rate_results(self, load, rate, **changes):
+        trial = dict(ok=True, errors=0, mismatches=0, latency_p99_ms=40.0,
+                     publish_rate=dict(unsent=0, no_reply=0, refused={}))
+        for key, value in changes.items():
+            if key in ('unsent', 'no_reply', 'refused'):
+                trial['publish_rate'][key] = value
+            else:
+                trial[key] = value
+        phase = load/f'rate-{rate}'
+        phase.mkdir(parents=True, exist_ok=True)
+        (phase/'results.jsonl').write_text(json.dumps(trial) + '\n')
+
+    def rate_sweep(self, root, steps='1000 2000 4000 8000'):
+        return self.campaign(
+            self.LOCAL_HOSTS + f'launch_bench() {{ echo "$4 $5" >>"{root}/launched"; }}; '
+            f'LOAD_ROOT={root}; rate_sweep wok 1 ws://10.0.0.2:7777', RATE_STEPS=steps)
+
+    def test_rate_sweep_stops_at_the_first_missed_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            load = root/'runs/r1-wok/load'
+            self.write_rate_results(load, 1000)
+            self.write_rate_results(load, 2000)
+            self.write_rate_results(load, 4000, latency_p99_ms=250.5)
+            self.write_rate_results(load, 8000)
+            result = self.rate_sweep(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Each step signs its events from its own seed.
+            self.assertEqual((root/'launched').read_text().splitlines(),
+                             ['rate-1000 4243', 'rate-2000 4244', 'rate-4000 4245'])
+            self.assertEqual((load/'rate-capacity.txt').read_text(),
+                             'capacity=2000\nfirst_missed=4000\n')
+
+    def test_rate_step_misses_unless_the_relay_kept_up(self):
+        misses = {
+            'rate not held': dict(ok=False),
+            'connection failed': dict(errors=1),
+            'refused': dict(refused={'rate-limited': 3}),
+            'unanswered': dict(no_reply=1),
+            'never sent': dict(unsent=5),
+            'trial error': dict(ok=False, errors=1, publish_rate=None),
+        }
+        for case, changes in misses.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                load = root/'runs/r1-wok/load'
+                self.write_rate_results(load, 1000)
+                self.write_rate_results(load, 2000, **changes)
+                result = self.rate_sweep(root, steps='1000 2000')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((load/'rate-capacity.txt').read_text(),
+                                 'capacity=1000\nfirst_missed=2000\n')
+
+    def test_rate_sweep_fails_on_a_misrouted_ok_or_missing_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            load = root/'runs/r1-wok/load'
+            self.write_rate_results(load, 1000)
+            self.write_rate_results(load, 2000, ok=False, mismatches=1)
+            self.assertNotEqual(self.rate_sweep(root, steps='1000 2000').returncode, 0)
+            self.assertNotEqual(self.rate_sweep(root, steps='1000 3000').returncode, 0)
+            self.assertFalse((load/'rate-capacity.txt').exists())
+
+    def test_reconciles_the_steps_that_ran_after_the_relay_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root/'calls'
+            load = root/'l/runs/r2-wok/load'
+            for rate in [1000, 2000]:
+                (load/f'rate-{rate}').mkdir(parents=True)
+                (load/f'rate-{rate}/outcomes-wok-r2-r1.jsonl').write_text('{}\n')
+            body = ('remote_command() { shift; if [[ $1 == "$CONTROL_REMOTE" ]]; then '
+                    f'echo "control ${{*:2}}" >>"{calls}"; else "$@"; fi; }}; '
+                    f'scp() {{ echo "scp ${{*: -2}}" >>"{calls}"; }}; '
+                    f'LOAD_ROOT={root}/l RELAY_ROOT={root}/r; reconcile_rate_steps wok 2')
+            result = self.campaign(body, RATE_STEPS='1000 2000 4000')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            relay = f'{root}/r/runs/r2-wok/rate'
+            self.assertEqual(calls.read_text().splitlines(), [
+                f'scp root@load:{load}/rate-1000/outcomes-wok-r2-r1.jsonl '
+                f'root@relay:{relay}/rate-1000/outcomes.jsonl',
+                f'scp root@load:{load}/rate-2000/outcomes-wok-r2-r1.jsonl '
+                f'root@relay:{relay}/rate-2000/outcomes.jsonl',
+                f'control reconcile wok /opt/relay-bench/bin/wok-bench/wok-bench {relay} '
+                '--nofile 524288',
+                f'scp root@relay:{relay}/rate-1000/reconciliation.json '
+                f'root@load:{load}/rate-1000/reconciliation.json',
+                f'scp root@relay:{relay}/rate-2000/reconciliation.json '
+                f'root@load:{load}/rate-2000/reconciliation.json',
+            ])
+
+    def test_social_campaign_skips_query_phases_and_expects_the_retained_count(self):
+        for mix, phases in [
+            ('realistic', ['query', 'deep-history', 'mixed-read-write', 'load', 'lifecycle']),
+            ('social', ['load', 'lifecycle']),
+        ]:
+            with self.subTest(mix=mix), tempfile.TemporaryDirectory() as tmp:
+                calls = Path(tmp)/'calls'
+                result = self.campaign(
+                    f'remote_command() {{ printf "%s\\n" "$*" >>"{calls}"; echo 7777; }}; '
+                    f'run_bench() {{ echo "phase $4" >>"{calls}"; }}; '
+                    f'rate_sweep() {{ echo sweep >>"{calls}"; }}; '
+                    f'reconcile_rate_steps() {{ echo reconcile >>"{calls}"; }}; scp() {{ :; }}; '
+                    'LOAD_ROOT=/l RELAY_ROOT=/r RELAY_CORPUS=/r/c LOAD_CORPUS=/l/c CAP_ARGS=() '
+                    'RETAINED=933179; run_target wok-master 1',
+                    CORPUS_MIX=mix, RATE_STEPS='1000')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                sent = calls.read_text().splitlines()
+                self.assertEqual([line[6:] for line in sent if line.startswith('phase ')], phases)
+                prepare = next(i for i, line in enumerate(sent) if ' prepare ' in line)
+                self.assertIn(' /r/c 933179 ', sent[prepare])
+                stop = next(i for i, line in enumerate(sent) if ' collect-stop ' in line)
+                self.assertLess(prepare, sent.index('sweep'))
+                self.assertLess(sent.index('sweep'), stop)
+                self.assertLess(stop, sent.index('reconcile'))
+
+    def test_retained_count_comes_from_the_social_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            body = self.LOCAL_HOSTS + f'LOAD_CORPUS_DIR={tmp}; retained_events'
+            self.assertEqual(self.campaign(body, EVENTS='1000').stdout.strip(), '1000')
+            social = self.campaign(body, EVENTS='1000', CORPUS_MIX='social')
+            self.assertNotEqual(social.returncode, 0)
+            self.assertIn('no retained count', social.stderr)
+            Path(tmp, 'manifest.json').write_text(
+                json.dumps({'corpus': {'social': {'retained': 933}}}))
+            social = self.campaign(body, EVENTS='1000', CORPUS_MIX='social')
+            self.assertEqual(social.stdout.strip(), '933', social.stderr)
 
     def test_generator_runs_as_a_named_unit_that_cleanup_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,8 +471,8 @@ class CampaignSettings(unittest.TestCase):
             result = self.campaign(
                 f'remote_command() {{ printf "%s\\n" "$*" >>"{calls}"; echo 7777; }}; '
                 'run_bench() { return 1; }; scp() { :; }; '
-                'LOAD_ROOT=/l RELAY_ROOT=/r RELAY_CORPUS=/r/c LOAD_CORPUS=/l/c CAP_ARGS=(); '
-                'run_target strfry-1.1.3 1 || true', NOFILE_LIMIT='1048576')
+                'LOAD_ROOT=/l RELAY_ROOT=/r RELAY_CORPUS=/r/c LOAD_CORPUS=/l/c CAP_ARGS=() '
+                'RETAINED=10; run_target strfry-1.1.3 1 || true', NOFILE_LIMIT='1048576')
             self.assertEqual(result.returncode, 0, result.stderr)
             sent = calls.read_text().splitlines()
             for command in ['prepare', 'start']:
@@ -316,6 +491,15 @@ class CampaignSettings(unittest.TestCase):
             'campaign id': dict(CAMPAIGN_ID='../x'),
             'cache': dict(CACHE='hot'),
             'snapshots': dict(SNAPSHOTS='yes'),
+            'corpus mix': dict(CORPUS_MIX='kind1'),
+            'social authors': dict(SOCIAL_AUTHORS='0'),
+            'rate step': dict(RATE_STEPS='1000 2k'),
+            'rate steps fall': dict(RATE_STEPS='2000 1000'),
+            'rate steps repeat': dict(RATE_STEPS='1000 1000'),
+            'rate seconds': dict(RATE_SECS='0'),
+            'rate drain': dict(RATE_DRAIN_SECS='x'),
+            'rate connections': dict(RATE_CONNECTIONS='-1'),
+            'rate p99': dict(RATE_P99_MS='2.5'),
         }
         for case, env in cases.items():
             with self.subTest(case=case):

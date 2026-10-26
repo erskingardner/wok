@@ -415,6 +415,10 @@ fn put_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
     for k in &idx.tag {
         txn.put(dbis.event_tag, k, &lev, 0)?;
     }
+    if txn.defer_tag_kind {
+        // A key-ordered pass puts them; see `defer_tag_kind_postings`.
+        return Ok(());
+    }
     put_tag_kind_entries(txn, lev_id, &idx.tag_kind)
 }
 
@@ -948,7 +952,11 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         note_search_indexed_through(txn, lev_id)?;
     }
     if let (Some(first), Some(last)) = (first_inserted, indexed_through) {
-        note_tag_kind_indexed(txn, first, last)?;
+        // Moving the marker past events whose postings were deferred would
+        // mark the table complete without them.
+        if !txn.defer_tag_kind {
+            note_tag_kind_indexed(txn, first, last)?;
+        }
     }
 
     Ok(())

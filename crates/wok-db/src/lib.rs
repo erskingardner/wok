@@ -76,9 +76,10 @@ pub use search::{
     MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TERMS,
 };
 pub use tag_kind::{
-    backfill_tag_kind_index, reset_tag_kind_index, tag_kind_index_complete_ro,
-    tag_kind_index_state_ro, tag_kind_key, TagKindBackfillStep, TagKindBulkPass, TagKindIndexState,
-    TAG_KIND_SCHEMA_VERSION,
+    backfill_tag_kind_index, defer_tag_kind_postings, reset_tag_kind_index,
+    tag_kind_index_complete_ro, tag_kind_index_state_ro, tag_kind_key, TagKindBackfillStep,
+    TagKindBulkPass, TagKindIndexState, TAG_KIND_SCHEMA_VERSION, TAG_KIND_STEP_BUDGET,
+    TAG_KIND_STEP_ENTRIES,
 };
 pub use txn::{RoTxn, RwTxn};
 pub use vanish::{

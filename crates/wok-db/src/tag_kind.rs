@@ -27,6 +27,12 @@
 //! walk ends, the marker takes the target. Any other gap above the marker is
 //! indexed in local-id order.
 //!
+//! A bulk load into a table that such a pass would build anyway, at marker 0
+//! with no pass running, may leave its events' postings to the pass
+//! ([`defer_tag_kind_postings`]); `wok import` does, then runs the pass. It
+//! does neither while another process has the database open: a relay's
+//! writer would begin the pass under the load.
+//!
 //! An earlier Wok release does not open these tables. The events it inserts take
 //! ids above the marker, so the index stays incomplete until they are indexed.
 //! The events it deletes leave their entries behind. Local ids are never
@@ -54,6 +60,16 @@ const PASS_CURSOR_KEY: &[u8] = b"cursor";
 
 /// The key layout this release reads and writes.
 pub const TAG_KIND_SCHEMA_VERSION: u64 = 1;
+
+/// Postings in one backfill step at most. The relay's writer and an import's
+/// closing build take steps of the same size, so a relay's publications wait
+/// no longer behind an import's steps than behind its own.
+pub const TAG_KIND_STEP_ENTRIES: usize = 5_000;
+/// Indexing time in one backfill step at most, plus its commit, so that
+/// publications during a backfill are acknowledged about as fast as without
+/// one. An entry cap alone let a step that hit cold pages run for most of a
+/// second.
+pub const TAG_KIND_STEP_BUDGET: Duration = Duration::from_millis(10);
 
 /// The `wok_Event__tagKind` key of one packed single-letter tag value.
 pub fn tag_kind_key(tag_name: u8, tag_value: &[u8], kind: u64, created_at: u64) -> Vec<u8> {
@@ -249,6 +265,42 @@ pub(crate) fn note_tag_kind_indexed(
         set_marker(txn, dbi, INDEXED_THROUGH_KEY, last)?;
     }
     Ok(())
+}
+
+/// Leave the postings of the events `txn` inserts to a key-ordered pass, when
+/// the next backfill step would begin one: the table is in this layout, at
+/// marker 0, and no pass runs. A pass begins only after this transaction
+/// commits, so its target covers these events and its walk visits each of
+/// their `Event__tag` entries. The write path then puts no postings for them
+/// and leaves the marker at 0, which keeps the table incomplete until that
+/// pass ends. Deletions still remove postings, and backfill steps still put
+/// theirs. Returns whether `txn` defers; in any other state it posts as usual.
+///
+/// For a bulk load, which in key order writes a fraction of the pages that
+/// postings in arrival order rewrite. `wok import` runs the pass before it
+/// exits; stopped earlier, the relay's writer finishes it.
+///
+/// Nothing is deferred while another process has the database open
+/// ([`crate::Env::open_in_another_process`]). A relay's writer would begin
+/// the pass after the first deferring transaction; the later ones would then
+/// post as usual, and the pass's end would leave their events to local-id
+/// steps, which costs more than posting them as they arrive. Correctness does
+/// not depend on this check, only the cost of the load.
+pub fn defer_tag_kind_postings(txn: &mut RwTxn<'_>) -> Result<bool, DbError> {
+    let dbis = txn.env().dbis();
+    let (Some(dbi), Some(build)) = (dbis.event_tag_kind, dbis.event_tag_kind_build) else {
+        return Ok(false);
+    };
+    let unbuilt = marker(txn.get(dbi, SCHEMA_KEY)?) == Some(TAG_KIND_SCHEMA_VERSION)
+        && marker(txn.get(dbi, INDEXED_THROUGH_KEY)?).unwrap_or(0) == 0
+        && read_pass(
+            txn.get(build, PASS_TARGET_KEY)?,
+            txn.get(build, PASS_VISITED_KEY)?,
+        )
+        .is_none();
+    let defer = unbuilt && !txn.env().open_in_another_process()?;
+    txn.defer_tag_kind = defer;
+    Ok(defer)
 }
 
 /// Empty the table and restart its marker at 0, so that the backfill indexes
@@ -985,6 +1037,166 @@ mod tests {
         assert_eq!(state(&env).bulk_pass, None);
 
         assert_eq!(progress(step(&env, 10)), (5, 5, None));
+        assert_complete_and_consistent(&env);
+    }
+
+    /// Write one event per time in one transaction that defers its postings
+    /// if it may, as an import batch does. Returns whether it deferred.
+    fn write_deferred(env: &Env, times: impl IntoIterator<Item = u64>) -> bool {
+        let mut events: Vec<_> = times.into_iter().map(event).collect();
+        let mut txn = env.begin_rw().unwrap();
+        let deferred = defer_tag_kind_postings(&mut txn).unwrap();
+        crate::write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        deferred
+    }
+
+    fn build(env: &Env) {
+        while !state(env).complete() {
+            step(env, 7);
+        }
+    }
+
+    #[test]
+    fn deferred_postings_are_left_to_a_key_ordered_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        // The first batch of a new database starts at local id 1, which a
+        // marker at 0 covers: noting it would mark the empty table complete.
+        assert!(write_deferred(&env, 100..110));
+        assert!(write_deferred(&env, 110..120));
+        let deferred = state(&env);
+        assert_eq!((deferred.indexed_through, deferred.high_water), (0, 20));
+        assert!(!deferred.complete());
+        assert_eq!(postings(&env), 0);
+        // Integrity expects no entries above the marker.
+        assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
+
+        assert_eq!(progress(step(&env, 7)), (7, 0, Some(7)));
+        build(&env);
+        assert_eq!(state(&env).indexed_through, 20);
+        assert_eq!(postings(&env), 20);
+        assert_complete_and_consistent(&env);
+        // Once built, writes post again.
+        assert!(!write_deferred(&env, [200]));
+        assert_eq!(state(&env).indexed_through, 21);
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn a_pass_over_a_database_from_before_the_table_covers_deferred_writes() {
+        let (_dir, env) = unindexed(5);
+        assert!(write_deferred(&env, 200..205));
+        let unbuilt = state(&env);
+        assert_eq!((unbuilt.indexed_through, unbuilt.high_water), (0, 10));
+        assert_eq!(postings(&env), 0);
+        build(&env);
+        assert_eq!(postings(&env), 10);
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn postings_are_deferred_only_before_a_pass_begins() {
+        // While a pass runs, its target is below the new events and its
+        // cursor may be past their keys, so they are posted as usual.
+        let (_dir, env) = unindexed(10);
+        step(&env, 4);
+        assert!(!write_deferred(&env, [200]));
+        assert_eq!(postings(&env), 5);
+        build(&env);
+        assert_complete_and_consistent(&env);
+        // Behind a nonzero marker, as an earlier release leaves it.
+        let earlier = write(&env, 201);
+        as_if_inserted_by_an_earlier_release(&env, &earlier, earlier.lev_id - 1);
+        assert!(!write_deferred(&env, [202]));
+        build(&env);
+        assert_complete_and_consistent(&env);
+    }
+
+    const READER_DATABASE: &str = "WOK_DB_TAG_KIND_READER_DATABASE";
+    const READER_READY: &str = "WOK_DB_TAG_KIND_READER_READY";
+
+    /// Run as a child process by the test below: read from the database, as
+    /// a relay's writer does when it starts, and wait to be killed.
+    #[test]
+    fn reader_child() {
+        let Some(path) = std::env::var_os(READER_DATABASE) else {
+            return;
+        };
+        let env = Env::open(path, EnvOptions::for_tests()).unwrap();
+        drop(env.begin_ro().unwrap());
+        std::fs::write(std::env::var_os(READER_READY).unwrap(), "ready").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn postings_are_not_deferred_while_another_process_has_the_database_open() {
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+        struct KillOnDrop(Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let defers = |env: &Env| {
+            let mut txn = env.begin_rw().unwrap();
+            defer_tag_kind_postings(&mut txn).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        // This process's own readers do not count.
+        drop(env.begin_ro().unwrap());
+        assert!(!env.open_in_another_process().unwrap());
+        assert!(defers(&env));
+
+        let ready_dir = tempfile::tempdir().unwrap();
+        let ready = ready_dir.path().join("ready");
+        let mut child = KillOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tag_kind::tests::reader_child", "--nocapture"])
+                .env(READER_DATABASE, dir.path())
+                .env(READER_READY, &ready)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "reader exited");
+            assert!(Instant::now() < deadline, "reader never read");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(env.open_in_another_process().unwrap());
+        assert!(!defers(&env));
+
+        // A process that died leaves its slot behind; the check clears it.
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(!env.open_in_another_process().unwrap());
+        assert!(defers(&env));
+    }
+
+    #[test]
+    fn a_deferring_transaction_still_deletes_postings() {
+        // A write while no pass runs posts its event without moving the
+        // marker; a deferring batch that then deletes that event must
+        // remove its posting, or the pass would leave it stale.
+        let (_dir, env) = unindexed(3);
+        let posted = write(&env, 50);
+        assert_eq!(postings(&env), 1);
+        let mut txn = env.begin_rw().unwrap();
+        assert!(defer_tag_kind_postings(&mut txn).unwrap());
+        crate::delete_events(&mut txn, &mut NoopNegentropy, [posted.lev_id]).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(postings(&env), 0);
+        build(&env);
+        assert_eq!(postings(&env), 3);
         assert_complete_and_consistent(&env);
     }
 

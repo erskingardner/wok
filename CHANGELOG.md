@@ -400,6 +400,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acknowledged but lost, refused (counted by reason), or unanswered and then
   stored or not. A relay the harness starts is reconciled when the run ends,
   and a lost write or a stored refusal fails the trial.
+- `scripts/benchmark-campaign.sh` can import the social corpus
+  (`CORPUS_MIX=social`) and measure publication capacity (#226). With
+  `RATE_STEPS`, each relay publishes at fixed rates that rise step by step
+  until one misses its targets: everything sent on time, accepted and
+  answered within `RATE_P99_MS`. The last step that met them is recorded as
+  the relay's capacity. Once the relay stops, every step's outcome log is
+  reconciled with its exported database, and a lost write or a stored
+  refusal fails the campaign. The query phases still need the realistic
+  corpus.
 - `wok-bench --scenario nip77_catchup` measures NIP-77 catch-up against a
   relay that holds a corpus (#226): an archive mirror syncing the corpus in
   time windows, or a Marmot app syncing each group's 445 messages at start.

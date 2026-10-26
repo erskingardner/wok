@@ -47,6 +47,7 @@ usage: benchmark-relay-control check TARGET...
        benchmark-relay-control start TARGET ARTIFACTS [--cache cold|warm]
            [--cpus LIST] [--memory SIZE] [--nofile N] [--ready-timeout SECS]
        benchmark-relay-control collect-stop TARGET ARTIFACTS
+       benchmark-relay-control reconcile TARGET WOK_BENCH DIR [--nofile N]
        benchmark-relay-control drop-snapshot TARGET
        benchmark-relay-control stop-all
        benchmark-relay-control status
@@ -630,6 +631,40 @@ collect_stop() {
     [[ $state == active ]] || die "$UNIT was $state, not active, when the run ended"
 }
 
+# Exports the stopped target's database once, under the import's limits,
+# and reconciles each fixed-rate outcome log DIR/<step>/outcomes.jsonl with
+# it, writing DIR/<step>/reconciliation.json. Fails when any step has an
+# acknowledged event missing or a refused event stored.
+reconcile_steps() {
+    local target=$1
+    local bench=$2
+    local dir=$3
+    shift 3
+    load_target "$target"
+    parse_run_options "nofile" "$@"
+    assert_benchmark_path "$dir"
+    [[ $bench == /* && -x $bench ]] || die "WOK_BENCH must be the absolute path of an executable"
+    [[ $(systemctl show "$UNIT" -p ActiveState --value) != active ]] ||
+        die "stop $TARGET before reconciling with its export"
+    local logs=("$dir"/*/outcomes.jsonl)
+    [[ -f ${logs[0]} ]] || die "no outcome logs under $dir"
+    local export=$DB_ROOT/reconcile-export.jsonl
+    unit_properties
+    if ! systemd-run --quiet --wait --pipe --collect --unit="$EXPORT_UNIT" "${UNIT_PROPS[@]}" \
+        -- "$BINARY" --config "$CONFIG" export >"$export"; then
+        rm -f -- "$export"
+        die "$TARGET export failed"
+    fi
+    local log step status=0
+    for log in "${logs[@]}"; do
+        step=$(dirname -- "$log")
+        "$bench" --reconcile "$log" --relay-export "$export" --out "$step" \
+            >"$step/reconcile.txt" 2>&1 || status=1
+    done
+    rm -f -- "$export"
+    return "$status"
+}
+
 check_targets() {
     local tool
     for tool in systemd-run systemctl journalctl ss nstat pidstat mpstat iostat runuser \
@@ -678,6 +713,10 @@ main() {
         collect-stop)
             [[ $# -eq 2 ]] || usage
             collect_stop "$@"
+            ;;
+        reconcile)
+            [[ $# -ge 3 ]] || usage
+            reconcile_steps "$@"
             ;;
         drop-snapshot)
             [[ $# -eq 1 ]] || usage

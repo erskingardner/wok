@@ -943,18 +943,26 @@ the operator host needs jq.
 Any number of relay targets take turns on one relay host, and a second host
 generates the load. It:
 
-1. generates one signed realistic corpus on the load host;
+1. generates one signed corpus on the load host: realistic, or with
+   `CORPUS_MIX=social` a public social relay's history of `SOCIAL_AUTHORS`
+   authors;
 2. copies and checksum-verifies that exact file on the relay host;
 3. for each target, stops every benchmark relay, then restores the target's
    database snapshot or resets the database, imports with signature
-   verification and confirms the exported retained count;
+   verification and confirms the exported retained count: the whole
+   realistic corpus, or the `corpus.social.retained` count from the social
+   corpus's `manifest.json`;
 4. starts only that target, on an emptied page cache, and captures provenance,
    per-thread process, per-CPU, disk, socket, network, Prometheus, journal,
    binary/config hash, import and database-size evidence;
-5. runs query latency, deep pagination, mixed reads/writes, scaled publication,
-   live fanout, idle connections and lifecycle publication, recording the load
-   host's per-CPU utilization for each phase; and
-6. rotates the target order each repetition, so over as many repetitions as
+5. runs query latency, deep pagination and mixed reads/writes (realistic
+   corpus only, since their expected results assume a relay keeps every
+   corpus event), then scaled publication, live fanout, idle connections and
+   lifecycle publication, and then the fixed-rate steps of `RATE_STEPS`,
+   recording the load host's per-CPU utilization for each phase;
+6. stops the relay and reconciles each fixed-rate step's outcome log with
+   one export of its database; and
+7. rotates the target order each repetition, so over as many repetitions as
    targets each target runs once in each position, and leaves every relay
    stopped.
 
@@ -1057,11 +1065,47 @@ RELAY_SSH=root@RELAY_SSH_IP LOAD_SSH=root@LOAD_SSH_IP RELAY_HOST=RELAY_PRIVATE_I
 `RELAY_SSH`, `LOAD_SSH`, `RELAY_HOST` (the relay host's address as the load
 host reaches it) and `TARGETS` are required. The other settings are
 `RELAY_CPUS`, `RELAY_MEMORY`, `CACHE`, `SNAPSHOTS`, `READY_TIMEOUT`,
-`LOAD_CPUS`, `BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`, `QUERIES`, `DEEP_PAGES`,
-`REPETITIONS`, `PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
+`LOAD_CPUS`, `BENCH_BIN`, `RELAY_BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`,
+`CORPUS_MIX`, `SOCIAL_AUTHORS`, `QUERIES`, `DEEP_PAGES`, `REPETITIONS`,
+`PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
 `IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`,
-`LIFECYCLE_CONNECTIONS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED` and
-`BASE_TIMESTAMP`.
+`LIFECYCLE_CONNECTIONS`, `RATE_STEPS`, `RATE_SECS`, `RATE_DRAIN_SECS`,
+`RATE_CONNECTIONS`, `RATE_P99_MS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED`
+and `BASE_TIMESTAMP`.
+
+A social corpus needs targets that accept its largest events: its manifest
+gives `needed_max_event_size`, and strfry's default `events.maxEventSize` of
+64 KiB is too small. A target that refuses some fails the retained-count
+check at import.
+
+#### Fixed-rate capacity steps
+
+`RATE_STEPS` lists rising rates in events per second, for example
+`"1000 2000 5000 10000 20000"`. After the other phases, each target runs
+`ws_publish_rate` at each rate in turn for `RATE_SECS` (default 180) over
+`RATE_CONNECTIONS` connections (default 64), waiting up to `RATE_DRAIN_SECS`
+(default 10) for the last replies. Each step signs fresh realistic events from
+its own seed, `SEED` plus the step's position. A step meets its targets when
+the relay kept up with the whole schedule: every event was sent at the
+intended rate on connections that stayed open, and each was accepted, none
+refused or left unanswered, with publish-to-OK p99 within `RATE_P99_MS`
+(default 250). The sweep stops after the first step that misses, and
+`rate-capacity.txt` beside the phases records the last step that met its
+targets (`capacity`, 0 for none) and the first that missed. A missed step is a
+result, not a failed campaign. A step that left no fixed-rate report, and so
+no complete outcome log, fails the campaign, as does an OK that names no event
+its connection sent.
+
+Once the relay has stopped, the campaign copies each step's outcome log to
+the relay host. `benchmark-relay-control reconcile` exports the database
+once, under the import's limits, and runs the relay host's `wok-bench`
+(`RELAY_BENCH_BIN`, default `/opt/relay-bench/bin/wok-bench/wok-bench`)
+with `--reconcile` against each log. Each step's `reconciliation.json` is
+copied back beside its results. The campaign fails when a step it started
+has no outcome log, when a log holds fewer events than its step planned, or
+when an acknowledged event is missing from the export or a refused one was
+stored. This runs even when the relay stopped on its own during the run. The relay host's `wok-bench` must
+include `--reconcile`.
 
 Lifecycle publication defaults to one ordered connection because a deletion
 request must follow the event it references. Scaled publication is measured in

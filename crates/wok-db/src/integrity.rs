@@ -18,6 +18,10 @@ use wok_event::PackedEventView;
 
 const MAX_REPORTED_ISSUES: usize = 100;
 
+/// Local-id buckets in a [`PostingBalance`]: 8 MiB of counters, whatever the
+/// size of the database.
+const BALANCE_BUCKETS: usize = 1 << 20;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntegrityIssue {
     pub category: &'static str,
@@ -150,6 +154,111 @@ impl IntegrityReport {
 
 fn read_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_ne_bytes(bytes.try_into().ok()?))
+}
+
+/// Balances one table's postings against the entries their events derive, so
+/// that each event's entries are derived once rather than once per posting.
+/// The event pass subtracts, in the bucket of the event's local id, each entry
+/// it derives and finds stored; the postings pass adds each posting that names
+/// an event the event pass derived, a lookup with no derivation. Every bucket
+/// then holds the postings that its events do not derive. Only the events of
+/// a bucket left positive are derived again, to name those postings.
+struct PostingBalance(Vec<i64>);
+
+impl PostingBalance {
+    fn new(buckets: usize) -> Self {
+        Self(vec![0; buckets])
+    }
+
+    fn bucket(&self, lev_id: u64) -> usize {
+        (lev_id % self.0.len() as u64) as usize
+    }
+
+    /// The event pass found an entry of the event at `lev_id` stored.
+    fn derived(&mut self, lev_id: u64) {
+        let bucket = self.bucket(lev_id);
+        self.0[bucket] -= 1;
+    }
+
+    /// A posting names the readable event at `lev_id`.
+    fn stored(&mut self, lev_id: u64) {
+        let bucket = self.bucket(lev_id);
+        self.0[bucket] += 1;
+    }
+
+    /// Postings that their event does not derive.
+    fn unexpected(&self) -> u64 {
+        self.0.iter().map(|&count| count.max(0) as u64).sum()
+    }
+
+    /// Whether the bucket of `lev_id` holds postings not named yet.
+    fn suspect(&self, lev_id: u64) -> bool {
+        self.0[self.bucket(lev_id)] > 0
+    }
+
+    /// One of the postings of the bucket of `lev_id` is named.
+    fn named(&mut self, lev_id: u64) {
+        let bucket = self.bucket(lev_id);
+        self.0[bucket] -= 1;
+    }
+}
+
+/// Report the postings of `dbi` that `balance` counted as unexpected, in key
+/// order, while the report has room. `unexpected` derives the event of a
+/// posting in a suspect bucket and gives the issue's detail when it is one
+/// that the balance counted and that its event does not derive.
+fn name_unexpected_postings(
+    txn: &RoTxn<'_>,
+    dbi: MDB_dbi,
+    table: &'static str,
+    balance: &mut PostingBalance,
+    report: &mut IntegrityReport,
+    mut unexpected: impl FnMut(&[u8], u64) -> Option<String>,
+) -> Result<(), DbError> {
+    let mut remaining = balance.unexpected();
+    if remaining == 0 || report.issues.len() >= MAX_REPORTED_ISSUES {
+        return Ok(());
+    }
+    txn.foreach_full(dbi, &[], &[], false, |key, value| {
+        let Some(lev_id) = read_u64(value) else {
+            return true;
+        };
+        if !balance.suspect(lev_id) {
+            return true;
+        }
+        if let Some(detail) = unexpected(key, lev_id) {
+            balance.named(lev_id);
+            remaining -= 1;
+            report.issue("unexpected-index", table, detail);
+        }
+        remaining > 0 && report.issues.len() < MAX_REPORTED_ISSUES
+    })?;
+    Ok(())
+}
+
+/// Whether the event pass derives the entries of the event at `lev_id`: it is
+/// stored, with a PackedEvent long enough to read.
+fn readable_event(txn: &RoTxn<'_>, lev_id: u64) -> bool {
+    matches!(
+        txn.get_u64(txn.env().dbis().event, lev_id),
+        Ok(Some(raw)) if PackedEventView::new(raw).is_ok()
+    )
+}
+
+/// Whether the event at `lev_id`, whose payload is `payload`, derives the
+/// search posting `key`.
+fn derives_search_posting(
+    txn: &RoTxn<'_>,
+    decompressor: &mut Decompressor,
+    payload: &[u8],
+    lev_id: u64,
+    key: &[u8],
+) -> bool {
+    decompressor
+        .decode(txn, payload, 16 * 1024 * 1024)
+        .ok()
+        .and_then(|json| search_index_entries(lev_id, json).ok())
+        .is_some_and(|entries| entries.iter().any(|(expected, _)| expected == key))
 }
 
 fn entry_exists(txn: &RoTxn<'_>, entry: &EventIndexEntry) -> Result<bool, DbError> {
@@ -432,6 +541,7 @@ fn check_tag_kind_postings(
     txn: &RoTxn<'_>,
     dbi: MDB_dbi,
     tag_kind: &mut TagKindIndexReport,
+    balance: &mut PostingBalance,
     report: &mut IntegrityReport,
 ) -> Result<(), DbError> {
     const TABLE: &str = "event_tag_kind";
@@ -467,17 +577,11 @@ fn check_tag_kind_postings(
             }
         };
         match txn.get_u64(txn.env().dbis().event, lev_id) {
-            Ok(Some(raw)) => match PackedEventView::new(raw) {
-                Ok(packed) if tag_kind_keys(packed).iter().any(|expected| expected == key) => {}
-                Ok(_) => {
-                    tag_kind.unexpected_entries += 1;
-                    report.issue("unexpected-index", TABLE, format!("levId {lev_id}"));
-                }
-                Err(_) => {
-                    tag_kind.unexpected_entries += 1;
-                    report.issue("unverifiable-index", TABLE, format!("levId {lev_id}"));
-                }
-            },
+            Ok(Some(raw)) if PackedEventView::new(raw).is_ok() => balance.stored(lev_id),
+            Ok(Some(_)) => {
+                tag_kind.unexpected_entries += 1;
+                report.issue("unverifiable-index", TABLE, format!("levId {lev_id}"));
+            }
             Ok(None) => {
                 tag_kind.stale_entries += 1;
                 report.issue("stale-index", TABLE, format!("levId {lev_id}"));
@@ -489,7 +593,93 @@ fn check_tag_kind_postings(
         }
         true
     })?;
-    Ok(())
+    tag_kind.unexpected_entries += balance.unexpected();
+    name_unexpected_postings(txn, dbi, TABLE, balance, report, |key, lev_id| {
+        if is_tag_kind_marker(key) || key.len() <= 16 {
+            return None;
+        }
+        let raw = txn.get_u64(txn.env().dbis().event, lev_id).ok()??;
+        let packed = PackedEventView::new(raw).ok()?;
+        (!tag_kind_keys(packed).iter().any(|expected| expected == key))
+            .then(|| format!("levId {lev_id}"))
+    })
+}
+
+/// Check every `wok_Event__search` posting against the payload it names.
+fn check_search_postings(
+    txn: &RoTxn<'_>,
+    dbi: MDB_dbi,
+    balance: &mut PostingBalance,
+    report: &mut IntegrityReport,
+) -> Result<(), DbError> {
+    const TABLE: &str = "event_search";
+    let payloads = txn.env().dbis().event_payload;
+    let mut decompressor = Decompressor::new();
+    txn.foreach_full(dbi, &[], &[], false, |key, value| {
+        if is_search_marker(key) {
+            if read_u64(value).is_none() {
+                report.malformed_records += 1;
+                report.issue(
+                    "malformed-value",
+                    TABLE,
+                    format!("marker value has {} bytes, expected 8", value.len()),
+                );
+            }
+            return true;
+        }
+        report.actual_index_entries += 1;
+        let Some(term) = search_term_from_key(key) else {
+            report.malformed_records += 1;
+            report.extra_index_entries += 1;
+            report.issue("malformed-key", TABLE, "invalid term key".into());
+            return true;
+        };
+        let Some(lev_id) = read_u64(value) else {
+            report.malformed_records += 1;
+            report.extra_index_entries += 1;
+            report.issue(
+                "malformed-value",
+                TABLE,
+                format!("value has {} bytes, expected 8", value.len()),
+            );
+            return true;
+        };
+        let payload = match txn.get_u64(payloads, lev_id) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => {
+                report.extra_index_entries += 1;
+                report.issue("dangling-index", TABLE, format!("levId {lev_id}"));
+                return true;
+            }
+            Err(error) => {
+                report.lookup_errors += 1;
+                report.issue("lookup", TABLE, error.to_string());
+                return true;
+            }
+        };
+        // The event pass derived the entries of a readable event. A payload
+        // without one, orphaned or under a PackedEvent too short, is rare:
+        // derive it here.
+        if readable_event(txn, lev_id) {
+            balance.stored(lev_id);
+        } else if !derives_search_posting(txn, &mut decompressor, payload, lev_id, key) {
+            report.extra_index_entries += 1;
+            report.issue(
+                "unexpected-index",
+                TABLE,
+                format!("term {term:?}, levId {lev_id}"),
+            );
+        }
+        true
+    })?;
+    report.extra_index_entries += balance.unexpected();
+    name_unexpected_postings(txn, dbi, TABLE, balance, report, |key, lev_id| {
+        let term = search_term_from_key(key)?;
+        let payload = txn.get_u64(payloads, lev_id).ok()??;
+        (readable_event(txn, lev_id)
+            && !derives_search_posting(txn, &mut decompressor, payload, lev_id, key))
+        .then(|| format!("term {term:?}, levId {lev_id}"))
+    })
 }
 
 /// Check the records of a key-ordered pass in progress.
@@ -533,9 +723,18 @@ fn index_specs(txn: &RoTxn<'_>) -> [(&'static str, MDB_dbi); 10] {
 }
 
 pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
+    check_integrity_with_buckets(txn, BALANCE_BUCKETS)
+}
+
+fn check_integrity_with_buckets(
+    txn: &RoTxn<'_>,
+    buckets: usize,
+) -> Result<IntegrityReport, DbError> {
     let dbis = txn.env().dbis();
     let mut report = IntegrityReport::default();
     let mut search_decompressor = Decompressor::new();
+    let mut search_balance = PostingBalance::new(buckets);
+    let mut tag_kind_balance = PostingBalance::new(buckets);
     let mut authors = HashMap::<[u8; 32], u64>::new();
     let mut largest_id = 0;
     let tag_entries = txn.entries(dbis.event_tag)? as u64;
@@ -606,7 +805,10 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
             report.legacy_untombstoned_deletions += 1;
         }
         if let (Some(dbi), Some(tag_kind)) = (dbis.event_tag_kind, tag_kind.as_mut()) {
-            if lev_id <= tag_kind_through {
+            // Only events at or below the marker must have their entries,
+            // but any stored event may: the balance needs them all.
+            if tag_kind.verifiable() {
+                let required = lev_id <= tag_kind_through;
                 for key in tag_kind_keys(packed) {
                     let entry = EventIndexEntry {
                         name: "event_tag_kind",
@@ -615,13 +817,16 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
                         value: lev_id.to_ne_bytes().to_vec(),
                         legacy_optional: false,
                     };
-                    tag_kind.expected_entries += 1;
+                    if required {
+                        tag_kind.expected_entries += 1;
+                    }
                     match entry_exists(txn, &entry) {
-                        Ok(true) => {}
-                        Ok(false) => {
+                        Ok(true) => tag_kind_balance.derived(lev_id),
+                        Ok(false) if required => {
                             tag_kind.missing_entries += 1;
                             report.issue("missing-index", entry.name, format!("levId {lev_id}"));
                         }
+                        Ok(false) => {}
                         Err(error) => {
                             report.lookup_errors += 1;
                             report.issue("lookup", entry.name, error.to_string());
@@ -662,7 +867,7 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
                         };
                         report.expected_index_entries += 1;
                         match entry_exists(txn, &entry) {
-                            Ok(true) => {}
+                            Ok(true) => search_balance.derived(lev_id),
                             Ok(false) => {
                                 report.missing_index_entries += 1;
                                 report.issue(
@@ -780,72 +985,11 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
     }
 
     if let Some(search_dbi) = dbis.event_search {
-        let mut decompressor = Decompressor::new();
-        txn.foreach_full(search_dbi, &[], &[], false, |key, value| {
-            if is_search_marker(key) {
-                if read_u64(value).is_none() {
-                    report.malformed_records += 1;
-                    report.issue(
-                        "malformed-value",
-                        "event_search",
-                        format!("marker value has {} bytes, expected 8", value.len()),
-                    );
-                }
-                return true;
-            }
-            report.actual_index_entries += 1;
-            let Some(term) = search_term_from_key(key) else {
-                report.malformed_records += 1;
-                report.extra_index_entries += 1;
-                report.issue("malformed-key", "event_search", "invalid term key".into());
-                return true;
-            };
-            let Some(lev_id) = read_u64(value) else {
-                report.malformed_records += 1;
-                report.extra_index_entries += 1;
-                report.issue(
-                    "malformed-value",
-                    "event_search",
-                    format!("value has {} bytes, expected 8", value.len()),
-                );
-                return true;
-            };
-            let payload = match txn.get_u64(dbis.event_payload, lev_id) {
-                Ok(Some(payload)) => payload.to_vec(),
-                Ok(None) => {
-                    report.extra_index_entries += 1;
-                    report.issue("dangling-index", "event_search", format!("levId {lev_id}"));
-                    return true;
-                }
-                Err(error) => {
-                    report.lookup_errors += 1;
-                    report.issue("lookup", "event_search", error.to_string());
-                    return true;
-                }
-            };
-            let valid = decompressor
-                .decode(txn, &payload, 16 * 1024 * 1024)
-                .ok()
-                .and_then(|json| search_index_entries(lev_id, json).ok())
-                .is_some_and(|entries| {
-                    entries.iter().any(|(expected_key, expected_value)| {
-                        expected_key == key && expected_value == value
-                    })
-                });
-            if !valid {
-                report.extra_index_entries += 1;
-                report.issue(
-                    "unexpected-index",
-                    "event_search",
-                    format!("term {term:?}, levId {lev_id}"),
-                );
-            }
-            true
-        })?;
+        check_search_postings(txn, search_dbi, &mut search_balance, &mut report)?;
     }
 
     if let (Some(dbi), Some(tag_kind)) = (dbis.event_tag_kind, tag_kind.as_mut()) {
-        check_tag_kind_postings(txn, dbi, tag_kind, &mut report)?;
+        check_tag_kind_postings(txn, dbi, tag_kind, &mut tag_kind_balance, &mut report)?;
     }
     if let Some(build) = dbis.event_tag_kind_build {
         check_tag_kind_pass(txn, build, &mut report)?;
@@ -873,4 +1017,99 @@ pub fn check_integrity(txn: &RoTxn<'_>) -> Result<IntegrityReport, DbError> {
         }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tag_kind::tag_kind_key;
+    use crate::{write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
+    use serde_json::json;
+
+    fn note(time: u64, content: &str) -> EventToWrite {
+        use secp256k1::{Keypair, SecretKey, SECP256K1};
+        let secret = SecretKey::from_byte_array(&[7; 32]).unwrap();
+        let key = Keypair::from_secret_key(SECP256K1, &secret);
+        let mut value = json!({"pubkey":hex::encode(key.x_only_public_key().0.serialize()),
+            "kind":1,"created_at":time,"tags":[["t", "nostr"], ["p", "11".repeat(32)]],
+            "content":content});
+        let id = wok_event::event_id_hash(&value).unwrap();
+        value["id"] = json!(hex::encode(id));
+        value["sig"] = json!(hex::encode(
+            SECP256K1.sign_schnorr_no_aux_rand(&id, &key).as_ref()
+        ));
+        let parsed =
+            wok_event::parse_and_verify_event(&value, &Default::default(), None, true, false)
+                .unwrap();
+        EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+    }
+
+    /// With every event in one bucket, each posting of every event is
+    /// suspect, and the check still names exactly the unexpected ones.
+    #[test]
+    fn one_bucket_names_the_same_postings_as_many() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut events = (0..4)
+            .map(|i| note(1_000 + i, &format!("alpha beta n{i}")))
+            .collect::<Vec<_>>();
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+
+        let lev = |i: usize| events[i].lev_id.to_ne_bytes();
+        let search = env.dbis().event_search.unwrap();
+        let tag_kind = env.dbis().event_tag_kind.unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        txn.put(search, b"\x01bogus", &lev(1), 0).unwrap();
+        txn.put(search, b"\x01n0", &lev(3), 0).unwrap();
+        assert!(txn.del(search, b"\x01n2", Some(&lev(2))).unwrap());
+        txn.put(search, b"\x01alpha", &99u64.to_ne_bytes(), 0)
+            .unwrap();
+        txn.put(
+            tag_kind,
+            &tag_kind_key(b't', b"nostr", 7, 1_000),
+            &lev(0),
+            0,
+        )
+        .unwrap();
+        txn.put(tag_kind, &tag_kind_key(b't', b"rust", 1, 1_002), &lev(2), 0)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro().unwrap();
+        let shared = check_integrity_with_buckets(&txn, 1).unwrap();
+        assert_eq!(shared.missing_index_entries, 1, "{shared:#?}");
+        assert_eq!(shared.extra_index_entries, 3, "{shared:#?}");
+        let tag_kind = shared.tag_kind_index.as_ref().unwrap();
+        assert_eq!(tag_kind.unexpected_entries, 2, "{tag_kind:#?}");
+        let unexpected = shared
+            .issues
+            .iter()
+            .filter(|issue| issue.category == "unexpected-index")
+            .map(|issue| (issue.table, issue.detail.as_str()))
+            .collect::<Vec<_>>();
+        let detail = |term: &str, i: usize| format!("term {term:?}, levId {}", events[i].lev_id);
+        assert_eq!(
+            unexpected,
+            [
+                ("event_search", detail("bogus", 1).as_str()),
+                ("event_search", detail("n0", 3).as_str()),
+                (
+                    "event_tag_kind",
+                    format!("levId {}", events[0].lev_id).as_str()
+                ),
+                (
+                    "event_tag_kind",
+                    format!("levId {}", events[2].lev_id).as_str()
+                ),
+            ]
+        );
+        let many = check_integrity(&txn).unwrap();
+        assert_eq!(
+            serde_json::to_value(&shared).unwrap(),
+            serde_json::to_value(&many).unwrap()
+        );
+    }
 }

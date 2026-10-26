@@ -9,8 +9,9 @@ use tempfile::TempDir;
 use wok_db::keys::parse_key_string_u64;
 use wok_db::{
     check_integrity, delete_events, get_packed_ro, rebuild_primary_and_event_indices,
-    sweep_vanished_events, tag_kind_index_state_ro, tag_kind_key, write_events_with_policy, Env,
-    EnvOptions, EventToWrite, EventWriteStatus, NoopNegentropy, PackedEventRebuild, VanishPolicy,
+    reset_tag_kind_index, sweep_vanished_events, tag_kind_index_state_ro, tag_kind_key,
+    write_events_with_policy, Env, EnvOptions, EventToWrite, EventWriteStatus, NoopNegentropy,
+    PackedEventRebuild, VanishPolicy,
 };
 use wok_event::PackedEventView;
 
@@ -372,4 +373,103 @@ fn reindex_rebuilds_the_index_the_write_path_keeps() {
         .unwrap()
         .unwrap();
     assert_eq!(state.high_water, source_state.high_water);
+}
+
+/// Three tagged notes by one author.
+fn tagged_events(env: &Env) -> Vec<EventToWrite> {
+    let author = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    let mut events = (0..3)
+        .map(|i| {
+            signed(
+                &author,
+                1,
+                1_000 + i,
+                json!([["p", "11".repeat(32)], ["t", format!("t{i}")]]),
+            )
+            .1
+        })
+        .collect::<Vec<_>>();
+    write(env, &mut events);
+    events
+}
+
+/// The `event_tag_kind` issues, as `(category, detail)`, sorted.
+fn tag_kind_issues(report: &wok_db::IntegrityReport) -> Vec<(&'static str, String)> {
+    let mut issues = report
+        .issues
+        .iter()
+        .filter(|issue| issue.table == "event_tag_kind")
+        .map(|issue| (issue.category, issue.detail.clone()))
+        .collect::<Vec<_>>();
+    issues.sort();
+    issues
+}
+
+#[test]
+fn integrity_checks_entries_of_events_above_the_marker() {
+    let dir = TempDir::new().unwrap();
+    let env = open(&dir);
+    let events = tagged_events(&env);
+    let dbi = env.dbis().event_tag_kind.unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    reset_tag_kind_index(&mut txn).unwrap();
+    // An event above the marker may have its entries, but no others.
+    for key in tag_kind_keys(&events[0].packed) {
+        txn.put(dbi, &key, &events[0].lev_id.to_ne_bytes(), 0)
+            .unwrap();
+    }
+    let view = PackedEventView::new(&events[1].packed).unwrap();
+    let unexpected = tag_kind_key(b't', b"t0", 1, view.created_at());
+    txn.put(dbi, &unexpected, &events[1].lev_id.to_ne_bytes(), 0)
+        .unwrap();
+    txn.commit().unwrap();
+
+    let report = check_integrity(&env.begin_ro().unwrap()).unwrap();
+    assert!(!report.ok());
+    let tag_kind = report.tag_kind_index.as_ref().unwrap();
+    assert!(!tag_kind.complete);
+    assert_eq!(tag_kind.state.indexed_through, 0);
+    assert_eq!((tag_kind.expected_entries, tag_kind.actual_entries), (0, 3));
+    assert_eq!(tag_kind.missing_entries, 0, "{tag_kind:?}");
+    assert_eq!(tag_kind.unexpected_entries, 1, "{tag_kind:?}");
+    assert_eq!(
+        tag_kind_issues(&report),
+        [("unexpected-index", format!("levId {}", events[1].lev_id))]
+    );
+}
+
+#[test]
+fn integrity_reports_malformed_and_unverifiable_entries() {
+    let dir = TempDir::new().unwrap();
+    let env = open(&dir);
+    let events = tagged_events(&env);
+    let dbi = env.dbis().event_tag_kind.unwrap();
+    let broken = events[2].lev_id;
+    let mut txn = env.begin_rw().unwrap();
+    txn.put(dbi, b"short key", &broken.to_ne_bytes(), 0)
+        .unwrap();
+    let key = tag_kind_key(b't', b"t9", 1, 1_000);
+    txn.put(dbi, &key, &7u32.to_ne_bytes(), 0).unwrap();
+    // The postings of an event whose PackedEvent is too short to read.
+    txn.put(env.dbis().event, &broken.to_ne_bytes(), b"short", 0)
+        .unwrap();
+    txn.commit().unwrap();
+
+    let report = check_integrity(&env.begin_ro().unwrap()).unwrap();
+    assert!(!report.ok());
+    assert_eq!(report.malformed_records, 2, "{report:#?}");
+    let tag_kind = report.tag_kind_index.as_ref().unwrap();
+    assert_eq!(tag_kind.missing_entries, 0, "{tag_kind:?}");
+    assert_eq!(tag_kind.unexpected_entries, 4, "{tag_kind:?}");
+    assert_eq!(tag_kind.stale_entries, 0, "{tag_kind:?}");
+    let unverifiable = format!("levId {broken}");
+    assert_eq!(
+        tag_kind_issues(&report),
+        [
+            ("malformed-record", "key has 19 bytes, value 4".to_string()),
+            ("malformed-record", "key has 9 bytes, value 8".to_string()),
+            ("unverifiable-index", unverifiable.clone()),
+            ("unverifiable-index", unverifiable),
+        ]
+    );
 }

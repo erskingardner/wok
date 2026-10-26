@@ -1965,8 +1965,13 @@ fn expected_history(events: &[Value], filter: &Value) -> Vec<Value> {
     matches
 }
 
+/// How long a historical REQ may take to reach its EOSE. Deep pages on a
+/// production-sized store can take tens of seconds (strfry #157), and the
+/// campaign records them rather than failing.
+const HISTORY_DEADLINE: Duration = Duration::from_secs(120);
+
 async fn read_history(socket: &mut ClientConnection, sid: &str) -> Result<Vec<Value>> {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(HISTORY_DEADLINE, async {
         let mut events = Vec::new();
         loop {
             let message = socket.next().await.context("closed before EOSE")??;

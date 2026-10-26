@@ -124,14 +124,39 @@ pub struct Limits {
 impl Limits {
     /// Account for one corpus line and its event's tags.
     pub fn observe(&mut self, line: &str, tags: &[Value]) {
+        self.observe_tags(
+            line,
+            tags.len(),
+            tags.iter()
+                .map(|tag| (tag[0].as_str().unwrap_or_default(), tag[1].as_str())),
+        );
+    }
+
+    /// [`Limits::observe`], given the event's `count` tags as their names
+    /// and values.
+    pub fn observe_tags<'a>(
+        &mut self,
+        line: &str,
+        count: usize,
+        tags: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+    ) {
         self.needed_max_event_size = self.needed_max_event_size.max(line.len() as u64 + 1);
-        self.most_tags = self.most_tags.max(tags.len() as u64);
-        for tag in tags {
-            if tag[0].as_str().is_some_and(|name| name.len() == 1) {
-                let bytes = tag[1].as_str().map_or(0, str::len) as u64;
+        self.most_tags = self.most_tags.max(count as u64);
+        for (name, value) in tags {
+            if name.len() == 1 {
+                let bytes = value.map_or(0, str::len) as u64;
                 self.largest_tag_value_bytes = self.largest_tag_value_bytes.max(bytes);
             }
         }
+    }
+
+    /// Limits that admit what both admit.
+    pub fn merge(&mut self, other: Limits) {
+        self.needed_max_event_size = self.needed_max_event_size.max(other.needed_max_event_size);
+        self.most_tags = self.most_tags.max(other.most_tags);
+        self.largest_tag_value_bytes = self
+            .largest_tag_value_bytes
+            .max(other.largest_tag_value_bytes);
     }
 }
 

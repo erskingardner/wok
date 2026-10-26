@@ -945,11 +945,12 @@ generates the load. It:
 4. starts only that target, on an emptied page cache, and captures provenance,
    per-thread process, per-CPU, disk, socket, network, Prometheus, journal,
    binary/config hash, import and database-size evidence;
-5. runs query latency, deep pagination and mixed reads/writes (realistic
-   corpus only, since their expected results assume a relay keeps every
-   corpus event), then scaled publication, live fanout, idle connections and
-   lifecycle publication, and then the fixed-rate steps of `RATE_STEPS`,
-   recording the load host's per-CPU utilization for each phase;
+5. runs query latency, deep pagination and mixed reads/writes against the
+   corpus (on a social corpus, the reads in
+   [Reading a social corpus](#reading-a-social-corpus)), then scaled
+   publication, live fanout, idle connections and lifecycle publication, and
+   then the fixed-rate steps of `RATE_STEPS`, recording the load host's
+   per-CPU utilization for each phase;
 6. stops the relay and reconciles each fixed-rate step's outcome log with
    one export of its database; and
 7. rotates the target order each repetition, so over as many repetitions as

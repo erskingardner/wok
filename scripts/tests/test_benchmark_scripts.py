@@ -483,16 +483,14 @@ class CampaignSettings(unittest.TestCase):
             self.assertFalse((load/'rate-2000/reconciliation.json').exists())
             self.assertTrue(any(line.startswith('control reconcile') for line in sent))
 
-    def test_social_campaign_skips_query_phases_and_expects_the_retained_count(self):
-        for mix, phases in [
-            ('realistic', ['query', 'deep-history', 'mixed-read-write', 'load', 'lifecycle']),
-            ('social', ['load', 'lifecycle']),
-        ]:
+    def test_campaign_reads_its_corpus_mix_and_expects_the_retained_count(self):
+        reads = ['query', 'deep-history', 'mixed-read-write']
+        for mix in ['realistic', 'social']:
             with self.subTest(mix=mix), tempfile.TemporaryDirectory() as tmp:
                 calls = Path(tmp)/'calls'
                 result = self.campaign(
                     f'remote_command() {{ printf "%s\\n" "$*" >>"{calls}"; echo 7777; }}; '
-                    f'run_bench() {{ echo "phase $4" >>"{calls}"; }}; '
+                    f'run_bench() {{ echo "phase $4 ${{*: -2:1}} ${{*: -1}}" >>"{calls}"; }}; '
                     f'rate_sweep() {{ echo sweep >>"{calls}"; }}; '
                     f'reconcile_rate_steps() {{ echo reconcile >>"{calls}"; }}; scp() {{ :; }}; '
                     'LOAD_ROOT=/l RELAY_ROOT=/r RELAY_CORPUS=/r/c LOAD_CORPUS=/l/c CAP_ARGS=() '
@@ -500,7 +498,10 @@ class CampaignSettings(unittest.TestCase):
                     CORPUS_MIX=mix, RATE_STEPS='1000')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 sent = calls.read_text().splitlines()
-                self.assertEqual([line[6:] for line in sent if line.startswith('phase ')], phases)
+                phases = [line.split()[1:] for line in sent if line.startswith('phase ')]
+                self.assertEqual([phase[0] for phase in phases], reads + ['load', 'lifecycle'])
+                for phase in phases[:3]:
+                    self.assertEqual(phase[1:], ['--event-mix', mix])
                 prepare = next(i for i, line in enumerate(sent) if ' prepare ' in line)
                 self.assertIn(' /r/c 933179 ', sent[prepare])
                 stop = next(i for i, line in enumerate(sent) if ' collect-stop ' in line)

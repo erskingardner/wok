@@ -363,6 +363,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pins the load generator, so it can run beside the relay over loopback. The
   relay and load hosts are required settings: the scripts no longer default
   to the old benchmark hosts' addresses.
+- `wok-bench --event-mix social --generate-corpus-only` writes a public
+  social relay's history at the scale of a large benchmark database: 100,000
+  authors with Zipf activity over two years, a reaction-, note- and
+  list-heavy kind mix, and real event sizes, such as follow lists of up to
+  2,000 follows and Marmot Welcomes (#226). Profiles and lists are replaced
+  and deletion requests delete, and the manifest gives the number of events a
+  relay keeps, which strfry 1.1.3 and Wok match on import.
 - `scripts/benchmark-qualify.sh` checks that two benchmark hosts are fit to
   measure on (#226). It records their hardware, and measures sync-write
   latency and random reads on the relay's database filesystem, the network

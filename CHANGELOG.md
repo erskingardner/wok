@@ -353,6 +353,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
+  changes to the crates, the script or the toolchain, so a pull request that
+  makes a relay function newly reachable, before authentication or after,
+  fails until its baseline in `crates/wok-compat/tests/reachability/` is
+  rewritten with the reason (#156).
 - `relay.search_enabled` turns NIP-50 search off (#153). Search was served
   and advertised in every configuration, so its query parser and ranked scan
   were reachable even in the `minimal` attack-surface profile, which turns

@@ -24,14 +24,15 @@ The baseline is `crates/wok-compat/tests/reachability/<profile>.txt`. `--check`
 fails when a phase reaches a function its baseline does not list, so code that
 becomes reachable before authentication is reviewed before it lands, and when a
 phase that reached functions reaches none, so a broken phase is not mistaken for
-a smaller surface; a function no longer reached is reported but does not fail. Needs `cargo-llvm-cov` and the
-`llvm-tools-preview` rustup component.
+a smaller surface; a function no longer reached is reported but does not fail. Needs `cargo-llvm-cov`,
+`rustfilt` and the `llvm-tools-preview` rustup component.
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,7 +52,16 @@ CLOSURE = re.compile(r"\{closure#\d+\}")
 
 
 def run(cmd, **kwargs):
-    return subprocess.run(cmd, check=True, cwd=ROOT, **kwargs)
+    try:
+        return subprocess.run(cmd, check=True, cwd=ROOT, **kwargs)
+    except subprocess.CalledProcessError as failed:
+        # Captured output is otherwise lost, and with it why the command failed:
+        # cargo writes its errors to stderr, libtest a failing test's to stdout.
+        for captured in (failed.stdout, failed.stderr):
+            if captured:
+                text = captured if isinstance(captured, str) else captured.decode(errors="replace")
+                sys.stderr.write(text)
+        raise
 
 
 def llvm_tool(name):
@@ -105,11 +115,16 @@ def reached(binary, profile, phase, work, profdata, cov, demangled):
 
 
 def demangler():
+    # cargo-llvm-cov 0.7 dropped its `demangle` subcommand; rustfilt is the
+    # demangler the rustc book names for coverage reports.
+    rustfilt = shutil.which("rustfilt")
+    if not rustfilt:
+        sys.exit("rustfilt is missing: cargo install rustfilt")
     cache = {}
 
     def demangle(name):
         if name not in cache:
-            out = run(["cargo", "llvm-cov", "demangle"], input=name + "\n",
+            out = run([rustfilt], input=name + "\n",
                       capture_output=True, text=True).stdout.strip()
             cache[name] = CLOSURE.sub("{closure}", HASH.sub("", out or name))
         return cache[name]
@@ -117,7 +132,7 @@ def demangler():
     def batch(names):
         missing = [n for n in names if n not in cache]
         if missing:
-            out = run(["cargo", "llvm-cov", "demangle"], input="\n".join(missing) + "\n",
+            out = run([rustfilt], input="\n".join(missing) + "\n",
                       capture_output=True, text=True).stdout.splitlines()
             for name, plain in zip(missing, out):
                 cache[name] = CLOSURE.sub("{closure}", HASH.sub("", plain.strip() or name))

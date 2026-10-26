@@ -317,11 +317,12 @@ scripts/attack-surface-reach.py --check    # fail on a function newly reached
 scripts/attack-surface-reach.py --bless    # rewrite the baseline
 ```
 
-It needs `cargo-llvm-cov` and the `llvm-tools-preview` rustup component. CI
-runs `--check` (`.github/workflows/reachability.yml`) on every pull request
-and push to master that changes a crate, the script or the toolchain. Run it
-locally too on a change that adds a path, a message or a setting, or moves a
-check, so a baseline rewrite lands in the same pull request. A function the
+It needs `cargo-llvm-cov`, `rustfilt` and the `llvm-tools-preview` rustup
+component. CI runs `--check` (`.github/workflows/reachability.yml`) on every
+pull request and push to master that changes a crate, the script or the
+toolchain. Run it locally too on a change that adds a path, a message or a
+setting, or moves a check, so a baseline rewrite lands in the same pull
+request. A function the
 anonymous phase newly reaches is code an unauthenticated client can now run:
 it belongs after the cheapest check that can refuse the request, or the
 baseline is rewritten with the reason in the pull request. A phase whose

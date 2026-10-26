@@ -163,9 +163,33 @@ struct Args {
     /// Offer permessage-deflate from --scenario clients connections.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     client_deflate: bool,
-    /// Fail --scenario clients when any request is refused.
+    /// Fail --scenario clients when any request is refused or unanswered, or
+    /// the relay disconnects a client.
     #[arg(long)]
     expect_no_refusals: bool,
+    /// Client sessions --scenario clients starts per second, cycling through
+    /// its clients; 0 starts every client at once.
+    #[arg(long, default_value_t = 0.0)]
+    client_arrival_rate: f64,
+    /// Seconds each --scenario clients session lasts before its client
+    /// leaves, to come back when the arrival schedule reaches it again; 0
+    /// keeps sessions to the end of the run.
+    #[arg(long, default_value_t = 0)]
+    client_session_secs: u64,
+    /// The --target-url relay's largest filter limit (`max_filter_limit`,
+    /// strfry `maxFilterLimit`), so --scenario clients can tell a capped
+    /// history from a short one; 0 for none.
+    #[arg(long, default_value_t = 0)]
+    target_max_filter_limit: u64,
+    /// The --target-url relay's cap on events per REQ
+    /// (`max_total_events_per_req`); 0 for none.
+    #[arg(long, default_value_t = 0)]
+    target_max_events_per_req: u64,
+    /// Kinds the --target-url relay serves only to their AUTHed recipient
+    /// (`relay.auth.recipient_only_kinds`, for example 4,1059,21059); none
+    /// for strfry.
+    #[arg(long, value_delimiter = ',')]
+    target_recipient_kinds: Vec<u64>,
     /// Events per history burst in --scenario ws_transport.
     #[arg(long, default_value_t = 500)]
     burst_events: u64,
@@ -446,6 +470,29 @@ fn main() -> Result<()> {
     if args.relay_config.is_some() && !scenarios.contains(&"clients") {
         anyhow::bail!("--relay-config is used only by --scenario clients");
     }
+    let remote_clients = args.target_url.is_some() && scenarios.contains(&"clients");
+    let described = args.target_max_filter_limit > 0
+        || args.target_max_events_per_req > 0
+        || !args.target_recipient_kinds.is_empty();
+    if described && !remote_clients {
+        anyhow::bail!("--target-max-* and --target-recipient-kinds describe a --target-url relay to --scenario clients");
+    }
+    if remote_clients {
+        // The relay must already hold what the oracle checks against, and
+        // what one run publishes would surprise the next.
+        anyhow::ensure!(
+            args.corpus.is_some(),
+            "--scenario clients against --target-url needs the --corpus the relay holds"
+        );
+        anyhow::ensure!(
+            args.repetitions == 1,
+            "--scenario clients against --target-url runs one repetition per restored database"
+        );
+        anyhow::ensure!(
+            args.relay_config.is_none(),
+            "--relay-config configures a relay this harness starts; describe a --target-url relay with --target-max-filter-limit, --target-max-events-per-req and --target-recipient-kinds"
+        );
+    }
     if args.clients_per_address > 0
         && (args.clients + args.marmot_clients).div_ceil(args.clients_per_address) > 1 << 22
     {
@@ -470,16 +517,20 @@ fn main() -> Result<()> {
                     | "mixed_read_write"
                     | "live_fanout"
                     | "idle_connections"
+                    | "clients"
             )
         })
     {
         anyhow::bail!(
-            "external targets support scaled and fixed-rate publication, query, mixed read/write, fanout, and idle-connection scenarios"
+            "external targets support scaled and fixed-rate publication, query, mixed read/write, fanout, idle-connection and clients scenarios"
         );
     }
 
     if args.target_unix.is_some() && scenarios.contains(&"ws_publish_rate") {
         anyhow::bail!("--scenario ws_publish_rate publishes over WebSocket only");
+    }
+    if args.target_unix.is_some() && scenarios.contains(&"clients") {
+        anyhow::bail!("--scenario clients drives a relay over WebSocket only");
     }
 
     if args.event_mix == EventMix::Lifecycle
@@ -594,6 +645,22 @@ fn main() -> Result<()> {
             retained.map_or(String::new(), |kept| format!(" ({kept} kept by a relay)")),
             corpus_path.display()
         );
+        if args.scenario.as_deref() == Some("clients") {
+            // What a --target-url relay must hold besides the corpus: the
+            // plan a one-repetition remote run regenerates.
+            let path = args.out.join("clients-corpus.jsonl");
+            let plan = clients::Plan::generate(
+                &clients_options(&args),
+                workload_seed(args.seed, "clients", 1),
+                base_timestamp,
+            );
+            write_clients_corpus(&path, &plan)?;
+            println!(
+                "wrote {} --scenario clients events at {}",
+                plan.events.len(),
+                path.display()
+            );
+        }
         return Ok(());
     }
 
@@ -994,32 +1061,21 @@ fn run_trial(
                 }
             }
         }
-        "clients" => {
-            let bin = local_bin()?;
-            match clients_trial(
-                rt,
-                args,
-                bin,
-                dir.path(),
-                corpus_path,
-                workload_seed,
-                &mut hist,
-            ) {
-                Ok((rate, nts, report)) => {
-                    throughput = rate;
-                    notes = nts;
-                    ok = report.ok();
-                    mismatches += report.mismatches;
-                    errors += report.errors;
-                    clients_report = Some(report);
-                }
-                Err(e) => {
-                    ok = false;
-                    errors += 1;
-                    notes = format!("{e}");
-                }
+        "clients" => match clients_trial(rt, args, target, corpus_path, workload_seed, &mut hist) {
+            Ok((rate, nts, report)) => {
+                throughput = rate;
+                notes = nts;
+                ok = report.ok();
+                mismatches += report.mismatches;
+                errors += report.errors;
+                clients_report = Some(report);
             }
-        }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e}");
+            }
+        },
         "ws_transport" => {
             let bin = local_bin()?;
             match transport_trial(rt, args, bin, dir.path(), corpus_path) {
@@ -2898,7 +2954,18 @@ fn clients_options(args: &Args) -> clients::ClientsOptions {
         clients_per_address: args.clients_per_address,
         deflate: args.client_deflate,
         expect_no_refusals: args.expect_no_refusals,
+        arrival_rate: args.client_arrival_rate,
+        session_secs: args.client_session_secs,
     }
+}
+
+fn write_clients_corpus(path: &Path, plan: &clients::Plan) -> Result<()> {
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for event in &plan.events {
+        writeln!(file, "{}", wok_event::json::to_tao_string(event))?;
+    }
+    file.flush()?;
+    Ok(())
 }
 
 fn import_with_config(bin: &Path, conf: &Path, dbdir: &Path, jsonl: &Path) -> Result<()> {
@@ -3032,13 +3099,13 @@ fn transport_trial(
 }
 
 /// Client-realistic load with abuse controls and AUTH on (see clients.rs).
-/// The relay gets the background corpus plus the scenario's own corpus, both
-/// imported with the trial's config before it starts.
+/// A relay this harness starts gets the background corpus plus the
+/// scenario's own corpus, both imported with the trial's config before it
+/// starts; a `--target-url` relay must already hold both.
 fn clients_trial(
     rt: &tokio::runtime::Runtime,
     args: &Args,
-    bin: &Path,
-    dbdir: &Path,
+    target: RelayTarget<'_>,
     corpus_path: &Path,
     workload_seed: u64,
     hist: &mut Histogram<u64>,
@@ -3049,6 +3116,75 @@ fn clients_trial(
         "--scenario clients publishes live events, so --base-timestamp cannot be in the future"
     );
     let opts = clients_options(args);
+    let plan = clients::Plan::generate(&opts, workload_seed, anchor);
+    let nodelay = CLIENT_NODELAY.load(std::sync::atomic::Ordering::Relaxed);
+    let (report, eose) = match target.url {
+        Some(url) => {
+            let addr = clients::target_addr(url)?;
+            let background = read_event_values(corpus_path)?;
+            let facts = clients::RelayFacts::remote(
+                url,
+                &args.target_recipient_kinds,
+                args.target_max_filter_limit,
+                args.target_max_events_per_req,
+            );
+            rt.block_on(clients::run(clients::RunInput {
+                addr,
+                plan,
+                background,
+                facts,
+                relay_config: format!("remote target {url}"),
+                config_overrides: Vec::new(),
+                opts,
+                nodelay,
+            }))?
+        }
+        None => {
+            let bin = target
+                .bin
+                .context("--scenario clients needs a wok binary or --target-url")?;
+            local_clients_run(rt, args, bin, target.dbdir, corpus_path, plan, opts)?
+        }
+    };
+    hist.add(&eose).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let top: Vec<String> = report
+        .refusals
+        .iter()
+        .take(3)
+        .map(|row| format!("{} x{}", row.reason, row.count))
+        .collect();
+    let notes = format!(
+        "{} outbox + {} Marmot clients ({} groups, {} invitees), {} sessions: {} subscriptions, {} refusals [{}], {} relay disconnects, {} unanswered, {} truncated, {} missed deliveries; deflate {}/{} connections; latency is time to EOSE",
+        report.options.outbox_clients,
+        report.options.marmot_clients,
+        report.options.marmot_groups,
+        report.options.marmot_invitees,
+        report.sessions,
+        report.subscriptions,
+        report.refusals_total,
+        top.join("; "),
+        report.disconnects_total,
+        report.unanswered_total,
+        report.truncated_total,
+        report.missed_deliveries,
+        report.deflate_negotiated,
+        report.connections,
+    );
+    let rate = report.eose_count() as f64 / report.elapsed_secs.max(f64::EPSILON);
+    Ok((rate, notes, report))
+}
+
+/// Import both corpora into a fresh relay, start it with the trial's config
+/// and run the scenario against it.
+fn local_clients_run(
+    rt: &tokio::runtime::Runtime,
+    args: &Args,
+    bin: &Path,
+    dbdir: &Path,
+    corpus_path: &Path,
+    plan: clients::Plan,
+    opts: clients::ClientsOptions,
+) -> Result<(clients::ClientsReport, Histogram<u64>)> {
     let port = free_port();
     let prepared = clients::prepare_config(
         dbdir,
@@ -3056,14 +3192,8 @@ fn clients_trial(
         args.relay_config.as_deref(),
         opts.clients_per_address > 0,
     )?;
-    let plan = clients::Plan::generate(&opts, workload_seed, anchor);
     let scenario_corpus = dbdir.join("clients-corpus.jsonl");
-    {
-        let mut file = std::io::BufWriter::new(std::fs::File::create(&scenario_corpus)?);
-        for event in &plan.events {
-            writeln!(file, "{}", wok_event::json::to_tao_string(event))?;
-        }
-    }
+    write_clients_corpus(&scenario_corpus, &plan)?;
     import_with_config(bin, &prepared.path, dbdir, corpus_path)?;
     import_with_config(bin, &prepared.path, dbdir, &scenario_corpus)?;
     let background = read_event_values(corpus_path)?;
@@ -3097,37 +3227,14 @@ fn clients_trial(
         addr,
         plan,
         background,
-        config: &prepared.effective,
+        facts: clients::RelayFacts::from_config(&prepared.effective),
         relay_config: prepared.source.clone(),
         config_overrides: prepared.overrides.clone(),
         opts,
         nodelay: CLIENT_NODELAY.load(std::sync::atomic::Ordering::Relaxed),
     }));
     stop_relay(&mut child, &url);
-    let (report, eose) = outcome?;
-    hist.add(&eose).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let top: Vec<String> = report
-        .refusals
-        .iter()
-        .take(3)
-        .map(|row| format!("{} x{}", row.reason, row.count))
-        .collect();
-    let notes = format!(
-        "{} outbox + {} Marmot clients ({} groups, {} invitees): {} subscriptions, {} refusals [{}], {} truncated, {} missed deliveries; deflate {}/{} connections; latency is time to EOSE",
-        report.options.outbox_clients,
-        report.options.marmot_clients,
-        report.options.marmot_groups,
-        report.options.marmot_invitees,
-        report.subscriptions,
-        report.refusals_total,
-        top.join("; "),
-        report.truncated_total,
-        report.missed_deliveries,
-        report.deflate_negotiated,
-        report.connections,
-    );
-    let rate = report.eose_count() as f64 / report.elapsed_secs.max(f64::EPSILON);
-    Ok((rate, notes, report))
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -3219,6 +3326,29 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         ));
         if args.expect_no_refusals {
             selection.push_str(" --expect-no-refusals");
+        }
+        if args.client_arrival_rate > 0.0 {
+            selection.push_str(&format!(
+                " --client-arrival-rate {} --client-session-secs {}",
+                args.client_arrival_rate, args.client_session_secs
+            ));
+        }
+        if args.target_url.is_some() {
+            selection.push_str(&format!(
+                " --target-max-filter-limit {} --target-max-events-per-req {}",
+                args.target_max_filter_limit, args.target_max_events_per_req
+            ));
+            if !args.target_recipient_kinds.is_empty() {
+                let kinds: Vec<String> = args
+                    .target_recipient_kinds
+                    .iter()
+                    .map(u64::to_string)
+                    .collect();
+                selection.push_str(&format!(" --target-recipient-kinds {}", kinds.join(",")));
+            }
+            if let Some(corpus) = &args.corpus {
+                selection.push_str(&format!(" --corpus \"{}\"", corpus.display()));
+            }
         }
     }
     if args.scenario.as_deref() == Some("ws_transport") {

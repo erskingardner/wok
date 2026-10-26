@@ -31,7 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::{connect_retry, read_ack, ClientConnection, EventFactory, EventMix};
 
 /// Share of the intended rate the sends must reach for a run to count.
-const RATE_HELD: f64 = 0.99;
+pub(crate) const RATE_HELD: f64 = 0.99;
 /// Acknowledged but missing events a reconciliation lists by id.
 const LISTED: usize = 20;
 /// How long a connection keeps reading once every event it sent is answered,

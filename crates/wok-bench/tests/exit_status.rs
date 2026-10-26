@@ -77,3 +77,25 @@ fn reconciliation_fails_on_a_lost_write_and_reads_the_export_from_stdin() {
     assert!(ok);
     assert_eq!(report["acked_stored"], 1);
 }
+
+#[test]
+fn remote_clients_need_the_corpus_and_target_facts_need_a_remote_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_wok-bench"))
+            .args(["--scenario", "clients", "--out"])
+            .arg(temp.path().join("results"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?} exited successfully");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    let stderr = run(&["--target-url", "ws://127.0.0.1:1"]);
+    assert!(
+        stderr.contains("needs the --corpus the relay holds"),
+        "{stderr}"
+    );
+    let stderr = run(&["--target-max-filter-limit", "500"]);
+    assert!(stderr.contains("describe a --target-url relay"), "{stderr}");
+}

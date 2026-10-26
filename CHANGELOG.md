@@ -384,6 +384,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acknowledged but lost, refused (counted by reason), or unanswered and then
   stored or not. A relay the harness starts is reconciled when the run ends,
   and a lost write or a stored refusal fails the trial.
+- `wok-bench --scenario clients` drives any relay by `--target-url`, such as
+  strfry or a Wok release, not only a Wok the harness starts (#226).
+  `--target-max-filter-limit`, `--target-max-events-per-req` and
+  `--target-recipient-kinds` give it the remote relay's limits, and
+  `--generate-corpus-only --scenario clients` writes the corpus that relay
+  must hold. Before the clock starts, the run checks that the relay holds
+  both corpora and nothing an earlier run published. With
+  `--client-arrival-rate` and `--client-session-secs`, client sessions start
+  and end on a fixed schedule. Connections, re-REQs, background publications
+  and Marmot bursts count their latency from when they were due, and the
+  background publishers must hold their rate. Requests left unanswered,
+  duplicate live deliveries, and connections the relay closed are counted,
+  each by reason for the closes; like refusals, they fail the trial only with
+  `--expect-no-refusals`. Background publishers now also send
+  `X-Forwarded-For`, and `--clients-per-address 0` turns it off for them as
+  for clients.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,

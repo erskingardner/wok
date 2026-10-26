@@ -8,7 +8,7 @@ Never opens a user database. Each trial uses a disposable temp dir, a determinis
 
 - `Cargo.toml`
 - `src/main.rs` — harness, profiles, scenarios, JSONL + markdown output
-- `src/clients.rs` — `--scenario clients`: client-realistic load with abuse controls and AUTH on (outbox and MDK-shaped Marmot clients, refusal counts, oracle checks)
+- `src/clients.rs` — `--scenario clients`: client-realistic load with abuse controls and AUTH on (outbox and MDK-shaped Marmot clients, refusal and disconnect counts, oracle checks), against a spawned Wok or a `--target-url` relay, with optional fixed-rate client arrivals
 - `src/transport.rs` — `--scenario ws_transport`: what WebSocket connections cost the relay (RSS per connection, bursts, fan-out, churn, deflate levels), with and without permessage-deflate
 - `src/author_kinds.rs` — `--scenario author_kinds`: `authors` × `kinds` planner sweep on a large, kept dataset, optionally against a second wok binary
 - `src/tag_kinds.rs` — `--scenario tag_kinds`: `#p`/`#e` + `kinds` fetches (notifications, zaps, DM inbox, reactions) on a kept dataset with heavily tagged pubkeys and notes, with the events a Tag-index plan reads counted from the dataset's index

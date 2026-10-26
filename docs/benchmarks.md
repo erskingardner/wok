@@ -202,8 +202,10 @@ duplicates, which the table counts.
 
 Every scenario above runs with `[relay.abuse]` and `[relay.auth]` disabled and
 sends one REQ at a time, so none of them can say whether a default limit
-refuses real clients. Wok-only `--scenario clients` keeps both on. It models
-the client traffic shapes W1–W10 that the limits plan cites
+refuses real clients. `--scenario clients` keeps both on. It runs against a
+Wok the harness starts, or against any relay by `--target-url` (see
+[Against a remote relay](#against-a-remote-relay)). It models the client
+traffic shapes W1–W10 that the limits plan cites
 ([#97](https://github.com/erskingardner/wok/issues/97)):
 
 - **Outbox clients.** Each opens 30 subscriptions at once on connect:
@@ -234,11 +236,92 @@ the client traffic shapes W1–W10 that the limits plan cites
   replies to watched threads, reactions to clients' notes, and 445s into the
   groups.
 
-Each simulated client sends from its own address through `X-Forwarded-For`,
-and the trial config sets `relay.real_ip_header` to that header. Connections
-negotiate permessage-deflate through wok-ws's codec in client mode. The
-scenario imports the `--events` background corpus plus its own deterministic
-corpus (about 30,000 events at the defaults) before it starts the relay.
+Each simulated client, and each background publisher, sends from its own
+address through `X-Forwarded-For`, and the trial config sets
+`relay.real_ip_header` to that header. `--clients-per-address 0` sends no
+header. Connections negotiate permessage-deflate through wok-ws's codec in
+client mode. The scenario imports the `--events` background corpus plus its
+own deterministic corpus (about 30,000 events at the defaults) before it
+starts the relay.
+
+### Arrivals and sessions
+
+By default every client connects at the start and stays to the end. With
+`--client-arrival-rate R`, sessions start on a fixed schedule: session `a` is
+due `a / R` seconds in and belongs to client `a mod clients`, with outbox and
+Marmot clients taking turns in proportion to their numbers. With
+`--client-session-secs L` each session ends `L` seconds after it was due,
+reads for another 2 s, and its client comes back on its next turn, so the
+scenario produces reconnect churn at a steady rate. A client may not come
+back before its last session ended, so `--clients + --marmot-clients` must be
+at least `R × (L + 2)`. Without `--client-session-secs`, each client arrives
+once.
+
+The schedule does not wait for the relay. Connect latency counts from when
+the session was due; re-REQs of replaced subscriptions are due every
+`--replace-interval-ms`; background publications are due every
+`1 / --publish-rate` seconds, spread over the publishers; and a Marmot burst
+is due at a fixed offset into its session. Each of those counts its latency
+from when it was due, as `ws_publish_rate` does, so time spent waiting behind
+a slow relay counts. A request still unanswered when its session stops
+reading counts as unanswered, with its latency up to then, so with
+unanswered requests the percentiles are lower bounds. The harness's own
+lateness in starting scheduled work is reported as the lag; a large lag means
+the load host, not the relay, is the bottleneck.
+
+Background publishing is held to its rate as in `ws_publish_rate`: sends over
+the run, or to the last send if that was later, must reach 99% of the
+publications due, or the trial is `ok=false`. A publisher the relay
+disconnects reconnects and keeps the schedule; slots it could not send count
+as due but not sent.
+
+### Against a remote relay
+
+`--target-url ws://host:port` drives a relay the harness did not start: a
+strfry, a Wok release, or Wok master with a preset. The harness cannot read
+those configs, so the run states what the oracle needs to know:
+
+| Option | Meaning |
+|---|---|
+| `--target-max-filter-limit` | The relay's per-filter `limit` cap (Wok `max_filter_limit`, strfry `maxFilterLimit`); 0 for none |
+| `--target-max-events-per-req` | Its cap on events per REQ (Wok `max_total_events_per_req`); 0 for none |
+| `--target-recipient-kinds` | Kinds it serves only to the AUTHed recipient, comma-separated (Wok's default is `4,1059,21059`; empty for strfry) |
+
+A history cut short by one of these caps is reported as truncated rather than
+failed, so state them as the relay is configured. In engine mode give every
+relay the same limits, and the histories are directly comparable. Clients
+AUTH against the `--target-url` itself, so a Wok target's
+`relay.auth.service_url` must be that URL.
+
+The relay must already hold both corpora, and nothing an earlier run
+published:
+
+```bash
+# On the load host: the background corpus and the scenario's own corpus.
+./target/release/wok-bench --generate-corpus-only --scenario clients \
+  --events 100000 --event-mix realistic --seed 7 --base-timestamp 1792000000 \
+  --out clients-corpus
+# On the relay host: import both, then snapshot the database.
+wok --config wok.toml import --no-verify < clients-corpus/corpus.jsonl
+wok --config wok.toml import --no-verify < clients-corpus/clients-corpus.jsonl
+# Each run, after restoring the snapshot:
+./target/release/wok-bench --scenario clients --target-url ws://10.0.0.3:7777 \
+  --target-label wok-master --corpus clients-corpus/corpus.jsonl \
+  --seed 7 --base-timestamp 1792000000 \
+  --target-max-filter-limit 2000 --target-max-events-per-req 10000 \
+  --target-recipient-kinds 4,1059,21059 \
+  --client-arrival-rate 20 --client-session-secs 60 --clients-duration-secs 180 \
+  --out bench-results/clients-wok-master
+```
+
+The run must use the seed, `--base-timestamp` and client options the corpus
+was generated with, and one repetition, since what a run publishes changes
+what the next one's histories should hold. Before the clock starts it checks
+that the relay holds a sample of both corpora and nothing the scenario's
+authors published after `--base-timestamp`, and stops with an explanation if
+not. For as-shipped runs, configure the relay to take the client address from
+`X-Forwarded-For` when the load host sends it: Wok's `relay.real_ip_header`
+and `relay.trusted_proxies`, strfry's `relay.realIpHeader`.
 
 ### Options
 
@@ -253,9 +336,11 @@ corpus (about 30,000 events at the defaults) before it starts the relay.
 | `--clients-duration-secs` | 15 | Activity before a 2 s delivery drain |
 | `--replace-interval-ms` | 3,000 | Interval between re-REQs of each replaced subscription |
 | `--publish-rate` | 20 | Background publications per second (0 turns them off) |
-| `--clients-per-address` | 1 | Clients per source address, e.g. 4 for CGNAT; 0 sends every client from the bench host's own address |
+| `--clients-per-address` | 1 | Clients per source address, e.g. 4 for CGNAT; 0 sends no `X-Forwarded-For`, so every client and publisher comes from the bench host's own address |
 | `--client-deflate` | `true` | Offer permessage-deflate |
-| `--expect-no-refusals` | off | Fail the trial on any refusal. This is the acceptance check for proposed defaults in #97 |
+| `--client-arrival-rate` | 0 | Client sessions started per second; 0 starts every client at once |
+| `--client-session-secs` | 0 | Length of each session; 0 keeps sessions to the end, so each client arrives once |
+| `--expect-no-refusals` | off | Fail the trial on any refusal, relay disconnect or unanswered request. This is the acceptance check for proposed defaults in #97 |
 
 ```bash
 cargo build --release -p wok-cli -p wok-bench
@@ -267,23 +352,35 @@ cargo build --release -p wok-cli -p wok-bench
 ### Reading the output
 
 Refusals are the measurement. Each `CLOSED`, `OK false`, `NOTICE`, `NEG-ERR`
-and HTTP 429 is grouped by its reason, with digits collapsed.
+and HTTP 429 or 503 is grouped by its reason, with digits collapsed. So is
+each connection the relay ended: by its close code and reason, or as closed
+without a close frame. Refusals and disconnects are results, not failures,
+unless `--expect-no-refusals` is set.
 
-`summary.md` has one section per trial with two tables:
+`summary.md` has one section per trial with three tables:
 
 - **Classes.** One row per subscription or publication class. The W1–W6
   classes are named after the traffic shape they model, for example
   `w2.metadata`, `live.home_feed` and `marmot.neg`. Each row gives:
-  - how many requests were sent, completed and refused;
+  - how many requests were sent, completed, refused and left unanswered;
   - how many histories were truncated;
   - events received in history and live;
-  - p50 and p99 of time to first EVENT and of time to done.
+  - p50 and p99 of time to first EVENT, and p50, p99 and max of time to
+    done.
 
   "Done" is EOSE for subscriptions, completion for NIP-77, OK for
   publications, completion for a whole burst, and publish-to-receipt for
-  `delivery.*`.
+  `delivery.*`. `delivery.outbox` and `delivery.marmot` are publish→live
+  delivery, counted once per subscription and event.
 - **Refusals.** One row per reason, with the configuration key responsible
   and the classes it refused.
+- **Disconnects.** One row per reason the relay ended a connection, with the
+  roles of the connections it ended.
+
+The summary line above the tables gives sessions, the arrival schedule,
+background publications due, sent and the achieved rate, the lag, and the
+counts of refusals, disconnects, unanswered requests, missed and duplicate
+deliveries.
 
 A history that comes back short with no refusal is reported as truncated
 when `max_filter_limit` or `max_total_events_per_req` explains the cut. Any
@@ -297,7 +394,9 @@ Correctness still decides `ok`, as in every other scenario:
 - no restricted event may reach a connection that is not its recipient. This
   is checked as each EVENT arrives, including on subscriptions refused later;
 - every live subscription must receive each accepted, matching event
-  published after its EOSE;
+  published after its EOSE while it was connected, exactly once. Events sent
+  after its session ended, or in the 2 s before the relay disconnected it,
+  may still have been on their way, so they are not required;
 - each NIP-77 pass must report exactly the corpus events the client lacked,
   plus only 445s published into that group, and none it already holds.
 
@@ -308,7 +407,12 @@ just before EOSE, so a history may hold more than `limit` events; only its
 stored part is bounded by `limit`.
 
 CI runs a small version as a unit test against an in-process relay with
-default limits (`clients::tests`).
+default limits, and a remote-mode run with arrivals and sessions against one
+known only by URL (`clients::tests`).
+
+The scenario does not yet scale live subscribers on their own, or model slow
+readers: scenario C's 1k → 20k subscribers with 5% slow readers in
+[#226](https://github.com/erskingardner/wok/issues/226) is still to come.
 
 ## WebSocket transport costs (`ws_transport`)
 

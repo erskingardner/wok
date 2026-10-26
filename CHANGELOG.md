@@ -908,6 +908,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A NEG-MSG to a session served from a negentropy tree that no longer
+  proves public what it holds gets `closed: visibility changed; reopen
+  synchronization`, the reason a visibility sweep gives, and the session
+  closes (#222). An event stored after the session opened, such as one of a
+  restricted kind or one that expires, ends that proof. **Clients see a new
+  reason**: such a NEG-MSG got `closed: unknown subscription handle`, which
+  named the wrong cause and did not say to reopen. A check that fails to
+  read the database gets `error: synchronization visibility check failed`.
 - A NEG-OPEN or NEG-MSG whose negentropy message does not reconcile gets one
   `NEG-ERR`, `error: invalid reconciliation message`, from a session served
   from a negentropy tree or from memory alike (#219). A NEG-MSG to a session

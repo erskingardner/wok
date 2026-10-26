@@ -215,6 +215,19 @@ fn public_tree_allowed(
     Ok(true)
 }
 
+/// The NEG-ERR that closes a tree session whose tree no longer proves
+/// public what it holds, or `None` while it does. An event stored since the
+/// session opened, such as one of a restricted kind or one that expires,
+/// ends that proof, and the client should reopen, as after a sweep. A check
+/// that failed proves nothing, so it is the relay's error.
+fn tree_refusal(allowed: Result<bool, wok_db::DbError>) -> Option<&'static str> {
+    match allowed {
+        Ok(true) => None,
+        Ok(false) => Some("closed: visibility changed; reopen synchronization"),
+        Err(_) => Some("error: synchronization visibility check failed"),
+    }
+}
+
 /// Who `relay.auth.read_policy` admits, as far as configuration decides it:
 /// the policy, and under `members` the admin pubkeys, which are members
 /// without a moderation record. A session opened under other access is
@@ -592,21 +605,25 @@ pub(super) fn run_negentropy(
                                 items,
                                 &payload,
                             ),
-                            View::Tree { sub, tree_id }
-                                if public_tree_allowed(&txn, sub, &cfg).unwrap_or(false) =>
-                            {
-                                reconcile_tree(
-                                    &txn,
-                                    &conns,
-                                    &metrics,
-                                    conn_id,
-                                    sub_id.as_str(),
-                                    *tree_id,
-                                    sub,
-                                    &payload,
-                                )
+                            View::Tree { sub, tree_id } => {
+                                match tree_refusal(public_tree_allowed(&txn, sub, &cfg)) {
+                                    None => reconcile_tree(
+                                        &txn,
+                                        &conns,
+                                        &metrics,
+                                        conn_id,
+                                        sub_id.as_str(),
+                                        *tree_id,
+                                        sub,
+                                        &payload,
+                                    ),
+                                    Some(reason) => {
+                                        fail(&conns, &metrics, conn_id, sub_id.as_str(), reason);
+                                        false
+                                    }
+                                }
                             }
-                            _ => return None,
+                            View::Memory { .. } => return None,
                         };
                         if answered {
                             session.waiting_since = Some(Instant::now());
@@ -1251,6 +1268,112 @@ mod tests {
         drop(tx);
         worker.join().unwrap();
         assert!(out_rx.try_recv().is_err(), "a second NEG-ERR");
+    }
+
+    /// A tree session whose tree no longer proves public what it holds,
+    /// here because an event of a restricted kind was stored after it
+    /// opened, is closed with the sweep's reason, so its client knows to
+    /// reopen, and that NEG-ERR is its only one. The reopened session is
+    /// built in memory. A check that failed says `error:` instead.
+    #[test]
+    fn a_tree_session_no_longer_provably_public_is_told_to_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        assert!(cfg
+            .read_restrictor()
+            .restricted_kinds()
+            .any(|kind| kind == 4));
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let (env, cfg, conns) = (env.clone(), cfg.clone(), conns.clone());
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        // `{}` is answered from the tree the database starts with.
+        let open = || {
+            let filter = json!({});
+            let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new("tree").unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        let msg = || NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new("tree").unwrap(),
+            payload: init.clone(),
+        };
+        let served = |reply: Value| {
+            assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!("tree")));
+        };
+        let err = |reason: &str| json!(["NEG-ERR", "tree", reason]);
+
+        tx.send(open()).unwrap();
+        served(next(&mut out_rx));
+        tx.send(msg()).unwrap();
+        served(next(&mut out_rx));
+        let event = json!({
+            "id": "dd".repeat(32), "pubkey": "ab".repeat(32),
+            "created_at": 1_700_000_000, "kind": 4, "tags": [["p", "cd".repeat(32)]],
+            "content": "ciphertext", "sig": "00".repeat(64),
+        });
+        let parsed = wok_event::parse_and_verify_event(
+            &event,
+            &wok_event::EventLimits::default(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut events = vec![wok_db::EventToWrite::new(
+            parsed.packed.into_bytes(),
+            parsed.json,
+        )];
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let NegMsg::Open { sub, .. } = open() else {
+            unreachable!()
+        };
+        assert!(!public_tree_allowed(&env.begin_ro().unwrap(), &sub, &cfg.read()).unwrap());
+        tx.send(msg()).unwrap();
+        assert_eq!(
+            next(&mut out_rx),
+            err("closed: visibility changed; reopen synchronization")
+        );
+        tx.send(msg()).unwrap();
+        assert_eq!(
+            next(&mut out_rx),
+            err("closed: unknown subscription handle")
+        );
+        tx.send(open()).unwrap();
+        served(next(&mut out_rx));
+        tx.send(msg()).unwrap();
+        served(next(&mut out_rx));
+        drop(tx);
+        worker.join().unwrap();
+        assert!(out_rx.try_recv().is_err(), "a second NEG-ERR");
+
+        assert_eq!(tree_refusal(Ok(true)), None);
+        assert_eq!(
+            tree_refusal(Err(wok_db::DbError::msg("read failed"))),
+            Some("error: synchronization visibility check failed")
+        );
     }
 
     /// A reload that made AUTH unusable ended every login, so the sessions

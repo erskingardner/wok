@@ -126,7 +126,12 @@ fast path, including databases containing profiles and contact lists. When
 retained history exists, filters that can include replaceable events use the
 bounded, visibility-filtered memory view, subject to sync event and memory limits. Physical
 history remains intact; migration, reindex, and operator export retain their
-storage-preservation semantics.
+storage-preservation semantics. A session served from a tree checks again at
+each NEG-MSG that the tree is still provably public. An event stored since it
+opened, such as one of a restricted kind or one that expires, can end that,
+and the session then closes with `closed: visibility changed; reopen
+synchronization`. A session opened while no tree is provably public is built
+in memory.
 
 NIP-50 matches normalized search terms against event `content`, intersects
 them with every other supplied filter field, ranks before applying `limit`,

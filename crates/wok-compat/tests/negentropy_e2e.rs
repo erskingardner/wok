@@ -243,6 +243,70 @@ async fn a_neg_msg_that_does_not_reconcile_gets_one_neg_err_from_either_view() {
     handle.request_shutdown();
 }
 
+/// A tree-backed session whose tree no longer proves public what it holds,
+/// here because an event that expires was stored after it opened, is closed
+/// with one NEG-ERR telling the client to reopen, the reason a visibility
+/// sweep gives, rather than as an unknown handle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tree_session_no_longer_provably_public_is_told_to_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    write_and_build_default_tree(dir.path());
+    let (handle, addr) = start_server(dir.path()).await;
+    let mut ws = ws_connect(addr).await;
+
+    let mut client_store = wok_negentropy::Vector::new();
+    client_store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(client_store, 60_000).unwrap();
+    let init = hex::encode(client.initiate().unwrap());
+    let open = json!(["NEG-OPEN", "s", {}, init]);
+    ws.send(Message::Text(open.to_string().into()))
+        .await
+        .unwrap();
+    let msgs = recv_matching(&mut ws, "\"NEG-MSG\"").await;
+    assert!(msgs.iter().any(|t| t.contains("\"NEG-MSG\"")), "{msgs:?}");
+
+    let event = sign_event(json!({
+        "created_at": now_secs(),
+        "kind": 1,
+        "tags": [["expiration", (now_secs() + 3600).to_string()]],
+        "content": "expires",
+    }));
+    ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+        .await
+        .unwrap();
+    let id = event["id"].as_str().unwrap();
+    let msgs = recv_matching(&mut ws, id).await;
+    assert!(
+        msgs.iter()
+            .any(|t| t.contains(&format!(r#""OK","{id}",true"#))),
+        "{msgs:?}"
+    );
+
+    // The reply to a handle never opened marks the end of the replies.
+    for msg in [
+        json!(["NEG-MSG", "s", init]),
+        json!(["NEG-MSG", "never", init]),
+    ] {
+        ws.send(Message::Text(msg.to_string().into()))
+            .await
+            .unwrap();
+    }
+    let msgs = recv_matching(&mut ws, "\"never\"").await;
+    assert_eq!(
+        msgs,
+        [
+            json!([
+                "NEG-ERR",
+                "s",
+                "closed: visibility changed; reopen synchronization"
+            ])
+            .to_string(),
+            json!(["NEG-ERR", "never", "closed: unknown subscription handle"]).to_string(),
+        ]
+    );
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_malformed_neg_msg_still_closes_its_session() {
     // A malformed NEG-MSG that names a session tears it down with NEG-ERR.

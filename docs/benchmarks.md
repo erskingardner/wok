@@ -53,7 +53,7 @@ often. Of every hundred events, about:
 |---:|---|
 | 30 | reactions (7) |
 | 27 | notes and replies (1) |
-| 12 | profiles, follow lists, relay lists and mute lists (0, 3, 10002, 10050, 10000) |
+| 12 | profiles, follow lists, relay lists, DM relay lists and mute lists (0, 3, 10002, 10050, 10000) |
 | 8 | gift wraps (1059), one in twenty a Marmot Welcome |
 | 6 | reposts (6) |
 | 6 | zap receipts (9735) |

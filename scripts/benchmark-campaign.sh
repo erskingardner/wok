@@ -226,8 +226,10 @@ RATE_TARGETS='all(.ok and .errors == 0 and .latency_p99_ms <= $p99
 # the first step that misses its targets. Each step signs fresh events from
 # its own seed, so no step repeats another's. Writes rate-capacity.txt beside
 # the phases: the last step that met its targets (0 for none) and the first
-# that missed. A missed step is a result; this fails only when a step left no
-# results or an OK named no event its connection sent.
+# that missed. A missed step is a result. This fails when a step left no
+# fixed-rate report, which also means no complete outcome log, or an OK
+# named no event its connection sent. RATE_LAUNCHED lists the steps it
+# started, for reconcile_rate_steps.
 rate_sweep() {
     local target=$1
     local repetition=$2
@@ -238,15 +240,21 @@ rate_sweep() {
     local capacity=0
     local missed=
     local index rate results
+    RATE_LAUNCHED=()
     for index in "${!steps[@]}"; do
         rate=${steps[index]}
+        RATE_LAUNCHED+=("$rate")
         launch_bench "$target" "$repetition" "$url" "rate-$rate" "$((SEED + index + 1))" \
             --scenario ws_publish_rate --send-rate "$rate" --send-secs "$RATE_SECS" \
             --drain-secs "$RATE_DRAIN_SECS" --publish-connections "$RATE_CONNECTIONS" \
             --event-mix realistic || true
         results=$load/rate-$rate/results.jsonl
-        remote_command "$LOAD_SSH" jq -e -s 'length > 0 and all(.mismatches == 0)' \
-            "$results" >/dev/null || return 1
+        if ! remote_command "$LOAD_SSH" jq -e -s \
+            'length > 0 and all(.publish_rate != null and .mismatches == 0)' \
+            "$results" >/dev/null; then
+            echo "$target step $rate left no fixed-rate report, or an OK named no sent event" >&2
+            return 1
+        fi
         if remote_command "$LOAD_SSH" jq -e -s --argjson p99 "$RATE_P99_MS" "$RATE_TARGETS" \
             "$results" >/dev/null; then
             capacity=$rate
@@ -260,34 +268,48 @@ rate_sweep() {
         sh "$capacity" "$missed" "$load/rate-capacity.txt"
 }
 
-# Copies each fixed-rate step's outcome log to the relay host, reconciles
-# them all against one export of the stopped relay's database, and copies
-# each step's reconciliation.json back beside its results. Fails when a step
-# has an acknowledged event missing or a refused event stored.
+# Copies the outcome log of each step the sweep started (RATE_LAUNCHED) to
+# the relay host, reconciles them all against one export of the stopped
+# relay's database, and copies each step's reconciliation.json back beside
+# its results. Fails when a started step has no outcome log, when a log does
+# not account for every event its step planned, or when a step has an
+# acknowledged event missing or a refused event stored.
 reconcile_rate_steps() {
     local target=$1
     local repetition=$2
     local load=$LOAD_ROOT/runs/r${repetition}-${target}/load
     local relay=$RELAY_ROOT/runs/r${repetition}-${target}/rate
-    local -a steps ran=()
-    read -r -a steps <<<"$RATE_STEPS"
+    local -a ran=()
     local rate log
-    for rate in "${steps[@]}"; do
+    local status=0
+    for rate in ${RATE_LAUNCHED[@]+"${RATE_LAUNCHED[@]}"}; do
         # wok-bench names the log for the trial's label and its repetition,
         # which is always 1 here.
         log=$load/rate-$rate/outcomes-$target-r$repetition-r1.jsonl
-        remote_command "$LOAD_SSH" test -f "$log" || continue
+        if ! remote_command "$LOAD_SSH" test -s "$log"; then
+            echo "$target step $rate ran but its outcome log $log is missing" >&2
+            status=1
+            continue
+        fi
         remote_command "$RELAY_SSH" mkdir -p "$relay/rate-$rate"
         scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$log" "$RELAY_SSH:$relay/rate-$rate/outcomes.jsonl"
         ran+=("$rate")
     done
-    [[ ${#ran[@]} -gt 0 ]] || return 0
-    local status=0
+    [[ ${#ran[@]} -gt 0 ]] || return "$status"
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" reconcile "$target" "$RELAY_BENCH_BIN" \
         "$relay" --nofile "$NOFILE_LIMIT" || status=1
     for rate in "${ran[@]}"; do
-        scp "${SSH_OPTIONS[@]}" -3 -q "$RELAY_SSH:$relay/rate-$rate/reconciliation.json" \
-            "$LOAD_SSH:$load/rate-$rate/reconciliation.json" || status=1
+        if ! scp "${SSH_OPTIONS[@]}" -3 -q "$RELAY_SSH:$relay/rate-$rate/reconciliation.json" \
+            "$LOAD_SSH:$load/rate-$rate/reconciliation.json"; then
+            status=1
+            continue
+        fi
+        # A log cut short would reconcile only the events it holds.
+        if ! remote_command "$LOAD_SSH" jq -e -s '.[0].publish_rate.events == .[1].events' \
+            "$load/rate-$rate/results.jsonl" "$load/rate-$rate/reconciliation.json" >/dev/null; then
+            echo "$target step $rate: the outcome log does not hold every planned event" >&2
+            status=1
+        fi
     done
     return "$status"
 }
@@ -305,6 +327,7 @@ run_target() {
         snapshot=keep
     fi
     remote_command "$LOAD_SSH" mkdir -p "$run_root/load" "$run_root/server"
+    RATE_LAUNCHED=()
 
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" prepare "$target" "$RELAY_CORPUS" \
         "$RETAINED" "$server_artifacts" --snapshot "$snapshot" --nofile "$NOFILE_LIMIT" \

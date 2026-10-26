@@ -924,17 +924,19 @@ refused or left unanswered, with publish-to-OK p99 within `RATE_P99_MS`
 (default 250). The sweep stops after the first step that misses, and
 `rate-capacity.txt` beside the phases records the last step that met its
 targets (`capacity`, 0 for none) and the first that missed. A missed step is a
-result, not a failed campaign. An OK that names no event its connection sent,
-or a step that wrote no results, fails the campaign.
+result, not a failed campaign. A step that left no fixed-rate report, and so
+no complete outcome log, fails the campaign, as does an OK that names no event
+its connection sent.
 
 Once the relay has stopped, the campaign copies each step's outcome log to
 the relay host. `benchmark-relay-control reconcile` exports the database
 once, under the import's limits, and runs the relay host's `wok-bench`
 (`RELAY_BENCH_BIN`, default `/opt/relay-bench/bin/wok-bench/wok-bench`)
 with `--reconcile` against each log. Each step's `reconciliation.json` is
-copied back beside its results. An acknowledged event missing from the
-export, or a refused one stored, fails the campaign. This runs even when the
-relay stopped on its own during the run. The relay host's `wok-bench` must
+copied back beside its results. The campaign fails when a step it started
+has no outcome log, when a log holds fewer events than its step planned, or
+when an acknowledged event is missing from the export or a refused one was
+stored. This runs even when the relay stopped on its own during the run. The relay host's `wok-bench` must
 include `--reconcile`.
 
 Lifecycle publication defaults to one ordered connection because a deletion

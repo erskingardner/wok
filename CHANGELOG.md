@@ -376,6 +376,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between the hosts, and steal time with every CPU busy. It fails when
   either host's average steal is above 1 percent and, given an earlier run,
   when the sync-write p99 has moved by more than 2x.
+- `wok-bench --scenario ws_publish_rate` publishes at a fixed rate without
+  waiting for replies (#226), so a relay that falls behind builds a backlog
+  that its latency shows, instead of slowing the sender. Every event's send
+  time and reply go to an outcome log, and `--reconcile` compares the log
+  with the relay's export: each event was acknowledged and stored,
+  acknowledged but lost, refused (counted by reason), or unanswered and then
+  stored or not. A relay the harness starts is reconciled when the run ends,
+  and a lost write or a stored refusal fails the trial.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,

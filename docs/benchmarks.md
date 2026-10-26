@@ -97,7 +97,8 @@ mismatch. Remote historical query scenarios assume the identical corpus has
 already been imported into the target relay; they verify parsed EOSE/subscription envelopes, exact expected historical
 sets, publication IDs/boolean acceptance, and complete per-subscriber deliveries.
 Local publication trials also export and compare the final stored state, including
-replacement, deletion and ephemeral semantics; remote storage is explicitly not inspected.
+replacement, deletion and ephemeral semantics; remote storage is explicitly not
+inspected, except by `--reconcile` after `ws_publish_rate`.
 
 Scenarios: `import` (signature-verifying bulk import), `export`,
 `negentropy_build`, `ws_publish_1conn`/`ws_publish_8conn` (per-publish OK
@@ -106,12 +107,89 @@ window, tag), `deep_history_pagination` (progressively older 500-event
 author+kind+until pages), `mixed_read_write` (historical REQs while another
 connection continuously publishes), `live_fanout` (configurable publisher and
 subscriber delivery completeness), `ws_publish_scaled` (configurable
-connection count), `idle_connections` (open-and-hold connection capacity),
+connection count), `ws_publish_rate` (fixed-rate publication with a
+per-event outcome log), `idle_connections` (open-and-hold connection capacity),
 `duplicate_import`, `cold_start`, and Wok-only
 `nip50_search` (rare, intersected, and full-corpus ranked searches with
 result/limit verification). Wok-only `clients`, `author_kinds`,
-`monitor_index` and `live_subscriptions` have their own sections below. Use
-`--scenario <name>` to isolate one scenario.
+`monitor_index` and `live_subscriptions` have their own sections below, as
+does `ws_publish_rate`. Use `--scenario <name>` to isolate one scenario.
+
+## Fixed-rate publication (`ws_publish_rate`)
+
+`ws_publish_scaled` sends a connection's next event only after the last one's
+OK, so a relay that slows down slows the sender too, and its backlog never
+shows. `ws_publish_rate` keeps a fixed schedule instead: event `n` is due
+`n / --send-rate` seconds after the start, on connection
+`n % --publish-connections`, and goes out then whether or not earlier events
+have been answered. Every event is signed before the clock starts, each
+connection with its own keys, and each connection first publishes one
+uncounted warm-up event and waits for its OK. Only `--event-mix kind1` and
+`realistic` are allowed, since a relay keeps every event of those mixes.
+
+```bash
+./target/release/wok-bench --scenario ws_publish_rate \
+  --target-url ws://10.0.0.3:7777 --target-label wok-master \
+  --send-rate 5000 --send-secs 180 --publish-connections 64 \
+  --event-mix realistic --seed 7 --out rate-5000
+```
+
+The options are `--send-rate`, events per second over all connections
+(default 1,000); `--send-secs` (default 10); `--publish-connections`
+(default 32); and `--drain-secs`, how long to wait for replies after the last
+send (default 10).
+
+Latency runs from when an event was due to its accepting OK, so time an event
+waited behind a slow relay counts. The fixed-rate table also gives the
+achieved send rate; the send lag, from when an event was due to the end of its
+send; and the accepted rate, counted up to the last accepting OK, which is
+the trial's throughput. An accepted rate below the send rate means the relay
+fell behind or refused events. A trial is `ok=false` when the achieved rate is below 99% of
+`--send-rate`, when a connection fails, when an OK is malformed, names no
+event of its connection's or repeats one, or when reconciliation finds a
+mismatch.
+
+Each event gets one line, in due order, in `outcomes-<relay>-r<repetition>.jsonl`
+under `--out`. Times are microseconds from the start:
+
+```json
+{"seq":0,"conn":0,"id":"…","kind":1,"due_us":0,"sent_us":84,"reply_us":1450,"ok":true,"message":""}
+```
+
+`sent_us` is null for an event never sent because its connection had failed.
+`reply_us`, `ok` and `message` are null for one with no OK when the drain
+ended. Reconciliation compares the log with the relay's export and puts each
+event in one outcome:
+
+| Outcome | Meaning |
+| --- | --- |
+| acknowledged, stored | correct |
+| acknowledged, missing | a lost write: must be zero |
+| refused | counted by the message's prefix, such as `rate-limited` |
+| refused, but stored | must be zero |
+| no reply, stored | slow, but kept |
+| no reply, not stored | a client would have to send it again |
+
+An event never sent counts as unanswered. A relay the harness starts is
+exported and reconciled when the run ends. For a remote target, export its
+database once the run is over and reconcile anywhere:
+
+```bash
+wok --config /etc/relay-bench/wok-master.toml export > export.jsonl
+./target/release/wok-bench --reconcile rate-5000/outcomes-wok-master-r1.jsonl \
+  --relay-export export.jsonl --out rate-5000
+```
+
+`--relay-export -` reads the export from standard input. `--reconcile`
+writes `reconciliation.json` under `--out`, prints the counts, and exits
+non-zero when an acknowledged event is missing or a refused one was stored.
+The export may hold other events, such as an imported corpus; only the log's
+events are counted.
+
+Each run signs its events from `--seed`, the repetition and
+`--base-timestamp`, which defaults to the start time. Rerun all three against
+one database and the relay already has the events: it accepts them as
+duplicates, which the table counts.
 
 ## Client-realistic scenario (`clients`)
 

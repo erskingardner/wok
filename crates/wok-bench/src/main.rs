@@ -14,6 +14,7 @@
 mod author_kinds;
 mod clients;
 mod live;
+mod rate;
 mod social;
 mod tag_kinds;
 mod transport;
@@ -78,9 +79,28 @@ struct Args {
     /// Repetitions per relay/scenario. Relay order alternates each repetition.
     #[arg(long, default_value_t = 1)]
     repetitions: u32,
-    /// Connections used by ws_publish_scaled.
+    /// Connections used by ws_publish_scaled and ws_publish_rate.
     #[arg(long, default_value_t = 32)]
     publish_connections: usize,
+    /// Events per second --scenario ws_publish_rate sends over all its
+    /// connections, whether or not earlier events have been answered.
+    #[arg(long, default_value_t = 1_000.0)]
+    send_rate: f64,
+    /// Seconds --scenario ws_publish_rate sends for.
+    #[arg(long, default_value_t = 10)]
+    send_secs: u64,
+    /// Seconds --scenario ws_publish_rate waits for replies after its last
+    /// send.
+    #[arg(long, default_value_t = 10)]
+    drain_secs: u64,
+    /// Instead of running trials, reconcile this ws_publish_rate outcome log
+    /// against --relay-export and write reconciliation.json under --out.
+    #[arg(long, requires = "relay_export")]
+    reconcile: Option<PathBuf>,
+    /// The relay's export (`wok export` or `strfry export`) that
+    /// --reconcile compares; `-` reads standard input.
+    #[arg(long, requires = "reconcile")]
+    relay_export: Option<PathBuf>,
     /// Subscribers used by live_fanout.
     #[arg(long, default_value_t = 32)]
     fanout_subscribers: usize,
@@ -267,6 +287,8 @@ struct Trial {
     author_kinds: Option<author_kinds::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag_kinds: Option<tag_kinds::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publish_rate: Option<rate::Report>,
 }
 
 #[derive(Serialize)]
@@ -359,6 +381,9 @@ fn main() -> Result<()> {
     let base_timestamp = args.base_timestamp.unwrap_or(unix_timestamp()?);
     args.base_timestamp = Some(base_timestamp);
     std::fs::create_dir_all(&args.out)?;
+    if let (Some(log), Some(export)) = (&args.reconcile, &args.relay_export) {
+        return reconcile_outcomes(&args.out, log, export);
+    }
     let profile_scenarios: Vec<&str> = if args.profile == "load" {
         vec!["ws_publish_scaled", "live_fanout", "idle_connections"]
     } else if args.profile == "full" {
@@ -399,6 +424,7 @@ fn main() -> Result<()> {
         "nip50_search",
         "live_fanout",
         "ws_publish_scaled",
+        "ws_publish_rate",
         "idle_connections",
         "duplicate_import",
         "cold_start",
@@ -438,6 +464,7 @@ fn main() -> Result<()> {
             !matches!(
                 *scenario,
                 "ws_publish_scaled"
+                    | "ws_publish_rate"
                     | "ws_query_latency"
                     | "deep_history_pagination"
                     | "mixed_read_write"
@@ -447,8 +474,12 @@ fn main() -> Result<()> {
         })
     {
         anyhow::bail!(
-            "external targets support scaled publication, query, mixed read/write, fanout, and idle-connection scenarios"
+            "external targets support scaled and fixed-rate publication, query, mixed read/write, fanout, and idle-connection scenarios"
         );
+    }
+
+    if args.target_unix.is_some() && scenarios.contains(&"ws_publish_rate") {
+        anyhow::bail!("--scenario ws_publish_rate publishes over WebSocket only");
     }
 
     if args.event_mix == EventMix::Lifecycle
@@ -658,6 +689,7 @@ fn run_trial(
     let mut live_report = None;
     let mut author_kinds_report = None;
     let mut tag_kinds_report = None;
+    let mut rate_report = None;
 
     let bin = if args.has_external_target() || scenario == "monitor_index" {
         // monitor_index runs the index compiled into this binary.
@@ -899,6 +931,26 @@ fn run_trial(
                 }
             }
         }
+        "ws_publish_rate" => {
+            let log = args
+                .out
+                .join(format!("outcomes-{relay}-r{repetition}.jsonl"));
+            match ws_publish_rate_trial(rt, args, target, workload, &log, &mut hist) {
+                Ok(report) => {
+                    throughput = report.accepted_rate;
+                    errors += report.errors();
+                    mismatches += report.mismatches();
+                    ok = report.ok();
+                    notes = report.notes();
+                    rate_report = Some(report);
+                }
+                Err(e) => {
+                    ok = false;
+                    errors += 1;
+                    notes = format!("{e:#}");
+                }
+            }
+        }
         "idle_connections" => {
             match idle_connections_trial(
                 rt,
@@ -1069,6 +1121,7 @@ fn run_trial(
         live_subscriptions: live_report,
         author_kinds: author_kinds_report,
         tag_kinds: tag_kinds_report,
+        publish_rate: rate_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1112,6 +1165,7 @@ fn failed_trial(
         live_subscriptions: None,
         author_kinds: None,
         tag_kinds: None,
+        publish_rate: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -2003,6 +2057,78 @@ fn ws_publish_target_trial(
         }
     );
     Ok((eps, notes, miss == 0, miss))
+}
+
+/// Publish at a fixed rate (`rate.rs`) and log every event's outcome. A relay
+/// this harness started is then reconciled against its export; a remote one
+/// is left to `--reconcile`.
+fn ws_publish_rate_trial(
+    rt: &tokio::runtime::Runtime,
+    args: &Args,
+    target: RelayTarget<'_>,
+    workload: EventWorkload,
+    log: &Path,
+    hist: &mut Histogram<u64>,
+) -> Result<rate::Report> {
+    let opts = rate::Options {
+        rate: args.send_rate,
+        secs: args.send_secs as f64,
+        conns: args.publish_connections,
+        drain: Duration::from_secs(args.drain_secs),
+        seed: workload.seed,
+        base_timestamp: workload.base_timestamp,
+        mix: workload.mix,
+    };
+    let lanes = rate::plan(&opts)?;
+    let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
+    let run = rt.block_on(rate::run(&url, lanes, &opts));
+    stop_target(&mut child, &url);
+    let run = run?;
+    rate::write_log(log, &run)?;
+    let mut report = rate::report(&run, &opts, log, hist)?;
+    if let Some(bin) = target.bin {
+        report.reconciliation = Some(reconcile_export(bin, target.dbdir, log)?);
+    }
+    Ok(report)
+}
+
+/// Reconcile an outcome log against a stopped local relay, streaming its
+/// export.
+fn reconcile_export(bin: &Path, dbdir: &Path, log: &Path) -> Result<rate::Reconciliation> {
+    let conf = write_conf(bin, dbdir, 0);
+    let mut export = Command::new(bin)
+        .arg("--config")
+        .arg(conf)
+        .arg("export")
+        .current_dir(dbdir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {} export", bin.display()))?;
+    let stdout = export.stdout.take().context("export has no output")?;
+    let log = std::fs::File::open(log).with_context(|| format!("open {}", log.display()))?;
+    let reconciliation = rate::reconcile(
+        std::io::BufReader::new(log),
+        std::io::BufReader::new(stdout),
+    );
+    let status = export.wait()?;
+    let reconciliation = reconciliation?;
+    anyhow::ensure!(status.success(), "storage export failed");
+    Ok(reconciliation)
+}
+
+/// `--reconcile`: compare an outcome log with a relay's export.
+fn reconcile_outcomes(out: &Path, log: &Path, export: &Path) -> Result<()> {
+    let reconciliation = rate::reconcile_files(log, export)?;
+    let path = out.join("reconciliation.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&reconciliation)?)?;
+    println!("{}", reconciliation.summary());
+    anyhow::ensure!(
+        reconciliation.ok(),
+        "acknowledged events are missing or refused events were stored; see {}",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Run `queries` REQs of mixed shapes against an exact corpus. Local targets
@@ -3065,6 +3191,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.tag_kinds {
             s.push_str(&tag_kinds::render_markdown(report));
         }
+        if let Some(report) = &t.publish_rate {
+            s.push_str(&rate::render_markdown(report, &t.relay, t.repetition));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -3103,6 +3232,12 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             args.fanout_events,
             args.churn_connections,
             args.events.unwrap_or_default(),
+        ));
+    }
+    if args.scenario.as_deref() == Some("ws_publish_rate") {
+        selection.push_str(&format!(
+            " --send-rate {} --send-secs {} --publish-connections {} --drain-secs {}",
+            args.send_rate, args.send_secs, args.publish_connections, args.drain_secs,
         ));
     }
     if matches!(

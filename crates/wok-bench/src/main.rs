@@ -2888,7 +2888,7 @@ fn catchup_trial(
         seed,
         nodelay: args.tcp_nodelay,
     };
-    let kept = retained_events(&read_event_values(corpus_path)?);
+    let kept = catchup::kept(read_event_values(corpus_path)?);
     let kept_count = kept.len() as u64;
     let plan = std::sync::Arc::new(catchup::plan(kept, &opts)?);
     if let Some(bin) = target.bin {

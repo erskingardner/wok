@@ -127,6 +127,76 @@ fn kind(event: &Value) -> u64 {
     event["kind"].as_u64().unwrap_or(u64::MAX)
 }
 
+/// What a relay keeps of `events` once it has imported them: each id once,
+/// no ephemeral event, the newest version of each replaceable and
+/// addressable address (on a tie, the lowest id, as NIP-01 says), and no
+/// event, other than a deletion, that its author deleted with a kind 5 `e`
+/// tag. The rules of `crate::retained_events`, in linear time, so a
+/// million-event social corpus takes seconds.
+pub fn kept(events: Vec<Value>) -> Vec<Value> {
+    let text = |event: &Value, field: &str| event[field].as_str().unwrap_or_default().to_owned();
+    let tag_values = |event: &Value, name: &'static str| {
+        event["tags"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(move |tag| tag[0] == name)
+            .filter_map(|tag| tag[1].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let mut keep = vec![false; events.len()];
+    let mut ids = HashSet::with_capacity(events.len());
+    let mut newest: HashMap<(String, u64, String), usize> = HashMap::new();
+    let mut deleted: HashSet<(String, String)> = HashSet::new();
+    for (i, event) in events.iter().enumerate() {
+        let k = kind(event);
+        if (20_000..30_000).contains(&k) || !ids.insert(text(event, "id")) {
+            continue;
+        }
+        let pubkey = text(event, "pubkey");
+        if k == 5 {
+            for target in tag_values(event, "e") {
+                deleted.insert((target, pubkey.clone()));
+            }
+        }
+        let addressable = (30_000..40_000).contains(&k);
+        if !(k == 0 || k == 3 || (10_000..20_000).contains(&k) || addressable) {
+            keep[i] = true;
+            continue;
+        }
+        let d = if addressable {
+            tag_values(event, "d")
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let version = |e: &Value| (e["created_at"].as_u64(), std::cmp::Reverse(text(e, "id")));
+        newest
+            .entry((pubkey, k, d))
+            .and_modify(|best| {
+                if version(event) > version(&events[*best]) {
+                    *best = i;
+                }
+            })
+            .or_insert(i);
+    }
+    for i in newest.into_values() {
+        keep[i] = true;
+    }
+    events
+        .into_iter()
+        .zip(keep)
+        .filter(|(event, keep)| {
+            *keep
+                && (kind(event) == 5
+                    || !deleted.contains(&(text(event, "id"), text(event, "pubkey"))))
+        })
+        .map(|(event, _)| event)
+        .collect()
+}
+
 /// Splits the corpus into filters and chooses what the client lacks.
 /// `events` is what the relay keeps of the corpus.
 pub fn plan(events: Vec<Value>, opts: &Options) -> Result<Plan> {
@@ -1371,6 +1441,42 @@ mod tests {
         (format!("ws://{addr}"), handle)
     }
 
+    fn ids(events: &[Value]) -> BTreeSet<String> {
+        events
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_relay_keeps_the_newest_version_and_drops_deleted_events() {
+        let author = |n: u8, created_at: u64, kind: u64, tags: Value| {
+            let mut e = event(created_at, n, kind, tags);
+            e["pubkey"] = json!("aa".repeat(32));
+            e
+        };
+        let events = vec![
+            author(1, 10, 0, json!([])),
+            author(2, 20, 0, json!([])),
+            // A tie keeps the lower id.
+            author(4, 5, 30_000, json!([["d", "x"]])),
+            author(3, 5, 30_000, json!([["d", "x"]])),
+            author(5, 5, 30_000, json!([["d", "y"]])),
+            author(6, 1, 1, json!([])),
+            author(7, 2, 1, json!([])),
+            author(8, 3, 5, json!([["e", hex::encode([6u8; 32])]])),
+            // Another author cannot delete note 7.
+            event(4, 9, 5, json!([["e", hex::encode([7u8; 32])]])),
+            event(6, 10, 20_001, json!([])),
+            author(6, 1, 1, json!([])),
+        ];
+        let kept: Vec<u8> = kept(events)
+            .iter()
+            .map(|e| event_id(e).unwrap()[0])
+            .collect();
+        assert_eq!(kept, [2, 3, 5, 7, 8, 9]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn catches_up_with_wok() {
         let dir = tempfile::tempdir().unwrap();
@@ -1389,7 +1495,12 @@ mod tests {
         let corpus = crate::read_event_values(&path).unwrap();
         let db = tempfile::tempdir().unwrap();
         let (url, handle) = start_wok(db.path(), &corpus).await;
-        let kept = crate::retained_events(&corpus);
+        let kept = kept(corpus.clone());
+        assert_eq!(
+            ids(&kept),
+            ids(&crate::retained_events(&corpus)),
+            "the linear oracle keeps what retained_events keeps"
+        );
         let cases = [
             Options {
                 windows: 1,

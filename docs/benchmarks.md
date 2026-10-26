@@ -286,8 +286,9 @@ left out in full, and the table lists the kinds left out. A relay's refusal,
 a `NEG-ERR` or a `CLOSED` for a fetch, ends that sync and is counted by
 reason; refusals fail the trial only with `--expect-no-refusals`, which
 engine-mode runs should pass. A connection that closes, or that has syncs
-open and receives nothing for 120 s, fails its syncs. The oracle holds the
-corpus in memory, as the query scenarios do.
+open and receives nothing for 120 s, fails its syncs. The oracle works out
+what a relay keeps of the corpus, after replacements and deletions, and holds
+that in memory, as the query scenarios hold their corpus.
 
 ## Client-realistic scenario (`clients`)
 

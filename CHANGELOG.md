@@ -397,10 +397,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   due behind an unfinished one waits and keeps its due time. Background
   publishers must hold their rate, counting a publication as sent once it is
   written to the socket, and a reconnecting publisher skips the slots it
-  missed instead of sending them in a burst. Requests left unanswered,
-  duplicate live deliveries, and connections the relay closed are counted,
-  each by reason for the closes; like refusals, they fail the trial only with
-  `--expect-no-refusals`. Background publishers now also send
+  missed instead of sending them in a burst. A session sends nothing new
+  after its visit ends. Requests left unanswered, duplicate live deliveries,
+  and connections the relay refused, dropped or closed are counted, by
+  reason for refusals and closes. Like refusals, they fail the trial only
+  with `--expect-no-refusals`. Errors are kept for failures of the load host
+  itself. Background publishers now also send
   `X-Forwarded-For`, and `--clients-per-address 0` turns it off for them as
   for clients.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on

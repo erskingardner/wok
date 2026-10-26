@@ -1444,12 +1444,19 @@ fn reset(writer: &tokio::net::tcp::OwnedWriteHalf, reader: &tokio::sync::Notify)
     reader.notify_one();
 }
 
+/// Why a connect did not become a WebSocket. Whatever the relay does is a
+/// result: it refused, or did not answer in time. A response that is not
+/// HTTP is the relay's protocol error. Only a failure of the load host
+/// itself is the harness's error.
 pub(crate) enum ConnectFailure {
-    /// The relay refused or dropped the connection: HTTP 429 or 503, or a
-    /// refused, reset or closed connection before the upgrade.
+    /// The relay refused or dropped the connection: an HTTP status other
+    /// than 101, or a refused, reset or closed connection.
     Refused(String),
     /// The relay did not take the connection, or answer the upgrade, in time.
     TimedOut(String),
+    /// The relay answered with something that is not an HTTP response.
+    Invalid(String),
+    /// The load host could not make the connection.
     Failed(String),
 }
 
@@ -1457,6 +1464,7 @@ impl std::fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(reason) => write!(f, "refused: {reason}"),
+            Self::Invalid(error) => write!(f, "invalid handshake response: {error}"),
             Self::TimedOut(error) | Self::Failed(error) => f.write_str(error),
         }
     }
@@ -1506,15 +1514,23 @@ fn close_reason(payload: &[u8]) -> String {
     }
 }
 
-/// A full accept queue or an overloaded relay refuses or resets the
-/// connection; any other I/O error is the load host's.
-fn dropped(stage: &str, e: std::io::Error) -> ConnectFailure {
-    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset};
-    match e.kind() {
-        ConnectionRefused | ConnectionReset | ConnectionAborted | BrokenPipe => {
-            ConnectFailure::Refused(format!("{stage}: {}", e.kind()))
-        }
-        _ => ConnectFailure::Failed(format!("{stage}: {e}")),
+/// An I/O error on the way to the relay is its refusal, counted by reason,
+/// unless the load host ran out of ports, descriptors, buffers or memory, or
+/// was not allowed the socket.
+fn io_failure(stage: &str, e: std::io::Error) -> ConnectFailure {
+    use std::io::ErrorKind::{
+        AddrInUse, AddrNotAvailable, InvalidInput, OutOfMemory, PermissionDenied, Unsupported,
+    };
+    // ENFILE and EMFILE are 23 and 24 on Linux and the BSDs; ENOBUFS is not.
+    const ENOBUFS: i32 = if cfg!(target_os = "linux") { 105 } else { 55 };
+    let local = matches!(
+        e.kind(),
+        AddrInUse | AddrNotAvailable | InvalidInput | OutOfMemory | PermissionDenied | Unsupported
+    ) || matches!(e.raw_os_error(), Some(23 | 24 | ENOBUFS));
+    if local {
+        ConnectFailure::Failed(format!("{stage}: {e}"))
+    } else {
+        ConnectFailure::Refused(format!("{stage}: {e}"))
     }
 }
 
@@ -1530,14 +1546,13 @@ pub(crate) async fn ws_handshake(
     offer_deflate: bool,
     nodelay: bool,
 ) -> Result<(tokio::net::TcpStream, Vec<u8>, bool), ConnectFailure> {
-    let failed = |e: String| ConnectFailure::Failed(e);
     let mut stream = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::net::TcpStream::connect(addr),
     )
     .await
     .map_err(|_| ConnectFailure::TimedOut("TCP connect timed out".into()))?
-    .map_err(|e| dropped("TCP connect", e))?;
+    .map_err(|e| io_failure("TCP connect", e))?;
     let _ = stream.set_nodelay(nodelay);
     let key = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 16]>());
     let mut request = format!(
@@ -1553,7 +1568,7 @@ pub(crate) async fn ws_handshake(
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(|e| dropped("handshake write", e))?;
+        .map_err(|e| io_failure("handshake write", e))?;
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let end = loop {
@@ -1561,12 +1576,12 @@ pub(crate) async fn ws_handshake(
             break end;
         }
         if buffer.len() > 64 * 1024 {
-            return Err(failed("oversized handshake response".into()));
+            return Err(ConnectFailure::Invalid("over 64 KiB with no end".into()));
         }
         let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
             .await
             .map_err(|_| ConnectFailure::TimedOut("handshake timed out".into()))?
-            .map_err(|e| dropped("handshake read", e))?;
+            .map_err(|e| io_failure("handshake read", e))?;
         if n == 0 {
             return Err(ConnectFailure::Refused(
                 "relay closed during handshake".into(),
@@ -1577,7 +1592,20 @@ pub(crate) async fn ws_handshake(
     let head = String::from_utf8_lossy(&buffer[..end]).to_string();
     let mut rest = buffer[end + 4..].to_vec();
     let status = head.lines().next().unwrap_or_default().to_owned();
-    if status.split_whitespace().nth(1) != Some("101") {
+    let code = match status.split_whitespace().collect::<Vec<_>>()[..] {
+        [version, code, ..]
+            if version.starts_with("HTTP/")
+                && code.len() == 3
+                && code.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            code.to_owned()
+        }
+        _ => {
+            let status: String = status.chars().take(80).collect();
+            return Err(ConnectFailure::Invalid(status));
+        }
+    };
+    if code != "101" {
         let length = head
             .lines()
             .find_map(|line| {
@@ -1593,15 +1621,14 @@ pub(crate) async fn ws_handshake(
             }
         }
         let body = String::from_utf8_lossy(&rest).trim().to_owned();
-        // Too many requests, or a relay shedding load.
-        if let Some(code @ ("429" | "503")) = status.split_whitespace().nth(1) {
-            return Err(ConnectFailure::Refused(if body.is_empty() {
-                format!("HTTP {code}")
-            } else {
-                body
-            }));
-        }
-        return Err(failed(format!("handshake refused: {status} {body}")));
+        // Too many requests, a relay shedding load, or any other refusal,
+        // by the relay's own reason when it gives a short one.
+        let reason = if body.is_empty() || body.len() > 200 || body.contains('\n') {
+            format!("HTTP {code}")
+        } else {
+            body
+        };
+        return Err(ConnectFailure::Refused(reason));
     }
     let deflate = offer_deflate
         && head.lines().any(|line| {
@@ -1919,9 +1946,12 @@ struct Session {
     identities: Vec<String>,
     challenge: Option<String>,
     auth: Auth,
-    auth_waiting: Vec<String>,
-    /// Publications refused with `auth-required:`, resent after AUTH.
-    auth_events: Vec<String>,
+    /// Subscriptions refused with `auth-required:`, and why, sent again
+    /// after AUTH.
+    auth_waiting: Vec<(String, String)>,
+    /// Publications refused with `auth-required:`, and why, resent after
+    /// AUTH.
+    auth_events: Vec<(String, String)>,
     /// NOTICEs that refuse the live part of the next subscription to EOSE.
     live_refusals: std::collections::VecDeque<String>,
     subs: HashMap<String, Sub>,
@@ -1933,6 +1963,7 @@ struct Session {
     gone: bool,
     /// When the relay disconnected this session.
     gone_at: Option<Instant>,
+    /// When the visit ends: see `open`.
     until: Instant,
     rng: rand::rngs::StdRng,
 }
@@ -2047,6 +2078,11 @@ impl Session {
                     tokio::time::sleep_until(retry.into()).await;
                 }
                 Err(ConnectFailure::TimedOut(_)) => unanswered(),
+                Err(failure @ ConnectFailure::Invalid(_)) => {
+                    ctx.stats()
+                        .mismatch("protocol", format!("{label}: {failure}"));
+                    return None;
+                }
                 Err(ConnectFailure::Failed(e)) => {
                     ctx.stats().error(format!("{label}: {e}"));
                     return None;
@@ -2060,11 +2096,29 @@ impl Session {
         let _ = self.conn.out.send(Out::Text(frame.to_string()));
     }
 
+    /// Whether the session may still give the relay new work: it is
+    /// connected and its visit has not ended. Requests, publications,
+    /// NIP-77 passes, AUTH, and the retries of any of them all start only
+    /// while this holds, so nothing new reaches the relay after the session
+    /// ends; only what finishes an exchange the relay is in the middle of
+    /// (NEG-MSG, NEG-CLOSE, CLOSE) still goes out. What could not be sent or
+    /// retried keeps the relay's last answer: due and not sent, refused, or
+    /// unanswered.
+    fn open(&self) -> bool {
+        !self.gone && Instant::now() < self.until
+    }
+
+    /// Wait for answers to what is in flight, `DRAIN` past the visit.
+    async fn drain(&mut self, done: impl Fn(&Session) -> bool) {
+        self.pump_until(self.until + DRAIN, done).await;
+    }
+
     fn req(&mut self, sid: &str, class: &'static str, mode: Mode, filters: Vec<Value>) {
         self.req_due(sid, class, mode, filters, Instant::now());
     }
 
-    /// A REQ that was due at `due`; time to EOSE counts from then.
+    /// A REQ that was due at `due`; time to EOSE counts from then. False,
+    /// with nothing sent, once the session has ended.
     fn req_due(
         &mut self,
         sid: &str,
@@ -2072,9 +2126,13 @@ impl Session {
         mode: Mode,
         filters: Vec<Value>,
         due: Instant,
-    ) {
+    ) -> bool {
+        if !self.open() {
+            return false;
+        }
         self.ctx.stats().class(class).sent += 1;
         self.send_req(sid, class, mode, filters, due);
+        true
     }
 
     fn send_req(
@@ -2122,6 +2180,9 @@ impl Session {
         if self.auth != Auth::None {
             return matches!(self.auth, Auth::Pending(..) | Auth::Done);
         }
+        if !self.open() {
+            return false;
+        }
         let event = signed(
             &keys,
             unix_now(),
@@ -2139,7 +2200,12 @@ impl Session {
         true
     }
 
-    fn publish(&mut self, event: Value, class: &'static str, retry: bool, due: Instant) {
+    /// Publish `event`, due at `due`. False, with nothing sent, once the
+    /// session has ended.
+    fn publish(&mut self, event: Value, class: &'static str, retry: bool, due: Instant) -> bool {
+        if !self.open() {
+            return false;
+        }
         let id = event["id"].as_str().unwrap_or_default().to_owned();
         let frame = json!(["EVENT", event]).to_string();
         self.ctx.published().insert(
@@ -2162,6 +2228,34 @@ impl Session {
             },
         );
         let _ = self.conn.out.send(Out::Event(id, frame));
+        true
+    }
+
+    /// Publish a group's Add commit and its Welcomes, due at `due`, as one
+    /// burst; nothing once the session has ended.
+    fn send_burst(&mut self, due: Instant, commit: Value, wraps: Vec<Value>) {
+        if !self.open() {
+            return;
+        }
+        {
+            let mut stats = self.ctx.stats();
+            stats.lag(due);
+            stats.largest_commit = stats.largest_commit.max(commit.to_string().len());
+            if let Some(wrap) = wraps.first() {
+                stats.largest_welcome = stats.largest_welcome.max(wrap.to_string().len());
+            }
+            stats.class("marmot.burst").sent += 1;
+        }
+        self.burst = Some(Burst {
+            started: due,
+            total: 1 + wraps.len(),
+            accepted: 0,
+            failed: 0,
+        });
+        self.publish(commit, "publish.marmot_commit", true, due);
+        for wrap in wraps {
+            self.publish(wrap, "publish.marmot_welcome", true, due);
+        }
     }
 
     fn next_timer(&self) -> Option<Instant> {
@@ -2176,8 +2270,13 @@ impl Session {
             .map(|(_, id)| id.clone())
             .collect();
         self.retries.retain(|(at, _)| *at > now);
+        // A retry the session's end overtook stays refused.
         for id in due {
-            self.resend(&id);
+            if self.open() {
+                self.resend(&id);
+            } else {
+                self.give_up(now, &id, None);
+            }
         }
     }
 
@@ -2282,20 +2381,24 @@ impl Session {
                     text(&frame, 1).unwrap_or_default(),
                     text(&frame, 2).unwrap_or_default(),
                 );
-                if reason.starts_with("closed: authentication changed") {
-                    // Wok closes open passes when the connection
-                    // authenticates, and the client opens them again,
-                    // timed from the first open. One it already finished
-                    // needs nothing.
-                    if let Some(neg) = self.negs.remove(&sid) {
+                // Wok closes open passes when the connection authenticates,
+                // and the client opens them again while its session lasts,
+                // timed from the first open. One it already finished needs
+                // nothing.
+                let reopen = reason.starts_with("closed: authentication changed");
+                match self.negs.remove(&sid) {
+                    Some(neg) if reopen && self.open() => {
                         self.send_neg_open(&sid, neg.group, neg.items, neg.started);
                     }
-                } else if self.negs.remove(&sid).is_some() {
-                    let mut stats = self.ctx.stats();
-                    stats.refusal("marmot.neg", &reason);
-                    stats.class("marmot.neg").refused += 1;
-                } else {
-                    self.protocol(format!("NEG-ERR for unknown session {sid}: {reason}"));
+                    Some(_) => {
+                        let mut stats = self.ctx.stats();
+                        stats.refusal("marmot.neg", &reason);
+                        stats.class("marmot.neg").refused += 1;
+                    }
+                    None if reopen => {}
+                    None => {
+                        self.protocol(format!("NEG-ERR for unknown session {sid}: {reason}"));
+                    }
                 }
             }
             _ => self.protocol(format!("unexpected relay message {}", Value::Array(frame))),
@@ -2437,12 +2540,14 @@ impl Session {
         if sub.closed {
             return;
         }
-        let class = sub.class;
-        let can_auth = self.keys.is_some() && matches!(self.auth, Auth::None | Auth::Pending(..));
-        if reason.starts_with("auth-required:") && sub.eose.is_none() && can_auth {
+        let (class, answered) = (sub.class, sub.eose.is_some());
+        let can_auth = self.open()
+            && self.keys.is_some()
+            && matches!(self.auth, Auth::None | Auth::Pending(..));
+        if reason.starts_with("auth-required:") && !answered && can_auth {
             // NIP-42: authenticate, then send the same REQ again. Before the
             // relay's challenge arrives, AUTH waits for it.
-            self.auth_waiting.push(sid.to_owned());
+            self.auth_waiting.push((sid.to_owned(), reason.to_owned()));
             self.ctx.stats().auth_round_trips += 1;
             if self.start_auth() || self.challenge.is_none() {
                 return;
@@ -2471,28 +2576,33 @@ impl Session {
                     class.completed += 1;
                     record_us(&mut class.done, micros(at - sent));
                     drop(stats);
-                    for sid in std::mem::take(&mut self.auth_waiting) {
-                        if let Some(old) = self.subs.remove(&sid) {
+                    // What AUTH was for goes out again while the session
+                    // lasts; after that it stays refused.
+                    let open = self.open();
+                    for (sid, reason) in std::mem::take(&mut self.auth_waiting) {
+                        if !open {
+                            self.refuse_sub(&sid, &reason);
+                        } else if let Some(old) = self.subs.remove(&sid) {
                             self.send_req(&sid, old.class, old.mode, old.filters, old.started);
                         }
                     }
-                    for event_id in std::mem::take(&mut self.auth_events) {
-                        self.resend(&event_id);
+                    for (event_id, reason) in std::mem::take(&mut self.auth_events) {
+                        if open {
+                            self.resend(&event_id);
+                        } else {
+                            self.give_up(at, &event_id, Some(&reason));
+                        }
                     }
                 } else {
                     self.auth = Auth::Failed;
                     let mut stats = self.ctx.stats();
                     stats.refusal("auth", reason);
                     stats.class("auth").refused += 1;
-                    for sid in std::mem::take(&mut self.auth_waiting) {
-                        if let Some(sub) = self.subs.get_mut(&sid) {
-                            sub.refused = true;
-                            stats.refusal(sub.class, "auth-required: AUTH was refused");
-                            stats.class(sub.class).refused += 1;
-                        }
-                    }
                     drop(stats);
-                    for event_id in std::mem::take(&mut self.auth_events) {
+                    for (sid, _) in std::mem::take(&mut self.auth_waiting) {
+                        self.refuse_sub(&sid, "auth-required: AUTH was refused");
+                    }
+                    for (event_id, _) in std::mem::take(&mut self.auth_events) {
                         self.give_up(at, &event_id, Some("auth-required: AUTH was refused"));
                     }
                 }
@@ -2524,9 +2634,11 @@ impl Session {
         }
         // MDK publishes anonymously and authenticates only when a relay
         // answers `auth-required:`, then publishes again.
-        let can_auth = self.keys.is_some() && matches!(self.auth, Auth::None | Auth::Pending(..));
+        let can_auth = self.open()
+            && self.keys.is_some()
+            && matches!(self.auth, Auth::None | Auth::Pending(..));
         if retry && reason.starts_with("auth-required:") && can_auth {
-            self.auth_events.push(id.to_owned());
+            self.auth_events.push((id.to_owned(), reason.to_owned()));
             self.ctx.stats().auth_round_trips += 1;
             if self.start_auth() || self.challenge.is_none() {
                 return;
@@ -2538,9 +2650,10 @@ impl Session {
             stats.refusal(class, reason);
             stats.class(class).refused += 1;
         }
-        // MDK retries `rate-limited:` publications with backoff.
-        if retry && reason.starts_with("rate-limited:") && at < self.until {
-            let delay = Duration::from_millis(250 * u64::from(attempts.min(12)));
+        // MDK retries `rate-limited:` publications with backoff, within the
+        // session.
+        let delay = Duration::from_millis(250 * u64::from(attempts.min(12)));
+        if retry && reason.starts_with("rate-limited:") && at + delay < self.until {
             if let Some(pending) = self.pending.get_mut(id) {
                 pending.attempts += 1;
             }
@@ -2561,6 +2674,16 @@ impl Session {
         };
         let frame = json!(["EVENT", event]).to_string();
         let _ = self.conn.out.send(Out::Event(id.to_owned(), frame));
+    }
+
+    /// A subscription the relay refused, and that is not asked again.
+    fn refuse_sub(&mut self, sid: &str, reason: &str) {
+        if let Some(sub) = self.subs.get_mut(sid) {
+            sub.refused = true;
+            let mut stats = self.ctx.stats();
+            stats.refusal(sub.class, reason);
+            stats.class(sub.class).refused += 1;
+        }
     }
 
     /// Stop publishing `id`; `refusal` is recorded when no OK said why.
@@ -2601,6 +2724,9 @@ impl Session {
     }
 
     fn open_neg(&mut self, sid: &str, group: usize, held: &[(u64, [u8; 32])]) {
+        if !self.open() {
+            return;
+        }
         self.ctx.stats().class("marmot.neg").sent += 1;
         self.send_neg_open(sid, group, held.to_vec(), Instant::now());
     }
@@ -2747,22 +2873,24 @@ impl Session {
     /// subscriptions for the delivery check, and close the socket.
     ///
     /// As in `rate.rs`, a request still unanswered when the session stops
-    /// reading counts in its class's latency until then, a lower bound. Work
-    /// started after `until` may still be answering, and work a relay
-    /// disconnect cut off is that disconnect's result, so neither counts.
+    /// reading counts in its class's latency until then, a lower bound.
+    /// Work a relay disconnect cut off is that disconnect's result, so it
+    /// does not count.
     fn finish(mut self) -> Vec<LiveRecord> {
         let now = Instant::now();
-        // A relay that answers `auth-required:` but never challenges.
-        for sid in std::mem::take(&mut self.auth_waiting) {
-            if let Some(sub) = self.subs.get_mut(&sid) {
-                sub.refused = true;
-                let mut stats = self.ctx.stats();
-                stats.refusal(sub.class, NO_CHALLENGE);
-                stats.class(sub.class).refused += 1;
-            }
+        // What still waited on AUTH stays refused: for want of a challenge,
+        // or with the relay's reason.
+        let challenged = self.challenge.is_some();
+        for (sid, reason) in std::mem::take(&mut self.auth_waiting) {
+            self.refuse_sub(&sid, if challenged { &reason } else { NO_CHALLENGE });
         }
-        for id in std::mem::take(&mut self.auth_events) {
-            self.give_up(now, &id, Some(NO_CHALLENGE));
+        for (id, reason) in std::mem::take(&mut self.auth_events) {
+            let reason = if challenged { &reason } else { NO_CHALLENGE };
+            self.give_up(now, &id, Some(reason));
+        }
+        // Retries the session's end overtook stay refused.
+        for (_, id) in std::mem::take(&mut self.retries) {
+            self.give_up(now, &id, None);
         }
         let cut_off = self.gone;
         let until = self.until;
@@ -3072,13 +3200,13 @@ async fn outbox_client(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<LiveRec
     };
     let mut until = [plan.anchor - 15 * DAY; 3];
     let mut step = 2;
-    while !s.gone && Instant::now() < visit.until {
+    while s.open() {
         let ready = |s: &Session| (0..5).any(|k| !queued[k].is_empty() && s.finished(&sid(k)));
         s.pump_until(next.min(visit.until), ready).await;
-        let now = Instant::now();
-        if s.gone || now >= visit.until {
+        if !s.open() {
             break;
         }
+        let now = Instant::now();
         if now >= next {
             ctx.stats().lag(next);
             for slots in &mut queued {
@@ -3102,10 +3230,12 @@ async fn outbox_client(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<LiveRec
                 step += 1;
                 rotation_filter(user, step)
             };
-            s.req_due(&id, replace_class(k), Mode::Replace, vec![filter], due);
+            if !s.req_due(&id, replace_class(k), Mode::Replace, vec![filter], due) {
+                slots.push_front(due);
+            }
         }
     }
-    s.pump_until(visit.until + DRAIN, |_| false).await;
+    s.drain(|_| false).await;
     // Re-REQs still waiting when the session stopped reading were due and
     // never answered, unless the relay ended the session.
     if !s.gone {
@@ -3154,10 +3284,8 @@ async fn marmot_receiver(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<LiveR
         s.pump_until(visit.until, |s| !matches!(s.auth, Auth::Pending(..)))
             .await;
     }
-    // A late upgrade can leave no session to subscribe in.
-    if s.gone || Instant::now() >= visit.until {
-        return s.finish();
-    }
+    // A late upgrade or AUTH can leave the session over: then nothing is
+    // subscribed.
     let anchor = plan.anchor;
     s.req(
         "inbox",
@@ -3175,7 +3303,7 @@ async fn marmot_receiver(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<LiveR
         );
         s.open_neg(&format!("n{k}"), group, &user.held[k]);
     }
-    s.pump_until(visit.until + DRAIN, |_| false).await;
+    s.drain(|_| false).await;
     s.finish()
 }
 
@@ -3198,10 +3326,7 @@ async fn marmot_directory(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<Live
         );
     }
     let sids: Vec<String> = (0..user.directory.len()).map(|k| format!("d{k}")).collect();
-    s.pump_until(visit.until + DRAIN, |s| {
-        sids.iter().all(|sid| s.finished(sid))
-    })
-    .await;
+    s.drain(|s| sids.iter().all(|sid| s.finished(sid))).await;
     s.finish()
 }
 
@@ -3259,36 +3384,10 @@ async fn marmot_publisher(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<Live
             ));
         }
         s.pump_until(burst_at, |_| false).await;
-        // A late upgrade and the preparation can run past the session.
-        if !s.gone && Instant::now() < visit.until {
-            {
-                let mut stats = ctx.stats();
-                stats.lag(burst_at);
-                stats.largest_commit = stats.largest_commit.max(commit.to_string().len());
-                if let Some(wrap) = wraps.first() {
-                    stats.largest_welcome = stats.largest_welcome.max(wrap.to_string().len());
-                }
-                stats.class("marmot.burst").sent += 1;
-            }
-            s.burst = Some(Burst {
-                started: burst_at,
-                total: 1 + wraps.len(),
-                accepted: 0,
-                failed: 0,
-            });
-            s.publish(commit, "publish.marmot_commit", true, burst_at);
-            for wrap in wraps {
-                s.publish(wrap, "publish.marmot_welcome", true, burst_at);
-            }
-        }
+        // A late upgrade and the preparation can leave the session over.
+        s.send_burst(burst_at, commit, wraps);
     }
-    s.pump_until(visit.until, |s| s.pending.is_empty()).await;
-    // Retries stop when the session ends; what is still refused stays refused.
-    for (_, id) in std::mem::take(&mut s.retries) {
-        s.give_up(Instant::now(), &id, None);
-    }
-    s.pump_until(visit.until + DRAIN, |s| s.pending.is_empty())
-        .await;
+    s.drain(|s| s.pending.is_empty()).await;
     s.finish()
 }
 
@@ -3334,7 +3433,7 @@ async fn background_publisher(ctx: Arc<Ctx>, index: usize) -> Vec<LiveRecord> {
                 next += interval;
             }
         }
-        while !s.gone && next < ctx.end {
+        while s.open() && next < ctx.end {
             s.pump_until(next, |_| false).await;
             if Instant::now() < next {
                 continue;
@@ -3348,9 +3447,10 @@ async fn background_publisher(ctx: Arc<Ctx>, index: usize) -> Vec<LiveRecord> {
                 stats.lag(due);
                 stats.publish_due += 1;
             }
+            // Due either way; sent only while the session lasts.
             s.publish(event, "publish.background", false, due);
         }
-        s.pump_until(ctx.drain_end, |s| s.pending.is_empty()).await;
+        s.drain(|s| s.pending.is_empty()).await;
         s.finish();
     }
     // Publications due once the relay no longer took the connection.
@@ -5231,6 +5331,11 @@ mod tests {
                 "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 11\r\n\r\nslow down\r\n",
                 "slow down",
             ),
+            // Any status but 101 is the relay declining; a page is no reason.
+            (
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 26\r\n\r\n<html>\n<p>denied</p>\n</html>",
+                "HTTP 403",
+            ),
         ] {
             let addr = scripted_relay(response.as_bytes().to_vec(), false).await;
             match ws_connect(addr, None, false, true).await {
@@ -5239,6 +5344,161 @@ mod tests {
                 Ok(_) => panic!("{response} upgraded"),
             }
         }
+        let addr = scripted_relay(b"SSH-2.0-OpenSSH\r\n\r\n".to_vec(), false).await;
+        assert!(matches!(
+            ws_connect(addr, None, false, true).await,
+            Err(ConnectFailure::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn io_failures_are_the_relays_unless_the_load_host_ran_out() {
+        use std::io::{Error, ErrorKind};
+        for relay in [
+            Error::from(ErrorKind::ConnectionRefused),
+            Error::from(ErrorKind::ConnectionReset),
+            Error::from(ErrorKind::BrokenPipe),
+            Error::from(ErrorKind::TimedOut),
+            Error::from(ErrorKind::HostUnreachable),
+        ] {
+            let kind = relay.kind();
+            assert!(
+                matches!(io_failure("x", relay), ConnectFailure::Refused(_)),
+                "{kind:?}"
+            );
+        }
+        for local in [
+            Error::from(ErrorKind::AddrNotAvailable),
+            Error::from(ErrorKind::PermissionDenied),
+            Error::from_raw_os_error(24),
+        ] {
+            let shown = local.to_string();
+            assert!(
+                matches!(io_failure("x", local), ConnectFailure::Failed(_)),
+                "{shown}"
+            );
+        }
+    }
+
+    /// Once a session's visit is over it gives the relay nothing new: no
+    /// REQ, publication, NIP-77 pass, burst or AUTH, and none is counted.
+    #[test]
+    fn a_session_whose_visit_is_over_starts_nothing() {
+        let keys = Keypair::new(SECP256K1, &mut rand::rngs::StdRng::seed_from_u64(6));
+        let groups = vec![Group {
+            gid: "ab".repeat(32),
+            members: vec![0],
+        }];
+        let mut s = offline_session(Vec::new(), groups, Some(keys));
+        s.challenge = Some("c".into());
+        s.until = Instant::now();
+        s.req(
+            "l0",
+            "live.home_feed",
+            Mode::Live,
+            vec![json!({"kinds":[1]})],
+        );
+        let now = Instant::now();
+        assert!(!s.req_due(
+            "r0",
+            "w6.scroll_replace",
+            Mode::Replace,
+            vec![json!({"kinds":[1]})],
+            now
+        ));
+        assert!(!s.publish(
+            event("e", 1, 1, json!([])),
+            "publish.background",
+            false,
+            now
+        ));
+        s.open_neg("n0", 0, &[]);
+        s.send_burst(
+            now,
+            event("c", 1, 445, json!([])),
+            vec![event("w", 1, 1059, json!([]))],
+        );
+        assert!(!s.start_auth());
+        assert!(s.subs.is_empty() && s.pending.is_empty() && s.negs.is_empty());
+        assert!(s.ctx.published().is_empty());
+        let stats = s.ctx.stats();
+        assert!(
+            stats.classes.values().all(|c| c.sent == 0),
+            "{:?}",
+            stats.classes.keys()
+        );
+    }
+
+    /// AUTH accepted after the visit ended: what it was for is not sent
+    /// again and stays refused, by the relay's reason.
+    #[test]
+    fn what_waited_on_an_auth_answered_after_the_visit_stays_refused() {
+        let keys = Keypair::new(SECP256K1, &mut rand::rngs::StdRng::seed_from_u64(7));
+        let mut s = offline_session(Vec::new(), Vec::new(), Some(keys));
+        s.challenge = Some("c".into());
+        s.req(
+            "l2",
+            "live.dm_nip04",
+            Mode::Live,
+            vec![json!({"kinds":[4],"#p":["bob"]})],
+        );
+        let dm_refused = "auth-required: requested filter requires authentication";
+        s.on_message(Instant::now(), json!(["CLOSED", "l2", dm_refused]));
+        assert!(s.publish(
+            event("e", 1, 1, json!([])),
+            "publish.marmot_commit",
+            true,
+            Instant::now()
+        ));
+        let event_refused = "auth-required: publishing requires authentication";
+        s.on_message(Instant::now(), json!(["OK", "e", false, event_refused]));
+        let Auth::Pending(auth_id, _) = &s.auth else {
+            panic!("the client answers with AUTH");
+        };
+        let auth_id = auth_id.clone();
+        s.until = Instant::now();
+        s.on_message(Instant::now(), json!(["OK", auth_id, true, ""]));
+        assert!(s.subs["l2"].refused, "the REQ was not sent again");
+        assert!(s.pending.is_empty(), "the publication was not sent again");
+        let stats = s.ctx.stats();
+        assert_eq!(stats.refusals[dm_refused]["live.dm_nip04"], 1);
+        assert_eq!(stats.refusals[event_refused]["publish.marmot_commit"], 1);
+    }
+
+    /// A `rate-limited:` retry that would fall after the visit is not
+    /// scheduled, and a NIP-77 pass Wok closes for a late AUTH after the
+    /// visit is not opened again: both stay refused.
+    #[test]
+    fn retries_the_visits_end_overtakes_are_not_made() {
+        let groups = vec![Group {
+            gid: "ab".repeat(32),
+            members: vec![0],
+        }];
+        let mut s = offline_session(Vec::new(), groups, None);
+        s.open_neg("n0", 0, &[(10, [1; 32])]);
+        s.until = Instant::now() + Duration::from_millis(100);
+        assert!(s.publish(
+            event("e", 1, 1, json!([])),
+            "publish.marmot_commit",
+            true,
+            Instant::now()
+        ));
+        s.on_message(
+            Instant::now(),
+            json!(["OK", "e", false, "rate-limited: slow down"]),
+        );
+        assert!(s.retries.is_empty() && s.pending.is_empty());
+        s.until = Instant::now();
+        let reset = "closed: authentication changed; reopen synchronization";
+        s.on_message(Instant::now(), json!(["NEG-ERR", "n0", reset]));
+        assert!(s.negs.is_empty(), "the pass was not opened again");
+        let mut stats = s.ctx.stats();
+        assert_eq!(
+            stats.refusals["rate-limited: slow down"]["publish.marmot_commit"],
+            1
+        );
+        let neg = stats.class("marmot.neg");
+        assert_eq!((neg.sent, neg.refused), (1, 1));
     }
 
     pub(super) fn small_options() -> ClientsOptions {

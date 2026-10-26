@@ -3759,7 +3759,7 @@ pub struct RunInput {
     pub nodelay: bool,
 }
 
-/// Run the scenario against a relay that already holds `plan.events` and
+/// Run the scenario against a relay that imported `plan.events` and
 /// `background`. Also returns every REQ class's time to EOSE, merged.
 pub async fn run(input: RunInput) -> Result<(ClientsReport, Histogram<u64>)> {
     let RunInput {
@@ -3774,6 +3774,9 @@ pub async fn run(input: RunInput) -> Result<(ClientsReport, Histogram<u64>)> {
     } = input;
     opts.validate()?;
     let scenario_events = plan.events.len() as u64;
+    // What the relay keeps of the background, `--event-mix social`'s
+    // deletions and replacements applied, is what it can hold and serve.
+    let background = crate::retained_events(&background);
     let background_events = background.len() as u64;
     let mut corpus = std::mem::take(&mut plan.events);
     corpus.extend(background);
@@ -3937,7 +3940,8 @@ async fn check_target(
     oracle: &Oracle,
     scenario_events: usize,
 ) -> Result<()> {
-    // Notes are never replaced or deleted, so a relay keeps every one.
+    // Notes are never replaced, and the oracle holds only those a relay
+    // keeps, so every one sampled must be there.
     let sample = |events: &[Value]| -> Vec<String> {
         let notes: Vec<&str> = events
             .iter()
@@ -6368,5 +6372,65 @@ mod tests {
         let mut stats = ctx.stats();
         assert_eq!(stats.errors, 0, "{:?}", stats.error_samples);
         assert_eq!(stats.class("connect").completed, 1);
+    }
+
+    /// A background corpus in which an author deletes a note and replaces
+    /// a profile, as `--event-mix social` does: a relay that applied both
+    /// passes the preflight and the history checks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_corpus_with_deletions_and_replacements_is_checked_as_the_relay_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ClientsOptions {
+            outbox_clients: 1,
+            marmot_clients: 0,
+            duration_secs: 3,
+            ..small_options()
+        };
+        let anchor = unix_now() - 5;
+        let plan = Plan::generate(&opts, 41, anchor);
+        let author = Keypair::new(SECP256K1, &mut rand::rngs::StdRng::seed_from_u64(10));
+        let at = |offset: u64| anchor - 100 + offset;
+        let tagged = vec![json!(["t", "nostr"])];
+        let mut background: Vec<Value> = (0..3)
+            .map(|i| signed(&author, at(i), 1, tagged.clone(), format!("note {i}")))
+            .collect();
+        let deleted = signed(&author, at(3), 1, tagged, "deleted".into());
+        let deletion = signed(
+            &author,
+            at(4),
+            5,
+            vec![json!(["e", deleted["id"]])],
+            String::new(),
+        );
+        background.extend([
+            deleted,
+            deletion,
+            signed(&author, at(5), 0, Vec::new(), r#"{"name":"old"}"#.into()),
+            signed(&author, at(6), 0, Vec::new(), r#"{"name":"new"}"#.into()),
+        ]);
+        let mut stored = plan.events.clone();
+        stored.extend(background.iter().cloned());
+        let (addr, handle, cfg) = spawn_relay(dir.path(), &stored, |_| {}).await;
+        let url = format!("ws://{addr}");
+        let (report, _) = run(RunInput {
+            addr,
+            plan,
+            background,
+            facts: RelayFacts::remote(
+                &url,
+                &cfg.relay.auth.recipient_only_kinds,
+                cfg.relay.max_filter_limit,
+                cfg.relay.max_total_events_per_req,
+            ),
+            relay_config: format!("remote target {url}"),
+            config_overrides: Vec::new(),
+            opts,
+            nodelay: true,
+        })
+        .await
+        .unwrap();
+        handle.request_shutdown();
+        assert_eq!(report.mismatches, 0, "{:#?}", report.mismatch_samples);
+        assert_eq!(report.errors, 0, "{:#?}", report.error_samples);
     }
 }

@@ -46,6 +46,7 @@ Other CI jobs:
 - distribution-platform builds
 - a short Linux soak
 - an AddressSanitizer fuzz run
+- the attack-surface reachability check (`scripts/attack-surface-reach.py --check`)
 
 To fuzz locally, you need nightly and `cargo-fuzz`:
 

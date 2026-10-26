@@ -1,0 +1,46 @@
+name: reachability
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/**'
+      - scripts/attack-surface-reach.py
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/reachability.yml
+  pull_request:
+    paths:
+      - 'crates/**'
+      - scripts/attack-surface-reach.py
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/reachability.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reachability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: attack-surface reachability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Pinned toolchain with llvm-tools
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools-preview
+          cargo --version
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Check relay functions reached per profile and phase
+        run: python3 scripts/attack-surface-reach.py --check

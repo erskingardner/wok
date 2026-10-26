@@ -13,6 +13,7 @@ or production capacity.
 | `platforms.yml` | Native release build, version check, storage/transport/compatibility/CLI tests on Linux x86-64/ARM64 and macOS Intel/Apple Silicon |
 | `fuzz.yml` | 10,000 AddressSanitizer ingress fuzz iterations, protocol-shaped seeds, 2 MiB input ceiling, corpus reuse, crash artifacts |
 | `reliability.yml` | Three-minute Linux canary on relevant master pushes/PRs; one-hour weekly or manual soak; retained workload, resource samples, correctness and failure evidence |
+| `reachability.yml` | Coverage-instrumented probe of every profile: no phase reaches a relay function its `crates/wok-compat/tests/reachability/` baseline does not list, and no phase that reached functions reaches none |
 | `security.yml` | Dependency advisories, licenses, sources, and dependency policy |
 
 C++ comparisons remain optional locally. Set `WOK_REQUIRE_STRFRY=1` to make a

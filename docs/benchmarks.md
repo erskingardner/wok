@@ -154,6 +154,10 @@ already been imported into the target relay; they verify parsed EOSE/subscriptio
 sets (where a `limit` cuts through a second, any of its events; see
 [Reading a social corpus](#reading-a-social-corpus)),
 publication IDs/boolean acceptance, and complete per-subscriber deliveries.
+`ws_query_latency`, `deep_history_pagination` and `mixed_read_write` work out
+each expected reply before the clock starts, since on a large corpus that can
+take longer than the relay takes to answer. A latency sample runs from the REQ
+to its EOSE, and throughput leaves out the time spent checking replies.
 Local publication trials also export and compare the final stored state, including
 replacement, deletion and ephemeral semantics; remote storage is explicitly not
 inspected, except by `--reconcile` after `ws_publish_rate`.

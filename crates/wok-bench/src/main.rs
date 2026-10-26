@@ -2245,6 +2245,9 @@ fn ws_query_trial(
     let measured_queries = queries.max(1);
     let total_queries = measured_queries.saturating_add(20);
     let filters = corpus.filters(total_queries, mix)?;
+    // Work out every reply before the clock starts: on a large corpus that
+    // takes longer than the relay does.
+    let expected: Vec<_> = filters.iter().map(|f| corpus.expected(f)).collect();
     preload(target, corpus_path, corpus)?;
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
@@ -2254,7 +2257,7 @@ fn ws_query_trial(
             sockets.push(connect_retry(&url).await?);
         }
         // Warm-up.
-        for (i, f) in filters.iter().take(20).enumerate() {
+        for (i, (f, expected)) in filters.iter().zip(&expected).take(20).enumerate() {
             let ws = &mut sockets[i % 4];
             let subscription = format!("warm-{i}");
             ws.send(Message::Text(
@@ -2263,7 +2266,7 @@ fn ws_query_trial(
             .await?;
             let actual = read_history(ws, &subscription).await?;
             anyhow::ensure!(
-                corpus.expected(f).matches(&actual),
+                expected.matches(&actual),
                 "warmup returned wrong events for {f}"
             );
             ws.send(Message::Text(
@@ -2272,10 +2275,11 @@ fn ws_query_trial(
             .await?;
         }
         let start = Instant::now();
+        let mut checking = Duration::ZERO;
         let mut done = 0u64;
         let mut results = 0u64;
         let mut mismatches = 0u64;
-        for (i, f) in filters.iter().skip(20).enumerate() {
+        for (i, (f, expected)) in filters.iter().zip(&expected).skip(20).enumerate() {
             let ws = &mut sockets[i % 4];
             let subscription = format!("query-{i}");
             let t0 = Instant::now();
@@ -2284,20 +2288,21 @@ fn ws_query_trial(
             ))
             .await?;
             let actual = read_history(ws, &subscription).await?;
+            hist.record(t0.elapsed().as_micros().max(1) as u64)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let checked = Instant::now();
             results += actual.len() as u64;
-            let correct = corpus.expected(f).matches(&actual);
+            if !expected.matches(&actual) {
+                mismatches += 1;
+            }
+            checking += checked.elapsed();
             ws.send(Message::Text(
                 json!(["CLOSE", subscription]).to_string().into(),
             ))
             .await?;
-            hist.record(t0.elapsed().as_micros().max(1) as u64)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if !correct {
-                mismatches += 1;
-            }
             done += 1;
         }
-        let elapsed = start.elapsed();
+        let elapsed = start.elapsed().saturating_sub(checking);
         for ws in &mut sockets {
             let _ = ws.close(None).await;
         }
@@ -2342,44 +2347,53 @@ fn deep_history_trial(
         filter
     };
     let available_pages = n.div_ceil(page_size);
-    let pages = queries.max(1).min(available_pages);
+    // Plan the pages and their replies before the clock starts. A correct
+    // page's oldest second is the same whichever of its events it holds.
+    // Skipped seconds can end the history a page early.
+    let mut plan = Vec::new();
+    let mut until = u64::MAX;
+    while (plan.len() as u64) < queries.max(1).min(available_pages) {
+        let filter = page(until);
+        let expected = corpus.expected(&filter);
+        let Some(oldest) = expected.oldest() else {
+            break;
+        };
+        until = oldest.saturating_sub(1);
+        plan.push((filter, expected));
+    }
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use std::collections::HashSet;
         use tokio_tungstenite::tungstenite::Message;
 
         let mut socket = connect_retry(&url).await?;
-        let mut until = u64::MAX;
         let mut seen = HashSet::new();
         let mut mismatches = 0u64;
         let mut latencies = Vec::new();
+        let mut checking = Duration::ZERO;
         let started_all = Instant::now();
-        for _page in 0..pages {
+        for (filter, expected) in &plan {
             let started = Instant::now();
-            let filter = page(until);
             socket
                 .send(Message::Text(
                     json!(["REQ", "deep", filter]).to_string().into(),
                 ))
                 .await?;
             let actual = read_history(&mut socket, "deep").await?;
-            if !corpus.expected(&filter).matches(&actual) {
+            latencies.push(started.elapsed().as_micros().max(1) as u64);
+            let checked = Instant::now();
+            if !expected.matches(&actual) {
                 mismatches += 1;
                 break;
             }
-            // Skipped seconds can end the history a page early.
-            let Some(oldest) = actual.iter().filter_map(|e| e["created_at"].as_u64()).min() else {
-                break;
-            };
             for event in &actual {
                 if !seen.insert(event["id"].as_str().unwrap().to_owned()) {
                     mismatches += 1;
                 }
             }
-            latencies.push(started.elapsed().as_micros().max(1) as u64);
-            until = oldest.saturating_sub(1);
+            checking += checked.elapsed();
         }
-        let elapsed = started_all.elapsed();
+        let elapsed = started_all.elapsed().saturating_sub(checking);
         let _ = socket.close(None).await;
         Ok::<_, anyhow::Error>((seen.len() as u64, mismatches, elapsed, latencies))
     });
@@ -2432,6 +2446,18 @@ fn mixed_read_write_trial(
             mix => mix,
         },
     })?;
+    // Work out every reply before the clock starts.
+    let plan: Vec<_> = (0..query_count)
+        .map(|query_number| {
+            let filter = json!({
+                "kinds":[1], "authors":[query_author],
+                "limit":100,
+                "until":u64::MAX.saturating_sub(query_number)
+            });
+            let expected = corpus.expected(&filter);
+            (filter, expected)
+        })
+        .collect();
     let (url, mut child) = start_target(target.bin, target.url, target.dbdir)?;
     let out = rt.block_on(async {
         use tokio_tungstenite::tungstenite::Message;
@@ -2440,38 +2466,35 @@ fn mixed_read_write_trial(
         let mut write_socket = connect_retry(&url).await?;
         let query_future = async {
             let started_all = Instant::now();
+            let mut checking = Duration::ZERO;
             let mut completed = 0u64;
             let mut results = 0u64;
             let mut mismatches = 0u64;
             let mut latencies = Vec::new();
-            for query_number in 0..query_count {
+            for (query_number, (filter, expected)) in plan.iter().enumerate() {
                 let started = Instant::now();
                 let subscription_id = format!("mixed-{query_number}");
                 query_socket
                     .send(Message::Text(
-                        json!(["REQ", subscription_id, {
-                            "kinds":[1], "authors":[query_author],
-                            "limit":100,
-                            "until":u64::MAX.saturating_sub(query_number)
-                        }])
-                        .to_string()
-                        .into(),
+                        json!(["REQ", subscription_id, filter]).to_string().into(),
                     ))
                     .await?;
                 let actual = read_history(&mut query_socket, &subscription_id).await?;
-                let expected = corpus.expected(&json!({"kinds":[1], "authors":[query_author], "limit":100, "until":u64::MAX.saturating_sub(query_number)}));
-                let query_results = actual.len() as u64;
-                if !expected.matches(&actual) { mismatches += 1; }
+                latencies.push(started.elapsed().as_micros().max(1) as u64);
+                let checked = Instant::now();
+                if !expected.matches(&actual) {
+                    mismatches += 1;
+                }
+                checking += checked.elapsed();
                 query_socket
                     .send(Message::Text(
                         json!(["CLOSE", subscription_id]).to_string().into(),
                     ))
                     .await?;
-                latencies.push(started.elapsed().as_micros().max(1) as u64);
-                results += query_results;
+                results += actual.len() as u64;
                 completed += 1;
             }
-            let elapsed = started_all.elapsed();
+            let elapsed = started_all.elapsed().saturating_sub(checking);
             let _ = query_socket.close(None).await;
             Ok::<_, anyhow::Error>((completed, results, mismatches, elapsed, latencies))
         };

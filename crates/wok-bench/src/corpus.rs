@@ -149,6 +149,16 @@ impl Expected<'_> {
         self.required.len() + self.take
     }
 
+    /// The oldest `created_at` in a correct reply, whichever of a cut
+    /// second's events it holds.
+    pub fn oldest(&self) -> Option<u64> {
+        if self.take > 0 {
+            self.tied.first().map(|e| created_at(e))
+        } else {
+            self.required.last().map(|e| created_at(e))
+        }
+    }
+
     /// Whether `actual` holds exactly the events this allows, each once and
     /// unchanged.
     pub fn matches(&self, actual: &[Value]) -> bool {
@@ -557,10 +567,15 @@ mod tests {
         let mut altered = all[1].clone();
         altered["content"] = json!("altered");
         assert!(!expected.matches(&[all[0].clone(), all[2].clone(), altered]));
+        // A page ends in the cut second, whichever of its events it holds.
+        assert_eq!(expected.oldest(), Some(20));
         // Nothing cut: the set is exact.
         let whole = corpus.expected(&json!({"kinds":[1],"limit":5}));
         assert!(whole.matches(all));
-        assert!(corpus.expected(&json!({"limit":0})).matches(&[]));
+        assert_eq!(whole.oldest(), Some(10));
+        let none = corpus.expected(&json!({"limit":0}));
+        assert!(none.matches(&[]));
+        assert_eq!(none.oldest(), None);
     }
 
     #[test]

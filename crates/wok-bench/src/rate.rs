@@ -244,6 +244,13 @@ fn since(start: Instant) -> u64 {
     micros(Instant::now().saturating_duration_since(start))
 }
 
+fn failure(conn: usize, start: Instant, why: &str) -> String {
+    format!(
+        "connection {conn} at {:.1} s: {why}",
+        since(start) as f64 / 1e6
+    )
+}
+
 async fn until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -296,7 +303,7 @@ async fn drive(
                 tokio::time::sleep_until(due).await;
             }
             if let Err(e) = sink.send(Message::Text(frame.into())).await {
-                error = Some(format!("connection {conn}: send failed: {e}"));
+                error = Some(failure(conn, start, &format!("send failed: {e}")));
                 break;
             }
             sent[k] = Some(since(start));
@@ -322,13 +329,20 @@ async fn drive(
                 message = stream.next() => {
                     let text = match message {
                         Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Close(frame))) => {
+                            let why = frame.map_or_else(String::new, |frame| {
+                                format!(" ({} {})", u16::from(frame.code), frame.reason)
+                            });
+                            error = Some(failure(conn, start, &format!("relay closed the connection{why}")));
+                            break;
+                        }
                         Some(Ok(_)) => continue,
                         Some(Err(e)) => {
-                            error = Some(format!("connection {conn}: {e}"));
+                            error = Some(failure(conn, start, &e.to_string()));
                             break;
                         }
                         None => {
-                            error = Some(format!("connection {conn}: relay closed the connection"));
+                            error = Some(failure(conn, start, "relay closed the connection"));
                             break;
                         }
                     };
@@ -382,7 +396,9 @@ async fn drive(
         .collect();
     LaneLog {
         records,
-        error: send_error.or(receive_error),
+        // A send fails because the relay closed the connection, which the
+        // reader saw first.
+        error: receive_error.or(send_error),
         misrouted,
         notices,
     }
@@ -1024,7 +1040,12 @@ mod tests {
                 let ok = json!(["OK", frame[1]["id"], true, ""]).to_string();
                 socket.send(Message::Text(ok.into())).await.unwrap();
             }
-            socket.close(None).await.unwrap();
+            use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+            let frame = CloseFrame {
+                code: CloseCode::Again,
+                reason: "overloaded".into(),
+            };
+            socket.close(Some(frame)).await.unwrap();
         });
         let opts = options(200.0, 1.0, 1);
         let begun = std::time::Instant::now();
@@ -1037,6 +1058,10 @@ mod tests {
         assert_eq!(report.accepted, 10);
         assert_eq!(report.sent + report.unsent, 200);
         assert!(report.unsent > 0, "{report:#?}");
+        assert!(
+            report.connection_errors[0].ends_with("relay closed the connection (1013 overloaded)"),
+            "{report:#?}"
+        );
         assert!(!report.ok());
     }
 }

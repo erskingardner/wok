@@ -656,9 +656,14 @@ target, and each relay and its import can write only under its own
 `/var/lib/relay-bench/<name>`. Name targets for what they
 run, such as `strfry-1.1.3`, `wok-0.7.0` and `wok-master`. Two configurations
 of one binary, such as limits off and a preset as shipped, are two targets
-with two databases. The relay host needs systemd with cgroup v2, sysstat
-(`pidstat`, `mpstat`, `iostat`), iproute2, curl and GNU time; the load host
-needs `wok-bench`, GNU time, jq and sysstat. The relay-side helper refuses
+with two databases. strfry raises its open-file limit to `relay.nofiles`
+(1,000,000 by default) whenever it starts, imports included, and exits when
+that is above the unit's limit (`NOFILE_LIMIT`, default 524288). So set
+`relay { nofiles = 0 }` in a strfry target's config, or raise
+`NOFILE_LIMIT`. The relay host needs systemd with cgroup v2, sysstat
+(`pidstat`, `mpstat`, `iostat`), iproute2, curl, GNU time and util-linux's
+`fincore`. The load host needs systemd, `wok-bench`, GNU time, jq and
+sysstat. The relay-side helper refuses
 artifact paths outside `/opt/relay-bench/{campaigns,results}`. Prometheus
 evidence needs `observability.metrics_enabled = true` and `METRICS_URL`.
 
@@ -666,8 +671,9 @@ Each relay runs as the transient unit `relay-bench-target-<name>.service`,
 and its import runs under the same limits:
 
 - `RELAY_CPUS` pins it with `AllowedCPUs`. On a host with hyperthreads, list
-  both threads of each core (`lscpu -e` shows which CPUs share a core), for
-  example `0-7,24-31`.
+  both threads of each core (`lscpu -e` shows which CPUs share a core): for
+  example `0-7,24-31` where each core's second thread is numbered 24 higher,
+  or `0-15` where a core's threads are adjacent.
 - `RELAY_MEMORY` caps it with `MemoryMax`, for example `64G`. Under cgroup
   v2 the cap includes the page cache the relay reads through, so a database
   larger than the cap stays disk-bound on a host with more memory.
@@ -680,9 +686,10 @@ Every start drops the page cache first. With `CACHE=cold` (the default) the
 relay starts on an empty cache. `CACHE=warm` reads the database files inside
 the relay's unit before the relay starts, so warmed pages count against its
 cap; raise `READY_TIMEOUT` (seconds, default 120) for a large database. A
-warm start fails when the database is at least `RELAY_MEMORY`, or when the
-unit's page cache is smaller than the database once the relay listens: a
-database larger than the cap can only be measured cold.
+warm start fails when the database is at least `RELAY_MEMORY`, or when any
+database file is not wholly in the page cache once the relay listens
+(`cache-at-start.txt` lists each file's size and cached bytes): a database
+larger than the cap can only be measured cold.
 
 With `SNAPSHOTS=1` (the default), a target's first import is copied to
 `/var/lib/relay-bench/snapshots/<name>`, reflinked where the filesystem
@@ -694,7 +701,11 @@ one snapshot, so a large corpus over several targets needs room for a copy of
 each, or `SNAPSHOTS=0`. Import timing is recorded only for imports.
 `benchmark-relay-control drop-snapshot <name>` deletes one.
 
-`LOAD_CPUS` pins the generator with a transient unit on the load host. To
+On the load host, the generator and its `mpstat` sampler run as the transient
+units `relay-bench-load-<campaign>` and `relay-bench-load-<campaign>-mpstat`.
+A campaign stops every `relay-bench-load-*` unit when it exits or is
+interrupted, and again before it starts, in case an earlier campaign lost
+its connection. `LOAD_CPUS` pins the generator's unit. To
 run the generator beside the relay over loopback, set `LOAD_SSH` to the relay
 host's destination, `RELAY_HOST` to `127.0.0.1` and `LOAD_CPUS` to CPUs
 outside `RELAY_CPUS`. This suits scenarios whose traffic the network between

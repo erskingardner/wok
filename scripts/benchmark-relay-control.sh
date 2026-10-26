@@ -253,6 +253,22 @@ database_bytes() {
     echo "$total"
 }
 
+# Prints "file size resident" for each database file: its size and the bytes
+# of it in the page cache, counted in whole pages.
+database_residency() {
+    local file resident
+    for file in "$DB_ROOT"/db/*.mdb; do
+        resident=$(fincore --bytes --noheadings --output RES -- "$file")
+        printf '%s %s %s\n' "$file" "$(stat -c %s -- "$file")" "${resident//[[:space:]]/}"
+    done
+}
+
+# Prints the files of a database_residency listing that are not wholly in the
+# page cache. Whole pages cover a file only when their bytes reach its size.
+uncached_database_files() {
+    awk '$3 < $2 { print $1 }' "$1"
+}
+
 assert_benchmark_path() {
     local path=$1
     case /$path/ in
@@ -501,11 +517,9 @@ check_limits() {
     local effective cached
     effective=$(effective_memory_max "$cgroup" /sys/fs/cgroup)
     cached=$(awk '$1 == "file" { print $2 }' "$cgroup/memory.stat" 2>/dev/null)
-    cached=${cached:-0}
-    printf 'cpuset.cpus.effective=%s\nmemory.max=%s\nmemory.max.effective=%s\n' \
-        "$cpus" "$memory" "$effective" >"$artifacts/cgroup-limits.txt"
-    printf 'database_bytes=%s\nmemory.stat.file=%s\n' "$(database_bytes)" "$cached" \
-        >"$artifacts/cache-at-start.txt"
+    printf 'cpuset.cpus.effective=%s\nmemory.max=%s\nmemory.max.effective=%s\nmemory.stat.file=%s\n' \
+        "$cpus" "$memory" "$effective" "$cached" >"$artifacts/cgroup-limits.txt"
+    database_residency >"$artifacts/cache-at-start.txt"
     if [[ -n $RUN_MEMORY ]]; then
         local page wanted
         page=$(getconf PAGESIZE)
@@ -519,8 +533,10 @@ check_limits() {
         $(expand_cpu_list "$cpus") != "$(expand_cpu_list "$RUN_CPUS")" ) ]]; then
         stop_and_die "$UNIT runs on CPUs $cpus, not the requested $RUN_CPUS"
     fi
-    if [[ $RUN_CACHE == warm && $cached -lt $(database_bytes) ]]; then
-        stop_and_die "$UNIT holds $cached bytes of page cache, less than its $(database_bytes)-byte database; it is not warm"
+    local uncached
+    uncached=$(uncached_database_files "$artifacts/cache-at-start.txt")
+    if [[ $RUN_CACHE == warm && -n $uncached ]]; then
+        stop_and_die "$UNIT is not warm: part of $uncached is not in the page cache; see $artifacts/cache-at-start.txt"
     fi
 }
 
@@ -612,7 +628,7 @@ collect_stop() {
 check_targets() {
     local tool
     for tool in systemd-run systemctl journalctl ss nstat pidstat mpstat iostat runuser \
-        sha256sum curl lscpu lsblk; do
+        sha256sum curl lscpu lsblk fincore; do
         command -v "$tool" >/dev/null || die "missing tool on the relay host: $tool"
     done
     [[ -x /usr/bin/time ]] || die "missing /usr/bin/time"

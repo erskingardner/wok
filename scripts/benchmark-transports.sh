@@ -158,7 +158,9 @@ done
     exit 1
 }
 # Only once the settings are complete: cleanup stops relays on RELAY_SSH.
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# A trapped signal would otherwise resume the script once cleanup ran.
+trap 'exit 130' INT TERM
 
 remote_command "$RELAY_SSH" mkdir -p "$(dirname -- "$CONTROL_REMOTE")"
 scp "${SSH_OPTIONS[@]}" -q "$CONTROL_LOCAL" "$RELAY_SSH:$CONTROL_REMOTE"

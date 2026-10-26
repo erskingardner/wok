@@ -39,6 +39,10 @@ LOAD_CPUS=${LOAD_CPUS:-}
 SEED=${SEED:-4242}
 BASE_TIMESTAMP=${BASE_TIMESTAMP:-$(date -u +%s)}
 CAMPAIGN_ID=${CAMPAIGN_ID:-campaign-$(date -u +%Y%m%dT%H%M%SZ)}
+# The generator and its CPU sampler run as transient units with these names
+# on the load host, so a campaign can stop them when it is interrupted, and
+# the next campaign can stop any that an earlier one lost track of.
+LOAD_UNIT=relay-bench-load-$CAMPAIGN_ID
 CONTROL_LOCAL=$SCRIPT_DIR/benchmark-relay-control.sh
 CONTROL_REMOTE=/opt/relay-bench/bin/benchmark-relay-control
 SSH_OPTIONS=(
@@ -88,8 +92,13 @@ rotation() {
     done
 }
 
+stop_load_units() {
+    ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "systemctl stop 'relay-bench-load-*.service'"
+}
+
 cleanup() {
     ssh "${SSH_OPTIONS[@]}" "$RELAY_SSH" "$CONTROL_REMOTE stop-all" >/dev/null 2>&1 || true
+    stop_load_units >/dev/null 2>&1 || true
     ssh "${SSH_OPTIONS[@]}" -O exit "$RELAY_SSH" >/dev/null 2>&1 || true
     ssh "${SSH_OPTIONS[@]}" -O exit "$LOAD_SSH" >/dev/null 2>&1 || true
 }
@@ -100,6 +109,19 @@ remote_command() {
     local rendered
     printf -v rendered '%q ' "$@"
     ssh "${SSH_OPTIONS[@]}" "$host" "$rendered"
+}
+
+# Sets LOAD_UNIT_COMMAND to run a command on the load host as the transient
+# unit LOAD_UNIT, pinned to LOAD_CPUS when set, and to wait for it.
+load_unit_command() {
+    local properties=(-p "LimitNOFILE=$NOFILE_LIMIT")
+    if [[ -n $LOAD_CPUS ]]; then
+        properties+=(-p "AllowedCPUs=$LOAD_CPUS")
+    fi
+    LOAD_UNIT_COMMAND=(
+        systemd-run --quiet --wait --pipe --collect --unit="$LOAD_UNIT"
+        "${properties[@]}" -- "$@"
+    )
 }
 
 run_bench() {
@@ -116,35 +138,29 @@ run_bench() {
         phase_timestamp=$(date -u +%s)
     fi
     remote_command "$LOAD_SSH" mkdir -p "$output"
-    local command=(
-        /usr/bin/time -v -o "$output/time.txt"
-        "$BENCH_BIN"
-        --target-url "$url"
-        --target-label "$target-r$repetition"
-        --seed "$SEED"
-        --base-timestamp "$phase_timestamp"
-        --repetitions 1
-        --out "$output"
+    load_unit_command /usr/bin/time -v -o "$output/time.txt" \
+        "$BENCH_BIN" \
+        --target-url "$url" \
+        --target-label "$target-r$repetition" \
+        --seed "$SEED" \
+        --base-timestamp "$phase_timestamp" \
+        --repetitions 1 \
+        --out "$output" \
         "$@"
-    )
-    if [[ -n $LOAD_CPUS ]]; then
-        command=(
-            systemd-run --quiet --wait --pipe --collect
-            -p "AllowedCPUs=$LOAD_CPUS" -p "LimitNOFILE=$NOFILE_LIMIT"
-            -- "${command[@]}"
-        )
-    fi
-    local rendered sampler_log
-    printf -v rendered '%q ' "${command[@]}"
-    printf -v sampler_log '%q' "$output/load-mpstat.txt"
     # Per-CPU load-host utilization shows whether the generator, not the
     # relay, was the limit.
-    ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "ulimit -n $NOFILE_LIMIT
-LC_ALL=C S_TIME_FORMAT=ISO mpstat -P ALL 1 >$sampler_log 2>&1 &
-sampler=\$!
-$rendered
+    local sampler=(
+        systemd-run --quiet --collect --unit="$LOAD_UNIT-mpstat"
+        -p "StandardOutput=truncate:$output/load-mpstat.txt" -p StandardError=journal
+        -E LC_ALL=C -E S_TIME_FORMAT=ISO -- mpstat -P ALL 1
+    )
+    local rendered_bench rendered_sampler
+    printf -v rendered_bench '%q ' "${LOAD_UNIT_COMMAND[@]}"
+    printf -v rendered_sampler '%q ' "${sampler[@]}"
+    ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "$rendered_sampler
+$rendered_bench
 rc=\$?
-kill \$sampler
+systemctl stop $LOAD_UNIT-mpstat.service
 exit \$rc"
     remote_command "$LOAD_SSH" jq -e -s 'all(.ok and (.errors == 0) and (.mismatches == 0))' \
         "$output/results.jsonl" >/dev/null
@@ -268,7 +284,9 @@ main() {
     fi
     local -a targets
     read -r -a targets <<<"$TARGETS"
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    # A trapped signal would otherwise resume the script once cleanup ran.
+    trap 'exit 130' INT TERM
 
     remote_command "$RELAY_SSH" mkdir -p "$(dirname -- "$CONTROL_REMOTE")"
     scp "${SSH_OPTIONS[@]}" -q "$CONTROL_LOCAL" "$RELAY_SSH:$CONTROL_REMOTE"
@@ -281,15 +299,15 @@ main() {
     remote_command "$LOAD_SSH" test -x /usr/bin/jq
     remote_command "$LOAD_SSH" sh -c 'command -v mpstat >/dev/null' ||
         die "the load host needs mpstat (sysstat)"
-    if [[ -n $LOAD_CPUS ]]; then
-        remote_command "$LOAD_SSH" sh -c 'command -v systemd-run >/dev/null' ||
-            die "LOAD_CPUS needs systemd-run on the load host"
-    fi
+    remote_command "$LOAD_SSH" sh -c 'command -v systemd-run >/dev/null' ||
+        die "the load host needs systemd-run"
+    stop_load_units
     write_campaign_metadata
 
-    remote_command "$LOAD_SSH" "$BENCH_BIN" \
+    load_unit_command "$BENCH_BIN" \
         --generate-corpus-only --events "$EVENTS" --event-mix realistic \
         --seed "$SEED" --base-timestamp "$BASE_TIMESTAMP" --out "$LOAD_CORPUS_DIR"
+    remote_command "$LOAD_SSH" "${LOAD_UNIT_COMMAND[@]}"
     scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$LOAD_CORPUS" "$RELAY_SSH:$RELAY_CORPUS"
 
     local load_sha relay_sha

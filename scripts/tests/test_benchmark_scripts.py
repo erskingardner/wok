@@ -157,6 +157,23 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         (unit.parent.parent/'memory.max').write_text('8589934592\n')
         self.assertEqual(self.control(effective, unit, cgroups).stdout.strip(), '8589934592')
 
+    def test_warm_needs_every_database_page_cached(self):
+        listing = self.prefix/'residency'
+        db = '/var/lib/relay-bench/wok/db'
+        cases = {
+            # Whole pages reach past an unaligned size.
+            'all cached': (f'{db}/data.mdb 8089600 8089600\n{db}/lock.mdb 16576 20480\n', ''),
+            'one page missing': (f'{db}/data.mdb 8089600 8085504\n{db}/lock.mdb 16576 20480\n',
+                                 f'{db}/data.mdb'),
+            'unaligned tail missing': (f'{db}/data.mdb 8089600 8089600\n{db}/lock.mdb 16576 16384\n',
+                                       f'{db}/lock.mdb'),
+        }
+        for case, (text, expected) in cases.items():
+            with self.subTest(case=case):
+                listing.write_text(text)
+                result = self.control('uncached_database_files "$1"', listing)
+                self.assertEqual(result.stdout.strip(), expected, result.stderr)
+
     def test_rejects_target_names(self):
         for name in ['', 'Wok', '.hidden', '-wok', 'a/b', 'snapshots', 'x' * 64]:
             with self.subTest(name=name):
@@ -233,6 +250,29 @@ class CampaignSettings(unittest.TestCase):
     def test_accepts_complete_settings(self):
         result = self.campaign('validate_settings')
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_generator_runs_as_a_named_unit_that_cleanup_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp)/'calls'
+            fake_ssh = (f'ssh() {{ printf "%s\\n---\\n" "$*" >>"{calls}"; }}; '
+                        'LOAD_ROOT=/opt/wok-load/results/c1; ')
+            for cpus, pinned in [('', False), ('16-47', True)]:
+                with self.subTest(load_cpus=cpus):
+                    calls.unlink(missing_ok=True)
+                    result = self.campaign(
+                        fake_ssh + 'run_bench wok-master 1 ws://10.0.0.2:7777 query '
+                        '--scenario ws_query_latency; cleanup',
+                        CAMPAIGN_ID='c1', LOAD_CPUS=cpus)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    sent = calls.read_text().split('\n---\n')
+                    bench = next(command for command in sent if 'ws_query_latency' in command)
+                    self.assertIn('systemd-run --quiet --wait --pipe --collect '
+                                  '--unit=relay-bench-load-c1 -p LimitNOFILE=524288', bench)
+                    self.assertIn('--unit=relay-bench-load-c1-mpstat', bench)
+                    self.assertIn('systemctl stop relay-bench-load-c1-mpstat.service', bench)
+                    self.assertEqual('AllowedCPUs=16-47' in bench, pinned)
+                    stop = "root@load systemctl stop 'relay-bench-load-*.service'"
+                    self.assertTrue(any(stop in command for command in sent), sent)
 
     def test_rejects_incomplete_or_invalid_settings(self):
         cases = {

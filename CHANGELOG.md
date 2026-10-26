@@ -531,14 +531,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index is not built yet, leaves the entries out and builds the index in key
   order once its events are written, as the relay builds it for an upgraded
   database, so the index is complete when the import exits. A million events
-  of a social relay's history took 429 s and left a 6.4 GB file, against
-  411 s and 6.4 GB without the index and 556 s and 8.0 GB when the import
-  kept it event by event. It builds in the relay's bounded steps. While
-  another process has the database open, as a running relay does, batches
-  keep the index as they go and the import leaves any build to the relay,
-  which would otherwise begin it under the load. An import stopped before
-  it builds the index leaves it for the relay to finish. A new database is
-  complete from the start.
+  of a social relay's history took 368 s and left a 6.4 GB file, the size
+  without the index, against 496 s and 8.0 GB when the import kept it event
+  by event. It builds in the relay's bounded steps. While another process
+  has the database open, as a running relay does, batches keep the index as
+  they go and the import leaves any build to the relay, which would
+  otherwise begin it under the load. An import stopped before it builds the
+  index leaves it for the relay to finish. A new database is complete from
+  its first open, and again once an import into it ends.
   On the first start after the upgrade, and after a strfry migration, the
   relay builds the index for the stored events in the background, without
   delaying startup: a key-ordered pass over the tag index, in steps of at

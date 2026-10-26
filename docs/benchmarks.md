@@ -267,8 +267,10 @@ counts. A re-REQ due while the subscription's last REQ is still unfinished
 waits for it and keeps its due time, so a slow relay builds a backlog rather
 than being offered less. A request still unanswered when its session stops
 reading counts as unanswered, with its latency up to then, as does a re-REQ
-still waiting, and a connect the relay has not completed when the session
-was due to end, which leaves that session with nothing to do; with
+still waiting. A connect attempt that is refused, or that the relay does not
+take or upgrade within 10 s, is made again until the session is due to end;
+each timed-out attempt, and an attempt still waiting then, counts as an
+unanswered connect, and a session that never connects does nothing. With
 unanswered requests the percentiles are lower bounds.
 The harness's own lateness in starting scheduled work is reported as the
 lag; a large lag means the load host, not the relay, is the bottleneck.
@@ -279,9 +281,11 @@ the run, or to the last send if that was later, must reach 99% of the
 publications due, or the trial is `ok=false`. A write that cannot finish for
 10 s means the relay stopped reading: the connection is given up and counted
 as a disconnect (`write stalled`) and reset, so the relay sees it drop. A
-publisher the relay refuses or disconnects connects again and resumes with
-the slot due then; the slots due while it had no connection count as due but
-not sent, and are not flushed in a burst.
+publisher the relay refuses or disconnects keeps connecting until the run
+ends and resumes with the slot due then; the slots due while it had no
+connection count as due but not sent, and are not flushed in a burst. Writes
+still queued 10 s after the drain are abandoned and the connection reset, so
+they are neither counted as sent nor reach the relay after the run.
 
 A Marmot receiver waits up to 250 ms for a connect-time AUTH challenge and
 authenticates before it subscribes, as MDK does. strfry, and Wok with AUTH
@@ -332,8 +336,8 @@ The run must use the seed, `--base-timestamp` and client options the corpus
 was generated with, and one repetition, since what a run publishes changes
 what the next one's histories should hold. Before the clock starts it checks
 that the relay holds a sample of both corpora and nothing the scenario's
-authors published after `--base-timestamp`, and stops with an explanation if
-not. For as-shipped runs, configure the relay to take the client address from
+authors, or its Marmot groups, published after `--base-timestamp`, and stops
+with an explanation if not. For as-shipped runs, configure the relay to take the client address from
 `X-Forwarded-For` when the load host sends it: Wok's `relay.real_ip_header`
 and `relay.trusted_proxies`, strfry's `relay.realIpHeader`.
 

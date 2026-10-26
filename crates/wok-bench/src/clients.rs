@@ -1405,12 +1405,42 @@ struct WsConn {
     inbound: mpsc::UnboundedReceiver<In>,
     deflate: bool,
     written: Arc<Mutex<Written>>,
-    /// The writer task, done once `written` is final.
-    writer: Option<tokio::task::JoinHandle<()>>,
+    writer: Option<Writer>,
+}
+
+/// A connection's writer task; `written` is final once it is done.
+struct Writer {
+    task: tokio::task::JoinHandle<()>,
+    halt: Arc<tokio::sync::Notify>,
+}
+
+impl Writer {
+    /// Let the writer send what it was given until `deadline`, then reset
+    /// the connection. Either way the writer is done when this returns.
+    async fn stop_by(mut self, deadline: Instant) {
+        if tokio::time::timeout_at(deadline.into(), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.halt.notify_one();
+            let _ = self.task.await;
+        }
+    }
+}
+
+/// Close with a reset rather than a FIN, which cannot pass a zero receive
+/// window, and stop the reader: the relay sees the connection drop. A zero
+/// linger does not block.
+fn reset(writer: &tokio::net::tcp::OwnedWriteHalf, reader: &tokio::sync::Notify) {
+    #[allow(deprecated)]
+    let _ = writer.as_ref().set_linger(Some(Duration::ZERO));
+    reader.notify_one();
 }
 
 pub(crate) enum ConnectFailure {
     Refused(String),
+    /// The relay did not take the connection, or answer the upgrade, in time.
+    TimedOut(String),
     Failed(String),
 }
 
@@ -1418,7 +1448,7 @@ impl std::fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(reason) => write!(f, "refused: {reason}"),
-            Self::Failed(error) => f.write_str(error),
+            Self::TimedOut(error) | Self::Failed(error) => f.write_str(error),
         }
     }
 }
@@ -1485,7 +1515,7 @@ pub(crate) async fn ws_handshake(
         tokio::net::TcpStream::connect(addr),
     )
     .await
-    .map_err(|_| failed("TCP connect timed out".into()))?
+    .map_err(|_| ConnectFailure::TimedOut("TCP connect timed out".into()))?
     .map_err(|e| failed(format!("TCP connect: {e}")))?;
     let _ = stream.set_nodelay(nodelay);
     let key = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 16]>());
@@ -1514,7 +1544,7 @@ pub(crate) async fn ws_handshake(
         }
         let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
             .await
-            .map_err(|_| failed("handshake timed out".into()))?
+            .map_err(|_| ConnectFailure::TimedOut("handshake timed out".into()))?
             .map_err(|e| failed(format!("handshake read: {e}")))?;
         if n == 0 {
             return Err(failed("relay closed during handshake".into()));
@@ -1573,10 +1603,17 @@ async fn ws_connect(
     let stalled = in_tx.clone();
     let abort = Arc::new(tokio::sync::Notify::new());
     let abort_reader = abort.clone();
-    let writer_task = tokio::spawn(async move {
+    let halt = Arc::new(tokio::sync::Notify::new());
+    let halted = halt.clone();
+    let task = tokio::spawn(async move {
         let mut encoder =
             WsEncoder::with_role(deflate.then(|| DeflateCtx::new(true)), Role::Client);
-        while let Some(out) = out_rx.recv().await {
+        loop {
+            let out = tokio::select! {
+                out = out_rx.recv() => out,
+                _ = halted.notified() => return reset(&writer, &abort),
+            };
+            let Some(out) = out else { break };
             let (frame, event) = match out {
                 Out::Text(text) => (
                     encoder.encode_message(MessageKind::Text, text.as_bytes()),
@@ -1598,7 +1635,14 @@ async fn ws_connect(
                 }
             };
             let Ok(frame) = frame else { break };
-            match tokio::time::timeout(WRITE_STALL, writer.write_all(&frame)).await {
+            let wrote = tokio::select! {
+                wrote = tokio::time::timeout(WRITE_STALL, writer.write_all(&frame)) => Some(wrote),
+                _ = halted.notified() => None,
+            };
+            let Some(wrote) = wrote else {
+                return reset(&writer, &abort);
+            };
+            match wrote {
                 Ok(Ok(())) => {
                     if let Some(id) = event {
                         let now = Instant::now();
@@ -1611,12 +1655,7 @@ async fn ws_connect(
                 }
                 Ok(Err(_)) => break,
                 Err(_) => {
-                    // A FIN cannot pass a zero receive window, so reset the
-                    // connection: the relay sees it drop, and the reader
-                    // stops waiting on it. A zero linger does not block.
-                    #[allow(deprecated)]
-                    let _ = writer.as_ref().set_linger(Some(Duration::ZERO));
-                    abort.notify_one();
+                    reset(&writer, &abort);
                     let _ = stalled.send(In::Gone(format!(
                         "write stalled for {} s: the relay stopped reading",
                         WRITE_STALL.as_secs()
@@ -1696,7 +1735,7 @@ async fn ws_connect(
         inbound: in_rx,
         deflate,
         written,
-        writer: Some(writer_task),
+        writer: Some(Writer { task, halt }),
     })
 }
 
@@ -1715,6 +1754,12 @@ struct Published {
     acked: Option<Instant>,
 }
 
+struct ConnLog {
+    role: &'static str,
+    written: Arc<Mutex<Written>>,
+    writer: Option<Writer>,
+}
+
 struct Ctx {
     addr: SocketAddr,
     service_url: String,
@@ -1725,8 +1770,9 @@ struct Ctx {
     policy: ReadPolicy,
     caps: Caps,
     published: Mutex<HashMap<String, Published>>,
-    /// Every connection's write log, for when its publications were sent.
-    writes: Mutex<Vec<Arc<Mutex<Written>>>>,
+    /// Every connection the run opened, for when its publications were
+    /// sent.
+    conns: Mutex<Vec<ConnLog>>,
     stats: Mutex<Stats>,
     start: Instant,
     end: Instant,
@@ -1922,8 +1968,9 @@ impl Session {
     }
 
     /// Connect for `visit`; connect latency counts from when it was due. A
-    /// relay that has not taken the connection when the visit ends leaves
-    /// the connect unanswered, and the visit does nothing.
+    /// refused or timed-out attempt is made again until the visit ends; a
+    /// relay that has not taken the connection by then leaves the connect
+    /// unanswered, and the visit does nothing.
     async fn connect(
         ctx: &Arc<Ctx>,
         label: String,
@@ -1933,22 +1980,29 @@ impl Session {
         seed: u64,
         visit: Visit,
     ) -> Option<Self> {
-        for _ in 0..3 {
+        let unanswered = || {
+            let mut stats = ctx.stats();
+            let class = stats.class("connect");
+            class.sent += 1;
+            class.unanswered += 1;
+            record_us(&mut class.done, micros(visit.due.elapsed()));
+        };
+        while Instant::now() < visit.until {
             let attempt = ws_connect(ctx.addr, address, ctx.opts.deflate, ctx.nodelay);
             let Ok(outcome) = tokio::time::timeout_at(visit.until.into(), attempt).await else {
-                let mut stats = ctx.stats();
-                let class = stats.class("connect");
-                class.sent += 1;
-                class.unanswered += 1;
-                record_us(&mut class.done, micros(visit.due.elapsed()));
+                unanswered();
                 return None;
             };
             match outcome {
-                Ok(conn) => {
-                    ctx.writes
+                Ok(mut conn) => {
+                    ctx.conns
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .push(conn.written.clone());
+                        .push(ConnLog {
+                            role,
+                            written: conn.written.clone(),
+                            writer: conn.writer.take(),
+                        });
                     {
                         let mut stats = ctx.stats();
                         stats.connections += 1;
@@ -1972,13 +2026,11 @@ impl Session {
                     let retry = (Instant::now() + Duration::from_secs(1)).min(visit.until);
                     tokio::time::sleep_until(retry.into()).await;
                 }
+                Err(ConnectFailure::TimedOut(_)) => unanswered(),
                 Err(ConnectFailure::Failed(e)) => {
                     ctx.stats().error(format!("{label}: {e}"));
                     return None;
                 }
-            }
-            if Instant::now() >= visit.until {
-                break;
             }
         }
         None
@@ -3078,6 +3130,10 @@ async fn marmot_receiver(ctx: Arc<Ctx>, index: usize, visit: Visit) -> Vec<LiveR
         s.pump_until(wait, |s| !matches!(s.auth, Auth::Pending(..)))
             .await;
     }
+    // A late upgrade can leave no session to subscribe in.
+    if s.gone || Instant::now() >= visit.until {
+        return s.finish();
+    }
     let anchor = plan.anchor;
     s.req(
         "inbox",
@@ -3228,10 +3284,6 @@ async fn background_publisher(ctx: Arc<Ctx>, index: usize) -> Vec<LiveRecord> {
     let mut next = ctx.start + interval.mul_f64(index as f64 / publishers as f64);
     let mut n = index as u64;
     let mut session = 0;
-    // What each connection put on the socket: a publication still queued
-    // behind a relay that stopped reading was not sent.
-    let mut writes = Vec::new();
-    let mut writers = Vec::new();
     while next < ctx.end {
         let visit = Visit {
             session,
@@ -3246,8 +3298,6 @@ async fn background_publisher(ctx: Arc<Ctx>, index: usize) -> Vec<LiveRecord> {
         else {
             break;
         };
-        writes.push(s.conn.written.clone());
-        writers.extend(s.conn.writer.take());
         {
             // What fell due while the relay refused or had dropped the
             // connection is due and not sent, as when `rate.rs` loses one;
@@ -3278,25 +3328,11 @@ async fn background_publisher(ctx: Arc<Ctx>, index: usize) -> Vec<LiveRecord> {
         s.pump_until(ctx.drain_end, |s| s.pending.is_empty()).await;
         s.finish();
     }
-    // A write may still finish within its stall budget.
-    let settled = ctx.drain_end + WRITE_STALL;
-    for writer in writers {
-        let _ = tokio::time::timeout_at(settled.into(), writer).await;
-    }
-    let mut stats = ctx.stats();
     // Publications due once the relay no longer took the connection.
+    let mut stats = ctx.stats();
     while next < ctx.end {
         stats.publish_due += 1;
         next += interval;
-    }
-    for written in writes {
-        let written = written.lock().unwrap_or_else(|e| e.into_inner());
-        stats.publish_sent += written.events;
-        if let Some(last) = written.last {
-            stats.publish_last = stats
-                .publish_last
-                .max(last.saturating_duration_since(ctx.start));
-        }
     }
     Vec::new()
 }
@@ -3630,7 +3666,7 @@ pub async fn run(input: RunInput) -> Result<(ClientsReport, Histogram<u64>)> {
         policy: ReadPolicy(facts.read.clone()),
         caps: Caps::new(facts.max_filter_limit, facts.max_events_per_req),
         published: Mutex::new(HashMap::new()),
-        writes: Mutex::new(Vec::new()),
+        conns: Mutex::new(Vec::new()),
         stats: Mutex::new(Stats::default()),
         start,
         end,
@@ -3651,7 +3687,8 @@ pub async fn run(input: RunInput) -> Result<(ClientsReport, Histogram<u64>)> {
         records.extend(joined.context("client task panicked")?);
     }
     let elapsed = start.elapsed();
-    stamp_write_times(&ctx);
+    // A write may still finish within its stall budget; none goes on after.
+    settle_writes(&ctx, ctx.drain_end + WRITE_STALL).await;
     check_deliveries(&ctx, &records);
 
     let stats = std::mem::take(&mut *ctx.stats());
@@ -3810,13 +3847,21 @@ async fn check_target(
             missing[0]
         );
     }
-    if !plan.popular_pk.is_empty() {
-        let filter = json!({"authors": plan.popular_pk, "since": plan.anchor, "limit": 1});
+    // Background publishers sign as the popular authors, and every Marmot
+    // burst and background 445 lands in the scenario's groups.
+    let gids: Vec<&str> = plan.groups.iter().map(|g| g.gid.as_str()).collect();
+    let fresh = [
+        (!plan.popular_pk.is_empty())
+            .then(|| json!({"authors": plan.popular_pk, "since": plan.anchor, "limit": 1})),
+        (!gids.is_empty())
+            .then(|| json!({"kinds": [445], "#h": gids, "since": plan.anchor, "limit": 1})),
+    ];
+    for filter in fresh.into_iter().flatten() {
         let newer = probe(&mut conn, "check-fresh", filter).await?;
         anyhow::ensure!(
             newer.is_empty(),
-            "the relay holds events this scenario's authors published after --base-timestamp \
-             {}: an earlier run published into this database, so restore it first",
+            "the relay holds events this scenario published after --base-timestamp {}: an \
+             earlier run published into this database, so restore it first",
             plan.anchor
         );
     }
@@ -3855,16 +3900,34 @@ async fn probe(conn: &mut WsConn, sid: &str, filter: Value) -> Result<HashSet<St
     Ok(ids)
 }
 
-/// A publication reached the relay when it was written, not when it was
-/// queued, and that decides whether a subscription had to see it live.
-fn stamp_write_times(ctx: &Ctx) {
-    let writes = ctx.writes.lock().unwrap_or_else(|e| e.into_inner());
+/// Stop every connection's writer by `deadline`, then take from their logs
+/// what was sent. A publication reached the relay when it was written, not
+/// when it was queued, and that decides whether a subscription had to see
+/// it live; a background publication still queued was not sent.
+async fn settle_writes(ctx: &Ctx, deadline: Instant) {
+    let conns = std::mem::take(&mut *ctx.conns.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut logs = Vec::new();
+    for conn in conns {
+        if let Some(writer) = conn.writer {
+            writer.stop_by(deadline).await;
+        }
+        logs.push((conn.role, conn.written));
+    }
     let mut published = ctx.published();
-    for written in writes.iter() {
+    let mut stats = ctx.stats();
+    for (role, written) in logs {
         let written = written.lock().unwrap_or_else(|e| e.into_inner());
         for (id, at) in &written.at {
             if let Some(p) = published.get_mut(id) {
                 p.sent = *at;
+            }
+        }
+        if role == "publisher" {
+            stats.publish_sent += written.events;
+            if let Some(last) = written.last {
+                stats.publish_last = stats
+                    .publish_last
+                    .max(last.saturating_duration_since(ctx.start));
             }
         }
     }
@@ -4658,7 +4721,7 @@ mod tests {
             policy: open_policy(),
             caps: NO_CAPS,
             published: Mutex::new(HashMap::new()),
-            writes: Mutex::new(Vec::new()),
+            conns: Mutex::new(Vec::new()),
             stats: Mutex::new(Stats::default()),
             start,
             end,
@@ -5565,9 +5628,10 @@ mod tests {
         );
     }
 
-    /// A relay that first refuses the publisher with HTTP 503, then drops it
-    /// and takes a second to accept it again: the slots due meanwhile are
-    /// not sent in a burst once it is back.
+    /// A relay that refuses the publisher with HTTP 503 for 3 s, then drops
+    /// it and takes a second to accept it again: the publisher keeps
+    /// dialing, and the slots due meanwhile are not sent in a burst once it
+    /// is back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reconnected_publisher_resumes_its_schedule_without_a_burst() {
         use futures_util::{SinkExt, StreamExt};
@@ -5582,7 +5646,7 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                if connection == 0 {
+                if connection < 3 {
                     let mut request = [0u8; 4096];
                     let _ = stream.read(&mut request).await;
                     let refusal = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
@@ -5597,7 +5661,7 @@ mod tests {
                     let ok = json!(["OK", frame[1]["id"], true, ""]).to_string();
                     let _ = ws.send(Message::Text(ok.into())).await;
                     events += 1;
-                    if connection == 1 && events == 5 {
+                    if connection == 3 && events == 5 {
                         let _ = ws.close(None).await;
                         tokio::time::sleep(gap).await;
                         break;
@@ -5614,16 +5678,19 @@ mod tests {
             ..small_options()
         };
         let plan = Plan::generate(&opts, 19, unix_now() - 5);
-        let ctx = test_ctx(addr, plan, Vec::new(), opts, 4);
+        let ctx = test_ctx(addr, plan, Vec::new(), opts, 6);
         background_publisher(ctx.clone(), 0).await;
+        settle_writes(&ctx, ctx.drain_end).await;
         let stats = ctx.stats();
         assert_eq!(stats.errors, 0, "{:?}", stats.error_samples);
-        assert_eq!(stats.refusals["HTTP N"]["connect"], 1);
-        assert_eq!(stats.publish_due, 40);
+        assert_eq!(stats.refusals["HTTP N"]["connect"], 3);
+        assert_eq!(stats.publish_due, 60);
         assert_eq!(stats.publish_sent, received.lock().unwrap().len() as u64);
-        // About 1 s lost to the refusal and 1 s to the reconnect.
+        // About 3 s lost to refusals and 1 s to the reconnect; the rest is
+        // still offered.
+        assert!(stats.publish_sent >= 15, "{} sent", stats.publish_sent);
         assert!(
-            stats.publish_sent + 15 <= stats.publish_due,
+            stats.publish_sent + 25 <= stats.publish_due,
             "{} of {} sent: the gap's slots were flushed",
             stats.publish_sent,
             stats.publish_due
@@ -5663,8 +5730,8 @@ mod tests {
         drop(listener);
     }
 
-    #[test]
-    fn a_publication_counts_as_sent_when_written_not_when_queued() {
+    #[tokio::test]
+    async fn a_publication_counts_as_sent_when_written_not_when_queued() {
         let mut s = offline_session(Vec::new(), Vec::new(), None);
         let ctx = s.ctx.clone();
         let note = event("w", 1, 1, json!([]));
@@ -5689,12 +5756,139 @@ mod tests {
             delivered: HashMap::new(),
             seen: HashSet::new(),
         };
-        ctx.writes.lock().unwrap().push(s.conn.written.clone());
+        ctx.conns.lock().unwrap().push(ConnLog {
+            role: "publisher",
+            written: s.conn.written.clone(),
+            writer: None,
+        });
         s.finish();
-        stamp_write_times(&ctx);
+        settle_writes(&ctx, Instant::now()).await;
         assert_eq!(ctx.published()["w"].sent, written);
         // Written after the subscription's EOSE, so it had to arrive live.
         check_deliveries(&ctx, &[record]);
         assert_eq!(ctx.stats().missed_deliveries, 1);
+    }
+    #[tokio::test]
+    async fn a_writer_stopped_at_the_deadline_sends_nothing_more() {
+        let addr = scripted_relay(UPGRADE.to_vec(), true).await;
+        let Ok(mut conn) = ws_connect(addr, None, false, true).await else {
+            panic!("handshake with the scripted relay failed");
+        };
+        let frame = format!(r#"["EVENT",{{"content":"{}"}}]"#, "x".repeat(64 << 10));
+        for i in 0..1_024 {
+            let _ = conn.out.send(Out::Event(i.to_string(), frame.clone()));
+        }
+        let started = Instant::now();
+        conn.writer
+            .take()
+            .unwrap()
+            .stop_by(started + Duration::from_millis(300))
+            .await;
+        assert!(started.elapsed() < WRITE_STALL, "{:?}", started.elapsed());
+        let written = conn.written.lock().unwrap().events;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(conn.written.lock().unwrap().events, written);
+        let reader = tokio::time::timeout(Duration::from_secs(2), conn.inbound.recv()).await;
+        assert!(matches!(reader, Ok(None)), "the reader is still waiting");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_marmot_only_database_an_earlier_run_published_into_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ClientsOptions {
+            outbox_clients: 0,
+            marmot_clients: 1,
+            publish_rate: 0.0,
+            ..small_options()
+        };
+        let anchor = unix_now() - 5;
+        let plan = Plan::generate(&opts, 23, anchor);
+        // What a burst leaves behind: a commit into one of the groups.
+        let keys = Keypair::new(SECP256K1, &mut rand::rngs::StdRng::seed_from_u64(4));
+        let gid = plan.groups[0].gid.clone();
+        let commit = signed(&keys, anchor + 1, 445, vec![json!(["h", gid])], "c".into());
+        let mut stored = plan.events.clone();
+        stored.push(commit);
+        let (addr, handle, _) = spawn_relay(dir.path(), &stored, |_| {}).await;
+        let oracle = Oracle::new(plan.events.clone());
+        let refused = check_target(addr, true, &plan, &oracle, plan.events.len())
+            .await
+            .expect_err("a used database is refused");
+        assert!(
+            refused.to_string().contains("restore it first"),
+            "{refused}"
+        );
+        handle.request_shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_receiver_upgraded_just_before_its_visit_ends_subscribes_nothing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let _ = stream.write_all(UPGRADE).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        let opts = ClientsOptions {
+            outbox_clients: 0,
+            marmot_clients: 1,
+            ..small_options()
+        };
+        let plan = Plan::generate(&opts, 29, 1_800_000_000);
+        let ctx = test_ctx(addr, plan, Vec::new(), opts, 60);
+        let due = Instant::now();
+        // Upgraded at 150 ms; the challenge wait runs past the end.
+        let visit = Visit {
+            session: 0,
+            due,
+            until: due + Duration::from_millis(350),
+        };
+        marmot_receiver(ctx.clone(), 0, visit).await;
+        let mut stats = ctx.stats();
+        assert_eq!(stats.errors, 0, "{:?}", stats.error_samples);
+        assert_eq!(stats.class("connect").completed, 1);
+        for class in ["marmot.inbox", "marmot.group_live", "marmot.neg"] {
+            assert_eq!(stats.class(class).sent, 0, "{class}");
+        }
+    }
+
+    /// A relay that takes TCP connections but never upgrades them, for
+    /// longer than the handshake's own timeout: a result, not an error.
+    #[tokio::test]
+    async fn a_handshake_that_times_out_is_unanswered_not_an_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let plan = Plan::generate(&small_options(), 3, 1_800_000_000);
+        let ctx = test_ctx(addr, plan, Vec::new(), small_options(), 60);
+        let due = Instant::now();
+        let visit = Visit {
+            session: 0,
+            due,
+            until: due + Duration::from_millis(10_500),
+        };
+        let session = Session::connect(&ctx, "slow".into(), "outbox", None, None, 1, visit).await;
+        assert!(session.is_none());
+        assert!(
+            due.elapsed() < Duration::from_secs(12),
+            "{:?}",
+            due.elapsed()
+        );
+        let mut stats = ctx.stats();
+        assert_eq!(stats.errors, 0, "{:?}", stats.error_samples);
+        let connect = stats.class("connect");
+        assert_eq!((connect.sent, connect.unanswered), (2, 2));
     }
 }

@@ -267,7 +267,9 @@ counts. A re-REQ due while the subscription's last REQ is still unfinished
 waits for it and keeps its due time, so a slow relay builds a backlog rather
 than being offered less. A request still unanswered when its session stops
 reading counts as unanswered, with its latency up to then, as does a re-REQ
-still waiting; with unanswered requests the percentiles are lower bounds.
+still waiting, and a connect the relay has not completed when the session
+was due to end, which leaves that session with nothing to do; with
+unanswered requests the percentiles are lower bounds.
 The harness's own lateness in starting scheduled work is reported as the
 lag; a large lag means the load host, not the relay, is the bottleneck.
 
@@ -276,9 +278,10 @@ publication counts as sent once it is written to the socket, and sends over
 the run, or to the last send if that was later, must reach 99% of the
 publications due, or the trial is `ok=false`. A write that cannot finish for
 10 s means the relay stopped reading: the connection is given up and counted
-as a disconnect (`write stalled`). A publisher the relay disconnects
-reconnects and resumes with the next slot; the slots due while it had no
-connection count as due but not sent, and are not flushed in a burst.
+as a disconnect (`write stalled`) and reset, so the relay sees it drop. A
+publisher the relay refuses or disconnects connects again and resumes with
+the slot due then; the slots due while it had no connection count as due but
+not sent, and are not flushed in a burst.
 
 A Marmot receiver waits up to 250 ms for a connect-time AUTH challenge and
 authenticates before it subscribes, as MDK does. strfry, and Wok with AUTH
@@ -405,9 +408,10 @@ Correctness still decides `ok`, as in every other scenario:
 - no restricted event may reach a connection that is not its recipient. This
   is checked as each EVENT arrives, including on subscriptions refused later;
 - every live subscription must receive each accepted, matching event
-  published after its EOSE while it was connected, exactly once. Events sent
-  after its session ended, or in the 2 s before the relay disconnected it,
-  may still have been on their way, so they are not required;
+  written to the socket after its EOSE while it was connected, exactly once.
+  Events written after its session ended, or in the 2 s before the relay
+  disconnected it, may still have been on their way, so they are not
+  required;
 - each NIP-77 pass must report exactly the corpus events the client lacked,
   plus only 445s published into that group, and none it already holds.
 

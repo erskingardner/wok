@@ -267,10 +267,12 @@ counts. A re-REQ due while the subscription's last REQ is still unfinished
 waits for it and keeps its due time, so a slow relay builds a backlog rather
 than being offered less. A request still unanswered when its session stops
 reading counts as unanswered, with its latency up to then, as does a re-REQ
-still waiting. A connect attempt that is refused, or that the relay does not
-take or upgrade within 10 s, is made again until the session is due to end;
-each timed-out attempt, and an attempt still waiting then, counts as an
-unanswered connect, and a session that never connects does nothing. With
+still waiting. A connect attempt that is refused (HTTP 429 or 503, or a
+connection refused, reset or closed before the upgrade), or that the relay
+does not take or upgrade within 10 s, is made again until the session is due
+to end; refusals are counted by reason, each timed-out attempt and an attempt
+still waiting then count as unanswered connects, and a session that never
+connects does nothing. With
 unanswered requests the percentiles are lower bounds.
 The harness's own lateness in starting scheduled work is reported as the
 lag; a large lag means the load host, not the relay, is the bottleneck.
@@ -290,8 +292,12 @@ they are neither counted as sent nor reach the relay after the run.
 A Marmot receiver waits up to 250 ms for a connect-time AUTH challenge and
 authenticates before it subscribes, as MDK does. strfry, and Wok with AUTH
 off, never challenge, so the wait is short and the subscriptions exist before
-the group's burst on every relay. A NIP-77 pass that Wok closes because the
-connection authenticated late is opened again, timed from the first open.
+the group's burst on every relay. Once it has sent AUTH it waits for the
+answer, until its session ends; an AUTH still unanswered then counts as
+unanswered. A NIP-77 pass that Wok closes because the connection
+authenticated late is opened again, timed from the first open. A Marmot
+sender that connects too late to start its burst before its session ends
+does not send it.
 
 ### Against a remote relay
 

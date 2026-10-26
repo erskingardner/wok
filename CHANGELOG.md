@@ -353,6 +353,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/benchmark-campaign.sh` compares any number of relay targets
+  (#226), each described by a file on the relay host, instead of one Wok and
+  one strfry. Each relay runs as a transient systemd unit, which
+  `RELAY_CPUS` pins and `RELAY_MEMORY` caps, page cache included, and the
+  helper fails the run when a requested limit is not in effect. Every start
+  drops the page cache, and `CACHE=warm` reads the database in first. Imports
+  are kept as snapshots and restored on later repetitions, and `LOAD_CPUS`
+  pins the load generator, so it can run beside the relay over loopback. The
+  relay and load hosts are required settings: the scripts no longer default
+  to the old benchmark hosts' addresses.
 - CI runs `scripts/attack-surface-reach.py --check` (`reachability.yml`) on
   changes to the crates, the script or the toolchain, so a pull request that
   makes a relay function newly reachable, before authentication or after,

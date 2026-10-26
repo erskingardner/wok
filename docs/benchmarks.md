@@ -614,42 +614,129 @@ preserve the result directories.
 
 ### Reproducible two-host campaign
 
-`scripts/benchmark-campaign.sh` automates the project benchmark hosts. It:
+`scripts/benchmark-campaign.sh` runs a campaign from an operator host over SSH.
+Any number of relay targets take turns on one relay host, and a second host
+generates the load. It:
 
-1. generates one signed realistic corpus on the load generator;
+1. generates one signed realistic corpus on the load host;
 2. copies and checksum-verifies that exact file on the relay host;
-3. stops both relays, resets only the selected benchmark database, imports
-   with signature verification, and confirms the exported retained count;
-4. starts only the selected relay and captures process, system, socket,
-   network, Prometheus, journal, binary/config hash, import, and database-size
-   evidence;
+3. for each target, stops every benchmark relay, then restores the target's
+   database snapshot or resets the database, imports with signature
+   verification and confirms the exported retained count;
+4. starts only that target, on an emptied page cache, and captures provenance,
+   per-thread process, per-CPU, disk, socket, network, Prometheus, journal,
+   binary/config hash, import and database-size evidence;
 5. runs query latency, deep pagination, mixed reads/writes, scaled publication,
-   live fanout, idle connections, and lifecycle publication; and
-6. alternates relay order between repetitions before leaving both stopped.
+   live fanout, idle connections and lifecycle publication, recording the load
+   host's per-CPU utilization for each phase; and
+6. rotates the target order each repetition, so over as many repetitions as
+   targets each target runs once in each position, and leaves every relay
+   stopped.
 
-The relay-side helper refuses database paths outside the fixed
-`/var/lib/relay-bench/{wok,strfry}` roots and artifact paths outside
-`/opt/relay-bench/{campaigns,results}`. The Prometheus evidence needs
-`observability.metrics_enabled = true` in `/etc/relay-bench/wok.toml`;
-without it the helper records no relay metrics.
+Each target is a file on the relay host,
+`/etc/relay-bench/targets/<name>.env`:
+
+```sh
+# wok or strfry
+KIND=wok
+BINARY=/opt/relay-bench/bin/wok-master/wok
+CONFIG=/etc/relay-bench/wok-master.toml
+PORT=7777
+# Optional: Prometheus endpoint, checkout whose commit is recorded, and
+# service account (created if missing).
+METRICS_URL=http://10.0.0.2:7777/metrics
+SOURCE=/opt/relay-bench/src/wok-master
+USER=relay-bench
+```
+
+Comments go on their own lines. `CONFIG` must put the database in
+`/var/lib/relay-bench/<name>/db`: Wok's `[database] path`, or strfry's `db`.
+The helper reads that setting before it checks, imports into or starts a
+target, and each relay and its import can write only under its own
+`/var/lib/relay-bench/<name>`. Name targets for what they
+run, such as `strfry-1.1.3`, `wok-0.7.0` and `wok-master`. Two configurations
+of one binary, such as limits off and a preset as shipped, are two targets
+with two databases. strfry raises its open-file limit to `relay.nofiles`
+(1,000,000 by default) whenever it starts, imports and exports included, and
+exits when that is above the unit's limit (`NOFILE_LIMIT`, default 524288).
+The helper applies that limit to the relay, its import and the export that
+counts what it kept. So set `relay { nofiles = 0 }` in a strfry target's
+config, or raise `NOFILE_LIMIT`. The relay host needs systemd with cgroup v2, sysstat
+(`pidstat`, `mpstat`, `iostat`), iproute2, curl, GNU time and util-linux's
+`fincore`. The load host needs systemd, `wok-bench`, GNU time, jq and
+sysstat. The relay-side helper refuses
+artifact paths outside `/opt/relay-bench/{campaigns,results}`. Prometheus
+evidence needs `observability.metrics_enabled = true` and `METRICS_URL`.
+
+Each relay runs as the transient unit `relay-bench-target-<name>.service`,
+and its import runs under the same limits:
+
+- `RELAY_CPUS` pins it with `AllowedCPUs`. On a host with hyperthreads, list
+  both threads of each core (`lscpu -e` shows which CPUs share a core): for
+  example `0-7,24-31` where each core's second thread is numbered 24 higher,
+  or `0-15` where a core's threads are adjacent.
+- `RELAY_MEMORY` caps it with `MemoryMax`, for example `64G`. Under cgroup
+  v2 the cap includes the page cache the relay reads through, so a database
+  larger than the cap stays disk-bound on a host with more memory.
+- The helper records the cgroup's `cpuset.cpus.effective` and `memory.max`
+  beside each run, and fails the start unless the CPU set is the requested
+  one and the smallest `memory.max` of the unit and its parent cgroups is
+  the requested size.
+
+Every start drops the page cache first. With `CACHE=cold` (the default) the
+relay starts on an empty cache. `CACHE=warm` reads the database files inside
+the relay's unit before the relay starts, so warmed pages count against its
+cap; raise `READY_TIMEOUT` (seconds, default 120) for a large database. A
+warm start fails when the database is at least `RELAY_MEMORY`, or when any
+database file is not wholly in the page cache once the relay listens
+(`cache-at-start.txt` lists each file's size and cached bytes): a database
+larger than the cap can only be measured cold.
+
+With `SNAPSHOTS=1` (the default), a target's first import is copied to
+`/var/lib/relay-bench/snapshots/<name>`, reflinked where the filesystem
+allows, and later repetitions restore it instead of importing again.
+`prepare.txt` in each run's server evidence says which happened. A snapshot is
+used only when its kind, binary, config, corpus and event count match the
+run's; otherwise the target imports again and replaces it. Each target keeps
+one snapshot, so a large corpus over several targets needs room for a copy of
+each, or `SNAPSHOTS=0`. Import timing is recorded only for imports.
+`benchmark-relay-control drop-snapshot <name>` deletes one.
+
+On the load host, the generator and its `mpstat` sampler run as the transient
+units `relay-bench-load-<campaign>` and `relay-bench-load-<campaign>-mpstat`.
+A campaign stops every `relay-bench-load-*` unit when it exits or is
+interrupted, and again before it starts, in case an earlier campaign lost
+its connection. `LOAD_CPUS` pins the generator's unit. To
+run the generator beside the relay over loopback, set `LOAD_SSH` to the relay
+host's destination, `RELAY_HOST` to `127.0.0.1` and `LOAD_CPUS` to CPUs
+outside `RELAY_CPUS`. This suits scenarios whose traffic the network between
+the hosts would otherwise limit. Report loopback and network results
+separately.
 
 ```bash
-# Defaults: 100k corpus, three order-balanced repetitions, 10k idle sockets.
-./scripts/benchmark-campaign.sh
+# Three targets, three rotated repetitions, the relay held to 16 vCPU and 64 GB.
+RELAY_SSH=root@RELAY_SSH_IP LOAD_SSH=root@LOAD_SSH_IP RELAY_HOST=RELAY_PRIVATE_IP \
+  TARGETS="strfry-1.1.3 wok-0.7.0 wok-master" \
+  RELAY_CPUS=0-7,24-31 RELAY_MEMORY=64G \
+  ./scripts/benchmark-campaign.sh
 
 # Short end-to-end validation before a measured campaign.
-CAMPAIGN_ID=shakeout EVENTS=2000 REPETITIONS=1 QUERIES=50 \
-  DEEP_PAGES=2 PUBLISH_CONNECTIONS=16 FANOUT_SUBSCRIBERS=16 \
-  FANOUT_EVENTS=50 IDLE_CONNECTIONS=128 HOLD_SECONDS=2 \
+RELAY_SSH=root@RELAY_SSH_IP LOAD_SSH=root@LOAD_SSH_IP RELAY_HOST=RELAY_PRIVATE_IP \
+  TARGETS="strfry-1.1.3 wok-master" CAMPAIGN_ID=shakeout EVENTS=2000 \
+  REPETITIONS=1 QUERIES=50 DEEP_PAGES=2 PUBLISH_CONNECTIONS=16 \
+  FANOUT_SUBSCRIBERS=16 FANOUT_EVENTS=50 IDLE_CONNECTIONS=128 HOLD_SECONDS=2 \
   LIFECYCLE_EVENTS=200 LIFECYCLE_CONNECTIONS=1 COOLDOWN_SECONDS=1 \
   ./scripts/benchmark-campaign.sh
 ```
 
-The main environment overrides are `RELAY_SSH`, `LOAD_SSH`, `RELAY_URL`,
-`BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`, `QUERIES`, `DEEP_PAGES`, `REPETITIONS`,
-`PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
-`IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`, `NOFILE_LIMIT`,
-`LIFECYCLE_CONNECTIONS`, `COOLDOWN_SECONDS`, `SEED`, and `BASE_TIMESTAMP`.
+`RELAY_SSH`, `LOAD_SSH`, `RELAY_HOST` (the relay host's address as the load
+host reaches it) and `TARGETS` are required. The other settings are
+`RELAY_CPUS`, `RELAY_MEMORY`, `CACHE`, `SNAPSHOTS`, `READY_TIMEOUT`,
+`LOAD_CPUS`, `BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`, `QUERIES`, `DEEP_PAGES`,
+`REPETITIONS`, `PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
+`IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`,
+`LIFECYCLE_CONNECTIONS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED` and
+`BASE_TIMESTAMP`.
 
 Lifecycle publication defaults to one ordered connection because a deletion
 request must follow the event it references. Scaled publication is measured in
@@ -660,10 +747,10 @@ phase uses a freshly recorded timestamp so short-lived ephemerals remain valid.
 
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`
-output, and a copy of each server-side evidence directory. Server originals
-remain under `/opt/relay-bench/campaigns/<campaign-id>`. Do not compare speed
-for any phase whose `results.jsonl` has `ok=false`, non-zero `errors`, or
-non-zero `mismatches`.
+and `mpstat` output, and a copy of each server-side evidence directory.
+Server originals remain under `/opt/relay-bench/campaigns/<campaign-id>`. Do
+not compare speed for any phase whose `results.jsonl` has `ok=false`, non-zero
+`errors`, or non-zero `mismatches`.
 
 A trial with missing events, unexpected rejections, or dropped deliveries is
 `ok=false` — correctness gates come before speed.
@@ -697,18 +784,23 @@ the relay VM:
 Each target receives a fresh database imported from the same checksum-verified
 signed corpus. The script rotates the three-target order over its default
 three repetitions, applies the same correctness gates, records both client and
-server resources, and leaves both services stopped. It requires the benchmark
-Wok config to enable `/var/lib/relay-bench/wok/wok.sock`.
+server resources, and leaves both relays stopped. It runs the relay targets
+(see the two-host campaign above) named by `WOK_TARGET` (default `wok`) and
+`STRFRY_TARGET` (default `strfry`). Both listen at `WS_URL`, one at a time,
+and the Wok target's config must enable the Unix socket at `WOK_UNIX_SOCKET`
+(default `/var/lib/relay-bench/<wok target>/wok.sock`).
 
 ```bash
 # Defaults: 100k events, three rotated repetitions.
-./scripts/benchmark-transports.sh
+RELAY_SSH=root@RELAY_SSH_IP LOAD_SSH=root@LOAD_SSH_IP \
+  WS_URL=ws://RELAY_PRIVATE_IP:7777 ./scripts/benchmark-transports.sh
 
 # Fast end-to-end transport shakeout.
-CAMPAIGN_ID=transport-shakeout EVENTS=2000 REPETITIONS=1 QUERIES=40 \
-  PUBLISH_CONNECTIONS=8 FANOUT_SUBSCRIBERS=8 FANOUT_EVENTS=30 \
-  IDLE_CONNECTIONS=64 HOLD_SECONDS=1 COOLDOWN_SECONDS=1 \
-  ./scripts/benchmark-transports.sh
+RELAY_SSH=root@RELAY_SSH_IP LOAD_SSH=root@LOAD_SSH_IP \
+  WS_URL=ws://RELAY_PRIVATE_IP:7777 CAMPAIGN_ID=transport-shakeout \
+  EVENTS=2000 REPETITIONS=1 QUERIES=40 PUBLISH_CONNECTIONS=8 \
+  FANOUT_SUBSCRIBERS=8 FANOUT_EVENTS=30 IDLE_CONNECTIONS=64 HOLD_SECONDS=1 \
+  COOLDOWN_SECONDS=1 ./scripts/benchmark-transports.sh
 ```
 
 Original artifacts remain under `/opt/relay-bench/campaigns/<campaign-id>` and

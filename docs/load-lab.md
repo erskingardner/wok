@@ -100,7 +100,7 @@ The operator:
 
 Source staging, images, and named volumes remain on the hosts. The runner does
 not stop systemd services, reset an existing database, edit host firewall rules,
-or operate the old fixed-host benchmark scripts.
+or operate the systemd-based campaign scripts (`scripts/benchmark-*.sh`).
 
 ## Direct Compose use
 

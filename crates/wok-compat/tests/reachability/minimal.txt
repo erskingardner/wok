@@ -475,7 +475,6 @@ wok_db::write::lookup_event_by_id
 wok_db::write::lookup_event_by_id::{closure}
 wok_db::write::original_tag_value
 wok_db::write::put_indices
-wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
 wok_event::hash::id_preimage
@@ -514,6 +513,7 @@ wok_event::validate::require_canonical_addresses
 wok_event::validate::verify_event_json_size
 wok_event::validate::verify_event_timestamp
 wok_event::validate::verify_nostr_event_with
+wok_negentropy::btree::check_encoded
 wok_negentropy::cache::parse_negentropy_filter
 wok_negentropy::lmdb_store::open_rw
 wok_negentropy::lmdb_store::tree_key

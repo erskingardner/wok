@@ -1,7 +1,7 @@
 # Relay functions reached in the `monitored` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 754
+## anonymous: 753
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -128,7 +128,6 @@
 <wok_negentropy::vector::Vector>::allocated_bytes
 <wok_negentropy::vector::Vector>::check_bounds
 <wok_negentropy::vector::Vector>::check_sealed
-<wok_negentropy::vector::Vector>::is_sealed
 <wok_negentropy::vector::Vector>::new
 <wok_negentropy::vector::Vector>::seal
 <wok_query::filter::FilterSetBytes>::at
@@ -571,7 +570,6 @@ wok_db::write::lookup_event_by_id
 wok_db::write::lookup_event_by_id::{closure}
 wok_db::write::original_tag_value
 wok_db::write::put_indices
-wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
 wok_event::hash::id_preimage
@@ -611,6 +609,7 @@ wok_event::validate::require_canonical_addresses
 wok_event::validate::verify_event_json_size
 wok_event::validate::verify_event_timestamp
 wok_event::validate::verify_nostr_event_with
+wok_negentropy::btree::check_encoded
 wok_negentropy::cache::parse_negentropy_filter
 wok_negentropy::encoding::decode_varint
 wok_negentropy::encoding::encode_varint

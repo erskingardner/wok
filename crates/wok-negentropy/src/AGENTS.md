@@ -14,3 +14,5 @@
 | `error.rs` | `NegError` |
 
 Storage errors must abort a reconcile session rather than substitute defaults. Fuzzing of protocol/tree bytes is in `fuzz/fuzz_targets/ingress.rs`.
+
+Lookups decode only the nodes on their path. Of each sibling they pass they read just `accum_count` and the accumulator (`BTreeBackend::get_node_summary`), in place from LMDB, as C++ does through the mmap, and the read-only backend keeps those it read for the rest of its snapshot (#254). Decoding whole siblings, each again for every lookup, made one crafted NEG-MSG cost seconds.

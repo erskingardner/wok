@@ -26,3 +26,7 @@ bench = false
 
 [workspace]
 members = ["."]
+
+# The same LMDB as the relay; see vendor/lmdb-sys/README.md.
+[patch.crates-io]
+lmdb-sys = { path = "../vendor/lmdb-sys" }

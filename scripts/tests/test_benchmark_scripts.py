@@ -626,7 +626,7 @@ class CampaignSettings(unittest.TestCase):
                     self.assertTrue(sent[marks[1]].endswith(
                         'io-mark wok /r/runs/r2-wok/server rate-1000-end'), sent)
 
-    def test_a_rerun_drops_the_earlier_runs_io_summary(self):
+    def test_a_rerun_starts_each_phase_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             phase = root/'runs/r1-wok/load/rate-1000'
@@ -639,8 +639,9 @@ class CampaignSettings(unittest.TestCase):
                 'launch_bench wok 1 ws://10.0.0.2:7777 rate-1000 7 --scenario x',
                 CAMPAIGN_ID='c1')
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse((phase/'relay-io.json').exists())
-            self.assertTrue((phase/'results.jsonl').exists())
+            # The bench (faked) wrote nothing, so nothing is left to read.
+            self.assertTrue(phase.is_dir())
+            self.assertEqual(list(phase.iterdir()), [])
 
     def test_phase_io_gives_bytes_per_stored_event_for_rate_steps(self):
         with tempfile.TemporaryDirectory() as tmp:

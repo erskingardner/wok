@@ -1,7 +1,7 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 673
+## anonymous: 676
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -465,10 +465,13 @@ wok_db::state::author_count
 wok_db::state::author_key
 wok_db::state::change_author_count
 wok_db::state::change_replacement_count
+wok_db::state::count_vanish_marker_change
 wok_db::state::invalidate_visibility
 wok_db::state::policy_generation
 wok_db::state::policy_generation::{closure}
 wok_db::state::preserve_high_water
+wok_db::state::vanish_marker_changes
+wok_db::state::vanish_marker_changes::{closure}
 wok_db::tag_kind::note_tag_kind_indexed
 wok_db::tag_kind::put_tag_kind_entries
 wok_db::tag_kind::tag_kind_key

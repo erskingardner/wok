@@ -132,8 +132,16 @@ local `events.max_event_size`, `max_num_tags` and `max_tag_val_size` limits,
 and that a deletion's `a` tags spell their kind canonically and name only
 its author's events. An event that fails, or a message that is not JSON, is
 skipped and logged on stderr. The command exits nonzero when it skipped
-anything or the connection closed before EOSE; the events it printed stay
-printed. In `wok download … | wok import` the shell reports import's exit
+anything, the connection closed before EOSE, the relay refused the REQ, or
+`--timeout` seconds (default 60, 0 waits forever) passed without the
+WebSocket handshake, an event or EOSE; the events it printed stay printed,
+and the error counts them. A refusal is a CLOSED for the subscription, or a
+NOTICE before the first event whose text starts with `error:` or one of
+NIP-01's machine-readable prefixes (`auth-required:`, `restricted:`,
+`invalid:`, `blocked:`, `rate-limited:`, `unsupported:`), ignoring case.
+Other NOTICEs are logged on stderr. Pings do not count as progress, so a
+relay that stops short of EOSE but keeps the socket open times out. In
+`wok download … | wok import` the shell reports import's exit
 status unless `pipefail` is set. `--no-verify` skips the id, signature and
 `max_event_size` checks; the tag limits and deletion checks still apply.
 Unlike `wok import --no-verify`, which still stops at a line of

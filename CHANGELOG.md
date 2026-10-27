@@ -1092,6 +1092,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wok download` no longer waits forever when the relay refuses its REQ
+  (#251). It read until EOSE or a Close frame, so a relay that answered
+  `["CLOSED","_","auth-required: …"]`, such as a Wok relay with
+  `read_policy = "authenticated"`, or refused with a NOTICE, or stopped short
+  of EOSE, held it open as long as the relay kept the socket up. A CLOSED
+  for its subscription, or a NOTICE before the first event that starts with
+  `error:` or a NIP-01 refusal prefix such as `restricted:`, now ends it
+  nonzero with the relay's reason and the number of events printed; other
+  NOTICEs are logged. A new `--timeout` (default 60 seconds, 0 disables),
+  like `wok sync`'s, ends it nonzero after that long without the WebSocket
+  handshake, an event or EOSE.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

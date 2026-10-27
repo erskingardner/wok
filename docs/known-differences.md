@@ -155,6 +155,11 @@ it is not a promise to reproduce upstream bugs.
   using different wording is counted as `upload_rejected`, and the run exits
   nonzero even if replacement semantics explain the difference. Arbitrary
   human-readable rejection text is not treated as evidence of supersession.
+- `wok download` exits nonzero on a NOTICE before the first event whose
+  text starts with `error:` or a NIP-01 refusal prefix, and after `--timeout`
+  seconds (default 60) without the handshake, an event or EOSE. The pinned
+  strfry's `download` logs every NOTICE and waits for EOSE without a bound.
+  Both exit nonzero on CLOSED.
 - Negentropy tree filters are parsed without `relay.max_tags_per_filter` or
   `relay.max_and_entries`, which bound client filters. strfry parses stored
   tree filters with `relay__maxTagsPerFilter`, so lowering it below a tree's

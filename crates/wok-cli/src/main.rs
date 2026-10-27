@@ -202,7 +202,8 @@ enum Command {
     Sync(sync::Options),
     Upload {
         url: String,
-        #[arg(long, default_value_t = 50)]
+        /// Events sent ahead of the relay's acknowledgments
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..))]
         pipeline: u64,
     },
     Download {
@@ -1685,40 +1686,162 @@ fn most_recent_levid_ro_quiet(txn: &wok_db::RoTxn<'_>) -> u64 {
     wok_db::most_recent_levid_ro(txn).unwrap_or(0)
 }
 
+/// What `wok upload` sent and how the relay answered, printed on stderr
+/// whether or not it succeeds.
+#[derive(Default)]
+struct UploadReport {
+    /// Lines read from standard input.
+    lines: u64,
+    sent: u64,
+    accepted: u64,
+    duplicates: u64,
+    /// Refused because the relay stores a newer version, as `wok sync` counts
+    /// them: not a failure.
+    superseded: u64,
+    refused: u64,
+    /// Lines not sent because they are not event JSON.
+    invalid: u64,
+    /// Events sent that the relay has not acknowledged.
+    unacknowledged: u64,
+}
+
 async fn cmd_upload(url: String, pipeline: u64) -> Result<()> {
+    let mut report = UploadReport::default();
+    let result = upload(&url, pipeline, &mut report).await;
+    eprintln!(
+        "Upload {}: lines={} sent={} accepted={} duplicates={} superseded={} refused={} invalid={} unacknowledged={}",
+        if result.is_ok() { "complete" } else { "failed" },
+        report.lines,
+        report.sent,
+        report.accepted,
+        report.duplicates,
+        report.superseded,
+        report.refused,
+        report.invalid,
+        report.unacknowledged
+    );
+    result
+}
+
+/// Send each line of standard input as an EVENT, at most `pipeline` ahead of
+/// the relay's OKs, and count the OKs by event id.
+async fn upload(url: &str, pipeline: u64, report: &mut UploadReport) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await?;
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
-    let mut inflight = 0u64;
+    // The relay answers each copy of an event the input repeats.
+    let mut pending = std::collections::HashMap::<String, u64>::new();
     let mut line = String::new();
     let mut eof = false;
+    let incomplete = |report: &UploadReport, eof: bool| {
+        format!(
+            "upload incomplete: connection lost with {} acknowledgments outstanding{}",
+            report.unacknowledged,
+            if eof { "" } else { " and input left unsent" }
+        )
+    };
     loop {
-        while inflight < pipeline && !eof {
+        while report.unacknowledged < pipeline && !eof {
             if !read_line_bounded(&mut stdin, &mut line, MAX_UPLOAD_LINE_BYTES)? {
                 eof = true;
                 break;
             }
+            report.lines += 1;
             if line.len() + 1 > MAX_UPLOAD_LINE_BYTES {
                 bail!("upload: stdin line exceeds {MAX_UPLOAD_LINE_BYTES} bytes");
             }
+            let id = match upload_line_id(&line) {
+                Ok(id) => id,
+                Err(error) => {
+                    report.invalid += 1;
+                    tracing::warn!("Not uploading line {}: {error}", report.lines);
+                    continue;
+                }
+            };
             let msg = format!("[\"EVENT\",{line}]");
-            ws.send(Message::Text(msg.into())).await?;
-            inflight += 1;
-        }
-        if inflight == 0 {
-            break;
-        }
-        if let Some(Ok(msg)) = ws.next().await {
-            if msg.to_text()?.contains("\"OK\"") {
-                inflight = inflight.saturating_sub(1);
+            if let Err(error) = ws.send(Message::Text(msg.into())).await {
+                return Err(error).context(incomplete(report, eof));
             }
-        } else {
+            report.sent += 1;
+            report.unacknowledged += 1;
+            *pending.entry(id).or_default() += 1;
+        }
+        if report.unacknowledged == 0 {
             break;
+        }
+        let text = match ws.next().await {
+            Some(Ok(Message::Text(text))) => text,
+            Some(Ok(Message::Close(_))) | None => bail!(incomplete(report, eof)),
+            Some(Err(error)) => return Err(error).context(incomplete(report, eof)),
+            // Reading on past a ping flushes tungstenite's queued pong.
+            Some(Ok(_)) => continue,
+        };
+        let message = match wok_event::json::parse_strict(&text) {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(%error, "upload ignored an unreadable relay message");
+                continue;
+            }
+        };
+        match message[0].as_str().unwrap_or_default() {
+            "OK" => {
+                let (Some(id), Some(accepted)) = (message[1].as_str(), message[2].as_bool()) else {
+                    bail!("upload incomplete: malformed OK from the relay");
+                };
+                let reason = message[3].as_str().unwrap_or_default();
+                let Some(copies) = pending.get_mut(id) else {
+                    tracing::warn!(id, "upload ignored an OK for an event not awaiting one");
+                    continue;
+                };
+                *copies -= 1;
+                if *copies == 0 {
+                    pending.remove(id);
+                }
+                report.unacknowledged -= 1;
+                if accepted && reason.starts_with("duplicate:") {
+                    report.duplicates += 1;
+                } else if accepted {
+                    report.accepted += 1;
+                } else if sync::upload_superseded(reason) {
+                    report.superseded += 1;
+                } else {
+                    report.refused += 1;
+                    tracing::warn!(id, reason, "relay refused event");
+                }
+            }
+            "NOTICE" => tracing::warn!(notice = %message[1], "relay NOTICE"),
+            "CLOSED" => {
+                tracing::warn!(subscription = %message[1], reason = %message[2], "relay CLOSED")
+            }
+            "AUTH" => tracing::debug!("relay advertises AUTH; wok upload has no signing identity"),
+            _ => {}
         }
     }
+    let _ = ws.close(None).await;
+    if report.refused + report.invalid > 0 {
+        bail!(
+            "upload incomplete: {} events refused, {} lines not events",
+            report.refused,
+            report.invalid
+        );
+    }
     Ok(())
+}
+
+/// The id of the event on a `wok upload` input line. Like `wok import`, the
+/// command skips a line that is not event JSON; the relay checks the rest.
+fn upload_line_id(line: &str) -> Result<String> {
+    let event = wok_event::json::parse_strict(line)?;
+    let id = event
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .context("not an event: no id")?;
+    if wok_event::from_lower_hex_exact(id)?.len() != 32 {
+        bail!("not an event: id is not 32 bytes");
+    }
+    Ok(id.to_owned())
 }
 
 async fn cmd_download(

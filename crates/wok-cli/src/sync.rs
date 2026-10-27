@@ -39,6 +39,7 @@ struct Report {
     reconciled: bool,
     have: u64,
     need: u64,
+    narrowed: u64,
     downloaded: u64,
     written: u64,
     duplicates: u64,
@@ -67,9 +68,9 @@ pub async fn run(cfg: &Config, options: Options) -> Result<()> {
             serde_json::to_string(&report)?
         )?;
     } else {
-        eprintln!("Sync {}: reconciled={} have={} need={} downloaded={} written={} duplicates={} superseded={} expired={} rejected={} unavailable={} uploaded={} upload_rejected={} upload_superseded={} upload_expired={}",
+        eprintln!("Sync {}: reconciled={} have={} need={} narrowed={} downloaded={} written={} duplicates={} superseded={} expired={} rejected={} unavailable={} uploaded={} upload_rejected={} upload_superseded={} upload_expired={}",
             if report.ok { "complete" } else { "failed" }, report.reconciled,
-            report.have, report.need, report.downloaded, report.written, report.duplicates, report.superseded,
+            report.have, report.need, report.narrowed, report.downloaded, report.written, report.duplicates, report.superseded,
             report.expired, report.rejected, report.unavailable, report.uploaded, report.upload_rejected,
             report.upload_superseded, report.upload_expired);
     }
@@ -88,6 +89,63 @@ pub(crate) fn upload_superseded(reason: &str) -> bool {
 /// side storing it is the end of that transfer, not a failure.
 fn expired(event: &Value, now: u64) -> bool {
     wok_event::expiration_tag(event).is_some_and(|expiration| expiration <= now)
+}
+
+/// Where an event the peer sent for a `need` ID falls.
+#[derive(Debug, PartialEq)]
+enum Fetched {
+    /// Inside the exact filter: a real difference.
+    InFilter,
+    /// Inside only the compatibility filter a peer without NIP-91 reconciled.
+    Narrowed,
+    /// Inside neither, or not the event its id names.
+    Rejected,
+}
+
+fn classify_fetched(
+    exact: &wok_query::NostrFilterGroup,
+    compatibility: Option<&wok_query::NostrFilterGroup>,
+    event: &Value,
+    limits: &EventLimits,
+) -> Fetched {
+    if downloaded_event_matches(exact, event, limits) {
+        return Fetched::InFilter;
+    }
+    // Set aside only an event that hashes to its id: its tags are the ones
+    // the peer reconciled, so a forged copy cannot hide a real difference.
+    let narrowed = compatibility
+        .is_some_and(|group| downloaded_event_matches(group, event, limits))
+        && wok_event::nostr_json_to_packed_event(event, limits).is_ok_and(|packed| {
+            wok_event::verify_id_allowing_legacy(event, packed.view().id()).is_ok()
+        });
+    if narrowed {
+        Fetched::Narrowed
+    } else {
+        Fetched::Rejected
+    }
+}
+
+/// False when the local record `id` is outside the exact filter, having
+/// matched only the compatibility filter. A record gone since reconciliation
+/// stays a difference: the upload reports it.
+fn stored_event_in_filter(
+    txn: &wok_db::RoTxn<'_>,
+    exact: &wok_query::NostrFilterGroup,
+    id: &[u8],
+    max_event_size: usize,
+) -> Result<bool> {
+    let Some((lev, raw)) = wok_db::lookup_event_by_id_ro(txn, id)? else {
+        return Ok(true);
+    };
+    let packed = PackedEventView::new(&raw)?;
+    if !exact.requires_content() {
+        return Ok(exact.does_match(packed));
+    }
+    let event = event_json_owned(txn, &mut Decompressor::new(), lev, max_event_size)?;
+    let event = wok_event::json::parse_strict(&event)?;
+    Ok(event["content"]
+        .as_str()
+        .is_some_and(|content| exact.does_match_with_content(packed, content)))
 }
 
 fn store_downloads(
@@ -175,6 +233,27 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
         bail!("sync requires at least one filter");
     }
     let env = open_env(cfg)?;
+    // A peer without NIP-91 reconciles the `#` compatibility filter, a
+    // superset of an `&` filter. Reconcile the same set here, then narrow
+    // both directions to the exact filter: differences outside it are
+    // neither transferred nor counted in have/need.
+    let view_filter = mesh::outbound_filter_for_relay(url, &filter_json).await?;
+    let compatibility = (view_filter != filter_json)
+        .then(|| {
+            wok_query::NostrFilterGroup::from_value(
+                &view_filter,
+                u64::MAX,
+                cfg.relay.max_tags_per_filter,
+                cfg.relay.max_and_entries,
+            )
+        })
+        .transpose()?;
+    if compatibility.is_some() && filter_group.filters.iter().any(|f| f.limit != u64::MAX) {
+        bail!("a peer without NIP-91 would apply `limit` to the `#` compatibility superset of the `&` filter, not to the filter; remove `limit`, or bound the sync with --range");
+    }
+    let view_group = compatibility.as_ref().unwrap_or(&filter_group);
+    // Only the peer's events reveal whether they match the exact filter.
+    let fetch_need = do_down || compatibility.is_some();
     // Prefer a precomputed tree whose canonical (time-stripped) filter
     // matches, like C++.
     enum SyncStorage {
@@ -182,7 +261,7 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
         Vector(wok_negentropy::Vector),
     }
     let mut storage = {
-        let mut canonical = filter_json.clone();
+        let mut canonical = view_filter.clone();
         if let Some(obj) = canonical.as_object_mut() {
             obj.remove("since");
             obj.remove("until");
@@ -198,10 +277,8 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 true
             }
         })?;
-        let tree_visible = wok_query::visibility::physical_tree_is_globally_visible(
-            &txn,
-            &filter_group.filters[0],
-        )?;
+        let tree_visible =
+            wok_query::visibility::physical_tree_is_globally_visible(&txn, &view_group.filters[0])?;
         match tree_id.filter(|_| tree_visible) {
             Some(id) => {
                 wok_negentropy::verify_tree(&txn, id, &canonical)?;
@@ -211,7 +288,7 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 // Match the relay's conservative construction budget. Falling
                 // back from a physical tree must not allocate an unbounded view.
                 let per_item =
-                    wok_negentropy::memory_view_item_bytes(filter_group.requires_content());
+                    wok_negentropy::memory_view_item_bytes(view_group.requires_content());
                 let memory_budget = cfg
                     .relay
                     .sync_memory_per_connection
@@ -225,7 +302,7 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 // Offer the peer only what a client may read, like the relay.
                 wok_query::foreach_visible_by_filter(
                     &txn,
-                    &filter_json,
+                    &view_filter,
                     cap.saturating_add(1),
                     cfg.relay.max_tags_per_filter,
                     cfg.relay.max_and_entries,
@@ -258,7 +335,7 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
             SyncStorage::Tree(tid) => {
                 let mut tree = wok_negentropy::open_ro(&txn, *tid)
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let f = filter_group.filters.first();
+                let f = view_group.filters.first();
                 let since = f.map(|f| f.since).unwrap_or(0);
                 let until = f.map(|f| f.until).unwrap_or(u64::MAX);
                 let lower = wok_negentropy::Bound::timestamp(since);
@@ -291,7 +368,7 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
             SyncStorage::Tree(tid) => {
                 let mut tree = wok_negentropy::open_ro(&txn, *tid)
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let f = filter_group.filters.first();
+                let f = view_group.filters.first();
                 let since = f.map(|f| f.since).unwrap_or(0);
                 let until = f.map(|f| f.until).unwrap_or(u64::MAX);
                 let lower = wok_negentropy::Bound::timestamp(since);
@@ -318,13 +395,9 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
         }
     };
 
-    let connect = mesh::connect_mesh(url, cfg.events.max_event_size);
-    let capability_filter = mesh::outbound_filter_for_relay(url, &filter_json);
-    let (ws, remote_filter) = tokio::join!(connect, capability_filter);
-    let mut ws = ws?;
-    let remote_filter = remote_filter?;
+    let mut ws = mesh::connect_mesh(url, cfg.events.max_event_size).await?;
     let init = initiate(&env, &mut storage)?;
-    let open = serde_json::json!(["NEG-OPEN", "N", remote_filter, hex::encode(init)]);
+    let open = serde_json::json!(["NEG-OPEN", "N", view_filter, hex::encode(init)]);
     ws.send(Message::Text(open.to_string().into())).await?;
 
     // Deduplication spans the whole reconciliation, including already-transferred IDs.
@@ -333,6 +406,8 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
     let mut need = VecDeque::new();
     let mut seen_have = HashSet::new();
     let mut seen_need = HashSet::new();
+    // Hex IDs of differences outside the exact filter.
+    let mut narrowed = HashSet::<String>::new();
     let mut pending_up = HashSet::<String>::new();
     let mut pending_down = HashSet::<String>::new();
     let mut down_active = false;
@@ -374,18 +449,38 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                     &mut current_have,
                     &mut current_need,
                 )?;
-                for id in current_have {
-                    if seen_have.insert(id.clone()) && do_up {
-                        have.push_back(id);
+                {
+                    let txn = compatibility.as_ref().map(|_| env.begin_ro()).transpose()?;
+                    for id in current_have {
+                        if !seen_have.insert(id.clone()) {
+                            continue;
+                        }
+                        if let Some(txn) = &txn {
+                            if !stored_event_in_filter(
+                                txn,
+                                &filter_group,
+                                &id,
+                                cfg.events.max_event_size,
+                            )? {
+                                report.narrowed += 1;
+                                narrowed.insert(hex::encode(&id));
+                                continue;
+                            }
+                        }
+                        report.have += 1;
+                        if do_up {
+                            have.push_back(id);
+                        }
                     }
                 }
                 for id in current_need {
-                    if seen_need.insert(id.clone()) && do_down {
-                        need.push_back(id);
+                    if seen_need.insert(id.clone()) {
+                        report.need += 1;
+                        if fetch_need {
+                            need.push_back(id);
+                        }
                     }
                 }
-                report.have = seen_have.len() as u64;
-                report.need = seen_need.len() as u64;
                 if seen_have.len() + seen_need.len() > MAX_SYNC_IDS {
                     bail!("sync peer exceeded {MAX_SYNC_IDS} unique differences; use narrower filters");
                 }
@@ -426,17 +521,36 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 let event = reply.get(2).context("missing sync event")?;
                 let id = event["id"].as_str().unwrap_or("");
                 if pending_down.remove(id) {
-                    report.downloaded += 1;
-                    if downloaded_event_matches(&filter_group, event, &cfg.event_limits()) {
-                        batch.push(event.clone());
-                    } else {
-                        report.rejected += 1;
+                    match classify_fetched(
+                        &filter_group,
+                        compatibility.as_ref(),
+                        event,
+                        &cfg.event_limits(),
+                    ) {
+                        Fetched::Narrowed => {
+                            report.need -= 1;
+                            report.narrowed += 1;
+                            narrowed.insert(id.to_owned());
+                        }
+                        // A comparison fetches only to find narrowed IDs.
+                        _ if !do_down => {}
+                        Fetched::InFilter => {
+                            report.downloaded += 1;
+                            batch.push(event.clone());
+                        }
+                        Fetched::Rejected => {
+                            report.downloaded += 1;
+                            report.rejected += 1;
+                        }
                     }
                     last_progress = Instant::now();
                 }
             }
             "EOSE" if reply[1] == "R" && down_active => {
-                report.unavailable += pending_down.len() as u64;
+                // An ID a comparison could not fetch stays a difference.
+                if do_down {
+                    report.unavailable += pending_down.len() as u64;
+                }
                 pending_down.clear();
                 down_active = false;
                 store_downloads(&env, cfg, &mut batch, report)?;
@@ -508,7 +622,7 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 pending_up.insert(id);
             }
         }
-        if do_down && !down_active && !need.is_empty() {
+        if fetch_need && !down_active && !need.is_empty() {
             let ids: Vec<_> = need.drain(..need.len().min(50)).map(hex::encode).collect();
             pending_down.extend(ids.iter().cloned());
             ws.send(Message::Text(
@@ -530,8 +644,10 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
                 for (label, ids) in [("have", &seen_have), ("need", &seen_need)] {
                     let mut ids: Vec<_> = ids.iter().collect();
                     ids.sort();
-                    for id in ids {
-                        writeln!(output, "{label},{}", hex::encode(id))?;
+                    for id in ids.into_iter().map(hex::encode) {
+                        if !narrowed.contains(&id) {
+                            writeln!(output, "{label},{id}")?;
+                        }
                     }
                 }
             }
@@ -561,5 +677,44 @@ mod tests {
         assert!(!upload_superseded("blocked: user requested deletion"));
         assert!(!upload_superseded("blocked: author storage quota exceeded"));
         assert!(!upload_superseded("have a newer version"));
+    }
+
+    #[test]
+    fn fetched_events_are_narrowed_only_when_they_hash_to_their_id() {
+        use secp256k1::{Keypair, SECP256K1};
+        let group = |filter: Value| {
+            wok_query::NostrFilterGroup::from_value(&filter, u64::MAX, 8, 16).unwrap()
+        };
+        let exact = group(json!({"&t":["a","b"]}));
+        let compatibility = group(json!({"#t":["a","b"]}));
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let event = |tags: &[&str]| {
+            let mut event = json!({
+                "created_at": 1_700_000_000u64,
+                "kind": 1,
+                "tags": tags.iter().map(|tag| json!(["t", tag])).collect::<Vec<_>>(),
+                "content": "",
+                "pubkey": hex::encode(key.x_only_public_key().0.serialize()),
+            });
+            let id = wok_event::event_id_hash(&event).unwrap();
+            event["id"] = json!(hex::encode(id));
+            event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+            event
+        };
+        let limits = EventLimits::default();
+        let classify =
+            |event: &Value| classify_fetched(&exact, Some(&compatibility), event, &limits);
+        assert_eq!(classify(&event(&["a", "b"])), Fetched::InFilter);
+        assert_eq!(classify(&event(&["a"])), Fetched::Narrowed);
+        assert_eq!(classify(&event(&["c"])), Fetched::Rejected);
+        // A body that does not hash to its id cannot set a difference aside.
+        let mut forged = event(&["a", "b"]);
+        forged["tags"] = json!([["t", "a"]]);
+        assert_eq!(classify(&forged), Fetched::Rejected);
+        // A peer sent the exact filter narrows nothing.
+        assert_eq!(
+            classify_fetched(&exact, None, &event(&["a"]), &limits),
+            Fetched::Rejected
+        );
     }
 }

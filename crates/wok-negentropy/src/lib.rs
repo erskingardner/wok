@@ -22,7 +22,7 @@ pub use integrity::verify_tree;
 pub use lmdb_store::{open_ro, open_rw, BTreeLmdbRo, BTreeLmdbRw};
 pub use protocol::Negentropy;
 pub use storage::Storage;
-pub use types::{Bound, Item, MAX_U64, PROTOCOL_VERSION};
+pub use types::{Accumulator, Bound, Item, MAX_U64, PROTOCOL_VERSION};
 pub use vector::{SubRange, Vector};
 
 pub use btree::{BTreeBackend, BTreeCore, Key, Node, NodePtr, MAX_ITEMS, NODE_SIZE};

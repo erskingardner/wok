@@ -1,7 +1,7 @@
 # Relay functions reached in the `gated` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 455
+## anonymous: 449
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::is_member
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
@@ -411,11 +411,6 @@ wok_ws::dispatch
 wok_ws::dispatch::{closure}
 wok_ws::dispatch::{closure}::{closure}
 wok_ws::empty
-wok_ws::extension::accept
-wok_ws::extension::negotiate::<core::iter::adapters::filter_map::FilterMap<http::header::map::ValueIter<http::header::value::HeaderValue>, wok_ws::upgrade_ws::{closure}::{closure}::{closure}>>
-wok_ws::extension::negotiate::<core::iter::adapters::filter_map::FilterMap<http::header::map::ValueIter<http::header::value::HeaderValue>, wok_ws::upgrade_ws::{closure}::{closure}::{closure}>>::{closure}
-wok_ws::extension::split_unquoted
-wok_ws::extension::split_unquoted::{closure}
 wok_ws::frame::apply_mask
 wok_ws::frame::check_close
 wok_ws::frame::inflate_allowance
@@ -454,11 +449,10 @@ wok_ws::text_status_response
 wok_ws::upgrade_ws
 wok_ws::upgrade_ws::{closure}
 wok_ws::upgrade_ws::{closure}::{closure}
-wok_ws::upgrade_ws::{closure}::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 307
+## authenticated: 308
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -716,6 +710,7 @@ wok_db::write::index_event::{closure}
 wok_db::write::lookup_event_by_id::{closure}
 wok_db::write::original_tag_value
 wok_event::packed::hashed_tag_value_digest
+wok_negentropy::btree::check_encoded
 wok_negentropy::encoding::decode_varint
 wok_negentropy::encoding::encode_varint
 wok_negentropy::encoding::get_byte

@@ -33,7 +33,9 @@ and allow-lists let in gets it, and it skips the connection, per-address and
 per-connection budgets. What it publishes is still limited by proof of work,
 the storage quotas and the per-author EVENT budget, which an authenticated
 connection pays from its first identity but an unauthenticated one starts
-afresh with each new key.
+afresh with each new key. NIP-62 vanish requests skip proof of work and the
+storage quotas, so on this transport the disk reserve is what bounds a peer
+that signs one with each new key.
 The relay at startup, and `wok doctor` in its `unix-access` check, warn when
 the mode lets every local user connect (others may write to the socket, as
 with `0o666`) while `relay.unix.auth_uids` and `auth_gids` are both empty.

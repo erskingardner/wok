@@ -265,6 +265,21 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         self.assertEqual([(row[0], row[2], row[3]) for row in rows[1:]],
                          [('query', '800', '500'), ('rate-1000', '50', '800000')])
 
+        # A phase started again without an end loses its earlier interval.
+        self.assertEqual(mark('query-start', 2000, 2000).returncode, 0)
+        result = self.control('io_phases "$1"', str(artifacts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = (artifacts/'io-phases.tsv').read_text().splitlines()
+        self.assertEqual([row.split('\t')[0] for row in rows[1:]], ['rate-1000'])
+
+        # With no marks, the summary is only its header, replacing any copy
+        # an earlier run left.
+        (artifacts/'io-marks.tsv').unlink()
+        result = self.control('io_phases "$1"', str(artifacts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((artifacts/'io-phases.tsv').read_text(),
+                         'phase\tsecs\tread_bytes\twrite_bytes\n')
+
         (artifacts/'main.pid').unlink()
         result = mark('lifecycle-start', 0, 0)
         self.assertNotEqual(result.returncode, 0)
@@ -610,6 +625,22 @@ class CampaignSettings(unittest.TestCase):
                         'io-mark wok /r/runs/r2-wok/server rate-1000-start'), sent)
                     self.assertTrue(sent[marks[1]].endswith(
                         'io-mark wok /r/runs/r2-wok/server rate-1000-end'), sent)
+
+    def test_a_rerun_drops_the_earlier_runs_io_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            phase = root/'runs/r1-wok/load/rate-1000'
+            phase.mkdir(parents=True)
+            (phase/'relay-io.json').write_text('{"phase": "rate-1000"}\n')
+            (phase/'results.jsonl').write_text('{}\n')
+            result = self.campaign(
+                'remote_command() { [[ $1 == "$LOAD_SSH" ]] || return 0; shift; "$@"; }; '
+                f'ssh() {{ :; }}; LOAD_ROOT={root} RELAY_ROOT=/r; '
+                'launch_bench wok 1 ws://10.0.0.2:7777 rate-1000 7 --scenario x',
+                CAMPAIGN_ID='c1')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((phase/'relay-io.json').exists())
+            self.assertTrue((phase/'results.jsonl').exists())
 
     def test_phase_io_gives_bytes_per_stored_event_for_rate_steps(self):
         with tempfile.TemporaryDirectory() as tmp:

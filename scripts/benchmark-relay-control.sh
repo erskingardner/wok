@@ -589,6 +589,9 @@ start_measurement() {
     local main_pid
     main_pid=$(systemctl show "$UNIT" -p MainPID --value)
     echo "$main_pid" >"$artifacts/main.pid"
+    # This start owns the I/O marks: a rerun under the same campaign ID must
+    # not pair its marks with an earlier run's.
+    rm -f -- "$artifacts/io-marks.tsv" "$artifacts/io-phases.tsv"
     systemctl show "$UNIT" >"$artifacts/systemd-before.properties"
     nstat -az >"$artifacts/nstat-before.txt"
     # node_exporter is optional.
@@ -627,16 +630,19 @@ io_mark() {
 
 # Writes ARTIFACTS/io-phases.tsv from io-marks.tsv: per phase marked
 # PHASE-start and PHASE-end, its seconds and the bytes the relay read and
-# wrote in between.
+# wrote in between. A phase whose last start has no end is left out; with no
+# marks, the file has only its header, so it replaces an earlier run's copy.
 io_phases() {
     local artifacts=$1
-    [[ -f $artifacts/io-marks.tsv ]] || return 0
+    local marks=$artifacts/io-marks.tsv
+    [[ -f $marks ]] || marks=/dev/null
     awk -F '\t' -v OFS='\t' '
         BEGIN { print "phase", "secs", "read_bytes", "write_bytes" }
         $1 ~ /-start$/ {
             phase = substr($1, 1, length($1) - 6)
             started[phase] = $2; read[phase] = $3; written[phase] = $4
-            order[++phases] = phase
+            delete secs[phase]
+            if (!(phase in seen)) { seen[phase] = 1; order[++phases] = phase }
         }
         $1 ~ /-end$/ {
             phase = substr($1, 1, length($1) - 4)
@@ -650,7 +656,7 @@ io_phases() {
                 phase = order[i]
                 if (phase in secs) print phase, secs[phase], dread[phase], dwrite[phase]
             }
-        }' "$artifacts/io-marks.tsv" >"$artifacts/io-phases.tsv"
+        }' "$marks" >"$artifacts/io-phases.tsv"
 }
 
 # Collects evidence even after a failed run, then fails if the relay was no

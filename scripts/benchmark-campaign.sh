@@ -185,7 +185,11 @@ launch_bench() {
         # instead be fresh when each live lifecycle phase actually begins.
         phase_timestamp=$(date -u +%s)
     fi
-    remote_command "$LOAD_SSH" mkdir -p "$output"
+    # A rerun under the same campaign ID must not keep an earlier run's I/O
+    # summary for this phase.
+    # shellcheck disable=SC2016 # The load host's shell expands it.
+    remote_command "$LOAD_SSH" sh -c 'mkdir -p -- "$1" && rm -f -- "$1/relay-io.json"' \
+        sh "$output"
     load_unit_command /usr/bin/time -v -o "$output/time.txt" \
         "$BENCH_BIN" \
         --target-url "$url" \

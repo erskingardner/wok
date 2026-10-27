@@ -1014,6 +1014,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- NIP-77 reconciliation accepts a message whatever number of ranges it
+  holds (#242). One with more than 4096 was refused, though the relay itself
+  answers with 500,000-byte frames, which hold about 23,000: `wok sync`
+  failed with `negentropy message has too many bounds` against Wok or strfry
+  once the two sets differed by more than a few thousand events, and the
+  relay sent `NEG-ERR "error: invalid reconciliation message"` to a client
+  that used large frames. Storage work bounds a round instead: once its
+  lookups and fingerprints have cost 65,536 B-tree descents, the reply
+  answers the rest of its range with one fingerprint, as it does when it
+  fills its frame, and the peer splits that range in its next message. A
+  crafted message costs no more than the range cap let one cost (#254).
 - A NEG-MSG sent before the relay replied to its session's NEG-OPEN, while
   the view built in memory is still being scanned, gets `invalid: NEG-MSG
   sent before the reply to NEG-OPEN`, and the session and its scan close

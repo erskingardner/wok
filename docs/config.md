@@ -420,10 +420,12 @@ historical queries waiting on this connection`.
 `relay.search_enabled` gates the NIP-50 query parser and the ranked search
 scan: while it is off, a request with a `search` filter is refused before its
 filters are parsed, whatever else it asks for. Subscriptions already open
-when a reload turns it off keep their search filters until they close. The
-writer keeps the search index current as it stores and deletes events either
-way, so turning search back on, which reloads live, answers from a complete
-index at once.
+when a reload turns it off keep their search filters until they close.
+While it is off, the writer does not build the search index. Turning search
+back on, which reloads live, starts the build in the background: searches
+read the events the index lacks directly, and while more than 100,000 wait
+they are refused with `error: search index is building` and NIP-11 omits
+NIP-50. See [NIP-50 search](nip50-search.md#index-and-recovery).
 
 ### Filter validation
 

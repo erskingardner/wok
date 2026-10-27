@@ -6,9 +6,7 @@ use crate::keys::{
     u64_from_ne_checked,
 };
 use crate::payload::{encode_raw_payload, Decompressor};
-use crate::search::{
-    index_event_search, note_search_indexed_through, payload_kind, remove_event_search,
-};
+use crate::search::{payload_kind, remove_event_search, search_indexed_through_rw};
 use crate::tag_kind::{
     del_tag_kind_entries, note_tag_kind_indexed, put_tag_kind_entries, tag_kind_keys,
 };
@@ -480,15 +478,18 @@ pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbEr
     } else {
         None
     };
-    let json = if let Some(raw) = txn.get_u64(dbis.event_payload, lev_id)?.map(<[u8]>::to_vec) {
-        let mut decompressor = Decompressor::new();
-        Some(
-            decompressor
-                .decode_rw(txn, &raw, 16 * 1024 * 1024)?
-                .to_owned(),
-        )
-    } else {
-        None
+    // Only an event at or below the search marker has postings to remove.
+    let indexed = search_indexed_through_rw(txn)?.is_some_and(|through| lev_id <= through);
+    let json = match txn.get_u64(dbis.event_payload, lev_id)?.map(<[u8]>::to_vec) {
+        Some(raw) if indexed => {
+            let mut decompressor = Decompressor::new();
+            Some(
+                decompressor
+                    .decode_rw(txn, &raw, 16 * 1024 * 1024)?
+                    .to_owned(),
+            )
+        }
+        _ => None,
     };
     // C++ deleteEventBasic: payload row first; the return value reports
     // whether a payload existed, independent of the primary record.
@@ -537,7 +538,7 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
         }
     }
     put_indices(txn, lev_id, &idx)?;
-    index_event_search(txn, lev_id, view.kind(), json)?;
+    // Search postings are built in later transactions, from the marker up.
     Ok(lev_id)
 }
 
@@ -709,7 +710,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
     });
 
     let mut first_inserted = None;
-    let mut indexed_through = None;
+    let mut last_inserted = None;
 
     for i in 0..evs.len() {
         let mut lev_ids_to_delete: Vec<u64> = Vec::new();
@@ -958,7 +959,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
         let inserted_lev_id = insert_event(txn, packed_bytes, json)?;
         first_inserted.get_or_insert(inserted_lev_id);
-        indexed_through = Some(inserted_lev_id);
+        last_inserted = Some(inserted_lev_id);
         *lev_id = inserted_lev_id;
         ne.update(txn, packed, true)?;
         *status = EventWriteStatus::Written;
@@ -971,13 +972,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
     }
 
-    // The search watermark is transaction-level progress. Updating the
-    // DUPSORT metadata key after every event needlessly deletes and reinserts
-    // the same record throughout a batch.
-    if let Some(lev_id) = indexed_through {
-        note_search_indexed_through(txn, lev_id)?;
-    }
-    if let (Some(first), Some(last)) = (first_inserted, indexed_through) {
+    if let (Some(first), Some(last)) = (first_inserted, last_inserted) {
         // Moving the marker past events whose postings were deferred would
         // mark the table complete without them.
         if !txn.defer_tag_kind {

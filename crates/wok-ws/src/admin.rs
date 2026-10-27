@@ -501,7 +501,7 @@ fn overview(handle: &RelayHandle) -> Response<Full<Bytes>> {
             "sections": fields::SECTIONS,
             "config": dashboard_config(&cfg),
             "preset_config": dashboard_config(&cfg.preset_defaults()),
-            "nip11": crate::nip11(&cfg)["limitation"],
+            "nip11": crate::nip11(&cfg, &[])["limitation"],
             "refusals": refusals(&handle.metrics),
             "warnings": cfg.zero_guards().into_iter().chain(cfg.message_caps()).map(|warning| {
                 serde_json::json!({"keys": warning.keys, "warning": warning.warning})
@@ -1991,7 +1991,7 @@ event_burst = 500
         // Every field NIP-11 can advertise: a lower bound set, abuse on.
         let mut cfg = Config::default();
         cfg.events.reject_older_than_secs = 3600;
-        let advertised = crate::nip11(&cfg)["limitation"]
+        let advertised = crate::nip11(&cfg, &[])["limitation"]
             .as_object()
             .unwrap()
             .clone();
@@ -2025,7 +2025,7 @@ event_burst = 500
             }
         }
         // A limit that is off is not advertised, so its chip is not shown.
-        let limitation = crate::nip11(&Config::default())["limitation"].clone();
+        let limitation = crate::nip11(&Config::default(), &[])["limitation"].clone();
         assert!(limitation.get("created_at_lower_limit").is_none());
     }
 

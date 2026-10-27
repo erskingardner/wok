@@ -1,7 +1,7 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 694
+## anonymous: 688
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -280,6 +280,7 @@
 <wok_relay::metrics::Histogram>::observe
 <wok_relay::metrics::Histogram>::observe::{closure}
 <wok_relay::metrics::Metrics>::refused
+<wok_relay::metrics::Metrics>::search_index_building
 <wok_relay::metrics::Refusals>::add
 <wok_relay::metrics::Setting>::of_filter_limit
 <wok_relay::metrics::Setting>::of_read_class
@@ -421,6 +422,7 @@
 <wok_relay::server::sub_gate::SubGate>::is_open
 <wok_relay::server::sub_gate::SubGate>::len
 <wok_relay::server::sub_gate::SubGate>::open
+<wok_relay::server::writer::SearchBuild>::note_stored
 <wok_relay::server::writer::ThreadStorageWrites>::bytes
 <wok_relay::source::TransportSource>::ip
 <wok_relay::source::TransportSource>::ip_address
@@ -462,20 +464,12 @@ wok_db::moderation::moderation_reason_inner
 wok_db::moderation::moderation_reason_ro
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
-wok_db::search::for_each_document_term::<wok_db::search::indexed_terms::{closure}>
 wok_db::search::for_each_term::<wok_db::search::normalize_search_terms_with_overflow::{closure}>
 wok_db::search::for_each_term::<wok_db::search::normalize_search_terms_with_overflow::{closure}>::{closure}
-wok_db::search::index_event_search
-wok_db::search::indexed_terms
 wok_db::search::normalize_search_terms_with_overflow
 wok_db::search::normalize_search_terms_with_overflow::{closure}
-wok_db::search::note_search_indexed_through
-wok_db::search::parse_event::<wok_db::search::EventContent>
 wok_db::search::parse_search_query
 wok_db::search::parse_search_query::{closure}
-wok_db::search::search_document
-wok_db::search::search_document::{closure}
-wok_db::search::search_index_entries
 wok_db::state::allocate_event_id
 wok_db::state::author_count
 wok_db::state::author_key

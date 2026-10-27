@@ -741,6 +741,7 @@ fn cmd_import(
     if deferred_tag_kind {
         build_tag_kind_index(&env)?;
     }
+    build_search_index(&env)?;
     tracing::info!(
         "Done. Processed {total_processed} lines. {total_written} added, {total_rejected} rejected, {total_dups} dups"
     );
@@ -896,6 +897,53 @@ fn commit_import(
         }
     }
     Ok(deferred_tag_kind)
+}
+
+/// Index the imported events for NIP-50 search, which publishing leaves to
+/// later steps, so that a relay started on the database can search it at
+/// once. Like the tag-kind build, it leaves the rest to the relay's writer
+/// once another process has the database open.
+fn build_search_index(env: &Env) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut last_log = started;
+    let mut events = 0u64;
+    loop {
+        if env.open_in_another_process()? {
+            tracing::info!(
+                "Another process has the database open; a relay on it builds the rest of the search index in the background"
+            );
+            return Ok(());
+        }
+        let mut txn = env.begin_rw()?;
+        let step = wok_db::build_search_index(
+            &mut txn,
+            wok_db::SEARCH_BUILD_STEP_EVENTS,
+            std::time::Duration::MAX,
+        )?;
+        txn.commit()?;
+        let Some(step) = step else {
+            return Ok(());
+        };
+        events += step.events;
+        if step.state.lag() == 0 {
+            break;
+        }
+        if last_log.elapsed() >= std::time::Duration::from_secs(10) {
+            last_log = std::time::Instant::now();
+            tracing::info!(
+                "Search index: indexed through {} of {}",
+                step.state.indexed_through,
+                step.state.high_water
+            );
+        }
+    }
+    if events > 0 {
+        tracing::info!(
+            "Built the search index for {events} events in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
 }
 
 /// Build the `(tag, kind, created_at)` index that import batches left to a

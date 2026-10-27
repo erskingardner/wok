@@ -1044,10 +1044,17 @@ Settled ones were duplicates, older versions of a replaceable event, or
 deleted, and have no row of their own; a social corpus has many. An event
 left pending or over a quota is unfinished and fails the trial.
 
+Publishing writes no NIP-50 search postings; the relay writer indexes
+stored events in later steps of their own. The scenario takes the steps a
+busy writer takes: one after a batch once 1,000 events wait, and, at the
+end of each step, the ones an idle writer takes to index the rest. Their
+time and bytes count in the step's. The preload builds the index for the
+history.
+
 Per step the table gives those counts, transactions, stored events per
 second and µs per stored event, transaction time (from `begin_rw` to the
-end of the commit) and commit time at p50 and p99, and the growth of
-`data.mdb`. On Linux it also gives the bytes the process wrote per stored
+end of the commit) and commit time at p50 and p99, the growth of
+`data.mdb`, and the events the search build indexed and its time. On Linux it also gives the bytes the process wrote per stored
 event and the 4 KiB pages per commit, from `write_bytes` in
 `/proc/self/io`, which counts each page once per commit that dirties it.
 With the minimum of 20 commits, a step's p99 is close to its maximum. The

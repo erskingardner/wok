@@ -1431,9 +1431,14 @@ impl RelayHandle {
         self.shutdown_notify.clone()
     }
 
+    /// The NIPs to advertise: those the configuration enables, less NIP-50
+    /// while the search index is too far behind to serve searches.
     pub fn supported_nips(&self) -> Vec<u64> {
-        let cfg = self.config.read();
-        supported_nips(&cfg)
+        let mut nips = supported_nips(&self.config.read());
+        if self.metrics.search_index_building() {
+            nips.retain(|&nip| nip != 50);
+        }
+        nips
     }
 
     pub fn set_config_path(&self, path: std::path::PathBuf) {
@@ -3364,11 +3369,16 @@ fn check_query_work(
     ))
 }
 
+/// Why a search is refused while the index is far behind: NIP-50 is not
+/// advertised meanwhile, and clients handle a relay without it.
+const SEARCH_INDEX_BUILDING: &str = "error: search index is building";
+
 /// Every check a REQ or COUNT passes before any worker sees it, returning
 /// the subscription and its serialized filter bytes. `Err` is the CLOSED
 /// reason: `invalid:` for a malformed request or one over a size limit,
-/// `unsupported:` for filter elements the relay does not know, and
-/// `blocked:` for an operator rule that applies to every client.
+/// `unsupported:` for filter elements the relay does not know, `blocked:`
+/// for an operator rule that applies to every client, and `error:` for a
+/// search while the search index is far behind.
 #[allow(clippy::too_many_arguments)]
 fn admit_req(
     cfg: &Config,
@@ -3447,12 +3457,16 @@ fn admit_req(
         cfg.relay.max_filter_limit
     };
     // With NIP-50 off, its query parser is not reached.
-    if !cfg.relay.search_enabled && filters.iter().any(|filter| filter.get("search").is_some()) {
+    let searches = filters.iter().any(|filter| filter.get("search").is_some());
+    if !cfg.relay.search_enabled && searches {
         return Err(refuse(
             Setting::SearchEnabled,
             "blocked",
             "search disabled".into(),
         ));
+    }
+    if searches && metrics.search_index_building() {
+        return Err(SEARCH_INDEX_BUILDING.into());
     }
     let mut arr = vec![json!("REQ"), json!(sid.as_str())];
     arr.extend(filters);
@@ -3952,6 +3966,9 @@ fn ingest_neg(
     if !cfg.relay.search_enabled && filter.get("search").is_some() {
         metrics.refused(Setting::SearchEnabled);
         return Err("blocked: search disabled".into());
+    }
+    if filter.get("search").is_some() && metrics.search_index_building() {
+        return Err(SEARCH_INDEX_BUILDING.into());
     }
     let max_limit = cfg.relay.max_sync_events.saturating_add(1);
     let fg = NostrFilterGroup::from_value(

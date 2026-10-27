@@ -1,14 +1,16 @@
 # Relay functions reached in the `gated` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 461
+## anonymous: 471
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::is_member
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
 <wok_db::moderation::ModerationSnapshot>::roles_of
 <wok_db::moderation::ModerationView>::hides
+<wok_db::payload::Decompressor>::decode_rw
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
+<wok_db::txn::RwTxn>::foreach_full::<wok_db::search::build_search_index::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 <wok_db::txn::RwTxn>::largest_integer_key
 <wok_db::vanish::VanishPolicy>::targets_this_relay_json
@@ -136,6 +138,7 @@
 <wok_relay::metrics::Histogram>::observe
 <wok_relay::metrics::Histogram>::observe::{closure}
 <wok_relay::metrics::Metrics>::refused
+<wok_relay::metrics::Metrics>::search_index_building
 <wok_relay::metrics::Refusals>::add
 <wok_relay::moderation::WriteGrant>::admits
 <wok_relay::moderation::WriteGrant>::new
@@ -229,6 +232,9 @@
 <wok_relay::server::negentropy::Swept>::took
 <wok_relay::server::sub_gate::SubGate>::close
 <wok_relay::server::sub_gate::SubGate>::ids_mut
+<wok_relay::server::writer::SearchBuild>::note_stored
+<wok_relay::server::writer::SearchBuild>::step
+<wok_relay::server::writer::SearchBuild>::step::{closure}
 <wok_relay::server::writer::ThreadStorageWrites>::bytes
 <wok_relay::source::TransportSource>::ip
 <wok_relay::source::TransportSource>::ip_address
@@ -270,10 +276,12 @@ wok_db::moderation::moderation_reason_ignoring_author_ro
 wok_db::moderation::moderation_reason_inner
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
+wok_db::payload::parse_payload
+wok_db::search::build_search_index
+wok_db::search::build_search_index::{closure}
+wok_db::search::build_search_index::{closure}::{closure}
 wok_db::search::for_each_document_term::<wok_db::search::indexed_terms::{closure}>
-wok_db::search::index_event_search
 wok_db::search::indexed_terms
-wok_db::search::note_search_indexed_through
 wok_db::search::search_document
 wok_db::search::search_index_entries
 wok_db::state::allocate_event_id
@@ -286,11 +294,13 @@ wok_db::state::policy_generation::{closure}
 wok_db::state::preserve_high_water
 wok_db::state::vanish_marker_changes
 wok_db::state::vanish_marker_changes::{closure}
+wok_db::tag_kind::high_water::{closure}
 wok_db::tag_kind::note_tag_kind_indexed
 wok_db::tag_kind::put_tag_kind_entries
 wok_db::tag_kind::tag_kind_keys
 wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
+wok_db::txn::foreach_full::<wok_db::search::build_search_index::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 wok_db::vanish::is_event_vanished_ro
 wok_db::vanish::mark_vanished
@@ -464,12 +474,11 @@ wok_ws::upgrade_ws::{closure}::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 310
+## authenticated: 303
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
 <wok_db::payload::Decompressor>::decode
-<wok_db::search::Tag>::name_and_value
 <wok_db::txn::RoTxn as wok_db::moderation::ReadOps>::get_record
 <wok_db::txn::RoTxn as wok_db::moderation::ReadOps>::moderation_dbi
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
@@ -696,12 +705,6 @@ wok_db::moderation::get_reason::<wok_db::txn::RoTxn>
 wok_db::moderation::moderation_reason_ro
 wok_db::moderation::pubkey_roles_ro::<wok_db::txn::RoTxn>
 wok_db::payload::parse_payload
-wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>
-wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>::{closure}
-wok_db::search::indexed_terms::{closure}
-wok_db::search::parse_event::<wok_db::search::EventText>
-wok_db::search::search_index_entries::{closure}
-wok_db::search::term_key
 wok_db::state::author_count
 wok_db::state::change_replacement_count
 wok_db::tag_kind::high_water::{closure}

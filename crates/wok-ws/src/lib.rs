@@ -32,9 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use wok_relay::{
-    supported_nips, Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource,
-};
+use wok_relay::{Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource};
 
 /// NIP-11 `software` MUST be the project's homepage URL.
 const SOFTWARE: &str = "https://github.com/erskingardner/wok";
@@ -380,10 +378,11 @@ async fn dispatch(
                 .unwrap_or_else(|_| empty(StatusCode::OK)),
         );
     }
+    let supported_nips = handle.supported_nips();
     let mut response = if wants_nip11 {
-        json_response(&nip11(&cfg))
+        json_response(&nip11(&cfg, &supported_nips))
     } else {
-        html_response(&landing(&cfg, &handle.supported_nips()))
+        html_response(&landing(&cfg, &supported_nips))
     };
     // `/` serves two documents, so caches must key on Accept too.
     response.headers_mut().insert(
@@ -481,14 +480,16 @@ fn maybe_npub(s: &str) -> String {
     s.to_string()
 }
 
-pub(crate) fn nip11(cfg: &Config) -> serde_json::Value {
+/// The NIP-11 document, advertising `supported_nips`: the relay handle's,
+/// which follow the index state as well as the configuration.
+pub(crate) fn nip11(cfg: &Config, supported_nips: &[u64]) -> serde_json::Value {
     let min_pow_difficulty = if cfg.relay.abuse.enabled {
         cfg.relay.abuse.min_pow_difficulty
     } else {
         0
     };
     let mut v = serde_json::json!({
-        "supported_nips": supported_nips(cfg),
+        "supported_nips": supported_nips,
         "software": SOFTWARE,
         "version": VERSION,
         "negentropy": PROTOCOL_NEG,

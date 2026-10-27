@@ -3,7 +3,7 @@ use serde_json::json;
 use std::time::Duration;
 use tempfile::TempDir;
 use wok_db::{
-    build_search_index, delete_events, encode_zstd_payload, event_json_owned,
+    build_search_index, delete_events, encode_zstd_payload, event_json_owned, finish_search_index,
     insert_compression_dictionary, reset_search_index, search_index_state_ro, write_events,
     Decompressor, Env, EnvOptions, EventToWrite, NoopNegentropy,
 };
@@ -61,6 +61,7 @@ fn search_is_ranked_then_limited_and_honors_structured_filters() {
     let mut txn = env.begin_rw().unwrap();
     write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
     txn.commit().unwrap();
+    finish_search_index(&env).unwrap();
 
     let txn = env.begin_ro().unwrap();
     let mut hits = Vec::new();
@@ -89,6 +90,7 @@ fn search_ignores_extensions_and_is_unicode_case_insensitive() {
     let mut txn = env.begin_rw().unwrap();
     write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
     txn.commit().unwrap();
+    finish_search_index(&env).unwrap();
 
     let txn = env.begin_ro().unwrap();
     let mut hits = Vec::new();
@@ -114,11 +116,13 @@ fn delete_removes_search_postings_and_missing_index_is_backfilled() {
     write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
     let lev_id = events[0].lev_id;
     txn.commit().unwrap();
+    finish_search_index(&env).unwrap();
 
     let mut txn = env.begin_rw().unwrap();
     txn.clear(env.dbis().event_search.unwrap()).unwrap();
     txn.commit().unwrap();
     env.ensure_initialized().unwrap();
+    assert_eq!(finish_search_index(&env).unwrap(), 1);
 
     let txn = env.begin_ro().unwrap();
     let mut hits = Vec::new();
@@ -164,6 +168,7 @@ fn multiple_search_filters_are_merged_by_quality() {
     let mut txn = env.begin_rw().unwrap();
     write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
     txn.commit().unwrap();
+    finish_search_index(&env).unwrap();
 
     let txn = env.begin_ro().unwrap();
     let mut hits = Vec::new();
@@ -247,6 +252,7 @@ fn compressed_matches_get_the_phrase_boost_through_the_scheduler() {
     let mut txn = env.begin_rw().unwrap();
     write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
     txn.commit().unwrap();
+    finish_search_index(&env).unwrap();
     compress_payloads(&env);
 
     // Every filter's phrase check reads a compressed payload through the
@@ -345,6 +351,7 @@ fn gap_corpus() -> (TempDir, Env) {
     let mut txn = env.begin_rw().unwrap();
     write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
     txn.commit().unwrap();
+    finish_search_index(&env).unwrap();
     (temp, env)
 }
 

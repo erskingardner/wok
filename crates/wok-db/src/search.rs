@@ -16,8 +16,12 @@
 //!   postings, and no event above it has any. A search reads the postings for
 //!   the events at or below it and reads the events above it directly.
 //!
-//! [`build_search_index`] indexes the events above the marker in bounded
-//! steps, in local-id order, and moves the marker past them.
+//! Publishing writes no postings: [`build_search_index`] indexes the events
+//! above the marker in later, bounded steps, in local-id order, and moves the
+//! marker past them. Each step puts a common term's postings for many events
+//! at once, so it rewrites that term's pages once rather than once per
+//! publication. The relay's writer takes the steps; `wok import` and `wok
+//! migrate strfry` finish the index before they exit.
 
 use crate::{DbError, Decompressor, Env, RoTxn, RwTxn};
 use lmdb_sys::{MDB_GET_BOTH, MDB_NODUPDATA, MDB_SET};
@@ -46,6 +50,11 @@ const BUILD_CHUNK: usize = 64;
 pub const SEARCH_BUILD_STEP_EVENTS: usize = 10_000;
 /// How long one build step indexes before it commits.
 pub const SEARCH_BUILD_STEP_BUDGET: Duration = Duration::from_millis(10);
+/// A writer with messages waiting takes a build step only once this many
+/// events are unindexed, so that a step indexes many events at once and
+/// publications wait behind one step per this many events at most. Every
+/// search reads up to this many events directly.
+pub const SEARCH_BUILD_BUSY_LAG: u64 = 1_000;
 
 pub const MAX_SEARCH_QUERY_BYTES: usize = 1_024;
 pub const MAX_SEARCH_TERMS: usize = 16;
@@ -495,10 +504,6 @@ pub(crate) fn initialize_search_index_state(
     set_indexed_through(txn, lev_id)
 }
 
-pub(crate) fn note_search_indexed_through(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<(), DbError> {
-    set_indexed_through(txn, lev_id)
-}
-
 fn marker(value: Option<&[u8]>) -> Option<u64> {
     Some(u64::from_ne_bytes(value?.try_into().ok()?))
 }
@@ -541,6 +546,17 @@ pub fn search_index_state_ro(txn: &RoTxn<'_>) -> Result<Option<SearchIndexState>
 pub fn search_indexed_through_ro(txn: &RoTxn<'_>) -> Result<u64, DbError> {
     let dbi = search_dbi_ro(txn)?;
     Ok(marker(txn.get(dbi, INDEXED_THROUGH_KEY)?).unwrap_or(0))
+}
+
+/// The marker in this write transaction, or `None` when the database has no
+/// search index.
+pub(crate) fn search_indexed_through_rw(txn: &RwTxn<'_>) -> Result<Option<u64>, DbError> {
+    let Some(dbi) = txn.env().dbis().event_search else {
+        return Ok(None);
+    };
+    Ok(Some(
+        marker(txn.get(dbi, INDEXED_THROUGH_KEY)?).unwrap_or(0),
+    ))
 }
 
 /// Empty the index and restart its marker at 0, so that build steps index
@@ -640,10 +656,9 @@ pub fn build_search_index(
     }))
 }
 
-/// On a writable open, empty an index in another layout, then index every
-/// event above the marker before the environment is used. Progress is
-/// committed in bounded batches so importing a large strfry database does
-/// not require one unbounded write transaction.
+/// On a writable open, empty an index in another layout and restart its
+/// marker at 0. Opening does not build it: the relay's writer does, in the
+/// background, and [`finish_search_index`] does for a bulk load.
 pub(crate) fn ensure_search_index(env: &Env) -> Result<(), DbError> {
     let Some(dbi) = env.dbis().event_search else {
         return Ok(());
@@ -654,13 +669,27 @@ pub(crate) fn ensure_search_index(env: &Env) -> Result<(), DbError> {
         reset_search_index(&mut txn)?;
         txn.commit()?;
     }
+    Ok(())
+}
+
+/// Index every event above the marker, committing every 10,000 events so a
+/// large database needs no unbounded write transaction. For a process that
+/// loaded events in bulk with no relay running: `wok import` and `wok migrate
+/// strfry`. Returns the events indexed.
+pub fn finish_search_index(env: &Env) -> Result<u64, DbError> {
+    let mut events = 0;
     loop {
         let mut txn = env.begin_rw()?;
         let step = build_search_index(&mut txn, BACKFILL_BATCH_SIZE, Duration::MAX)?;
         txn.commit()?;
         match step {
-            Some(step) if step.state.lag() > 0 => {}
-            _ => return Ok(()),
+            Some(step) => {
+                events += step.events;
+                if step.state.lag() == 0 {
+                    return Ok(events);
+                }
+            }
+            None => return Ok(events),
         }
     }
 }
@@ -804,6 +833,7 @@ mod tests {
             txn.commit().unwrap();
         }
         let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+        assert_eq!(finish_search_index(&env).unwrap(), 2);
         let txn = env.begin_ro().unwrap();
         assert_eq!(search_posting_count(&txn, "mined").unwrap(), 2);
         let report = crate::check_integrity(&txn).unwrap();
@@ -952,7 +982,7 @@ mod tests {
         txn.del(dbi, SEARCH_SCHEMA_KEY, None).unwrap();
         txn.put(dbi, SEARCH_SCHEMA_KEY, &sentinel_schema.to_ne_bytes(), 0)
             .unwrap();
-        note_search_indexed_through(&mut txn, 42).unwrap();
+        set_indexed_through(&mut txn, 42).unwrap();
         txn.commit().unwrap();
 
         let txn = env.begin_ro().unwrap();
@@ -993,6 +1023,7 @@ mod tests {
             crate::write_events(&mut txn, &mut crate::NoopNegentropy, &mut events, false).unwrap();
             txn.commit().unwrap();
         }
+        finish_search_index(&env).unwrap();
         (dir, env)
     }
 
@@ -1032,6 +1063,35 @@ mod tests {
     fn assert_consistent(env: &Env) {
         let report = crate::check_integrity(&env.begin_ro().unwrap()).unwrap();
         assert!(report.ok(), "{:#?}", report.issues);
+    }
+
+    #[test]
+    fn publishing_leaves_postings_to_build_steps() {
+        let (_dir, env) = notes(&["one alpha"]);
+        let mut events = [note(200, "two alpha"), note(201, "three alpha")];
+        let mut txn = env.begin_rw().unwrap();
+        crate::write_events(&mut txn, &mut crate::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(search_posting_count(&txn, "alpha").unwrap(), 1);
+        let state = search_index_state_ro(&txn).unwrap().unwrap();
+        assert_eq!((state.indexed_through, state.lag()), (1, 2));
+        drop(txn);
+        assert_consistent(&env);
+
+        // Deleting an event above the marker has no postings to remove, and
+        // the build passes over it.
+        let mut txn = env.begin_rw().unwrap();
+        assert!(crate::delete_event_basic(&mut txn, 3).unwrap());
+        txn.commit().unwrap();
+        assert_eq!(finish_search_index(&env).unwrap(), 1);
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(search_posting_count(&txn, "alpha").unwrap(), 2);
+        let state = search_index_state_ro(&txn).unwrap().unwrap();
+        assert_eq!((state.indexed_through, state.lag()), (3, 0));
+        drop(txn);
+        assert_eq!(finish_search_index(&env).unwrap(), 0);
+        assert_consistent(&env);
     }
 
     #[test]

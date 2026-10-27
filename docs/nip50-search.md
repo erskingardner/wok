@@ -7,8 +7,8 @@ match.
 
 `relay.search_enabled = false` turns search off: NIP-11 stops listing NIP-50,
 and a REQ, COUNT or NEG-OPEN with a `search` filter is refused with
-`blocked:` before its query is parsed. The index below is kept current either
-way; see [Search](config.md#search).
+`blocked:` before its query is parsed. While search is off, the index below
+is not built; see [Search](config.md#search).
 
 ## What is searched
 
@@ -89,9 +89,10 @@ the search index and therefore do not appear in search results.
 
 The rebuildable `wok_Event__search` LMDB DBI stores the first 256 unique
 normalized terms of each event's searched text, mapped to local event ids.
-An event of a kind that is not searched writes no postings. It is
-maintained in the same write transaction as Event, EventPayload,
-replacement, and deletion changes. Queries count postings, start with the
+An event of a kind that is not searched writes no postings. Publishing
+writes none either: the relay's writer indexes stored events in later
+transactions of their own, and deleting an indexed event removes its
+postings with it. Queries count postings, start with the
 rarest term, intersect remaining terms with exact LMDB lookups, and retain
 only the best `limit` candidates in a bounded heap. For a query of two or
 more words, each match's searched text is read once to find which adjacent
@@ -105,9 +106,22 @@ terms as a live subscription does, so its results are complete while the
 index lags. A term's rarity, which ranks the matches of filters searched
 together, counts only the indexed events.
 
-Existing Wok databases and migrated strfry v3 snapshots are backfilled in
-10,000-event transactions on first open. An event with no payload, or one that
-does not decode, is left out; `wok doctor` reports it. A versioned marker makes
+The writer indexes the events above the marker in steps of up to 10,000
+events and 10 ms of indexing, each committed on its own: whenever no
+publication has reached it for 20 ms, and before each batch of publications
+while 1,000 or more events wait. A step puts each term's postings for many
+events at once, so a common term's pages are written once per step rather
+than once per publication. With search off, nothing is indexed. While more
+than 100,000 events wait, as after search is turned back on or after an
+index-format change, a REQ, COUNT or NEG-OPEN with a `search` filter is
+refused with `error: search index is building`, and NIP-11 omits NIP-50,
+until the build catches up. `wok_search_index_lag_events` reports the events
+waiting; see [Observability](observability.md).
+
+`wok import` and `wok migrate strfry` index every event before they exit, in
+10,000-event transactions; an import into a database a relay has open leaves
+the rest to its writer. An event with no payload, or one that does not
+decode, is left out; `wok doctor` reports it. A versioned marker makes
 index-format changes rebuild automatically. `wok doctor` expects postings for
 the events at or below the marker only, and verifies missing, dangling, and
 semantically incorrect search postings, while `wok reindex` derives the search

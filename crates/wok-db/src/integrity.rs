@@ -1155,6 +1155,7 @@ mod tests {
         let mut txn = env.begin_rw().unwrap();
         write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
         txn.commit().unwrap();
+        crate::finish_search_index(&env).unwrap();
 
         let lev = |i: usize| events[i].lev_id.to_ne_bytes();
         let search = env.dbis().event_search.unwrap();

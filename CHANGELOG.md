@@ -1092,6 +1092,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wok upload` exits nonzero unless the relay acknowledged every event it
+  sent and refused none (#252). It counted any message that contained `"OK"`
+  as an acknowledgment, `OK false` and a NOTICE included, and exited 0 when
+  the connection dropped, so a relay that refused events, or rate-limited and
+  disconnected partway through the input, left the operator believing the
+  data was copied. It now matches each OK to an event it sent by id, logs
+  each refusal with its reason, and prints a summary line on stderr like
+  `wok sync`'s. It exits nonzero when the relay refused an event, or the
+  connection closed with acknowledgments outstanding or input left unsent.
+  A refusal because the relay stores a newer version counts as
+  `superseded`, as in `wok sync`, and is not a failure. **A line that is not
+  event JSON is no longer sent**: it is logged and the command exits
+  nonzero, as `wok import` does. **`--pipeline 0`**, which sent nothing and
+  exited 0, **is refused**.
 - permessage-deflate is negotiated as RFC 7692 §7 says (#246). The relay
   answered plain `permessage-deflate` to any offer and kept its compression
   context between messages, so a client that offered

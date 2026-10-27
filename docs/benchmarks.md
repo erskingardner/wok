@@ -1020,8 +1020,9 @@ CI runs small versions of both scenarios as unit tests (`live::tests`). The
 
 This Wok-only scenario measures the CPU each message costs on the publish
 and delivery paths, in process on one thread, so it measures the code
-compiled into this `wok-bench` build. For every corpus event (`--corpus`,
-or one generated from `--events` and `--event-mix`) it times:
+compiled into this `wok-bench` build, and a trial records this binary's
+hash. For every corpus event (`--corpus`, or one generated from `--events`
+and any `--event-mix`, `social` included) it times:
 
 - **ws decode:** the client's masked `["EVENT", …]` frame through a
   connection's `WsParser`;

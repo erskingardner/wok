@@ -47,6 +47,11 @@ const READ_SCENARIOS: [&str; 3] = [
     "deep_history_pagination",
     "mixed_read_write",
 ];
+/// Scenarios that run code compiled into this binary rather than a relay, so
+/// a trial records this binary's hash.
+const IN_PROCESS_SCENARIOS: [&str; 2] = ["monitor_index", "codec_cpu"];
+/// In-process scenarios that read the corpus as it is, of any event mix.
+const ANY_MIX_SCENARIOS: [&str; 1] = ["codec_cpu"];
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -596,18 +601,7 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--event-mix lifecycle is only valid for live publication scenarios");
     }
-    // Only the read scenarios check a social corpus's import against what a
-    // relay keeps of it.
-    if args.event_mix == EventMix::Social
-        && !args.generate_corpus_only
-        && scenarios
-            .iter()
-            .any(|scenario| !READ_SCENARIOS.contains(scenario))
-    {
-        anyhow::bail!(
-            "--event-mix social runs only ws_query_latency, deep_history_pagination and mixed_read_write, or --generate-corpus-only"
-        );
-    }
+    check_social_mix(&args, &scenarios)?;
 
     let default_event_count = if args.profile == "smoke" {
         2_000
@@ -838,8 +832,7 @@ fn run_trial(
     let mut catchup_report = None;
     let mut codec_report = None;
 
-    let bin = if args.has_external_target() || matches!(scenario, "monitor_index" | "codec_cpu") {
-        // monitor_index and codec_cpu run the code compiled into this binary.
+    let bin = if args.has_external_target() || IN_PROCESS_SCENARIOS.contains(&scenario) {
         None
     } else if relay == "wok" {
         Some(args.wok.as_path())
@@ -1340,11 +1333,38 @@ fn run_trial(
         event_mix: args.event_mix,
         base_timestamp,
         corpus_sha256: corpus_sha256.into(),
-        binary_sha256: bin
-            .and_then(|path| sha256_file(path).ok())
-            .unwrap_or_default(),
+        binary_sha256: measured_binary_sha256(bin, scenario),
         profile: args.profile.clone(),
     })
+}
+
+/// The hash of what a trial measured: the relay binary it started, or this
+/// `wok-bench` for an in-process scenario.
+fn measured_binary_sha256(bin: Option<&Path>, scenario: &str) -> String {
+    let path = match bin {
+        Some(path) => Some(path.to_path_buf()),
+        None if IN_PROCESS_SCENARIOS.contains(&scenario) => std::env::current_exe().ok(),
+        None => None,
+    };
+    path.and_then(|path| sha256_file(&path).ok())
+        .unwrap_or_default()
+}
+
+/// Only the read scenarios check a social corpus's import against what a
+/// relay keeps of it; the any-mix scenarios read its events as they are.
+fn check_social_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
+    if args.event_mix == EventMix::Social
+        && !args.generate_corpus_only
+        && scenarios.iter().any(|scenario| {
+            !READ_SCENARIOS.contains(scenario) && !ANY_MIX_SCENARIOS.contains(scenario)
+        })
+    {
+        anyhow::bail!(
+            "--event-mix social runs only ws_query_latency, deep_history_pagination, mixed_read_write and {}, or --generate-corpus-only",
+            ANY_MIX_SCENARIOS.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn failed_trial(
@@ -3942,6 +3962,31 @@ mod tests {
         let opts = author_kinds_options(&args).unwrap();
         assert!(opts.dataset_dir.is_absolute());
         assert!(opts.dataset_dir.ends_with("bench-results/datasets"));
+    }
+
+    #[test]
+    fn a_social_corpus_runs_the_read_and_any_mix_scenarios_only() {
+        let social = |scenario: &str| {
+            let args = Args::try_parse_from([
+                "wok-bench",
+                "--scenario",
+                scenario,
+                "--event-mix",
+                "social",
+            ])
+            .unwrap();
+            check_social_mix(&args, &[scenario])
+        };
+        assert!(social("codec_cpu").is_ok());
+        assert!(social("ws_query_latency").is_ok());
+        assert!(social("ws_publish_1conn").is_err());
+    }
+
+    #[test]
+    fn in_process_trials_record_this_binary() {
+        let this = sha256_file(&std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(measured_binary_sha256(None, "codec_cpu"), this);
+        assert_eq!(measured_binary_sha256(None, "ws_publish_1conn"), "");
     }
 
     #[test]

@@ -35,7 +35,7 @@ async fn reach_startup() {
     let (_, cfg) = profile();
     let relay = Relay::start(cfg.clone()).await;
     let _unix = unix_listener(&relay, &cfg, my_uid()).await;
-    stop(relay).await;
+    stop(relay, &cfg).await;
 }
 
 /// Everything a client that never authenticates can send.
@@ -56,7 +56,7 @@ async fn reach_anonymous() {
         let mut rest = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
     }
-    stop(relay).await;
+    stop(relay, &cfg).await;
 }
 
 /// A client that authenticates, then sends what AUTH unlocks.
@@ -118,7 +118,7 @@ async fn reach_authenticated() {
         .await;
     until_end(&mut wire, "neg").await;
     wire.close().await;
-    stop(relay).await;
+    stop(relay, &cfg).await;
 }
 
 /// An admin of the `gated` profile, using the dashboard API and NIP-86.
@@ -208,7 +208,7 @@ async fn reach_admin() {
     // which it checks every 100 ms. The probe cannot see the watcher, so it
     // gives it ten checks before stopping the relay.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    stop(relay).await;
+    stop(relay, &cfg).await;
 }
 
 /// A local peer the Unix socket admits, sending what an anonymous client
@@ -224,7 +224,7 @@ async fn reach_local() {
         anonymous_messages(&mut conn, &cfg).await;
         conn.close().await;
     }
-    stop(relay).await;
+    stop(relay, &cfg).await;
 }
 
 /// Every client message, valid and not, from a connection that never
@@ -594,15 +594,28 @@ async fn unix_listener(
 /// `Close` races the ingester's `Stop`: the workers drain their queues before
 /// they exit, but get the connection's `Close` only if it reached the
 /// ingester first. The gauge drops once `Close` is queued.
-async fn stop(relay: Relay) {
+///
+/// With search on, it also waits for the writer to index the phase's events
+/// for search, which it does once idle, and to store nothing more for
+/// 100 ms, so that build runs in this phase on every run too.
+async fn stop(relay: Relay, cfg: &wok_relay::Config) {
     let metrics = relay.handle.metrics.clone();
+    // Read from the profile: a relay function called here would count as
+    // startup, and so leave every phase's list.
+    let searchable = cfg.relay.search_enabled;
+    let (mut written, mut quiet) = (u64::MAX, 0);
     for _ in 0..500 {
-        if metrics.active_connections.load(Ordering::Relaxed) == 0 {
+        let now = metrics.written_events_total.load(Ordering::Relaxed);
+        quiet = if now == written { quiet + 1 } else { 0 };
+        written = now;
+        let indexed = !searchable
+            || (quiet >= 10 && metrics.search_index_lag_events.load(Ordering::Relaxed) == 0);
+        if metrics.active_connections.load(Ordering::Relaxed) == 0 && indexed {
             return relay.stop().await;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the relay still holds a connection 5 s after the probe closed its last");
+    panic!("the relay still holds a connection, or unindexed events, 5 s after the probe closed its last");
 }
 
 /// The probe's own user ID, read from a file it creates.

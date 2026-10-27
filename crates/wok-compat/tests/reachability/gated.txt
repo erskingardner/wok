@@ -474,11 +474,12 @@ wok_ws::upgrade_ws::{closure}::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 303
+## authenticated: 308
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
 <wok_db::payload::Decompressor>::decode
+<wok_db::search::Tag>::name_and_value
 <wok_db::txn::RoTxn as wok_db::moderation::ReadOps>::get_record
 <wok_db::txn::RoTxn as wok_db::moderation::ReadOps>::moderation_dbi
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
@@ -704,10 +705,14 @@ wok_db::moderation::banned_pubkey_reason_ro::<wok_db::txn::RoTxn>
 wok_db::moderation::get_reason::<wok_db::txn::RoTxn>
 wok_db::moderation::moderation_reason_ro
 wok_db::moderation::pubkey_roles_ro::<wok_db::txn::RoTxn>
-wok_db::payload::parse_payload
+wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>
+wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>::{closure}
+wok_db::search::indexed_terms::{closure}
+wok_db::search::parse_event::<wok_db::search::EventText>
+wok_db::search::search_index_entries::{closure}
+wok_db::search::term_key
 wok_db::state::author_count
 wok_db::state::change_replacement_count
-wok_db::tag_kind::high_water::{closure}
 wok_db::tag_kind::tag_kind_index_complete_ro
 wok_db::tag_kind::tag_kind_index_complete_ro::{closure}
 wok_db::tag_kind::tag_kind_key

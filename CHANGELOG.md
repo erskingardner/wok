@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so such a socket gives each local user a channel that only proof of work,
   the storage quotas and the per-author EVENT budget limit, and an
   unauthenticated connection starts that budget afresh with each new key.
+  NIP-62 vanish requests skip proof of work and the quotas (#248), so the
+  disk reserve is what bounds a peer that signs one with each new key.
   docs/production-deployment.md now says what a write-policy plugin's
   request carries: `authed` is present only for NIP-70 protected events and
   owner-only kinds, so a plugin cannot use it to tell who is logged in, and
@@ -279,12 +281,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLI's outbound `wss://` and HTTPS clients (mesh, router, upload/download,
   NIP-11 fetches) and the benchmark harness; the relay listener does not
   terminate TLS.
-- NIP-62 vanish requests (kind 62) now pay NIP-13 proof of work and the
-  per-author EVENT budget like any other event. Before, a validly signed vanish
-  request skipped both and only the per-address budget limited them. They
-  still bypass the write-policy plugin, now documented: NIP-62 requires relays
-  that restrict who can post to honor vanish regardless of the user's status
-  (#48).
+- NIP-62 vanish requests (kind 62) now pay the per-author EVENT budget like
+  any other event. Before, a validly signed vanish request skipped it and only
+  the per-address budget limited them. They still bypass the write-policy
+  plugin and NIP-13 proof of work, now documented: NIP-62 requires relays that
+  restrict who can post to honor vanish regardless of the user's status
+  (#48, #248).
+- A NIP-62 vanish request that targets the relay is now stored when the
+  relay is at its global storage quota (`relay.abuse.max_stored_events`), and
+  its author's events are then deleted (#248). Before, the request was
+  refused with the rest of its writer batch, so nobody could vanish from a
+  full relay, though NIP-62 says a relay MUST honor the request. The quota no
+  longer counts a batch's vanish requests: when the rest of the batch is over
+  it, they are written on their own and everything else is refused as
+  before. On a full relay, or one that requires proof of work, anyone can
+  therefore store a vanish request with each fresh key. The per-address
+  EVENT budget (which a Unix connection skips), the per-author EVENT budget
+  and the disk reserve (`database.min_free_disk_bytes`) bound them, and the
+  NIP-86 kind policy,
+  event-id bans, blocked addresses and `relay.nip62.enabled` still refuse
+  them (see docs/attack-surface.md).
 - NIP-62 vanish requests are now honored from banned authors and, with
   `relay.auth.restrict_writes`, from pubkeys not on the write allowlist. Before,
   both were refused, so an author who lost write access could not erase what
@@ -1099,6 +1115,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `#d` filter for the empty string matches only events with a `d` tag of
+  that value, and addressable events without a `d` tag, whose address it is
+  (#245). Packing adds an empty `d` to every replaceable and addressable
+  event, so that the first `d` sets the address and a missing one means the
+  empty string, and filters matched it: `{"kinds":[30023],"authors":[pk],
+  "#d":[""],"limit":1}`, which resolves an `naddr` with an empty
+  identifier, returned pk's newest article whatever its `d`, a live
+  subscription to it got each new one, and `{"kinds":[10002],"#d":[""]}`
+  matched every relay list. REQ, live subscriptions, COUNT, NIP-77 and
+  NIP-91 `&d` now leave the added tag out. The tag indexes still hold it,
+  so a filter for the empty `d` reads each candidate event instead of
+  answering from the index alone. **Clients that relied on `#d:[""]`
+  selecting every replaceable or addressable event get fewer events.** A
+  persistent negentropy tree whose filter selects the empty `d` still holds
+  the events the old matching put there: `wok doctor` reports it, and
+  `wok reindex --confirm-relay-stopped` rebuilds it. A tag with no value,
+  such as `["t"]`, is still packed and matched as `["t",""]`, and kind 41
+  history that earlier releases packed as replaceable keeps its added `d`.
+- `wok upload` exits nonzero unless the relay acknowledged every event it
+  sent and refused none (#252). It counted any message that contained `"OK"`
+  as an acknowledgment, `OK false` and a NOTICE included, and exited 0 when
+  the connection dropped, so a relay that refused events, or rate-limited and
+  disconnected partway through the input, left the operator believing the
+  data was copied. It now matches each OK to an event it sent by id, logs
+  each refusal with its reason, and prints a summary line on stderr like
+  `wok sync`'s. It exits nonzero when the relay refused an event, or the
+  connection closed with acknowledgments outstanding or input left unsent.
+  A refusal because the relay stores a newer version counts as
+  `superseded`, as in `wok sync`, and is not a failure. **A line that is not
+  event JSON is no longer sent**: it is logged and the command exits
+  nonzero, as `wok import` does. **`--pipeline 0`**, which sent nothing and
+  exited 0, **is refused**.
+- `wok scan` and `wok scan --count` read the whole database (#256). They
+  clamped a filter to `relay.max_filter_limit`, which bounds client REQs, so
+  at the default of 2000 `wok scan --count '{"kinds":[1]}'` printed 2000 on
+  a database holding millions of notes, and `wok scan '{}'` stopped after
+  2000 events without saying so. strfry's `scan` has no such cap, nor do
+  `wok delete` and `wok dict`; a `limit` in the filter still applies.
+  Operator scans (`wok scan`, `wok delete`, `wok dict`) now hand each event
+  over as they find it, not once the scan is done, and remember only what a
+  filter cut by its `limit`, or a `search`, sent: counting every event takes
+  memory for the events sharing one `created_at`, not for every match. A
+  `search` filter whose rarest term has more than 4,096 postings returned
+  nothing to them; it now runs to the end.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

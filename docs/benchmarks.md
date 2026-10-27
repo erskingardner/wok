@@ -1371,8 +1371,10 @@ mean events per commit and the queue it found, its mean milliseconds per
 commit in each stage (prepare, write, commit, reply), and the bytes its
 commits sent to storage per stored event. These come from the writer's
 cumulative histograms, so a step's batches show apart from the load before
-it. A scrape that fails leaves that phase out; strfry's summary is only its
-header.
+it. A start is scraped before its I/O mark and an end after, so a slow scrape
+never lengthens the phase's seconds. A phase is left out when a scrape fails
+or a snapshot lacks the writer's series, as strfry's and those of Wok before
+#258 do.
 
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`

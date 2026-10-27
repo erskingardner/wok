@@ -241,9 +241,14 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         io.write_text('read_bytes: 0\nwrite_bytes: 0\n')
         scrape = self.prefix/'metrics.prom'
 
-        def mark(label, commits, events, commit_seconds, stored_bytes):
+        scraped_at = self.prefix/'scraped-at'
+
+        def mark(label, commits, events=0, seconds=0.0, stored_bytes=0):
             if commits is None:
                 scrape.unlink(missing_ok=True)
+            elif commits == 'old':
+                # Wok before #258 serves metrics without the writer's series.
+                scrape.write_text('wok_connections 3\n')
             else:
                 scrape.write_text(
                     '# HELP wok_writer_commit_events Events each writer commit stored\n'
@@ -252,23 +257,34 @@ METRICS_URL=http://10.0.0.2:7777/metrics
                     f'wok_writer_commit_events_count {commits}\n'
                     f'wok_writer_queue_depth_sum {2 * events}\n'
                     f'wok_writer_queue_depth_count {commits}\n'
-                    f'wok_writer_commit_seconds_sum {commit_seconds}\n'
-                    f'wok_writer_commit_seconds_count {commits}\n'
+                    f'wok_writer_prepare_seconds_sum {seconds / 10}\n'
+                    f'wok_writer_write_seconds_sum {seconds / 2}\n'
+                    f'wok_writer_commit_seconds_sum {seconds}\n'
+                    f'wok_writer_reply_seconds_sum {seconds / 5}\n'
                     f'wok_writer_storage_bytes_total {stored_bytes}\n'
                     'wok_connections 3\n')
-            # A scrape that fails leaves no snapshot, like curl --fail.
-            return self.control(f'curl() {{ cat "{scrape}"; }}; io_mark wok "$1" "$2"',
-                                str(artifacts), label)
+            # A scrape that fails leaves no snapshot, like curl --fail. Each
+            # records how many marks were written when it ran.
+            return self.control(
+                f'curl() {{ wc -l <"{artifacts}/io-marks.tsv" >>"{scraped_at}" 2>/dev/null'
+                f' || echo 0 >>"{scraped_at}"; cat "{scrape}"; }}; io_mark wok "$1" "$2"',
+                str(artifacts), label)
 
         for label, *metrics in [('query-start', 10, 100, 0.5, 1000),
                                 ('query-end', 10, 100, 0.5, 1000),
                                 ('rate-1000-start', 10, 100, 0.5, 1000),
                                 ('rate-1000-end', 30, 2100, 1.5, 401000),
-                                ('rate-2000-start', None, 0, 0, 0),
-                                ('rate-2000-end', 40, 4100, 2.0, 801000)]:
+                                ('rate-2000-start', None),
+                                ('rate-2000-end', 40, 4100, 2.0, 801000),
+                                ('rate-3000-start', 'old'),
+                                ('rate-3000-end', 50, 5100, 2.5, 901000)]:
             result = mark(label, *metrics)
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((artifacts/'metrics-marks/rate-2000-start.prom').exists())
+        # A start is scraped before its mark and an end after, so the scrape
+        # is outside the interval io-phases.tsv times.
+        self.assertEqual([int(n) for n in scraped_at.read_text().split()],
+                         [0, 2, 2, 4, 4, 6, 6, 8])
 
         result = self.control('writer_phases "$1"', str(artifacts))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -277,11 +293,12 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         self.assertEqual(rows[0], ['phase', 'commits', 'events', 'events_per_commit',
                                    'queue_depth', 'prepare_ms', 'write_ms', 'commit_ms',
                                    'reply_ms', 'storage_bytes_per_event'])
-        # No commits, no means. A phase missing a snapshot is left out.
+        # No commits, no means. A phase missing a snapshot, or the writer's
+        # series in one, is left out.
         self.assertEqual(rows[1:], [
             ['query', '0', '0', '', '', '', '', '', '', ''],
-            ['rate-1000', '20', '2000', '100.00', '200.00', '0.00', '0.00', '50.00',
-             '0.00', '200'],
+            ['rate-1000', '20', '2000', '100.00', '200.00', '5.00', '25.00', '50.00',
+             '10.00', '200'],
         ])
 
         # Without METRICS_URL, as for strfry, marks keep no snapshots and the
@@ -750,10 +767,14 @@ class CampaignSettings(unittest.TestCase):
                 line = next(line for line in sent if f'control {command} ' in line)
                 self.assertIn('--nofile 1048576', line)
             # An earlier run's I/O summary is gone before this run starts.
+            start = next(i for i, line in enumerate(sent) if 'control start ' in line)
             clear = sent.index('root@load rm -f -- /l/runs/r1-strfry-1.1.3/server/io-phases.tsv'
                                ' /l/runs/r1-strfry-1.1.3/server/writer-phases.tsv')
-            self.assertLess(clear, next(i for i, line in enumerate(sent)
-                                        if 'control start ' in line))
+            self.assertLess(clear, start)
+            # And its metrics snapshots, which the copy back would only add to.
+            snapshots = sent.index(
+                'root@load rm -rf -- /l/runs/r1-strfry-1.1.3/server/metrics-marks')
+            self.assertLess(snapshots, start)
 
     def test_rejects_incomplete_or_invalid_settings(self):
         cases = {

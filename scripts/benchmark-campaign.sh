@@ -399,6 +399,9 @@ run_target() {
     # campaign ID whose collect fails must leave every phase's bytes out.
     remote_command "$LOAD_SSH" rm -f -- "$run_root/server/io-phases.tsv" \
         "$run_root/server/writer-phases.tsv"
+    # Its metrics snapshots too: the copy back overwrites files and keeps the
+    # rest, so an earlier run's could pair with this run's.
+    remote_command "$LOAD_SSH" rm -rf -- "$run_root/server/metrics-marks"
     RATE_LAUNCHED=()
     PHASES_LAUNCHED=()
 

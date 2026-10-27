@@ -630,6 +630,115 @@ async fn download_prints_only_events_that_verify_unless_told_not_to() {
     task.await.unwrap();
 }
 
+/// A relay that answers the first REQ with `frames`, then holds the
+/// connection open, pinging, until the client leaves.
+async fn holding_peer(frames: Vec<Message>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if message
+                .to_text()
+                .is_ok_and(|text| text.starts_with(r#"["REQ""#))
+            {
+                break;
+            }
+        }
+        for frame in frames {
+            let _ = ws.send(frame).await;
+        }
+        let mut ping = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            let open = tokio::select! {
+                message = ws.next() => matches!(message, Some(Ok(_))),
+                _ = ping.tick() => ws.send(Message::Ping(b"ping".to_vec().into())).await.is_ok(),
+            };
+            if !open {
+                break;
+            }
+        }
+    });
+    (url, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn download_ends_when_the_relay_refuses_or_stalls_the_req() {
+    // #251: download waited for EOSE or a Close frame, so a relay that
+    // refused the REQ but kept the socket open held it forever.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), "");
+    let good = event(1);
+    let text = |value: Value| Message::Text(value.to_string().into());
+    // Long enough that only the refusal itself can end these runs in time.
+    let patient = ["--timeout", "120"];
+    let download = |url: &str, extra: &[&str]| {
+        let started = std::time::Instant::now();
+        let output = cli(&cfg, &[&["download", url][..], extra].concat());
+        (output, started.elapsed())
+    };
+
+    let (url, task) = holding_peer(vec![
+        text(json!(["EVENT", "_", good])),
+        text(json!(["CLOSED", "_", "auth-required: sign in first"])),
+    ])
+    .await;
+    let (output, elapsed) = download(&url, &patient);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?} {stderr}");
+    assert_eq!(printed_events(&output), vec![good.clone()], "{stderr}");
+    assert!(stderr.contains("auth-required: sign in first"), "{stderr}");
+    assert!(stderr.contains("1 printed, 0 rejected"), "{stderr}");
+    task.await.unwrap();
+
+    // strfry and Wok refuse a REQ they cannot parse with a NOTICE.
+    let (url, task) = holding_peer(vec![text(json!([
+        "NOTICE",
+        "ERROR: bad msg: invalid filter"
+    ]))])
+    .await;
+    let (output, elapsed) = download(&url, &patient);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?} {stderr}");
+    assert!(stderr.contains("bad msg: invalid filter"), "{stderr}");
+    task.await.unwrap();
+
+    // A greeting, a CLOSED for another subscription, and a NOTICE once events
+    // flow are logged, not fatal.
+    let (url, task) = holding_peer(vec![
+        text(json!(["NOTICE", "welcome"])),
+        text(json!(["CLOSED", "other", "error: not yours"])),
+        text(json!(["EVENT", "_", good])),
+        text(json!(["NOTICE", "error: slow down"])),
+        text(json!(["EOSE", "_"])),
+    ])
+    .await;
+    let (output, _) = download(&url, &patient);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(printed_events(&output), vec![good.clone()], "{stderr}");
+    assert!(
+        stderr.contains("welcome") && stderr.contains("slow down"),
+        "{stderr}"
+    );
+    task.await.unwrap();
+
+    // A relay that stops short of EOSE times out, though it keeps pinging.
+    let (url, task) = holding_peer(vec![text(json!(["EVENT", "_", good]))]).await;
+    let (output, elapsed) = download(&url, &["--timeout", "2"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?} {stderr}");
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?} {stderr}");
+    assert_eq!(printed_events(&output), vec![good], "{stderr}");
+    assert!(stderr.contains("no event or EOSE for 2s"), "{stderr}");
+    assert!(stderr.contains("1 printed, 0 rejected"), "{stderr}");
+    task.await.unwrap();
+}
+
 struct KillOnDrop(std::process::Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -1124,6 +1233,159 @@ async fn expired_ephemeral_events_are_reported_without_failing_sync() {
             "expired"
         };
         assert_eq!(report[counter], 1, "{direction}: {report}");
+    }
+}
+
+fn tagged(values: &[&str]) -> Value {
+    let tags: Vec<_> = values.iter().map(|value| json!(["t", value])).collect();
+    sign(
+        json!({"kind":1,"created_at":now(),"tags":tags,"content":"sync"}),
+        &key(),
+    )
+}
+
+/// A peer without NIP-91 reconciles the `#t` compatibility filter of an `&t`
+/// filter. Events tagged only `t=a`, on either side, match that superset but
+/// not the AND filter: they are neither differences, transfers nor failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn and_filters_against_a_peer_without_nip91_narrow_both_directions() {
+    let auth = "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n";
+    // Direction, have, need, written and uploaded of one run.
+    type Run = (&'static str, u64, u64, u64, u64);
+    let scenarios: [&[Run]; 2] = [
+        &[("both", 1, 1, 1, 1)],
+        &[("down", 1, 1, 1, 0), ("up", 1, 0, 0, 1)],
+    ];
+    for runs in scenarios {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let lc = config(local.path(), auth);
+        // A zero AND budget turns NIP-91 off and out of supported_nips.
+        let rc = config(
+            remote.path(),
+            &format!("[relay]\nmax_and_entries=0\n{auth}"),
+        );
+        let (local_ab, local_a) = (tagged(&["a", "b"]), tagged(&["a"]));
+        let (remote_ab, remote_a) = (tagged(&["a", "b"]), tagged(&["a"]));
+        import(&lc, &[local_ab.clone(), local_a.clone()]);
+        import(&rc, &[remote_ab.clone(), remote_a.clone()]);
+        let server = serve(&rc).await;
+        let and_sync = |args: &[&str]| {
+            let mut all = vec!["--filter", r#"{"&t":["a","b"]}"#];
+            all.extend_from_slice(args);
+            sync(&lc, &server.url, &all)
+        };
+        let missing = |output: Output| {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let pair = |have: &Value, need: &Value| {
+            std::collections::BTreeSet::from([
+                format!("have,{}", have["id"].as_str().unwrap()),
+                format!("need,{}", need["id"].as_str().unwrap()),
+            ])
+        };
+
+        assert_eq!(
+            missing(and_sync(&["--print-missing"])),
+            pair(&local_ab, &remote_ab)
+        );
+        let output = and_sync(&["--check", "--json"]);
+        let report = summary(&output);
+        assert!(!output.status.success(), "{report}");
+        assert!(report["error"]
+            .as_str()
+            .unwrap()
+            .contains("sync sets differ: have 1 need 1"));
+        assert_eq!(report["narrowed"], 2, "{report}");
+        assert_eq!(report["rejected"], 0, "{report}");
+
+        for &(direction, have, need, written, uploaded) in runs {
+            let output = and_sync(&["--dir", direction, "--json"]);
+            let report = summary(&output);
+            assert!(output.status.success(), "{direction}: {report}");
+            assert_eq!(report["have"], have, "{direction}: {report}");
+            assert_eq!(report["need"], need, "{direction}: {report}");
+            assert_eq!(report["narrowed"], 2, "{direction}: {report}");
+            assert_eq!(report["downloaded"], written, "{direction}: {report}");
+            assert_eq!(report["written"], written, "{direction}: {report}");
+            assert_eq!(report["uploaded"], uploaded, "{direction}: {report}");
+            for outcome in ["rejected", "unavailable", "upload_rejected"] {
+                assert_eq!(report[outcome], 0, "{direction}: {report}");
+            }
+        }
+
+        let output = and_sync(&["--check", "--json"]);
+        let report = summary(&output);
+        assert!(output.status.success(), "{report}");
+        assert_eq!(report["have"], 0, "{report}");
+        assert_eq!(report["need"], 0, "{report}");
+        assert_eq!(report["narrowed"], 2, "{report}");
+        // The events tagged only t=a stayed on their own side.
+        assert_eq!(
+            missing(sync(
+                &lc,
+                &server.url,
+                &["--filter", r##"{"#t":["a"]}"##, "--print-missing"]
+            )),
+            pair(&local_a, &remote_a)
+        );
+    }
+}
+
+/// A peer without NIP-91 can only apply `limit` to the compatibility
+/// superset. Here its newest event is a shared `t=a` one, so both sides
+/// would offer only that and report no differences, though each side's
+/// newest AND match differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limit_on_an_and_filter_is_refused_only_for_a_peer_without_nip91() {
+    let auth = "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n";
+    let older = |key: &Keypair| {
+        sign(
+            json!({"kind":1,"created_at":now() - 10,"tags":[["t","a"],["t","b"]],"content":"sync"}),
+            key,
+        )
+    };
+    let shared = tagged(&["a"]);
+    let (local_ab, remote_ab) = (older(&key()), older(&key()));
+    let local = tempfile::tempdir().unwrap();
+    let lc = config(local.path(), auth);
+    import(&lc, &[shared.clone(), local_ab]);
+    for (nip91, extra) in [(false, "[relay]\nmax_and_entries=0\n"), (true, "")] {
+        let remote = tempfile::tempdir().unwrap();
+        let rc = config(remote.path(), &format!("{extra}{auth}"));
+        import(&rc, &[shared.clone(), remote_ab.clone()]);
+        let server = serve(&rc).await;
+        let output = sync(
+            &lc,
+            &server.url,
+            &[
+                "--filter",
+                r#"{"&t":["a","b"],"limit":1}"#,
+                "--check",
+                "--json",
+            ],
+        );
+        let report = summary(&output);
+        assert!(!output.status.success(), "{report}");
+        let error = report["error"].as_str().unwrap();
+        if nip91 {
+            assert!(
+                error.contains("sync sets differ: have 1 need 1"),
+                "{report}"
+            );
+        } else {
+            assert!(error.contains("remove `limit`"), "{report}");
+            assert_eq!(report["reconciled"], false, "{report}");
+        }
     }
 }
 

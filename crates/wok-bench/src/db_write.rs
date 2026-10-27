@@ -53,6 +53,9 @@ pub struct Options {
     pub dir: PathBuf,
     pub batches: Vec<usize>,
     pub step_events: u64,
+    /// Log every committed write here, for replay on other engines
+    /// (`op-log` feature).
+    pub record_ops: Option<PathBuf>,
 }
 
 #[derive(Serialize, Clone)]
@@ -245,6 +248,9 @@ pub fn run(opts: &Options) -> Result<Report> {
         .with_context(|| format!("create a database under {}", opts.dir.display()))?;
     let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::default())?;
     env.ensure_initialized()?;
+    if let Some(path) = &opts.record_ops {
+        record_ops(path, &env)?;
+    }
     let mut trees = wok_negentropy::NegentropyFilterCache::default();
     let mut lines = std::io::BufReader::new(std::fs::File::open(&opts.corpus)?)
         .lines()
@@ -255,6 +261,7 @@ pub fn run(opts: &Options) -> Result<Report> {
     };
 
     let preloaded = corpus_events - held;
+    phase(&format!("preload {preloaded}"))?;
     let started = Instant::now();
     let mut batch = Vec::with_capacity(PRELOAD_BATCH);
     let mut preload = Outcomes::default();
@@ -279,6 +286,7 @@ pub fn run(opts: &Options) -> Result<Report> {
     let mut steps = Vec::new();
     for (&batch_size, &events) in opts.batches.iter().zip(&sizes) {
         let mut pending = (0..events).map(|_| next()).collect::<Result<Vec<_>>>()?;
+        phase(&format!("step {batch_size} {events}"))?;
         let size_before = std::fs::metadata(&data)?.len();
         let io_before = process_write_bytes();
         let mut txn_us = Vec::new();
@@ -334,6 +342,9 @@ pub fn run(opts: &Options) -> Result<Report> {
         });
         pending.clear();
     }
+    if opts.record_ops.is_some() {
+        finish_ops()?;
+    }
     Ok(Report {
         corpus_events,
         preloaded,
@@ -342,6 +353,36 @@ pub fn run(opts: &Options) -> Result<Report> {
         io_counted,
         steps,
     })
+}
+
+#[cfg(feature = "op-log")]
+fn record_ops(path: &std::path::Path, env: &wok_db::Env) -> Result<()> {
+    wok_db::op_log::start(path, env).with_context(|| format!("create {}", path.display()))
+}
+
+#[cfg(not(feature = "op-log"))]
+fn record_ops(_: &std::path::Path, _: &wok_db::Env) -> Result<()> {
+    anyhow::bail!("--db-record-ops needs wok-bench built with --features op-log")
+}
+
+#[cfg(feature = "op-log")]
+fn phase(label: &str) -> Result<()> {
+    Ok(wok_db::op_log::phase(label)?)
+}
+
+#[cfg(not(feature = "op-log"))]
+fn phase(_: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "op-log")]
+fn finish_ops() -> Result<()> {
+    Ok(wok_db::op_log::finish()?)
+}
+
+#[cfg(not(feature = "op-log"))]
+fn finish_ops() -> Result<()> {
+    Ok(())
 }
 
 fn parse(line: &str) -> Result<wok_db::EventToWrite> {
@@ -457,6 +498,7 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![1, 4],
             step_events: 40,
+            record_ops: None,
         })
         .unwrap();
         assert_eq!(report.corpus_events, 300);
@@ -519,6 +561,7 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![4],
             step_events: 80,
+            record_ops: None,
         })
         .unwrap();
         assert_eq!((report.preloaded, report.preload_stored), (101, 101));
@@ -548,6 +591,7 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![1],
             step_events: 50,
+            record_ops: None,
         })
         .err()
         .unwrap();

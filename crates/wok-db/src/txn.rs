@@ -32,6 +32,9 @@ pub struct RwTxn<'env> {
     /// Set by [`crate::defer_tag_kind_postings`]: the events this
     /// transaction inserts get no `wok_Event__tagKind` postings.
     pub(crate) defer_tag_kind: bool,
+    /// This transaction's writes, for [`crate::op_log`] once it commits.
+    #[cfg(feature = "op-log")]
+    op_log: Vec<u8>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -122,6 +125,8 @@ impl<'env> RwTxn<'env> {
             superseded_events: None,
             author_counts: Default::default(),
             defer_tag_kind: false,
+            #[cfg(feature = "op-log")]
+            op_log: Vec::new(),
             _not_send_or_sync: PhantomData,
         })
     }
@@ -141,7 +146,12 @@ impl<'env> RwTxn<'env> {
         val: &[u8],
         flags: u32,
     ) -> Result<bool, DbError> {
-        put_raw(self.txn, dbi, key, val, flags)
+        let changed = put_raw(self.txn, dbi, key, val, flags)?;
+        #[cfg(feature = "op-log")]
+        if changed && crate::op_log::active() {
+            crate::op_log::put(&mut self.op_log, dbi, flags, key, val);
+        }
+        Ok(changed)
     }
 
     pub fn put_u64(
@@ -155,7 +165,39 @@ impl<'env> RwTxn<'env> {
     }
 
     pub fn del(&mut self, dbi: MDB_dbi, key: &[u8], val: Option<&[u8]>) -> Result<bool, DbError> {
+        #[cfg(feature = "op-log")]
+        if crate::op_log::active() {
+            return self.del_logged(dbi, key, val);
+        }
         del_raw(self.txn, dbi, key, val)
+    }
+
+    /// [`Self::del`], logging each duplicate a whole-key delete removes.
+    #[cfg(feature = "op-log")]
+    fn del_logged(
+        &mut self,
+        dbi: MDB_dbi,
+        key: &[u8],
+        val: Option<&[u8]>,
+    ) -> Result<bool, DbError> {
+        let mut dups = Vec::new();
+        if val.is_none() && dbi_flags(self.txn, dbi)? & MDB_DUPSORT != 0 {
+            let mut cursor = self.cursor(dbi)?;
+            let mut at = cursor.get(Some(key), None, MDB_SET_KEY)?;
+            while let Some((_, dup)) = at {
+                dups.push(dup.to_vec());
+                at = cursor.get(None, None, MDB_NEXT_DUP)?;
+            }
+        }
+        let removed = del_raw(self.txn, dbi, key, val)?;
+        if removed && dups.is_empty() {
+            crate::op_log::del(&mut self.op_log, dbi, key, val);
+        } else if removed {
+            for dup in &dups {
+                crate::op_log::del(&mut self.op_log, dbi, key, Some(dup));
+            }
+        }
+        Ok(removed)
     }
 
     pub fn del_u64(&mut self, dbi: MDB_dbi, key: u64, val: Option<&[u8]>) -> Result<bool, DbError> {
@@ -164,7 +206,12 @@ impl<'env> RwTxn<'env> {
 
     /// Remove every record while retaining the open DBI and its flags.
     pub fn clear(&mut self, dbi: MDB_dbi) -> Result<(), DbError> {
-        check(unsafe { mdb_drop(self.txn, dbi, 0) })
+        check(unsafe { mdb_drop(self.txn, dbi, 0) })?;
+        #[cfg(feature = "op-log")]
+        if crate::op_log::active() {
+            crate::op_log::clear(&mut self.op_log, dbi);
+        }
+        Ok(())
     }
 
     pub fn cursor(&self, dbi: MDB_dbi) -> Result<Cursor<'_>, DbError> {
@@ -214,6 +261,10 @@ impl<'env> RwTxn<'env> {
         #[cfg(test)]
         if result.is_ok() {
             crate::crash_tests::checkpoint("write-after-commit");
+        }
+        #[cfg(feature = "op-log")]
+        if result.is_ok() && crate::op_log::active() {
+            crate::op_log::committed(&self.op_log);
         }
         result
     }

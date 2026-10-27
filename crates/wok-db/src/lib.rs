@@ -18,6 +18,8 @@ pub mod long_tags;
 pub mod lookup;
 pub mod migration;
 pub mod moderation;
+#[cfg(feature = "op-log")]
+pub mod op_log;
 pub mod payload;
 pub mod purge;
 pub mod reindex;

@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Wok LMDB storage and verified strfry v3 migration"
 
+[features]
+# Log every committed write for replay on other engines (#257 item 12).
+op-log = []
+
 [dependencies]
 flatbuffers.workspace = true
 libc.workspace = true

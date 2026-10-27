@@ -10,6 +10,9 @@ description = "Comparative load generation for wok and C++ strfry"
 name = "wok-bench"
 path = "src/main.rs"
 
+[features]
+op-log = ["wok-db/op-log"]
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true

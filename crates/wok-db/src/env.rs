@@ -241,6 +241,15 @@ fn check_lmdb_version((major, minor, patch): (i32, i32, i32)) -> Result<(), DbEr
     )))
 }
 
+#[cfg(feature = "op-log")]
+impl Env {
+    /// Bench-only: turn `MDB_NOMETASYNC` on or off. A commit then skips the
+    /// meta page's sync, so a crash can undo it until the next synced commit.
+    pub fn set_no_meta_sync(&self, on: bool) -> Result<(), DbError> {
+        check(unsafe { mdb_env_set_flags(self.inner.env, MDB_NOMETASYNC, on as libc::c_int) })
+    }
+}
+
 impl Env {
     pub fn open(path: impl AsRef<Path>, opts: EnvOptions) -> Result<Self, DbError> {
         check_lmdb_version(lmdb_version())?;

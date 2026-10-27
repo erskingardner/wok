@@ -320,6 +320,10 @@ struct Args {
     /// the end of the corpus; a step also writes at least 20 transactions.
     #[arg(long, default_value_t = 2_000)]
     db_step_events: u64,
+    /// Log every write --scenario db_write commits to this file, for
+    /// replaying on other storage engines. Needs the `op-log` feature.
+    #[arg(long)]
+    db_record_ops: Option<PathBuf>,
 }
 
 impl Args {
@@ -1306,6 +1310,7 @@ fn run_trial(
             dir: args.dataset_dir.clone(),
             batches: args.db_batches.clone(),
             step_events: args.db_step_events,
+            record_ops: args.db_record_ops.clone(),
         }) {
             Ok(report) => {
                 throughput = report.best_rate();

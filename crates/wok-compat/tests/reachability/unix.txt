@@ -501,10 +501,16 @@ wok_db::payload::encode_raw_payload
 wok_db::payload::parse_payload
 wok_db::search::bounded_index_keys
 wok_db::search::bounded_index_keys::{closure}
+wok_db::search::bounded_search_terms
+wok_db::search::bounded_search_terms::{closure}
 wok_db::search::event_content
-wok_db::search::finish_term
+wok_db::search::for_each_word::<wok_db::search::bounded_search_terms::{closure}>
+wok_db::search::for_each_word::<wok_db::search::bounded_search_terms::{closure}>::{closure}
+wok_db::search::for_each_word::<wok_db::search::normalize_search_terms_with_overflow::{closure}>
+wok_db::search::for_each_word::<wok_db::search::normalize_search_terms_with_overflow::{closure}>::{closure}
 wok_db::search::index_event_search
 wok_db::search::normalize_search_terms_with_overflow
+wok_db::search::normalize_search_terms_with_overflow::{closure}
 wok_db::search::note_search_indexed_through
 wok_db::search::parse_event_content
 wok_db::search::parse_search_query
@@ -704,11 +710,6 @@ wok_ws::dispatch
 wok_ws::dispatch::{closure}
 wok_ws::dispatch::{closure}::{closure}
 wok_ws::empty
-wok_ws::extension::accept
-wok_ws::extension::negotiate::<core::iter::adapters::filter_map::FilterMap<http::header::map::ValueIter<http::header::value::HeaderValue>, wok_ws::upgrade_ws::{closure}::{closure}::{closure}>>
-wok_ws::extension::negotiate::<core::iter::adapters::filter_map::FilterMap<http::header::map::ValueIter<http::header::value::HeaderValue>, wok_ws::upgrade_ws::{closure}::{closure}::{closure}>>::{closure}
-wok_ws::extension::split_unquoted
-wok_ws::extension::split_unquoted::{closure}
 wok_ws::frame::apply_mask
 wok_ws::frame::check_close
 wok_ws::frame::inflate_allowance
@@ -740,7 +741,6 @@ wok_ws::text_status_response
 wok_ws::upgrade_ws
 wok_ws::upgrade_ws::{closure}
 wok_ws::upgrade_ws::{closure}::{closure}
-wok_ws::upgrade_ws::{closure}::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 

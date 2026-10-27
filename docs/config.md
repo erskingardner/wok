@@ -732,6 +732,10 @@ What bounds a sync instead:
   500,000 bytes, then answers the rest of the range with one fingerprint,
   which the client splits in its next message. A message is never refused
   for the number of ranges it holds.
+- Turns. A session answers one NEG-MSG at a time: one the client sent
+  before the reply to its last message closes the session with
+  `invalid: NEG-MSG sent before the reply to ...`, so a connection cannot
+  queue a burst of rounds on a negentropy worker.
 
 With `negentropy_enabled` off, the relay still keeps its negentropy trees
 current as it stores and deletes events. Turning NIP-77 back on, which

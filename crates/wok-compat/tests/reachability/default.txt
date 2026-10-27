@@ -189,10 +189,10 @@
 <wok_query::scan::DbQuery>::new
 <wok_query::scan::DbQuery>::new::{closure}
 <wok_query::scan::DbQuery>::note
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}
+<wok_query::scan::DbQuery>::process_with::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>
+<wok_query::scan::DbQuery>::process_with::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}
+<wok_query::scan::DbQuery>::process_with::<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
+<wok_query::scan::DbQuery>::process_with::<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}
 <wok_query::scan::DbQuery>::sent_count
 <wok_query::scan::DbQuery>::set_visibility
 <wok_query::scan::DbQuery>::track_completeness
@@ -200,8 +200,8 @@
 <wok_query::scan::DbScan>::new
 <wok_query::scan::DbScan>::new_unplanned
 <wok_query::scan::DbScan>::new_unplanned::{closure}
-<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}, <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
-<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}, <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}>
+<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process_with<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}, <wok_query::scan::DbQuery>::process_with<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
+<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process_with<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}, <wok_query::scan::DbQuery>::process_with<<wok_query::scheduler::QueryScheduler>::process_visible<wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}, wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>::{closure}>
 <wok_query::scan::DbScan>::settle
 <wok_query::scan::ScanCursor>::active
 <wok_query::scan::ScanCursor>::collect
@@ -214,7 +214,7 @@
 <wok_query::scan::ScanPlan>::name
 <wok_query::scan::SearchGroupScan>::new
 <wok_query::scan::SearchGroupScan>::new::{closure}
-<wok_query::scan::SearchGroupScan>::process::<<wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
+<wok_query::scan::SearchGroupScan>::process::<<wok_query::scan::DbQuery>::process_with<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
 <wok_query::scan::SearchScan>::base_score
 <wok_query::scan::SearchScan>::gather
 <wok_query::scan::SearchScan>::gather::{closure}

@@ -713,6 +713,52 @@ mod tests {
     }
 
     #[test]
+    fn keeps_moderation_records() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("db");
+        let env = Env::open(&database, EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let (packed, json) = signed_event();
+        let mut events = [EventToWrite::new(packed.clone(), json)];
+        let view = wok_event::PackedEventView::new(&packed).unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        wok_db::ban_event(&mut txn, view.id().try_into().unwrap(), "abuse").unwrap();
+        wok_db::allow_pubkey(&mut txn, &[8; 32], "member").unwrap();
+        wok_db::assign_role(&mut txn, &[8; 32], wok_db::BUILTIN_ROLE_MODERATOR).unwrap();
+        wok_db::disallow_kind(&mut txn, 4).unwrap();
+        txn.commit().unwrap();
+        let moderation = |env: &Env| {
+            let txn = env.begin_ro().unwrap();
+            let mut records = Vec::new();
+            txn.foreach_full(
+                env.dbis().moderation.unwrap(),
+                &[],
+                &[],
+                false,
+                |key, value| {
+                    records.push((key.to_vec(), value.to_vec()));
+                    true
+                },
+            )
+            .unwrap();
+            records
+        };
+        let before = moderation(&env);
+        drop(env);
+
+        let cfg = Config {
+            db: database.clone(),
+            ..Config::default()
+        };
+        run(&cfg, Some(&root.path().join("backup")), true).unwrap();
+        let promoted = open_existing(&database);
+        assert_eq!(moderation(&promoted), before);
+        let txn = promoted.begin_ro().unwrap();
+        assert!(wok_db::is_event_moderated_ro(&txn, view).unwrap());
+    }
+
+    #[test]
     fn completes_a_tag_kind_index_the_relay_was_still_building() {
         let root = tempfile::tempdir().unwrap();
         let database = root.path().join("db");

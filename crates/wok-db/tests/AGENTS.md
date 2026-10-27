@@ -9,6 +9,7 @@ Storage integration tests. They open disposable LMDB environments.
 | `foreach_full.rs` | Full-table scans; `MDB_GET_BOTH_RANGE` must not be used on non-DUPSORT DBIs |
 | `index_drift.rs` | Derived indexes stay consistent with primaries |
 | `tag_kind_index.rs` | `wok_Event__tagKind` through every write/delete path, reindex, drift reports |
+| `reindex_kept_tables.rs` | Reindex keeps each table events don't derive; names every table as kept or derived |
 | `failure_recovery.rs` | Unclean shutdown / recovery |
 | `file_mode.rs` | Permission bits of new database files, compact copies and migration snapshots |
 | `state_integrity.rs` | Corrupt state detection and valid lazy/deleted-tail state |

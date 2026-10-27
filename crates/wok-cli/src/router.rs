@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use wok_db::{Decompressor, Env, EventToWrite};
 use wok_event::{parse_and_verify_event_with, EventLimits, IdPreimage, PackedEventView, AUTH_KIND};
 use wok_query::NostrFilterGroup;
@@ -405,22 +405,20 @@ pub fn parse_router_config(text: &str) -> Result<RouterConfig> {
 // Router runtime
 // ---------------------------------------------------------------------------
 
-enum ConnMsg {
-    /// Manager -> connection task: send this raw frame to the remote.
-    Send(String),
-    /// Manager -> connection task: close and exit.
-    Close,
-}
-
 enum ManagerMsg {
     Connected {
         group: String,
         url: String,
+        id: u64,
+        handle: ConnHandle,
     },
     Disconnected {
         group: String,
         url: String,
+        id: u64,
     },
+    /// A connection's up queue drained to `UP_QUEUE_LOW_WATER`.
+    Drained,
     IncomingEvent {
         group: String,
         url: String,
@@ -448,6 +446,16 @@ const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// Cap the text of log messages crossing the manager channel.
 const MAX_LOG_CHARS: usize = 512;
 
+/// Up-direction frames a connection queues before its stream waits for it.
+const UP_QUEUE_CAPACITY: usize = 256;
+
+/// A connection tells the manager when its up queue drains to this, so a
+/// stream waiting on it resumes without waiting for the next DB change.
+const UP_QUEUE_LOW_WATER: usize = UP_QUEUE_CAPACITY / 2;
+
+/// How long a connection waits to send its Close frame on the way out.
+const CLOSE_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
+
 struct Group {
     spec: StreamSpec,
     filter_group: NostrFilterGroup,
@@ -455,27 +463,27 @@ struct Group {
     plugin_up: PluginEventSifter,
     /// url -> connection liveness state.
     conns: HashMap<String, ConnState>,
+    /// Last levId this group's up direction has handled. Events after it are
+    /// sent once every connected peer has queue room for them.
+    up_cursor: u64,
 }
 
-#[derive(Clone, Copy)]
 struct ConnState {
     alive: bool,
     reconnect_after: Instant,
+    /// Identifies the task spawned for this url, so a task a reload replaced
+    /// can't report itself as this one.
+    id: u64,
+    /// Set once the task has connected. Dropping it closes the connection.
+    handle: Option<ConnHandle>,
 }
 
-/// Live connection senders keyed by (group, url); maintained by conn tasks.
-type ConnKey = (String, String);
-static CONN_REGISTRY: std::sync::LazyLock<
-    parking_lot::Mutex<HashMap<ConnKey, mpsc::Sender<ConnMsg>>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-fn registry_close(group: &str, url: &str) {
-    if let Some(tx) = CONN_REGISTRY
-        .lock()
-        .get(&(group.to_string(), url.to_string()))
-    {
-        let _ = tx.try_send(ConnMsg::Close);
-    }
+struct ConnHandle {
+    /// Up-direction frames for the connection task to send.
+    tx: mpsc::Sender<String>,
+    /// Dropping this tells the task to close. It is separate from `tx` so a
+    /// full queue can't hold the close back.
+    _close: oneshot::Sender<()>,
 }
 
 pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
@@ -493,11 +501,14 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
     let queue_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_EVENT_BYTES));
     let mut groups: HashMap<String, Group> = HashMap::new();
     let mut router_cfg = load_router_config(&router_path)?;
-    reconcile(&cfg, &router_cfg, &mut groups);
-    let mut curr_event_id = {
+    let mut head = {
         let txn = env.begin_ro()?;
         wok_db::most_recent_levid_ro(&txn).unwrap_or(0)
     };
+    reconcile(&cfg, &router_cfg, &mut groups, head);
+    // Some up group stopped at a peer's full queue and has events left.
+    let mut up_behind = false;
+    let mut next_conn_id = 0u64;
 
     let mut last_cfg_mtime = file_mtime(&router_path);
     let mut last_db_mtime = file_mtime(&env.path().join("data.mdb"));
@@ -513,24 +524,29 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
             msg = manager_rx.recv() => {
                 let Some(msg) = msg else { break };
                 match msg {
-                    ManagerMsg::Connected { group, url } => {
-                        if router_cfg.verbose {
-                            tracing::info!("{group}: Connected to {url}");
-                        }
-                        if let Some(g) = groups.get_mut(&group) {
-                            if let Some(c) = g.conns.get_mut(&url) {
-                                c.alive = true;
+                    ManagerMsg::Connected { group, url, id, handle } => {
+                        // A task whose url a reload removed or replaced while
+                        // it connected is closed by dropping its handle here.
+                        if let Some(c) = conn_state(&mut groups, &group, &url, id) {
+                            if router_cfg.verbose {
+                                tracing::info!("{group}: Connected to {url}");
                             }
+                            c.alive = true;
+                            c.handle = Some(handle);
                         }
                     }
-                    ManagerMsg::Disconnected { group, url } => {
+                    ManagerMsg::Disconnected { group, url, id } => {
                         tracing::info!("{group}: Disconnected from {url}");
-                        if let Some(g) = groups.get_mut(&group) {
-                            if let Some(c) = g.conns.get_mut(&url) {
-                                c.alive = false;
-                                c.reconnect_after =
-                                    Instant::now() + router_cfg.connection_timeout * 2;
-                            }
+                        if let Some(c) = conn_state(&mut groups, &group, &url, id) {
+                            c.alive = false;
+                            c.handle = None;
+                            c.reconnect_after =
+                                Instant::now() + router_cfg.connection_timeout * 2;
+                        }
+                    }
+                    ManagerMsg::Drained => {
+                        if up_behind {
+                            up_behind = router_db_change(&env, &cfg, &mut groups, &mut head)?;
                         }
                     }
                     ManagerMsg::IncomingEvent { group, url, event, approx_bytes } => {
@@ -586,16 +602,18 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
                     match load_router_config(&router_path) {
                         Ok(new_cfg) => {
                             tracing::info!("router config reloaded");
-                            reconcile(&cfg, &new_cfg, &mut groups);
+                            reconcile(&cfg, &new_cfg, &mut groups, head);
                             router_cfg = new_cfg;
                         }
                         Err(e) => tracing::error!("router config reload failed, keeping old: {e}"),
                     }
                 }
+                // A stream that stopped at a full queue also retries here, in
+                // case the peer it waits on disconnected instead of draining.
                 let dm = file_mtime(&env.path().join("data.mdb"));
-                if dm != last_db_mtime {
+                if dm != last_db_mtime || up_behind {
                     last_db_mtime = dm;
-                    router_db_change(&env, &cfg, &mut groups, &mut curr_event_id).await?;
+                    up_behind = router_db_change(&env, &cfg, &mut groups, &mut head)?;
                 }
             }
             _ = cron_tick.tick() => {
@@ -609,11 +627,15 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
                             None => true,
                         };
                         if needs {
+                            next_conn_id += 1;
+                            let id = next_conn_id;
                             g.conns.insert(
                                 url.clone(),
                                 ConnState {
                                     alive: true,
                                     reconnect_after: now + router_cfg.connection_timeout * 2,
+                                    id,
+                                    handle: None,
                                 },
                             );
                             let dir = g.spec.dir.clone();
@@ -625,7 +647,7 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
                             let max_event_size = cfg.events.max_event_size;
                             let budget = queue_budget.clone();
                             tokio::spawn(async move {
-                                run_conn(gname2, url2, dir, filter, tx, timeout, max_event_size, budget).await;
+                                run_conn(gname2, url2, id, dir, filter, tx, timeout, max_event_size, budget).await;
                             });
                         }
                     }
@@ -634,6 +656,21 @@ pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The state of `url` in `group`, if connection task `id` is still the one
+/// spawned for it.
+fn conn_state<'a>(
+    groups: &'a mut HashMap<String, Group>,
+    group: &str,
+    url: &str,
+    id: u64,
+) -> Option<&'a mut ConnState> {
+    groups
+        .get_mut(group)?
+        .conns
+        .get_mut(url)
+        .filter(|c| c.id == id)
 }
 
 fn file_mtime(p: &Path) -> Option<std::time::SystemTime> {
@@ -690,19 +727,15 @@ fn flush_router_batch(env: &Env, cfg: &Config, batch: &mut Vec<Value>) -> Result
 
 /// Reconcile live groups with a (possibly new) config: drop removed
 /// groups/urls, reconnect groups whose dir/filter changed, keep the rest.
-fn reconcile(cfg: &Config, router_cfg: &RouterConfig, groups: &mut HashMap<String, Group>) {
-    let removed: Vec<String> = groups
-        .keys()
-        .filter(|k| !router_cfg.streams.contains_key(*k))
-        .cloned()
-        .collect();
-    for name in removed {
-        if let Some(g) = groups.remove(&name) {
-            for url in g.conns.keys() {
-                registry_close(&name, url);
-            }
-        }
-    }
+/// Dropping a connection's state closes it. New and changed groups stream up
+/// the events stored after `head`.
+fn reconcile(
+    cfg: &Config,
+    router_cfg: &RouterConfig,
+    groups: &mut HashMap<String, Group>,
+    head: u64,
+) {
+    groups.retain(|name, _| router_cfg.streams.contains_key(name));
     for (name, spec) in &router_cfg.streams {
         let filter_group = match compile_router_filter(
             name,
@@ -719,26 +752,15 @@ fn reconcile(cfg: &Config, router_cfg: &RouterConfig, groups: &mut HashMap<Strin
         match groups.get_mut(name) {
             Some(g) => {
                 if g.spec.dir != spec.dir || g.spec.filter_str != spec.filter_str {
-                    for url in g.conns.keys() {
-                        registry_close(name, url);
-                    }
                     g.conns.clear();
                     g.spec.dir = spec.dir.clone();
                     g.spec.filter_str = spec.filter_str.clone();
                     g.spec.filter = spec.filter.clone();
                     g.filter_group = filter_group;
+                    g.up_cursor = head;
                 }
                 let keep: HashSet<&String> = spec.urls.iter().collect();
-                let removed: Vec<String> = g
-                    .conns
-                    .keys()
-                    .filter(|k| !keep.contains(k))
-                    .cloned()
-                    .collect();
-                for url in removed {
-                    registry_close(name, &url);
-                    g.conns.remove(&url);
-                }
+                g.conns.retain(|url, _| keep.contains(url));
                 g.spec.plugin_down = spec.plugin_down.clone();
                 g.spec.plugin_up = spec.plugin_up.clone();
                 g.spec.urls = spec.urls.clone();
@@ -753,6 +775,7 @@ fn reconcile(cfg: &Config, router_cfg: &RouterConfig, groups: &mut HashMap<Strin
                         plugin_down: PluginEventSifter::new(cfg.relay.write_policy_timeout_secs),
                         plugin_up: PluginEventSifter::new(cfg.relay.write_policy_timeout_secs),
                         conns: HashMap::new(),
+                        up_cursor: head,
                     },
                 );
             }
@@ -765,6 +788,7 @@ fn reconcile(cfg: &Config, router_cfg: &RouterConfig, groups: &mut HashMap<Strin
 async fn run_conn(
     group: String,
     url: String,
+    id: u64,
     dir: String,
     filter: Value,
     tx: mpsc::Sender<ManagerMsg>,
@@ -806,7 +830,7 @@ async fn run_conn(
                     text: format!("error connecting: {e}"),
                 })
                 .await;
-            let _ = tx.send(ManagerMsg::Disconnected { group, url }).await;
+            let _ = tx.send(ManagerMsg::Disconnected { group, url, id }).await;
             return;
         }
     };
@@ -820,34 +844,40 @@ async fn run_conn(
                     text: format!("bad filter: {e}"),
                 })
                 .await;
-            let _ = tx.send(ManagerMsg::Disconnected { group, url }).await;
+            let _ = tx.send(ManagerMsg::Disconnected { group, url, id }).await;
             return;
         }
     };
-    let (conn_tx, mut conn_rx) = mpsc::channel::<ConnMsg>(256);
-    CONN_REGISTRY
-        .lock()
-        .insert((group.clone(), url.clone()), conn_tx);
+    let (conn_tx, mut conn_rx) = mpsc::channel::<String>(UP_QUEUE_CAPACITY);
+    let (close_tx, mut close_rx) = oneshot::channel::<()>();
     let _ = tx
         .send(ManagerMsg::Connected {
             group: group.clone(),
             url: url.clone(),
+            id,
+            handle: ConnHandle {
+                tx: conn_tx,
+                _close: close_tx,
+            },
         })
         .await;
 
+    // `close_rx` resolves once the manager drops the handle. A select that
+    // sees it resolve ends the loop, so it is never polled again after that.
+    // The loop is unbiased so neither reads nor queued sends starve the other.
     let (mut wtx, mut wrx) = ws.split();
+    let mut sent = Ok(());
+    // An up frame was taken off the queue but not sent.
+    let mut lost_frame = false;
     if dir == "down" || dir == "both" {
         let mut f = remote_filter;
         f["limit"] = json!(0);
         let msg = json!(["REQ", "X", f]).to_string();
-        if wtx.send(Message::Text(msg.into())).await.is_err() {
-            CONN_REGISTRY.lock().remove(&(group.clone(), url.clone()));
-            let _ = tx.send(ManagerMsg::Disconnected { group, url }).await;
-            return;
-        }
+        sent = send_frame(&mut wtx, Message::Text(msg.into()), timeout, &mut close_rx).await;
     }
-    loop {
+    while sent.is_ok() {
         tokio::select! {
+            _ = &mut close_rx => break,
             msg = wrx.next() => {
                 match msg {
                     Some(Ok(Message::Text(t))) => {
@@ -858,27 +888,72 @@ async fn run_conn(
                         handle_conn_text(&tx, &group, &url, &t, max_event_size, &budget).await;
                     }
                     Some(Ok(Message::Ping(p))) => {
-                        let _ = wtx.send(Message::Pong(p)).await;
+                        sent = send_frame(&mut wtx, Message::Pong(p), timeout, &mut close_rx).await;
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     _ => {}
                 }
             }
-            cmd = conn_rx.recv() => {
-                match cmd {
-                    Some(ConnMsg::Send(s)) => {
-                        if wtx.send(Message::Text(s.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(ConnMsg::Close) | None => break,
+            frame = conn_rx.recv() => {
+                let Some(frame) = frame else { break };
+                sent = send_frame(&mut wtx, Message::Text(frame.into()), timeout, &mut close_rx).await;
+                lost_frame = sent.is_err();
+                if sent.is_ok() && conn_rx.len() == UP_QUEUE_LOW_WATER {
+                    let _ = tx.send(ManagerMsg::Drained).await;
                 }
             }
         }
     }
-    let _ = wtx.send(Message::Close(None)).await;
-    CONN_REGISTRY.lock().remove(&(group.clone(), url.clone()));
-    let _ = tx.send(ManagerMsg::Disconnected { group, url }).await;
+    // Up streams are live-only: what was queued for a dropped peer is not
+    // resent when it reconnects.
+    if let Err(SendStop::Peer(reason)) = sent {
+        let unsent = conn_rx.len() + usize::from(lost_frame);
+        let _ = tx
+            .send(ManagerMsg::Log {
+                group: group.clone(),
+                url: url.clone(),
+                text: format!("disconnecting: {reason}; {unsent} queued up events not sent"),
+            })
+            .await;
+    }
+    let _ = tokio::time::timeout(CLOSE_FRAME_TIMEOUT, wtx.send(Message::Close(None))).await;
+    let _ = tx.send(ManagerMsg::Disconnected { group, url, id }).await;
+}
+
+/// Why a connection stopped sending.
+enum SendStop {
+    /// The manager dropped the connection's handle.
+    Closed,
+    /// The write failed, or the peer took longer than the timeout to accept it.
+    Peer(String),
+}
+
+/// Send one frame unless the manager closes the connection first or the peer
+/// takes longer than `timeout` to accept it, so a peer that stops reading
+/// can't hold up its stream. An error ends the connection.
+async fn send_frame<S>(
+    wtx: &mut S,
+    frame: tokio_tungstenite::tungstenite::Message,
+    timeout: Duration,
+    close_rx: &mut oneshot::Receiver<()>,
+) -> Result<(), SendStop>
+where
+    S: futures_util::Sink<tokio_tungstenite::tungstenite::Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    use futures_util::SinkExt;
+    tokio::select! {
+        biased;
+        _ = &mut *close_rx => Err(SendStop::Closed),
+        sent = tokio::time::timeout(timeout, wtx.send(frame)) => match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(SendStop::Peer(format!("send failed: {error}"))),
+            Err(_) => Err(SendStop::Peer(format!(
+                "peer took longer than {}s to accept a frame",
+                timeout.as_secs()
+            ))),
+        },
+    }
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -952,96 +1027,151 @@ async fn handle_conn_text(
     }
 }
 
-/// DB changed: stream new events to up/both groups (C++ handleDBChange).
-async fn router_db_change(
+/// DB changed or a peer's queue drained: stream new events to up/both groups
+/// (C++ handleDBChange). Each group sends from its own cursor and stops at the
+/// first event one of its connected peers has no queue room for, so a full
+/// queue holds the event back instead of dropping it; a later call resumes
+/// there. Returns whether any group stopped early.
+fn router_db_change(
     env: &Env,
     cfg: &Config,
     groups: &mut HashMap<String, Group>,
-    curr_event_id: &mut u64,
-) -> Result<()> {
-    let mut sends: Vec<((String, String), String)> = Vec::new();
-    {
-        let txn = env.begin_ro()?;
-        let mut decomp = Decompressor::new();
-        let start = curr_event_id.saturating_add(1);
-        let mut latest = *curr_event_id;
+    head: &mut u64,
+) -> Result<bool> {
+    let txn = env.begin_ro()?;
+    *head = (*head).max(wok_db::most_recent_levid_ro(&txn)?);
+    let mut decomp = Decompressor::new();
+    let visibility = wok_query::visibility::ReadVisibility {
+        ephemeral_lifetime_secs: Some(cfg.events.ephemeral_lifetime_secs),
+        ..Default::default()
+    };
+    let snapshot = wok_query::visibility::ReadSnapshot::for_stored(&txn);
+    let mut behind = false;
+    for g in groups.values_mut() {
+        if g.spec.dir == "down" {
+            continue;
+        }
+        let peers: Vec<mpsc::Sender<String>> = g
+            .conns
+            .values()
+            .filter_map(|c| c.handle.as_ref().map(|h| h.tx.clone()))
+            .collect();
+        let mut full = false;
         let mut visibility_error = None;
-        let visibility = wok_query::visibility::ReadVisibility {
-            ephemeral_lifetime_secs: Some(cfg.events.ephemeral_lifetime_secs),
-            ..Default::default()
-        };
-        let snapshot = wok_query::visibility::ReadSnapshot::for_stored(&txn);
-        wok_db::foreach_event_from(&txn, start, |lev, packed_bytes| {
-            latest = lev;
-            let packed = match PackedEventView::new(packed_bytes) {
-                Ok(p) => p,
-                Err(_) => return true,
-            };
-            match visibility.globally_visible(&snapshot, packed) {
-                Ok(true) => {}
-                Ok(false) => return true,
-                Err(error) => {
-                    visibility_error = Some(error);
-                    return false;
-                }
-            }
-            let mut response: Option<String> = None;
-            let mut ev_json: Option<Value> = None;
-            for (gname, g) in groups.iter_mut() {
-                if g.spec.dir == "down" {
-                    continue;
-                }
-                if !g.filter_group.does_match(packed) {
-                    continue;
-                }
-                if response.is_none() {
-                    match wok_db::event_json_owned(
-                        &txn,
-                        &mut decomp,
-                        lev,
-                        cfg.events.max_event_size,
-                    ) {
-                        Ok(j) => {
-                            ev_json = serde_json::from_str(&j).ok();
-                            response = Some(format!("[\"EVENT\",{j}]"));
-                        }
-                        Err(_) => continue,
+        wok_db::foreach_event_from(&txn, g.up_cursor.saturating_add(1), |lev, packed_bytes| {
+            'event: {
+                let Ok(packed) = PackedEventView::new(packed_bytes) else {
+                    break 'event;
+                };
+                match visibility.globally_visible(&snapshot, packed) {
+                    Ok(true) => {}
+                    Ok(false) => break 'event,
+                    Err(error) => {
+                        visibility_error = Some(error);
+                        return false;
                     }
                 }
-                let Some(ev) = &ev_json else { continue };
+                if !g.filter_group.does_match(packed) {
+                    break 'event;
+                }
+                // Reserve a slot with every connected peer before the plugin
+                // sees the event. A peer whose task has exited is skipped.
+                let mut permits = Vec::with_capacity(peers.len());
+                for peer in &peers {
+                    match peer.try_reserve() {
+                        Ok(permit) => permits.push(permit),
+                        Err(mpsc::error::TrySendError::Full(())) => {
+                            full = true;
+                            return false;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(())) => {}
+                    }
+                }
+                let Ok(json) =
+                    wok_db::event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size)
+                else {
+                    break 'event;
+                };
+                let Ok(ev) = serde_json::from_str::<Value>(&json) else {
+                    break 'event;
+                };
                 let cmd = g.spec.plugin_up.clone();
-                let ev = ev.clone();
                 let res = tokio::task::block_in_place(|| {
                     let mut msg = String::new();
                     g.plugin_up
                         .accept_event(&cmd, &ev, "Stored", "", None, &mut msg)
                 });
                 if res == PluginResult::Accept {
-                    if let Some(resp) = &response {
-                        for url in &g.spec.urls {
-                            sends.push(((gname.clone(), url.clone()), resp.clone()));
-                        }
+                    let frame = format!("[\"EVENT\",{json}]");
+                    for permit in permits {
+                        permit.send(frame.clone());
                     }
                 }
             }
+            g.up_cursor = lev;
             true
         })?;
         if let Some(error) = visibility_error {
             return Err(error.into());
         }
-        *curr_event_id = latest;
-    }
-    for (key, payload) in sends {
-        if let Some(tx) = CONN_REGISTRY.lock().get(&key) {
-            let _ = tx.try_send(ConnMsg::Send(payload));
+        if full {
+            behind = true;
+        } else {
+            g.up_cursor = g.up_cursor.max(*head);
         }
     }
-    Ok(())
+    Ok(behind)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn up_spec(urls: Vec<String>) -> StreamSpec {
+        StreamSpec {
+            dir: "up".into(),
+            filter: json!({}),
+            filter_str: "{}".into(),
+            plugin_down: String::new(),
+            plugin_up: String::new(),
+            urls,
+        }
+    }
+
+    /// The handle of a connected peer whose queue holds `capacity` frames.
+    fn conn_handle(capacity: usize) -> (ConnHandle, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let (close, _) = oneshot::channel();
+        (ConnHandle { tx, _close: close }, rx)
+    }
+
+    /// An up group with one connected peer at `url`.
+    fn up_group(url: &str, handle: ConnHandle) -> Group {
+        Group {
+            spec: up_spec(vec![url.to_string()]),
+            filter_group: NostrFilterGroup::from_value(&json!({}), u64::MAX, 3, 16).unwrap(),
+            plugin_down: PluginEventSifter::new(5),
+            plugin_up: PluginEventSifter::new(5),
+            conns: HashMap::from([(
+                url.to_string(),
+                ConnState {
+                    alive: true,
+                    reconnect_after: Instant::now(),
+                    id: 1,
+                    handle: Some(handle),
+                },
+            )]),
+            up_cursor: 0,
+        }
+    }
+
+    fn sent_events(rx: &mut mpsc::Receiver<String>) -> Vec<Value> {
+        let mut sent = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            sent.push(serde_json::from_str::<Value>(&frame).unwrap()[1].clone());
+        }
+        sent
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn router_outbound_skips_hidden_records_and_advances_the_cursor() {
@@ -1051,43 +1181,17 @@ mod tests {
             let env = replacement_fixture::seed(dir.path(), &events, 5);
             let mut cfg = Config::default();
             cfg.events.ephemeral_lifetime_secs = ttl;
-            let name = format!("replacement-test-{kind}-{ttl}");
-            let url = "ws://replacement-test.invalid".to_string();
-            let spec = StreamSpec {
-                dir: "up".into(),
-                filter: json!({}),
-                filter_str: "{}".into(),
-                plugin_down: String::new(),
-                plugin_up: String::new(),
-                urls: vec![url.clone()],
-            };
+            let (handle, mut rx) = conn_handle(8);
             let mut groups = HashMap::from([(
-                name.clone(),
-                Group {
-                    spec,
-                    filter_group: NostrFilterGroup::from_value(&json!({}), u64::MAX, 3, 16)
-                        .unwrap(),
-                    plugin_down: PluginEventSifter::new(5),
-                    plugin_up: PluginEventSifter::new(5),
-                    conns: HashMap::new(),
-                },
+                "replacement-test".to_string(),
+                up_group("ws://replacement-test.invalid", handle),
             )]);
-            let (tx, mut rx) = mpsc::channel(8);
-            let registry_key = (name, url);
-            CONN_REGISTRY.lock().insert(registry_key.clone(), tx);
-            let mut cursor = 0;
-            router_db_change(&env, &cfg, &mut groups, &mut cursor)
-                .await
-                .unwrap();
-            router_db_change(&env, &cfg, &mut groups, &mut cursor)
-                .await
-                .unwrap();
-            CONN_REGISTRY.lock().remove(&registry_key);
-            let mut sent = Vec::new();
-            while let Ok(ConnMsg::Send(payload)) = rx.try_recv() {
-                sent.push(serde_json::from_str::<Value>(&payload).unwrap()[1].clone());
-            }
-            assert_eq!(cursor, 3);
+            let mut head = 0;
+            assert!(!router_db_change(&env, &cfg, &mut groups, &mut head).unwrap());
+            assert!(!router_db_change(&env, &cfg, &mut groups, &mut head).unwrap());
+            let sent = sent_events(&mut rx);
+            assert_eq!(head, 3);
+            assert_eq!(groups["replacement-test"].up_cursor, 3);
             let expected = if kind != 20001 {
                 vec![events[2].clone()]
             } else if ttl == 1 {
@@ -1097,6 +1201,170 @@ mod tests {
             };
             assert_eq!(sent, expected, "kind {kind}, ttl {ttl}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn up_stream_waits_at_a_full_queue_and_sends_every_event() {
+        use secp256k1::{Keypair, SECP256K1};
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let cfg = Config::default();
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut batch: Vec<Value> = (0..UP_QUEUE_CAPACITY * 2 + 10)
+            .map(|i| {
+                let mut event = json!({
+                    "pubkey": hex::encode(key.x_only_public_key().0.serialize()),
+                    "kind": 1,
+                    "created_at": now,
+                    "tags": [],
+                    "content": format!("event {i}"),
+                });
+                let id = wok_event::event_id_hash(&event).unwrap();
+                event["id"] = json!(hex::encode(id));
+                event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+                event
+            })
+            .collect();
+        let mut stored: Vec<String> = batch
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect();
+        flush_router_batch(&env, &cfg, &mut batch).unwrap();
+
+        let (handle, mut rx) = conn_handle(UP_QUEUE_CAPACITY);
+        let mut groups =
+            HashMap::from([("full".to_string(), up_group("ws://full.invalid", handle))]);
+        let mut head = 0;
+        assert!(router_db_change(&env, &cfg, &mut groups, &mut head).unwrap());
+        assert_eq!(rx.len(), UP_QUEUE_CAPACITY);
+        let cursor = groups["full"].up_cursor;
+        assert_eq!(cursor, UP_QUEUE_CAPACITY as u64);
+        // While the queue stays full, the stream neither sends nor skips.
+        assert!(router_db_change(&env, &cfg, &mut groups, &mut head).unwrap());
+        assert_eq!(groups["full"].up_cursor, cursor);
+
+        let mut sent = Vec::new();
+        loop {
+            sent.extend(sent_events(&mut rx));
+            if !router_db_change(&env, &cfg, &mut groups, &mut head).unwrap() {
+                break;
+            }
+        }
+        sent.extend(sent_events(&mut rx));
+        let mut sent: Vec<String> = sent
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(sent.len(), stored.len());
+        sent.sort();
+        stored.sort();
+        assert_eq!(sent, stored);
+        assert_eq!(groups["full"].up_cursor, head);
+    }
+
+    /// An up connection, with its queue filled, to a peer that completes the
+    /// handshake and then never reads. Also returns the manager's end of the
+    /// connection's reports and the peer's task.
+    async fn stalled_up_conn(
+        write_timeout: Duration,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<ManagerMsg>,
+        ConnHandle,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        // As roomy as the router's, so the `Drained` reports the connection
+        // sends while the queue fills never block it.
+        let (manager_tx, mut manager_rx) = mpsc::channel(4096);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_EVENT_BYTES));
+        let conn = tokio::spawn(run_conn(
+            "g".into(),
+            url,
+            1,
+            "up".into(),
+            json!({}),
+            manager_tx,
+            write_timeout,
+            65536,
+            budget,
+        ));
+        let Some(ManagerMsg::Connected { handle, .. }) = manager_rx.recv().await else {
+            panic!("the connection did not report itself connected");
+        };
+        let frame = "x".repeat(64 * 1024);
+        loop {
+            match handle.tx.try_send(frame.clone()) {
+                Ok(()) => tokio::task::yield_now().await,
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => panic!("the connection ended early"),
+            }
+        }
+        (conn, manager_rx, handle, peer)
+    }
+
+    /// The connection's reports up to its disconnect, without `Drained`.
+    async fn reports_until_disconnect(manager_rx: &mut mpsc::Receiver<ManagerMsg>) -> Vec<String> {
+        let mut logs = Vec::new();
+        loop {
+            match manager_rx.recv().await {
+                Some(ManagerMsg::Disconnected { id, .. }) => break assert_eq!(id, 1),
+                Some(ManagerMsg::Drained) => {}
+                Some(ManagerMsg::Log { text, .. }) => logs.push(text),
+                _ => panic!("the connection did not report its disconnect"),
+            }
+        }
+        logs
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_closes_a_connection_whose_up_queue_is_full() {
+        // A write timeout far beyond the test's wait, so only the close can
+        // end the connection in time.
+        let (conn, mut manager_rx, handle, peer) = stalled_up_conn(Duration::from_secs(600)).await;
+        let url = "ws://stalled.invalid";
+        let mut groups = HashMap::from([("g".to_string(), up_group(url, handle))]);
+        let router_cfg = RouterConfig {
+            connection_timeout: Duration::from_secs(20),
+            verbose: false,
+            streams: BTreeMap::from([("g".to_string(), up_spec(Vec::new()))]),
+        };
+        reconcile(&Config::default(), &router_cfg, &mut groups, 0);
+        assert!(groups["g"].conns.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("the close was held back by the full queue")
+            .unwrap();
+        assert!(reports_until_disconnect(&mut manager_rx).await.is_empty());
+        peer.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_that_stops_reading_is_dropped_and_logged() {
+        let (conn, mut manager_rx, _handle, peer) = stalled_up_conn(Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_secs(15), conn)
+            .await
+            .expect("the write timeout did not drop the peer")
+            .unwrap();
+        let logs = reports_until_disconnect(&mut manager_rx).await;
+        assert!(
+            logs.iter().any(|text| text
+                .starts_with("disconnecting: peer took longer than 2s to accept a frame;")
+                && text.ends_with("queued up events not sent")),
+            "{logs:?}"
+        );
+        peer.abort();
     }
 
     #[tokio::test]

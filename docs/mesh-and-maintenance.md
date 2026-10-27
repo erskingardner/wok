@@ -41,6 +41,8 @@ except from a backup.
 
 With the relay stopped, `wok reindex --confirm-relay-stopped` can repair derived
 indexes and author counts while retaining the original database as a backup.
+It copies the records events don't derive unchanged: negentropy filters,
+compression dictionaries, NIP-62 vanish markers and NIP-86 moderation records.
 It preserves the stored sequence even when the newest events have been deleted.
 A malformed or regressed sequence is metadata corruption and blocks reindex:
 surviving records cannot establish the lost deletion history. Use a trusted
@@ -165,6 +167,19 @@ historical gaps. Supervise router and run non-overlapping `wok sync` jobs
 periodically and after outages. Start router before the first catch-up.
 Outbound router delivery applies global read visibility, including replacement,
 moderation, vanish, and expiration, before sending newly stored records.
+
+An up or `both` stream sends each new event to the peers connected at the
+time. Each connection queues up to 256 events. When a peer's queue is full,
+its stream waits at that event and resumes as the peer catches up, so
+nothing is skipped, but a slow peer holds back the other peers in its
+stream: give peers of very different speeds streams of their own. A peer
+that takes longer than `connectionTimeout` to accept a frame is disconnected,
+with a log line giving the reason and how many queued events it missed, and
+reconnected. Like any peer that disconnects, it misses the events queued for
+it and those stored before it reconnects; `wok sync` repairs the gap. A
+reload that removes a
+URL, or changes a stream's `dir` or `filter`, closes those connections at
+once; a changed stream then sends the events stored from then on.
 
 ## Reconciliation results
 

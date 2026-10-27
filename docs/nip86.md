@@ -184,5 +184,5 @@ WebSocket connections already open from the address, before it answers.
 
 Moderation records live in a dedicated Wok-owned LMDB table
 (`wok_Moderation`, prefix-keyed by record type) next to the NIP-62 markers.
-They survive restarts, are loaded into memory at startup, and are refreshed
-after every management mutation and every stored report.
+They survive restarts and `wok reindex`, are loaded into memory at startup,
+and are refreshed after every management mutation and every stored report.

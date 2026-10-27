@@ -64,6 +64,28 @@ scrape_configs:
 | `wok_tag_kind_index_tag_entries` | gauge | none | Tag-index entries stored, which a key-ordered build visits once. |
 | `wok_tag_kind_backfill_entries_total` | counter | none | Postings the writer's background build put. |
 | `wok_tag_kind_backfill_seconds_total` | counter | none | Time the writer spent in background build transactions, commits included. |
+| `wok_writer_queue_depth` | histogram | none | Messages queued for the writer when it started a batch that committed, the one it took first included. |
+| `wok_writer_commit_events` | histogram | none | Events each writer commit stored. Duplicates, and events replaced, deleted or refused by an author's quota, are left out. |
+| `wok_writer_prepare_seconds` | histogram | none | From the start of a writer batch to its write transaction: management commands, maintenance and each event's checks against committed state. |
+| `wok_writer_write_seconds` | histogram | none | Writing a batch's events and index entries, before its commit. |
+| `wok_writer_commit_seconds` | histogram | none | Committing a batch, its flushes to storage included. |
+| `wok_writer_reply_seconds` | histogram | none | Sending a committed batch's OKs and handing its events to the req monitors. |
+| `wok_writer_storage_bytes_total` | counter | none | Bytes the writer's committed event transactions sent to storage: pages they dirtied, from `/proc/thread-self/io`, so 0 on tmpfs. Linux only; 0 elsewhere. |
+| `wok_author_count_drift_total` | counter | none | Per-author event counters that a deletion found below that author's stored events. Each is dropped, with a warning naming the author, and counted again from the author index when a quota check next needs it. Counters kept by earlier releases can be low; `wok reindex` repairs them all. |
+
+The `wok_writer_*` metrics cover each writer batch whose transaction
+committed, so their counts agree. Batches whose events are all refused
+before the write transaction opens, batches that only run management
+commands, and transactions that fail are not counted. A transaction can
+commit with no event stored, for example when every event is over its
+author's quota; it counts, with 0 in `wok_writer_commit_events`. A
+publication's EVENT→OK time on the writer is roughly the wait for the batch
+in progress plus its own batch's prepare, write, commit and reply. While the
+`(tag, kind, created_at)` index is being built, a build step also runs
+before each batch; its time is in `wok_tag_kind_backfill_seconds_total`, not
+in these. The storage bytes divided by `wok_writer_commit_events_sum` is
+what each stored event costs to write; on a disk-bound writer, commit time
+follows it.
 
 The `wok_tag_kind_*` gauges are updated after each build step and on the
 writer's maintenance tick (every 2 seconds). While a key-ordered build runs,

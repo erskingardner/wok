@@ -16,6 +16,7 @@ mod catchup;
 mod clients;
 mod codec;
 mod corpus;
+mod db_write;
 mod live;
 mod rate;
 mod social;
@@ -49,9 +50,13 @@ const READ_SCENARIOS: [&str; 3] = [
 ];
 /// Scenarios that run code compiled into this binary rather than a relay, so
 /// a trial records this binary's hash.
-const IN_PROCESS_SCENARIOS: [&str; 2] = ["monitor_index", "codec_cpu"];
-/// In-process scenarios that read the corpus as it is, of any event mix.
-const ANY_MIX_SCENARIOS: [&str; 1] = ["codec_cpu"];
+const IN_PROCESS_SCENARIOS: [&str; 3] = ["monitor_index", "db_write", "codec_cpu"];
+/// In-process scenarios that read a corpus's events as they are, so a social
+/// corpus suits them as well as a realistic one.
+const ANY_MIX_SCENARIOS: [&str; 2] = ["db_write", "codec_cpu"];
+/// Of those, the ones a lifecycle corpus suits too. `db_write` measures
+/// storage, and a lifecycle corpus holds ephemeral events a relay never stores.
+const LIFECYCLE_MIX_SCENARIOS: [&str; 1] = ["codec_cpu"];
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -125,6 +130,11 @@ struct Args {
     /// Events published during live_fanout.
     #[arg(long, default_value_t = 200)]
     fanout_events: u64,
+    /// Publications live_fanout leaves unacknowledged at once. With 1 it
+    /// waits for each OK, so the result is bound by publish round trips
+    /// rather than delivery.
+    #[arg(long, default_value_t = 256)]
+    fanout_window: usize,
     /// Connections opened by idle_connections.
     #[arg(long, default_value_t = 1_000)]
     connections: usize,
@@ -302,6 +312,14 @@ struct Args {
     /// `--sync-filter groups`, none for `all`.
     #[arg(long)]
     sync_limit: Option<u64>,
+    /// Batch sizes --scenario db_write times, one step each: events per
+    /// durable write transaction.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 8, 64, 512])]
+    db_batches: Vec<usize>,
+    /// Fewest events each --scenario db_write step writes, held back from
+    /// the end of the corpus; a step also writes at least 20 transactions.
+    #[arg(long, default_value_t = 2_000)]
+    db_step_events: u64,
 }
 
 impl Args {
@@ -360,6 +378,7 @@ struct Trial {
     #[serde(skip_serializing_if = "Option::is_none")]
     nip77_catchup: Option<catchup::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    db_write: Option<db_write::Report>,
     codec_cpu: Option<codec::Report>,
 }
 
@@ -444,7 +463,11 @@ fn main() -> Result<()> {
     if args.repetitions == 0 {
         anyhow::bail!("--repetitions must be at least 1");
     }
-    if args.publish_connections == 0 || args.fanout_subscribers == 0 || args.connections == 0 {
+    if args.publish_connections == 0
+        || args.fanout_subscribers == 0
+        || args.fanout_window == 0
+        || args.connections == 0
+    {
         anyhow::bail!("connection counts must be at least 1");
     }
     if args.events == Some(0) || args.queries == Some(0) || args.fanout_events == 0 {
@@ -507,6 +530,7 @@ fn main() -> Result<()> {
         "author_kinds",
         "tag_kinds",
         "nip77_catchup",
+        "db_write",
         "codec_cpu",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
@@ -626,7 +650,9 @@ fn main() -> Result<()> {
         }
         (path, count)
     } else {
-        let count = args.events.unwrap_or(default_event_count);
+        let count = args
+            .events
+            .unwrap_or_else(|| generated_corpus_events(&args, &scenarios, default_event_count));
         let path = args.out.join("corpus.jsonl");
         if args.event_mix == EventMix::Social {
             let opts = social::Options {
@@ -732,6 +758,7 @@ fn main() -> Result<()> {
                     | "tag_kinds"
                     | "monitor_index"
                     | "live_subscriptions"
+                    | "db_write"
                     | "codec_cpu"
             ) {
                 vec!["wok"]
@@ -816,6 +843,7 @@ fn run_trial(
     let mut tag_kinds_report = None;
     let mut rate_report = None;
     let mut catchup_report = None;
+    let mut db_write_report = None;
     let mut codec_report = None;
 
     let bin = if args.has_external_target() || IN_PROCESS_SCENARIOS.contains(&scenario) {
@@ -1052,7 +1080,14 @@ fn run_trial(
                 count: args.fanout_events,
                 ..workload
             };
-            match live_fanout_trial(rt, target, workload, args.fanout_subscribers, &mut hist) {
+            match live_fanout_trial(
+                rt,
+                target,
+                workload,
+                args.fanout_subscribers,
+                args.fanout_window,
+                &mut hist,
+            ) {
                 Ok((eps, nts, good, miss)) => {
                     throughput = eps;
                     notes = nts;
@@ -1265,6 +1300,36 @@ fn run_trial(
                 }
             }
         }
+        "db_write" => match db_write::run(&db_write::Options {
+            corpus: corpus_path.to_path_buf(),
+            dir: args.dataset_dir.clone(),
+            batches: args.db_batches.clone(),
+            step_events: args.db_step_events,
+        }) {
+            Ok(report) => {
+                throughput = report.best_rate();
+                // The latency columns hold the smallest batch's transactions.
+                if let Some(step) = report.smallest_batch() {
+                    for &us in &step.txn_us {
+                        hist.record(us.max(1))?;
+                    }
+                }
+                // A step fails when the writer left an event unfinished.
+                mismatches += report.failed_steps();
+                ok = report.failed_steps() == 0;
+                notes = format!(
+                    "in-process storage writes on {} preloaded events; throughput is the best step's stored events per second, latency is one transaction at batch {}; see the db_write table",
+                    report.preloaded,
+                    report.smallest_batch().map_or(0, |step| step.batch),
+                );
+                db_write_report = Some(report);
+            }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e:#}");
+            }
+        },
         "codec_cpu" => match codec::run(corpus_path) {
             Ok(report) => {
                 throughput = report.inbound_rate();
@@ -1297,6 +1362,7 @@ fn run_trial(
         tag_kinds: tag_kinds_report,
         publish_rate: rate_report,
         nip77_catchup: catchup_report,
+        db_write: db_write_report,
         codec_cpu: codec_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
@@ -1336,9 +1402,10 @@ fn measured_binary_sha256(bin: Option<&Path>, scenario: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A lifecycle corpus suits only live publication, and only the read
-/// scenarios check a social corpus's import against what a relay keeps of
-/// it. The any-mix scenarios read a corpus's events as they are.
+/// A lifecycle corpus suits only live publication and the lifecycle-mix
+/// scenarios, and only the read scenarios check a social corpus's import
+/// against what a relay keeps of it; the any-mix scenarios read a corpus's
+/// events as they are.
 fn check_event_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
     if args.event_mix == EventMix::Lifecycle
         && scenarios.iter().any(|scenario| {
@@ -1349,12 +1416,12 @@ fn check_event_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
                     | "ws_publish_scaled"
                     | "live_fanout"
                     | "idle_connections"
-            ) && !ANY_MIX_SCENARIOS.contains(scenario)
+            ) && !LIFECYCLE_MIX_SCENARIOS.contains(scenario)
         })
     {
         anyhow::bail!(
             "--event-mix lifecycle is only valid for live publication scenarios and {}",
-            ANY_MIX_SCENARIOS.join(", ")
+            LIFECYCLE_MIX_SCENARIOS.join(", ")
         );
     }
     if args.event_mix == EventMix::Social
@@ -1369,6 +1436,19 @@ fn check_event_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Events in a corpus generated without `--events`: the profile's default,
+/// or what `db_write`'s steps and a history need.
+fn generated_corpus_events(args: &Args, scenarios: &[&str], profile_default: u64) -> u64 {
+    if scenarios.contains(&"db_write") {
+        profile_default.max(db_write::default_corpus_events(
+            &args.db_batches,
+            args.db_step_events,
+        ))
+    } else {
+        profile_default
+    }
 }
 
 fn failed_trial(
@@ -1388,6 +1468,7 @@ fn failed_trial(
         tag_kinds: None,
         publish_rate: None,
         nip77_catchup: None,
+        db_write: None,
         codec_cpu: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
@@ -1991,6 +2072,11 @@ fn parse_receipt(reply: &Value, event: &Value) -> Result<bool> {
 }
 
 async fn read_ack(socket: &mut ClientConnection, event: &Value) -> Result<bool> {
+    parse_receipt(&next_reply(socket).await?, event)
+}
+
+/// The next relay message other than AUTH, which should be an OK.
+async fn next_reply(socket: &mut ClientConnection) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let message = socket.next().await.context("closed before OK")??;
@@ -2001,7 +2087,7 @@ async fn read_ack(socket: &mut ClientConnection, event: &Value) -> Result<bool> 
             if reply[0] == "AUTH" {
                 continue;
             }
-            return parse_receipt(&reply, event);
+            return Ok(reply);
         }
     })
     .await
@@ -2822,6 +2908,7 @@ fn live_fanout_trial(
     target: RelayTarget<'_>,
     workload: EventWorkload,
     subs: usize,
+    window: usize,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
     let n = workload.count;
@@ -2859,14 +2946,31 @@ fn live_fanout_trial(
             "duplicate generated fanout IDs"
         );
         let start = Instant::now();
+        // Up to `window` publications are unacknowledged at once, so the
+        // relay can batch them and delivery, not each OK's round trip,
+        // bounds the result.
         let publish = async {
-            for ev in &events {
-                publisher
-                    .send(Message::Text(json!(["EVENT", ev]).to_string().into()))
-                    .await?;
+            let mut unsent = events.iter();
+            let mut unacknowledged = std::collections::HashMap::new();
+            loop {
+                while unacknowledged.len() < window {
+                    let Some(ev) = unsent.next() else { break };
+                    publisher
+                        .send(Message::Text(json!(["EVENT", ev]).to_string().into()))
+                        .await?;
+                    unacknowledged.insert(ev["id"].as_str().context("event without id")?, ev);
+                }
+                if unacknowledged.is_empty() {
+                    break;
+                }
+                let reply = next_reply(&mut publisher).await?;
+                let ev = reply[1]
+                    .as_str()
+                    .and_then(|id| unacknowledged.remove(id))
+                    .with_context(|| format!("OK for no unacknowledged publication: {reply}"))?;
                 anyhow::ensure!(
-                    read_ack(&mut publisher, ev).await?,
-                    "fanout publication rejected"
+                    parse_receipt(&reply, ev)?,
+                    "fanout publication rejected: {reply}"
                 );
             }
             Ok::<_, anyhow::Error>(())
@@ -2912,7 +3016,7 @@ fn live_fanout_trial(
     let expected = n * subs as u64;
     let eps = delivered as f64 / elapsed.as_secs_f64();
     let miss = if delivered != expected { 1 } else { 0 };
-    let notes = format!("{subs} subscribers x {n} events: delivered {delivered}/{expected}; concurrent readers; latency is aggregate trial duration");
+    let notes = format!("{subs} subscribers x {n} events, up to {window} unacknowledged: delivered {delivered}/{expected}; concurrent readers; latency is aggregate trial duration");
     Ok((eps, notes, miss == 0, miss))
 }
 
@@ -3522,6 +3626,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.nip77_catchup {
             s.push_str(&catchup::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.db_write {
+            s.push_str(&db_write::render_markdown(report));
+        }
         if let Some(report) = &t.codec_cpu {
             s.push_str(&codec::render_markdown(report));
         }
@@ -3628,6 +3735,18 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             args.live_phase_secs,
             args.live_churners,
             args.live_churn_rate,
+        ));
+    }
+    if args.scenario.as_deref() == Some("db_write") {
+        if let Some(events) = args.events {
+            selection.push_str(&format!(" --events {events}"));
+        }
+        let batches: Vec<String> = args.db_batches.iter().map(usize::to_string).collect();
+        selection.push_str(&format!(
+            " --db-batches {} --db-step-events {} --dataset-dir \"{}\"",
+            batches.join(","),
+            args.db_step_events,
+            args.dataset_dir.display(),
         ));
     }
     if let Some(scenario @ ("author_kinds" | "tag_kinds")) = args.scenario.as_deref() {
@@ -3764,11 +3883,85 @@ mod tests {
                 mix: EventMix::Kind1,
             },
             1,
+            1,
             &mut Histogram::new(3).unwrap(),
         );
         let peer_result = server.join().unwrap();
         assert!(peer_result.is_ok(), "{peer_result:?}");
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn fanout_publishes_ahead_of_acknowledgements() {
+        const EVENTS: usize = 3;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    use tokio_tungstenite::tungstenite::Message;
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let (stream, _) = listener.accept().await?;
+                    let mut subscriber = tokio_tungstenite::accept_async(stream).await?;
+                    let _req = subscriber.next().await.context("subscription closed")??;
+                    subscriber
+                        .send(Message::Text(json!(["EOSE", "s0"]).to_string().into()))
+                        .await?;
+                    let (stream, _) = listener.accept().await?;
+                    let mut publisher = tokio_tungstenite::accept_async(stream).await?;
+                    // Every publication arrives before any OK is sent, which
+                    // a publisher waiting for each OK would never do.
+                    let mut events = Vec::new();
+                    for _ in 0..EVENTS {
+                        let message =
+                            tokio::time::timeout(Duration::from_secs(5), publisher.next())
+                                .await
+                                .context("publication not sent ahead of its OK")?
+                                .context("publisher closed")??;
+                        let message: Value = serde_json::from_str(message.to_text()?)?;
+                        events.push(message[1].clone());
+                    }
+                    for event in events.iter().rev() {
+                        subscriber
+                            .send(Message::Text(
+                                json!(["EVENT", "s0", event]).to_string().into(),
+                            ))
+                            .await?;
+                        publisher
+                            .send(Message::Text(
+                                json!(["OK", event["id"], true, ""]).to_string().into(),
+                            ))
+                            .await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp = TempDir::new().unwrap();
+        let url = format!("ws://{addr}");
+        let result = live_fanout_trial(
+            &rt,
+            RelayTarget {
+                bin: None,
+                url: Some(&url),
+                dbdir: temp.path(),
+            },
+            EventWorkload {
+                count: EVENTS as u64,
+                seed: 1,
+                base_timestamp: 1_800_000_000,
+                mix: EventMix::Kind1,
+            },
+            1,
+            EVENTS,
+            &mut Histogram::new(3).unwrap(),
+        );
+        let peer_result = server.join().unwrap();
+        assert!(peer_result.is_ok(), "{peer_result:?}");
+        let (_, notes, good, _) = result.unwrap();
+        assert!(good, "{notes}");
     }
 
     #[test]
@@ -3969,6 +4162,27 @@ mod tests {
     }
 
     #[test]
+    fn db_write_runs_on_a_social_corpus_and_by_default() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["wok-bench", "--scenario", "db_write"];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+        let social = parse(&["--event-mix", "social"]);
+        assert!(check_event_mix(&social, &["db_write"]).is_ok());
+        assert!(check_event_mix(&social, &["ws_publish_1conn"]).is_err());
+        // Without --events, the generated corpus holds the default steps
+        // and a history to write them on.
+        let default = parse(&[]);
+        let events = generated_corpus_events(&default, &["db_write"], 2_000);
+        assert_eq!(
+            events,
+            db_write::default_corpus_events(&default.db_batches, default.db_step_events)
+        );
+        assert_eq!(generated_corpus_events(&default, &["import"], 2_000), 2_000);
+    }
+
+    #[test]
     fn the_any_mix_scenarios_take_social_and_lifecycle_corpora() {
         let check = |scenario: &str, mix: &str| {
             let args =
@@ -3978,6 +4192,8 @@ mod tests {
         };
         assert!(check("codec_cpu", "social").is_ok());
         assert!(check("codec_cpu", "lifecycle").is_ok());
+        assert!(check("db_write", "social").is_ok());
+        assert!(check("db_write", "lifecycle").is_err());
         assert!(check("ws_query_latency", "social").is_ok());
         assert!(check("ws_publish_1conn", "social").is_err());
         assert!(check("ws_publish_1conn", "lifecycle").is_ok());
@@ -3987,6 +4203,7 @@ mod tests {
     #[test]
     fn in_process_trials_record_this_binary() {
         let this = sha256_file(&std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(measured_binary_sha256(None, "db_write"), this);
         assert_eq!(measured_binary_sha256(None, "codec_cpu"), this);
         assert_eq!(measured_binary_sha256(None, "ws_publish_1conn"), "");
     }

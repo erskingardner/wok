@@ -65,11 +65,14 @@ counted again rather than abort its transaction (`wok_author_count_drift_total`)
 
 Events are stored in `Event` (PackedEvent) and `EventPayload` (JSON), keyed
 by a local ID that the writer allocates and never reuses. Every other event
-table is derived from them, written and removed in the transaction that
-inserts or deletes the event, and rebuilt by `wok reindex`: strfry's indexes
-by id, pubkey, kind, pubkey and kind, single-letter tag, `created_at`,
+table is derived from them and rebuilt by `wok reindex`: strfry's indexes by
+id, pubkey, kind, pubkey and kind, single-letter tag, `created_at`,
 expiration, replacement address and deletion, then Wok's NIP-50 search
-postings and `(tag, kind, created_at)` postings. Layouts are in
+postings and `(tag, kind, created_at)` postings. All but the search postings
+are written and removed in the transaction that inserts or deletes the event.
+The writer writes an event's search postings later, in a build step of its
+own, and a deletion removes them only once that step has run; see
+[NIP-50 search](nip50-search.md#index-and-recovery). Layouts are in
 [lmdb-v3.md](lmdb-v3.md).
 
 The `(tag, kind, created_at)` table, `wok_Event__tagKind`, holds the tag

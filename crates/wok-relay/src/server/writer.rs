@@ -448,16 +448,30 @@ pub(super) fn run_writer(
         }
         let report_capacity =
             MAX_MODERATION_RECORDS.saturating_sub(moderation.read().reported_events.len());
+        let global_quota = if cfg_snap.relay.abuse.enabled {
+            cfg_snap.relay.abuse.max_stored_events
+        } else {
+            0
+        };
+        // NIP-62 requires a vanish request that targets this relay to be
+        // honored whatever the user's status, so the global quota does not
+        // count the ones a batch records and never refuses a batch for them.
+        let records_vanish = |event: &EventToWrite<u64>| {
+            vanish_policy.enabled
+                && event.status == EventWriteStatus::Written
+                && PackedEventView::new(&event.packed).is_ok_and(|e| e.kind() == VANISH_KIND)
+        };
         let write_started = Instant::now();
         let storage_before = storage_writes.bytes();
         let mut commit_started = None;
-        let write_res = (|| {
+        // `None` when the global quota refuses the batch.
+        let mut write_batch = |events: &mut Vec<EventToWrite<u64>>| {
             let mut txn = env.begin_rw()?;
             let mut tree_batch = negentropy_cache.batch();
             wok_db::write::write_events_with_quota(
                 &mut txn,
                 &mut tree_batch,
-                &mut events,
+                events,
                 &vanish_policy,
                 if cfg_snap.relay.abuse.enabled {
                     cfg_snap.relay.abuse.max_stored_events_per_pubkey
@@ -468,29 +482,65 @@ pub(super) fn run_writer(
             tree_batch
                 .flush(&mut txn)
                 .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
-            let report_updates = record_reports(&mut txn, &events, report_capacity);
-            if cfg_snap.relay.abuse.enabled && cfg_snap.relay.abuse.max_stored_events != 0 {
-                let stored = txn.entries(txn.env().dbis().event)? as u64;
-                if stored > cfg_snap.relay.abuse.max_stored_events {
-                    metrics
-                        .abuse_global_quota_rejections
-                        .fetch_add(events.len() as u64, Ordering::Relaxed);
-                    metrics
-                        .refusals
-                        .add(Setting::MaxStoredEvents, events.len() as u64);
-                    return Err(wok_db::DbError::msg(format!(
-                        "global storage quota of {} events exceeded",
-                        cfg_snap.relay.abuse.max_stored_events
-                    )));
+            let report_updates = record_reports(&mut txn, events, report_capacity);
+            if global_quota != 0 {
+                let vanishing = events.iter().filter(|e| records_vanish(e)).count();
+                let written = events
+                    .iter()
+                    .filter(|e| e.status == EventWriteStatus::Written)
+                    .count();
+                let stored = txn
+                    .entries(txn.env().dbis().event)?
+                    .saturating_sub(vanishing);
+                if written > vanishing && stored as u64 > global_quota {
+                    return Ok(None);
                 }
             }
             commit_started = Some(Instant::now());
             txn.commit()?;
-            Ok::<_, wok_db::DbError>(report_updates)
-        })();
+            Ok::<_, wok_db::DbError>(Some(report_updates))
+        };
+        let mut write_res = write_batch(&mut events);
+        if matches!(write_res, Ok(None)) {
+            // The quota refuses everything else in the batch, and the
+            // vanish requests it held are written on their own.
+            let (vanishing, refused): (Vec<_>, Vec<_>) = events.drain(..).partition(records_vanish);
+            metrics
+                .abuse_global_quota_rejections
+                .fetch_add(refused.len() as u64, Ordering::Relaxed);
+            metrics
+                .refusals
+                .add(Setting::MaxStoredEvents, refused.len() as u64);
+            for event in &refused {
+                let id_hex = PackedEventView::new(&event.packed)
+                    .map(|p| to_hex(p.id()))
+                    .unwrap_or_else(|_| "?".into());
+                conns.send(
+                    event.context,
+                    RelayMessage::Ok {
+                        event_id: id_hex,
+                        accepted: false,
+                        message: format!(
+                            "error: global storage quota of {global_quota} events exceeded"
+                        ),
+                    },
+                    &metrics,
+                );
+            }
+            events.extend(vanishing.into_iter().map(|mut event| {
+                event.status = EventWriteStatus::Pending;
+                event.lev_id = 0;
+                event
+            }));
+            if !events.is_empty() {
+                write_res = write_batch(&mut events);
+            }
+        }
         let committed = Instant::now();
         let report_updates = match write_res {
-            Ok(report_updates) => report_updates,
+            Ok(Some(report_updates)) => report_updates,
+            // Nothing in the batch was left to write.
+            Ok(None) => continue,
             Err(error) => {
                 // The transaction aborted; nothing was written this batch.
                 for event in &events {
@@ -1392,6 +1442,138 @@ mod tests {
             metrics.writer_storage_bytes_total.load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[test]
+    fn the_global_quota_never_refuses_a_vanish_request() {
+        // #248: NIP-62 says a relay MUST honor a request to vanish that
+        // targets it. On a full relay the request is still recorded and what
+        // its author published is deleted; everything else stays under the
+        // quota.
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut config = Config {
+            db: dir.path().to_path_buf(),
+            db_min_free_disk_bytes: 0,
+            ..Config::default()
+        };
+        config.relay.abuse.max_stored_events = 1;
+        config.relay.nip62.service_url = "wss://relay.example.com".into();
+        // An unsigned event `n` from `author`, answered on connection `n`.
+        let event = |n: u8, author: u8, created_at: u64, kind: u64, tags: Value| {
+            let (id, author) = ([n; 32], [author; 32]);
+            let packed = PackedEventBuilder::build(
+                &id,
+                &author,
+                created_at,
+                kind,
+                0,
+                &PackedEventTagBuilder::default(),
+            )
+            .unwrap();
+            let json = json!({
+                "id": to_hex(&id),
+                "pubkey": to_hex(&author),
+                "created_at": created_at,
+                "kind": kind,
+                "tags": tags,
+                "content": "",
+                "sig": "00".repeat(64),
+            })
+            .to_string();
+            WriterMsg::AddEvent {
+                conn_id: u64::from(n),
+                source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                packed: packed.into_bytes(),
+                json,
+                authed: None,
+                grant: Default::default(),
+            }
+        };
+        let vanish = |n: u8, author: u8, relay: &str| {
+            event(n, author, 200, VANISH_KIND, json!([["relay", relay]]))
+        };
+        // One writer batch; the `OK` each event got, in order.
+        let write = |config: &Config, messages: Vec<WriterMsg>| -> Vec<Value> {
+            let conns = Arc::new(ConnTable::new());
+            let mut replies = Vec::new();
+            let (writer_tx, writer_rx) = bounded(messages.len());
+            for message in messages {
+                if let WriterMsg::AddEvent { conn_id, .. } = &message {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    conns.insert(*conn_id, Outbound::new(tx, 0));
+                    replies.push(rx);
+                }
+                writer_tx.send(message).unwrap();
+            }
+            drop(writer_tx);
+            let moderation = env
+                .begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                .unwrap();
+            run_writer(
+                env.clone(),
+                Arc::new(parking_lot::RwLock::new(config.clone())),
+                conns,
+                Arc::new(Metrics::default()),
+                writer_rx,
+                Vec::new(),
+                Arc::new(parking_lot::RwLock::new(moderation)),
+                TAG_KIND_STEP,
+            );
+            replies
+                .iter_mut()
+                .map(|rx| serde_json::from_str(&rx.try_recv().unwrap().into_text()).unwrap())
+                .collect()
+        };
+        let stored = || env.begin_ro().unwrap().entries(env.dbis().event).unwrap();
+        let quota_refusal = json!("error: global storage quota of 1 events exceeded");
+
+        // Author 0xa1's note fills the relay.
+        let replies = write(&config, vec![event(1, 0xa1, 100, 1, json!([]))]);
+        assert_eq!(replies[0][2], true, "{replies:?}");
+
+        // Its author's vanish request is stored over the quota. A note, and a
+        // vanish request for another relay, which records nothing, are not.
+        let replies = write(
+            &config,
+            vec![
+                vanish(2, 0xa1, "ALL_RELAYS"),
+                event(3, 0xb2, 200, 1, json!([])),
+                vanish(4, 0xc3, "wss://other.example.com"),
+            ],
+        );
+        assert_eq!(replies[0][2], true, "{replies:?}");
+        assert_eq!(replies[1][3], quota_refusal, "{replies:?}");
+        assert_eq!(replies[2][3], quota_refusal, "{replies:?}");
+        assert_eq!(stored(), 2);
+        {
+            let txn = env.begin_ro().unwrap();
+            let (_, note) = wok_db::lookup_event_by_id_ro(&txn, &[1; 32])
+                .unwrap()
+                .unwrap();
+            assert!(is_event_vanished_ro(&txn, PackedEventView::new(&note).unwrap()).unwrap());
+        }
+        // Maintenance then deletes the note.
+        run_maintenance(&env, &config, &mut Vec::new());
+        let txn = env.begin_ro().unwrap();
+        assert!(wok_db::lookup_event_by_id_ro(&txn, &[1; 32])
+            .unwrap()
+            .is_none());
+        drop(txn);
+        assert_eq!(stored(), 1);
+
+        // A fresh key's request is stored while the relay is still full.
+        let replies = write(&config, vec![vanish(5, 0xd4, "ALL_RELAYS")]);
+        assert_eq!(replies[0][2], true, "{replies:?}");
+        assert_eq!(stored(), 2);
+
+        // With NIP-62 off, a kind 62 is an ordinary event, and over the quota.
+        config.relay.nip62.enabled = false;
+        let replies = write(&config, vec![vanish(6, 0xe5, "ALL_RELAYS")]);
+        assert_eq!(replies[0][3], quota_refusal, "{replies:?}");
+        assert_eq!(stored(), 2);
     }
 
     #[test]

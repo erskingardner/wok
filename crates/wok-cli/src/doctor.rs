@@ -378,7 +378,11 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
                             integrity.legacy_untombstoned_deletions,
                         ),
                     );
-                    check_tag_kind_index(integrity.tag_kind_index.as_ref(), &mut report);
+                    check_tag_kind_index(
+                        integrity.tag_kind_index.as_ref(),
+                        cfg.relay.tag_kind_index_enabled,
+                        &mut report,
+                    );
                     report.integrity = Some(integrity);
                 }
                 Err(error) => report.add("integrity", CheckStatus::Fail, error.to_string()),
@@ -393,8 +397,13 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
 }
 
 /// Report how far `wok_Event__tagKind` indexes the stored events, and the
-/// entries that do not match them.
-fn check_tag_kind_index(tag_kind: Option<&TagKindIndexReport>, report: &mut DoctorReport) {
+/// entries that do not match them. With `relay.tag_kind_index_enabled` off,
+/// the relay keeps it incomplete on purpose.
+fn check_tag_kind_index(
+    tag_kind: Option<&TagKindIndexReport>,
+    enabled: bool,
+    report: &mut DoctorReport,
+) {
     const NAME: &str = "tag-kind-index";
     const REINDEX: &str = "`wok reindex --confirm-relay-stopped`";
     let Some(tag_kind) = tag_kind else {
@@ -441,7 +450,12 @@ fn check_tag_kind_index(tag_kind: Option<&TagKindIndexReport>, report: &mut Doct
             },
         ));
     }
-    if !tag_kind.complete {
+    if !tag_kind.complete && !enabled {
+        details.push(format!(
+            "off (`relay.tag_kind_index_enabled = false`), so queries read the tag index: indexed through local ID {} of {}, and the relay builds the rest once it is back on",
+            state.indexed_through, state.high_water
+        ));
+    } else if !tag_kind.complete {
         if status == CheckStatus::Pass {
             status = CheckStatus::Warn;
         }
@@ -1050,6 +1064,20 @@ mod tests {
             tag_kind
                 .detail
                 .starts_with("being built in key order: 1 of 1 tag entries visited"),
+            "{}",
+            tag_kind.detail
+        );
+
+        // With the index off, the relay keeps it incomplete on purpose.
+        let mut off = cfg.clone();
+        off.relay.tag_kind_index_enabled = false;
+        let report = run(&off, Path::new("missing-test-config.toml"));
+        let tag_kind = check(&report, "tag-kind-index");
+        assert_eq!(tag_kind.status, CheckStatus::Pass, "{}", tag_kind.detail);
+        assert!(
+            tag_kind
+                .detail
+                .starts_with("off (`relay.tag_kind_index_enabled = false`)"),
             "{}",
             tag_kind.detail
         );

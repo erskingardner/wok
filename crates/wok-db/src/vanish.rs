@@ -144,8 +144,8 @@ pub fn mark_vanished(txn: &mut RwTxn<'_>, pubkey: &[u8], timestamp: u64) -> Resu
         .vanish_pubkey
         .ok_or_else(|| DbError::msg("NIP-62 marker database is unavailable"))?;
     // No marker sorts below any: a request at created_at 0 still leaves one,
-    // which covers the author's events at 0 and the gift wraps that p-tag
-    // the author.
+    // which covers the author's events at 0 and the gift wraps at 0 that
+    // p-tag the author.
     if txn.get(dbi, pubkey)?.and_then(read_timestamp) < Some(timestamp) {
         txn.put(dbi, pubkey, &timestamp.to_ne_bytes(), 0)?;
         crate::state::invalidate_visibility(txn)?;
@@ -236,6 +236,19 @@ pub fn backfill_vanish_markers(
     Ok(updated)
 }
 
+/// Whether a NIP-59 gift wrap created at `created_at` falls under the
+/// vanish request at `timestamp` of a pubkey it p-tags. Wraps follow the
+/// rule for the pubkey's own events: only those created at or before the
+/// request vanish, so the key can be sent wraps again afterwards. NIP-59
+/// backdates a wrap's `created_at` by up to two days, so a wrap sent in the
+/// two days after the request can still fall under it. Every check of a
+/// wrap against a marker goes through here; the sweep reads wraps in
+/// `created_at` order and stops at the first this refuses, so the rule
+/// must stay a bound on `created_at`.
+pub fn gift_wrap_vanished(created_at: u64, timestamp: u64) -> bool {
+    created_at <= timestamp
+}
+
 pub fn is_event_vanished_ro(txn: &RoTxn<'_>, packed: PackedEventView<'_>) -> Result<bool, DbError> {
     if packed.kind() != VANISH_KIND
         && vanish_timestamp_ro(txn, packed.pubkey())?
@@ -249,11 +262,11 @@ pub fn is_event_vanished_ro(txn: &RoTxn<'_>, packed: PackedEventView<'_>) -> Res
         packed.foreach_tag(|name, value| {
             if name == 'p' {
                 match vanish_timestamp_ro(txn, value) {
-                    Ok(Some(_)) => {
+                    Ok(Some(timestamp)) if gift_wrap_vanished(packed.created_at(), timestamp) => {
                         vanished = true;
                         return false;
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(err) => {
                         error = Some(err);
                         return false;
@@ -285,11 +298,11 @@ pub fn is_event_vanished_rw(txn: &RwTxn<'_>, packed: PackedEventView<'_>) -> Res
         packed.foreach_tag(|name, value| {
             if name == 'p' {
                 match vanish_timestamp_rw(txn, value) {
-                    Ok(Some(_)) => {
+                    Ok(Some(timestamp)) if gift_wrap_vanished(packed.created_at(), timestamp) => {
                         vanished = true;
                         return false;
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(err) => {
                         error = Some(err);
                         return false;
@@ -392,7 +405,14 @@ pub fn sweep_vanished_events<N: NegentropySink>(
             &0u64.to_ne_bytes(),
             false,
             |key, value| {
-                if !key.starts_with(&tag_prefix) || value.len() != 8 {
+                if !key.starts_with(&tag_prefix)
+                    || key.len() != tag_prefix.len() + 8
+                    || value.len() != 8
+                {
+                    return false;
+                }
+                let created_at = u64::from_ne_bytes(key[tag_prefix.len()..].try_into().unwrap());
+                if !gift_wrap_vanished(created_at, timestamp) {
                     return false;
                 }
                 let lev_id = u64::from_ne_bytes(value.try_into().unwrap());

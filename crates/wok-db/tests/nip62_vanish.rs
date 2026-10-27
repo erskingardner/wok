@@ -66,8 +66,16 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
     let (old_id, mut old) = signed(&author, 1, 100, json!([]));
     let (new_id, mut newer) = signed(&author, 1, 300, json!([]));
     let (deletion_id, mut deletion) = signed(&author, 5, 150, json!([["e", "00".repeat(32)]]));
-    let (gift_id, mut gift) = signed(&gift_sender, 1059, 400, json!([["p", author_hex.clone()]]));
-    for event in [&mut old, &mut newer, &mut deletion, &mut gift] {
+    let (gift_id, mut gift) = signed(&gift_sender, 1059, 150, json!([["p", author_hex.clone()]]));
+    let (later_gift_id, mut later_gift) =
+        signed(&gift_sender, 1059, 400, json!([["p", author_hex.clone()]]));
+    for event in [
+        &mut old,
+        &mut newer,
+        &mut deletion,
+        &mut gift,
+        &mut later_gift,
+    ] {
         write_one(&env, &policy, event);
         assert_eq!(event.status, EventWriteStatus::Written);
     }
@@ -85,7 +93,7 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
         let (_, packed) = lookup_event_by_id_ro(&txn, &id).unwrap().unwrap();
         assert!(is_event_vanished_ro(&txn, PackedEventView::new(&packed).unwrap()).unwrap());
     }
-    for id in [new_id, vanish_id] {
+    for id in [new_id, vanish_id, later_gift_id] {
         let (_, packed) = lookup_event_by_id_ro(&txn, &id).unwrap().unwrap();
         assert!(!is_event_vanished_ro(&txn, PackedEventView::new(&packed).unwrap()).unwrap());
     }
@@ -94,9 +102,13 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
     let (_, mut rebroadcast) = signed(&author, 1, 100, json!([["x", "rebroadcast"]]));
     write_one(&env, &policy, &mut rebroadcast);
     assert_eq!(rebroadcast.status, EventWriteStatus::Deleted);
-    let (_, mut new_gift) = signed(&gift_sender, 1059, 500, json!([["p", author_hex]]));
+    let (_, mut backdated_gift) =
+        signed(&gift_sender, 1059, 200, json!([["p", author_hex.clone()]]));
+    write_one(&env, &policy, &mut backdated_gift);
+    assert_eq!(backdated_gift.status, EventWriteStatus::Deleted);
+    let (new_gift_id, mut new_gift) = signed(&gift_sender, 1059, 500, json!([["p", author_hex]]));
     write_one(&env, &policy, &mut new_gift);
-    assert_eq!(new_gift.status, EventWriteStatus::Deleted);
+    assert_eq!(new_gift.status, EventWriteStatus::Written);
 
     // A kind 5 after the request has no effect on the stored bookkeeping event.
     let (_, mut delete_vanish) = signed(&author, 5, 201, json!([["e", hex::encode(vanish_id)]]));
@@ -123,6 +135,8 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
     assert!(!stored(&env, &deletion_id));
     assert!(stored(&env, &new_id));
     assert!(stored(&env, &vanish_id));
+    assert!(stored(&env, &later_gift_id));
+    assert!(stored(&env, &new_gift_id));
 
     drop(env);
     let reopened = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
@@ -234,7 +248,8 @@ fn existing_request_records_are_backfilled_for_migrations() {
 
 /// A request at created_at 0 leaves a marker, written live or by the
 /// backfill, which reads the kind index from its first entry: it covers the
-/// author's events at created_at 0 and the gift wraps that p-tag the author.
+/// author's events at created_at 0 and the gift wraps at 0 that p-tag the
+/// author.
 #[test]
 fn a_request_at_created_at_zero_leaves_a_marker() {
     let policy = VanishPolicy {
@@ -281,14 +296,19 @@ fn a_request_at_created_at_zero_leaves_a_marker() {
         write_one(&env, &policy, &mut later);
         assert_eq!(later.status, EventWriteStatus::Written);
         let sender = Keypair::new(SECP256K1, &mut rng);
-        let (_, mut wrap) = signed(
-            &sender,
-            1059,
-            100,
-            json!([["p", hex::encode(pubkey.serialize())]]),
-        );
-        write_one(&env, &policy, &mut wrap);
-        assert_eq!(wrap.status, EventWriteStatus::Deleted);
+        for (created_at, status) in [
+            (0, EventWriteStatus::Deleted),
+            (1, EventWriteStatus::Written),
+        ] {
+            let (_, mut wrap) = signed(
+                &sender,
+                1059,
+                created_at,
+                json!([["p", hex::encode(pubkey.serialize())]]),
+            );
+            write_one(&env, &policy, &mut wrap);
+            assert_eq!(wrap.status, status, "wrap at {created_at}");
+        }
         let (_, mut other) = signed(
             &sender,
             1059,
@@ -297,5 +317,81 @@ fn a_request_at_created_at_zero_leaves_a_marker() {
         );
         write_one(&env, &policy, &mut other);
         assert_eq!(other.status, EventWriteStatus::Written);
+    }
+}
+
+/// A gift wrap to a vanished pubkey falls under the request only up to its
+/// created_at, as the pubkey's own events do, so the key can be sent wraps
+/// again afterwards (#249). `same_batch_vanish_request_refuses_only_what_it_covers`
+/// in wok-relay checks the same answers for a request and events in one
+/// writer batch.
+#[test]
+fn gift_wraps_vanish_only_up_to_the_request() {
+    let directory = TempDir::new().unwrap();
+    let env = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let policy = VanishPolicy {
+        enabled: true,
+        service_url: String::new(),
+    };
+    let mut rng = rand::thread_rng();
+    let recipient = Keypair::new(SECP256K1, &mut rng);
+    let sender = Keypair::new(SECP256K1, &mut rng);
+    let recipient_hex = hex::encode(recipient.x_only_public_key().0.serialize());
+    let wrap = |created_at, label: &str| {
+        signed(
+            &sender,
+            1059,
+            created_at,
+            json!([["p", recipient_hex], ["x", label]]),
+        )
+    };
+
+    let (before_id, mut before) = wrap(900, "before");
+    let (at_id, mut at) = wrap(1000, "at");
+    let (after_id, mut after) = wrap(1100, "after");
+    for event in [&mut before, &mut at, &mut after] {
+        write_one(&env, &policy, event);
+        assert_eq!(event.status, EventWriteStatus::Written);
+    }
+
+    let (_, mut request) = signed(&recipient, 62, 1000, json!([["relay", "ALL_RELAYS"]]));
+    write_one(&env, &policy, &mut request);
+    assert_eq!(request.status, EventWriteStatus::Written);
+    let (_, mut late_wrap) = wrap(1000, "late");
+    let (new_wrap_id, mut new_wrap) = wrap(1001, "new");
+    let (_, mut late_note) = signed(&recipient, 1, 1000, json!([]));
+    let (new_note_id, mut new_note) = signed(&recipient, 1, 1001, json!([]));
+    for (event, status) in [
+        (&mut late_wrap, EventWriteStatus::Deleted),
+        (&mut new_wrap, EventWriteStatus::Written),
+        (&mut late_note, EventWriteStatus::Deleted),
+        (&mut new_note, EventWriteStatus::Written),
+    ] {
+        write_one(&env, &policy, event);
+        assert_eq!(event.status, status);
+    }
+
+    let txn = env.begin_ro().unwrap();
+    let vanished = |id: &[u8; 32]| {
+        let (_, packed) = lookup_event_by_id_ro(&txn, id).unwrap().unwrap();
+        is_event_vanished_ro(&txn, PackedEventView::new(&packed).unwrap()).unwrap()
+    };
+    assert!(vanished(&before_id));
+    assert!(vanished(&at_id));
+    assert!(!vanished(&after_id));
+    assert!(!vanished(&new_wrap_id));
+    assert!(!vanished(&new_note_id));
+    drop(txn);
+
+    let mut txn = env.begin_rw().unwrap();
+    let deleted =
+        sweep_vanished_events(&mut txn, &mut NoopNegentropy, 100, &mut Vec::new()).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(deleted, 2);
+    assert!(!stored(&env, &before_id));
+    assert!(!stored(&env, &at_id));
+    for id in [after_id, new_wrap_id, new_note_id] {
+        assert!(stored(&env, &id));
     }
 }

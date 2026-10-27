@@ -1092,6 +1092,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- permessage-deflate is negotiated as RFC 7692 §7 says (#246). The relay
+  answered plain `permessage-deflate` to any offer and kept its compression
+  context between messages, so a client that offered
+  `server_no_context_takeover` or a `server_max_window_bits` below 15
+  either refused the handshake, as Python `websockets` does, or failed to
+  inflate from about its second message. The relay now accepts the first
+  offer in the client's list it can honour: it echoes
+  `server_no_context_takeover` and compresses each of that connection's
+  messages on its own, echoes `server_max_window_bits=15`, still echoes
+  `client_no_context_takeover`, and accepts `client_max_window_bits`.
+  **An offer with an unknown, repeated or invalid parameter, or a
+  `server_max_window_bits` below 15, is declined**, and a connection with
+  no offer left is not compressed. Browsers, which offer only
+  `client_max_window_bits`, negotiate as before.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

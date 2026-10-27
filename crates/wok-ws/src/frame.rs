@@ -1,8 +1,9 @@
 //! Minimal RFC 6455 frame codec plus RFC 7692 permessage-deflate.
 //!
-//! Server-side only: reads masked client frames, writes unmasked server
-//! frames. Negotiation mirrors C++ uWS as configured by strfry: plain
-//! `permessage-deflate` with context takeover (sliding window) by default,
+//! Reads masked client frames and writes unmasked server frames, or the
+//! reverse with [`Role::Client`]. The server's negotiation is in
+//! `extension`: context takeover (sliding window) by default, off for a
+//! connection that offered `server_no_context_takeover`, and
 //! `client_no_context_takeover` echoed when the client offers it.
 
 use bytes::{Buf, BytesMut};
@@ -258,8 +259,9 @@ fn inflate_into(
 }
 
 /// RFC 7692 deflater for one connection. With `takeover` (strfry's
-/// `compression.slidingWindow`, default true) each message is compressed
-/// against the history of the previous ones.
+/// `compression.slidingWindow`, default true, unless the client offered
+/// `server_no_context_takeover`) each message is compressed against the
+/// history of the previous ones; without it, each on its own.
 ///
 /// The compressor (about 300 KiB with miniz_oxide) is created by the first
 /// message rather than at upgrade, and [`DeflateCtx::release_idle`] drops it

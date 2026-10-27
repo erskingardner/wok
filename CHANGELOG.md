@@ -1106,7 +1106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--print-missing`, `--dir none` and `--dir up` now fetch the peer's
   remote-only events of the superset**, without storing them, since only an
   event shows its tags. The local view, and its `relay.max_sync_events` and
-  sync memory budget, now cover the superset.
+  sync memory budget, now cover the superset. **Sync now refuses an `&`
+  filter with a `limit` for such a peer**, which would apply the limit to
+  the superset; bound the sync with `--range` instead.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

@@ -248,6 +248,9 @@ async fn transfer(cfg: &Config, options: &Options, report: &mut Report) -> Resul
             )
         })
         .transpose()?;
+    if compatibility.is_some() && filter_group.filters.iter().any(|f| f.limit != u64::MAX) {
+        bail!("a peer without NIP-91 would apply `limit` to the `#` compatibility superset of the `&` filter, not to the filter; remove `limit`, or bound the sync with --range");
+    }
     let view_group = compatibility.as_ref().unwrap_or(&filter_group);
     // Only the peer's events reveal whether they match the exact filter.
     let fetch_need = do_down || compatibility.is_some();

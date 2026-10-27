@@ -214,7 +214,9 @@ uploaded, and a remote one is fetched, checked against its id, and discarded.
 event shows its tags, so with such a filter `--check`, `--print-missing`,
 `--dir none` and `--dir up` also fetch the remote-only events of the superset,
 without storing them; an ID the peer does not return stays counted in `need`.
-The local view's construction budget applies to the superset too.
+The local view's construction budget applies to the superset too. Such a peer
+would apply a `limit` to the superset, not to the filter, so sync refuses an
+`&` filter with a `limit` for it; bound the sync with `--range` instead.
 
 A transfer exits nonzero on rejected downloads, rejected uploads, requested IDs
 missing at EOSE, closed subscriptions, protocol errors, disconnects or timeout.

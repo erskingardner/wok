@@ -37,9 +37,9 @@ text a person wrote, from the pinned NIPs' kind table:
 | 31922, 31923, 31924 | Calendar events, calendar | 52 |
 | 39701 | Web bookmark | B0 |
 
-For these, the values of `title`, `subject`, `name`, `summary` and
-`description` tags are searched with `content`, ahead of it, so a long
-event never loses its title to the term limit below. `alt` is not: it
+For these, the values of `title`, `subject` and `name` tags, then of
+`summary` and `description` tags, are searched with `content`, ahead of it,
+so a long summary or content cannot push a title past the term limit below. `alt` is not: it
 describes the event for clients that cannot show its kind. Words in two
 tags, or in a tag and `content`, are not adjacent.
 

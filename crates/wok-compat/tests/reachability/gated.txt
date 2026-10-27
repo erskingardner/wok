@@ -451,6 +451,7 @@ wok_ws::ws_accept_key
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
 <wok_db::payload::Decompressor>::decode
+<wok_db::search::Tag>::name_and_value
 <wok_db::txn::RoTxn as wok_db::moderation::ReadOps>::get_record
 <wok_db::txn::RoTxn as wok_db::moderation::ReadOps>::moderation_dbi
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
@@ -679,7 +680,6 @@ wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>
 wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>::{closure}
 wok_db::search::indexed_terms::{closure}
 wok_db::search::parse_event::<wok_db::search::EventText>
-wok_db::search::search_document::{closure}
 wok_db::search::search_index_entries::{closure}
 wok_db::search::term_key
 wok_db::state::author_count

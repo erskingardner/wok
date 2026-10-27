@@ -10,6 +10,7 @@
 
 use crate::{DbError, Decompressor, Env, RoTxn, RwTxn};
 use lmdb_sys::{MDB_GET_BOTH, MDB_NODUPDATA, MDB_SET};
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
@@ -35,10 +36,12 @@ const TEXT_KINDS: [u64; 31] = [
     1, 9, 11, 20, 21, 22, 42, 54, 1063, 1068, 1111, 1311, 1337, 1618, 1621, 2003, 2004, 7516, 9041,
     9802, 30023, 30402, 30818, 31922, 31923, 31924, 34235, 34236, 37516, 37517, 39701,
 ];
-/// Tags that name or summarize a text event. Their values are indexed before
-/// its content, so the unique-term cap never drops them. `alt` is not one: it
-/// describes the event for clients that cannot show its kind.
-const TITLE_TAGS: [&str; 5] = ["title", "subject", "name", "summary", "description"];
+/// Tags that name a text event, then tags that summarize one. Their values
+/// are indexed ahead of its content, names first, so a long summary or
+/// content cannot push a title past the unique-term cap. `alt` is in neither:
+/// it describes the event for clients that cannot show its kind.
+const NAME_TAGS: [&str; 3] = ["title", "subject", "name"];
+const SUMMARY_TAGS: [&str; 2] = ["summary", "description"];
 /// A profile's metadata fields that search indexes, in indexing order.
 const PROFILE_FIELDS: [&str; 4] = ["name", "display_name", "nip05", "about"];
 
@@ -127,13 +130,41 @@ struct EventContent<'a> {
 #[derive(Deserialize)]
 struct EventText<'a> {
     #[serde(borrow, default)]
-    tags: Vec<Vec<Text<'a>>>,
+    tags: Vec<Tag<'a>>,
     #[serde(borrow)]
     content: Cow<'a, str>,
 }
 
+/// A tag as search reads it. strfry stores tags whose elements are not all
+/// strings, such as a NIP-13 nonce's numeric difficulty: search skips what it
+/// does not read rather than fail the event.
 #[derive(Deserialize)]
-struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
+#[serde(untagged)]
+enum Tag<'a> {
+    Elements(#[serde(borrow)] Vec<TagElement<'a>>),
+    Other(IgnoredAny),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TagElement<'a> {
+    Text(#[serde(borrow)] Cow<'a, str>),
+    Other(IgnoredAny),
+}
+
+impl<'a> Tag<'a> {
+    /// The tag's name and first value, when both are strings.
+    fn name_and_value(self) -> Option<(Cow<'a, str>, Cow<'a, str>)> {
+        let Tag::Elements(elements) = self else {
+            return None;
+        };
+        let mut elements = elements.into_iter();
+        match (elements.next()?, elements.next()?) {
+            (TagElement::Text(name), TagElement::Text(value)) => Some((name, value)),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct EventKind {
@@ -146,7 +177,7 @@ fn parse_event<'a, T: Deserialize<'a>>(json: &'a str) -> Result<T, DbError> {
 }
 
 /// The text an event of `kind` is searched by, in indexing order: for a text
-/// kind, its title tags then its content; for a profile, the metadata fields
+/// kind, its name tags, its summary tags, then its content; for a profile, the metadata fields
 /// a person is looked up by. Nothing for any other kind. The index, removal,
 /// `wok doctor`, reindex, live matching and the phrase boost all read this,
 /// so a stored event and a live one match the same searches.
@@ -166,18 +197,18 @@ fn search_document(kind: u64, json: &str) -> Result<Vec<Cow<'_, str>>, DbError> 
         return Ok(Vec::new());
     }
     let event = parse_event::<EventText<'_>>(json)?;
-    let mut document: Vec<_> = event
+    let (names, summaries): (Vec<_>, Vec<_>) = event
         .tags
         .into_iter()
-        .filter_map(|tag| {
-            let mut tag = tag.into_iter();
-            let name = tag.next()?;
-            TITLE_TAGS
-                .contains(&name.0.as_ref())
-                .then(|| tag.next())
-                .flatten()
-                .map(|value| value.0)
+        .filter_map(Tag::name_and_value)
+        .filter(|(name, _)| {
+            NAME_TAGS.contains(&name.as_ref()) || SUMMARY_TAGS.contains(&name.as_ref())
         })
+        .partition(|(name, _)| NAME_TAGS.contains(&name.as_ref()));
+    let mut document: Vec<_> = names
+        .into_iter()
+        .chain(summaries)
+        .map(|(_, value)| value)
         .collect();
     document.push(event.content);
     Ok(document)
@@ -590,22 +621,88 @@ mod tests {
         let json = serde_json::json!({
             "tags": [
                 ["d", "slug"],
-                ["title", "Relay Design"],
+                ["summary", format!("Why LMDB {content}")],
                 ["alt", "Long-form article: fallback"],
-                ["summary", "Why LMDB"],
+                ["title", "Relay Design"],
                 ["t", "hashtag"],
             ],
-            "content": content,
+            "content": "body",
         })
         .to_string();
+        // The title is indexed first, though a long summary comes before it.
         let terms = event_search_terms(30023, &json).unwrap();
         assert_eq!(terms.len(), MAX_INDEXED_UNIQUE_TERMS);
         for term in ["relay", "design", "why", "lmdb", "word0", "word251"] {
             assert!(terms.contains(term), "{term}");
         }
-        for term in ["slug", "fallback", "hashtag", "word252"] {
+        for term in ["slug", "fallback", "hashtag", "word252", "body"] {
             assert!(!terms.contains(term), "{term}");
         }
+    }
+
+    /// strfry stores tags whose elements are not all strings, such as a
+    /// NIP-13 nonce's numeric difficulty. Search skips them: rebuilding the
+    /// index on open, deleting and the doctor all handle such a note.
+    #[test]
+    fn a_tag_element_that_is_not_a_string_is_skipped() {
+        let json = |id: u8| {
+            serde_json::json!({
+                "id": wok_event::to_hex(&[id; 32]),
+                "pubkey": wok_event::to_hex(&[9; 32]),
+                "created_at": 1,
+                "kind": 1,
+                "tags": [["nonce", "7", 21], ["title", 3], [5, "x"], 6, ["subject", "Mined"]],
+                "content": "hello world",
+                "sig": "00".repeat(64),
+            })
+            .to_string()
+        };
+        assert_eq!(
+            event_search_terms(1, &json(1)).unwrap(),
+            search_term_set("mined hello world")
+        );
+        assert!(check_event_text(&json(1)).is_ok());
+
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut events: Vec<_> = (1..=2)
+                .map(|id| {
+                    let packed = wok_event::PackedEventBuilder::build(
+                        &[id; 32],
+                        &[9; 32],
+                        1,
+                        1,
+                        0,
+                        &wok_event::PackedEventTagBuilder::default(),
+                    )
+                    .unwrap();
+                    crate::EventToWrite::new(packed.into_bytes(), json(id))
+                })
+                .collect();
+            let mut txn = env.begin_rw().unwrap();
+            crate::write_events(&mut txn, &mut crate::NoopNegentropy, &mut events, false).unwrap();
+            // An index on another schema is rebuilt on the next open.
+            let dbi = env.dbis().event_search.unwrap();
+            txn.del(dbi, SEARCH_SCHEMA_KEY, None).unwrap();
+            txn.put(dbi, SEARCH_SCHEMA_KEY, &99_u64.to_ne_bytes(), 0)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(search_posting_count(&txn, "mined").unwrap(), 2);
+        let report = crate::check_integrity(&txn).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
+        drop(txn);
+        let mut txn = env.begin_rw().unwrap();
+        assert!(crate::delete_event_basic(&mut txn, 1).unwrap());
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(search_posting_count(&txn, "mined").unwrap(), 1);
+        let report = crate::check_integrity(&txn).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
     }
 
     #[test]

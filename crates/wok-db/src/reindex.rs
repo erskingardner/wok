@@ -1,6 +1,7 @@
 //! Build a fresh database from authoritative primary records and derive every
 //! event secondary index from PackedEvent again.
 
+use crate::env::Dbis;
 use crate::long_tags::{long_tag_packing, LongTagPacking};
 use crate::tag_kind::{initialize_tag_kind_index_state, put_tag_kind_entries, tag_kind_keys};
 use crate::write::{
@@ -45,6 +46,18 @@ pub struct ReindexStats {
     pub deleted_versions: BTreeSet<u64>,
 }
 
+/// Tables of records that events don't derive, which a rebuild copies
+/// unchanged. Meta is copied too, then given this release's version. The
+/// Wok tables are absent from a strfry v3 source.
+fn copied_tables(dbis: Dbis) -> [Option<lmdb_sys::MDB_dbi>; 4] {
+    [
+        Some(dbis.negentropy_filter),
+        Some(dbis.compression_dictionary),
+        dbis.vanish_pubkey,
+        dbis.moderation,
+    ]
+}
+
 fn copy_table(
     source: &RoTxn<'_>,
     target: &mut RwTxn<'_>,
@@ -78,7 +91,6 @@ pub fn rebuild_primary_and_event_indices(
     let target_dbis = target.env().dbis();
     let mut dbis_to_clear = vec![
         target_dbis.meta,
-        target_dbis.negentropy_filter,
         target_dbis.event,
         target_dbis.event_id,
         target_dbis.event_pubkey_kind,
@@ -90,15 +102,11 @@ pub fn rebuild_primary_and_event_indices(
         target_dbis.event_replace_deletion,
         target_dbis.event_kind,
         target_dbis.event_expiration,
-        target_dbis.compression_dictionary,
         target_dbis.event_payload,
         target_dbis.negentropy,
     ];
     if let Some(event_search) = target_dbis.event_search {
         dbis_to_clear.push(event_search);
-    }
-    if let Some(vanish_pubkey) = target_dbis.vanish_pubkey {
-        dbis_to_clear.push(vanish_pubkey);
     }
     if let Some(event_tag_kind) = target_dbis.event_tag_kind {
         dbis_to_clear.push(event_tag_kind);
@@ -113,22 +121,17 @@ pub fn rebuild_primary_and_event_indices(
         crate::state::reset_for_reindex(source, target)?;
     }
 
-    copy_table(
-        source,
-        target,
-        source_dbis.negentropy_filter,
-        target_dbis.negentropy_filter,
-    )?;
-    copy_table(
-        source,
-        target,
-        source_dbis.compression_dictionary,
-        target_dbis.compression_dictionary,
-    )?;
-    if let (Some(source_vanish), Some(target_vanish)) =
-        (source_dbis.vanish_pubkey, target_dbis.vanish_pubkey)
+    for (source_dbi, target_dbi) in copied_tables(source_dbis)
+        .into_iter()
+        .zip(copied_tables(target_dbis))
     {
-        copy_table(source, target, source_vanish, target_vanish)?;
+        let Some(target_dbi) = target_dbi else {
+            continue;
+        };
+        target.clear(target_dbi)?;
+        if let Some(source_dbi) = source_dbi {
+            copy_table(source, target, source_dbi, target_dbi)?;
+        }
     }
     let payloads = copy_table(
         source,

@@ -376,6 +376,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the NIP-62 backfill miss requests at 0. A request at `created_at` 0 now
   leaves a marker like any other, so the key's events at 0 and the gift
   wraps that p-tag it are deleted; before, it was stored and did nothing.
+- `wok reindex` keeps the NIP-86 moderation records (#241). It copied the
+  other tables that events don't derive but not `wok_Moderation`, so the
+  database it promoted had no bans, allowlist entries, roles, kind policy,
+  IP blocks or reports: banned pubkeys and events were served again, every
+  kind was accepted, pubkeys given the `admin` or `moderator` role lost
+  management access, and under the `members` policies only `admin.pubkeys`
+  were still members. **A database reindexed by an earlier release has lost
+  these records**, but the backup reindex kept
+  (`<database>.pre-reindex-<timestamp>`, or the `--backup` path) still holds
+  them. With the relay stopped, `mdb_dump -s wok_Moderation <backup> |
+  mdb_load -s wok_Moderation <database>` copies them back. Each replaces
+  the record with the same key, and records under other keys stay. That also
+  undoes what changed since the reindex, such as a lifted ban, a revoked
+  role or a new kind map, so then repeat, in order, every NIP-86
+  management call made since, before letting clients back in. After more
+  than one such reindex, restore from the backup the first one kept and
+  repeat every call made since then.
 
 ### Added
 

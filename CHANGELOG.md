@@ -350,6 +350,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access. Existing files keep their mode: `chmod g-w,o= data.mdb lock.mdb`
   in the database directory narrows them. The example systemd unit's
   `UMask=0077` and `0700` state directory already kept other users out.
+- `wok reindex` keeps the NIP-86 moderation records (#241). It copied the
+  other tables that events don't derive but not `wok_Moderation`, so the
+  database it promoted had no bans, allowlist entries, roles, kind policy,
+  IP blocks or reports: banned pubkeys and events were served again, every
+  kind was accepted, pubkeys given the `admin` or `moderator` role lost
+  management access, and under the `members` policies only `admin.pubkeys`
+  were still members. **A database reindexed by an earlier release has lost
+  these records**, but the backup reindex kept
+  (`<database>.pre-reindex-<timestamp>`, or the `--backup` path) still holds
+  them. With the relay stopped, LMDB's own tools copy them back and leave
+  every record written since in place: `mdb_dump -s wok_Moderation <backup>
+  | mdb_load -N -s wok_Moderation <database>`. After more than one such
+  reindex, run it for each backup, newest first.
 
 ### Added
 

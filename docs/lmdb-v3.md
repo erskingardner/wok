@@ -278,8 +278,9 @@ identity, opens negentropy trees, and diagnoses version, endianness, capacity,
 config, plugin, and socket-path problems.
 
 `wok reindex --confirm-relay-stopped` repairs damage confined to derived
-event/negentropy indexes or author counters. It copies authoritative Meta, filter, dictionary,
-PackedEvent, and EventPayload records into a sibling staging database,
+event/negentropy indexes or author counters. It copies authoritative Meta, negentropy filter,
+compression dictionary, NIP-62 vanish marker, NIP-86 moderation, PackedEvent, and EventPayload
+records into a sibling staging database,
 repacking PackedEvent records that dropped long tag values (see
 [PackedEvent](#packedevent)), derives all indexes again, `wok_Event__tagKind`
 included and marked complete, deletes the versions

@@ -41,6 +41,8 @@ except from a backup.
 
 With the relay stopped, `wok reindex --confirm-relay-stopped` can repair derived
 indexes and author counts while retaining the original database as a backup.
+It copies the records events don't derive unchanged: negentropy filters,
+compression dictionaries, NIP-62 vanish markers and NIP-86 moderation records.
 It preserves the stored sequence even when the newest events have been deleted.
 A malformed or regressed sequence is metadata corruption and blocks reindex:
 surviving records cannot establish the lost deletion history. Use a trusted

@@ -8,6 +8,9 @@
 //! relay. It never calls the relay's crates itself: it signs events, frames
 //! Unix messages and holds its NIP-77 message on its own, so that what the
 //! script counts is what the relay ran.
+//!
+//! Its relays run without the maintenance timer: no caller sends a tick, and
+//! whether one lands in a phase depends on how long the phase takes.
 
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
@@ -33,7 +36,7 @@ fn profile() -> (String, wok_relay::Config) {
 #[ignore = "run by scripts/attack-surface-reach.py"]
 async fn reach_startup() {
     let (_, cfg) = profile();
-    let relay = Relay::start(cfg.clone()).await;
+    let relay = Relay::start_without_maintenance(cfg.clone()).await;
     let _unix = unix_listener(&relay, &cfg, my_uid()).await;
     stop(relay).await;
 }
@@ -43,7 +46,7 @@ async fn reach_startup() {
 #[ignore = "run by scripts/attack-surface-reach.py"]
 async fn reach_anonymous() {
     let (_, cfg) = profile();
-    let relay = Relay::start(cfg.clone()).await;
+    let relay = Relay::start_without_maintenance(cfg.clone()).await;
     let mut conn = Conn::Ws(Box::new(Wire::connect(relay.addr).await));
     anonymous_messages(&mut conn, &cfg).await;
     conn.close().await;
@@ -67,7 +70,7 @@ async fn reach_authenticated() {
     if !cfg.auth_usable() {
         return;
     }
-    let relay = Relay::start(cfg.clone()).await;
+    let relay = Relay::start_without_maintenance(cfg.clone()).await;
     let mut wire = Conn::Ws(Box::new(Wire::connect(relay.addr).await));
     let challenge = wire.challenge().await;
     let author = key(1);
@@ -129,7 +132,7 @@ async fn reach_admin() {
     if !cfg.admin.enabled {
         return;
     }
-    let relay = Relay::start(cfg.clone()).await;
+    let relay = Relay::start_without_maintenance(cfg.clone()).await;
     let admin = key(1);
     let public_url = cfg.admin.public_url.clone();
     for (method, path, body) in [
@@ -217,7 +220,7 @@ async fn reach_admin() {
 #[ignore = "run by scripts/attack-surface-reach.py"]
 async fn reach_local() {
     let (_, cfg) = profile();
-    let relay = Relay::start(cfg.clone()).await;
+    let relay = Relay::start_without_maintenance(cfg.clone()).await;
     if let Some((_dir, path)) = unix_listener(&relay, &cfg, my_uid()).await {
         let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         let mut conn = Conn::Unix(stream, Vec::new());

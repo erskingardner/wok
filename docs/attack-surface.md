@@ -308,7 +308,13 @@ queued their teardown before it stops the relay, so a connection's teardown
 is counted in the phase that opened it. The probe shares its process with
 the relay, so it signs events, frames Unix messages and builds its NIP-77
 message without the relay's crates: every function counted is one the relay
-ran.
+ran. Its relays run without the maintenance timer, which every two seconds
+has the writer delete expired events and sweep the events of authors who
+vanished (NIP-62). No caller sends that tick, and whether the first one lands
+inside a phase depends on how long the phase takes on the runner, so the
+admin phase, with its wait of a second, would count it on a slow run and not
+on a fast one. Code that maintenance shares with a request is still counted
+in the phase whose request runs it.
 
 From each run it keeps the functions of the relay crates (`wok-relay`,
 `wok-ws`, `wok-unix`, `wok-event`, `wok-query`, `wok-negentropy` and

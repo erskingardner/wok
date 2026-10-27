@@ -46,6 +46,9 @@ RELAY_CRATES = re.compile(r"crates/wok-(relay|ws|unix|event|query|negentropy|db)
 PHASES = ["startup", "anonymous", "authenticated", "admin", "local"]
 # Background code that timers and file watchers run whenever they fire, not
 # because of anything a client sent; whether it lands in a phase is timing.
+# The maintenance timer is off in the probe instead: requests also run the
+# code it runs, such as deleting an event, so dropping that by name would
+# hide what they reach.
 BACKGROUND = re.compile(r"::run_db_watch\b")
 HASH = re.compile(r"::h[0-9a-f]{16}$")
 CLOSURE = re.compile(r"\{closure#\d+\}")

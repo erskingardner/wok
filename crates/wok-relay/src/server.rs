@@ -1479,6 +1479,19 @@ impl RelayHandle {
 }
 
 pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
+    start_relay(env, config, true)
+}
+
+/// [`start`] without the maintenance timer, so the writer never runs
+/// maintenance: expired events and vanished authors' events stay stored, and
+/// the tag-kind index is checked only at start. For the reachability probe in
+/// `wok-compat`, which counts what each phase's requests reach: a tick lands
+/// inside a phase only when the phase runs past it.
+pub fn start_without_maintenance(env: Env, config: Config) -> Result<RelayHandle, String> {
+    start_relay(env, config, false)
+}
+
+fn start_relay(env: Env, config: Config, maintenance: bool) -> Result<RelayHandle, String> {
     if let Some(error) = config.serving_error() {
         return Err(error);
     }
@@ -1653,7 +1666,7 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
             .map(worker)
             .map_err(|e| e.to_string())?;
     }
-    {
+    if maintenance {
         let shutdown = shutdown.clone();
         thread::Builder::new()
             .name("cron".into())

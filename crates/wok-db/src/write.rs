@@ -191,18 +191,11 @@ fn original_tag_value(json: &str, name: &str, packed_value: &[u8]) -> Result<Vec
 /// The `event_replace` key of an event: its author and the value of its first
 /// `d` tag, then its kind. An event without a `d` tag has none.
 pub(crate) fn replace_key(packed: PackedEventView<'_>) -> Option<Vec<u8>> {
-    let mut key = None;
-    packed.foreach_tag(|tag_name, tag_val| {
-        if tag_name != 'd' {
-            return true;
-        }
-        let mut s = Vec::with_capacity(32 + tag_val.len());
-        s.extend_from_slice(packed.pubkey());
-        s.extend_from_slice(tag_val);
-        key = Some(make_key_string_u64(&s, packed.kind()));
-        false
-    });
-    key
+    let d = packed.first_d_tag()?;
+    let mut s = Vec::with_capacity(32 + d.len());
+    s.extend_from_slice(packed.pubkey());
+    s.extend_from_slice(&d);
+    Some(make_key_string_u64(&s, packed.kind()))
 }
 
 fn index_event(packed: PackedEventView<'_>) -> EventIndices {

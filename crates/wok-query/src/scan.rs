@@ -364,8 +364,6 @@ struct SearchScan {
     overflow: Option<u64>,
     /// A match was hidden by the restricted-read rule alone.
     restricted: bool,
-    /// Reads a match's content for its phrase boost.
-    decompressor: Decompressor,
 }
 
 struct SearchGroupScan {
@@ -391,6 +389,7 @@ impl SearchGroupScan {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process<H>(
         &mut self,
         snapshot: &ReadSnapshot<'_>,
@@ -398,6 +397,7 @@ impl SearchGroupScan {
         latest_event_id: u64,
         time_budget_us: u64,
         visibility: &ReadVisibility,
+        decompressor: &mut Decompressor,
         mut handle_event: H,
     ) -> Result<bool, wok_db::DbError>
     where
@@ -414,6 +414,7 @@ impl SearchGroupScan {
                     latest_event_id,
                     remaining_us,
                     visibility,
+                    decompressor,
                 )?;
                 if !complete {
                     return Ok(false);
@@ -483,7 +484,6 @@ impl SearchScan {
             approx_work: 0,
             overflow: None,
             restricted: false,
-            decompressor: Decompressor::new(),
         })
     }
 
@@ -498,7 +498,7 @@ impl SearchScan {
     }
 
     // `is_multiple_of` is not available at Wok's Rust 1.85 MSRV.
-    #[allow(clippy::manual_is_multiple_of)]
+    #[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
     fn gather(
         &mut self,
         snapshot: &ReadSnapshot<'_>,
@@ -506,6 +506,9 @@ impl SearchScan {
         latest_event_id: u64,
         time_budget_us: u64,
         visibility: &ReadVisibility,
+        // Reads a match's content for its phrase boost. The caller's, so a
+        // paused search holds no decompression buffer.
+        decompressor: &mut Decompressor,
     ) -> Result<bool, wok_db::DbError> {
         let txn = snapshot.txn();
         if self.gathering_complete {
@@ -597,8 +600,7 @@ impl SearchScan {
                 // A payload that does not decode ranks without the boost;
                 // sending the event reports it.
                 let pairs = match txn.get_u64(txn.env().dbis().event_payload, lev_id) {
-                    Ok(Some(raw)) => self
-                        .decompressor
+                    Ok(Some(raw)) => decompressor
                         .decode(txn, raw, PHRASE_PAYLOAD_BOUND)
                         .and_then(|json| count_phrase_pairs(packed.kind(), json, &phrase_pairs))
                         .unwrap_or(0),
@@ -637,6 +639,7 @@ impl SearchScan {
         Ok(completed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan<H>(
         &mut self,
         snapshot: &ReadSnapshot<'_>,
@@ -644,6 +647,7 @@ impl SearchScan {
         latest_event_id: u64,
         time_budget_us: u64,
         visibility: &ReadVisibility,
+        decompressor: &mut Decompressor,
         mut handle_event: H,
     ) -> Result<bool, wok_db::DbError>
     where
@@ -655,6 +659,7 @@ impl SearchScan {
             latest_event_id,
             time_budget_us,
             visibility,
+            decompressor,
         )? {
             return Ok(false);
         }
@@ -1316,8 +1321,24 @@ impl DbQuery {
     pub fn process<F>(
         &mut self,
         txn: &RoTxn<'_>,
+        cb: F,
+        time_budget_us: u64,
+    ) -> Result<bool, wok_db::DbError>
+    where
+        F: FnMut(&Subscription, u64),
+    {
+        self.process_with(txn, cb, time_budget_us, &mut Decompressor::new())
+    }
+
+    /// [`Self::process`], reading a search's matches through `decompressor`.
+    /// A scheduler lends every query the same one, so its buffer, sized for
+    /// the largest payload, is held once rather than by each paused search.
+    pub fn process_with<F>(
+        &mut self,
+        txn: &RoTxn<'_>,
         mut cb: F,
         time_budget_us: u64,
+        decompressor: &mut Decompressor,
     ) -> Result<bool, wok_db::DbError>
     where
         F: FnMut(&Subscription, u64),
@@ -1354,6 +1375,7 @@ impl DbQuery {
                 self.sub.latest_event_id,
                 time_budget_us,
                 &self.visibility,
+                decompressor,
                 |lev_id| {
                     let pubkey = match Self::visible_event_pubkey(
                         &snapshot,
@@ -1510,6 +1532,7 @@ impl DbQuery {
                     latest,
                     time_budget_us.saturating_sub(elapsed_us()),
                     &self.visibility,
+                    decompressor,
                     &mut handle,
                 )?,
             };
@@ -1655,10 +1678,19 @@ fn foreach_visible_match(
     cb: &mut impl FnMut(u64),
 ) -> Result<(), wok_db::DbError> {
     let snapshot = ReadSnapshot::for_stored(txn);
+    let mut decompressor = Decompressor::new();
     if !filters.is_empty() && filters.iter().all(|f| f.search.is_some()) {
         // A REQ's searches are ranked together, as `DbQuery` does.
         let mut group = SearchGroupScan::new(filters, txn)?;
-        while !group.process(&snapshot, filters, u64::MAX, u64::MAX, visibility, &mut *cb)? {}
+        while !group.process(
+            &snapshot,
+            filters,
+            u64::MAX,
+            u64::MAX,
+            visibility,
+            &mut decompressor,
+            &mut *cb,
+        )? {}
         return Ok(());
     }
     let mut sent = Vec::with_capacity(filters.len());
@@ -1705,7 +1737,15 @@ fn foreach_visible_match(
             if f.search.is_some() {
                 let mut scan = SearchScan::new(f, txn)?;
                 // A search yields every few thousand postings.
-                while !scan.scan(&snapshot, f, u64::MAX, u64::MAX, visibility, &mut handle)? {}
+                while !scan.scan(
+                    &snapshot,
+                    f,
+                    u64::MAX,
+                    u64::MAX,
+                    visibility,
+                    &mut decompressor,
+                    &mut handle,
+                )? {}
             } else {
                 DbScan::new(f, txn).scan(txn, f, &mut handle, |_| false)?;
             }

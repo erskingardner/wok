@@ -212,6 +212,10 @@ enum Command {
         filter: Option<String>,
         #[arg(long)]
         no_verify: bool,
+        /// Abort after this many seconds without the handshake, an event or
+        /// EOSE (0 disables).
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
     },
     Router {
         /// Router config file (taocpp::config format)
@@ -416,7 +420,8 @@ async fn main() -> Result<()> {
             url,
             filter,
             no_verify,
-        } => cmd_download(&cfg, url, filter, no_verify).await,
+            timeout,
+        } => cmd_download(&cfg, url, filter, no_verify, timeout).await,
         Command::Router { router_config_file } => router::run_router(cfg, router_config_file).await,
     }
 }
@@ -1846,11 +1851,45 @@ fn upload_line_id(line: &str) -> Result<String> {
     Ok(id.to_owned())
 }
 
+/// NIP-01's machine-readable refusal prefixes, and the `ERROR:` strfry and Wok
+/// put on a REQ they cannot parse. A NOTICE without one, such as a greeting,
+/// does not stop `wok download`.
+const REFUSAL_PREFIXES: [&str; 7] = [
+    "error",
+    "auth-required",
+    "restricted",
+    "invalid",
+    "blocked",
+    "rate-limited",
+    "unsupported",
+];
+
+fn notice_refuses(notice: &str) -> bool {
+    REFUSAL_PREFIXES.iter().any(|prefix| {
+        notice
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && notice[prefix.len()..].starts_with(':')
+    })
+}
+
+/// Awaits `future` until `deadline`, or for as long as it takes without one.
+async fn until<T>(
+    deadline: Option<tokio::time::Instant>,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await.ok(),
+        None => Some(future.await),
+    }
+}
+
 async fn cmd_download(
     cfg: &Config,
     url: String,
     filter: Option<String>,
     no_verify: bool,
+    timeout: u64,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -1858,12 +1897,26 @@ async fn cmd_download(
         tracing::warn!("not verifying event IDs or signatures!");
     }
     let limits = cfg.event_limits();
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    // A relay that stalls holds the socket open as long as tungstenite answers
+    // its pings, so only a deadline ends the wait.
+    let idle = (timeout > 0).then(|| std::time::Duration::from_secs(timeout));
+    let next_deadline = || idle.and_then(|idle| tokio::time::Instant::now().checked_add(idle));
+    let Some(connected) = until(next_deadline(), tokio_tungstenite::connect_async(&url)).await
+    else {
+        bail!("download failed: no WebSocket handshake within {timeout}s");
+    };
+    let (mut ws, _) = connected?;
     let filter = filter.unwrap_or_else(|| "{}".into());
     let req = format!(r#"["REQ","_",{filter}]"#);
     ws.send(Message::Text(req.into())).await?;
     let (mut printed, mut rejected, mut eose) = (0u64, 0u64, false);
-    while let Some(msg) = ws.next().await {
+    let mut answered = false;
+    let mut deadline = next_deadline();
+    loop {
+        let Some(msg) = until(deadline, ws.next()).await else {
+            bail!("download incomplete: no event or EOSE for {timeout}s; {printed} printed, {rejected} rejected");
+        };
+        let Some(msg) = msg else { break };
         // Reading on past a ping flushes tungstenite's queued pong.
         let text = match msg? {
             Message::Text(text) => text,
@@ -1878,22 +1931,41 @@ async fn cmd_download(
                 continue;
             }
         };
-        if v[0] == "EOSE" {
-            eose = true;
-            break;
-        }
-        if v[0] == "EVENT" {
-            match downloaded_event_json(&v[2], no_verify, &limits) {
-                Ok(json) => {
-                    cli_println!("{json}");
-                    printed += 1;
+        match v[0].as_str().unwrap_or_default() {
+            "EOSE" => {
+                eose = true;
+                break;
+            }
+            "EVENT" => {
+                match downloaded_event_json(&v[2], no_verify, &limits) {
+                    Ok(json) => {
+                        cli_println!("{json}");
+                        printed += 1;
+                    }
+                    Err(error) => {
+                        rejected += 1;
+                        let id = v[2]["id"].as_str().unwrap_or_default();
+                        tracing::warn!(id, %error, "download rejected event");
+                    }
                 }
-                Err(error) => {
-                    rejected += 1;
-                    let id = v[2]["id"].as_str().unwrap_or_default();
-                    tracing::warn!(id, %error, "download rejected event");
+                answered = true;
+                deadline = next_deadline();
+            }
+            "CLOSED" if v[1] == "_" => bail!(
+                "download refused: relay closed the subscription: {}; {printed} printed, {rejected} rejected",
+                v[2]
+            ),
+            "NOTICE" => {
+                tracing::warn!(notice = %v[1], "download relay NOTICE");
+                // Once events flow, a NOTICE concerns something else.
+                if !answered && v[1].as_str().is_some_and(notice_refuses) {
+                    bail!(
+                        "download refused: relay NOTICE {}; {printed} printed, {rejected} rejected",
+                        v[1]
+                    );
                 }
             }
+            _ => {}
         }
     }
     if !eose {
@@ -2399,5 +2471,26 @@ mod main_tests {
         // Verification off still refuses what is not an event.
         assert!(downloaded_event_json(&json!(null), true, &limits).is_err());
         assert!(downloaded_event_json(&json!({"kind": 1}), true, &limits).is_err());
+    }
+
+    #[test]
+    fn download_treats_only_prefixed_notices_as_refusals() {
+        for refusal in [
+            "ERROR: bad msg: invalid filter",
+            "auth-required: sign in first",
+            "Restricted: members only",
+            "rate-limited:",
+        ] {
+            assert!(notice_refuses(refusal), "{refusal}");
+        }
+        for other in [
+            "",
+            "Welcome to the relay",
+            "errors are logged",
+            "error",
+            "é error: not a prefix",
+        ] {
+            assert!(!notice_refuses(other), "{other}");
+        }
     }
 }

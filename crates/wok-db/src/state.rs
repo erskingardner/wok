@@ -1,6 +1,12 @@
 //! Transactional bookkeeping, separate from signed primary records.
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::keys::make_key_string_u64;
 use crate::{DbError, RoTxn, RwTxn};
+
+/// Author counters that a deletion in this process found below the author's
+/// stored events, and dropped so that the next quota check counts them again.
+pub static AUTHOR_COUNT_DRIFT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const HIGH_WATER: &[u8] = b"sequence";
 pub(crate) const SUPERSEDED_EVENTS: &[u8] = b"superseded-versions";
@@ -76,7 +82,9 @@ pub fn author_count(txn: &mut RwTxn<'_>, pubkey: &[u8]) -> Result<u64, DbError> 
     txn.foreach_full(
         txn.env().dbis().event_pubkey,
         &make_key_string_u64(pubkey, 0),
-        &[],
+        // The first duplicate. Without one, the scan skips the events stored
+        // under an existing `(pubkey, 0)` key: those at created_at 0.
+        &0u64.to_ne_bytes(),
         false,
         |k, _| {
             if !k.starts_with(pubkey) {
@@ -113,10 +121,24 @@ pub fn change_author_count(
     };
     let count = if insert {
         old.checked_add(1)
+            .ok_or_else(|| DbError::msg("author count overflow"))?
+    } else if let Some(count) = old.checked_sub(1) {
+        count
     } else {
-        old.checked_sub(1)
-    }
-    .ok_or_else(|| DbError::msg("author count overflow or drift"))?;
+        // The event being deleted is still stored, so this counter is below
+        // the author's events: earlier releases missed those at created_at 0
+        // when they counted. Failing here would abort the whole batch, so drop
+        // the counter, as if never requested, for the next quota check to
+        // count from the author index.
+        AUTHOR_COUNT_DRIFT.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            pubkey = %wok_event::to_hex(pubkey),
+            "author count was below the author's stored events; dropped to be counted again"
+        );
+        txn.author_counts.remove(&key);
+        txn.del(dbi, &key, None)?;
+        return Ok(());
+    };
     txn.author_counts.insert(key, count);
     Ok(())
 }

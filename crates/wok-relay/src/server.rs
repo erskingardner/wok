@@ -2711,9 +2711,16 @@ fn ingest_event(
     dispatch: &mut Dispatch,
 ) {
     let claimed_kind = orig.get("kind").and_then(Value::as_u64);
+    // A vanish request `kind_refusal` lets through targets this relay, and
+    // NIP-62 requires it to be honored whatever the user's status, so it
+    // needs no proof of work. Verification still holds it to its stated kind
+    // and tags.
     let refusal = claimed_kind
         .and_then(|kind| kind_refusal(cfg, metrics, moderation, kind, &orig))
-        .or_else(|| pow_refusal(cfg, metrics, &orig));
+        .or_else(|| match claimed_kind {
+            Some(VANISH_KIND) => None,
+            _ => pow_refusal(cfg, metrics, &orig),
+        });
     if let Some(message) = refusal {
         let id = orig.get("id").and_then(Value::as_str).unwrap_or("?");
         conns.send(
@@ -2821,8 +2828,9 @@ fn ingest_event(
         }
         grant
     };
-    // The vanish request's relay tag and the proof of work were checked
-    // before the event was verified (`kind_refusal`, `pow_refusal`).
+    // A vanish request's relay tag, and any other event's proof of work,
+    // were checked before the event was verified (`kind_refusal`,
+    // `pow_refusal`).
     if cfg.relay.abuse.enabled {
         // An event signed by a key that is not one of the connection's AUTHed
         // identities, such as a Marmot 445 from a fresh key per event or a
@@ -3066,7 +3074,8 @@ fn kind_refusal(
 /// NIP-13 proof of work, counted from the id the event states, before that
 /// id is hashed and the signature verified: an id that does not match the
 /// event still fails verification afterwards. One that is not 64 lowercase
-/// hex digits is left to verification to refuse.
+/// hex digits is left to verification to refuse. The caller exempts NIP-62
+/// vanish requests.
 fn pow_refusal(cfg: &Config, metrics: &Metrics, event: &Value) -> Option<String> {
     let required = cfg.relay.abuse.min_pow_difficulty;
     if !cfg.relay.abuse.enabled || required == 0 {
@@ -6770,13 +6779,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn vanish_requests_pay_pow_and_author_budget() {
-        let vanish = |kp: &Keypair, content: &str| {
+    async fn vanish_requests_skip_pow_but_pay_the_author_budget() {
+        let vanish = |kp: &Keypair, relay: &str, content: &str| {
             sign_event_with_key(
                 json!({
                     "created_at": now_secs(),
                     "kind": VANISH_KIND,
-                    "tags": [["relay", "ALL_RELAYS"]],
+                    "tags": [["relay", relay]],
                     "content": content,
                 }),
                 kp,
@@ -6791,31 +6800,87 @@ mod tests {
             cfg.relay.auth.enabled = false;
             cfg.relay.nip62.service_url = "wss://relay.example.com".into();
             configure(&mut cfg);
-            (dir, start(env, cfg).unwrap())
+            (dir, env.clone(), start(env, cfg).unwrap())
         };
         let source = || TransportSource::ip_address("127.0.0.1".parse().unwrap());
         let mut rng = rand::thread_rng();
         let kp = Keypair::new(SECP256K1, &mut rng);
 
-        let (_dir, handle) = start_relay(&|cfg| cfg.relay.abuse.min_pow_difficulty = 255);
+        // #248: NIP-62 says a relay MUST honor a request to vanish that
+        // targets it, and clients do not mine proof of work for one.
+        let (_dir, env, handle) = start_relay(&|_| {});
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
         let conn = handle.next_conn_id();
         handle.register(conn, Outbound::new(tx, 0)).await;
+        let note = sign_event_with_key(
+            json!({
+                "created_at": now_secs() - 60,
+                "kind": 1,
+                "tags": [],
+                "content": "published before proof of work was required",
+            }),
+            &kp,
+        );
         handle
-            .client_message(
-                conn,
-                source(),
-                json!(["EVENT", vanish(&kp, "no-pow")]).to_string(),
-            )
+            .client_message(conn, source(), json!(["EVENT", note]).to_string())
+            .await;
+        let response = recv_outbound(&mut rx).await;
+        assert!(response.contains("true"), "{response}");
+        handle.config.write().relay.abuse.min_pow_difficulty = 255;
+        // Without proof of work, an ordinary event is refused, and so is a
+        // vanish request for another relay.
+        let unmined = sign_event_with_key(
+            json!({"created_at": now_secs(), "kind": 1, "tags": [], "content": "no-pow"}),
+            &kp,
+        );
+        for (event, expected) in [
+            (unmined, "pow: difficulty 255 required"),
+            (
+                vanish(&kp, "wss://other.example.com", "elsewhere"),
+                "blocked: vanish request not targeting this relay",
+            ),
+        ] {
+            handle
+                .client_message(conn, source(), json!(["EVENT", event]).to_string())
+                .await;
+            let response = recv_outbound(&mut rx).await;
+            assert!(response.contains(expected), "{expected}: {response}");
+        }
+        let request = vanish(&kp, "wss://relay.example.com", "no-pow");
+        handle
+            .client_message(conn, source(), json!(["EVENT", request]).to_string())
             .await;
         let response = recv_outbound(&mut rx).await;
         assert!(
-            response.contains("pow: difficulty 255 required"),
+            response.contains(request["id"].as_str().unwrap()) && response.contains("true"),
             "{response}"
         );
+        // The note is hidden at once, and maintenance deletes it.
+        let note_id: [u8; 32] = hex::decode(note["id"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let note_stored = || {
+            let txn = env.begin_ro().unwrap();
+            let stored = wok_db::lookup_event_by_id_ro(&txn, &note_id).unwrap();
+            if let Some((_, packed)) = &stored {
+                let vanished =
+                    is_event_vanished_ro(&txn, PackedEventView::new(packed).unwrap()).unwrap();
+                assert!(vanished, "the vanish request recorded no marker");
+            }
+            stored.is_some()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while note_stored() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "maintenance did not delete the note"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         handle.request_shutdown();
 
-        let (_dir, handle) = start_relay(&|cfg| {
+        let (_dir, _env, handle) = start_relay(&|cfg| {
             cfg.relay.abuse.pubkey_event_rate_per_second = 1;
             cfg.relay.abuse.pubkey_event_burst = 1;
         });
@@ -6827,7 +6892,7 @@ mod tests {
                 .client_message(
                     conn,
                     source(),
-                    json!(["EVENT", vanish(&kp, content)]).to_string(),
+                    json!(["EVENT", vanish(&kp, "ALL_RELAYS", content)]).to_string(),
                 )
                 .await;
         }

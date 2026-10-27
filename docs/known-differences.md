@@ -98,7 +98,9 @@ it is not a promise to reproduce upstream bugs.
   and per-author token buckets,
   pre-scan query costing, historical-query concurrency (excess scans wait
   their turn), author storage quotas,
-  and optional NIP-13 proof of work. Migrated configs receive the documented
+  and optional NIP-13 proof of work. A NIP-62 vanish request that targets the
+  relay needs no proof of work and is stored over the storage quotas, since
+  NIP-62 says a relay MUST honor it. Migrated configs receive the documented
   Wok defaults and the preflight prints them for review. Per-address buckets
   key an IPv6 client by its /64 (`relay.abuse.ipv6_prefix_len`), so a host
   cannot take a fresh budget from each address in its network; write-policy
@@ -156,6 +158,13 @@ it is not a promise to reproduce upstream bugs.
   using different wording is counted as `upload_rejected`, and the run exits
   nonzero even if replacement semantics explain the difference. Arbitrary
   human-readable rejection text is not treated as evidence of supersession.
+- `wok upload` exits nonzero when the relay refuses an event, other than as
+  superseded (classified as `wok sync` does), and when the connection closes
+  with acknowledgments outstanding. It matches each OK to an event it sent
+  by id. strfry's `upload` counts any OK, for any event, and exits 0 once
+  none is in flight, refusals included. Wok also sends only lines that are
+  JSON with a lowercase 32-byte hex `id`, and refuses `--pipeline 0`, with
+  which strfry's sends nothing and waits.
 - Negentropy tree filters are parsed without `relay.max_tags_per_filter` or
   `relay.max_and_entries`, which bound client filters. strfry parses stored
   tree filters with `relay__maxTagsPerFilter`, so lowering it below a tree's
@@ -348,6 +357,17 @@ regression test. Differential parity alone is not a reason to retain it.
   versions that a deletion with such a long `a` tag names. The repair keeps a
   record that packs differently in any other way, such as kind 41 history
   packed with a virtual `d`.
+- NIP-01 `#d` filters: the empty `d` that packing adds to replaceable and
+  addressable events, so that the first `d` sets the address, is not a tag
+  filters match. `#d:[""]` matches events with a `d` tag of that value, and
+  addressable events without a `d`, whose address it is. The pinned strfry
+  matches the added tag, so `#d:[""]` selects every replaceable event and
+  every addressable event whatever its `d`, and an `naddr` with an empty
+  identifier resolves to the author's newest event of that kind. The tag
+  indexes still hold the added tag, so a filter for the empty `d` reads each
+  candidate event. Kind 41 history packed by releases that treated it as
+  replaceable keeps its added `d`, and a tag with no value, such as `["t"]`,
+  is still matched as `["t",""]`, as in strfry.
 - NIP-01 kind ranges: kind 41 (NIP-28 channel metadata) is regular. The pinned
   strfry treats it as replaceable per author, so metadata for a second channel
   deleted the first channel's. Migrated kind 41 history stays stored and

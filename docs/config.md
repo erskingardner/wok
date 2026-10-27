@@ -325,7 +325,7 @@ the dashboard. An event that breaks one is refused with `OK false` and
 | `events.reject_ephemeral_older_than_secs` | `60` | Live subscribers, from replayed ephemeral events (kinds 20000–29999, such as NIP-46). AUTH and 21059 use their NIPs' windows. | Ephemeral messages from clients with slow clocks or queues are refused. | — |
 | `events.ephemeral_persistence` | `"live_only"` | Storage: `live_only` delivers ephemeral events to live subscribers without storing them; `ttl` stores them for `ephemeral_lifetime_secs`. | — | `ttl` removes NIP-59 from `supported_nips` |
 | `events.ephemeral_lifetime_secs` | `300` | How long a stored (`ttl`) ephemeral event stays readable. | Clients that reconnect miss recent ephemeral events. | — |
-| `relay.abuse.min_pow_difficulty` | `0` | Spam: the NIP-13 difficulty, in leading zero bits of the id, every event must meet. `0` is off. | — (too high: most clients can't post; few mine proof of work, and Marmot clients never do.) | `min_pow_difficulty`, always (0 while abuse protection is off); above 0 it also adds NIP-13 to `supported_nips` and sets `restricted_writes` |
+| `relay.abuse.min_pow_difficulty` | `0` | Spam: the NIP-13 difficulty, in leading zero bits of the id, every event must meet but a NIP-62 vanish request that targets this relay, which NIP-62 requires a relay to honor. `0` is off. | — (too high: most clients can't post; few mine proof of work, and Marmot clients never do.) | `min_pow_difficulty`, always (0 while abuse protection is off); above 0 it also adds NIP-13 to `supported_nips` and sets `restricted_writes` |
 | `relay.nip62.enabled` | `true` | NIP-62 Request to Vanish: accept requests to erase everything an author published here. | Off: users can't erase their data from this relay. Deletion markers stored earlier stay enforced. | NIP-62 in `supported_nips` |
 | `relay.nip62.service_url` | empty | The relay URL a targeted vanish request must name, compared as for AUTH; empty uses `relay.auth.service_url`. `ALL_RELAYS` always matches. | — | — |
 
@@ -381,7 +381,7 @@ may keep open. All reload live and are on the dashboard.
 | `relay.max_req_filter_size` | `262144` | Parse and live-matching memory per REQ, COUNT or NEG-OPEN, as compact JSON. | Outbox clients can't fetch a large follow list in one request. At 64 KiB, the default through 0.7, a REQ naming about 970 authors or more was refused. | — |
 | `relay.max_filter_bytes_per_connection` | `2097152` | Memory for the filters of every subscription open on one connection, and separately of its COUNTs not yet answered and of its NEG-OPEN sessions. `0` is unlimited. | Clients that keep several subscriptions over a long follow list open, such as a home feed and a profile feed, have new ones refused. | — |
 | `relay.max_subs_per_connection` | `200` | Live-matching memory per connection. It also bounds the queries waiting for the concurrency cap. | Apps that keep many subscriptions open have some refused with `blocked: too many concurrent REQs`. Clients use 30–100. | `max_subscriptions` |
-| `relay.max_filter_limit` | `2000` | Rows per filter: a filter's `limit` is clamped to it, and a filter without one gets it. | Results are cut, and clients make extra round trips. At 500, the default through 0.7, MDK's directory batches (`limit` 1,200) and outbox fetches without a `limit` lost events. | `max_limit`, `default_limit` |
+| `relay.max_filter_limit` | `2000` | Rows per filter: a filter's `limit` is clamped to it, and a filter without one gets it. Operator commands such as `wok scan`, `wok delete` and `wok dict` don't apply it. | Results are cut, and clients make extra round trips. At 500, the default through 0.7, MDK's directory batches (`limit` 1,200) and outbox fetches without a `limit` lost events. | `max_limit`, `default_limit` |
 | `relay.max_total_events_per_req` | `10000` | Rows per REQ over all its filters, deduplicated. `0` is unlimited. | Merged batches are cut. At 2,000, the default through 0.7, five filters of 500 lost a fifth of their events. | `max_total_events_per_req` |
 | `relay.max_tags_per_filter` | `8` | Residual tag checks on each candidate event: the distinct tag letters across `#` and NIP-91 `&` keys. `0` refuses every filter that names a tag. Negentropy tree filters are not limited. | Comment, community and marketplace queries are refused. At 3, the default through 0.7, a NIP-22 query on `#E`, `#K`, `#P` and `#k` was. | `max_tags_per_filter`; NIP-91 in `supported_nips` while it is above 0 |
 | `relay.max_and_entries` | `16` | NIP-91 checks on each candidate event: the values across all `&` keys of one filter. `0` turns NIP-91 off. | NIP-91 queries that require several tags are refused. | `max_and_entries`; NIP-91 in `supported_nips` while it and `max_tags_per_filter` are above 0 |
@@ -580,7 +580,10 @@ reason ending `for this address` for the backstop.
 Unix-socket connections carry no network address, so by design they bypass
 every rate bucket (connection, EVENT, REQ, COUNT, and the per-connection
 budgets) and the cap on open connections. Per-author publication, storage
-quotas, the query work ceiling and proof of work still apply to them. Keep
+quotas, the query work ceiling and proof of work still apply to them, except
+that NIP-62 vanish requests skip proof of work and the storage quotas (see
+[Storage](#storage)), so the disk reserve is what bounds a peer that signs
+one with each new key. Keep
 the socket on a trusted host with tight `mode`, `auth_uids` and `auth_gids`;
 the relay warns at startup, and `wok doctor` in its `unix-access` check, when
 the mode lets every local user connect and both allow-lists are empty.
@@ -677,15 +680,23 @@ on the dashboard; the database limits are restart settings, shown read-only.
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
 | `relay.abuse.max_stored_events_per_pubkey` | `1000000` | One key filling the disk. `0` is unlimited. | Active users and bots can no longer post new events. At quota, an author can still replace their own replaceable and addressable events and delete their own events. | — |
-| `relay.abuse.max_stored_events` | `0` | The disk, by a count of events in all. `0`, the public preset's value, is unlimited. | Once reached, every write on the relay fails. A busy public relay stores far more than 10,000,000 events, the default through 0.7. | — |
+| `relay.abuse.max_stored_events` | `0` | The disk, by a count of events in all. `0`, the public preset's value, is unlimited. | Once reached, every write on the relay fails but a NIP-62 vanish request. A busy public relay stores far more than 10,000,000 events, the default through 0.7. | — |
 | `database.min_free_disk_bytes` | `1073741824` | The filesystem: writes are refused before free space falls below this reserve. `0` turns the guard off. Restart. | Writes stop while the disk still has room. (Off or too small: the disk can fill, and the database with it.) | — |
 | `database.map_size` | `68719476736` | The LMDB map ceiling: writes fail atomically once the database reaches it. Address space only; the file grows as data is written. Restart. | Writes fail while the disk still has room. | — |
 
 A write over a quota is refused with `OK false`: `blocked: author storage
 quota exceeded`, or `error: global storage quota of <n> events exceeded` for
-the whole batch, or `error: disk reserve requires <n> free bytes`. Only a
+the whole writer batch, or `error: disk reserve requires <n> free bytes`. Only a
 deletion that removes none of the author's events is refused at quota,
 since it would add an event and free none.
+
+A NIP-62 vanish request that targets this relay is exempt from both quotas,
+since NIP-62 requires a relay to honor it: it is stored over them, and its
+author's events are then deleted. The global quota does not count the vanish
+requests in a batch, and when the rest of the batch is over it, they are
+written on their own. They are not exempt from the disk reserve, which bounds
+storage once the quotas do not (see
+[attack-surface.md](attack-surface.md#messages)).
 
 The per-author quota is charged to the event's author, so one throwaway key
 is held to it, while a new key per event starts a new count each time; even

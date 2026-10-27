@@ -1014,6 +1014,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A negentropy tree whose filter names more tag letters than
+  `relay.max_tags_per_filter` no longer makes every write fail (#243). The
+  writer parsed stored tree filters with that client-filter limit, so
+  lowering it, or a `wok negentropy add` of a filter with 9 or more tag
+  letters at the default of 8, refused every EVENT with `error: too many
+  tags in filter` and aborted every maintenance tick, stopping NIP-40 expiry
+  and NIP-62 sweeps. Stored trees now parse without the client-filter
+  limits, as `wok doctor` already checked them, and `wok negentropy add`
+  checks a new filter with that same parser. **It now refuses an array of
+  filters**, which it stored before though every write then failed on it.
 - A NEG-MSG sent before the relay replied to its session's NEG-OPEN, while
   the view built in memory is still being scanned, gets `invalid: NEG-MSG
   sent before the reply to NEG-OPEN`, and the session and its scan close

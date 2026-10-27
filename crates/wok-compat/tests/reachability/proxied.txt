@@ -1,7 +1,7 @@
 # Relay functions reached in the `proxied` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 752
+## anonymous: 757
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -570,7 +570,6 @@ wok_db::write::lookup_event_by_id
 wok_db::write::lookup_event_by_id::{closure}
 wok_db::write::original_tag_value
 wok_db::write::put_indices
-wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
 wok_event::hash::id_preimage
@@ -720,6 +719,11 @@ wok_ws::dispatch
 wok_ws::dispatch::{closure}
 wok_ws::dispatch::{closure}::{closure}
 wok_ws::empty
+wok_ws::extension::accept
+wok_ws::extension::negotiate::<core::iter::adapters::filter_map::FilterMap<http::header::map::ValueIter<http::header::value::HeaderValue>, wok_ws::upgrade_ws::{closure}::{closure}::{closure}>>
+wok_ws::extension::negotiate::<core::iter::adapters::filter_map::FilterMap<http::header::map::ValueIter<http::header::value::HeaderValue>, wok_ws::upgrade_ws::{closure}::{closure}::{closure}>>::{closure}
+wok_ws::extension::split_unquoted
+wok_ws::extension::split_unquoted::{closure}
 wok_ws::forwarded::client
 wok_ws::frame::apply_mask
 wok_ws::frame::check_close
@@ -752,6 +756,7 @@ wok_ws::text_status_response
 wok_ws::upgrade_ws
 wok_ws::upgrade_ws::{closure}
 wok_ws::upgrade_ws::{closure}::{closure}
+wok_ws::upgrade_ws::{closure}::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 

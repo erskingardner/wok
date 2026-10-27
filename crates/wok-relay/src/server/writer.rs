@@ -1000,7 +1000,9 @@ pub(super) fn event_matches_vanish_markers(
             if name == 'p' && value.len() == 32 {
                 let mut recipient = [0u8; 32];
                 recipient.copy_from_slice(value);
-                if markers.contains_key(&recipient) {
+                if markers.get(&recipient).is_some_and(|timestamp| {
+                    wok_db::gift_wrap_vanished(packed.created_at(), *timestamp)
+                }) {
                     matched = true;
                     return false;
                 }

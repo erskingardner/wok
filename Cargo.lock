@@ -2938,6 +2938,7 @@ dependencies = [
  "thiserror",
  "wok-db",
  "wok-event",
+ "zstd",
 ]
 
 [[package]]

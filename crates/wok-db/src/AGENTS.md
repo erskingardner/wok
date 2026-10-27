@@ -15,7 +15,7 @@ LMDB environment and table access. Start at `lib.rs` for the public API.
 | `payload.rs` | Raw / zstd EventPayload, decompressor |
 | `lookup.rs` | Read helpers on Ro/Rw txns (id, created_at, negentropy filters) |
 | `write.rs` | Insert/delete/replace matching strfry `events.cpp` |
-| `search.rs` | NIP-50 term/bigram postings |
+| `search.rs` | NIP-50 term postings |
 | `tag_kind.rs` | `(tag, kind, created_at)` postings, schema and indexed-through markers, bounded backfill steps |
 | `vanish.rs` | NIP-62 markers, query suppression, bounded sweep that resumes from its stored progress |
 | `moderation.rs` | NIP-86 records (prefix-keyed), snapshot, query suppression |

@@ -269,11 +269,13 @@ or below `\0through`, and reports under `tag_kind_index` the markers, whether
 the index is complete, any key-ordered pass in progress, and entries
 missing, stale (the event is no longer stored) or unexpected (the stored event
 does not derive them, or a malformed record). Missing and unexpected entries
-fail the check; stale entries do not. It derives each event's search and
-tag-kind entries once: a posting of either table is checked by looking up the
-event it names and balancing it against the entries the event pass found, in
-16 MiB of counters whatever the size of the database, and events are derived
-again only to name unexpected entries.
+fail the check; stale entries do not. It derives each event's entries once: a
+posting of the search, tag-kind or strfry-layout indexes is checked by looking
+up the event it names and balancing it against the entries the event pass
+found, in 24 MiB of counters whatever the size of the database, and events are
+derived again only to name unexpected entries. `Event__replace` postings, from
+which superseded history is counted, are each checked against their event's
+replacement key instead.
 It also validates `wok_State` encodings, compares each stored author
 count against primary events (not the derived author index), and checks that a
 stored sequence is at least the greatest surviving local ID. Author-count

@@ -1198,6 +1198,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NOTICEs are logged. A new `--timeout` (default 60 seconds, 0 disables),
   like `wok sync`'s, ends it nonzero after that long without the WebSocket
   handshake, an event or EOSE.
+- A second copy of an event in one writer batch, as two connections or a
+  client that retries can send, is answered as the first copy was (#255).
+  When the first copy was refused, as superseded by a newer version, over
+  the author's storage quota, or deleted or vanished, the second was told
+  `true, "duplicate: have this event"` though the relay did not hold the
+  event, so its client stopped retrying. It now gets the same refusal, and
+  `duplicate:` only when the first copy was stored. A copy of a vanish
+  request that a relay at its global storage quota still stores is
+  answered `duplicate:` too, not with the quota's refusal. The relay's
+  metrics, `wok import` and `wok sync` count a refused copy with the
+  refusals, not as a duplicate.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

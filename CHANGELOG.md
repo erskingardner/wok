@@ -357,9 +357,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the network (#257). It loads a corpus into a fresh database, then writes
   the corpus's last events through the relay writer's storage calls in
   durable transactions of each `--db-batches` size (1, 8, 64 and 512 by
-  default). Per batch size it reports events per second, transaction and
-  commit percentiles, and on Linux the bytes written per event and pages
-  per commit. The database lives under `--dataset-dir`, so a tmpfs `/tmp`
+  default). Per batch size it reports stored events per second, transaction
+  and commit percentiles, and on Linux the bytes written per stored event
+  and pages per commit; duplicates and superseded or deleted events are
+  counted apart. The database lives under `--dataset-dir`, so a tmpfs `/tmp`
   does not hide the disk.
 - `scripts/benchmark-campaign.sh` compares any number of relay targets
   (#226), each described by a file on the relay host, instead of one Wok and

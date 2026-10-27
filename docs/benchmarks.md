@@ -1026,24 +1026,31 @@ build, not the `--wok` binary. Each write transaction is one writer batch:
 in the writer's order. The writer's checks before its transaction
 (duplicates, write policy, quotas) are not timed.
 
-The corpus (`--corpus`, or one generated from `--events` and `--event-mix`)
-is loaded into a fresh database in untimed transactions of 1,000 events,
-except its last events. Those are held back for the timed steps, one per
+The corpus (`--corpus`, or one generated from `--events` and any
+`--event-mix`, `social` included) is loaded into a fresh database in untimed
+transactions of 1,000 events, except its last events. Without `--events`, a
+generated corpus holds the steps' events plus 20,000 for the history. Those are held back for the timed steps, one per
 `--db-batches` size, each writing its own slice in corpus order on top of
 the history already stored. A step writes at least `--db-step-events`
 events and at least 20 transactions. The database is created under
 `--dataset-dir` and removed after the trial; the system temp directory is a
 tmpfs on many Linux hosts and would hide the disk's cost.
 
-Per step the table gives events stored, transactions, events per second,
-µs per event, transaction time (from `begin_rw` to the end of the commit)
-and commit time at p50 and p99, and the growth of `data.mdb`. On Linux it
-also gives the bytes the process wrote per event and the 4 KiB pages per
-commit, from `write_bytes` in `/proc/self/io`, which counts each page once
-per commit that dirties it. The trial's throughput is the best step's
-events per second; its latency columns hold the smallest batch's
-transaction times. A step that stores fewer events than it
-wrote counts as a mismatch.
+Each event ends as the relay writer leaves it. Stored events were inserted.
+Settled ones were duplicates, older versions of a replaceable event, or
+deleted, and have no row of their own; a social corpus has many. An event
+left pending or over a quota is unfinished and fails the trial.
+
+Per step the table gives those counts, transactions, stored events per
+second and µs per stored event, transaction time (from `begin_rw` to the
+end of the commit) and commit time at p50 and p99, and the growth of
+`data.mdb`. On Linux it also gives the bytes the process wrote per stored
+event and the 4 KiB pages per commit, from `write_bytes` in
+`/proc/self/io`, which counts each page once per commit that dirties it.
+With the minimum of 20 commits, a step's p99 is close to its maximum. The
+trial's throughput is the best step's stored events per second, its latency
+columns hold the smallest batch's transaction times, and it records this
+`wok-bench` binary's hash.
 
 ```bash
 # On a production-sized history (a 1M-event social corpus), with the

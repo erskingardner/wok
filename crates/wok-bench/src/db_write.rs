@@ -15,6 +15,12 @@
 //! dirtied once per commit). The relay writer's checks before its write
 //! transaction (duplicates, policy, quotas) are not part of the time.
 //!
+//! Each event ends as the writer leaves it. Stored events were inserted; a
+//! duplicate, an older version of a replaceable event, or a deleted event
+//! is settled without a row of its own, as on a relay (a social corpus has
+//! many). Rates and costs are per stored event. An event the writer left
+//! pending or over a quota fails the step.
+//!
 //! The database lives under `--dataset-dir`, not the system temp directory,
 //! which is a tmpfs on many Linux hosts and would hide the disk's cost.
 
@@ -31,6 +37,8 @@ use std::time::Instant;
 const PRELOAD_BATCH: usize = 1_000;
 /// Fewest transactions a step commits, so its percentiles mean something.
 pub const MIN_COMMITS: u64 = 20;
+/// Events preloaded before the steps when the scenario generates its corpus.
+const DEFAULT_PRELOAD: u64 = 20_000;
 const PAGE_BYTES: f64 = 4_096.0;
 
 pub struct Options {
@@ -45,7 +53,9 @@ pub struct Options {
 #[derive(Serialize, Clone)]
 pub struct Report {
     pub corpus_events: u64,
+    /// Corpus events written before the steps, and those of them stored.
     pub preloaded: u64,
+    pub preload_stored: u64,
     pub preload_secs: f64,
     /// Whether `/proc/self/io` was readable, so the byte columns are filled.
     pub io_counted: bool,
@@ -56,11 +66,16 @@ pub struct Report {
 pub struct Step {
     pub batch: usize,
     pub events: u64,
+    /// Inserted as rows.
     pub stored: u64,
+    /// Duplicates, superseded replaceable events and deleted events.
+    pub settled: u64,
+    /// Left pending or over a quota: a failure.
+    pub unfinished: u64,
     pub commits: u64,
     pub secs: f64,
-    pub events_per_s: f64,
-    pub us_per_event: f64,
+    pub stored_per_s: f64,
+    pub us_per_stored: f64,
     pub txn_p50_us: u64,
     pub txn_p99_us: u64,
     pub txn_max_us: u64,
@@ -69,7 +84,7 @@ pub struct Step {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes_per_event: Option<f64>,
+    pub bytes_per_stored: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pages_per_commit: Option<f64>,
     /// Growth of `data.mdb` over the step.
@@ -80,17 +95,22 @@ pub struct Step {
 }
 
 impl Report {
-    /// The step with the smallest batch: one durable write per event.
-    pub fn first(&self) -> Option<&Step> {
-        self.steps.first()
+    /// The step with the smallest batch.
+    pub fn smallest_batch(&self) -> Option<&Step> {
+        self.steps.iter().min_by_key(|step| step.batch)
     }
 
-    /// The highest events per second over the steps.
+    /// The highest stored events per second over the steps.
     pub fn best_rate(&self) -> f64 {
         self.steps
             .iter()
-            .map(|step| step.events_per_s)
+            .map(|step| step.stored_per_s)
             .fold(0.0, f64::max)
+    }
+
+    /// Steps with an event the writer did not finish.
+    pub fn failed_steps(&self) -> u64 {
+        self.steps.iter().filter(|step| step.unfinished > 0).count() as u64
     }
 }
 
@@ -101,6 +121,33 @@ fn step_sizes(batches: &[usize], step_events: u64) -> Vec<u64> {
         .iter()
         .map(|&batch| step_events.max(batch as u64 * MIN_COMMITS))
         .collect()
+}
+
+/// Events a corpus generated for this scenario holds: the steps' events
+/// plus a preloaded history of [`DEFAULT_PRELOAD`].
+pub fn default_corpus_events(batches: &[usize], step_events: u64) -> u64 {
+    step_sizes(batches, step_events).iter().sum::<u64>() + DEFAULT_PRELOAD
+}
+
+/// What a batch of events came to.
+#[derive(Default)]
+struct Outcomes {
+    stored: u64,
+    settled: u64,
+    unfinished: u64,
+}
+
+impl Outcomes {
+    fn add(&mut self, events: &[wok_db::EventToWrite]) {
+        use wok_db::EventWriteStatus as Status;
+        for event in events {
+            match event.status {
+                Status::Written => self.stored += 1,
+                Status::Duplicate | Status::Replaced | Status::Deleted => self.settled += 1,
+                Status::Pending | Status::QuotaExceeded => self.unfinished += 1,
+            }
+        }
+    }
 }
 
 pub fn run(opts: &Options) -> Result<Report> {
@@ -134,14 +181,21 @@ pub fn run(opts: &Options) -> Result<Report> {
     let preloaded = corpus_events - held;
     let started = Instant::now();
     let mut batch = Vec::with_capacity(PRELOAD_BATCH);
+    let mut preload = Outcomes::default();
     for i in 0..preloaded {
         batch.push(next()?);
         if batch.len() == PRELOAD_BATCH || i + 1 == preloaded {
             write_batch(&env, &mut trees, &mut batch)?;
+            preload.add(&batch);
             batch.clear();
         }
     }
     let preload_secs = started.elapsed().as_secs_f64();
+    anyhow::ensure!(
+        preload.unfinished == 0,
+        "{} preloaded events were left pending",
+        preload.unfinished
+    );
 
     let data = dir.path().join("data.mdb");
     let mut io_counted = true;
@@ -152,16 +206,13 @@ pub fn run(opts: &Options) -> Result<Report> {
         let io_before = process_write_bytes();
         let mut txn_us = Vec::new();
         let mut commit_hist = Histogram::<u64>::new(3)?;
-        let mut stored = 0u64;
+        let mut outcomes = Outcomes::default();
         let started = Instant::now();
         for chunk in pending.chunks_mut(batch_size) {
             let times = write_batch(&env, &mut trees, chunk)?;
             txn_us.push(times.txn_us);
             commit_hist.record(times.commit_us.max(1))?;
-            stored += chunk
-                .iter()
-                .filter(|event| matches!(event.status, wok_db::EventWriteStatus::Written))
-                .count() as u64;
+            outcomes.add(chunk);
         }
         let secs = started.elapsed().as_secs_f64();
         let bytes_written = match (io_before, process_write_bytes()) {
@@ -176,21 +227,24 @@ pub fn run(opts: &Options) -> Result<Report> {
         for &us in &txn_us {
             txn_hist.record(us.max(1))?;
         }
+        let stored = outcomes.stored.max(1) as f64;
         steps.push(Step {
             batch: batch_size,
             events,
-            stored,
+            stored: outcomes.stored,
+            settled: outcomes.settled,
+            unfinished: outcomes.unfinished,
             commits,
             secs,
-            events_per_s: events as f64 / secs.max(f64::MIN_POSITIVE),
-            us_per_event: secs * 1e6 / events as f64,
+            stored_per_s: outcomes.stored as f64 / secs.max(f64::MIN_POSITIVE),
+            us_per_stored: secs * 1e6 / stored,
             txn_p50_us: txn_hist.value_at_quantile(0.50),
             txn_p99_us: txn_hist.value_at_quantile(0.99),
             txn_max_us: txn_hist.max(),
             commit_p50_us: commit_hist.value_at_quantile(0.50),
             commit_p99_us: commit_hist.value_at_quantile(0.99),
             bytes_written,
-            bytes_per_event: bytes_written.map(|bytes| bytes as f64 / events as f64),
+            bytes_per_stored: bytes_written.map(|bytes| bytes as f64 / stored),
             pages_per_commit: bytes_written.map(|bytes| bytes as f64 / PAGE_BYTES / commits as f64),
             file_growth_bytes: std::fs::metadata(&data)?.len().saturating_sub(size_before),
             txn_us,
@@ -200,6 +254,7 @@ pub fn run(opts: &Options) -> Result<Report> {
     Ok(Report {
         corpus_events,
         preloaded,
+        preload_stored: preload.stored,
         preload_secs,
         io_counted,
         steps,
@@ -267,25 +322,27 @@ fn process_write_bytes() -> Option<u64> {
 
 pub fn render_markdown(report: &Report) -> String {
     let mut s = format!(
-        "\n## db_write: {} events preloaded in {:.1} s\n\nEach step writes its own slice of the corpus's last events in transactions of `batch` events, each committed durably, as the relay writer does. Transaction time runs from `begin_rw` to the end of the commit. Bytes are what the process wrote, from `/proc/self/io`; a page counts once per commit that dirties it.\n\n| batch | events | stored | commits | events/s | µs/event | txn p50 µs | txn p99 µs | txn max µs | commit p50 µs | commit p99 µs | bytes/event | pages/commit | file growth MB |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
-        report.preloaded, report.preload_secs
+        "\n## db_write: {} events preloaded ({} stored) in {:.1} s\n\nEach step writes its own slice of the corpus's last events in transactions of `batch` events, each committed durably, as the relay writer does. Stored events were inserted; settled ones are duplicates, older versions of replaceable events, or deleted, with no row of their own. Rates, times and bytes per event count stored events. Transaction time runs from `begin_rw` to the end of the commit. Bytes are what the process wrote, from `/proc/self/io`; a page counts once per commit that dirties it. With few commits, p99 is close to the step's maximum.\n\n| batch | events | stored | settled | unfinished | commits | stored/s | µs/stored | txn p50 µs | txn p99 µs | txn max µs | commit p50 µs | commit p99 µs | bytes/stored | pages/commit | file growth MB |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        report.preloaded, report.preload_stored, report.preload_secs
     );
     let optional = |value: Option<f64>| value.map_or_else(|| "n/a".into(), |v| format!("{v:.0}"));
     for step in &report.steps {
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {:.0} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {:.1} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.0} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {:.1} |\n",
             step.batch,
             step.events,
             step.stored,
+            step.settled,
+            step.unfinished,
             step.commits,
-            step.events_per_s,
-            step.us_per_event,
+            step.stored_per_s,
+            step.us_per_stored,
             step.txn_p50_us,
             step.txn_p99_us,
             step.txn_max_us,
             step.commit_p50_us,
             step.commit_p99_us,
-            optional(step.bytes_per_event),
+            optional(step.bytes_per_stored),
             optional(step.pages_per_commit),
             step.file_growth_bytes as f64 / 1e6,
         ));
@@ -326,6 +383,8 @@ mod tests {
             .map(|step| (step.batch, step.events, step.stored, step.commits))
             .collect();
         assert_eq!(shape, vec![(1, 40, 40, 40), (4, 80, 80, 20)]);
+        assert_eq!(report.preload_stored, 180);
+        assert_eq!(report.failed_steps(), 0);
         assert!(report
             .steps
             .iter()
@@ -335,6 +394,62 @@ mod tests {
         }
         // The trial's database is removed with its directory.
         assert_eq!(std::fs::read_dir(dir.path().join("db")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn superseded_and_duplicate_events_are_settled_not_failed() {
+        use secp256k1::{Keypair, SECP256K1};
+        let dir = tempfile::tempdir().unwrap();
+        let corpus = dir.path().join("corpus.jsonl");
+        crate::generate_events(&corpus, 178, 7, 1_700_000_000, crate::EventMix::Kind1).unwrap();
+        let notes: Vec<String> = std::fs::read_to_string(&corpus)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let keys = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let profile = |created_at, name: &str| {
+            let event = crate::clients::signed(
+                &keys,
+                created_at,
+                0,
+                vec![],
+                format!(r#"{{"name":"{name}"}}"#),
+            );
+            wok_event::json::to_tao_string(&event)
+        };
+        // The preload ends with a profile; the timed slice starts with an
+        // older version of it and a note already stored.
+        let mut lines = notes[..100].to_vec();
+        lines.push(profile(1_700_000_100, "new"));
+        lines.push(profile(1_700_000_050, "old"));
+        lines.push(notes[0].clone());
+        lines.extend_from_slice(&notes[100..]);
+        std::fs::write(&corpus, lines.join("\n")).unwrap();
+
+        let report = run(&Options {
+            corpus,
+            dir: dir.path().join("db"),
+            batches: vec![4],
+            step_events: 80,
+            max_tags_per_filter: 8,
+        })
+        .unwrap();
+        assert_eq!((report.preloaded, report.preload_stored), (101, 101));
+        let step = &report.steps[0];
+        assert_eq!(
+            (step.events, step.stored, step.settled, step.unfinished),
+            (80, 78, 2, 0)
+        );
+        assert_eq!(report.failed_steps(), 0);
+    }
+
+    #[test]
+    fn the_default_corpus_holds_the_default_steps_and_a_history() {
+        assert_eq!(
+            default_corpus_events(&[1, 8, 64, 512], 2_000),
+            16_240 + DEFAULT_PRELOAD
+        );
     }
 
     #[test]

@@ -156,7 +156,7 @@ impl Index {
             found(self.authors.get(packed.pubkey()));
         }
         if self.tag_postings != 0 {
-            packed.foreach_tag(|name, value| {
+            packed.foreach_filter_tag(|name, value| {
                 let values = &self.tags[usize::from(name as u8)];
                 if !values.is_empty() {
                     found(values.get(value));

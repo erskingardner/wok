@@ -44,6 +44,12 @@ copies) get mode `0640`, less the umask; earlier releases used `0664`.
 
 `e`/`p` tag values stored as raw 32 bytes. Replaceable kinds prepend virtual `d=""`. Param-replaceable append virtual `d=""`. Ephemeral kinds set expiration=1.
 
+Tag filters do not match the virtual `d`: the first tag of a replaceable
+kind, and the last tag of an addressable kind whose earlier tags hold a `d`.
+An addressable event without a `d` keeps it as its address, so `#d:[""]`
+matches it. The tag indexes hold every virtual `d`, so a filter for the empty
+`d` checks each candidate's PackedEvent instead of answering from the index.
+
 A single-letter tag value longer than 255 bytes does not fit `len`. strfry v3
 and earlier Wok releases drop that tag. Wok packs it as `0xFF` followed by the
 SHA-256 of the value (33 bytes). Other packed values are UTF-8, which never

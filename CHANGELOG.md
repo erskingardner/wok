@@ -1111,6 +1111,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `#d` filter for the empty string matches only events with a `d` tag of
+  that value, and addressable events without a `d` tag, whose address it is
+  (#245). Packing adds an empty `d` to every replaceable and addressable
+  event, so that the first `d` sets the address and a missing one means the
+  empty string, and filters matched it: `{"kinds":[30023],"authors":[pk],
+  "#d":[""],"limit":1}`, which resolves an `naddr` with an empty
+  identifier, returned pk's newest article whatever its `d`, a live
+  subscription to it got each new one, and `{"kinds":[10002],"#d":[""]}`
+  matched every relay list. REQ, live subscriptions, COUNT, NIP-77 and
+  NIP-91 `&d` now leave the added tag out. The tag indexes still hold it,
+  so a filter for the empty `d` reads each candidate event instead of
+  answering from the index alone. **Clients that relied on `#d:[""]`
+  selecting every replaceable or addressable event get fewer events.** A
+  persistent negentropy tree whose filter selects the empty `d` still holds
+  the events the old matching put there: `wok doctor` reports it, and
+  `wok reindex --confirm-relay-stopped` rebuilds it. A tag with no value,
+  such as `["t"]`, is still packed and matched as `["t",""]`, and kind 41
+  history that earlier releases packed as replaceable keeps its added `d`.
+- `wok upload` exits nonzero unless the relay acknowledged every event it
+  sent and refused none (#252). It counted any message that contained `"OK"`
+  as an acknowledgment, `OK false` and a NOTICE included, and exited 0 when
+  the connection dropped, so a relay that refused events, or rate-limited and
+  disconnected partway through the input, left the operator believing the
+  data was copied. It now matches each OK to an event it sent by id, logs
+  each refusal with its reason, and prints a summary line on stderr like
+  `wok sync`'s. It exits nonzero when the relay refused an event, or the
+  connection closed with acknowledgments outstanding or input left unsent.
+  A refusal because the relay stores a newer version counts as
+  `superseded`, as in `wok sync`, and is not a failure. **A line that is not
+  event JSON is no longer sent**: it is logged and the command exits
+  nonzero, as `wok import` does. **`--pipeline 0`**, which sent nothing and
+  exited 0, **is refused**.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

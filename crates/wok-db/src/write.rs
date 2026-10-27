@@ -700,7 +700,6 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
     for i in 0..evs.len() {
         let mut lev_ids_to_delete: Vec<u64> = Vec::new();
         let (previous, current_and_after) = evs.split_at_mut(i);
-        let previous_packed = previous.last().map(|event| event.packed.as_slice());
         let EventToWrite {
             packed: packed_bytes,
             json,
@@ -710,10 +709,23 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         } = &mut current_and_after[0];
         let packed = PackedEventView::new(packed_bytes)?;
 
-        if lookup_event_by_id(txn, packed.id())?.is_some()
-            || previous_packed
-                .is_some_and(|previous| packed_bytes.get(0..32) == previous.get(0..32))
+        // Copies of one event sort next to each other, and the loop never
+        // revisits an event, so the previous copy's status is final. A copy
+        // has the event only when that one was stored or found stored;
+        // otherwise it shares that copy's refusal.
+        if let Some(copy) = previous
+            .last()
+            .filter(|previous| previous.packed.get(0..32) == packed_bytes.get(0..32))
         {
+            *status = match copy.status {
+                EventWriteStatus::Written | EventWriteStatus::Duplicate => {
+                    EventWriteStatus::Duplicate
+                }
+                refused => refused,
+            };
+            continue;
+        }
+        if lookup_event_by_id(txn, packed.id())?.is_some() {
             *status = EventWriteStatus::Duplicate;
             continue;
         }

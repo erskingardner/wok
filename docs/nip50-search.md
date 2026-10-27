@@ -13,7 +13,11 @@ way; see [Search](config.md#search).
 ## Query semantics
 
 - Free text is split into Unicode alphanumeric terms and lowercased.
-- Every unique free-text term must occur in `content` (AND semantics).
+- Every unique free-text term must be one of the event's searchable terms
+  (AND semantics): the first 256 unique terms of its `content`, in document
+  order. A word an event first uses after that, such as the 300th distinct
+  word of a long article, is not searchable, in history, COUNT, NEG-OPEN or a
+  live subscription alike.
 - Words containing a non-empty `key:value` pair are treated as extensions and
   ignored. Wok does not currently implement the optional `domain`, `language`,
   `sentiment`, `nsfw`, or `include:spam` extensions.
@@ -28,6 +32,10 @@ way; see [Search](config.md#search).
 Queries are limited to 1,024 UTF-8 bytes and 16 searchable terms. Individual
 normalized terms are limited to 64 bytes. These
 bounds prevent a single REQ from creating unbounded parser or index work.
+Each event is searchable by at most 256 unique terms, so one small event of
+many distinct words cannot amplify into thousands of index writes. Live matching uses the same bounded
+terms the index stores, so a search finds the same events whether it is open
+when they arrive or sent later.
 Events rejected by Wok's admission/write policy never enter the database or
 the search index and therefore do not appear in search results.
 

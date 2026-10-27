@@ -54,8 +54,25 @@ pub fn normalize_search_terms(text: &str) -> Vec<String> {
     normalize_search_terms_with_overflow(text).0
 }
 
+/// The terms of `content` a search can find: its first
+/// `MAX_INDEXED_UNIQUE_TERMS` unique terms, in document order. The index
+/// stores exactly these, so live matching against this set agrees with
+/// history, COUNT and NEG-OPEN.
+///
+/// The event itself remains bounded by `events.max_event_size`, but without
+/// this separate limit one small event containing many distinct words can
+/// amplify into thousands of LMDB writes, so the walk stops at the limit.
 pub fn search_term_set(content: &str) -> SearchTermSet {
-    normalize_search_terms(content).into_iter().collect()
+    let mut terms = SearchTermSet::new();
+    for_each_term(content, |term| {
+        if let Some(term) = term {
+            if !terms.contains(term) {
+                terms.insert(term.to_owned());
+            }
+        }
+        terms.len() < MAX_INDEXED_UNIQUE_TERMS
+    });
+    terms
 }
 
 /// Parse the free-text portion of a NIP-50 query. `key:value` extension words
@@ -117,7 +134,8 @@ pub fn event_content(json: &str) -> Result<String, DbError> {
 }
 
 /// Extract only the event content field and normalize it once for all live
-/// search subscriptions. This avoids building a full JSON DOM per event.
+/// search subscriptions, into the bounded `search_term_set` the index stores.
+/// This avoids building a full JSON DOM per event.
 pub fn event_search_terms(json: &str) -> Result<SearchTermSet, DbError> {
     Ok(search_term_set(&parse_event_content(json)?))
 }
@@ -139,20 +157,13 @@ pub(crate) fn search_index_entries(
     Ok(keys.into_iter().map(|key| (key, value.clone())).collect())
 }
 
-/// Build a deterministic, bounded index for untrusted event content.
-///
-/// The event itself remains bounded by `events.max_event_size`, but without
-/// this separate limit one small event containing many distinct words can
-/// amplify into thousands of LMDB writes. We retain the first unique terms in
-/// document order and stop adding postings after that.
+/// The postings one event's content adds to the index: the keys of its
+/// `search_term_set`, so indexing and live matching cannot disagree.
 fn bounded_index_keys(content: &str) -> BTreeSet<Vec<u8>> {
-    let mut keys = BTreeSet::new();
-    for_each_term(content, |term| {
-        if let Some(term) = term {
-            keys.insert(term_key(term));
-        }
-        keys.len() < MAX_INDEXED_UNIQUE_TERMS
-    });
+    let keys: BTreeSet<Vec<u8>> = search_term_set(content)
+        .iter()
+        .map(|term| term_key(term))
+        .collect();
     keys
 }
 
@@ -495,6 +506,25 @@ mod tests {
             1
         );
         assert_eq!(count_phrase_pairs(&json, &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn live_terms_are_the_indexed_terms() {
+        let mut words = vec!["inside".to_string()];
+        words.extend((1..MAX_INDEXED_UNIQUE_TERMS).map(|n| format!("filler{n}")));
+        words.extend(["inside".into(), "zebra".into()]);
+        let json = serde_json::json!({"content": words.join(" ")}).to_string();
+        let indexed: SearchTermSet = search_index_entries(9, &json)
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| key.first() == Some(&TERM_PREFIX))
+            .map(|(key, _)| search_term_from_key(&key).unwrap().to_owned())
+            .collect();
+        let live = event_search_terms(&json).unwrap();
+        assert_eq!(live, indexed);
+        assert_eq!(live.len(), MAX_INDEXED_UNIQUE_TERMS);
+        assert!(live.contains("inside"));
+        assert!(!live.contains("zebra"));
     }
 
     #[test]

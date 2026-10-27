@@ -456,10 +456,20 @@ pub(super) fn run_writer(
         // NIP-62 requires a vanish request that targets this relay to be
         // honored whatever the user's status, so the global quota does not
         // count the ones a batch records and never refuses a batch for them.
-        let records_vanish = |event: &EventToWrite<u64>| {
+        let honors_vanish = |event: &EventToWrite<u64>| {
             vanish_policy.enabled
-                && event.status == EventWriteStatus::Written
                 && PackedEventView::new(&event.packed).is_ok_and(|e| e.kind() == VANISH_KIND)
+        };
+        let records_vanish = |event: &EventToWrite<u64>| {
+            event.status == EventWriteStatus::Written && honors_vanish(event)
+        };
+        // A copy of a request the batch recorded, or of one already stored,
+        // is answered `duplicate:`, as the batch without the quota would.
+        let keeps_vanish = |event: &EventToWrite<u64>| {
+            matches!(
+                event.status,
+                EventWriteStatus::Written | EventWriteStatus::Duplicate
+            ) && honors_vanish(event)
         };
         let write_started = Instant::now();
         let storage_before = storage_writes.bytes();
@@ -504,7 +514,7 @@ pub(super) fn run_writer(
         if matches!(write_res, Ok(None)) {
             // The quota refuses everything else in the batch, and the
             // vanish requests it held are written on their own.
-            let (vanishing, refused): (Vec<_>, Vec<_>) = events.drain(..).partition(records_vanish);
+            let (vanishing, refused): (Vec<_>, Vec<_>) = events.drain(..).partition(keeps_vanish);
             metrics
                 .abuse_global_quota_rejections
                 .fetch_add(refused.len() as u64, Ordering::Relaxed);
@@ -1261,6 +1271,181 @@ mod tests {
         ] {
             assert_eq!(step.count(), 1);
         }
+    }
+
+    /// An unsigned event `id` from `author`, sent by connection `conn_id`.
+    /// A vanish request names every relay.
+    fn copy_of(conn_id: u64, id: u8, author: [u8; 32], created_at: u64, kind: u64) -> WriterMsg {
+        let mut tags = PackedEventTagBuilder::default();
+        if wok_event::is_replaceable_kind(kind) {
+            tags.add('d', b"").unwrap();
+        }
+        let packed =
+            PackedEventBuilder::build(&[id; 32], &author, created_at, kind, 0, &tags).unwrap();
+        let json = json!({
+            "id": to_hex(&[id; 32]),
+            "pubkey": to_hex(&author),
+            "created_at": created_at,
+            "kind": kind,
+            "tags": if kind == VANISH_KIND { json!([["relay", "ALL_RELAYS"]]) } else { json!([]) },
+            "content": "",
+            "sig": "00".repeat(64),
+        })
+        .to_string();
+        WriterMsg::AddEvent {
+            conn_id,
+            source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+            packed: packed.into_bytes(),
+            json,
+            authed: None,
+            grant: Default::default(),
+        }
+    }
+
+    /// The `[accepted, message]` of the OK each of `copies`' connections
+    /// gets when the writer takes them in one batch.
+    fn replies_to(config: Config, env: &Env, copies: Vec<WriterMsg>) -> Vec<Value> {
+        let conns = Arc::new(ConnTable::new());
+        let mut receivers = Vec::new();
+        for copy in &copies {
+            let WriterMsg::AddEvent { conn_id, .. } = copy else {
+                unreachable!()
+            };
+            let (out, rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(*conn_id, Outbound::new(out, 0));
+            receivers.push(rx);
+        }
+        let moderation = Arc::new(parking_lot::RwLock::new(
+            env.begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                .unwrap(),
+        ));
+        let (writer_tx, writer_rx) = bounded(copies.len());
+        for copy in copies {
+            writer_tx.send(copy).unwrap();
+        }
+        drop(writer_tx);
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config)),
+            conns,
+            Arc::new(Metrics::default()),
+            writer_rx,
+            Vec::new(),
+            moderation,
+            TAG_KIND_STEP,
+        );
+        receivers
+            .iter_mut()
+            .map(|rx| {
+                let ok: Value = serde_json::from_str(&rx.try_recv().unwrap().into_text()).unwrap();
+                json!([ok[2], ok[3]])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_copy_in_one_batch_is_answered_like_the_first() {
+        let author = [0x55; 32];
+        let fresh = || {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config {
+                db: dir.path().to_path_buf(),
+                ..Config::default()
+            };
+            config.db_min_free_disk_bytes = 0;
+            (dir, env, config)
+        };
+
+        // Stored, then a copy from each of two connections.
+        let (_dir, env, config) = fresh();
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 1, author, 100, 1), copy_of(2, 1, author, 100, 1)],
+        );
+        assert_eq!(
+            replies,
+            [
+                json!([true, ""]),
+                json!([true, "duplicate: have this event"])
+            ]
+        );
+
+        // Superseded by a stored newer version: neither copy is a duplicate.
+        let (_dir, env, config) = fresh();
+        replies_to(
+            config.clone(),
+            &env,
+            vec![copy_of(1, 1, author, 200, 10002)],
+        );
+        let replies = replies_to(
+            config,
+            &env,
+            vec![
+                copy_of(1, 2, author, 100, 10002),
+                copy_of(2, 2, author, 100, 10002),
+            ],
+        );
+        let superseded = json!([false, SUPERSEDED_OK_REASON]);
+        assert_eq!(replies, [superseded.clone(), superseded]);
+
+        // The author is at the per-author quota.
+        let (_dir, env, mut config) = fresh();
+        config.relay.abuse.enabled = true;
+        config.relay.abuse.max_stored_events_per_pubkey = 1;
+        replies_to(config.clone(), &env, vec![copy_of(1, 1, author, 100, 1)]);
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 2, author, 200, 1), copy_of(2, 2, author, 200, 1)],
+        );
+        let over_quota = json!([false, "blocked: author storage quota exceeded"]);
+        assert_eq!(replies, [over_quota.clone(), over_quota]);
+        assert_eq!(
+            env.begin_ro().unwrap().entries(env.dbis().event).unwrap(),
+            1
+        );
+
+        // Refusals made before the write see no other copy and decide each
+        // one alike.
+        let (_dir, env, config) = fresh();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::ban_event(&mut txn, &[3; 32], "").unwrap();
+        txn.commit().unwrap();
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 3, author, 100, 1), copy_of(2, 3, author, 100, 1)],
+        );
+        let banned = json!([false, "restricted: event is banned by the relay operator"]);
+        assert_eq!(replies, [banned.clone(), banned]);
+
+        // A full relay still stores a vanish request, and answers its copy
+        // as a duplicate, not with the global quota's refusal.
+        let (_dir, env, mut config) = fresh();
+        config.relay.abuse.max_stored_events = 1;
+        config.relay.nip62.service_url = "wss://relay.example.com".into();
+        replies_to(config.clone(), &env, vec![copy_of(1, 1, author, 100, 1)]);
+        let replies = replies_to(
+            config,
+            &env,
+            vec![
+                copy_of(1, 4, author, 200, VANISH_KIND),
+                copy_of(2, 4, author, 200, VANISH_KIND),
+                copy_of(3, 5, [0x66; 32], 200, 1),
+            ],
+        );
+        assert_eq!(
+            replies,
+            [
+                json!([true, ""]),
+                json!([true, "duplicate: have this event"]),
+                json!([false, "error: global storage quota of 1 events exceeded"]),
+            ]
+        );
     }
 
     #[test]

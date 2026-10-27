@@ -158,9 +158,15 @@ Outbound filters are adapted to the upstream. Router `REQ`s and `wok sync`
 NIP-91; the document is cached per relay and is not consulted for anything
 else. For every other upstream — including one that serves no usable NIP-11
 document — each `&x` value set is folded into the `#x` compatibility clause the
-draft requires clients to send, so the remote answers a superset that is then
-narrowed by the exact AND filter locally. The `&` keys are never simply
-dropped, which would turn an `&`-only filter into a match-all request.
+draft requires clients to send, so the remote answers a superset. The `&`
+keys are never simply dropped, which would turn an `&`-only filter into a
+match-all request. The router stores only the events of that superset that
+match the exact AND filter. `wok sync` reconciles its local view of the same
+superset, so both sides compare like sets, then narrows each difference to the
+exact filter: a local event outside it is not uploaded, and a remote one is
+fetched and discarded. Those differences are counted as `narrowed`, not in
+`have` or `need` (see
+[reconciliation results](mesh-and-maintenance.md#reconciliation-results)).
 
 NIP-62 accepts a signed kind 62 request containing either a matching
 `["relay", "<public relay URL>"]` tag or `["relay", "ALL_RELAYS"]`. The

@@ -196,12 +196,25 @@ exit status when the comparison itself succeeds. All comparisons use the supplie
 filter and the remote connection's readable view, not the remote operator's full DB.
 
 `--json` emits one summary on stdout, including transfer/protocol failures; tracing
-logs go to stderr. Fields are `ok`, `reconciled`, `have`, `need`, `downloaded`,
-`written`, `duplicates`, `superseded`, `expired`, `rejected`, `unavailable`,
-`uploaded`, `upload_rejected`, `upload_superseded`, `upload_expired`, and `error`. `have` and `need` count unique differences discovered during the run,
+logs go to stderr. Fields are `ok`, `reconciled`, `have`, `need`, `narrowed`,
+`downloaded`, `written`, `duplicates`, `superseded`, `expired`, `rejected`,
+`unavailable`, `uploaded`, `upload_rejected`, `upload_superseded`,
+`upload_expired`, and `error`. `have` and `need` count unique differences discovered during the run,
 not the remaining differences after transfer. `uploaded` counts positive relay
 ACKs, not recipient delivery. CLI parsing/config-loading errors may occur before a
 summary can be produced. JSON and missing-ID output are mutually exclusive.
+
+A peer whose NIP-11 document does not advertise NIP-91 is sent each NIP-91
+`&x` set of the filter folded into its `#x` clause, a superset of the filter
+([NIPs](nips.md)). Sync builds its local view from that same superset and
+narrows the differences to the exact filter: a local event outside it is not
+uploaded, and a remote one is fetched, checked against its id, and discarded.
+`narrowed` counts both kinds. They are not in `have`, `need` or
+`--print-missing` output, and do not fail the run or `--check`. Only a remote
+event shows its tags, so with such a filter `--check`, `--print-missing`,
+`--dir none` and `--dir up` also fetch the remote-only events of the superset,
+without storing them; an ID the peer does not return stays counted in `need`.
+The local view's construction budget applies to the superset too.
 
 A transfer exits nonzero on rejected downloads, rejected uploads, requested IDs
 missing at EOSE, closed subscriptions, protocol errors, disconnects or timeout.

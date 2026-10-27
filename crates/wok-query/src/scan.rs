@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
 use wok_db::{
-    search_bigram_posting_exists, search_posting_count, search_posting_exists, search_postings,
+    count_phrase_pairs, search_posting_count, search_posting_exists, search_postings, Decompressor,
     RoTxn, SearchQuery,
 };
 use wok_event::PackedEventView;
@@ -343,6 +343,10 @@ impl PartialOrd for SearchHit {
     }
 }
 
+/// The largest stored payload a phrase check decompresses, as for `wok
+/// doctor` and reindex. Only a compressed payload needs it.
+const PHRASE_PAYLOAD_BOUND: usize = 16 * 1024 * 1024;
+
 /// Resumable NIP-50 posting intersection and relevance ranking.
 struct SearchScan {
     query: SearchQuery,
@@ -360,6 +364,8 @@ struct SearchScan {
     overflow: Option<u64>,
     /// A match was hidden by the restricted-read rule alone.
     restricted: bool,
+    /// Reads a match's content for its phrase boost.
+    decompressor: Decompressor,
 }
 
 struct SearchGroupScan {
@@ -477,6 +483,7 @@ impl SearchScan {
             approx_work: 0,
             overflow: None,
             restricted: false,
+            decompressor: Decompressor::new(),
         })
     }
 
@@ -582,15 +589,22 @@ impl SearchScan {
                 }
             }
             let mut score = base_score;
-            for (first, second) in &phrase_pairs {
-                match search_bigram_posting_exists(txn, first, second, lev_id) {
-                    Ok(true) => score = score.saturating_add(2_000_000_000),
-                    Ok(false) => {}
+            if !phrase_pairs.is_empty() {
+                // A payload that does not decode ranks without the boost;
+                // sending the event reports it.
+                let pairs = match txn.get_u64(txn.env().dbis().event_payload, lev_id) {
+                    Ok(Some(raw)) => self
+                        .decompressor
+                        .decode(txn, raw, PHRASE_PAYLOAD_BOUND)
+                        .and_then(|json| count_phrase_pairs(json, &phrase_pairs))
+                        .unwrap_or(0),
+                    Ok(None) => 0,
                     Err(err) => {
                         error = Some(err);
                         return false;
                     }
-                }
+                };
+                score = score.saturating_add((pairs as u64).saturating_mul(2_000_000_000));
             }
             let mut id = [0u8; 32];
             id.copy_from_slice(packed.id());

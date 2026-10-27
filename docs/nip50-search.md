@@ -18,8 +18,8 @@ way; see [Search](config.md#search).
   ignored. Wok does not currently implement the optional `domain`, `language`,
   `sentiment`, `nsfw`, or `include:spam` extensions.
 - Results are ranked by inverse term document frequency, then boosted for each
-  adjacent query-term pair found in the content. Ties use newer `created_at`,
-  then lexical event id, for deterministic output.
+  adjacent query-term pair found in the content, anywhere in it. Ties use
+  newer `created_at`, then lexical event id, for deterministic output.
 - `limit` is applied only after ranking. Multiple search filters in one REQ are
   evaluated independently and duplicate events are emitted once.
 - After historical results and EOSE, matching new events continue to be sent
@@ -33,12 +33,15 @@ the search index and therefore do not appear in search results.
 
 ## Index and recovery
 
-The rebuildable `wok_Event__search` LMDB DBI stores unique normalized terms and
-adjacent term pairs mapped to local event ids. It is maintained in the same
-write transaction as Event, EventPayload, replacement, and deletion changes.
-Queries count postings, start with the rarest term, intersect remaining terms
-with exact LMDB lookups, and retain only the best `limit` candidates in a
-bounded heap.
+The rebuildable `wok_Event__search` LMDB DBI stores the first 256 unique
+normalized terms of each event's content, mapped to local event ids. It is
+maintained in the same write transaction as Event, EventPayload,
+replacement, and deletion changes. Queries count postings, start with the
+rarest term, intersect remaining terms with exact LMDB lookups, and retain
+only the best `limit` candidates in a bounded heap. For a query of two or
+more words, each match's content is read once to find which adjacent pairs
+it holds; a word too long to index separates the words beside it. Adjacent
+pairs are not indexed, so an event writes one posting per unique word.
 
 Existing Wok databases and migrated strfry v3 snapshots are backfilled in
 10,000-event transactions on first open. A versioned marker makes index-format

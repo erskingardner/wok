@@ -1,7 +1,7 @@
 # Relay functions reached in the `unix` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 725
+## anonymous: 727
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -494,6 +494,8 @@ wok_db::search::bounded_index_keys
 wok_db::search::bounded_index_keys::{closure}
 wok_db::search::event_content
 wok_db::search::finish_term
+wok_db::search::for_each_term::<wok_db::search::bounded_index_keys::{closure}>
+wok_db::search::for_each_term::<wok_db::search::bounded_index_keys::{closure}>::{closure}
 wok_db::search::index_event_search
 wok_db::search::normalize_search_terms_with_overflow
 wok_db::search::note_search_indexed_through

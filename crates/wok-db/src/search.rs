@@ -3,7 +3,8 @@
 //! Each normalized content term is a DUPSORT key whose duplicate values are
 //! local event ids. Query execution can therefore start with the rarest term
 //! and use exact duplicate lookups to intersect the remaining terms without
-//! scanning event payloads that cannot match.
+//! scanning event payloads that cannot match. Word adjacency, which only
+//! ranks matches, is read from a matching event's content at query time.
 
 use crate::{DbError, Decompressor, Env, RoTxn, RwTxn};
 use lmdb_sys::{MDB_GET_BOTH, MDB_NODUPDATA, MDB_SET};
@@ -12,17 +13,16 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 
 const TERM_PREFIX: u8 = 1;
-const BIGRAM_PREFIX: u8 = 2;
 const INDEXED_THROUGH_KEY: &[u8] = b"\0indexed-through";
 const SEARCH_SCHEMA_KEY: &[u8] = b"\0schema";
-const SEARCH_SCHEMA_VERSION: u64 = 2;
+/// 3 dropped the adjacent-term postings (prefix 2) that version 2 kept.
+const SEARCH_SCHEMA_VERSION: u64 = 3;
 const MAX_INDEXED_TERM_BYTES: usize = 64;
 const BACKFILL_BATCH_SIZE: usize = 10_000;
 
 pub const MAX_SEARCH_QUERY_BYTES: usize = 1_024;
 pub const MAX_SEARCH_TERMS: usize = 16;
 pub const MAX_INDEXED_UNIQUE_TERMS: usize = 256;
-pub const MAX_INDEXED_BIGRAMS: usize = 256;
 
 type SearchIndexEntry = (Vec<u8>, Vec<u8>);
 pub type SearchTermSet = HashSet<String>;
@@ -144,15 +144,6 @@ fn term_key(term: &str) -> Vec<u8> {
     key
 }
 
-fn bigram_key(first: &str, second: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 + first.len() + second.len());
-    key.push(BIGRAM_PREFIX);
-    key.extend_from_slice(first.as_bytes());
-    key.push(0);
-    key.extend_from_slice(second.as_bytes());
-    key
-}
-
 pub(crate) fn search_index_entries(
     lev_id: u64,
     json: &str,
@@ -166,52 +157,77 @@ pub(crate) fn search_index_entries(
 /// Build a deterministic, bounded index for untrusted event content.
 ///
 /// The event itself remains bounded by `events.max_event_size`, but without
-/// these separate limits one small event containing many distinct words can
-/// amplify into thousands of LMDB writes. We retain the first unique terms
-/// and bigrams in document order, then stop adding new postings while still
-/// scanning the bounded input.
+/// this separate limit one small event containing many distinct words can
+/// amplify into thousands of LMDB writes. We retain the first unique terms in
+/// document order and stop adding postings after that.
 fn bounded_index_keys(content: &str) -> BTreeSet<Vec<u8>> {
     let mut keys = BTreeSet::new();
-    let mut term_count = 0;
-    let mut bigram_count = 0;
-    let mut current = String::new();
-    let mut previous = String::new();
-
-    let mut finish = |term: &mut String| {
-        if term.is_empty() {
-            return;
+    for_each_term(content, |term| {
+        if let Some(term) = term {
+            keys.insert(term_key(term));
         }
-        if term.len() <= MAX_INDEXED_TERM_BYTES {
-            if term_count < MAX_INDEXED_UNIQUE_TERMS && keys.insert(term_key(term)) {
-                term_count += 1;
-            }
-            if !previous.is_empty()
-                && bigram_count < MAX_INDEXED_BIGRAMS
-                && keys.insert(bigram_key(&previous, term))
-            {
-                bigram_count += 1;
-            }
-            previous.clear();
-            previous.push_str(term);
-        } else {
-            previous.clear();
-        }
-        term.clear();
-    };
-
-    for ch in content.chars() {
-        if ch.is_alphanumeric() {
-            current.extend(ch.to_lowercase());
-        } else {
-            finish(&mut current);
-        }
-    }
-    finish(&mut current);
+        keys.len() < MAX_INDEXED_UNIQUE_TERMS
+    });
     keys
 }
 
+/// Calls `f` with each normalized term of `text` in document order, or with
+/// `None` for a word longer than [`MAX_INDEXED_TERM_BYTES`]: it is never
+/// indexed, and it separates the words on either side. Stops once `f`
+/// returns false.
+fn for_each_term(text: &str, mut f: impl FnMut(Option<&str>) -> bool) {
+    let mut current = String::new();
+    let mut finish = |current: &mut String| {
+        if current.is_empty() {
+            return true;
+        }
+        let more = f((current.len() <= MAX_INDEXED_TERM_BYTES).then_some(current.as_str()));
+        current.clear();
+        more
+    };
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !finish(&mut current) {
+            return;
+        }
+    }
+    finish(&mut current);
+}
+
+/// How many of `pairs` occur in the event's content as adjacent words: the
+/// phrase boost a search ranks a match by. A pair listed twice counts twice,
+/// as the query named it twice.
+pub fn count_phrase_pairs(json: &str, pairs: &[(String, String)]) -> Result<usize, DbError> {
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+    let content = parse_event_content(json)?;
+    let mut found = vec![false; pairs.len()];
+    let mut remaining = pairs.len();
+    let mut previous = String::new();
+    for_each_term(&content, |term| {
+        let Some(term) = term else {
+            previous.clear();
+            return true;
+        };
+        if !previous.is_empty() {
+            for (seen, (first, second)) in found.iter_mut().zip(pairs) {
+                if !*seen && *first == previous && second == term {
+                    *seen = true;
+                    remaining -= 1;
+                }
+            }
+        }
+        previous.clear();
+        previous.push_str(term);
+        remaining > 0
+    });
+    Ok(pairs.len() - remaining)
+}
+
 pub(crate) fn search_term_from_key(key: &[u8]) -> Option<&str> {
-    matches!(key.first(), Some(prefix) if *prefix == TERM_PREFIX || *prefix == BIGRAM_PREFIX)
+    (key.first() == Some(&TERM_PREFIX))
         .then(|| std::str::from_utf8(&key[1..]).ok())
         .flatten()
 }
@@ -263,21 +279,6 @@ pub fn search_posting_count(txn: &RoTxn<'_>, term: &str) -> Result<usize, DbErro
 pub fn search_posting_exists(txn: &RoTxn<'_>, term: &str, lev_id: u64) -> Result<bool, DbError> {
     let dbi = search_dbi_ro(txn)?;
     let key = term_key(term);
-    let value = lev_id.to_ne_bytes();
-    let mut cursor = txn.cursor(dbi)?;
-    Ok(cursor
-        .get(Some(&key), Some(&value), MDB_GET_BOTH)?
-        .is_some())
-}
-
-pub fn search_bigram_posting_exists(
-    txn: &RoTxn<'_>,
-    first: &str,
-    second: &str,
-    lev_id: u64,
-) -> Result<bool, DbError> {
-    let dbi = search_dbi_ro(txn)?;
-    let key = bigram_key(first, second);
     let value = lev_id.to_ne_bytes();
     let mut cursor = txn.cursor(dbi)?;
     Ok(cursor
@@ -462,17 +463,53 @@ mod tests {
             .join(" ");
         let json = serde_json::json!({"content": content}).to_string();
         let entries = search_index_entries(7, &json).unwrap();
-        let terms = entries
+        assert_eq!(entries.len(), MAX_INDEXED_UNIQUE_TERMS);
+        assert!(entries
             .iter()
-            .filter(|(key, _)| key.first() == Some(&TERM_PREFIX))
-            .count();
-        let bigrams = entries
-            .iter()
-            .filter(|(key, _)| key.first() == Some(&BIGRAM_PREFIX))
-            .count();
-        assert_eq!(terms, MAX_INDEXED_UNIQUE_TERMS);
-        assert_eq!(bigrams, MAX_INDEXED_BIGRAMS);
-        assert!(entries.len() <= MAX_INDEXED_UNIQUE_TERMS + MAX_INDEXED_BIGRAMS);
+            .all(|(key, _)| key.first() == Some(&TERM_PREFIX)));
+        assert!(entries.iter().any(|(key, _)| key == &term_key("term255")));
+    }
+
+    #[test]
+    fn phrase_pairs_are_read_from_the_content() {
+        let pairs = |query: &[&str]| {
+            query
+                .windows(2)
+                .map(|pair| (pair[0].to_string(), pair[1].to_string()))
+                .collect::<Vec<_>>()
+        };
+        let event = |content: &str| serde_json::json!({ "content": content }).to_string();
+        let json = event("The Best NOSTR apps, best of all");
+        assert_eq!(
+            count_phrase_pairs(&json, &pairs(&["best", "nostr", "apps"])).unwrap(),
+            2
+        );
+        assert_eq!(
+            count_phrase_pairs(&json, &pairs(&["nostr", "best"])).unwrap(),
+            0
+        );
+        // A pair the query names twice counts twice.
+        assert_eq!(
+            count_phrase_pairs(&json, &pairs(&["best", "nostr", "best", "nostr"])).unwrap(),
+            2
+        );
+        // A word too long to index separates its neighbours.
+        let long = "x".repeat(MAX_INDEXED_TERM_BYTES + 1);
+        let json = event(&format!("best {long} nostr"));
+        assert_eq!(
+            count_phrase_pairs(&json, &pairs(&["best", "nostr"])).unwrap(),
+            0
+        );
+        // Unlike the old adjacent-term postings, there is no cap: a pair is
+        // found however far into the content it is.
+        let mut words: Vec<String> = (0..1_000).map(|n| format!("w{n}")).collect();
+        words.extend(["late".into(), "pair".into()]);
+        let json = event(&words.join(" "));
+        assert_eq!(
+            count_phrase_pairs(&json, &pairs(&["late", "pair"])).unwrap(),
+            1
+        );
+        assert_eq!(count_phrase_pairs(&json, &[]).unwrap(), 0);
     }
 
     #[test]

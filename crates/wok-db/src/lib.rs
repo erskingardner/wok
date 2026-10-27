@@ -70,8 +70,8 @@ pub use purge::{count_superseded_ro, purge_superseded, SupersededHistory};
 pub use reindex::{rebuild_primary_and_event_indices, PackedEventRebuild, ReindexStats};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use search::{
-    event_content, event_search_terms, index_event_search, normalize_search_terms,
-    parse_search_query, remove_event_search, search_bigram_posting_exists, search_posting_count,
+    count_phrase_pairs, event_content, event_search_terms, index_event_search,
+    normalize_search_terms, parse_search_query, remove_event_search, search_posting_count,
     search_posting_exists, search_postings, search_term_set, SearchQuery, SearchTermSet,
     MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TERMS,
 };

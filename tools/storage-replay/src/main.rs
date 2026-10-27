@@ -46,6 +46,10 @@ const PAYLOAD_TABLE: &str = "rasgueadb_defaultDb__EventPayload";
 const PRELOAD_BATCH: u64 = 1_000;
 const READ_LIMIT: usize = 50;
 const SAMPLED_AUTHORS: usize = 20_000;
+/// Authors whose answers [`Report::read_digest`] covers.
+const DIGEST_AUTHORS: usize = 200;
+/// How far each preload copy shifts local IDs.
+const COPY_OFFSET: u64 = 1 << 40;
 
 const MDB_REVERSEKEY: u32 = 0x02;
 const MDB_DUPSORT: u32 = 0x04;
@@ -79,6 +83,16 @@ struct Args {
     /// RocksDB block cache.
     #[arg(long, default_value_t = 8_192)]
     rocks_cache_mb: usize,
+    /// RocksDB: store the integers of `StringUint64` and
+    /// `StringUint64Uint64` keys and their duplicates inverted, so an
+    /// author's newest events come first in a forward scan, and fetch a
+    /// query's payloads with one multi-get.
+    #[arg(long)]
+    rocks_newest_first: bool,
+    /// RocksDB: commit the preload this many times, each copy's local IDs
+    /// shifted above the last, for a tree as deep as a larger history's.
+    #[arg(long, default_value_t = 1)]
+    preload_repeat: u64,
 }
 
 // ---------------------------------------------------------------- the log
@@ -227,6 +241,50 @@ impl Log {
     }
 }
 
+/// Where a table holds local IDs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalIds {
+    None,
+    Key,
+    Duplicate,
+}
+
+fn local_ids(t: &Table) -> LocalIds {
+    if t.name == EVENT_TABLE || t.name == PAYLOAD_TABLE {
+        LocalIds::Key
+    } else if t.flags & MDB_DUPSORT != 0 && t.flags & MDB_INTEGERDUP != 0 {
+        LocalIds::Duplicate
+    } else {
+        LocalIds::None
+    }
+}
+
+/// Add `by` to every local ID `txn` writes or deletes.
+fn shift_local_ids(txn: &mut Txn, tables: &[LocalIds], by: u64) {
+    let add = |b: &mut Vec<u8>| {
+        if let Ok(raw) = <[u8; 8]>::try_from(&b[..]) {
+            b.copy_from_slice(&(u64::from_ne_bytes(raw) + by).to_ne_bytes());
+        }
+    };
+    for op in &mut txn.ops {
+        match op {
+            Op::Put {
+                table, key, val, ..
+            } => match tables[*table] {
+                LocalIds::Key => add(key),
+                LocalIds::Duplicate => add(val),
+                LocalIds::None => {}
+            },
+            Op::Del { table, key, val } => match (tables[*table], val) {
+                (LocalIds::Key, _) => add(key),
+                (LocalIds::Duplicate, Some(val)) => add(val),
+                _ => {}
+            },
+            Op::Clear { .. } => {}
+        }
+    }
+}
+
 fn read_u8(r: &mut impl Read) -> Result<u8> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b)?;
@@ -277,6 +335,21 @@ impl Background {
     }
 }
 
+/// What a reader's query returned: its events, and an order-sensitive
+/// digest of their local IDs.
+#[derive(Default)]
+struct Answer {
+    events: usize,
+    digest: u64,
+}
+
+impl Answer {
+    fn add(&mut self, lev_id: u64) {
+        self.events += 1;
+        self.digest = self.digest.rotate_left(7) ^ lev_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
 trait Engine: Send + Sync {
     /// Commit `txn` durably: (transaction µs, commit µs, ops that did not
     /// apply as recorded).
@@ -288,7 +361,7 @@ trait Engine: Send + Sync {
     /// Compaction bytes RocksDB estimates it owes.
     fn pending_compaction_bytes(&self) -> u64;
     /// An author's newest `limit` events with their payloads: events read.
-    fn newest_by_author(&self, pubkey: &[u8], limit: usize) -> Result<usize>;
+    fn newest_by_author(&self, pubkey: &[u8], limit: usize) -> Result<Answer>;
 }
 
 struct Lmdb {
@@ -367,7 +440,7 @@ impl Engine for Lmdb {
         0
     }
 
-    fn newest_by_author(&self, pubkey: &[u8], limit: usize) -> Result<usize> {
+    fn newest_by_author(&self, pubkey: &[u8], limit: usize) -> Result<Answer> {
         use lmdb_sys::{MDB_LAST, MDB_PREV, MDB_SET_RANGE};
         let ro = self.env.begin_ro()?;
         let mut cursor = ro.cursor(self.pubkey)?;
@@ -377,29 +450,30 @@ impl Engine for Lmdb {
             Some(_) => cursor.get(None, None, MDB_PREV)?,
             None => cursor.get(None, None, MDB_LAST)?,
         };
-        let mut read = 0;
+        let mut answer = Answer::default();
         while let Some((key, lev_id)) = at {
-            if read == limit || !key.starts_with(pubkey) {
+            if answer.events == limit || !key.starts_with(pubkey) {
                 break;
             }
             let payload = ro.get(self.payload, lev_id)?.context("payload missing")?;
             std::hint::black_box(payload);
-            read += 1;
+            answer.add(u64::from_ne_bytes(lev_id.try_into()?));
             at = cursor.get(None, None, MDB_PREV)?;
         }
-        Ok(read)
+        Ok(answer)
     }
 }
 
 struct Rocks {
     db: rocksdb::DB,
     tables: Vec<Table>,
+    newest_first: bool,
     /// The options the database was opened with, for its statistics.
     opts: Mutex<rocksdb::Options>,
 }
 
 impl Rocks {
-    fn open(dir: &Path, tables: Vec<Table>, cache_mb: usize) -> Result<Self> {
+    fn open(dir: &Path, tables: Vec<Table>, cache_mb: usize, newest_first: bool) -> Result<Self> {
         use rocksdb::{
             BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Options,
         };
@@ -437,6 +511,7 @@ impl Rocks {
         Ok(Self {
             db,
             tables,
+            newest_first,
             opts: Mutex::new(opts),
         })
     }
@@ -465,15 +540,20 @@ impl Rocks {
 }
 
 /// `key` re-encoded so bytewise order matches the table's LMDB order, with
-/// the duplicate `dup` appended for a DUPSORT table.
-fn rocks_key(t: &Table, key: &[u8], dup: Option<&[u8]>) -> Vec<u8> {
-    fn be(b: &[u8]) -> [u8; 8] {
-        u64::from_ne_bytes(b.try_into().unwrap()).to_be_bytes()
-    }
+/// the duplicate `dup` appended for a DUPSORT table. With `newest_first`,
+/// the integers of `StringUint64` and `StringUint64Uint64` keys and their
+/// duplicates sort in reverse.
+fn rocks_key(t: &Table, key: &[u8], dup: Option<&[u8]>, newest_first: bool) -> Vec<u8> {
+    let invert = newest_first && matches!(t.comparator, 1 | 3);
+    let be = |b: &[u8]| -> [u8; 8] {
+        let v = u64::from_ne_bytes(b.try_into().unwrap());
+        if invert { !v } else { v }.to_be_bytes()
+    };
+    let int_be = |b: &[u8]| -> [u8; 8] { u64::from_ne_bytes(b.try_into().unwrap()).to_be_bytes() };
     let mut out = Vec::with_capacity(key.len() + 8);
     let n = key.len();
     if t.flags & MDB_INTEGERKEY != 0 && n == 8 {
-        out.extend_from_slice(&be(key));
+        out.extend_from_slice(&int_be(key));
     } else if t.flags & MDB_REVERSEKEY != 0 {
         out.extend(key.iter().rev());
     } else {
@@ -485,8 +565,8 @@ fn rocks_key(t: &Table, key: &[u8], dup: Option<&[u8]>) -> Vec<u8> {
             }
             // Uint64Uint64
             2 if n == 16 => {
-                out.extend_from_slice(&be(&key[..8]));
-                out.extend_from_slice(&be(&key[8..]));
+                out.extend_from_slice(&int_be(&key[..8]));
+                out.extend_from_slice(&int_be(&key[8..]));
             }
             // StringUint64Uint64
             3 if n >= 16 => {
@@ -518,9 +598,17 @@ impl Engine for Rocks {
                 } => {
                     let t = &self.tables[*table];
                     if t.flags & MDB_DUPSORT != 0 {
-                        batch.put_cf(self.cf(*table), rocks_key(t, key, Some(val)), []);
+                        batch.put_cf(
+                            self.cf(*table),
+                            rocks_key(t, key, Some(val), self.newest_first),
+                            [],
+                        );
                     } else {
-                        batch.put_cf(self.cf(*table), rocks_key(t, key, None), val);
+                        batch.put_cf(
+                            self.cf(*table),
+                            rocks_key(t, key, None, self.newest_first),
+                            val,
+                        );
                     }
                 }
                 Op::Del { table, key, val } => {
@@ -529,9 +617,13 @@ impl Engine for Rocks {
                         let dup = val
                             .as_deref()
                             .context("whole-key delete on a DUPSORT table")?;
-                        batch.delete_cf(self.cf(*table), rocks_key(t, key, Some(dup)));
+                        batch.delete_cf(
+                            self.cf(*table),
+                            rocks_key(t, key, Some(dup), self.newest_first),
+                        );
                     } else {
-                        batch.delete_cf(self.cf(*table), rocks_key(t, key, None));
+                        batch
+                            .delete_cf(self.cf(*table), rocks_key(t, key, None, self.newest_first));
                     }
                 }
                 Op::Clear { table } => {
@@ -602,7 +694,7 @@ impl Engine for Rocks {
         self.sum_property("rocksdb.estimate-pending-compaction-bytes")
     }
 
-    fn newest_by_author(&self, pubkey: &[u8], limit: usize) -> Result<usize> {
+    fn newest_by_author(&self, pubkey: &[u8], limit: usize) -> Result<Answer> {
         // One snapshot for the index and the payloads, as an LMDB read
         // transaction has: otherwise an event replaced in between has an
         // index entry and no payload.
@@ -617,11 +709,36 @@ impl Engine for Rocks {
             .db
             .raw_iterator_cf_opt(self.cf_named(PUBKEY_TABLE), opts());
         let get_opts = opts();
+        if self.newest_first {
+            it.seek(pubkey);
+            let mut lev_ids = Vec::with_capacity(limit);
+            while lev_ids.len() < limit && it.valid() {
+                let key = it.key().unwrap();
+                if !key.starts_with(pubkey) {
+                    break;
+                }
+                let inverted = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                lev_ids.push((!inverted).to_be_bytes());
+                it.next();
+            }
+            it.status()?;
+            let mut answer = Answer::default();
+            for (lev_id, value) in lev_ids.iter().zip(self.db.batched_multi_get_cf_opt(
+                payload,
+                lev_ids.iter(),
+                false,
+                &get_opts,
+            )) {
+                std::hint::black_box(&*value?.context("payload missing")?);
+                answer.add(u64::from_be_bytes(*lev_id));
+            }
+            return Ok(answer);
+        }
         let mut seek = pubkey.to_vec();
         seek.extend_from_slice(&[0xFF; 16]);
         it.seek_for_prev(&seek);
-        let mut read = 0;
-        while read < limit && it.valid() {
+        let mut answer = Answer::default();
+        while answer.events < limit && it.valid() {
             let key = it.key().unwrap();
             if !key.starts_with(pubkey) {
                 break;
@@ -632,11 +749,11 @@ impl Engine for Rocks {
                 .get_pinned_cf_opt(payload, lev_id, &get_opts)?
                 .context("payload missing")?;
             std::hint::black_box(&*value);
-            read += 1;
+            answer.add(u64::from_be_bytes(lev_id.try_into()?));
             it.prev();
         }
         it.status()?;
-        Ok(read)
+        Ok(answer)
     }
 }
 
@@ -699,11 +816,15 @@ struct Step {
     all_in_bytes_per_stored: Option<f64>,
     pending_compaction_bytes_at_end: u64,
     reads: Latency,
+    /// Mean events a reader's query returned (at most 50).
+    read_events_per_query: f64,
 }
 
 #[derive(Serialize)]
 struct Report {
     engine: EngineKind,
+    rocks_newest_first: bool,
+    preload_repeat: u64,
     log: PathBuf,
     preload: Option<Preload>,
     steps: Vec<Step>,
@@ -717,6 +838,9 @@ struct Report {
     divergent_ops: u64,
     /// Reader queries that failed; the first is printed.
     read_errors: u64,
+    /// Digest of the newest events of the first sampled authors after the
+    /// last step: equal across engines that replayed the same log once.
+    read_digest: String,
 }
 
 fn process_write_bytes() -> Option<u64> {
@@ -759,11 +883,14 @@ struct Phase {
 }
 
 impl Phase {
-    fn start(label: String, engine: &dyn Engine) -> Result<Self> {
+    fn start(label: String, engine: &dyn Engine, preload_repeat: u64) -> Result<Self> {
         let mut words = label.split_whitespace();
         let kind = words.next().unwrap_or_default();
         let (batch, events) = match kind {
-            "preload" => (PRELOAD_BATCH, words.next().unwrap_or("0").parse()?),
+            "preload" => (
+                PRELOAD_BATCH,
+                words.next().unwrap_or("0").parse::<u64>()? * preload_repeat,
+            ),
             "step" => (
                 words.next().unwrap_or("0").parse()?,
                 words.next().unwrap_or("0").parse()?,
@@ -790,6 +917,48 @@ impl Phase {
     fn is_preload(&self) -> bool {
         self.label.starts_with("preload")
     }
+
+    /// Commit `txn` and count it: ops that did not apply as recorded.
+    fn apply(&mut self, engine: &dyn Engine, txn: &Txn) -> Result<u64> {
+        let (txn_us, commit_us, divergent) = engine.apply(txn)?;
+        self.txns += 1;
+        self.logical_bytes += txn.logical_bytes;
+        if txn.stored > 0 {
+            self.stored += txn.stored;
+            self.commits += 1;
+            self.txn_hist.record(txn_us.max(1))?;
+            self.commit_hist.record(commit_us.max(1))?;
+        }
+        if self.is_preload()
+            && self.half.is_none()
+            && self.commits * PRELOAD_BATCH * 2 >= self.events
+        {
+            self.half = Some((self.logical_bytes, engine.background()));
+        }
+        Ok(divergent)
+    }
+}
+
+/// Commit the preload of the log at `path` again, local IDs shifted by
+/// `copy` × [`COPY_OFFSET`].
+fn apply_preload_copy(
+    path: &Path,
+    copy: u64,
+    shifts: &[LocalIds],
+    engine: &dyn Engine,
+    p: &mut Phase,
+) -> Result<u64> {
+    let mut log = Log::open(path)?;
+    match log.next()? {
+        Item::Phase(label) if label.starts_with("preload") => {}
+        _ => bail!("the log does not start with its preload"),
+    }
+    let mut divergent = 0;
+    while let Item::Txn(mut txn) = log.next()? {
+        shift_local_ids(&mut txn, shifts, copy * COPY_OFFSET);
+        divergent += p.apply(engine, &txn)?;
+    }
+    Ok(divergent)
 }
 
 fn main() -> Result<()> {
@@ -798,10 +967,24 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.dir)?;
     let mut log = Log::open(&args.log)?;
     let tables = std::mem::take(&mut log.tables);
+    ensure!(
+        args.preload_repeat == 1 || args.engine == EngineKind::Rocksdb,
+        "--preload-repeat is for RocksDB: LMDB's MDB_APPEND puts need rising keys"
+    );
+    ensure!(
+        !args.rocks_newest_first || args.engine == EngineKind::Rocksdb,
+        "--rocks-newest-first is for RocksDB"
+    );
+    let shifts: Vec<LocalIds> = tables.iter().map(local_ids).collect();
     let engine: Arc<dyn Engine> = match args.engine {
         EngineKind::Lmdb => Arc::new(Lmdb::open(&args.dir, &tables, false)?),
         EngineKind::LmdbNometasync => Arc::new(Lmdb::open(&args.dir, &tables, true)?),
-        EngineKind::Rocksdb => Arc::new(Rocks::open(&args.dir, tables, args.rocks_cache_mb)?),
+        EngineKind::Rocksdb => Arc::new(Rocks::open(
+            &args.dir,
+            tables,
+            args.rocks_cache_mb,
+            args.rocks_newest_first,
+        )?),
     };
 
     let mut authors: Vec<Vec<u8>> = Vec::new();
@@ -817,8 +1000,11 @@ fn main() -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(Mutex::new(Histogram::<u64>::new(3)?));
     let read_errors = Arc::new(AtomicU64::new(0));
+    // Events the readers' queries returned, for comparing engines' answers.
+    let read_events = Arc::new(AtomicU64::new(0));
     let mut readers = Vec::new();
 
+    let mut check_authors: Vec<Vec<u8>> = Vec::new();
     let mut preload = None;
     let mut steps = Vec::new();
     let mut divergent_ops = 0;
@@ -830,6 +1016,16 @@ fn main() -> Result<()> {
     loop {
         let item = log.next()?;
         if !matches!(item, Item::Txn(_)) {
+            if let Some(p) = phase.as_mut().filter(|p| p.is_preload()) {
+                for copy in 1..args.preload_repeat {
+                    divergent_ops +=
+                        apply_preload_copy(&args.log, copy, &shifts, engine.as_ref(), p)?;
+                    eprintln!(
+                        "preload copy {copy}: {:.0} s",
+                        p.started.elapsed().as_secs_f64()
+                    );
+                }
+            }
             if let Some(done) = phase.take() {
                 let secs = done.started.elapsed().as_secs_f64();
                 if done.is_preload() {
@@ -860,12 +1056,14 @@ fn main() -> Result<()> {
                     let mut chosen = authors.clone();
                     chosen.truncate(SAMPLED_AUTHORS);
                     let chosen = Arc::new(chosen);
+                    check_authors = chosen[..chosen.len().min(DIGEST_AUTHORS)].to_vec();
                     for i in 0..args.readers {
-                        let (engine, stop, reads, errors, chosen) = (
+                        let (engine, stop, reads, errors, events, chosen) = (
                             engine.clone(),
                             stop.clone(),
                             reads.clone(),
                             read_errors.clone(),
+                            read_events.clone(),
                             chosen.clone(),
                         );
                         readers.push(std::thread::spawn(move || {
@@ -877,9 +1075,11 @@ fn main() -> Result<()> {
                                 let author = &chosen[(x % chosen.len() as u64) as usize];
                                 let started = Instant::now();
                                 match engine.newest_by_author(author, READ_LIMIT) {
-                                    Ok(_) => {
+                                    Ok(answer) => {
                                         let us = started.elapsed().as_micros() as u64;
-                                        let _ = reads.lock().unwrap().record(us.max(1));
+                                        let mut reads = reads.lock().unwrap();
+                                        let _ = reads.record(us.max(1));
+                                        events.fetch_add(answer.events as u64, Ordering::Relaxed);
                                     }
                                     Err(error) => {
                                         if errors.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -913,11 +1113,13 @@ fn main() -> Result<()> {
                         }
                         _ => bytes_written.map(|b| b as f64 / stored),
                     };
-                    let read_latency = {
+                    let (read_latency, read_events_per_query) = {
                         let mut h = reads.lock().unwrap();
                         let latency = Latency::of(&h);
+                        let per_query =
+                            read_events.swap(0, Ordering::Relaxed) as f64 / h.len().max(1) as f64;
                         h.reset();
-                        latency
+                        (latency, per_query)
                     };
                     steps_logical += done.logical_bytes;
                     eprintln!(
@@ -944,6 +1146,7 @@ fn main() -> Result<()> {
                         all_in_bytes_per_stored: all_in,
                         pending_compaction_bytes_at_end: engine.pending_compaction_bytes(),
                         reads: read_latency,
+                        read_events_per_query,
                     });
                 }
             }
@@ -954,8 +1157,11 @@ fn main() -> Result<()> {
                     bail!("a step before the preload");
                 }
                 // Readers measure steps only.
-                reads.lock().unwrap().reset();
-                phase = Some(Phase::start(label, engine.as_ref())?);
+                let mut h = reads.lock().unwrap();
+                h.reset();
+                read_events.store(0, Ordering::Relaxed);
+                drop(h);
+                phase = Some(Phase::start(label, engine.as_ref(), args.preload_repeat)?);
             }
             Item::Txn(txn) => {
                 let p = phase.as_mut().context("a transaction before any phase")?;
@@ -977,19 +1183,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                let (txn_us, commit_us, divergent) = engine.apply(&txn)?;
-                divergent_ops += divergent;
-                p.txns += 1;
-                p.logical_bytes += txn.logical_bytes;
-                if txn.stored > 0 {
-                    p.stored += txn.stored;
-                    p.commits += 1;
-                    p.txn_hist.record(txn_us.max(1))?;
-                    p.commit_hist.record(commit_us.max(1))?;
-                }
-                if p.is_preload() && p.half.is_none() && p.commits * PRELOAD_BATCH * 2 >= p.events {
-                    p.half = Some((p.logical_bytes, engine.background()));
-                }
+                divergent_ops += p.apply(engine.as_ref(), &txn)?;
             }
             Item::End => break,
         }
@@ -1006,8 +1200,15 @@ fn main() -> Result<()> {
     let final_settle_secs = settle_started.elapsed().as_secs_f64();
     let final_bg = engine.background();
     let steps_bg = final_bg.since(steps_bg_before);
+    let mut read_digest = 0u64;
+    for author in &check_authors {
+        let answer = engine.newest_by_author(author, READ_LIMIT)?;
+        read_digest = read_digest.rotate_left(13) ^ answer.digest ^ answer.events as u64;
+    }
     let report = Report {
         engine: args.engine,
+        rocks_newest_first: args.rocks_newest_first,
+        preload_repeat: args.preload_repeat,
         log: args.log.clone(),
         preload,
         steps,
@@ -1019,6 +1220,7 @@ fn main() -> Result<()> {
         footprint_bytes: dir_bytes(&args.dir),
         divergent_ops,
         read_errors: read_errors.load(Ordering::Relaxed),
+        read_digest: format!("{read_digest:016x}"),
     };
     std::fs::write(&args.out, serde_json::to_string_pretty(&report)?)?;
     ensure!(

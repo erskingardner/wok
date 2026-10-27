@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so such a socket gives each local user a channel that only proof of work,
   the storage quotas and the per-author EVENT budget limit, and an
   unauthenticated connection starts that budget afresh with each new key.
+  NIP-62 vanish requests skip proof of work and the quotas (#248), so the
+  disk reserve is what bounds a peer that signs one with each new key.
   docs/production-deployment.md now says what a write-policy plugin's
   request carries: `authed` is present only for NIP-70 protected events and
   owner-only kinds, so a plugin cannot use it to tell who is logged in, and
@@ -293,9 +295,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer counts a batch's vanish requests: when the rest of the batch is over
   it, they are written on their own and everything else is refused as
   before. On a full relay, or one that requires proof of work, anyone can
-  therefore store a vanish request with each fresh key. The per-address and
-  per-author EVENT budgets and the disk reserve
-  (`database.min_free_disk_bytes`) bound them, and the NIP-86 kind policy,
+  therefore store a vanish request with each fresh key. The per-address
+  EVENT budget (which a Unix connection skips), the per-author EVENT budget
+  and the disk reserve (`database.min_free_disk_bytes`) bound them, and the
+  NIP-86 kind policy,
   event-id bans, blocked addresses and `relay.nip62.enabled` still refuse
   them (see docs/attack-surface.md).
 - NIP-62 vanish requests are now honored from banned authors and, with

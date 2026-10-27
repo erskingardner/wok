@@ -155,6 +155,13 @@ it is not a promise to reproduce upstream bugs.
   using different wording is counted as `upload_rejected`, and the run exits
   nonzero even if replacement semantics explain the difference. Arbitrary
   human-readable rejection text is not treated as evidence of supersession.
+- `wok upload` exits nonzero when the relay refuses an event, other than as
+  superseded (classified as `wok sync` does), and when the connection closes
+  with acknowledgments outstanding. It matches each OK to an event it sent
+  by id. strfry's `upload` counts any OK, for any event, and exits 0 once
+  none is in flight, refusals included. Wok also sends only lines that are
+  JSON with a lowercase 32-byte hex `id`, and refuses `--pipeline 0`, with
+  which strfry's sends nothing and waits.
 - Negentropy tree filters are parsed without `relay.max_tags_per_filter` or
   `relay.max_and_entries`, which bound client filters. strfry parses stored
   tree filters with `relay__maxTagsPerFilter`, so lowering it below a tree's

@@ -8,9 +8,12 @@
 //!
 //! Each step runs over every corpus event twice: once timing each call, for
 //! the percentiles, and once untimed, for the rate, so the clock's own cost
-//! (tens of ns a call) does not bias the mean of the shortest steps. Every
-//! result is checked: an id or signature that does not verify, or a frame
-//! that decodes to other bytes, is a mismatch.
+//! (tens of ns a call) does not bias the mean of the shortest steps. Only the
+//! codec call is timed; its output is checked after the clock stops, on the
+//! timed pass, and kept from the optimizer on both. An id or signature that
+//! does not verify, an inbound frame that decodes to other bytes, or an
+//! outbound frame a client would not decode back to the delivery is a
+//! mismatch.
 
 use anyhow::{Context, Result};
 use hdrhistogram::Histogram;
@@ -39,6 +42,7 @@ pub struct Report {
 #[derive(Serialize, Clone)]
 pub struct Step {
     pub name: String,
+    /// Calls whose output checked out.
     pub ops: u64,
     /// Mean of the untimed pass.
     pub mean_ns: f64,
@@ -49,7 +53,7 @@ pub struct Step {
     /// Message bytes per second of the untimed pass: the event JSON, or the
     /// whole message for the WebSocket steps.
     pub mb_per_s: f64,
-    /// Output bytes over input bytes, for the steps that compress.
+    /// Compressed over uncompressed bytes, for the steps that compress.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_ratio: Option<f64>,
 }
@@ -88,6 +92,13 @@ struct Sample {
     client_frame: Vec<u8>,
 }
 
+impl Sample {
+    fn value_len(&self) -> usize {
+        // The message is `["EVENT",` + the event + `]`.
+        self.message.len() - 10
+    }
+}
+
 pub fn run(corpus: &Path) -> Result<Report> {
     let mut samples = Vec::new();
     for line in std::io::BufReader::new(std::fs::File::open(corpus)?).lines() {
@@ -99,88 +110,68 @@ pub fn run(corpus: &Path) -> Result<Report> {
     }
     anyhow::ensure!(!samples.is_empty(), "--scenario codec_cpu needs a corpus");
     let events = samples.len() as u64;
-    let event_bytes: usize = samples.iter().map(|sample| sample.value_len()).sum();
-    let mut mismatches = 0u64;
-    let mut steps = Vec::new();
+    let event_bytes: usize = samples.iter().map(Sample::value_len).sum();
+    let message_bytes: usize = samples.iter().map(|s| s.message.len()).sum();
+    let delivery_bytes: usize = samples.iter().map(|s| s.delivery.len()).sum();
     let limits = wok_event::EventLimits {
         max_event_size: usize::MAX,
         max_num_tags: usize::MAX,
         max_tag_val_size: usize::MAX,
     };
+    let mut steps = Vec::new();
 
     // A connection's parser and encoder live across its messages, and with
     // deflate's context takeover so does their history, so each pass keeps
     // one of each, as one connection does.
-    steps.push(
-        measure(
-            "ws decode",
-            &samples,
-            || WsParser::new(MAX_MESSAGE, None),
-            |parser, s| {
-                let ok = decoded(parser, &s.client_frame).as_deref() == Some(s.message.as_bytes());
-                (s.message.len(), ok)
-            },
-        )
-        .0,
-    );
-    steps.push(
-        measure(
-            "EVENT message parse",
-            &samples,
-            || (),
-            |_, s| {
-                let ok = matches!(
-                    wok_relay::protocol::ClientCommand::parse(black_box(&s.message)),
-                    Ok(wok_relay::protocol::ClientCommand::Event(_))
-                );
-                (s.message.len(), ok)
-            },
-        )
-        .0,
-    );
-    steps.push(
-        measure(
-            "event pack",
-            &samples,
-            || (),
-            |_, s| {
-                let packed = wok_event::parse_and_verify_event(
-                    black_box(&s.value),
-                    &limits,
-                    None,
-                    false,
-                    false,
-                );
-                (s.value_len(), packed.is_ok())
-            },
-        )
-        .0,
-    );
-    steps.push(
-        measure(
-            "id hash",
-            &samples,
-            || (),
-            |_, s| {
-                let ok = wok_event::verify_id(black_box(&s.value), &s.id).is_ok();
-                (s.value_len(), ok)
-            },
-        )
-        .0,
-    );
-    steps.push(
-        measure(
-            "signature verify",
-            &samples,
-            || (),
-            |_, s| {
-                let ok =
-                    wok_event::verify_sig(black_box(&s.sig), &s.id, &s.pubkey).unwrap_or(false);
-                (s.value_len(), ok)
-            },
-        )
-        .0,
-    );
+    steps.push(measure(
+        "ws decode",
+        &samples,
+        |s| s.message.len(),
+        || WsParser::new(MAX_MESSAGE, None),
+        |parser, s| parser.feed(&s.client_frame),
+        |s, events| text_of(events) == Some(s.message.as_bytes()),
+    ));
+    steps.push(measure(
+        "EVENT message parse",
+        &samples,
+        |s| s.message.len(),
+        || (),
+        |_, s| wok_relay::protocol::ClientCommand::parse(&s.message),
+        |_, command| matches!(command, Ok(wok_relay::protocol::ClientCommand::Event(_))),
+    ));
+    steps.push(measure(
+        "event pack",
+        &samples,
+        Sample::value_len,
+        || (),
+        |_, s| {
+            let parsed = wok_event::parse_and_verify_event(&s.value, &limits, None, false, false);
+            // The stored JSON and packed bytes are the step's output; keep
+            // them, or the optimizer may drop the work that builds them.
+            if let Ok(parsed) = &parsed {
+                black_box(parsed.json.as_bytes());
+                black_box(parsed.packed.as_bytes());
+            }
+            parsed
+        },
+        |_, parsed| parsed.is_ok(),
+    ));
+    steps.push(measure(
+        "id hash",
+        &samples,
+        Sample::value_len,
+        || (),
+        |_, s| wok_event::verify_id(&s.value, &s.id),
+        |_, verified| verified.is_ok(),
+    ));
+    steps.push(measure(
+        "signature verify",
+        &samples,
+        |_| 64,
+        || (),
+        |_, s| wok_event::verify_sig(&s.sig, &s.id, &s.pubkey),
+        |_, verified| matches!(verified, Ok(true)),
+    ));
 
     let compressed = {
         let mut client = WsEncoder::with_role(Some(DeflateCtx::new(true)), Role::Client);
@@ -189,59 +180,56 @@ pub fn run(corpus: &Path) -> Result<Report> {
             .map(|s| client.encode_message(MessageKind::Text, s.message.as_bytes()))
             .collect::<Result<Vec<_>, _>>()?
     };
-    let message_bytes: usize = samples.iter().map(|s| s.message.len()).sum();
-    let (mut step, _) = measure(
+    let mut step = measure(
         "ws decode + inflate",
         &samples,
+        |s| s.message.len(),
         || {
             (
                 WsParser::new(MAX_MESSAGE, Some(InflateCtx::new(true))),
                 compressed.iter(),
             )
         },
-        |(parser, frames), s| {
-            let frame = frames.next().expect("one frame per sample");
-            let ok = decoded(parser, frame).as_deref() == Some(s.message.as_bytes());
-            (s.message.len(), ok)
-        },
+        |(parser, frames), _| parser.feed(frames.next().expect("one frame per sample")),
+        |s, events| text_of(events) == Some(s.message.as_bytes()),
     );
     step.size_ratio =
         Some(compressed.iter().map(Vec::len).sum::<usize>() as f64 / message_bytes as f64);
     steps.push(step);
 
-    steps.push(
-        measure(
-            "ws encode",
-            &samples,
-            || WsEncoder::new(None),
-            |encoder, s| {
-                let frame =
-                    encoder.encode_message(MessageKind::Text, black_box(s.delivery.as_bytes()));
-                (
-                    s.delivery.len(),
-                    frame.is_ok_and(|frame| frame.ends_with(s.delivery.as_bytes())),
-                )
-            },
-        )
-        .0,
-    );
-    let delivery_bytes: usize = samples.iter().map(|s| s.delivery.len()).sum();
-    let (mut step, (_, out_bytes)) = measure(
+    // Outbound frames are checked as a client reads them.
+    let mut client = WsParser::with_role(MAX_MESSAGE, None, Role::Client);
+    steps.push(measure(
+        "ws encode",
+        &samples,
+        |s| s.delivery.len(),
+        || WsEncoder::new(None),
+        |encoder, s| encoder.encode_message(MessageKind::Text, s.delivery.as_bytes()),
+        |s, frame| {
+            frame
+                .as_ref()
+                .is_ok_and(|frame| decodes_to(&mut client, frame, s.delivery.as_bytes()))
+        },
+    ));
+    let mut client = WsParser::with_role(MAX_MESSAGE, Some(InflateCtx::new(true)), Role::Client);
+    let mut sent = 0usize;
+    let mut step = measure(
         "ws encode + deflate",
         &samples,
-        || (WsEncoder::new(Some(DeflateCtx::new(true))), 0usize),
-        |(encoder, out_bytes), s| {
-            let frame = encoder.encode_message(MessageKind::Text, s.delivery.as_bytes());
-            let ok = frame.as_ref().is_ok_and(|frame| !frame.is_empty());
-            *out_bytes += frame.map_or(0, |frame| frame.len());
-            (s.delivery.len(), ok)
+        |s| s.delivery.len(),
+        || WsEncoder::new(Some(DeflateCtx::new(true))),
+        |encoder, s| encoder.encode_message(MessageKind::Text, s.delivery.as_bytes()),
+        |s, frame| {
+            frame.as_ref().is_ok_and(|frame| {
+                sent += frame.len();
+                decodes_to(&mut client, frame, s.delivery.as_bytes())
+            })
         },
     );
-    step.size_ratio = Some(out_bytes as f64 / delivery_bytes as f64);
+    step.size_ratio = Some(sent as f64 / delivery_bytes as f64);
     steps.push(step);
-    for step in &steps {
-        mismatches += events - step.ops;
-    }
+
+    let mismatches = steps.iter().map(|step| events - step.ops).sum();
     Ok(Report {
         events,
         mean_event_bytes: event_bytes as f64 / events as f64,
@@ -249,13 +237,6 @@ pub fn run(corpus: &Path) -> Result<Report> {
         steps,
         mismatches,
     })
-}
-
-impl Sample {
-    fn value_len(&self) -> usize {
-        // The message is `["EVENT",` + the event + `]`.
-        self.message.len() - 10
-    }
 }
 
 fn sample(line: &str) -> Result<Sample> {
@@ -285,41 +266,49 @@ fn sample(line: &str) -> Result<Sample> {
     })
 }
 
-fn decoded(parser: &mut WsParser, frame: &[u8]) -> Option<Vec<u8>> {
-    match parser.feed(frame).ok()?.pop()? {
-        WsEvent::Message(MessageKind::Text, bytes) => Some(bytes),
+/// The one text message a parser's output holds.
+fn text_of(events: &Result<Vec<WsEvent>, wok_ws::frame::WsError>) -> Option<&[u8]> {
+    match events.as_ref().ok()?.as_slice() {
+        [WsEvent::Message(MessageKind::Text, bytes)] => Some(bytes),
         _ => None,
     }
 }
 
-/// Time `op` on every sample, with state from `new_state` that lasts one
-/// pass. `op` returns the sample's input bytes and whether its result checked
-/// out; `ops` counts those that did. Returns the untimed pass's final state.
-fn measure<'a, S>(
+/// Whether `parser` reads `frame` as exactly one text message, `expected`.
+fn decodes_to(parser: &mut WsParser, frame: &[u8], expected: &[u8]) -> bool {
+    text_of(&parser.feed(frame)) == Some(expected)
+}
+
+/// Times `op` on every sample, with state from `new_state` that lasts one
+/// pass. On the timed pass, `check` judges each output after the clock
+/// stops; `ops` counts those that pass. The untimed pass gives the mean.
+fn measure<'a, S, O>(
     name: &str,
     samples: &'a [Sample],
+    bytes: impl Fn(&Sample) -> usize,
     mut new_state: impl FnMut() -> S,
-    mut op: impl FnMut(&mut S, &'a Sample) -> (usize, bool),
-) -> (Step, S) {
+    mut op: impl FnMut(&mut S, &'a Sample) -> O,
+    mut check: impl FnMut(&Sample, &O) -> bool,
+) -> Step {
     let mut hist = Histogram::<u64>::new(3).expect("histogram bounds");
     let mut ops = 0u64;
     let mut state = new_state();
     for s in samples {
         let started = Instant::now();
-        let (_, ok) = black_box(op(&mut state, s));
+        let output = black_box(op(&mut state, black_box(s)));
         let ns = started.elapsed().as_nanos() as u64;
         hist.record(ns.max(1)).expect("histogram range");
-        ops += u64::from(ok);
+        ops += u64::from(check(s, &output));
     }
     let mut state = new_state();
-    let mut bytes = 0usize;
     let started = Instant::now();
     for s in samples {
-        bytes += black_box(op(&mut state, s)).0;
+        black_box(op(&mut state, black_box(s)));
     }
     let secs = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
     let n = samples.len() as f64;
-    let step = Step {
+    let total: usize = samples.iter().map(&bytes).sum();
+    Step {
         name: name.into(),
         ops,
         mean_ns: secs * 1e9 / n,
@@ -327,15 +316,14 @@ fn measure<'a, S>(
         p99_ns: hist.value_at_quantile(0.99),
         max_ns: hist.max(),
         ops_per_s: n / secs,
-        mb_per_s: bytes as f64 / secs / 1e6,
+        mb_per_s: total as f64 / secs / 1e6,
         size_ratio: None,
-    };
-    (step, state)
+    }
 }
 
 pub fn render_markdown(report: &Report) -> String {
     let mut s = format!(
-        "\n## codec_cpu: {} events, {:.0} bytes on average\n\nCPU per message on one thread. The mean and rate come from an untimed pass, the percentiles from timing each call. Deflate is level {} with context takeover; its ratio is output over input bytes. One core takes about {:.0} uncompressed publications per second through the inbound steps (`ws decode` to `signature verify`).\n\n| step | mean ns | p50 ns | p99 ns | max ns | ops/s | MB/s | ratio | checked |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "\n## codec_cpu: {} events, {:.0} bytes on average\n\nCPU per message on one thread. The mean and rate come from an untimed pass, the percentiles from timing each call; checks run outside the clock. Deflate is level {} with context takeover; its ratio is compressed over uncompressed bytes. One core takes about {:.0} uncompressed publications per second through the inbound steps (`ws decode` to `signature verify`).\n\n| step | mean ns | p50 ns | p99 ns | max ns | ops/s | MB/s | ratio | checked |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         report.events,
         report.mean_event_bytes,
         report.deflate_level,
@@ -352,7 +340,7 @@ pub fn render_markdown(report: &Report) -> String {
             step.ops_per_s,
             step.mb_per_s,
             step.size_ratio
-                .map_or_else(|| "".into(), |ratio| format!("{ratio:.2}")),
+                .map_or_else(String::new, |ratio| format!("{ratio:.2}")),
             step.ops,
             report.events,
         ));
@@ -423,5 +411,38 @@ mod tests {
             .unwrap();
         assert_eq!(verify.ops, 1);
         assert_eq!(report.mismatches, 1);
+    }
+
+    #[test]
+    fn outbound_frames_check_only_when_a_client_reads_the_delivery() {
+        let delivery = br#"["EVENT","feed",{"content":"hello hello hello"}]"#;
+        let client = || WsParser::with_role(MAX_MESSAGE, Some(InflateCtx::new(true)), Role::Client);
+        let mut server = WsEncoder::new(Some(DeflateCtx::new(true)));
+        let frame = server.encode_message(MessageKind::Text, delivery).unwrap();
+        assert!(decodes_to(&mut client(), &frame, delivery));
+        // Another message, a corrupt payload, and a cut frame do not.
+        assert!(!decodes_to(
+            &mut client(),
+            &frame,
+            b"[\"EVENT\",\"feed\",{}]"
+        ));
+        let mut corrupt = frame.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        assert!(!decodes_to(&mut client(), &corrupt, delivery));
+        assert!(!decodes_to(
+            &mut client(),
+            &frame[..frame.len() - 1],
+            delivery
+        ));
+        // A server reads only masked frames, so an unmasked one is refused.
+        let plain = WsEncoder::new(None)
+            .encode_message(MessageKind::Text, delivery)
+            .unwrap();
+        assert!(!decodes_to(
+            &mut WsParser::new(MAX_MESSAGE, None),
+            &plain,
+            delivery
+        ));
     }
 }

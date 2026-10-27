@@ -1022,7 +1022,7 @@ This Wok-only scenario measures the CPU each message costs on the publish
 and delivery paths, in process on one thread, so it measures the code
 compiled into this `wok-bench` build, and a trial records this binary's
 hash. For every corpus event (`--corpus`, or one generated from `--events`
-and any `--event-mix`, `social` included) it times:
+and any `--event-mix`) it times:
 
 - **ws decode:** the client's masked `["EVENT", …]` frame through a
   connection's `WsParser`;
@@ -1040,10 +1040,14 @@ and any `--event-mix`, `social` included) it times:
 
 Each step runs over every event twice: timing each call, for the
 percentiles, and untimed, for the mean and rate, so the clock's own cost
-does not inflate the shortest steps. A parser, encoder or deflate context
-lasts one pass, as one connection's does. The ratio column is compressed
-over uncompressed bytes. A result that does not check out (an id or
-signature that fails, a frame that decodes to other bytes) is a mismatch.
+does not inflate the shortest steps. Only the codec call is timed: its
+output is checked after the clock stops, and kept from the optimizer on
+both passes. A parser, encoder or deflate context lasts one pass, as one
+connection's does. The ratio column is compressed over uncompressed bytes.
+A result that does not check out is a mismatch: an id or signature that
+fails, an inbound frame that decodes to other bytes, or an outbound frame
+that a client, inflating with the same context, does not read back as the
+delivery.
 The trial's throughput is the uncompressed publications per second one core
 takes through the five inbound steps; its latency columns are unused.
 

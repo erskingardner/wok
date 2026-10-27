@@ -587,21 +587,7 @@ fn main() -> Result<()> {
         anyhow::bail!("--scenario nip77_catchup syncs over WebSocket only");
     }
 
-    if args.event_mix == EventMix::Lifecycle
-        && scenarios.iter().any(|scenario| {
-            !matches!(
-                *scenario,
-                "ws_publish_1conn"
-                    | "ws_publish_8conn"
-                    | "ws_publish_scaled"
-                    | "live_fanout"
-                    | "idle_connections"
-            )
-        })
-    {
-        anyhow::bail!("--event-mix lifecycle is only valid for live publication scenarios");
-    }
-    check_social_mix(&args, &scenarios)?;
+    check_event_mix(&args, &scenarios)?;
 
     let default_event_count = if args.profile == "smoke" {
         2_000
@@ -1350,9 +1336,27 @@ fn measured_binary_sha256(bin: Option<&Path>, scenario: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Only the read scenarios check a social corpus's import against what a
-/// relay keeps of it; the any-mix scenarios read its events as they are.
-fn check_social_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
+/// A lifecycle corpus suits only live publication, and only the read
+/// scenarios check a social corpus's import against what a relay keeps of
+/// it. The any-mix scenarios read a corpus's events as they are.
+fn check_event_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
+    if args.event_mix == EventMix::Lifecycle
+        && scenarios.iter().any(|scenario| {
+            !matches!(
+                *scenario,
+                "ws_publish_1conn"
+                    | "ws_publish_8conn"
+                    | "ws_publish_scaled"
+                    | "live_fanout"
+                    | "idle_connections"
+            ) && !ANY_MIX_SCENARIOS.contains(scenario)
+        })
+    {
+        anyhow::bail!(
+            "--event-mix lifecycle is only valid for live publication scenarios and {}",
+            ANY_MIX_SCENARIOS.join(", ")
+        );
+    }
     if args.event_mix == EventMix::Social
         && !args.generate_corpus_only
         && scenarios.iter().any(|scenario| {
@@ -3965,21 +3969,19 @@ mod tests {
     }
 
     #[test]
-    fn a_social_corpus_runs_the_read_and_any_mix_scenarios_only() {
-        let social = |scenario: &str| {
-            let args = Args::try_parse_from([
-                "wok-bench",
-                "--scenario",
-                scenario,
-                "--event-mix",
-                "social",
-            ])
-            .unwrap();
-            check_social_mix(&args, &[scenario])
+    fn the_any_mix_scenarios_take_social_and_lifecycle_corpora() {
+        let check = |scenario: &str, mix: &str| {
+            let args =
+                Args::try_parse_from(["wok-bench", "--scenario", scenario, "--event-mix", mix])
+                    .unwrap();
+            check_event_mix(&args, &[scenario])
         };
-        assert!(social("codec_cpu").is_ok());
-        assert!(social("ws_query_latency").is_ok());
-        assert!(social("ws_publish_1conn").is_err());
+        assert!(check("codec_cpu", "social").is_ok());
+        assert!(check("codec_cpu", "lifecycle").is_ok());
+        assert!(check("ws_query_latency", "social").is_ok());
+        assert!(check("ws_publish_1conn", "social").is_err());
+        assert!(check("ws_publish_1conn", "lifecycle").is_ok());
+        assert!(check("ws_query_latency", "lifecycle").is_err());
     }
 
     #[test]

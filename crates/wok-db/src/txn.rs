@@ -29,8 +29,9 @@ pub struct RwTxn<'env> {
     pub(crate) event_sequence: Option<u64>,
     pub(crate) superseded_events: Option<u64>,
     pub(crate) author_counts: std::collections::HashMap<Vec<u8>, u64>,
-    /// Set by [`crate::defer_tag_kind_postings`]: the events this
-    /// transaction inserts get no `wok_Event__tagKind` postings.
+    /// Set by [`crate::defer_tag_kind_postings`] and
+    /// [`crate::skip_tag_kind_postings`]: the events this transaction
+    /// inserts get no `wok_Event__tagKind` postings.
     pub(crate) defer_tag_kind: bool,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }

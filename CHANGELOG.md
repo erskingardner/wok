@@ -353,6 +353,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wok-bench --scenario codec_cpu` measures the CPU each message costs on
+  the publish and delivery paths (#257), in process on one thread: the
+  client's EVENT message parsed as the relay parses it, the event packed,
+  its id hashed and its signature verified, and WebSocket frames decoded
+  and encoded with and without permessage-deflate. Every result is checked,
+  and the summary gives the publications per second one core can take
+  through the inbound steps.
 - `scripts/benchmark-campaign.sh` compares any number of relay targets
   (#226), each described by a file on the relay host, instead of one Wok and
   one strfry. Each relay runs as a transient systemd unit, which

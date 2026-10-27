@@ -1016,6 +1016,38 @@ author range, raise it or some subscriptions are refused.
 CI runs small versions of both scenarios as unit tests (`live::tests`). The
 `live_subscriptions` test uses an in-process relay.
 
+## Codec CPU (`codec_cpu`)
+
+This Wok-only scenario measures the CPU each message costs on the publish
+and delivery paths, in process on one thread, so it measures the code
+compiled into this `wok-bench` build. For every corpus event (`--corpus`,
+or one generated from `--events` and `--event-mix`) it times:
+
+- **ws decode:** the client's masked `["EVENT", …]` frame through a
+  connection's `WsParser`;
+- **EVENT message parse:** `ClientCommand::parse`, the relay's JSON parse of
+  the message;
+- **event pack:** `parse_and_verify_event` without verification: the packed
+  event and the normalized stored JSON;
+- **id hash** and **signature verify:** the NIP-01 id and the Schnorr
+  signature;
+- **ws decode + inflate:** the same message compressed by a client with
+  permessage-deflate and context takeover;
+- **ws encode** and **ws encode + deflate:** the relay's
+  `["EVENT", sub, …]` frame for one subscriber, at the relay's deflate level
+  with context takeover.
+
+Each step runs over every event twice: timing each call, for the
+percentiles, and untimed, for the mean and rate, so the clock's own cost
+does not inflate the shortest steps. A parser, encoder or deflate context
+lasts one pass, as one connection's does. The ratio column is compressed
+over uncompressed bytes. A result that does not check out (an id or
+signature that fails, a frame that decodes to other bytes) is a mismatch.
+The trial's throughput is the uncompressed publications per second one core
+takes through the five inbound steps; its latency columns are unused.
+
+CI runs a small version as unit tests (`codec::tests`).
+
 ## Portable Docker lab
 
 For a repeatable local setup or fresh two-VM deployment, start with the

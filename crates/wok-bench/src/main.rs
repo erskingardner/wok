@@ -14,6 +14,7 @@
 mod author_kinds;
 mod catchup;
 mod clients;
+mod codec;
 mod corpus;
 mod live;
 mod rate;
@@ -353,6 +354,8 @@ struct Trial {
     publish_rate: Option<rate::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nip77_catchup: Option<catchup::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codec_cpu: Option<codec::Report>,
 }
 
 #[derive(Serialize)]
@@ -499,6 +502,7 @@ fn main() -> Result<()> {
         "author_kinds",
         "tag_kinds",
         "nip77_catchup",
+        "codec_cpu",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -748,6 +752,7 @@ fn main() -> Result<()> {
                     | "tag_kinds"
                     | "monitor_index"
                     | "live_subscriptions"
+                    | "codec_cpu"
             ) {
                 vec!["wok"]
             } else {
@@ -831,9 +836,10 @@ fn run_trial(
     let mut tag_kinds_report = None;
     let mut rate_report = None;
     let mut catchup_report = None;
+    let mut codec_report = None;
 
-    let bin = if args.has_external_target() || scenario == "monitor_index" {
-        // monitor_index runs the index compiled into this binary.
+    let bin = if args.has_external_target() || matches!(scenario, "monitor_index" | "codec_cpu") {
+        // monitor_index and codec_cpu run the code compiled into this binary.
         None
     } else if relay == "wok" {
         Some(args.wok.as_path())
@@ -1280,6 +1286,23 @@ fn run_trial(
                 }
             }
         }
+        "codec_cpu" => match codec::run(corpus_path) {
+            Ok(report) => {
+                throughput = report.inbound_rate();
+                mismatches += report.mismatches;
+                ok = report.mismatches == 0;
+                notes = format!(
+                    "in-process codec CPU on {} events; throughput is uncompressed publications per core through the inbound steps; see the codec_cpu table",
+                    report.events
+                );
+                codec_report = Some(report);
+            }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e:#}");
+            }
+        },
         _ => {
             notes = "unrecognized scenario".into();
             ok = false;
@@ -1295,6 +1318,7 @@ fn run_trial(
         tag_kinds: tag_kinds_report,
         publish_rate: rate_report,
         nip77_catchup: catchup_report,
+        codec_cpu: codec_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1340,6 +1364,7 @@ fn failed_trial(
         tag_kinds: None,
         publish_rate: None,
         nip77_catchup: None,
+        codec_cpu: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -3472,6 +3497,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         }
         if let Some(report) = &t.nip77_catchup {
             s.push_str(&catchup::render_markdown(report, &t.relay, t.repetition));
+        }
+        if let Some(report) = &t.codec_cpu {
+            s.push_str(&codec::render_markdown(report));
         }
     }
     let mut selection = args.scenario.as_ref().map_or_else(

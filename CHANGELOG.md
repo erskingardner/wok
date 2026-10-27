@@ -379,6 +379,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Writer metrics (#257): histograms of how many messages were queued when
+  the writer started a batch, how many events each commit holds, and how
+  long the batch's checks, writes, commit and replies took
+  (`wok_writer_*`), plus the bytes its transactions sent to storage on
+  Linux. Publishing is bound by the single writer, so these show where an
+  event's EVENT→OK time goes and what each event costs to write.
 - `wok-bench`'s `live_fanout` keeps up to `--fanout-window` publications
   unacknowledged (256 by default; `FANOUT_WINDOW` in the campaign scripts)
   instead of waiting for each OK before the next (#257). It measured publish

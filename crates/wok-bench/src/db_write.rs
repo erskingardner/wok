@@ -47,7 +47,6 @@ pub struct Options {
     pub dir: PathBuf,
     pub batches: Vec<usize>,
     pub step_events: u64,
-    pub max_tags_per_filter: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -169,7 +168,7 @@ pub fn run(opts: &Options) -> Result<Report> {
         .with_context(|| format!("create a database under {}", opts.dir.display()))?;
     let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::default())?;
     env.ensure_initialized()?;
-    let mut trees = wok_negentropy::NegentropyFilterCache::new(opts.max_tags_per_filter);
+    let mut trees = wok_negentropy::NegentropyFilterCache::default();
     let mut lines = std::io::BufReader::new(std::fs::File::open(&opts.corpus)?)
         .lines()
         .filter(|line| !matches!(line, Ok(line) if line.trim().is_empty()));
@@ -372,7 +371,6 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![1, 4],
             step_events: 40,
-            max_tags_per_filter: 8,
         })
         .unwrap();
         assert_eq!(report.corpus_events, 300);
@@ -432,7 +430,6 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![4],
             step_events: 80,
-            max_tags_per_filter: 8,
         })
         .unwrap();
         assert_eq!((report.preloaded, report.preload_stored), (101, 101));
@@ -462,7 +459,6 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![1],
             step_events: 50,
-            max_tags_per_filter: 8,
         })
         .err()
         .unwrap();

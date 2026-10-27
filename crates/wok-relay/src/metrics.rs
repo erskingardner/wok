@@ -467,6 +467,9 @@ impl Metrics {
                 "wok_tag_kind_backfill_entries_total {}\n",
                 "# TYPE wok_tag_kind_backfill_seconds_total counter\n",
                 "wok_tag_kind_backfill_seconds_total {}\n",
+                "# HELP wok_author_count_drift_total Author counters a deletion found below the author's stored events, and dropped to be counted again\n",
+                "# TYPE wok_author_count_drift_total counter\n",
+                "wok_author_count_drift_total {}\n",
             ),
             g(&self.active_connections),
             g(&self.authenticated_connections),
@@ -513,6 +516,7 @@ impl Metrics {
             g(&self.tag_kind_tag_entries),
             g(&self.tag_kind_backfill_entries_total),
             g(&self.tag_kind_backfill_micros_total) as f64 / 1e6,
+            g(&wok_db::state::AUTHOR_COUNT_DRIFT),
         );
         out.push_str(concat!(
             "# HELP wok_refusals_total Requests and events refused, by the config key that refused them\n",

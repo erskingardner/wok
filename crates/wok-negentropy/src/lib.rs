@@ -16,7 +16,7 @@ mod storage;
 mod types;
 mod vector;
 
-pub use cache::{DeferredSink, NegentropyFilterCache};
+pub use cache::{parse_negentropy_filter, DeferredSink, NegentropyFilterCache};
 pub use error::NegError;
 pub use integrity::verify_tree;
 pub use lmdb_store::{open_ro, open_rw, BTreeLmdbRo, BTreeLmdbRw};

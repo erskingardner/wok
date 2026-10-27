@@ -29,6 +29,8 @@ REPETITIONS=${REPETITIONS:-3}
 PUBLISH_CONNECTIONS=${PUBLISH_CONNECTIONS:-128}
 FANOUT_SUBSCRIBERS=${FANOUT_SUBSCRIBERS:-128}
 FANOUT_EVENTS=${FANOUT_EVENTS:-500}
+# Publications live_fanout leaves unacknowledged at once; 1 waits for each OK.
+FANOUT_WINDOW=${FANOUT_WINDOW:-256}
 IDLE_CONNECTIONS=${IDLE_CONNECTIONS:-10000}
 HOLD_SECONDS=${HOLD_SECONDS:-15}
 LIFECYCLE_EVENTS=${LIFECYCLE_EVENTS:-10000}
@@ -364,6 +366,7 @@ run_target() {
         --profile load --corpus "$LOAD_CORPUS" --events "$EVENTS" \
         --event-mix realistic --publish-connections "$PUBLISH_CONNECTIONS" \
         --fanout-subscribers "$FANOUT_SUBSCRIBERS" --fanout-events "$FANOUT_EVENTS" \
+        --fanout-window "$FANOUT_WINDOW" \
         --connections "$IDLE_CONNECTIONS" --hold-seconds "$HOLD_SECONDS"; then
         status=1
     fi
@@ -426,6 +429,7 @@ write_campaign_metadata() {
         "publish_connections=$PUBLISH_CONNECTIONS"
         "fanout_subscribers=$FANOUT_SUBSCRIBERS"
         "fanout_events=$FANOUT_EVENTS"
+        "fanout_window=$FANOUT_WINDOW"
         "idle_connections=$IDLE_CONNECTIONS"
         "hold_seconds=$HOLD_SECONDS"
         "lifecycle_events=$LIFECYCLE_EVENTS"

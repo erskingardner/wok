@@ -359,10 +359,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were still members. **A database reindexed by an earlier release has lost
   these records**, but the backup reindex kept
   (`<database>.pre-reindex-<timestamp>`, or the `--backup` path) still holds
-  them. With the relay stopped, LMDB's own tools copy them back and leave
-  every record written since in place: `mdb_dump -s wok_Moderation <backup>
-  | mdb_load -N -s wok_Moderation <database>`. After more than one such
-  reindex, run it for each backup, newest first.
+  them. With the relay stopped, `mdb_dump -s wok_Moderation <backup> >
+  moderation.dump` writes them out, each as a line of hex key and a line of
+  hex value, and `mdb_load -N -s wok_Moderation <database> <
+  moderation.dump` adds every record whose key the database lacks. A
+  removal leaves no key behind, so this also puts back what was taken away
+  since the reindex: a lifted ban or IP block, an allowlist entry, a role.
+  Delete those records' two lines from the dump first. A key is the record
+  type, then the pubkey, event id, IP or role id, in hex: `42` a banned
+  pubkey, `45` a banned event, `49` a blocked IP, `41` an allowed pubkey,
+  `50` a pubkey's roles, `47` a role. The kind map, key `4b`, overrides any
+  `allowkind` made since, so repeat those after loading. Each earlier
+  backup holds what its own reindex dropped and needs the same check
+  against everything removed since.
 
 ### Added
 

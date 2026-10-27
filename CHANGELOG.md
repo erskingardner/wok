@@ -1070,6 +1070,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wok router` no longer drops up-direction events when a peer's queue is
+  full (#244). Each connection queued at most 256 events, and the rest of a
+  burst, such as the up to 1,000 events a `both` stream downloads in one
+  batch, or a `wok import` into a routed database, was dropped without a
+  word. A stream now waits at the first event a connected peer has no room
+  for and resumes there as that peer catches up. **A slow peer now holds
+  back the other peers in its stream**, and a peer that takes longer than
+  `connectionTimeout` to accept a frame is disconnected, with a log line,
+  and reconnected. Up streams stay live-only: like any peer that
+  disconnects, it misses the events queued for it, and `wok sync` repairs
+  the gap. A reload that removes a URL, or changes a stream's `dir` or `filter`, now
+  closes the connection even when its queue is full; before, the close
+  waited in that queue, was lost when it was full, and left the old
+  connection running and storing what it downloaded.
 - A negentropy tree whose filter names more tag letters than
   `relay.max_tags_per_filter` no longer makes every write fail (#243). The
   writer parsed stored tree filters with that client-filter limit, so

@@ -121,6 +121,12 @@ it is not a promise to reproduce upstream bugs.
   (`relay.message_read_timeout_secs`), and ping/pong liveness (a ping
   unanswered for a full `relay.auto_ping_seconds` interval closes the
   connection).
+- `wok router` queues at most 256 up-direction events per connection. A
+  stream that reaches a peer whose queue is full waits at that event and
+  resumes as the peer drains it, so a slow peer slows the other peers in its
+  stream, and a peer that takes longer than `connectionTimeout` to accept a
+  frame is disconnected, missing what was queued for it. The pinned strfry
+  queues these sends without a bound.
 - Mesh client connections do not currently offer permessage-deflate. Wok's
   WebSocket server does negotiate it, and refuses a compressed message that
   inflates past half of `relay.max_websocket_payload_size` plus 64 KiB and

@@ -325,7 +325,7 @@ the dashboard. An event that breaks one is refused with `OK false` and
 | `events.reject_ephemeral_older_than_secs` | `60` | Live subscribers, from replayed ephemeral events (kinds 20000–29999, such as NIP-46). AUTH and 21059 use their NIPs' windows. | Ephemeral messages from clients with slow clocks or queues are refused. | — |
 | `events.ephemeral_persistence` | `"live_only"` | Storage: `live_only` delivers ephemeral events to live subscribers without storing them; `ttl` stores them for `ephemeral_lifetime_secs`. | — | `ttl` removes NIP-59 from `supported_nips` |
 | `events.ephemeral_lifetime_secs` | `300` | How long a stored (`ttl`) ephemeral event stays readable. | Clients that reconnect miss recent ephemeral events. | — |
-| `relay.abuse.min_pow_difficulty` | `0` | Spam: the NIP-13 difficulty, in leading zero bits of the id, every event must meet. `0` is off. | — (too high: most clients can't post; few mine proof of work, and Marmot clients never do.) | `min_pow_difficulty`, always (0 while abuse protection is off); above 0 it also adds NIP-13 to `supported_nips` and sets `restricted_writes` |
+| `relay.abuse.min_pow_difficulty` | `0` | Spam: the NIP-13 difficulty, in leading zero bits of the id, every event must meet but a NIP-62 vanish request that targets this relay, which NIP-62 requires a relay to honor. `0` is off. | — (too high: most clients can't post; few mine proof of work, and Marmot clients never do.) | `min_pow_difficulty`, always (0 while abuse protection is off); above 0 it also adds NIP-13 to `supported_nips` and sets `restricted_writes` |
 | `relay.nip62.enabled` | `true` | NIP-62 Request to Vanish: accept requests to erase everything an author published here. | Off: users can't erase their data from this relay. Deletion markers stored earlier stay enforced. | NIP-62 in `supported_nips` |
 | `relay.nip62.service_url` | empty | The relay URL a targeted vanish request must name, compared as for AUTH; empty uses `relay.auth.service_url`. `ALL_RELAYS` always matches. | — | — |
 
@@ -677,15 +677,23 @@ on the dashboard; the database limits are restart settings, shown read-only.
 | Key | Default | Protects | If too low | NIP-11 |
 |---|---|---|---|---|
 | `relay.abuse.max_stored_events_per_pubkey` | `1000000` | One key filling the disk. `0` is unlimited. | Active users and bots can no longer post new events. At quota, an author can still replace their own replaceable and addressable events and delete their own events. | — |
-| `relay.abuse.max_stored_events` | `0` | The disk, by a count of events in all. `0`, the public preset's value, is unlimited. | Once reached, every write on the relay fails. A busy public relay stores far more than 10,000,000 events, the default through 0.7. | — |
+| `relay.abuse.max_stored_events` | `0` | The disk, by a count of events in all. `0`, the public preset's value, is unlimited. | Once reached, every write on the relay fails but a NIP-62 vanish request. A busy public relay stores far more than 10,000,000 events, the default through 0.7. | — |
 | `database.min_free_disk_bytes` | `1073741824` | The filesystem: writes are refused before free space falls below this reserve. `0` turns the guard off. Restart. | Writes stop while the disk still has room. (Off or too small: the disk can fill, and the database with it.) | — |
 | `database.map_size` | `68719476736` | The LMDB map ceiling: writes fail atomically once the database reaches it. Address space only; the file grows as data is written. Restart. | Writes fail while the disk still has room. | — |
 
 A write over a quota is refused with `OK false`: `blocked: author storage
 quota exceeded`, or `error: global storage quota of <n> events exceeded` for
-the whole batch, or `error: disk reserve requires <n> free bytes`. Only a
+the whole writer batch, or `error: disk reserve requires <n> free bytes`. Only a
 deletion that removes none of the author's events is refused at quota,
 since it would add an event and free none.
+
+A NIP-62 vanish request that targets this relay is exempt from both quotas,
+since NIP-62 requires a relay to honor it: it is stored over them, and its
+author's events are then deleted. The global quota does not count the vanish
+requests in a batch, and when the rest of the batch is over it, they are
+written on their own. They are not exempt from the disk reserve, which bounds
+storage once the quotas do not (see
+[attack-surface.md](attack-surface.md#messages)).
 
 The per-author quota is charged to the event's author, so one throwaway key
 is held to it, while a new key per event starts a new count each time; even

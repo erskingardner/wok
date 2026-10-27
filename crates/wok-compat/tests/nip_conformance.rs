@@ -1306,6 +1306,80 @@ async fn nip67_no_finish_when_a_stored_event_could_not_be_sent() {
     assert_eq!(eose, json!(["EOSE", "t", ["finish"]]));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip62_a_full_relay_that_requires_proof_of_work_still_honors_vanish() {
+    // NIP-62: relays MUST honor a request to vanish that targets them, and
+    // relays that restrict who can post "MUST also follow the request to
+    // vanish regardless of the user's status". Clients do not mine one, and
+    // a full relay must still take it (#248).
+    let relay = Relay::new(|cfg| {
+        // An id with 8 leading zero bits starts with a zero byte.
+        cfg.relay.abuse.min_pow_difficulty = 8;
+        cfg.relay.abuse.max_stored_events = 1;
+    });
+    let author = Keypair::new(SECP256K1, &mut rand::thread_rng());
+    // `event` signed by `author`, with a nonce until its first id byte is
+    // zero or not, as `mined` asks.
+    let signed = |event: Value, mined: bool| {
+        (0u64..)
+            .map(|nonce| {
+                let mut event = event.clone();
+                event["tags"].as_array_mut().unwrap().push(json!([
+                    "nonce",
+                    nonce.to_string(),
+                    "8"
+                ]));
+                sign_event_with_key(event, &author)
+            })
+            .find(|event| event["id"].as_str().unwrap().starts_with("00") == mined)
+            .unwrap()
+    };
+    let note = sign_event_with_key(
+        json!({"created_at": now() - 60, "kind": 1, "tags": [], "content": "erase me"}),
+        &author,
+    );
+    // The note fills the relay.
+    wok_compat::write_event_to_env(&relay.env, &note);
+    let mut conn = relay.connect().await;
+    let ordinary = |mined| {
+        signed(
+            json!({"created_at": now(), "kind": 1, "tags": [], "content": "ordinary"}),
+            mined,
+        )
+    };
+    let unmined = ordinary(false);
+    assert_eq!(
+        conn.publish(&unmined).await,
+        json!(["OK", unmined["id"], false, "pow: difficulty 8 required"])
+    );
+    let over_quota = ordinary(true);
+    assert_eq!(
+        conn.publish(&over_quota).await,
+        json!([
+            "OK",
+            over_quota["id"],
+            false,
+            "error: global storage quota of 1 events exceeded"
+        ])
+    );
+
+    let vanish = signed(
+        json!({
+            "created_at": now(),
+            "kind": 62,
+            "tags": [["relay", "ALL_RELAYS"]],
+            "content": "",
+        }),
+        false,
+    );
+    assert_eq!(
+        conn.publish(&vanish).await,
+        json!(["OK", vanish["id"], true, ""])
+    );
+    let (events, _, _) = conn.backfill("s", json!([{"kinds": [1]}])).await;
+    assert!(events.is_empty(), "{events:?}");
+}
+
 #[test]
 fn nip62_is_enabled_by_default_and_can_be_disabled() {
     let mut cfg = wok_relay::Config::default();

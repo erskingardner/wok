@@ -279,12 +279,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLI's outbound `wss://` and HTTPS clients (mesh, router, upload/download,
   NIP-11 fetches) and the benchmark harness; the relay listener does not
   terminate TLS.
-- NIP-62 vanish requests (kind 62) now pay NIP-13 proof of work and the
-  per-author EVENT budget like any other event. Before, a validly signed vanish
-  request skipped both and only the per-address budget limited them. They
-  still bypass the write-policy plugin, now documented: NIP-62 requires relays
-  that restrict who can post to honor vanish regardless of the user's status
-  (#48).
+- NIP-62 vanish requests (kind 62) now pay the per-author EVENT budget like
+  any other event. Before, a validly signed vanish request skipped it and only
+  the per-address budget limited them. They still bypass the write-policy
+  plugin and NIP-13 proof of work, now documented: NIP-62 requires relays that
+  restrict who can post to honor vanish regardless of the user's status
+  (#48, #248).
+- A NIP-62 vanish request that targets the relay is now stored when the
+  relay is at its global storage quota (`relay.abuse.max_stored_events`), and
+  its author's events are then deleted (#248). Before, the request was
+  refused with the rest of its writer batch, so nobody could vanish from a
+  full relay, though NIP-62 says a relay MUST honor the request. The quota no
+  longer counts a batch's vanish requests: when the rest of the batch is over
+  it, they are written on their own and everything else is refused as
+  before. On a full relay, or one that requires proof of work, anyone can
+  therefore store a vanish request with each fresh key. The per-address and
+  per-author EVENT budgets and the disk reserve
+  (`database.min_free_disk_bytes`) bound them, and the NIP-86 kind policy,
+  event-id bans, blocked addresses and `relay.nip62.enabled` still refuse
+  them (see docs/attack-surface.md).
 - NIP-62 vanish requests are now honored from banned authors and, with
   `relay.auth.restrict_writes`, from pubkeys not on the write allowlist. Before,
   both were refused, so an author who lost write access could not erase what

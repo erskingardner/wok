@@ -167,7 +167,11 @@ NIP-62 accepts a signed kind 62 request containing either a matching
 relay immediately suppresses qualifying authored events and gift wraps for the
 requesting recipient, prevents rebroadcast, then physically deletes them in
 bounded background batches. The request itself remains stored and cannot be
-deleted with kind 5. See `relay.nip62` in the sample configuration.
+deleted with kind 5. NIP-62 says relays MUST honor a request that targets
+them, so one is accepted without proof of work, over both storage quotas, and
+whatever the write policy, the write-policy plugin or an author ban says (see
+[attack-surface.md](attack-surface.md#messages)). See `relay.nip62`
+in the sample configuration.
 
 NIP-86 management calls are JSON-RPC-like POSTs to the relay URI authorized
 by NIP-98 events from operator admins or role-holding moderators. They follow

@@ -64,6 +64,7 @@ scrape_configs:
 | `wok_tag_kind_index_tag_entries` | gauge | none | Tag-index entries stored, which a key-ordered build visits once. |
 | `wok_tag_kind_backfill_entries_total` | counter | none | Postings the writer's background build put. |
 | `wok_tag_kind_backfill_seconds_total` | counter | none | Time the writer spent in background build transactions, commits included. |
+| `wok_author_count_drift_total` | counter | none | Per-author event counters that a deletion found below that author's stored events. Each is dropped, with a warning naming the author, and counted again from the author index when a quota check next needs it. Counters kept by earlier releases can be low; `wok reindex` repairs them all. |
 
 The `wok_tag_kind_*` gauges are updated after each build step and on the
 writer's maintenance tick (every 2 seconds). While a key-ordered build runs,

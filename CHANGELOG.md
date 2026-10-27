@@ -350,6 +350,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access. Existing files keep their mode: `chmod g-w,o= data.mdb lock.mdb`
   in the database directory narrows them. The example systemd unit's
   `UMask=0077` and `0700` state directory already kept other users out.
+- Any key could stop expiry and NIP-62 deletion for the whole relay (#240).
+  The count of a key's events that `relay.abuse.max_stored_events_per_pubkey`
+  checks against, built from the author index the first time it is needed,
+  skipped the key's events at `created_at` 0. A kind 62, which the quota
+  does not check, could be stored at 0 before the count was built. Once the
+  key's counted events were deleted, the next deletion found the count at
+  zero and aborted its transaction: maintenance retried the same expired
+  events every 2 seconds and failed each time, and a deletion request
+  aborted the writer batch it was in, other clients' events included, with
+  `error: author count overflow or drift`. The count now includes those
+  events. A count that a deletion still finds at zero, as an earlier release
+  may have stored, is dropped with a warning and counted again from the
+  author index when next needed; `wok_author_count_drift_total` counts them,
+  and `wok reindex --confirm-relay-stopped` drops every stored count. The
+  same scan let a NEG-OPEN be answered from the persistent negentropy tree
+  while it held an event of a restricted kind at `created_at` 0, and made
+  the NIP-62 backfill miss requests at 0. A request at `created_at` 0 now
+  leaves a marker like any other, so the key's events at 0 and the gift
+  wraps that p-tag it are deleted; before, it was stored and did nothing.
 
 ### Added
 

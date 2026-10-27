@@ -98,9 +98,18 @@ more words, each match's searched text is read once to find which adjacent
 pairs it holds; a word too long to index separates the words beside it. Adjacent
 pairs are not indexed, so an event writes one posting per unique word.
 
+An `indexed-through` marker names a local id: every event at or below it has
+its postings, and no event above it has any. A search reads postings for the
+events at or below the marker and reads each event above it, matching its
+terms as a live subscription does, so its results are complete while the
+index lags. A term's rarity, which ranks the matches of filters searched
+together, counts only the indexed events.
+
 Existing Wok databases and migrated strfry v3 snapshots are backfilled in
-10,000-event transactions on first open. A versioned marker makes index-format
-changes rebuild automatically. `wok doctor` verifies missing, dangling, and
+10,000-event transactions on first open. An event with no payload, or one that
+does not decode, is left out; `wok doctor` reports it. A versioned marker makes
+index-format changes rebuild automatically. `wok doctor` expects postings for
+the events at or below the marker only, and verifies missing, dangling, and
 semantically incorrect search postings, while `wok reindex` derives the search
 index again from authoritative payloads.
 

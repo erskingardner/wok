@@ -70,10 +70,12 @@ pub use purge::{count_superseded_ro, purge_superseded, SupersededHistory};
 pub use reindex::{rebuild_primary_and_event_indices, PackedEventRebuild, ReindexStats};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use search::{
-    count_phrase_pairs, event_search_terms, index_event_search, normalize_search_terms,
-    parse_search_query, remove_event_search, search_posting_count, search_posting_exists,
-    search_postings, search_term_set, SearchQuery, SearchTermSet, MAX_SEARCH_QUERY_BYTES,
-    MAX_SEARCH_TERMS,
+    build_search_index, count_phrase_pairs, event_search_terms, index_event_search,
+    normalize_search_terms, parse_search_query, remove_event_search, reset_search_index,
+    search_index_state_ro, search_indexed_through_ro, search_posting_count, search_posting_exists,
+    search_postings, search_term_set, SearchBuildStep, SearchIndexState, SearchQuery,
+    SearchTermSet, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TERMS, SEARCH_BUILD_STEP_BUDGET,
+    SEARCH_BUILD_STEP_EVENTS,
 };
 pub use tag_kind::{
     backfill_tag_kind_index, defer_tag_kind_postings, reset_tag_kind_index,

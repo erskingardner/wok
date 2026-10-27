@@ -7,13 +7,26 @@
 //! lookups to intersect the remaining terms without scanning event payloads
 //! that cannot match. Word adjacency, which only ranks matches, is read from
 //! a matching event's text at query time.
+//!
+//! Two markers, with keys that no term key matches, describe the table:
+//!
+//! - `schema` is the key layout. A writable open that finds another layout
+//!   empties the table and starts again from local id 0.
+//! - `indexed-through` is a local id: every event at or below it has its
+//!   postings, and no event above it has any. A search reads the postings for
+//!   the events at or below it and reads the events above it directly.
+//!
+//! [`build_search_index`] indexes the events above the marker in bounded
+//! steps, in local-id order, and moves the marker past them.
 
 use crate::{DbError, Decompressor, Env, RoTxn, RwTxn};
 use lmdb_sys::{MDB_GET_BOTH, MDB_NODUPDATA, MDB_SET};
 use serde::de::IgnoredAny;
 use serde::Deserialize;
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
+use std::time::{Duration, Instant};
 use wok_event::PackedEventView;
 
 const TERM_PREFIX: u8 = 1;
@@ -24,6 +37,15 @@ const SEARCH_SCHEMA_KEY: &[u8] = b"\0schema";
 const SEARCH_SCHEMA_VERSION: u64 = 4;
 const MAX_INDEXED_TERM_BYTES: usize = 64;
 const BACKFILL_BATCH_SIZE: usize = 10_000;
+/// The largest stored payload a build step decompresses, as for `wok doctor`.
+const BUILD_PAYLOAD_BOUND: usize = 16 * 1024 * 1024;
+/// Events a build step reads ahead of indexing them.
+const BUILD_CHUNK: usize = 64;
+
+/// Events one build step indexes at most.
+pub const SEARCH_BUILD_STEP_EVENTS: usize = 10_000;
+/// How long one build step indexes before it commits.
+pub const SEARCH_BUILD_STEP_BUDGET: Duration = Duration::from_millis(10);
 
 pub const MAX_SEARCH_QUERY_BYTES: usize = 1_024;
 pub const MAX_SEARCH_TERMS: usize = 16;
@@ -477,80 +499,168 @@ pub(crate) fn note_search_indexed_through(txn: &mut RwTxn<'_>, lev_id: u64) -> R
     set_indexed_through(txn, lev_id)
 }
 
-/// Backfill a newly-created derived search DBI before the environment is used.
-/// Progress is committed in bounded batches so importing a large strfry
-/// database does not require one unbounded write transaction.
+fn marker(value: Option<&[u8]>) -> Option<u64> {
+    Some(u64::from_ne_bytes(value?.try_into().ok()?))
+}
+
+/// Where the search index stands in one snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SearchIndexState {
+    /// Every event with a local id at or below this one has its postings, and
+    /// no event above it has any.
+    pub indexed_through: u64,
+    /// The greatest local id ever allocated.
+    pub high_water: u64,
+}
+
+impl SearchIndexState {
+    /// Local ids above the marker: at most this many events are unindexed.
+    pub fn lag(&self) -> u64 {
+        self.high_water.saturating_sub(self.indexed_through)
+    }
+}
+
+/// The index's state, or `None` when the database has no search index.
+pub fn search_index_state_ro(txn: &RoTxn<'_>) -> Result<Option<SearchIndexState>, DbError> {
+    let dbis = txn.env().dbis();
+    if dbis.event_search.is_none() {
+        return Ok(None);
+    }
+    let sequence = match dbis.state {
+        Some(state) => txn.get(state, crate::state::HIGH_WATER)?,
+        None => None,
+    };
+    Ok(Some(SearchIndexState {
+        indexed_through: search_indexed_through_ro(txn)?,
+        high_water: crate::tag_kind::high_water(sequence, txn.largest_integer_key(dbis.event)?),
+    }))
+}
+
+/// The marker in this snapshot: a search reads postings for the events at or
+/// below it and reads the events above it.
+pub fn search_indexed_through_ro(txn: &RoTxn<'_>) -> Result<u64, DbError> {
+    let dbi = search_dbi_ro(txn)?;
+    Ok(marker(txn.get(dbi, INDEXED_THROUGH_KEY)?).unwrap_or(0))
+}
+
+/// Empty the index and restart its marker at 0, so that build steps index
+/// every stored event again.
+pub fn reset_search_index(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
+    let Some(dbi) = txn.env().dbis().event_search else {
+        return Ok(());
+    };
+    txn.clear(dbi)?;
+    initialize_search_index_state(txn, 0)
+}
+
+/// What one build step did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchBuildStep {
+    /// Events the step indexed, whether or not their kind is searched.
+    pub events: u64,
+    /// The index's state once the step commits.
+    pub state: SearchIndexState,
+}
+
+/// Index, in `txn`, the events above the marker in local-id order, and move
+/// the marker past them. A step stops after `max_events` events, or once it
+/// has run for `budget`, whichever comes first, and always makes some
+/// progress. Once it passes the newest event the marker takes the high-water
+/// mark. An event whose postings cannot be derived, with no payload or one
+/// that does not decode, is passed over: `wok doctor` reports it. `None` when
+/// the database has no search index.
+pub fn build_search_index(
+    txn: &mut RwTxn<'_>,
+    max_events: usize,
+    budget: Duration,
+) -> Result<Option<SearchBuildStep>, DbError> {
+    let started = Instant::now();
+    let dbis = txn.env().dbis();
+    let Some(dbi) = dbis.event_search else {
+        return Ok(None);
+    };
+    let through = marker(txn.get(dbi, INDEXED_THROUGH_KEY)?).unwrap_or(0);
+    let sequence = match dbis.state {
+        Some(state) => txn.get(state, crate::state::HIGH_WATER)?,
+        None => None,
+    };
+    let high_water = crate::tag_kind::high_water(sequence, txn.largest_integer_key(dbis.event)?)
+        .max(txn.event_sequence.unwrap_or(0));
+    let max_events = u64::try_from(max_events.max(1)).unwrap_or(u64::MAX);
+    let mut events = 0;
+    let mut done = through;
+    let mut walked_to_end = through >= high_water;
+    let mut decompressor = Decompressor::new();
+    'step: while !walked_to_end {
+        let mut chunk = Vec::with_capacity(BUILD_CHUNK);
+        let at_end = txn.foreach_full(
+            dbis.event,
+            &done.saturating_add(1).to_ne_bytes(),
+            &[],
+            false,
+            |key, packed| {
+                if let Ok(key) = <[u8; 8]>::try_from(key) {
+                    // `wok doctor` reports a PackedEvent too short to read.
+                    let kind = PackedEventView::new(packed)
+                        .ok()
+                        .map(|packed| packed.kind());
+                    chunk.push((u64::from_ne_bytes(key), kind));
+                }
+                chunk.len() < BUILD_CHUNK
+            },
+        )?;
+        for (lev_id, kind) in chunk {
+            let payload = txn.get_u64(dbis.event_payload, lev_id)?.map(<[u8]>::to_vec);
+            if let (Some(kind), Some(payload)) = (kind, payload) {
+                if let Ok(json) = decompressor.decode_rw(txn, &payload, BUILD_PAYLOAD_BOUND) {
+                    let entries = search_index_entries(lev_id, kind, json);
+                    for (key, value) in entries.into_iter().flatten() {
+                        txn.put(dbi, &key, &value, MDB_NODUPDATA)?;
+                    }
+                }
+            }
+            events += 1;
+            done = lev_id;
+            if events >= max_events || started.elapsed() >= budget {
+                break 'step;
+            }
+        }
+        walked_to_end = at_end;
+    }
+    let indexed_through = if walked_to_end { high_water } else { done }.max(through);
+    if indexed_through != through {
+        set_indexed_through(txn, indexed_through)?;
+    }
+    Ok(Some(SearchBuildStep {
+        events,
+        state: SearchIndexState {
+            indexed_through,
+            high_water,
+        },
+    }))
+}
+
+/// On a writable open, empty an index in another layout, then index every
+/// event above the marker before the environment is used. Progress is
+/// committed in bounded batches so importing a large strfry database does
+/// not require one unbounded write transaction.
 pub(crate) fn ensure_search_index(env: &Env) -> Result<(), DbError> {
     let Some(dbi) = env.dbis().event_search else {
         return Ok(());
     };
-    let schema_version = {
-        let txn = env.begin_ro()?;
-        txn.get(dbi, SEARCH_SCHEMA_KEY)?
-            .and_then(|value| value.try_into().ok())
-            .map(u64::from_ne_bytes)
-    };
+    let schema_version = marker(env.begin_ro()?.get(dbi, SEARCH_SCHEMA_KEY)?);
     if schema_version != Some(SEARCH_SCHEMA_VERSION) {
         let mut txn = env.begin_rw()?;
-        txn.clear(dbi)?;
-        initialize_search_index_state(&mut txn, 0)?;
+        reset_search_index(&mut txn)?;
         txn.commit()?;
     }
     loop {
-        let indexed_through = {
-            let txn = env.begin_ro()?;
-            txn.get(dbi, INDEXED_THROUGH_KEY)?
-                .and_then(|value| value.try_into().ok())
-                .map(u64::from_ne_bytes)
-                .unwrap_or(0)
-        };
-
         let mut txn = env.begin_rw()?;
-        let mut batch = Vec::with_capacity(BACKFILL_BATCH_SIZE);
-        let start = indexed_through.saturating_add(1);
-        txn.foreach_full(
-            txn.env().dbis().event,
-            &start.to_ne_bytes(),
-            &[],
-            false,
-            |key, packed| {
-                if key.len() != 8 {
-                    return true;
-                }
-                // `wok doctor` reports a PackedEvent too short to read.
-                let kind = PackedEventView::new(packed)
-                    .ok()
-                    .map(|packed| packed.kind());
-                batch.push((u64::from_ne_bytes(key.try_into().unwrap()), kind));
-                batch.len() < BACKFILL_BATCH_SIZE
-            },
-        )?;
-
-        if batch.is_empty() {
-            set_indexed_through(&mut txn, indexed_through)?;
-            txn.commit()?;
-            return Ok(());
-        }
-
-        let mut decompressor = Decompressor::new();
-        for &(lev_id, kind) in &batch {
-            let Some(kind) = kind else {
-                continue;
-            };
-            let payload = txn
-                .get_u64(txn.env().dbis().event_payload, lev_id)?
-                .ok_or_else(|| DbError::msg(format!("event {lev_id} has no payload")))?
-                .to_vec();
-            let json = decompressor
-                .decode_rw(&txn, &payload, 16 * 1024 * 1024)?
-                .to_owned();
-            index_event_search(&mut txn, lev_id, kind, &json)?;
-        }
-        set_indexed_through(&mut txn, batch.last().unwrap().0)?;
-        let done = batch.len() < BACKFILL_BATCH_SIZE;
+        let step = build_search_index(&mut txn, BACKFILL_BATCH_SIZE, Duration::MAX)?;
         txn.commit()?;
-        if done {
-            return Ok(());
+        match step {
+            Some(step) if step.state.lag() > 0 => {}
+            _ => return Ok(()),
         }
     }
 }
@@ -854,5 +964,128 @@ mod tests {
             txn.get(dbi, INDEXED_THROUGH_KEY).unwrap(),
             Some(42_u64.to_ne_bytes().as_slice())
         );
+    }
+
+    fn note(time: u64, content: &str) -> crate::EventToWrite {
+        use secp256k1::{Keypair, SecretKey, SECP256K1};
+        let secret = SecretKey::from_byte_array(&[7; 32]).unwrap();
+        let key = Keypair::from_secret_key(SECP256K1, &secret);
+        let mut value = serde_json::json!({"pubkey":hex::encode(key.x_only_public_key().0.serialize()),
+            "kind":1,"created_at":time,"tags":[],"content":content});
+        let id = wok_event::event_id_hash(&value).unwrap();
+        value["id"] = serde_json::json!(hex::encode(id));
+        value["sig"] = serde_json::json!(hex::encode(
+            SECP256K1.sign_schnorr_no_aux_rand(&id, &key).as_ref()
+        ));
+        let parsed =
+            wok_event::parse_and_verify_event(&value, &Default::default(), None, true, false)
+                .unwrap();
+        crate::EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+    }
+
+    fn notes(contents: &[&str]) -> (tempfile::TempDir, Env) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        for (time, content) in (100..).zip(contents) {
+            let mut events = [note(time, content)];
+            let mut txn = env.begin_rw().unwrap();
+            crate::write_events(&mut txn, &mut crate::NoopNegentropy, &mut events, false).unwrap();
+            txn.commit().unwrap();
+        }
+        (dir, env)
+    }
+
+    fn postings(env: &Env) -> usize {
+        let txn = env.begin_ro().unwrap();
+        let mut count = 0;
+        txn.foreach_full(
+            env.dbis().event_search.unwrap(),
+            &[],
+            &[],
+            false,
+            |key, _| {
+                count += usize::from(!is_search_marker(key));
+                true
+            },
+        )
+        .unwrap();
+        count
+    }
+
+    fn reset(env: &Env) {
+        let mut txn = env.begin_rw().unwrap();
+        reset_search_index(&mut txn).unwrap();
+        txn.commit().unwrap();
+    }
+
+    /// One build step of at most `max_events`: events indexed, and the marker.
+    fn step(env: &Env, max_events: usize) -> (u64, u64) {
+        let mut txn = env.begin_rw().unwrap();
+        let step = build_search_index(&mut txn, max_events, Duration::MAX)
+            .unwrap()
+            .unwrap();
+        txn.commit().unwrap();
+        (step.events, step.state.indexed_through)
+    }
+
+    fn assert_consistent(env: &Env) {
+        let report = crate::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:#?}", report.issues);
+    }
+
+    #[test]
+    fn build_steps_index_the_events_above_the_marker_up_to_the_high_water_mark() {
+        let (_dir, env) = notes(&["one alpha", "two beta", "three gamma", "four", "five"]);
+        let mut txn = env.begin_rw().unwrap();
+        crate::delete_events(&mut txn, &mut crate::NoopNegentropy, [4, 5]).unwrap();
+        txn.commit().unwrap();
+        let indexed = postings(&env);
+        assert_eq!(indexed, 6);
+
+        reset(&env);
+        assert_eq!(postings(&env), 0);
+        let state = search_index_state_ro(&env.begin_ro().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!((state.indexed_through, state.lag()), (0, 5));
+        // Events above the marker need no postings.
+        assert_consistent(&env);
+
+        assert_eq!(step(&env, 2), (2, 2));
+        assert_eq!(postings(&env), 4);
+        assert_consistent(&env);
+        // The last stored event ends the walk at the deleted tail's end.
+        assert_eq!(step(&env, 2), (1, 5));
+        assert_eq!(postings(&env), indexed);
+        assert_consistent(&env);
+        assert_eq!(step(&env, 2), (0, 5));
+    }
+
+    #[test]
+    fn a_posting_above_the_marker_is_unexpected() {
+        let (_dir, env) = notes(&["alpha", "beta"]);
+        reset(&env);
+        let mut txn = env.begin_rw().unwrap();
+        index_event_search(&mut txn, 2, 1, r#"{"content":"beta"}"#).unwrap();
+        txn.commit().unwrap();
+        let report = crate::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(!report.ok());
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.table == "event_search"
+                && issue.detail.contains("above indexed-through 0")));
+    }
+
+    #[test]
+    fn a_build_step_passes_over_an_event_it_cannot_read() {
+        let (_dir, env) = notes(&["alpha", "beta"]);
+        reset(&env);
+        let mut txn = env.begin_rw().unwrap();
+        txn.del_u64(env.dbis().event_payload, 1, None).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(step(&env, 10), (2, 2));
+        assert_eq!(postings(&env), 1);
     }
 }

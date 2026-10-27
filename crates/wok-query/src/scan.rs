@@ -8,8 +8,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
 use wok_db::{
-    count_phrase_pairs, search_posting_count, search_posting_exists, search_postings, Decompressor,
-    RoTxn, SearchQuery,
+    count_phrase_pairs, event_search_terms, search_indexed_through_ro, search_posting_count,
+    search_posting_exists, search_postings, Decompressor, RoTxn, SearchQuery,
 };
 use wok_event::PackedEventView;
 
@@ -347,12 +347,49 @@ impl PartialOrd for SearchHit {
 /// doctor` and reindex. Only a compressed payload needs it.
 const PHRASE_PAYLOAD_BOUND: usize = 16 * 1024 * 1024;
 
+/// Whether a search slice that began at `start`, with `starting_work`
+/// candidates done, yields before its next one: after 4,096 candidates, or
+/// once out of time. The clock is read every 128 candidates, and after each
+/// whose text was read, which can cost far more.
+// `is_multiple_of` is not available at Wok's Rust 1.85 MSRV.
+#[allow(clippy::manual_is_multiple_of)]
+fn slice_spent(
+    start: std::time::Instant,
+    time_budget_us: u64,
+    starting_work: u64,
+    work: u64,
+    read_text: bool,
+) -> bool {
+    work > starting_work
+        && (read_text || work % 128 == 0)
+        && (work - starting_work >= 4096 || start.elapsed().as_micros() as u64 > time_budget_us)
+}
+
+/// The text of the event at `lev_id`, or `None` when it has no payload or
+/// its payload does not decode.
+fn event_text<'a>(
+    txn: &'a RoTxn<'_>,
+    decompressor: &'a mut Decompressor,
+    lev_id: u64,
+) -> Result<Option<&'a str>, wok_db::DbError> {
+    Ok(match txn.get_u64(txn.env().dbis().event_payload, lev_id)? {
+        Some(raw) => decompressor.decode(txn, raw, PHRASE_PAYLOAD_BOUND).ok(),
+        None => None,
+    })
+}
+
 /// Resumable NIP-50 posting intersection and relevance ranking.
 struct SearchScan {
     query: SearchQuery,
     primary_term: String,
     term_document_counts: HashMap<String, usize>,
+    /// The search index's marker when the search began. Postings cover the
+    /// events at or below it; the events above it are read.
+    indexed_through: u64,
     resume_lev_id: u64,
+    postings_complete: bool,
+    /// The next event above the marker to read.
+    gap_resume_lev_id: u64,
     gathering_complete: bool,
     top_hits: BinaryHeap<Reverse<SearchHit>>,
     ranked_hits: Vec<SearchHit>,
@@ -475,7 +512,10 @@ impl SearchScan {
             query,
             primary_term,
             term_document_counts,
+            indexed_through: search_indexed_through_ro(txn)?,
             resume_lev_id: 0,
+            postings_complete: false,
+            gap_resume_lev_id: 0,
             gathering_complete: false,
             top_hits: BinaryHeap::new(),
             ranked_hits: Vec::new(),
@@ -487,6 +527,9 @@ impl SearchScan {
         })
     }
 
+    /// Rarity from the posting counts, so the events above the marker don't
+    /// count: filters ranked together may order differently while the index
+    /// lags. Every match of one filter shares this score.
     fn base_score(&self) -> u64 {
         let mut score = 0u64;
         for term in &self.query.terms {
@@ -497,8 +540,7 @@ impl SearchScan {
         score
     }
 
-    // `is_multiple_of` is not available at Wok's Rust 1.85 MSRV.
-    #[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn gather(
         &mut self,
         snapshot: &ReadSnapshot<'_>,
@@ -506,8 +548,9 @@ impl SearchScan {
         latest_event_id: u64,
         time_budget_us: u64,
         visibility: &ReadVisibility,
-        // Reads a match's content for its phrase boost. The caller's, so a
-        // paused search holds no decompression buffer.
+        // Reads a match's content for its phrase boost, and an event's above
+        // the marker for its terms. The caller's, so a paused search holds no
+        // decompression buffer.
         decompressor: &mut Decompressor,
     ) -> Result<bool, wok_db::DbError> {
         let txn = snapshot.txn();
@@ -517,10 +560,6 @@ impl SearchScan {
         // A limit of 0 means no hits are ranked or emitted, so there is
         // nothing to gather: don't walk the posting list at all.
         if self.max_hits == 0 {
-            self.gathering_complete = true;
-            return Ok(true);
-        }
-        if self.term_document_counts[&self.primary_term] == 0 {
             self.gathering_complete = true;
             return Ok(true);
         }
@@ -542,101 +581,200 @@ impl SearchScan {
             .collect();
         let base_score = self.base_score();
         let starting_work = self.approx_work;
-        let mut read_content = false;
+        let indexed_through = self.indexed_through.min(latest_event_id);
+        let mut read_text = false;
         let mut error = None;
-        let completed = search_postings(txn, &primary, self.resume_lev_id, |lev_id| {
-            // Check before consuming this candidate so every miss path yields,
-            // and resume still points at the first unprocessed posting. A
-            // match whose content was read for its phrase boost can cost far
-            // more than 128 posting lookups, so the clock is read after each.
-            if self.approx_work > starting_work
-                && (std::mem::take(&mut read_content) || self.approx_work % 128 == 0)
-                && (self.approx_work - starting_work >= 4096
-                    || start.elapsed().as_micros() as u64 > time_budget_us)
-            {
-                return false;
-            }
-            self.resume_lev_id = lev_id.saturating_add(1);
-            self.approx_work = self.approx_work.saturating_add(1);
-            if lev_id > latest_event_id {
-                return true;
-            }
-            for term in &other_terms {
-                match search_posting_exists(txn, term, lev_id) {
-                    Ok(true) => {}
-                    Ok(false) => return true,
-                    Err(err) => {
-                        error = Some(err);
-                        return false;
-                    }
-                }
-            }
-            let packed_raw = match txn.get_u64(txn.env().dbis().event, lev_id) {
-                Ok(Some(raw)) => raw,
-                Ok(None) => return true,
-                Err(err) => {
-                    error = Some(err);
-                    return false;
-                }
-            };
-            let packed = match PackedEventView::new(packed_raw) {
-                Ok(packed) => packed,
-                Err(_) => return true,
-            };
-            if !filter.does_match_without_search(packed) {
-                return true;
-            }
-            match visibility.allows_noting_restricted(snapshot, packed, &mut self.restricted) {
-                Ok(true) => {}
-                Ok(false) => return true,
-                Err(err) => {
-                    error = Some(err);
-                    return false;
-                }
-            }
-            let mut score = base_score;
-            if !phrase_pairs.is_empty() {
-                read_content = true;
-                // A payload that does not decode ranks without the boost;
-                // sending the event reports it.
-                let pairs = match txn.get_u64(txn.env().dbis().event_payload, lev_id) {
-                    Ok(Some(raw)) => decompressor
-                        .decode(txn, raw, PHRASE_PAYLOAD_BOUND)
-                        .and_then(|json| count_phrase_pairs(packed.kind(), json, &phrase_pairs))
-                        .unwrap_or(0),
-                    Ok(None) => 0,
-                    Err(err) => {
-                        error = Some(err);
-                        return false;
-                    }
-                };
-                score = score.saturating_add((pairs as u64).saturating_mul(2_000_000_000));
-            }
-            let mut id = [0u8; 32];
-            id.copy_from_slice(packed.id());
-            if self.max_hits != 0 {
-                self.top_hits.push(Reverse(SearchHit {
-                    lev_id,
-                    score,
-                    created_at: packed.created_at(),
-                    id,
-                }));
-                if self.top_hits.len() > self.max_hits {
-                    self.overflow = self.top_hits.pop().map(|Reverse(hit)| hit.lev_id);
-                }
-            }
 
-            true
-        })?;
+        if !self.postings_complete && self.term_document_counts[&primary] != 0 {
+            let mut past_marker = false;
+            let completed = search_postings(txn, &primary, self.resume_lev_id, |lev_id| {
+                // Check before consuming this candidate so every miss path
+                // yields, and resume still points at the first unprocessed
+                // posting.
+                if slice_spent(
+                    start,
+                    time_budget_us,
+                    starting_work,
+                    self.approx_work,
+                    std::mem::take(&mut read_text),
+                ) {
+                    return false;
+                }
+                // Postings ascend, so the rest are above the marker too: a
+                // build step's since the search began, left to the next phase.
+                if lev_id > indexed_through {
+                    past_marker = true;
+                    return false;
+                }
+                self.resume_lev_id = lev_id.saturating_add(1);
+                self.approx_work = self.approx_work.saturating_add(1);
+                for term in &other_terms {
+                    match search_posting_exists(txn, term, lev_id) {
+                        Ok(true) => {}
+                        Ok(false) => return true,
+                        Err(err) => {
+                            error = Some(err);
+                            return false;
+                        }
+                    }
+                }
+                match self.consider(
+                    snapshot,
+                    filter,
+                    visibility,
+                    decompressor,
+                    lev_id,
+                    true,
+                    base_score,
+                    &phrase_pairs,
+                ) {
+                    Ok(read) => {
+                        read_text = read;
+                        true
+                    }
+                    Err(err) => {
+                        error = Some(err);
+                        false
+                    }
+                }
+            })?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if !completed && !past_marker {
+                return Ok(false);
+            }
+        }
+        self.postings_complete = true;
+
+        // The events above the marker have no postings yet: read each one's
+        // text and match its terms, as live matching does.
+        let gap_start = self
+            .gap_resume_lev_id
+            .max(indexed_through.saturating_add(1));
+        let mut past_latest = gap_start > latest_event_id;
+        let completed = past_latest
+            || txn.foreach_full(
+                txn.env().dbis().event,
+                &gap_start.to_ne_bytes(),
+                &[],
+                false,
+                |key, _| {
+                    // `wok doctor` reports a malformed key.
+                    let Ok(lev_id) = u64_from_ne_checked(key) else {
+                        return true;
+                    };
+                    if lev_id > latest_event_id {
+                        past_latest = true;
+                        return false;
+                    }
+                    if slice_spent(
+                        start,
+                        time_budget_us,
+                        starting_work,
+                        self.approx_work,
+                        std::mem::take(&mut read_text),
+                    ) {
+                        return false;
+                    }
+                    self.gap_resume_lev_id = lev_id.saturating_add(1);
+                    self.approx_work = self.approx_work.saturating_add(1);
+                    match self.consider(
+                        snapshot,
+                        filter,
+                        visibility,
+                        decompressor,
+                        lev_id,
+                        false,
+                        base_score,
+                        &phrase_pairs,
+                    ) {
+                        Ok(read) => {
+                            read_text = read;
+                            true
+                        }
+                        Err(err) => {
+                            error = Some(err);
+                            false
+                        }
+                    }
+                },
+            )?;
         if let Some(error) = error {
             return Err(error);
         }
-        if completed {
-            self.gathering_complete = true;
-            self.ranked_hits = self.top_hits.drain().map(|Reverse(hit)| hit).collect();
-            self.ranked_hits.sort_by(|a, b| b.cmp(a));
+        if !completed && !past_latest {
+            return Ok(false);
         }
-        Ok(completed)
+        self.gathering_complete = true;
+        self.ranked_hits = self.top_hits.drain().map(|Reverse(hit)| hit).collect();
+        self.ranked_hits.sort_by(|a, b| b.cmp(a));
+        Ok(true)
+    }
+
+    /// Rank the event at `lev_id` if it matches `filter` and the reader may
+    /// see it. A posting-list candidate (`indexed`) has every term already.
+    /// An event above the marker has no postings, so its terms are read from
+    /// its text. Returns whether its text was read.
+    #[allow(clippy::too_many_arguments)]
+    fn consider(
+        &mut self,
+        snapshot: &ReadSnapshot<'_>,
+        filter: &NostrFilter,
+        visibility: &ReadVisibility,
+        decompressor: &mut Decompressor,
+        lev_id: u64,
+        indexed: bool,
+        base_score: u64,
+        phrase_pairs: &[(String, String)],
+    ) -> Result<bool, wok_db::DbError> {
+        let txn = snapshot.txn();
+        let Some(packed_raw) = txn.get_u64(txn.env().dbis().event, lev_id)? else {
+            return Ok(false);
+        };
+        let Ok(packed) = PackedEventView::new(packed_raw) else {
+            return Ok(false);
+        };
+        if !filter.does_match_without_search(packed) {
+            return Ok(false);
+        }
+        let mut text = None;
+        if !indexed {
+            text = event_text(txn, decompressor, lev_id)?;
+            let terms = text.and_then(|json| event_search_terms(packed.kind(), json).ok());
+            let matches =
+                terms.is_some_and(|terms| self.query.terms.iter().all(|term| terms.contains(term)));
+            if !matches {
+                return Ok(true);
+            }
+        }
+        if !visibility.allows_noting_restricted(snapshot, packed, &mut self.restricted)? {
+            return Ok(!indexed);
+        }
+        let mut score = base_score;
+        if !phrase_pairs.is_empty() {
+            if indexed {
+                text = event_text(txn, decompressor, lev_id)?;
+            }
+            // A payload that does not decode ranks without the boost;
+            // sending the event reports it.
+            let pairs = text
+                .and_then(|json| count_phrase_pairs(packed.kind(), json, phrase_pairs).ok())
+                .unwrap_or(0);
+            score = score.saturating_add((pairs as u64).saturating_mul(2_000_000_000));
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(packed.id());
+        self.top_hits.push(Reverse(SearchHit {
+            lev_id,
+            score,
+            created_at: packed.created_at(),
+            id,
+        }));
+        if self.top_hits.len() > self.max_hits {
+            self.overflow = self.top_hits.pop().map(|Reverse(hit)| hit.lev_id);
+        }
+        Ok(!indexed || !phrase_pairs.is_empty())
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -1,9 +1,11 @@
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::json;
+use std::time::Duration;
 use tempfile::TempDir;
 use wok_db::{
-    delete_events, encode_zstd_payload, event_json_owned, insert_compression_dictionary,
-    write_events, Decompressor, Env, EnvOptions, EventToWrite, NoopNegentropy,
+    build_search_index, delete_events, encode_zstd_payload, event_json_owned,
+    insert_compression_dictionary, reset_search_index, search_index_state_ro, write_events,
+    Decompressor, Env, EnvOptions, EventToWrite, NoopNegentropy,
 };
 use wok_event::{parse_and_verify_event, EventLimits};
 use wok_query::{
@@ -275,4 +277,145 @@ fn compressed_matches_get_the_phrase_boost_through_the_scheduler() {
     }
     drop(txn);
     assert_eq!(contents(&env, &hits), vec!["alpha beta"]);
+}
+
+/// Leave the search index built for the first `events` events only, so that
+/// a search reads the rest above its marker.
+fn index_first(env: &Env, events: usize) {
+    let mut txn = env.begin_rw().unwrap();
+    reset_search_index(&mut txn).unwrap();
+    if events > 0 {
+        build_search_index(&mut txn, events, Duration::MAX).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// Run `filters` through a scheduler, in slices of `budget_us`, and return
+/// the contents it sends in order. `between` runs between slices, with no
+/// read transaction open.
+fn scheduled_search(
+    env: &Env,
+    filters: &serde_json::Value,
+    budget_us: u64,
+    mut between: impl FnMut(),
+) -> Vec<String> {
+    let group = NostrFilterGroup::from_value(filters, 100, 3, 16).unwrap();
+    let mut scheduler = QueryScheduler::new(1, 0, 0);
+    let txn = env.begin_ro().unwrap();
+    scheduler
+        .add_sub(
+            &txn,
+            Subscription::new(1, SubId::new("gap").unwrap(), group, false),
+        )
+        .unwrap();
+    drop(txn);
+    let mut hits = Vec::new();
+    while scheduler.has_running() {
+        let txn = env.begin_ro().unwrap();
+        scheduler
+            .process(
+                &txn,
+                budget_us,
+                |_, lev_id, _| {
+                    hits.push(lev_id);
+                    true
+                },
+                |_, _, _, _, _| {},
+            )
+            .unwrap();
+        drop(txn);
+        between();
+    }
+    contents(env, &hits)
+}
+
+fn gap_corpus() -> (TempDir, Env) {
+    let temp = TempDir::new().unwrap();
+    let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut events = vec![
+        sign(1, "alpha beta", 100),
+        sign(1, "alpha gamma beta", 200),
+        sign(1, "beta alpha", 300),
+        sign(1, "unrelated words", 400),
+        sign(1, "alpha", 500),
+        // Reactions are not searched, whatever their content.
+        sign(7, "alpha beta", 600),
+    ];
+    let mut txn = env.begin_rw().unwrap();
+    write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+    txn.commit().unwrap();
+    (temp, env)
+}
+
+fn gap_queries() -> Vec<serde_json::Value> {
+    vec![
+        json!([{"search": "alpha beta"}]),
+        json!([{"search": "alpha beta", "limit": 2}]),
+        json!([{"search": "beta", "since": 250}]),
+        json!([{"search": "alpha beta", "limit": 1}, {"search": "gamma"}]),
+    ]
+}
+
+#[test]
+fn a_search_reads_the_events_above_the_index_marker() {
+    let (_temp, env) = gap_corpus();
+    let queries = gap_queries();
+    let expected: Vec<_> = queries
+        .iter()
+        .map(|query| scheduled_search(&env, query, u64::MAX, || {}))
+        .collect();
+    // The phrase ranks first, then the newer notes.
+    assert_eq!(
+        expected[0],
+        ["alpha beta", "beta alpha", "alpha gamma beta"]
+    );
+    assert_eq!(expected[3], ["alpha gamma beta", "alpha beta"]);
+
+    for indexed in [0, 2, 4, 6] {
+        index_first(&env, indexed);
+        let state = search_index_state_ro(&env.begin_ro().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.lag(), 6 - indexed as u64);
+        for (query, expected) in queries.iter().zip(&expected) {
+            // A term's rarity counts the indexed events only, so filters
+            // ranked together may order differently while the index lags.
+            // Within one filter every match shares that score.
+            let order = |mut hits: Vec<String>| {
+                if indexed < 6 && query.as_array().unwrap().len() > 1 {
+                    hits.sort();
+                }
+                hits
+            };
+            assert_eq!(
+                order(scheduled_search(&env, query, u64::MAX, || {})),
+                order(expected.clone()),
+                "{indexed} indexed: {query}"
+            );
+            // A slice of 0 µs yields after each candidate whose text it read.
+            assert_eq!(
+                order(scheduled_search(&env, query, 0, || {})),
+                order(expected.clone()),
+                "{indexed} indexed, sliced: {query}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_search_is_unchanged_by_build_steps_between_its_slices() {
+    let (_temp, env) = gap_corpus();
+    // One filter: ranking between filters depends on how much is indexed.
+    let queries = &gap_queries()[..3];
+    for query in queries {
+        let expected = scheduled_search(&env, query, u64::MAX, || {});
+        index_first(&env, 0);
+        let step = || {
+            let mut txn = env.begin_rw().unwrap();
+            build_search_index(&mut txn, 1, Duration::MAX).unwrap();
+            txn.commit().unwrap();
+        };
+        assert_eq!(scheduled_search(&env, query, 0, step), expected, "{query}");
+    }
 }

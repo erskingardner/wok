@@ -1014,6 +1014,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wok router` no longer drops up-direction events when a peer's queue is
+  full (#244). Each connection queued at most 256 events, and the rest of a
+  burst, such as the up to 1,000 events a `both` stream downloads in one
+  batch, or a `wok import` into a routed database, was dropped without a
+  word. A stream now waits at the first event a connected peer has no room
+  for and resumes there as that peer catches up. **A slow peer now holds
+  back the other peers in its stream**, and a peer that takes longer than
+  `connectionTimeout` to accept a frame is disconnected and reconnected. A
+  reload that removes a URL, or changes a stream's `dir` or `filter`, now
+  closes the connection even when its queue is full; before, the close
+  waited in that queue, was lost when it was full, and left the old
+  connection running and storing what it downloaded.
 - A NEG-MSG sent before the relay replied to its session's NEG-OPEN, while
   the view built in memory is still being scanned, gets `invalid: NEG-MSG
   sent before the reply to NEG-OPEN`, and the session and its scan close

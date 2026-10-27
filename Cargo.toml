@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# Patched in below; not a member, so workspace lints and tests skip it.
+exclude = ["vendor/lmdb-sys"]
 members = [
     "crates/wok-event",
     "crates/wok-db",
@@ -77,3 +79,7 @@ panic = "abort"
 
 [profile.bench]
 lto = "thin"
+
+# LMDB 0.9.37, always built from source. See vendor/lmdb-sys/README.md.
+[patch.crates-io]
+lmdb-sys = { path = "vendor/lmdb-sys" }

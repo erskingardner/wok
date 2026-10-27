@@ -945,6 +945,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Wok bundles LMDB 0.9.37, up from 0.9.21 (#257). The newer releases fix
+  DUPSORT deletes and alignment, a race freeing spilled pages at the end of
+  a write, and fdatasync and metapage syncs on macOS. The source is vendored
+  and always built, so a system liblmdb found by pkg-config is no longer
+  linked in its place. The file format is unchanged, so existing databases
+  and strfry imports open as before; a binary linked with any LMDB but 0.9
+  refuses to open one, and the relay logs its LMDB version at startup.
 - The NIP-50 search index keeps only word postings (#257). It also kept a
   posting for each pair of adjacent words, up to 256 an event, which only
   boosted a match whose content holds the query's words in order; that

@@ -28,7 +28,7 @@ pub mod txn;
 pub mod vanish;
 pub mod write;
 
-pub use env::{Env, EnvOptions, EnvironmentStats};
+pub use env::{lmdb_version, Env, EnvOptions, EnvironmentStats};
 pub use error::DbError;
 pub use fbs::{
     decode_compression_dictionary, decode_meta, decode_negentropy_filter,

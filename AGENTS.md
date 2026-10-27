@@ -13,6 +13,7 @@ License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MS
 | `scripts/` | Release checks and benchmark campaign wrappers |
 | `contrib/` | Packaging extras (systemd unit) |
 | `fuzz/` | Separate cargo-fuzz workspace for untrusted-input targets |
+| `vendor/` | LMDB 0.9.37 source and the patched `lmdb-sys` that builds it |
 | `.github/workflows/` | CI, fuzz, security, platforms, release |
 
 Generated or local-only: `target/`, `bench-results/`, `strfry-db/`, `fuzz/artifacts/`, `fuzz/corpus/`. Do not treat those as source.

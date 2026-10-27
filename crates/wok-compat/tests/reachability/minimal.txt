@@ -1,7 +1,7 @@
 # Relay functions reached in the `minimal` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 626
+## anonymous: 627
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
 <wok_db::moderation::ModerationView>::hides
@@ -513,6 +513,7 @@ wok_event::validate::require_canonical_addresses
 wok_event::validate::verify_event_json_size
 wok_event::validate::verify_event_timestamp
 wok_event::validate::verify_nostr_event_with
+wok_negentropy::btree::check_encoded
 wok_negentropy::cache::parse_negentropy_filter
 wok_negentropy::lmdb_store::open_rw
 wok_negentropy::lmdb_store::tree_key

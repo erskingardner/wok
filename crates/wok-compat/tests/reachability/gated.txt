@@ -452,7 +452,7 @@ wok_ws::upgrade_ws::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 307
+## authenticated: 308
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -710,6 +710,7 @@ wok_db::write::index_event::{closure}
 wok_db::write::lookup_event_by_id::{closure}
 wok_db::write::original_tag_value
 wok_event::packed::hashed_tag_value_digest
+wok_negentropy::btree::check_encoded
 wok_negentropy::encoding::decode_varint
 wok_negentropy::encoding::encode_varint
 wok_negentropy::encoding::get_byte

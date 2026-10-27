@@ -15,6 +15,7 @@ mod author_kinds;
 mod catchup;
 mod clients;
 mod corpus;
+mod db_write;
 mod live;
 mod rate;
 mod social;
@@ -296,6 +297,14 @@ struct Args {
     /// `--sync-filter groups`, none for `all`.
     #[arg(long)]
     sync_limit: Option<u64>,
+    /// Batch sizes --scenario db_write times, one step each: events per
+    /// durable write transaction.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 8, 64, 512])]
+    db_batches: Vec<usize>,
+    /// Fewest events each --scenario db_write step writes, held back from
+    /// the end of the corpus; a step also writes at least 20 transactions.
+    #[arg(long, default_value_t = 2_000)]
+    db_step_events: u64,
 }
 
 impl Args {
@@ -353,6 +362,8 @@ struct Trial {
     publish_rate: Option<rate::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nip77_catchup: Option<catchup::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db_write: Option<db_write::Report>,
 }
 
 #[derive(Serialize)]
@@ -499,6 +510,7 @@ fn main() -> Result<()> {
         "author_kinds",
         "tag_kinds",
         "nip77_catchup",
+        "db_write",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -748,6 +760,7 @@ fn main() -> Result<()> {
                     | "tag_kinds"
                     | "monitor_index"
                     | "live_subscriptions"
+                    | "db_write"
             ) {
                 vec!["wok"]
             } else {
@@ -831,9 +844,10 @@ fn run_trial(
     let mut tag_kinds_report = None;
     let mut rate_report = None;
     let mut catchup_report = None;
+    let mut db_write_report = None;
 
-    let bin = if args.has_external_target() || scenario == "monitor_index" {
-        // monitor_index runs the index compiled into this binary.
+    let bin = if args.has_external_target() || matches!(scenario, "monitor_index" | "db_write") {
+        // monitor_index and db_write run the code compiled into this binary.
         None
     } else if relay == "wok" {
         Some(args.wok.as_path())
@@ -1280,6 +1294,39 @@ fn run_trial(
                 }
             }
         }
+        "db_write" => match db_write::run(&db_write::Options {
+            corpus: corpus_path.to_path_buf(),
+            dir: args.dataset_dir.clone(),
+            batches: args.db_batches.clone(),
+            step_events: args.db_step_events,
+            max_tags_per_filter: wok_relay::Config::default().relay.max_tags_per_filter,
+        }) {
+            Ok(report) => {
+                throughput = report.best_rate();
+                // The latency columns hold the smallest batch's transactions.
+                if let Some(step) = report.first() {
+                    for &us in &step.txn_us {
+                        hist.record(us.max(1))?;
+                    }
+                }
+                mismatches += report
+                    .steps
+                    .iter()
+                    .filter(|step| step.stored != step.events)
+                    .count() as u64;
+                notes = format!(
+                    "in-process storage writes on {} preloaded events; throughput is the best step, latency is one transaction at batch {}; see the db_write table",
+                    report.preloaded,
+                    report.first().map_or(0, |step| step.batch),
+                );
+                db_write_report = Some(report);
+            }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e:#}");
+            }
+        },
         _ => {
             notes = "unrecognized scenario".into();
             ok = false;
@@ -1295,6 +1342,7 @@ fn run_trial(
         tag_kinds: tag_kinds_report,
         publish_rate: rate_report,
         nip77_catchup: catchup_report,
+        db_write: db_write_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1340,6 +1388,7 @@ fn failed_trial(
         tag_kinds: None,
         publish_rate: None,
         nip77_catchup: None,
+        db_write: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -3473,6 +3522,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.nip77_catchup {
             s.push_str(&catchup::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.db_write {
+            s.push_str(&db_write::render_markdown(report));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -3576,6 +3628,18 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             args.live_phase_secs,
             args.live_churners,
             args.live_churn_rate,
+        ));
+    }
+    if args.scenario.as_deref() == Some("db_write") {
+        if let Some(events) = args.events {
+            selection.push_str(&format!(" --events {events}"));
+        }
+        let batches: Vec<String> = args.db_batches.iter().map(usize::to_string).collect();
+        selection.push_str(&format!(
+            " --db-batches {} --db-step-events {} --dataset-dir \"{}\"",
+            batches.join(","),
+            args.db_step_events,
+            args.dataset_dir.display(),
         ));
     }
     if let Some(scenario @ ("author_kinds" | "tag_kinds")) = args.scenario.as_deref() {

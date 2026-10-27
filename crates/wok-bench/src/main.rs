@@ -15,6 +15,7 @@ mod author_kinds;
 mod catchup;
 mod clients;
 mod corpus;
+mod db_write;
 mod live;
 mod rate;
 mod social;
@@ -46,6 +47,11 @@ const READ_SCENARIOS: [&str; 3] = [
     "deep_history_pagination",
     "mixed_read_write",
 ];
+/// Scenarios that run code compiled into this binary rather than a relay, so
+/// a trial records this binary's hash.
+const IN_PROCESS_SCENARIOS: [&str; 2] = ["monitor_index", "db_write"];
+/// In-process scenarios that read the corpus as it is, of any event mix.
+const ANY_MIX_SCENARIOS: [&str; 1] = ["db_write"];
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -301,6 +307,14 @@ struct Args {
     /// `--sync-filter groups`, none for `all`.
     #[arg(long)]
     sync_limit: Option<u64>,
+    /// Batch sizes --scenario db_write times, one step each: events per
+    /// durable write transaction.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 8, 64, 512])]
+    db_batches: Vec<usize>,
+    /// Fewest events each --scenario db_write step writes, held back from
+    /// the end of the corpus; a step also writes at least 20 transactions.
+    #[arg(long, default_value_t = 2_000)]
+    db_step_events: u64,
 }
 
 impl Args {
@@ -358,6 +372,8 @@ struct Trial {
     publish_rate: Option<rate::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nip77_catchup: Option<catchup::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db_write: Option<db_write::Report>,
 }
 
 #[derive(Serialize)]
@@ -508,6 +524,7 @@ fn main() -> Result<()> {
         "author_kinds",
         "tag_kinds",
         "nip77_catchup",
+        "db_write",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -601,18 +618,7 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--event-mix lifecycle is only valid for live publication scenarios");
     }
-    // Only the read scenarios check a social corpus's import against what a
-    // relay keeps of it.
-    if args.event_mix == EventMix::Social
-        && !args.generate_corpus_only
-        && scenarios
-            .iter()
-            .any(|scenario| !READ_SCENARIOS.contains(scenario))
-    {
-        anyhow::bail!(
-            "--event-mix social runs only ws_query_latency, deep_history_pagination and mixed_read_write, or --generate-corpus-only"
-        );
-    }
+    check_social_mix(&args, &scenarios)?;
 
     let default_event_count = if args.profile == "smoke" {
         2_000
@@ -651,7 +657,9 @@ fn main() -> Result<()> {
         }
         (path, count)
     } else {
-        let count = args.events.unwrap_or(default_event_count);
+        let count = args
+            .events
+            .unwrap_or_else(|| generated_corpus_events(&args, &scenarios, default_event_count));
         let path = args.out.join("corpus.jsonl");
         if args.event_mix == EventMix::Social {
             let opts = social::Options {
@@ -757,6 +765,7 @@ fn main() -> Result<()> {
                     | "tag_kinds"
                     | "monitor_index"
                     | "live_subscriptions"
+                    | "db_write"
             ) {
                 vec!["wok"]
             } else {
@@ -840,9 +849,9 @@ fn run_trial(
     let mut tag_kinds_report = None;
     let mut rate_report = None;
     let mut catchup_report = None;
+    let mut db_write_report = None;
 
-    let bin = if args.has_external_target() || scenario == "monitor_index" {
-        // monitor_index runs the index compiled into this binary.
+    let bin = if args.has_external_target() || IN_PROCESS_SCENARIOS.contains(&scenario) {
         None
     } else if relay == "wok" {
         Some(args.wok.as_path())
@@ -1296,6 +1305,36 @@ fn run_trial(
                 }
             }
         }
+        "db_write" => match db_write::run(&db_write::Options {
+            corpus: corpus_path.to_path_buf(),
+            dir: args.dataset_dir.clone(),
+            batches: args.db_batches.clone(),
+            step_events: args.db_step_events,
+        }) {
+            Ok(report) => {
+                throughput = report.best_rate();
+                // The latency columns hold the smallest batch's transactions.
+                if let Some(step) = report.smallest_batch() {
+                    for &us in &step.txn_us {
+                        hist.record(us.max(1))?;
+                    }
+                }
+                // A step fails when the writer left an event unfinished.
+                mismatches += report.failed_steps();
+                ok = report.failed_steps() == 0;
+                notes = format!(
+                    "in-process storage writes on {} preloaded events; throughput is the best step's stored events per second, latency is one transaction at batch {}; see the db_write table",
+                    report.preloaded,
+                    report.smallest_batch().map_or(0, |step| step.batch),
+                );
+                db_write_report = Some(report);
+            }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e:#}");
+            }
+        },
         _ => {
             notes = "unrecognized scenario".into();
             ok = false;
@@ -1311,6 +1350,7 @@ fn run_trial(
         tag_kinds: tag_kinds_report,
         publish_rate: rate_report,
         nip77_catchup: catchup_report,
+        db_write: db_write_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1332,11 +1372,51 @@ fn run_trial(
         event_mix: args.event_mix,
         base_timestamp,
         corpus_sha256: corpus_sha256.into(),
-        binary_sha256: bin
-            .and_then(|path| sha256_file(path).ok())
-            .unwrap_or_default(),
+        binary_sha256: measured_binary_sha256(bin, scenario),
         profile: args.profile.clone(),
     })
+}
+
+/// The hash of what a trial measured: the relay binary it started, or this
+/// `wok-bench` for an in-process scenario.
+fn measured_binary_sha256(bin: Option<&Path>, scenario: &str) -> String {
+    let path = match bin {
+        Some(path) => Some(path.to_path_buf()),
+        None if IN_PROCESS_SCENARIOS.contains(&scenario) => std::env::current_exe().ok(),
+        None => None,
+    };
+    path.and_then(|path| sha256_file(&path).ok())
+        .unwrap_or_default()
+}
+
+/// Only the read scenarios check a social corpus's import against what a
+/// relay keeps of it; the any-mix scenarios read its events as they are.
+fn check_social_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
+    if args.event_mix == EventMix::Social
+        && !args.generate_corpus_only
+        && scenarios.iter().any(|scenario| {
+            !READ_SCENARIOS.contains(scenario) && !ANY_MIX_SCENARIOS.contains(scenario)
+        })
+    {
+        anyhow::bail!(
+            "--event-mix social runs only ws_query_latency, deep_history_pagination, mixed_read_write and {}, or --generate-corpus-only",
+            ANY_MIX_SCENARIOS.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Events in a corpus generated without `--events`: the profile's default,
+/// or what `db_write`'s steps and a history need.
+fn generated_corpus_events(args: &Args, scenarios: &[&str], profile_default: u64) -> u64 {
+    if scenarios.contains(&"db_write") {
+        profile_default.max(db_write::default_corpus_events(
+            &args.db_batches,
+            args.db_step_events,
+        ))
+    } else {
+        profile_default
+    }
 }
 
 fn failed_trial(
@@ -1356,6 +1436,7 @@ fn failed_trial(
         tag_kinds: None,
         publish_rate: None,
         nip77_catchup: None,
+        db_write: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -3512,6 +3593,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.nip77_catchup {
             s.push_str(&catchup::render_markdown(report, &t.relay, t.repetition));
         }
+        if let Some(report) = &t.db_write {
+            s.push_str(&db_write::render_markdown(report));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -3615,6 +3699,18 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
             args.live_phase_secs,
             args.live_churners,
             args.live_churn_rate,
+        ));
+    }
+    if args.scenario.as_deref() == Some("db_write") {
+        if let Some(events) = args.events {
+            selection.push_str(&format!(" --events {events}"));
+        }
+        let batches: Vec<String> = args.db_batches.iter().map(usize::to_string).collect();
+        selection.push_str(&format!(
+            " --db-batches {} --db-step-events {} --dataset-dir \"{}\"",
+            batches.join(","),
+            args.db_step_events,
+            args.dataset_dir.display(),
         ));
     }
     if let Some(scenario @ ("author_kinds" | "tag_kinds")) = args.scenario.as_deref() {
@@ -4027,6 +4123,34 @@ mod tests {
         let opts = author_kinds_options(&args).unwrap();
         assert!(opts.dataset_dir.is_absolute());
         assert!(opts.dataset_dir.ends_with("bench-results/datasets"));
+    }
+
+    #[test]
+    fn db_write_runs_on_a_social_corpus_and_by_default() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["wok-bench", "--scenario", "db_write"];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+        let social = parse(&["--event-mix", "social"]);
+        assert!(check_social_mix(&social, &["db_write"]).is_ok());
+        assert!(check_social_mix(&social, &["ws_publish_1conn"]).is_err());
+        // Without --events, the generated corpus holds the default steps
+        // and a history to write them on.
+        let default = parse(&[]);
+        let events = generated_corpus_events(&default, &["db_write"], 2_000);
+        assert_eq!(
+            events,
+            db_write::default_corpus_events(&default.db_batches, default.db_step_events)
+        );
+        assert_eq!(generated_corpus_events(&default, &["import"], 2_000), 2_000);
+    }
+
+    #[test]
+    fn in_process_trials_record_this_binary() {
+        let this = sha256_file(&std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(measured_binary_sha256(None, "db_write"), this);
+        assert_eq!(measured_binary_sha256(None, "ws_publish_1conn"), "");
     }
 
     #[test]

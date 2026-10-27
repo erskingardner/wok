@@ -396,6 +396,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wok-bench --scenario db_write` times storing events without a relay or
+  the network (#257). It loads a corpus into a fresh database, then writes
+  the corpus's last events through the relay writer's storage calls in
+  durable transactions of each `--db-batches` size (1, 8, 64 and 512 by
+  default). Per batch size it reports stored events per second, transaction
+  and commit percentiles, and on Linux the bytes written per stored event
+  and pages per commit; duplicates and superseded or deleted events are
+  counted apart. The database lives under `--dataset-dir`, so a tmpfs `/tmp`
+  does not hide the disk.
 - Writer metrics (#257): histograms of how many messages were queued when
   the writer started a batch, how many events each commit holds, and how
   long the batch's checks, writes, commit and replies took

@@ -1019,6 +1019,62 @@ author range, raise it or some subscriptions are refused.
 CI runs small versions of both scenarios as unit tests (`live::tests`). The
 `live_subscriptions` test uses an in-process relay.
 
+## Storage writes (`db_write`)
+
+This Wok-only scenario measures what storing events costs, with no relay,
+network or ingest in the way. It runs the relay writer's storage calls in
+process, so it measures the storage code compiled into this `wok-bench`
+build, not the `--wok` binary. Each write transaction is one writer batch:
+`write_events_with_quota`, the negentropy tree flush, and a durable commit,
+in the writer's order. The writer's checks before its transaction
+(duplicates, write policy, quotas) are not timed.
+
+The corpus (`--corpus`, or one generated from `--events` and any
+`--event-mix`, `social` included) is loaded into a fresh database in untimed
+transactions of 1,000 events, except its last events. Without `--events`, a
+generated corpus holds the steps' events plus 20,000 for the history. Those are held back for the timed steps, one per
+`--db-batches` size, each writing its own slice in corpus order on top of
+the history already stored. A step writes at least `--db-step-events`
+events and at least 20 transactions. The database is created under
+`--dataset-dir` and removed after the trial; the system temp directory is a
+tmpfs on many Linux hosts and would hide the disk's cost.
+
+Each event ends as the relay writer leaves it. Stored events were inserted.
+Settled ones were duplicates, older versions of a replaceable event, or
+deleted, and have no row of their own; a social corpus has many. An event
+left pending or over a quota is unfinished and fails the trial.
+
+Per step the table gives those counts, transactions, stored events per
+second and µs per stored event, transaction time (from `begin_rw` to the
+end of the commit) and commit time at p50 and p99, and the growth of
+`data.mdb`. On Linux it also gives the bytes the process wrote per stored
+event and the 4 KiB pages per commit, from `write_bytes` in
+`/proc/self/io`, which counts each page once per commit that dirties it.
+With the minimum of 20 commits, a step's p99 is close to its maximum. The
+trial's throughput is the best step's stored events per second, its latency
+columns hold the smallest batch's transaction times, and it records this
+`wok-bench` binary's hash.
+
+```bash
+# On a production-sized history (a 1M-event social corpus), with the
+# database on the disk a relay would use.
+./target/release/wok-bench --scenario db_write \
+  --corpus bench-results/social-1m/corpus.jsonl \
+  --dataset-dir /srv/relay-disk/bench \
+  --db-batches 1,8,64,512 --db-step-events 5000 --out bench-results/db-write
+```
+
+To compare storage changes, build `wok-bench` from each commit and run both
+on the same host and corpus, as for `monitor_index`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--db-batches` | 1,8,64,512 | Events per write transaction, one step each |
+| `--db-step-events` | 2,000 | Fewest events a step writes |
+| `--dataset-dir` | `bench-results/datasets` | Where the trial's database is created |
+
+CI runs a small version as unit tests (`db_write::tests`).
+
 ## Portable Docker lab
 
 For a repeatable local setup or fresh two-VM deployment, start with the

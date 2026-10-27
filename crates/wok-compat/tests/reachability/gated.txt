@@ -1,7 +1,7 @@
 # Relay functions reached in the `gated` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 458
+## anonymous: 461
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::is_member
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
@@ -279,10 +279,13 @@ wok_db::search::search_index_entries
 wok_db::state::allocate_event_id
 wok_db::state::author_key
 wok_db::state::change_author_count
+wok_db::state::count_vanish_marker_change
 wok_db::state::invalidate_visibility
 wok_db::state::policy_generation
 wok_db::state::policy_generation::{closure}
 wok_db::state::preserve_high_water
+wok_db::state::vanish_marker_changes
+wok_db::state::vanish_marker_changes::{closure}
 wok_db::tag_kind::note_tag_kind_indexed
 wok_db::tag_kind::put_tag_kind_entries
 wok_db::tag_kind::tag_kind_keys
@@ -773,7 +776,7 @@ wok_relay::server::run_req_worker::{closure}
 wok_relay::server::slice_config
 wok_relay::server::stored_reader_admitted
 
-## admin: 123
+## admin: 113
 <wok_db::moderation::KindPolicy>::allow_all
 <wok_db::moderation::KindPolicy>::allows
 <wok_db::moderation::KindPolicy>::allows::{closure}
@@ -782,14 +785,11 @@ wok_relay::server::stored_reader_admitted
 <wok_db::moderation::KindPolicy>::set_allowed
 <wok_db::moderation::ModerationView>::new::{closure}::{closure}::{closure}
 <wok_db::txn::RoTxn>::foreach_full::<<wok_db::moderation::ModerationView>::new::{closure}::{closure}::{closure}>
-<wok_db::txn::RoTxn>::foreach_full::<wok_relay::server::writer::run_maintenance::{closure}>
 <wok_db::txn::RwTxn as wok_db::moderation::ReadOps>::foreach_prefix
 <wok_db::txn::RwTxn as wok_db::moderation::ReadOps>::foreach_prefix::{closure}
 <wok_db::txn::RwTxn as wok_db::moderation::ReadOps>::get_record
 <wok_db::txn::RwTxn as wok_db::moderation::ReadOps>::moderation_dbi
 <wok_db::txn::RwTxn>::foreach_full::<<wok_db::txn::RwTxn as wok_db::moderation::ReadOps>::foreach_prefix::{closure}>
-<wok_db::txn::RwTxn>::foreach_full::<wok_db::vanish::next_marker::{closure}>
-<wok_negentropy::cache::DeferredSink>::apply
 <wok_relay::config::AccessPolicy>::name
 <wok_relay::config::Config>::accepted_kind_list
 <wok_relay::config::Config>::auth_configuration_warning
@@ -848,15 +848,8 @@ wok_db::moderation::validate_role_id
 wok_db::moderation::write_pubkey_roles
 wok_db::txn::foreach_full::<<wok_db::moderation::ModerationView>::new::{closure}::{closure}::{closure}>
 wok_db::txn::foreach_full::<<wok_db::txn::RwTxn as wok_db::moderation::ReadOps>::foreach_prefix::{closure}>
-wok_db::txn::foreach_full::<wok_db::vanish::next_marker::{closure}>
-wok_db::txn::foreach_full::<wok_relay::server::writer::run_maintenance::{closure}>
-wok_db::vanish::next_marker
-wok_db::vanish::sweep_vanished_events::<wok_negentropy::cache::DeferredSink>
-wok_db::write::delete_events::<wok_negentropy::cache::DeferredSink, alloc::vec::Vec<u64>>
 wok_relay::server::writer::apply_management
 wok_relay::server::writer::apply_management::{closure}
-wok_relay::server::writer::run_maintenance
-wok_relay::server::writer::run_maintenance::{closure}
 wok_ws::admin::apply_config_patch
 wok_ws::admin::authorize
 wok_ws::admin::authorize::{closure}

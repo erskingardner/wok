@@ -409,6 +409,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   management call made since, before letting clients back in. After more
   than one such reindex, restore from the backup the first one kept and
   repeat every call made since then.
+- The NIP-62 sweep no longer reads every event that tags a vanished key on
+  every maintenance tick (#253). To find the gift wraps to each vanished
+  key, the writer read each event with a `p` tag naming it, every 2 seconds
+  and forever, inside its write transaction: only the gift wraps counted
+  toward `relay.nip62.deletion_batch_size`, and a finished sweep started
+  over. When a widely mentioned key vanished, or anyone vanished a key and
+  tagged it from throwaway keys, event writes waited behind that walk. A
+  tick now examines at most `deletion_batch_size` index entries and visits
+  at most as many vanished keys. Each key's pass resumes where it stopped,
+  after a restart too, from progress kept in `wok_State`, and runs once: the
+  relay refuses the events it covered, and a later request from the same
+  key sweeps only the events it adds. Once every pass has finished, the
+  sweep does nothing until another request arrives. Events stay hidden from
+  the request on, but a key that a million events tag now takes about half
+  an hour to sweep at the default 1000. Each key stored before this release
+  is swept once more, and so is each after a `wok reindex`, which does not
+  copy the progress. An earlier release's `wok integrity` reports the
+  progress records and their `vanish-markers` counter as unknown `wok_State`
+  keys.
 - A NIP-77 message to a session served from a negentropy tree costs a
   tenth of the worker time it did, and sessions take turns with their
   client (#254). To read the item count of each node it passed, a lookup in

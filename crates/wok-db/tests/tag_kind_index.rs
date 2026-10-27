@@ -241,9 +241,11 @@ fn every_write_and_deletion_path_keeps_the_index_equal_to_the_tag_index() {
     let (_, vanish) = signed(&bob, 62, 4_000, json!([["relay", "ALL_RELAYS"]]));
     let mut vanish = [vanish];
     write(&env, &mut vanish);
-    let mut cursor = Vec::new();
+    let mut cursor = Default::default();
     let mut txn = env.begin_rw().unwrap();
-    let swept = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 100, &mut cursor).unwrap();
+    let swept = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 100, &mut cursor)
+        .unwrap()
+        .deleted;
     txn.commit().unwrap();
     assert_eq!(swept, 3);
     assert!(!stored(&env, lev(1)) && !stored(&env, lev(2)) && !stored(&env, lev(7)));

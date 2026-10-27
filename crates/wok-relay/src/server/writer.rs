@@ -456,10 +456,20 @@ pub(super) fn run_writer(
         // NIP-62 requires a vanish request that targets this relay to be
         // honored whatever the user's status, so the global quota does not
         // count the ones a batch records and never refuses a batch for them.
-        let records_vanish = |event: &EventToWrite<u64>| {
+        let honors_vanish = |event: &EventToWrite<u64>| {
             vanish_policy.enabled
-                && event.status == EventWriteStatus::Written
                 && PackedEventView::new(&event.packed).is_ok_and(|e| e.kind() == VANISH_KIND)
+        };
+        let records_vanish = |event: &EventToWrite<u64>| {
+            event.status == EventWriteStatus::Written && honors_vanish(event)
+        };
+        // A copy of a request the batch recorded, or of one already stored,
+        // is answered `duplicate:`, as the batch without the quota would.
+        let keeps_vanish = |event: &EventToWrite<u64>| {
+            matches!(
+                event.status,
+                EventWriteStatus::Written | EventWriteStatus::Duplicate
+            ) && honors_vanish(event)
         };
         let write_started = Instant::now();
         let storage_before = storage_writes.bytes();
@@ -504,7 +514,7 @@ pub(super) fn run_writer(
         if matches!(write_res, Ok(None)) {
             // The quota refuses everything else in the batch, and the
             // vanish requests it held are written on their own.
-            let (vanishing, refused): (Vec<_>, Vec<_>) = events.drain(..).partition(records_vanish);
+            let (vanishing, refused): (Vec<_>, Vec<_>) = events.drain(..).partition(keeps_vanish);
             metrics
                 .abuse_global_quota_rejections
                 .fetch_add(refused.len() as u64, Ordering::Relaxed);
@@ -1264,6 +1274,7 @@ mod tests {
     }
 
     /// An unsigned event `id` from `author`, sent by connection `conn_id`.
+    /// A vanish request names every relay.
     fn copy_of(conn_id: u64, id: u8, author: [u8; 32], created_at: u64, kind: u64) -> WriterMsg {
         let mut tags = PackedEventTagBuilder::default();
         if wok_event::is_replaceable_kind(kind) {
@@ -1276,7 +1287,7 @@ mod tests {
             "pubkey": to_hex(&author),
             "created_at": created_at,
             "kind": kind,
-            "tags": [],
+            "tags": if kind == VANISH_KIND { json!([["relay", "ALL_RELAYS"]]) } else { json!([]) },
             "content": "",
             "sig": "00".repeat(64),
         })
@@ -1411,6 +1422,30 @@ mod tests {
         );
         let banned = json!([false, "restricted: event is banned by the relay operator"]);
         assert_eq!(replies, [banned.clone(), banned]);
+
+        // A full relay still stores a vanish request, and answers its copy
+        // as a duplicate, not with the global quota's refusal.
+        let (_dir, env, mut config) = fresh();
+        config.relay.abuse.max_stored_events = 1;
+        config.relay.nip62.service_url = "wss://relay.example.com".into();
+        replies_to(config.clone(), &env, vec![copy_of(1, 1, author, 100, 1)]);
+        let replies = replies_to(
+            config,
+            &env,
+            vec![
+                copy_of(1, 4, author, 200, VANISH_KIND),
+                copy_of(2, 4, author, 200, VANISH_KIND),
+                copy_of(3, 5, [0x66; 32], 200, 1),
+            ],
+        );
+        assert_eq!(
+            replies,
+            [
+                json!([true, ""]),
+                json!([true, "duplicate: have this event"]),
+                json!([false, "error: global storage quota of 1 events exceeded"]),
+            ]
+        );
     }
 
     #[test]

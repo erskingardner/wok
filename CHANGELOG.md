@@ -417,6 +417,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   round trips rather than delivery: 128 subscribers took 64,000 events in
   4.2 s on Wok master, about one event per 8 ms OK. `--fanout-window 1`
   keeps the old behavior, so earlier results are comparable only with it.
+- `scripts/benchmark-campaign.sh` records what each phase made the relay
+  write (#257): the relay host's helper marks the relay process's storage
+  I/O before and after every phase, and each phase's results get a
+  `relay-io.json` with the bytes read and written, and for a fixed-rate step
+  the bytes written per newly stored event. It works for any relay, strfry
+  included.
 
 - `scripts/benchmark-campaign.sh` compares any number of relay targets
   (#226), each described by a file on the relay host, instead of one Wok and

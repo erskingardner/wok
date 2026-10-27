@@ -156,9 +156,21 @@ load_unit_command() {
     )
 }
 
+# Asks the relay host to mark the relay's cumulative storage I/O. A missing
+# mark leaves that phase's bytes out; it does not fail the phase.
+io_mark() {
+    local target=$1
+    local repetition=$2
+    local label=$3
+    remote_command "$RELAY_SSH" "$CONTROL_REMOTE" io-mark "$target" \
+        "$RELAY_ROOT/runs/r${repetition}-${target}/server" "$label" ||
+        echo "$target: could not mark the relay's I/O at $label" >&2
+}
+
 # Runs one phase on the load host, signing its workload from the given seed,
 # and returns wok-bench's status. Its results go to
-# $LOAD_ROOT/runs/r<repetition>-<target>/load/<phase>.
+# $LOAD_ROOT/runs/r<repetition>-<target>/load/<phase>, and the relay's I/O
+# is marked at its start and end.
 launch_bench() {
     local target=$1
     local repetition=$2
@@ -173,7 +185,10 @@ launch_bench() {
         # instead be fresh when each live lifecycle phase actually begins.
         phase_timestamp=$(date -u +%s)
     fi
-    remote_command "$LOAD_SSH" mkdir -p "$output"
+    # The phase starts empty: under a reused campaign ID, an earlier run's
+    # report or I/O summary must not stand in for one this run never wrote.
+    # shellcheck disable=SC2016 # The load host's shell expands it.
+    remote_command "$LOAD_SSH" sh -c 'rm -rf -- "$1" && mkdir -p -- "$1"' sh "$output"
     load_unit_command /usr/bin/time -v -o "$output/time.txt" \
         "$BENCH_BIN" \
         --target-url "$url" \
@@ -193,11 +208,54 @@ launch_bench() {
     local rendered_bench rendered_sampler
     printf -v rendered_bench '%q ' "${LOAD_UNIT_COMMAND[@]}"
     printf -v rendered_sampler '%q ' "${sampler[@]}"
+    io_mark "$target" "$repetition" "$phase-start"
+    local status=0
     ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "$rendered_sampler
 $rendered_bench
 rc=\$?
 systemctl stop $LOAD_UNIT-mpstat.service
-exit \$rc"
+exit \$rc" || status=$?
+    io_mark "$target" "$repetition" "$phase-end"
+    PHASES_LAUNCHED+=("$phase")
+    return "$status"
+}
+
+# What each phase the run launched made the relay write, from the server
+# evidence's io-phases.tsv, as <phase>/relay-io.json beside its results:
+# seconds, bytes read and written, and for a fixed-rate step the events it
+# newly stored (accepted less duplicates) and bytes written per such event.
+# shellcheck disable=SC2016 # $io, $phase and $stored are jq's.
+PHASE_IO='($io | split("\n") | map(split("\t")) | map(select(length == 4 and .[0] == $phase)))
+    as $rows
+    | if ($rows | length) == 0 then empty else
+        $rows[0] as $row
+        | {phase: $phase, secs: ($row[1] | tonumber), read_bytes: ($row[2] | tonumber),
+           write_bytes: ($row[3] | tonumber)}
+        | if ($results | length) > 0 and $results[0].publish_rate != null then
+            ($results[0].publish_rate | .accepted - .duplicates) as $stored
+            | . + {stored_events: $stored,
+                   write_bytes_per_stored_event:
+                     (if $stored > 0 then .write_bytes / $stored else null end)}
+          else . end
+      end'
+
+phase_io() {
+    local target=$1
+    local repetition=$2
+    local run_root=$LOAD_ROOT/runs/r${repetition}-${target}
+    local io=$run_root/server/io-phases.tsv
+    remote_command "$LOAD_SSH" test -s "$io" || return 0
+    local phase
+    for phase in ${PHASES_LAUNCHED[@]+"${PHASES_LAUNCHED[@]}"}; do
+        # shellcheck disable=SC2016 # The load host's shell expands them.
+        remote_command "$LOAD_SSH" sh -c \
+            'jq -n --rawfile io "$1" --arg phase "$2" --slurpfile results "$3" "$4" \
+                >"$5.tmp" || { rm -f -- "$5.tmp"; exit 1; }
+            if [ -s "$5.tmp" ]; then mv -- "$5.tmp" "$5"; else rm -f -- "$5.tmp"; fi' \
+            sh "$io" "$phase" "$run_root/load/$phase/results.jsonl" "$PHASE_IO" \
+            "$run_root/load/$phase/relay-io.json" ||
+            echo "$target: could not summarize the relay's I/O for $phase" >&2
+    done
 }
 
 # Runs one phase and fails unless every trial passed: ok, with no errors or
@@ -337,7 +395,11 @@ run_target() {
         snapshot=keep
     fi
     remote_command "$LOAD_SSH" mkdir -p "$run_root/load" "$run_root/server"
+    # Only this run's evidence may replace it: a rerun under the same
+    # campaign ID whose collect fails must leave every phase's bytes out.
+    remote_command "$LOAD_SSH" rm -f -- "$run_root/server/io-phases.tsv"
     RATE_LAUNCHED=()
+    PHASES_LAUNCHED=()
 
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" prepare "$target" "$RELAY_CORPUS" \
         "$RETAINED" "$server_artifacts" --snapshot "$snapshot" --nofile "$NOFILE_LIMIT" \
@@ -386,8 +448,12 @@ run_target() {
     if [[ -n $RATE_STEPS ]] && ! reconcile_rate_steps "$target" "$repetition"; then
         status=1
     fi
-    scp "${SSH_OPTIONS[@]}" -3 -q -r "$RELAY_SSH:$server_artifacts/." "$LOAD_SSH:$run_root/server/" ||
+    if scp "${SSH_OPTIONS[@]}" -3 -q -r "$RELAY_SSH:$server_artifacts/." \
+        "$LOAD_SSH:$run_root/server/"; then
+        phase_io "$target" "$repetition"
+    else
         status=1
+    fi
     if [[ $status -ne 0 ]]; then
         echo "campaign phase failed for $target repetition $repetition" >&2
         return "$status"

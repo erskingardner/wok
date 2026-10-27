@@ -29,6 +29,7 @@ TARGETS_ROOT=$PREFIX/etc/relay-bench/targets
 STATE_ROOT=$PREFIX/var/lib/relay-bench
 SNAPSHOT_ROOT=$STATE_ROOT/snapshots
 OPT_ROOT=$PREFIX/opt/relay-bench
+PROC_ROOT=$PREFIX/proc
 UNIT_PREFIX=relay-bench-
 SLICE=relay-bench.slice
 DEFAULT_USER=relay-bench
@@ -46,6 +47,7 @@ usage: benchmark-relay-control check TARGET...
            [--snapshot keep|none] [--cpus LIST] [--memory SIZE] [--nofile N]
        benchmark-relay-control start TARGET ARTIFACTS [--cache cold|warm]
            [--cpus LIST] [--memory SIZE] [--nofile N] [--ready-timeout SECS]
+       benchmark-relay-control io-mark TARGET ARTIFACTS LABEL
        benchmark-relay-control collect-stop TARGET ARTIFACTS
        benchmark-relay-control reconcile TARGET WOK_BENCH DIR [--nofile N]
        benchmark-relay-control drop-snapshot TARGET
@@ -587,6 +589,9 @@ start_measurement() {
     local main_pid
     main_pid=$(systemctl show "$UNIT" -p MainPID --value)
     echo "$main_pid" >"$artifacts/main.pid"
+    # This start owns the I/O marks: a rerun under the same campaign ID must
+    # not pair its marks with an earlier run's.
+    rm -f -- "$artifacts/io-marks.tsv" "$artifacts/io-phases.tsv"
     systemctl show "$UNIT" >"$artifacts/systemd-before.properties"
     nstat -az >"$artifacts/nstat-before.txt"
     # node_exporter is optional.
@@ -595,6 +600,63 @@ start_measurement() {
     start_sampler pidstat "$artifacts/pidstat.txt" pidstat -h -t -r -u -d -w -p "$main_pid" 1
     start_sampler mpstat "$artifacts/mpstat.txt" mpstat -P ALL 1
     start_sampler iostat "$artifacts/iostat.txt" iostat -x -m -t 1
+}
+
+# Appends LABEL, the time, and the running relay's cumulative storage I/O
+# (read_bytes and write_bytes of /proc/PID/io, every thread included) to
+# ARTIFACTS/io-marks.tsv. The campaign marks each phase's start and end, so
+# what a phase made the relay read and write is the difference.
+io_mark() {
+    local target=$1
+    local artifacts=$2
+    local label=$3
+    load_target "$target"
+    assert_benchmark_path "$artifacts"
+    [[ $label =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid I/O mark label: $label"
+    [[ -s $artifacts/main.pid ]] || die "$TARGET has no recorded main PID in $artifacts"
+    local pid
+    pid=$(<"$artifacts/main.pid")
+    local key value read_bytes='' write_bytes=''
+    while read -r key value; do
+        case $key in
+            read_bytes:) read_bytes=$value ;;
+            write_bytes:) write_bytes=$value ;;
+        esac
+    done <"$PROC_ROOT/$pid/io" || die "cannot read the I/O of $TARGET's process $pid"
+    [[ -n $read_bytes && -n $write_bytes ]] || die "no byte counts in $PROC_ROOT/$pid/io"
+    printf '%s\t%s\t%s\t%s\n' "$label" "$(date +%s.%N)" "$read_bytes" "$write_bytes" \
+        >>"$artifacts/io-marks.tsv"
+}
+
+# Writes ARTIFACTS/io-phases.tsv from io-marks.tsv: per phase marked
+# PHASE-start and PHASE-end, its seconds and the bytes the relay read and
+# wrote in between. A phase whose last start has no end is left out; with no
+# marks, the file has only its header, so it replaces an earlier run's copy.
+io_phases() {
+    local artifacts=$1
+    local marks=$artifacts/io-marks.tsv
+    [[ -f $marks ]] || marks=/dev/null
+    awk -F '\t' -v OFS='\t' '
+        BEGIN { print "phase", "secs", "read_bytes", "write_bytes" }
+        $1 ~ /-start$/ {
+            phase = substr($1, 1, length($1) - 6)
+            started[phase] = $2; read[phase] = $3; written[phase] = $4
+            delete secs[phase]
+            if (!(phase in seen)) { seen[phase] = 1; order[++phases] = phase }
+        }
+        $1 ~ /-end$/ {
+            phase = substr($1, 1, length($1) - 4)
+            if (phase in started) {
+                secs[phase] = sprintf("%.3f", $2 - started[phase])
+                dread[phase] = $3 - read[phase]; dwrite[phase] = $4 - written[phase]
+            }
+        }
+        END {
+            for (i = 1; i <= phases; i++) {
+                phase = order[i]
+                if (phase in secs) print phase, secs[phase], dread[phase], dwrite[phase]
+            }
+        }' "$marks" >"$artifacts/io-phases.tsv"
 }
 
 # Collects evidence even after a failed run, then fails if the relay was no
@@ -627,6 +689,7 @@ collect_stop() {
             -o short-iso --no-pager >"$artifacts/journal.log" || true
     fi
     du -sb "$DB_ROOT" >"$artifacts/database-size-final.txt"
+    io_phases "$artifacts"
     systemctl stop "$UNIT" || true
     [[ $state == active ]] || die "$UNIT was $state, not active, when the run ended"
 }
@@ -709,6 +772,10 @@ main() {
         start)
             [[ $# -ge 2 ]] || usage
             start_measurement "$@"
+            ;;
+        io-mark)
+            [[ $# -eq 3 ]] || usage
+            io_mark "$@"
             ;;
         collect-stop)
             [[ $# -eq 2 ]] || usage

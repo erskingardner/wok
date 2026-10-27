@@ -1213,6 +1213,156 @@ mod tests {
         }
     }
 
+    /// An unsigned event `id` from `author`, sent by connection `conn_id`.
+    fn copy_of(conn_id: u64, id: u8, author: [u8; 32], created_at: u64, kind: u64) -> WriterMsg {
+        let mut tags = PackedEventTagBuilder::default();
+        if wok_event::is_replaceable_kind(kind) {
+            tags.add('d', b"").unwrap();
+        }
+        let packed =
+            PackedEventBuilder::build(&[id; 32], &author, created_at, kind, 0, &tags).unwrap();
+        let json = json!({
+            "id": to_hex(&[id; 32]),
+            "pubkey": to_hex(&author),
+            "created_at": created_at,
+            "kind": kind,
+            "tags": [],
+            "content": "",
+            "sig": "00".repeat(64),
+        })
+        .to_string();
+        WriterMsg::AddEvent {
+            conn_id,
+            source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+            packed: packed.into_bytes(),
+            json,
+            authed: None,
+            grant: Default::default(),
+        }
+    }
+
+    /// The `[accepted, message]` of the OK each of `copies`' connections
+    /// gets when the writer takes them in one batch.
+    fn replies_to(config: Config, env: &Env, copies: Vec<WriterMsg>) -> Vec<Value> {
+        let conns = Arc::new(ConnTable::new());
+        let mut receivers = Vec::new();
+        for copy in &copies {
+            let WriterMsg::AddEvent { conn_id, .. } = copy else {
+                unreachable!()
+            };
+            let (out, rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(*conn_id, Outbound::new(out, 0));
+            receivers.push(rx);
+        }
+        let moderation = Arc::new(parking_lot::RwLock::new(
+            env.begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                .unwrap(),
+        ));
+        let (writer_tx, writer_rx) = bounded(copies.len());
+        for copy in copies {
+            writer_tx.send(copy).unwrap();
+        }
+        drop(writer_tx);
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config)),
+            conns,
+            Arc::new(Metrics::default()),
+            writer_rx,
+            Vec::new(),
+            moderation,
+            TAG_KIND_STEP,
+        );
+        receivers
+            .iter_mut()
+            .map(|rx| {
+                let ok: Value = serde_json::from_str(&rx.try_recv().unwrap().into_text()).unwrap();
+                json!([ok[2], ok[3]])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_copy_in_one_batch_is_answered_like_the_first() {
+        let author = [0x55; 32];
+        let fresh = || {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config {
+                db: dir.path().to_path_buf(),
+                ..Config::default()
+            };
+            config.db_min_free_disk_bytes = 0;
+            (dir, env, config)
+        };
+
+        // Stored, then a copy from each of two connections.
+        let (_dir, env, config) = fresh();
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 1, author, 100, 1), copy_of(2, 1, author, 100, 1)],
+        );
+        assert_eq!(
+            replies,
+            [
+                json!([true, ""]),
+                json!([true, "duplicate: have this event"])
+            ]
+        );
+
+        // Superseded by a stored newer version: neither copy is a duplicate.
+        let (_dir, env, config) = fresh();
+        replies_to(
+            config.clone(),
+            &env,
+            vec![copy_of(1, 1, author, 200, 10002)],
+        );
+        let replies = replies_to(
+            config,
+            &env,
+            vec![
+                copy_of(1, 2, author, 100, 10002),
+                copy_of(2, 2, author, 100, 10002),
+            ],
+        );
+        let superseded = json!([false, SUPERSEDED_OK_REASON]);
+        assert_eq!(replies, [superseded.clone(), superseded]);
+
+        // The author is at the per-author quota.
+        let (_dir, env, mut config) = fresh();
+        config.relay.abuse.enabled = true;
+        config.relay.abuse.max_stored_events_per_pubkey = 1;
+        replies_to(config.clone(), &env, vec![copy_of(1, 1, author, 100, 1)]);
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 2, author, 200, 1), copy_of(2, 2, author, 200, 1)],
+        );
+        let over_quota = json!([false, "blocked: author storage quota exceeded"]);
+        assert_eq!(replies, [over_quota.clone(), over_quota]);
+        assert_eq!(
+            env.begin_ro().unwrap().entries(env.dbis().event).unwrap(),
+            1
+        );
+
+        // Refusals made before the write see no other copy and decide each
+        // one alike.
+        let (_dir, env, config) = fresh();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::ban_event(&mut txn, &[3; 32], "").unwrap();
+        txn.commit().unwrap();
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 3, author, 100, 1), copy_of(2, 3, author, 100, 1)],
+        );
+        let banned = json!([false, "restricted: event is banned by the relay operator"]);
+        assert_eq!(replies, [banned.clone(), banned]);
+    }
+
     #[test]
     fn writer_metrics_leave_out_batches_that_did_not_commit() {
         let dir = tempfile::tempdir().unwrap();

@@ -539,12 +539,15 @@ impl SearchScan {
             .collect();
         let base_score = self.base_score();
         let starting_work = self.approx_work;
+        let mut read_content = false;
         let mut error = None;
         let completed = search_postings(txn, &primary, self.resume_lev_id, |lev_id| {
             // Check before consuming this candidate so every miss path yields,
-            // and resume still points at the first unprocessed posting.
+            // and resume still points at the first unprocessed posting. A
+            // match whose content was read for its phrase boost can cost far
+            // more than 128 posting lookups, so the clock is read after each.
             if self.approx_work > starting_work
-                && self.approx_work % 128 == 0
+                && (std::mem::take(&mut read_content) || self.approx_work % 128 == 0)
                 && (self.approx_work - starting_work >= 4096
                     || start.elapsed().as_micros() as u64 > time_budget_us)
             {
@@ -590,6 +593,7 @@ impl SearchScan {
             }
             let mut score = base_score;
             if !phrase_pairs.is_empty() {
+                read_content = true;
                 // A payload that does not decode ranks without the boost;
                 // sending the event reports it.
                 let pairs = match txn.get_u64(txn.env().dbis().event_payload, lev_id) {

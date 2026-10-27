@@ -35,31 +35,16 @@ pub struct SearchQuery {
     pub phrase: String,
 }
 
-fn finish_term(current: &mut String, terms: &mut Vec<String>) -> bool {
-    if current.is_empty() {
-        return false;
-    }
-    if current.len() <= MAX_INDEXED_TERM_BYTES {
-        terms.push(std::mem::take(current));
-        false
-    } else {
-        current.clear();
-        true
-    }
-}
-
 fn normalize_search_terms_with_overflow(text: &str) -> (Vec<String>, bool) {
     let mut terms = Vec::new();
-    let mut current = String::new();
     let mut overflow = false;
-    for ch in text.chars() {
-        if ch.is_alphanumeric() {
-            current.extend(ch.to_lowercase());
-        } else {
-            overflow |= finish_term(&mut current, &mut terms);
+    for_each_term(text, |term| {
+        match term {
+            Some(term) => terms.push(term.to_owned()),
+            None => overflow = true,
         }
-    }
-    overflow |= finish_term(&mut current, &mut terms);
+        true
+    });
     (terms, overflow)
 }
 

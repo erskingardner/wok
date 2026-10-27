@@ -3,9 +3,9 @@ name: reliability soak
 on:
   push:
     branches: [master]
-    paths: ['crates/**', 'scripts/reliability-soak.py', 'scripts/lab.py', 'scripts/lab-bootstrap-debian.sh', 'scripts/benchmark-*.sh', 'scripts/tests/**', 'contrib/lab/**', '.dockerignore', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
+    paths: ['crates/**', 'vendor/**', 'scripts/reliability-soak.py', 'scripts/lab.py', 'scripts/lab-bootstrap-debian.sh', 'scripts/benchmark-*.sh', 'scripts/tests/**', 'contrib/lab/**', '.dockerignore', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
   pull_request:
-    paths: ['crates/**', 'scripts/reliability-soak.py', 'scripts/lab.py', 'scripts/lab-bootstrap-debian.sh', 'scripts/benchmark-*.sh', 'scripts/tests/**', 'contrib/lab/**', '.dockerignore', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
+    paths: ['crates/**', 'vendor/**', 'scripts/reliability-soak.py', 'scripts/lab.py', 'scripts/lab-bootstrap-debian.sh', 'scripts/benchmark-*.sh', 'scripts/tests/**', 'contrib/lab/**', '.dockerignore', 'Cargo.toml', 'Cargo.lock', '.github/workflows/reliability.yml']
   schedule:
     - cron: '23 2 * * 0'
   workflow_dispatch:

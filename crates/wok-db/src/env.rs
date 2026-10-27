@@ -229,8 +229,9 @@ pub fn lmdb_version() -> (i32, i32, i32) {
 }
 
 /// Wok's databases, and the strfry ones it imports, are LMDB 0.9 files.
-/// LMDB 1.0 changed the file format, so any other LMDB is refused rather than
-/// left to misread one.
+/// LMDB 1.0 changed the file format: it refuses to open a 0.9 file, and would
+/// create a new database that strfry and earlier Wok releases cannot read. So
+/// any LMDB but 0.9 is refused before it opens or creates one.
 fn check_lmdb_version((major, minor, patch): (i32, i32, i32)) -> Result<(), DbError> {
     if (major, minor) == (0, 9) {
         return Ok(());

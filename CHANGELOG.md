@@ -353,6 +353,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wok-bench`'s `live_fanout` keeps up to `--fanout-window` publications
+  unacknowledged (256 by default; `FANOUT_WINDOW` in the campaign scripts)
+  instead of waiting for each OK before the next (#257). It measured publish
+  round trips rather than delivery: 128 subscribers took 64,000 events in
+  4.2 s on Wok master, about one event per 8 ms OK. `--fanout-window 1`
+  keeps the old behavior, so earlier results are comparable only with it.
+
 - `scripts/benchmark-campaign.sh` compares any number of relay targets
   (#226), each described by a file on the relay host, instead of one Wok and
   one strfry. Each relay runs as a transient systemd unit, which

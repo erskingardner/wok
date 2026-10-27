@@ -1,7 +1,7 @@
 # Relay functions reached in the `minimal` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 628
+## anonymous: 631
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
 <wok_db::moderation::ModerationView>::hides
@@ -433,7 +433,11 @@ wok_db::payload::encode_raw_payload
 wok_db::payload::parse_payload
 wok_db::search::bounded_index_keys
 wok_db::search::bounded_index_keys::{closure}
+wok_db::search::bounded_search_terms
+wok_db::search::bounded_search_terms::{closure}
 wok_db::search::event_content
+wok_db::search::for_each_word::<wok_db::search::bounded_search_terms::{closure}>
+wok_db::search::for_each_word::<wok_db::search::bounded_search_terms::{closure}>::{closure}
 wok_db::search::index_event_search
 wok_db::search::note_search_indexed_through
 wok_db::search::parse_event_content
@@ -475,7 +479,6 @@ wok_db::write::lookup_event_by_id
 wok_db::write::lookup_event_by_id::{closure}
 wok_db::write::original_tag_value
 wok_db::write::put_indices
-wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
 wok_event::hash::id_preimage

@@ -591,7 +591,9 @@ start_measurement() {
     echo "$main_pid" >"$artifacts/main.pid"
     # This start owns the I/O marks: a rerun under the same campaign ID must
     # not pair its marks with an earlier run's.
-    rm -f -- "$artifacts/io-marks.tsv" "$artifacts/io-phases.tsv"
+    rm -f -- "$artifacts/io-marks.tsv" "$artifacts/io-phases.tsv" \
+        "$artifacts/writer-phases.tsv"
+    rm -rf -- "$artifacts/metrics-marks"
     systemctl show "$UNIT" >"$artifacts/systemd-before.properties"
     nstat -az >"$artifacts/nstat-before.txt"
     # node_exporter is optional.
@@ -614,6 +616,9 @@ io_mark() {
     assert_benchmark_path "$artifacts"
     [[ $label =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid I/O mark label: $label"
     [[ -s $artifacts/main.pid ]] || die "$TARGET has no recorded main PID in $artifacts"
+    # A phase's metrics are scraped outside its I/O interval, so a slow or
+    # failed scrape never lengthens the phase's seconds.
+    [[ $label == *-end ]] || metrics_snapshot "$artifacts" "$label"
     local pid
     pid=$(<"$artifacts/main.pid")
     local key value read_bytes='' write_bytes=''
@@ -626,6 +631,21 @@ io_mark() {
     [[ -n $read_bytes && -n $write_bytes ]] || die "no byte counts in $PROC_ROOT/$pid/io"
     printf '%s\t%s\t%s\t%s\n' "$label" "$(date +%s.%N)" "$read_bytes" "$write_bytes" \
         >>"$artifacts/io-marks.tsv"
+    [[ $label != *-end ]] || metrics_snapshot "$artifacts" "$label"
+}
+
+# With METRICS_URL, keeps the relay's metrics as ARTIFACTS/metrics-marks/
+# LABEL.prom; their counters and histogram sums give each phase's writer
+# batches. A failed scrape leaves the mark without a snapshot and does not
+# fail it.
+metrics_snapshot() {
+    local artifacts=$1
+    local label=$2
+    [[ -n $METRICS_URL ]] || return 0
+    install -d -m 0750 "$artifacts/metrics-marks"
+    local snapshot=$artifacts/metrics-marks/$label.prom
+    curl --fail --silent --show-error --max-time 5 "$METRICS_URL" >"$snapshot" \
+        || rm -f -- "$snapshot"
 }
 
 # Writes ARTIFACTS/io-phases.tsv from io-marks.tsv: per phase marked
@@ -659,6 +679,56 @@ io_phases() {
         }' "$marks" >"$artifacts/io-phases.tsv"
 }
 
+# Writes ARTIFACTS/writer-phases.tsv from the metrics snapshots io_mark kept:
+# per phase with a snapshot at its start and its end, the Wok writer's
+# commits and stored events, its mean batch, the queue it found, its mean
+# milliseconds per commit in each stage (#258's histograms), and the bytes
+# its commits sent to storage per stored event. A phase is left out unless
+# both snapshots have the writer's series, which strfry and Wok before #258
+# lack, so a missing series never reads as an idle writer.
+writer_phases() {
+    local artifacts=$1
+    local marks=$artifacts/io-marks.tsv
+    [[ -f $marks ]] || marks=/dev/null
+    {
+        printf 'phase\tcommits\tevents\tevents_per_commit\tqueue_depth\tprepare_ms'
+        printf '\twrite_ms\tcommit_ms\treply_ms\tstorage_bytes_per_event\n'
+        local label phase
+        local listed=' '
+        while IFS=$'\t' read -r label _; do
+            [[ $label == *-end ]] || continue
+            phase=${label%-end}
+            [[ $listed != *" $phase "* ]] || continue
+            listed+="$phase "
+            local start=$artifacts/metrics-marks/$phase-start.prom
+            local end=$artifacts/metrics-marks/$phase-end.prom
+            [[ -s $start && -s $end ]] || continue
+            awk -v phase="$phase" -v OFS='\t' '
+                FNR == 1 { file++ }
+                /^wok_writer_[a-z_]+(_sum|_count|_total) / {
+                    value[$1] += (file == 1 ? -$2 : $2)
+                }
+                $1 == "wok_writer_commit_events_count" { instrumented[file] = 1 }
+                function per_commit(name, scale) {
+                    return commits > 0 ? sprintf("%.2f", value[name "_sum"] * scale / commits) : ""
+                }
+                END {
+                    if (!instrumented[1] || !instrumented[2]) exit
+                    commits = value["wok_writer_commit_events_count"]
+                    events = value["wok_writer_commit_events_sum"]
+                    print phase, commits + 0, events + 0,
+                        per_commit("wok_writer_commit_events", 1),
+                        per_commit("wok_writer_queue_depth", 1),
+                        per_commit("wok_writer_prepare_seconds", 1000),
+                        per_commit("wok_writer_write_seconds", 1000),
+                        per_commit("wok_writer_commit_seconds", 1000),
+                        per_commit("wok_writer_reply_seconds", 1000),
+                        (events > 0 ? sprintf("%.0f", value["wok_writer_storage_bytes_total"] / events) : "")
+                }' "$start" "$end"
+        done <"$marks"
+    } >"$artifacts/writer-phases.tsv"
+}
+
 # Collects evidence even after a failed run, then fails if the relay was no
 # longer running when the run ended.
 collect_stop() {
@@ -690,6 +760,7 @@ collect_stop() {
     fi
     du -sb "$DB_ROOT" >"$artifacts/database-size-final.txt"
     io_phases "$artifacts"
+    writer_phases "$artifacts"
     systemctl stop "$UNIT" || true
     [[ $state == active ]] || die "$UNIT was $state, not active, when the run ended"
 }

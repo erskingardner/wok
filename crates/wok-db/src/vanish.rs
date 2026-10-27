@@ -144,8 +144,8 @@ pub fn mark_vanished(txn: &mut RwTxn<'_>, pubkey: &[u8], timestamp: u64) -> Resu
         .vanish_pubkey
         .ok_or_else(|| DbError::msg("NIP-62 marker database is unavailable"))?;
     // No marker sorts below any: a request at created_at 0 still leaves one,
-    // which covers the author's events at 0 and the gift wraps that p-tag
-    // the author.
+    // which covers the author's events at 0 and the gift wraps at 0 that
+    // p-tag the author.
     if txn.get(dbi, pubkey)?.and_then(read_timestamp) < Some(timestamp) {
         txn.put(dbi, pubkey, &timestamp.to_ne_bytes(), 0)?;
         crate::state::invalidate_visibility(txn)?;
@@ -237,6 +237,19 @@ pub fn backfill_vanish_markers(
     Ok(updated)
 }
 
+/// Whether a NIP-59 gift wrap created at `created_at` falls under the
+/// vanish request at `timestamp` of a pubkey it p-tags. Wraps follow the
+/// rule for the pubkey's own events: only those created at or before the
+/// request vanish, so the key can be sent wraps again afterwards. NIP-59
+/// backdates a wrap's `created_at` by up to two days, so a wrap sent in the
+/// two days after the request can still fall under it. Every check of a
+/// wrap against a marker goes through here; the sweep reads wraps in
+/// `created_at` order and stops at the first this refuses, so the rule
+/// must stay a bound on `created_at`.
+pub fn gift_wrap_vanished(created_at: u64, timestamp: u64) -> bool {
+    created_at <= timestamp
+}
+
 pub fn is_event_vanished_ro(txn: &RoTxn<'_>, packed: PackedEventView<'_>) -> Result<bool, DbError> {
     if packed.kind() != VANISH_KIND
         && vanish_timestamp_ro(txn, packed.pubkey())?
@@ -250,11 +263,11 @@ pub fn is_event_vanished_ro(txn: &RoTxn<'_>, packed: PackedEventView<'_>) -> Res
         packed.foreach_tag(|name, value| {
             if name == 'p' {
                 match vanish_timestamp_ro(txn, value) {
-                    Ok(Some(_)) => {
+                    Ok(Some(timestamp)) if gift_wrap_vanished(packed.created_at(), timestamp) => {
                         vanished = true;
                         return false;
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(err) => {
                         error = Some(err);
                         return false;
@@ -286,11 +299,11 @@ pub fn is_event_vanished_rw(txn: &RwTxn<'_>, packed: PackedEventView<'_>) -> Res
         packed.foreach_tag(|name, value| {
             if name == 'p' {
                 match vanish_timestamp_rw(txn, value) {
-                    Ok(Some(_)) => {
+                    Ok(Some(timestamp)) if gift_wrap_vanished(packed.created_at(), timestamp) => {
                         vanished = true;
                         return false;
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(err) => {
                         error = Some(err);
                         return false;
@@ -335,16 +348,6 @@ fn next_marker(txn: &RwTxn<'_>, cursor: &[u8]) -> Result<Option<([u8; 32], u64)>
         })?;
     }
     Ok(selected)
-}
-
-/// The latest `created_at` of the gift wraps to a vanished recipient that the
-/// sweep deletes, for a marker at `timestamp`: with the gift-wrap kinds
-/// [`Sweep::advance`] keeps, this is the sweep's whole rule for them. It
-/// deletes every gift wrap to the recipient, whatever its `created_at`, as
-/// `is_event_vanished_*` hides them all. A finished pass is not repeated, so
-/// the write path must refuse the wraps this covers.
-fn gift_wraps_swept_through(_timestamp: u64) -> u64 {
-    u64::MAX
 }
 
 /// How far the sweep has carried out one vanish marker, kept in `wok_State`
@@ -600,21 +603,18 @@ impl Sweep {
                 txn.env().dbis().event_pubkey,
                 pubkey,
                 position,
-                progress.target,
+                |created_at| created_at <= progress.target,
                 |event| event.kind() != VANISH_KIND,
             )?;
-            let tagged_from = match progress.from {
-                0 => Some(0),
-                from => gift_wraps_swept_through(from - 1).checked_add(1),
-            };
-            progress.step = match (next, tagged_from) {
-                (Some(next), _) => SweepStep::Authored(next),
-                (None, Some(created_at)) => SweepStep::Tagged(Position {
-                    created_at,
+            // A later pass starts past the wraps the pass before covered:
+            // `gift_wrap_vanished` covers every wrap created up to a request.
+            progress.step = next.map_or(
+                SweepStep::Tagged(Position {
+                    created_at: progress.from,
                     lev_id: 0,
                 }),
-                (None, None) => SweepStep::Done,
-            };
+                SweepStep::Authored,
+            );
         }
         if let SweepStep::Tagged(position) = progress.step {
             let mut tag = [b'p'; 33];
@@ -624,7 +624,7 @@ impl Sweep {
                 txn.env().dbis().event_tag,
                 &tag,
                 position,
-                gift_wraps_swept_through(progress.target),
+                |created_at| gift_wrap_vanished(created_at, progress.target),
                 |event| GIFT_WRAP_KINDS.contains(&event.kind()),
             )?;
             progress.step = next.map_or(SweepStep::Done, SweepStep::Tagged);
@@ -632,16 +632,17 @@ impl Sweep {
         Ok(progress)
     }
 
-    /// Examine the entries of `dbi` under `prefix`, from `position` through
-    /// `created_at` `through`, keeping the events `deletes` picks. Returns the
-    /// first entry left unexamined, or `None` once the range is done.
+    /// Examine the entries of `dbi` under `prefix`, from `position` while
+    /// `within` takes their `created_at`, keeping the events `deletes` picks.
+    /// Returns the first entry left unexamined, or `None` once the range is
+    /// done.
     fn walk(
         &mut self,
         txn: &RwTxn<'_>,
         dbi: lmdb_sys::MDB_dbi,
         prefix: &[u8],
         position: Position,
-        through: u64,
+        within: impl Fn(u64) -> bool,
         deletes: impl Fn(PackedEventView<'_>) -> bool,
     ) -> Result<Option<Position>, DbError> {
         let mut next = None;
@@ -659,7 +660,7 @@ impl Sweep {
                 else {
                     return false;
                 };
-                if string != prefix || created_at > through {
+                if string != prefix || !within(created_at) {
                     return false;
                 }
                 let lev_id = u64::from_ne_bytes(lev_id);

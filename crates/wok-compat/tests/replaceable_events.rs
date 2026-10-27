@@ -729,9 +729,10 @@ fn read_snapshots_answer_as_the_policy_lookups_do() {
             "a disallowed kind",
             Box::new(|txn| wok_db::disallow_kind(txn, 7).unwrap()),
         ),
+        // A request covers the wraps dated up to it, so at the wrap's date.
         (
             "a vanished recipient",
-            Box::new(|txn| wok_db::mark_vanished(txn, &pubkey(&recipient), 1).unwrap()),
+            Box::new(|txn| wok_db::mark_vanished(txn, &pubkey(&recipient), 103).unwrap()),
         ),
         (
             "a vanished author",

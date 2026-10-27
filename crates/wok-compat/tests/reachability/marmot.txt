@@ -1,7 +1,7 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 694
+## anonymous: 693
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -15,7 +15,6 @@
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
-<wok_db::txn::RwTxn>::largest_integer_key
 <wok_db::vanish::VanishPolicy>::targets_this_relay_json
 <wok_db::vanish::VanishPolicy>::targets_this_relay_json::{closure}
 <wok_db::vanish::VanishPolicy>::targets_this_relay_value

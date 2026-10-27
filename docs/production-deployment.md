@@ -142,9 +142,10 @@ NIP-62 requires relays that restrict who can post to honor vanish requests
 regardless of the user's status. The plugin is not consulted for them, and
 neither pubkey bans nor `relay.auth.write_policy` refuse them, so an author
 who was rejected by the plugin, dropped from the allowlist, or banned can still
-erase what they published. Vanish requests still pay proof of work and the
-per-author EVENT budget, and event-id bans, the kind allowlist, and
-`relay.nip62.enabled` still apply.
+erase what they published. Vanish requests that target the relay also need
+no proof of work and are stored over both storage quotas. They still pay the
+per-address and per-author EVENT budgets and the disk reserve, and event-id
+bans, the NIP-86 kind policy and `relay.nip62.enabled` still apply.
 
 Use an absolute command, keep the executable and its dependencies root-owned,
 and avoid shell substitutions or writable script directories. The plugin must

@@ -97,7 +97,9 @@ it is not a promise to reproduce upstream bugs.
   and per-author token buckets,
   pre-scan query costing, historical-query concurrency (excess scans wait
   their turn), author storage quotas,
-  and optional NIP-13 proof of work. Migrated configs receive the documented
+  and optional NIP-13 proof of work. A NIP-62 vanish request that targets the
+  relay needs no proof of work and is stored over the storage quotas, since
+  NIP-62 says a relay MUST honor it. Migrated configs receive the documented
   Wok defaults and the preflight prints them for review. Per-address buckets
   key an IPv6 client by its /64 (`relay.abuse.ipv6_prefix_len`), so a host
   cannot take a fresh budget from each address in its network; write-policy

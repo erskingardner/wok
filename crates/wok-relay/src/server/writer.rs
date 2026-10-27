@@ -1,6 +1,7 @@
 //! Single-writer mutation, publication receipts and maintenance.
 use super::*;
 use crate::protocol::SUPERSEDED_OK_REASON;
+use std::time::Instant;
 
 /// Bounds on one `(tag, kind, created_at)` backfill transaction. The writer
 /// runs one before each batch of messages it takes, so a publication waits
@@ -42,6 +43,7 @@ pub(super) fn run_writer(
     let stored_in_flight = Arc::new(AtomicUsize::new(0));
     let mut tag_kind = TagKindBackfill::new(tag_kind_step);
     tag_kind.recheck(&env, &metrics);
+    let mut storage_writes = ThreadStorageWrites::open();
     let mut stop = false;
     while !stop {
         // While the index is behind, each pass indexes one bounded batch
@@ -58,6 +60,8 @@ pub(super) fn run_writer(
             let Ok(msg) = rx.recv() else { break };
             msg
         };
+        let batch_started = Instant::now();
+        let queued = rx.len() as u64 + 1;
         batch.clear();
         event_batch.clear();
         batch_vanish.clear();
@@ -445,6 +449,14 @@ pub(super) fn run_writer(
         }
         let report_capacity =
             MAX_MODERATION_RECORDS.saturating_sub(moderation.read().reported_events.len());
+        let write_started = Instant::now();
+        metrics
+            .writer_prepare
+            .observe(write_started - batch_started);
+        metrics.writer_queue_depth.observe(queued);
+        metrics.writer_commit_events.observe(events.len() as u64);
+        let storage_before = storage_writes.bytes();
+        let mut commit_started = None;
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
             if negentropy_max_tags != cfg_snap.relay.max_tags_per_filter {
@@ -482,9 +494,20 @@ pub(super) fn run_writer(
                     )));
                 }
             }
+            commit_started = Some(Instant::now());
             txn.commit()?;
             Ok::<_, wok_db::DbError>(report_updates)
         })();
+        if let Some(commit_started) = commit_started {
+            metrics.writer_write.observe(commit_started - write_started);
+            metrics.writer_commit.observe(commit_started.elapsed());
+        }
+        if let (Some(before), Some(after)) = (storage_before, storage_writes.bytes()) {
+            metrics
+                .writer_storage_bytes_total
+                .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
+        }
+        let reply_started = Instant::now();
         let report_updates = match write_res {
             Ok(report_updates) => report_updates,
             Err(error) => {
@@ -563,6 +586,40 @@ pub(super) fn run_writer(
             );
         }
         broadcast_stored(&mon_txs, &stored_in_flight, &mut events);
+        metrics.writer_reply.observe(reply_started.elapsed());
+    }
+}
+
+/// What the calling thread has sent to storage, from Linux's
+/// `/proc/thread-self/io`, so the writer can count the bytes its
+/// transactions write. Elsewhere, or when the file cannot be read, nothing.
+struct ThreadStorageWrites {
+    file: Option<std::fs::File>,
+    text: String,
+}
+
+impl ThreadStorageWrites {
+    /// Open the file for the calling thread, which is the one it measures.
+    fn open() -> Self {
+        Self {
+            file: std::fs::File::open("/proc/thread-self/io").ok(),
+            text: String::new(),
+        }
+    }
+
+    /// The thread's `write_bytes` so far.
+    fn bytes(&mut self) -> Option<u64> {
+        use std::io::{Read, Seek, SeekFrom};
+        let file = self.file.as_mut()?;
+        file.seek(SeekFrom::Start(0)).ok()?;
+        self.text.clear();
+        file.read_to_string(&mut self.text).ok()?;
+        self.text
+            .lines()
+            .find_map(|line| line.strip_prefix("write_bytes:"))?
+            .trim()
+            .parse()
+            .ok()
     }
 }
 
@@ -1031,11 +1088,12 @@ mod tests {
         }
         drop(writer_tx);
 
+        let metrics = Arc::new(Metrics::default());
         run_writer(
             env.clone(),
             Arc::new(parking_lot::RwLock::new(config)),
             Arc::new(ConnTable::new()),
-            Arc::new(Metrics::default()),
+            metrics.clone(),
             writer_rx,
             Vec::new(),
             moderation,
@@ -1044,6 +1102,24 @@ mod tests {
 
         let txn = env.begin_ro().unwrap();
         assert_eq!(txn.entries(env.dbis().event).unwrap(), PUBLISHERS as usize);
+        // Everything was queued before the writer started, so it took one
+        // batch and committed once.
+        assert_eq!(metrics.writer_queue_depth.count(), 1);
+        assert_eq!(metrics.writer_queue_depth.sum(), 2 * PUBLISHERS);
+        assert_eq!(metrics.writer_commit_events.sum(), PUBLISHERS);
+        for steps in [
+            &metrics.writer_prepare,
+            &metrics.writer_write,
+            &metrics.writer_commit,
+            &metrics.writer_reply,
+        ] {
+            assert_eq!(steps.count(), 1);
+        }
+        // A temporary directory may be on tmpfs, which counts no storage
+        // writes, so check only that Linux reports the counter.
+        if cfg!(target_os = "linux") {
+            assert!(ThreadStorageWrites::open().bytes().is_some());
+        }
     }
 
     /// An unsigned gift wrap to Alice; the writer does not check signatures.

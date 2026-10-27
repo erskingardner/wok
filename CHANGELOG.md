@@ -353,6 +353,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Writer metrics (#257): histograms of how many messages were queued when
+  the writer started a batch, how many events each commit holds, and how
+  long the batch's checks, writes, commit and replies took
+  (`wok_writer_*`), plus the bytes its transactions sent to storage on
+  Linux. Publishing is bound by the single writer, so these show where an
+  event's EVENT→OK time goes and what each event costs to write.
+
 - `scripts/benchmark-campaign.sh` compares any number of relay targets
   (#226), each described by a file on the relay host, instead of one Wok and
   one strfry. Each relay runs as a transient systemd unit, which

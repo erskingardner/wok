@@ -64,6 +64,20 @@ scrape_configs:
 | `wok_tag_kind_index_tag_entries` | gauge | none | Tag-index entries stored, which a key-ordered build visits once. |
 | `wok_tag_kind_backfill_entries_total` | counter | none | Postings the writer's background build put. |
 | `wok_tag_kind_backfill_seconds_total` | counter | none | Time the writer spent in background build transactions, commits included. |
+| `wok_writer_queue_depth` | histogram | none | Messages queued for the writer when it started a batch that commits events, the one it took first included. |
+| `wok_writer_commit_events` | histogram | none | Events in each writer commit. |
+| `wok_writer_prepare_seconds` | histogram | none | From the start of a writer batch to its write transaction: management commands, maintenance and each event's checks against committed state. |
+| `wok_writer_write_seconds` | histogram | none | Writing a batch's events and index entries, before its commit. |
+| `wok_writer_commit_seconds` | histogram | none | Committing a batch, its flushes to storage included. |
+| `wok_writer_reply_seconds` | histogram | none | Sending a committed batch's OKs and handing its events to the req monitors. |
+| `wok_writer_storage_bytes_total` | counter | none | Bytes the writer's event transactions sent to storage, from `/proc/thread-self/io`. Linux only; 0 elsewhere. |
+
+The `wok_writer_*` metrics cover each batch that commits events; batches
+that only refuse events or run management commands are not counted. A
+publication's EVENT→OK time on the writer is roughly the wait for the batch
+in progress plus its own batch's prepare, write, commit and reply. The
+storage bytes divided by `wok_writer_commit_events_sum` is what each event
+costs to write; on a disk-bound writer, commit time follows it.
 
 The `wok_tag_kind_*` gauges are updated after each build step and on the
 writer's maintenance tick (every 2 seconds). While a key-ordered build runs,

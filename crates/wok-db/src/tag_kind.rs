@@ -171,7 +171,7 @@ pub fn tag_kind_index_complete_ro(txn: &RoTxn<'_>) -> Result<bool, DbError> {
 /// tails, and the newest record covers a database whose sequence was never
 /// stored. A malformed sequence is integrity's to report; the newest record
 /// still bounds the events.
-fn high_water(sequence: Option<&[u8]>, newest_event: u64) -> u64 {
+pub(crate) fn high_water(sequence: Option<&[u8]>, newest_event: u64) -> u64 {
     sequence
         .and_then(|raw| crate::state::decode(raw).ok())
         .unwrap_or(0)

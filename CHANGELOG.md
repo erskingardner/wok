@@ -971,6 +971,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   linked in its place. The file format is unchanged, so existing databases
   and strfry imports open as before; a binary linked with any LMDB but 0.9
   refuses to open one, and the relay logs its LMDB version at startup.
+- Opening a database no longer fails when the search index is being rebuilt
+  and an event has no payload, or a payload that does not decode (#257).
+  The event is left out of the index, and `wok doctor` reports it.
 - NIP-50 search covers only kinds whose content is text a person wrote, such
   as notes, articles, comments and chat, plus profiles (#257). It matched
   any kind whose `content` held the words, so a search without `kinds`

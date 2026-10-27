@@ -1331,15 +1331,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   16 MiB and spent about 75 µs per compressed event zeroing it, more than a
   Schnorr signature check takes; relay reads bound it by
   `events.max_event_size`.
-- `wok integrity` derives each event's NIP-50 search postings and
-  `wok_Event__tagKind` entries once, not once per posting. A note with N
-  search terms was decompressed and tokenized N times, and a follow list
-  with N `p` tags had its tag-kind keys built N times: on a 1M-event social
-  database the check had not finished after 25 minutes. Each posting of the
-  two tables is now checked by looking up the event it names, and balanced
-  against the entries the event pass found, in 16 MiB of counters whatever
-  the size of the database. Reports are unchanged, except that a table's
-  unexpected entries are listed after its other issues.
+- `wok integrity` derives each event's NIP-50 search postings,
+  `wok_Event__tagKind` entries and strfry-layout index entries once, not
+  once per posting. A note with N search terms was decompressed and
+  tokenized N times, and a follow list with N `p` tags had its tag-kind keys
+  and all of its index entries built N times: on a 1M-event social database
+  the check had not finished after 25 minutes. Each posting is now checked
+  by looking up the event it names, and balanced against the entries the
+  event pass found, in 24 MiB of counters whatever the size of the
+  database. `Event__replace` postings, from which superseded history is
+  counted, are still each checked against their event's replacement key.
+  Reports are unchanged, except that a table's unexpected entries are listed
+  after its other issues, and those of the strfry-layout indexes after the
+  other issues of all ten.
 - An `authors` and `kinds` filter past 1,000 (author, kind) pairs under a
   small `limit` no longer reads every event the authors wrote when they
   rarely publish those kinds. A picture feed (`kinds [20,21]`, `limit 50`) of

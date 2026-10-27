@@ -188,6 +188,16 @@ fn original_tag_value(json: &str, name: &str, packed_value: &[u8]) -> Result<Vec
         .ok_or_else(|| DbError::msg(format!("event JSON lacks its hashed {name} tag")))
 }
 
+/// The `event_replace` key of an event: its author and the value of its first
+/// `d` tag, then its kind. An event without a `d` tag has none.
+pub(crate) fn replace_key(packed: PackedEventView<'_>) -> Option<Vec<u8>> {
+    let d = packed.first_d_tag()?;
+    let mut s = Vec::with_capacity(32 + d.len());
+    s.extend_from_slice(packed.pubkey());
+    s.extend_from_slice(&d);
+    Some(make_key_string_u64(&s, packed.kind()))
+}
+
 fn index_event(packed: PackedEventView<'_>) -> EventIndices {
     let index_time = packed.created_at();
     let mut idx = EventIndices {
@@ -204,7 +214,7 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
         tag_kind: tag_kind_keys(packed),
         deletion: Vec::new(),
         expiration: Vec::new(),
-        replace: Vec::new(),
+        replace: replace_key(packed).into_iter().collect(),
         replace_deletion: Vec::new(),
         canonical_replace_deletion: Vec::new(),
     };
@@ -215,12 +225,7 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
         tag_key.extend_from_slice(tag_val);
         idx.tag.push(make_key_string_u64(&tag_key, index_time));
 
-        if tag_name == 'd' && idx.replace.is_empty() {
-            let mut s = Vec::with_capacity(32 + tag_val.len());
-            s.extend_from_slice(packed.pubkey());
-            s.extend_from_slice(tag_val);
-            idx.replace.push(make_key_string_u64(&s, packed.kind()));
-        } else if tag_name == 'e' && packed.kind() == 5 {
+        if tag_name == 'e' && packed.kind() == 5 {
             let mut s = Vec::with_capacity(tag_val.len() + 32);
             s.extend_from_slice(tag_val);
             s.extend_from_slice(packed.pubkey());

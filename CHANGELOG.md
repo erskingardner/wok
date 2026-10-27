@@ -1092,6 +1092,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A NIP-50 search finds the same events live as in history, COUNT and
+  NEG-OPEN (#247). The search index keeps each event's first 256 unique
+  terms, so that one event of many distinct words cannot amplify into
+  thousands of index writes, but live matching used every word: a long
+  article whose 300th distinct word was `zebra` reached a
+  `{"search":"zebra"}` subscription open when it arrived, and the same
+  search sent later never found it. **Live search no longer matches a word
+  an event first uses after its 256th unique term**, and `wok sync` with a
+  `search` filter checks the events it downloads the same way.
+  docs/nip50-search.md now states the cap.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

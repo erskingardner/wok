@@ -35,31 +35,35 @@ pub struct SearchQuery {
     pub phrase: String,
 }
 
-fn finish_term(current: &mut String, terms: &mut Vec<String>) -> bool {
-    if current.is_empty() {
-        return false;
-    }
-    if current.len() <= MAX_INDEXED_TERM_BYTES {
-        terms.push(std::mem::take(current));
-        false
-    } else {
-        current.clear();
-        true
-    }
-}
-
-fn normalize_search_terms_with_overflow(text: &str) -> (Vec<String>, bool) {
-    let mut terms = Vec::new();
+/// Visit the normalized words of `text` in order. A word longer than
+/// `MAX_INDEXED_TERM_BYTES` is never indexed or matched, so it is visited as
+/// `None`: a query rejects it and a bigram does not span it.
+fn for_each_word(text: &str, mut visit: impl FnMut(Option<&str>)) {
     let mut current = String::new();
-    let mut overflow = false;
+    let mut finish = |current: &mut String| {
+        if current.is_empty() {
+            return;
+        }
+        visit((current.len() <= MAX_INDEXED_TERM_BYTES).then_some(current.as_str()));
+        current.clear();
+    };
     for ch in text.chars() {
         if ch.is_alphanumeric() {
             current.extend(ch.to_lowercase());
         } else {
-            overflow |= finish_term(&mut current, &mut terms);
+            finish(&mut current);
         }
     }
-    overflow |= finish_term(&mut current, &mut terms);
+    finish(&mut current);
+}
+
+fn normalize_search_terms_with_overflow(text: &str) -> (Vec<String>, bool) {
+    let mut terms = Vec::new();
+    let mut overflow = false;
+    for_each_word(text, |word| match word {
+        Some(term) => terms.push(term.to_owned()),
+        None => overflow = true,
+    });
     (terms, overflow)
 }
 
@@ -69,8 +73,51 @@ pub fn normalize_search_terms(text: &str) -> Vec<String> {
     normalize_search_terms_with_overflow(text).0
 }
 
+/// The terms of `content` a search can find: its first
+/// `MAX_INDEXED_UNIQUE_TERMS` unique terms, in document order. The index
+/// stores exactly these, so live matching against this set agrees with
+/// history, COUNT and NEG-OPEN.
 pub fn search_term_set(content: &str) -> SearchTermSet {
-    normalize_search_terms(content).into_iter().collect()
+    bounded_search_terms(content, None)
+}
+
+/// Build the deterministic, bounded searchable view of untrusted event
+/// content: its first `MAX_INDEXED_UNIQUE_TERMS` unique terms and, into
+/// `bigram_keys` when given, the index keys of its first `MAX_INDEXED_BIGRAMS`
+/// unique adjacent term pairs, both in document order. Indexing and live
+/// matching both come here, so they cannot disagree on what an event contains.
+///
+/// The event itself remains bounded by `events.max_event_size`, but without
+/// these separate limits one small event containing many distinct words can
+/// amplify into thousands of LMDB writes. Past either limit we stop adding
+/// terms or bigrams while still scanning the bounded input.
+fn bounded_search_terms(
+    content: &str,
+    mut bigram_keys: Option<&mut BTreeSet<Vec<u8>>>,
+) -> SearchTermSet {
+    let mut terms = SearchTermSet::new();
+    let mut bigram_count = 0;
+    let mut previous = String::new();
+    for_each_word(content, |word| {
+        let Some(term) = word else {
+            previous.clear();
+            return;
+        };
+        if terms.len() < MAX_INDEXED_UNIQUE_TERMS && !terms.contains(term) {
+            terms.insert(term.to_owned());
+        }
+        if let Some(keys) = bigram_keys.as_deref_mut() {
+            if !previous.is_empty()
+                && bigram_count < MAX_INDEXED_BIGRAMS
+                && keys.insert(bigram_key(&previous, term))
+            {
+                bigram_count += 1;
+            }
+            previous.clear();
+            previous.push_str(term);
+        }
+    });
+    terms
 }
 
 /// Parse the free-text portion of a NIP-50 query. `key:value` extension words
@@ -132,7 +179,8 @@ pub fn event_content(json: &str) -> Result<String, DbError> {
 }
 
 /// Extract only the event content field and normalize it once for all live
-/// search subscriptions. This avoids building a full JSON DOM per event.
+/// search subscriptions, into the bounded `search_term_set` the index stores.
+/// This avoids building a full JSON DOM per event.
 pub fn event_search_terms(json: &str) -> Result<SearchTermSet, DbError> {
     Ok(search_term_set(&parse_event_content(json)?))
 }
@@ -163,50 +211,12 @@ pub(crate) fn search_index_entries(
     Ok(keys.into_iter().map(|key| (key, value.clone())).collect())
 }
 
-/// Build a deterministic, bounded index for untrusted event content.
-///
-/// The event itself remains bounded by `events.max_event_size`, but without
-/// these separate limits one small event containing many distinct words can
-/// amplify into thousands of LMDB writes. We retain the first unique terms
-/// and bigrams in document order, then stop adding new postings while still
-/// scanning the bounded input.
+/// The postings one event's content adds to the index; see
+/// `bounded_search_terms`.
 fn bounded_index_keys(content: &str) -> BTreeSet<Vec<u8>> {
     let mut keys = BTreeSet::new();
-    let mut term_count = 0;
-    let mut bigram_count = 0;
-    let mut current = String::new();
-    let mut previous = String::new();
-
-    let mut finish = |term: &mut String| {
-        if term.is_empty() {
-            return;
-        }
-        if term.len() <= MAX_INDEXED_TERM_BYTES {
-            if term_count < MAX_INDEXED_UNIQUE_TERMS && keys.insert(term_key(term)) {
-                term_count += 1;
-            }
-            if !previous.is_empty()
-                && bigram_count < MAX_INDEXED_BIGRAMS
-                && keys.insert(bigram_key(&previous, term))
-            {
-                bigram_count += 1;
-            }
-            previous.clear();
-            previous.push_str(term);
-        } else {
-            previous.clear();
-        }
-        term.clear();
-    };
-
-    for ch in content.chars() {
-        if ch.is_alphanumeric() {
-            current.extend(ch.to_lowercase());
-        } else {
-            finish(&mut current);
-        }
-    }
-    finish(&mut current);
+    let terms = bounded_search_terms(content, Some(&mut keys));
+    keys.extend(terms.iter().map(|term| term_key(term)));
     keys
 }
 
@@ -473,6 +483,25 @@ mod tests {
         assert_eq!(terms, MAX_INDEXED_UNIQUE_TERMS);
         assert_eq!(bigrams, MAX_INDEXED_BIGRAMS);
         assert!(entries.len() <= MAX_INDEXED_UNIQUE_TERMS + MAX_INDEXED_BIGRAMS);
+    }
+
+    #[test]
+    fn live_terms_are_the_indexed_terms() {
+        let mut words = vec!["inside".to_string()];
+        words.extend((1..MAX_INDEXED_UNIQUE_TERMS).map(|n| format!("filler{n}")));
+        words.extend(["inside".into(), "zebra".into()]);
+        let json = serde_json::json!({"content": words.join(" ")}).to_string();
+        let indexed: SearchTermSet = search_index_entries(9, &json)
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| key.first() == Some(&TERM_PREFIX))
+            .map(|(key, _)| search_term_from_key(&key).unwrap().to_owned())
+            .collect();
+        let live = event_search_terms(&json).unwrap();
+        assert_eq!(live, indexed);
+        assert_eq!(live.len(), MAX_INDEXED_UNIQUE_TERMS);
+        assert!(live.contains("inside"));
+        assert!(!live.contains("zebra"));
     }
 
     #[test]

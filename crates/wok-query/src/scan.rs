@@ -602,7 +602,7 @@ impl SearchScan {
                 let pairs = match txn.get_u64(txn.env().dbis().event_payload, lev_id) {
                     Ok(Some(raw)) => decompressor
                         .decode(txn, raw, PHRASE_PAYLOAD_BOUND)
-                        .and_then(|json| count_phrase_pairs(json, &phrase_pairs))
+                        .and_then(|json| count_phrase_pairs(packed.kind(), json, &phrase_pairs))
                         .unwrap_or(0),
                     Ok(None) => 0,
                     Err(err) => {

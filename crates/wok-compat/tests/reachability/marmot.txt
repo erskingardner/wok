@@ -1,7 +1,7 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 689
+## anonymous: 695
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -464,10 +464,16 @@ wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
 wok_db::search::bounded_index_keys
 wok_db::search::bounded_index_keys::{closure}
+wok_db::search::bounded_search_terms
+wok_db::search::bounded_search_terms::{closure}
 wok_db::search::event_content
-wok_db::search::finish_term
+wok_db::search::for_each_word::<wok_db::search::bounded_search_terms::{closure}>
+wok_db::search::for_each_word::<wok_db::search::bounded_search_terms::{closure}>::{closure}
+wok_db::search::for_each_word::<wok_db::search::normalize_search_terms_with_overflow::{closure}>
+wok_db::search::for_each_word::<wok_db::search::normalize_search_terms_with_overflow::{closure}>::{closure}
 wok_db::search::index_event_search
 wok_db::search::normalize_search_terms_with_overflow
+wok_db::search::normalize_search_terms_with_overflow::{closure}
 wok_db::search::note_search_indexed_through
 wok_db::search::parse_event_content
 wok_db::search::parse_search_query

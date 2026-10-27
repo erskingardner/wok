@@ -1594,7 +1594,10 @@ where
     )
 }
 
-/// Records matching `filter` that `visibility` lets a reader see.
+/// Records matching `filter` that `visibility` lets a reader see, handed to
+/// `cb` as they are found: each filter's matches newest first (a search's by
+/// rank), then the next filter's that no earlier one sent. Filters that are
+/// all searches are ranked together.
 pub fn foreach_visible_by_filter<F>(
     txn: &RoTxn<'_>,
     filter: &serde_json::Value,
@@ -1609,10 +1612,108 @@ where
 {
     let fg =
         crate::filter::NostrFilterGroup::from_value(filter, max_limit, max_tags, max_and_entries)?;
-    let sub = Subscription::new(1, crate::subid::SubId::new(".").unwrap(), fg, false);
-    let mut q = DbQuery::new(sub, 0, 0);
-    q.visibility = visibility;
-    q.process(txn, |_, lev| cb(lev), u64::MAX)
-        .map_err(|e| crate::subid::QueryError::msg(e.to_string()))?;
+    foreach_visible_match(txn, &fg.filters, &visibility, &mut cb)
+        .map_err(|e| crate::subid::QueryError::msg(e.to_string()))
+}
+
+/// What a filter of an operator scan sent, for the filters after it to skip.
+enum Sent {
+    /// Every match the reader may see: the filter ran out of matches first.
+    All,
+    /// These: the filter's limit cut it, or it is a search, which
+    /// `does_match` cannot answer.
+    These(HashSet<u64>),
+}
+
+/// The scan behind [`foreach_visible_by_filter`]. A [`DbQuery`] remembers
+/// every event a REQ sent, so that its later filters and time slices skip
+/// them. This remembers only what a limited filter or a search sent, so
+/// `wok scan --count '{}'` holds no set the size of the database: a filter
+/// that ran out of matches sent every event it matches.
+fn foreach_visible_match(
+    txn: &RoTxn<'_>,
+    filters: &[NostrFilter],
+    visibility: &ReadVisibility,
+    cb: &mut impl FnMut(u64),
+) -> Result<(), wok_db::DbError> {
+    let snapshot = ReadSnapshot::for_stored(txn);
+    if !filters.is_empty() && filters.iter().all(|f| f.search.is_some()) {
+        // A REQ's searches are ranked together, as `DbQuery` does.
+        let mut group = SearchGroupScan::new(filters, txn)?;
+        while !group.process(&snapshot, filters, u64::MAX, u64::MAX, visibility, &mut *cb)? {}
+        return Ok(());
+    }
+    let mut sent = Vec::with_capacity(filters.len());
+    for (i, f) in filters.iter().enumerate() {
+        let keep = i + 1 < filters.len() && (f.limit != u64::MAX || f.search.is_some());
+        let mut kept = HashSet::new();
+        let mut matched = 0u64;
+        // A scan hands its matches over newest first (see `DbScan::settle`),
+        // so the copies of an event that several of its cursors read, one for
+        // each value of an OR tag it carries, come one after another: the
+        // events at the current `created_at` are enough to find them.
+        let mut current: (Option<u64>, HashSet<u64>) = (None, HashSet::new());
+        let mut error = None;
+        {
+            let mut handle = |lev_id: u64| {
+                let packed = match visible_event(&snapshot, visibility, lev_id) {
+                    Ok(Some(packed)) => packed,
+                    Ok(None) => return false,
+                    Err(e) => {
+                        error = Some(e);
+                        return true;
+                    }
+                };
+                if current.0 != Some(packed.created_at()) {
+                    current.0 = Some(packed.created_at());
+                    current.1.clear();
+                }
+                if !current.1.insert(lev_id) {
+                    return false;
+                }
+                matched += 1;
+                if keep {
+                    kept.insert(lev_id);
+                }
+                let sent_before = filters.iter().zip(&sent).any(|(g, s)| match s {
+                    Sent::All => g.does_match(packed),
+                    Sent::These(levs) => levs.contains(&lev_id),
+                });
+                if !sent_before {
+                    cb(lev_id);
+                }
+                matched >= f.limit
+            };
+            if f.search.is_some() {
+                let mut scan = SearchScan::new(f, txn)?;
+                // A search yields every few thousand postings.
+                while !scan.scan(&snapshot, f, u64::MAX, u64::MAX, visibility, &mut handle)? {}
+            } else {
+                DbScan::new(f, txn).scan(txn, f, &mut handle, |_| false)?;
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        sent.push(if f.search.is_none() && matched < f.limit {
+            Sent::All
+        } else {
+            Sent::These(kept)
+        });
+    }
     Ok(())
+}
+
+/// Stored event `lev_id`, if `visibility` lets a reader see it.
+fn visible_event<'t>(
+    snapshot: &ReadSnapshot<'t>,
+    visibility: &ReadVisibility,
+    lev_id: u64,
+) -> Result<Option<PackedEventView<'t>>, wok_db::DbError> {
+    let txn = snapshot.txn();
+    let Some(raw) = txn.get_u64(txn.env().dbis().event, lev_id)? else {
+        return Ok(None);
+    };
+    let packed = PackedEventView::new(raw)?;
+    Ok(visibility.allows(snapshot, packed)?.then_some(packed))
 }

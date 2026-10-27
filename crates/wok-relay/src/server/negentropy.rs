@@ -201,7 +201,8 @@ fn public_tree_allowed(
         txn.foreach_full(
             db.event_kind,
             &wok_db::keys::make_key_u64_u64(kind, 0),
-            &[],
+            // The first duplicate, or events at created_at 0 are skipped.
+            &0u64.to_ne_bytes(),
             false,
             |key, _| {
                 present = key.get(..8) == Some(kind.to_ne_bytes().as_slice());
@@ -1386,6 +1387,42 @@ mod tests {
             tree_refusal(Err(wok_db::DbError::msg("read failed"))),
             Some("error: synchronization visibility check failed")
         );
+    }
+
+    /// An event of a restricted kind at created_at 0 is the first entry of
+    /// that kind in the kind index, and the presence check still sees it.
+    #[test]
+    fn a_restricted_event_at_created_at_zero_keeps_the_tree_unproven() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let filter = json!({});
+        let group = NostrFilterGroup::from_value(&filter, 1_000_001, 8, 16).unwrap();
+        let sub = Subscription::new(1, SubId::new("tree").unwrap(), group, false);
+        assert!(public_tree_allowed(&env.begin_ro().unwrap(), &sub, &cfg).unwrap());
+        let event = json!({
+            "id": "dd".repeat(32), "pubkey": "ab".repeat(32),
+            "created_at": 0, "kind": 4, "tags": [["p", "cd".repeat(32)]],
+            "content": "ciphertext", "sig": "00".repeat(64),
+        });
+        let parsed = wok_event::parse_and_verify_event(
+            &event,
+            &wok_event::EventLimits::default(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut events = vec![wok_db::EventToWrite::new(
+            parsed.packed.into_bytes(),
+            parsed.json,
+        )];
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+        assert!(!public_tree_allowed(&env.begin_ro().unwrap(), &sub, &cfg).unwrap());
     }
 
     /// A NEG-MSG sent while its session's view is still being built, before

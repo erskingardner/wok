@@ -82,7 +82,9 @@ pub fn author_count(txn: &mut RwTxn<'_>, pubkey: &[u8]) -> Result<u64, DbError> 
     txn.foreach_full(
         txn.env().dbis().event_pubkey,
         &make_key_string_u64(pubkey, 0),
-        &[],
+        // The first duplicate. Without one, the scan skips the events stored
+        // under an existing `(pubkey, 0)` key: those at created_at 0.
+        &0u64.to_ne_bytes(),
         false,
         |k, _| {
             if !k.starts_with(pubkey) {

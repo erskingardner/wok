@@ -264,6 +264,35 @@ fn enabling_quota_counts_preexisting_events_and_disabling_keeps_cache_current() 
     txn.commit().unwrap();
 }
 
+#[test]
+fn author_count_includes_events_at_created_at_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    let mut events = [
+        stored_event(1, 0, 1),
+        stored_event(2, 0, 62),
+        stored_event(3, 5, 1),
+    ];
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+    assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 3);
+    assert_eq!(
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [1, 2, 3]).unwrap(),
+        3
+    );
+    txn.commit().unwrap();
+    // Each deletion found the event it removed counted: a count it found at
+    // zero would have been dropped.
+    let mut counter = vec![b'a'];
+    counter.extend_from_slice(&[9; 32]);
+    let txn = env.begin_ro().unwrap();
+    assert_eq!(
+        txn.get(env.dbis().state.unwrap(), &counter).unwrap(),
+        Some(0u64.to_le_bytes().as_slice())
+    );
+}
+
 /// A counter below the author's stored events, as earlier releases left
 /// when they missed events at created_at 0, does not abort the deletion
 /// that would take it below zero: that deletion drops it, and the next

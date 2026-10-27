@@ -6,14 +6,16 @@ use wok_db::{lookup, RoTxn, RwTxn};
 use wok_event::PackedEventView;
 use wok_query::NostrFilter;
 
-pub(crate) fn parse_negentropy_filter(
-    filter_str: &str,
-    max_tags_per_filter: usize,
-    max_and_entries: usize,
-) -> Result<NostrFilter, NegError> {
+/// Parse a stored tree filter. Every tree writer, `verify_tree` and
+/// `wok negentropy add` use this, so a filter the CLI accepts is one every
+/// write can parse. Tree membership is matched once per stored event, so
+/// the client-filter cost limits (`relay.max_tags_per_filter`,
+/// `relay.max_and_entries`) do not apply: a reload that lowers them must not
+/// make a stored tree unparseable and every write fail (#243).
+pub fn parse_negentropy_filter(filter_str: &str) -> Result<NostrFilter, NegError> {
     let value = wok_event::json::parse_strict(filter_str)
         .map_err(|error| NegError::msg(error.to_string()))?;
-    let filter = NostrFilter::parse(&value, u64::MAX, max_tags_per_filter, max_and_entries)
+    let filter = NostrFilter::parse(&value, u64::MAX, usize::MAX, usize::MAX)
         .map_err(|error| NegError::msg(error.to_string()))?;
     if filter.search.is_some() {
         return Err(NegError::msg(
@@ -28,28 +30,15 @@ struct FilterInfo {
     tree_id: u64,
 }
 
+/// Stored tree filters, parsed without client-filter limits (C++ applies
+/// `relay__maxTagsPerFilter` here; see [`parse_negentropy_filter`]).
+#[derive(Default)]
 pub struct NegentropyFilterCache {
     filters: Vec<FilterInfo>,
     modification_counter: Option<u64>,
-    max_tags_per_filter: usize,
-}
-
-impl Default for NegentropyFilterCache {
-    fn default() -> Self {
-        // C++ uses cfg().relay__maxTagsPerFilter (default 3).
-        Self::new(3)
-    }
 }
 
 impl NegentropyFilterCache {
-    pub fn new(max_tags_per_filter: usize) -> Self {
-        Self {
-            filters: Vec::new(),
-            modification_counter: None,
-            max_tags_per_filter,
-        }
-    }
-
     fn freshen(&mut self, txn: &RoTxn<'_>) -> Result<(), NegError> {
         let raw = txn
             .get_u64(txn.env().dbis().meta, 1)?
@@ -60,11 +49,10 @@ impl NegentropyFilterCache {
         }
         self.filters.clear();
         let mut parse_err: Option<NegError> = None;
-        let max_tags = self.max_tags_per_filter;
         lookup::foreach_negentropy_filter(txn, |id, filter_str| {
             // C++ tao::json::from_string throws on a corrupt filter row;
             // propagate instead of silently substituting a match-all {}.
-            match parse_negentropy_filter(filter_str, max_tags, usize::MAX) {
+            match parse_negentropy_filter(filter_str) {
                 Ok(f) => self.filters.push(FilterInfo {
                     filter: f,
                     tree_id: id,
@@ -93,9 +81,8 @@ impl NegentropyFilterCache {
         }
         self.filters.clear();
         let mut parse_err: Option<NegError> = None;
-        let max_tags = self.max_tags_per_filter;
         lookup::foreach_negentropy_filter_rw(txn, |id, filter_str| {
-            match parse_negentropy_filter(filter_str, max_tags, usize::MAX) {
+            match parse_negentropy_filter(filter_str) {
                 Ok(f) => self.filters.push(FilterInfo {
                     filter: f,
                     tree_id: id,
@@ -257,7 +244,7 @@ mod tests {
 
     #[test]
     fn rejects_search_filters_without_event_content() {
-        let error = parse_negentropy_filter(r#"{"search":"nostr"}"#, 3, 16).unwrap_err();
+        let error = parse_negentropy_filter(r#"{"search":"nostr"}"#).unwrap_err();
         assert!(error
             .to_string()
             .contains("negentropy filters do not support content search"));
@@ -265,12 +252,9 @@ mod tests {
 
     #[test]
     fn accepts_nip91_filters_with_overlap_normalization() {
-        let filter = parse_negentropy_filter(
-            r##"{"&t":["meme","cat"],"#t":["meme","cat","black"]}"##,
-            3,
-            16,
-        )
-        .unwrap();
+        let filter =
+            parse_negentropy_filter(r##"{"&t":["meme","cat"],"#t":["meme","cat","black"]}"##)
+                .unwrap();
         assert_eq!(filter.and_tags[&'t'].size(), 2);
         assert_eq!(filter.tags[&'t'].size(), 1);
     }

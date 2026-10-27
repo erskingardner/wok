@@ -288,6 +288,10 @@ the tree code parses.
 ## Precomputed-tree filters and restricted kinds
 
 `wok negentropy add <filter>` registers a persistent tree for a filter.
+The filter is one filter object without `since`, `until` or `search`. It
+may name any number of tag letters and NIP-91 `&` values:
+`relay.max_tags_per_filter` and `relay.max_and_entries` bound client
+filters, not trees, so changing them never affects a stored tree.
 The relay uses that tree directly only when it can prove its records are
 publicly visible. The current conservative proof checks restricted-kind
 presence and requires empty expiration, moderation and vanish tables. A filter

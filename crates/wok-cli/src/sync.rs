@@ -127,7 +127,7 @@ fn store_downloads(
         return Ok(());
     }
     let mut txn = env.begin_rw()?;
-    let mut cache = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
+    let mut cache = wok_negentropy::NegentropyFilterCache::default();
     let mut sink = cache.batch();
     write_events_with_policy(
         &mut txn,

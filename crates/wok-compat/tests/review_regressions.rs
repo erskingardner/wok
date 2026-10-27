@@ -533,3 +533,42 @@ async fn author_reads_own_restricted_event_without_p_tag() {
     assert_eq!(reply[2]["count"], 1, "{reply}");
     conn.close().await;
 }
+
+/// A kind 62 skips the author quota, so it was stored without counting, and
+/// an author count built later missed it at created_at 0. Once it and the
+/// author's next event expired, the counter underflowed and every
+/// maintenance transaction aborted (#240).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expiring_a_request_at_created_at_zero_and_a_note_keeps_maintenance_running() {
+    let relay = Relay::new(|_| {});
+    let (conn, mut rx) = relay.connection().await;
+    let key = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
+    let expiration = (now() + 2).to_string();
+    let request = wok_compat::sign_event_with_key(
+        json!({"created_at":0, "kind":62, "tags":[["relay","ALL_RELAYS"],
+            ["expiration", expiration]], "content":""}),
+        &key,
+    );
+    let note = wok_compat::sign_event_with_key(
+        json!({"created_at":now(), "kind":1, "tags":[["expiration", expiration]],
+            "content":"expires"}),
+        &key,
+    );
+    publish(&conn, &mut rx, &request).await;
+    publish(&conn, &mut rx, &note).await;
+    conn.close().await;
+    let stored = |event: &Value| {
+        let id = hex::decode(event["id"].as_str().unwrap()).unwrap();
+        wok_db::lookup_event_by_id_ro(&relay.env.begin_ro().unwrap(), &id)
+            .unwrap()
+            .is_some()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while stored(&request) || stored(&note) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "maintenance did not delete the expired events"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

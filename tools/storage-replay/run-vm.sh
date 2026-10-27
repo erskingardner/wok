@@ -16,7 +16,9 @@ git -C /opt/relay-bench/src/wok-perf257 fetch -q origin
 git -C "$src" checkout -q --detach "$sha"
 (cd "$src" && cargo build --release --locked -p wok-bench --features op-log > "$base/build-bench.log" 2>&1) \
   || { echo "wok-bench build failed" >> "$status"; exit 1; }
-(cd "$src/tools/storage-replay" && LIBCLANG_PATH=/usr/lib/llvm-19/lib cargo build --release --locked > "$base/build-replay.log" 2>&1) \
+# Debian's libclang1-19 lacks clang's own headers; bindgen takes GCC's.
+(cd "$src/tools/storage-replay" && LIBCLANG_PATH=/usr/lib/llvm-19/lib \
+  BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/14/include cargo build --release --locked > "$base/build-replay.log" 2>&1) \
   || { echo "replay build failed" >> "$status"; exit 1; }
 bench=$src/target/release/wok-bench
 replay=$src/tools/storage-replay/target/release/storage-replay

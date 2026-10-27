@@ -345,6 +345,101 @@ async fn nip01_empty_filter_lists_match_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip01_empty_d_filter_matches_only_events_with_that_value() {
+    // "the event and filter condition values must have at least one item in
+    // common." Packing adds an empty `d` to replaceable and addressable
+    // events; a `#d` filter for "" matches only the events whose tags have
+    // that value, and addressable events without a `d`, whose address it is.
+    let relay = Relay::new(|_| {});
+    let (author, other) = (key(), key());
+    let event = |key: &Keypair, kind: u64, tags: Value| {
+        sign_event_with_key(
+            json!({"created_at": now(), "kind": kind, "tags": tags, "content": ""}),
+            key,
+        )
+    };
+    let matching = [
+        event(&author, 30023, json!([])),
+        event(&author, 30024, json!([["d", ""]])),
+        event(&author, 30025, json!([["d", "draft"], ["d", ""]])),
+        event(&other, 10002, json!([["d", ""]])),
+    ];
+    let article = event(&author, 30023, json!([["d", "intro"]]));
+    let others = [
+        article.clone(),
+        event(&author, 0, json!([])),
+        event(&author, 10002, json!([["r", "wss://relay.test"]])),
+        event(&other, 1, json!([])),
+    ];
+
+    let mut conn = relay.connect().await;
+    conn.subscribe("live", json!({"#d": [""]})).await;
+    let mut publisher = relay.connect().await;
+    for event in others.iter().chain(&matching) {
+        assert_eq!(publisher.publish(event).await[2], true);
+    }
+    for event in &matching {
+        assert_eq!(conn.recv().await, json!(["EVENT", "live", event]));
+    }
+    assert_eq!(conn.try_recv().await, None);
+
+    let ids = |events: &[Value]| {
+        let mut ids: Vec<_> = events.iter().map(|e| e["id"].clone()).collect();
+        ids.sort_by_key(|id| id.to_string());
+        ids
+    };
+    let kinds = json!([0, 1, 10002, 30023, 30024, 30025]);
+    for filter in [
+        // One tag: the Tag plan, which a filter for any other value reads
+        // from the index alone.
+        json!({"#d": [""]}),
+        // With kinds: the TagKind plan.
+        json!({"kinds": kinds.clone(), "#d": [""]}),
+        json!({"&d": [""]}),
+    ] {
+        assert_eq!(
+            ids(&conn.history(filter.clone()).await),
+            ids(&matching),
+            "{filter}"
+        );
+        // COUNT needs kinds to rule out restricted ones.
+        let mut counted = filter.clone();
+        counted["kinds"] = kinds.clone();
+        conn.send(json!(["COUNT", "count", counted])).await;
+        let reply = conn.recv().await;
+        assert_eq!(
+            (&reply[0], &reply[2]["count"]),
+            (&json!("COUNT"), &json!(4)),
+            "{reply}"
+        );
+    }
+    // An naddr with an empty identifier resolves to its own address, not to
+    // the author's newest article.
+    let naddr = json!({"kinds": [30023], "authors": [pubkey_hex(&author)], "#d": [""], "limit": 1});
+    assert_eq!(conn.history(naddr).await, [matching[0].clone()]);
+    // Index-only for any other value.
+    assert_eq!(conn.history(json!({"#d": ["intro"]})).await, [article]);
+
+    // NIP-77 reconciles against the same events.
+    let mut store = wok_negentropy::Vector::new();
+    store.seal().unwrap();
+    let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+    let init = client.initiate().unwrap();
+    conn.send(json!(["NEG-OPEN", "neg", {"#d": [""]}, hex::encode(init)]))
+        .await;
+    let reply = conn.recv().await;
+    assert_eq!(reply[0], "NEG-MSG", "{reply}");
+    let reply = hex::decode(reply[2].as_str().unwrap()).unwrap();
+    let (mut have, mut need) = (Vec::new(), Vec::new());
+    client
+        .reconcile_with_ids(&reply, &mut have, &mut need)
+        .unwrap();
+    let mut need: Vec<_> = need.iter().map(|id| json!(hex::encode(id))).collect();
+    need.sort_by_key(|id| id.to_string());
+    assert_eq!(need, ids(&matching));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip01_limit_zero_sends_eose_and_stays_live() {
     // "When `limit` is zero, the relay MUST NOT return stored events for that
     // filter. After the initial queries for all filters are complete, the

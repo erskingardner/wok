@@ -57,7 +57,9 @@ enforcement (enabled by default). Publications without quotas do not create unus
 initialized, a counter stays transactionally current through inserts, replacements
 and deletions, including while quotas are disabled. Enabling a quota may therefore
 require a one-time author-index scan for an author without a cached count; no
-database upgrade or startup-wide scan is required.
+database upgrade or startup-wide scan is required. A deletion that finds a
+counter already at zero, below the author's stored events, drops it to be
+counted again rather than abort its transaction (`wok_author_count_drift_total`).
 
 ## Indexes
 

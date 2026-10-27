@@ -119,6 +119,11 @@ struct Args {
     /// Events published during live_fanout.
     #[arg(long, default_value_t = 200)]
     fanout_events: u64,
+    /// Publications live_fanout leaves unacknowledged at once. With 1 it
+    /// waits for each OK, so the result is bound by publish round trips
+    /// rather than delivery.
+    #[arg(long, default_value_t = 256)]
+    fanout_window: usize,
     /// Connections opened by idle_connections.
     #[arg(long, default_value_t = 1_000)]
     connections: usize,
@@ -436,7 +441,11 @@ fn main() -> Result<()> {
     if args.repetitions == 0 {
         anyhow::bail!("--repetitions must be at least 1");
     }
-    if args.publish_connections == 0 || args.fanout_subscribers == 0 || args.connections == 0 {
+    if args.publish_connections == 0
+        || args.fanout_subscribers == 0
+        || args.fanout_window == 0
+        || args.connections == 0
+    {
         anyhow::bail!("connection counts must be at least 1");
     }
     if args.events == Some(0) || args.queries == Some(0) || args.fanout_events == 0 {
@@ -1067,7 +1076,14 @@ fn run_trial(
                 count: args.fanout_events,
                 ..workload
             };
-            match live_fanout_trial(rt, target, workload, args.fanout_subscribers, &mut hist) {
+            match live_fanout_trial(
+                rt,
+                target,
+                workload,
+                args.fanout_subscribers,
+                args.fanout_window,
+                &mut hist,
+            ) {
                 Ok((eps, nts, good, miss)) => {
                     throughput = eps;
                     notes = nts;
@@ -1942,6 +1958,11 @@ fn parse_receipt(reply: &Value, event: &Value) -> Result<bool> {
 }
 
 async fn read_ack(socket: &mut ClientConnection, event: &Value) -> Result<bool> {
+    parse_receipt(&next_reply(socket).await?, event)
+}
+
+/// The next relay message other than AUTH, which should be an OK.
+async fn next_reply(socket: &mut ClientConnection) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let message = socket.next().await.context("closed before OK")??;
@@ -1952,7 +1973,7 @@ async fn read_ack(socket: &mut ClientConnection, event: &Value) -> Result<bool> 
             if reply[0] == "AUTH" {
                 continue;
             }
-            return parse_receipt(&reply, event);
+            return Ok(reply);
         }
     })
     .await
@@ -2773,6 +2794,7 @@ fn live_fanout_trial(
     target: RelayTarget<'_>,
     workload: EventWorkload,
     subs: usize,
+    window: usize,
     hist: &mut Histogram<u64>,
 ) -> Result<(f64, String, bool, u64)> {
     let n = workload.count;
@@ -2810,14 +2832,31 @@ fn live_fanout_trial(
             "duplicate generated fanout IDs"
         );
         let start = Instant::now();
+        // Up to `window` publications are unacknowledged at once, so the
+        // relay can batch them and delivery, not each OK's round trip,
+        // bounds the result.
         let publish = async {
-            for ev in &events {
-                publisher
-                    .send(Message::Text(json!(["EVENT", ev]).to_string().into()))
-                    .await?;
+            let mut unsent = events.iter();
+            let mut unacknowledged = std::collections::HashMap::new();
+            loop {
+                while unacknowledged.len() < window {
+                    let Some(ev) = unsent.next() else { break };
+                    publisher
+                        .send(Message::Text(json!(["EVENT", ev]).to_string().into()))
+                        .await?;
+                    unacknowledged.insert(ev["id"].as_str().context("event without id")?, ev);
+                }
+                if unacknowledged.is_empty() {
+                    break;
+                }
+                let reply = next_reply(&mut publisher).await?;
+                let ev = reply[1]
+                    .as_str()
+                    .and_then(|id| unacknowledged.remove(id))
+                    .with_context(|| format!("OK for no unacknowledged publication: {reply}"))?;
                 anyhow::ensure!(
-                    read_ack(&mut publisher, ev).await?,
-                    "fanout publication rejected"
+                    parse_receipt(&reply, ev)?,
+                    "fanout publication rejected: {reply}"
                 );
             }
             Ok::<_, anyhow::Error>(())
@@ -2863,7 +2902,7 @@ fn live_fanout_trial(
     let expected = n * subs as u64;
     let eps = delivered as f64 / elapsed.as_secs_f64();
     let miss = if delivered != expected { 1 } else { 0 };
-    let notes = format!("{subs} subscribers x {n} events: delivered {delivered}/{expected}; concurrent readers; latency is aggregate trial duration");
+    let notes = format!("{subs} subscribers x {n} events, up to {window} unacknowledged: delivered {delivered}/{expected}; concurrent readers; latency is aggregate trial duration");
     Ok((eps, notes, miss == 0, miss))
 }
 
@@ -3712,11 +3751,85 @@ mod tests {
                 mix: EventMix::Kind1,
             },
             1,
+            1,
             &mut Histogram::new(3).unwrap(),
         );
         let peer_result = server.join().unwrap();
         assert!(peer_result.is_ok(), "{peer_result:?}");
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn fanout_publishes_ahead_of_acknowledgements() {
+        const EVENTS: usize = 3;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    use tokio_tungstenite::tungstenite::Message;
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let (stream, _) = listener.accept().await?;
+                    let mut subscriber = tokio_tungstenite::accept_async(stream).await?;
+                    let _req = subscriber.next().await.context("subscription closed")??;
+                    subscriber
+                        .send(Message::Text(json!(["EOSE", "s0"]).to_string().into()))
+                        .await?;
+                    let (stream, _) = listener.accept().await?;
+                    let mut publisher = tokio_tungstenite::accept_async(stream).await?;
+                    // Every publication arrives before any OK is sent, which
+                    // a publisher waiting for each OK would never do.
+                    let mut events = Vec::new();
+                    for _ in 0..EVENTS {
+                        let message =
+                            tokio::time::timeout(Duration::from_secs(5), publisher.next())
+                                .await
+                                .context("publication not sent ahead of its OK")?
+                                .context("publisher closed")??;
+                        let message: Value = serde_json::from_str(message.to_text()?)?;
+                        events.push(message[1].clone());
+                    }
+                    for event in events.iter().rev() {
+                        subscriber
+                            .send(Message::Text(
+                                json!(["EVENT", "s0", event]).to_string().into(),
+                            ))
+                            .await?;
+                        publisher
+                            .send(Message::Text(
+                                json!(["OK", event["id"], true, ""]).to_string().into(),
+                            ))
+                            .await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp = TempDir::new().unwrap();
+        let url = format!("ws://{addr}");
+        let result = live_fanout_trial(
+            &rt,
+            RelayTarget {
+                bin: None,
+                url: Some(&url),
+                dbdir: temp.path(),
+            },
+            EventWorkload {
+                count: EVENTS as u64,
+                seed: 1,
+                base_timestamp: 1_800_000_000,
+                mix: EventMix::Kind1,
+            },
+            1,
+            EVENTS,
+            &mut Histogram::new(3).unwrap(),
+        );
+        let peer_result = server.join().unwrap();
+        assert!(peer_result.is_ok(), "{peer_result:?}");
+        let (_, notes, good, _) = result.unwrap();
+        assert!(good, "{notes}");
     }
 
     #[test]

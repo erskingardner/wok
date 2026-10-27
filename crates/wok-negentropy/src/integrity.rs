@@ -6,7 +6,7 @@ use wok_event::PackedEventView;
 /// Check the complete registered filter, ignoring result limits as tree writers do.
 /// The caller holds one read snapshot for both primary events and tree records.
 pub fn verify_tree(txn: &RoTxn<'_>, tree_id: u64, filter: &str) -> Result<u64, NegError> {
-    let filter = crate::cache::parse_negentropy_filter(filter, usize::MAX, usize::MAX)?;
+    let filter = crate::cache::parse_negentropy_filter(filter)?;
     let mut expected = 0u64;
     let mut error = None;
     wok_db::foreach_event_from(txn, 0, |_, raw| {

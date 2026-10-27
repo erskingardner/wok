@@ -911,7 +911,7 @@ fn write_with_quota(
         parsed.json,
     )];
     let mut txn = env.begin_rw().unwrap();
-    let mut sink = wok_negentropy::NegentropyFilterCache::new(3);
+    let mut sink = wok_negentropy::NegentropyFilterCache::default();
     wok_db::write::write_events_with_quota(
         &mut txn,
         &mut sink,
@@ -1495,8 +1495,7 @@ fn purging_superseded_history_keeps_one_winner_per_address() {
 
     // One version per transaction exercises resumption between groups.
     let purged =
-        wok_db::purge_superseded(&env, || wok_negentropy::NegentropyFilterCache::new(3), 1)
-            .unwrap();
+        wok_db::purge_superseded(&env, wok_negentropy::NegentropyFilterCache::default, 1).unwrap();
     assert_eq!((purged.groups, purged.events), (groups, superseded));
     assert_eq!(stored_ids(&env), ids(&winners));
 
@@ -1519,7 +1518,7 @@ fn purging_superseded_history_keeps_one_winner_per_address() {
     txn.abort();
 
     let again =
-        wok_db::purge_superseded(&env, || wok_negentropy::NegentropyFilterCache::new(3), 1000)
+        wok_db::purge_superseded(&env, wok_negentropy::NegentropyFilterCache::default, 1000)
             .unwrap();
     assert_eq!((again.groups, again.events), (0, 0));
     assert_eq!(stored_ids(&env), ids(&winners));

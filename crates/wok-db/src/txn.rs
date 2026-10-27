@@ -433,6 +433,10 @@ fn dbi_entries(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<usize, DbError> {
 /// databases. Integer-key tables (Event, Meta, payloads, NegentropyFilter)
 /// must use `MDB_SET_RANGE` or they return `MDB_INCOMPATIBLE`.
 ///
+/// On a `MDB_DUPSORT` table, an empty `start_dup` skips every duplicate of an
+/// existing `start_key`, as in C++. To start at that key's first duplicate,
+/// pass the smallest one: `0u64.to_ne_bytes()` on the integer-dup tables.
+///
 /// Returns `Ok(true)` if the scan finished, `Ok(false)` if the callback stopped it.
 fn foreach_full<F>(
     txn: *mut MDB_txn,

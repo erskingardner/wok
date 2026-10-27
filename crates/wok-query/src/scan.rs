@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
 use wok_db::{
-    search_bigram_posting_exists, search_posting_count, search_posting_exists, search_postings,
+    count_phrase_pairs, search_posting_count, search_posting_exists, search_postings, Decompressor,
     RoTxn, SearchQuery,
 };
 use wok_event::PackedEventView;
@@ -343,6 +343,10 @@ impl PartialOrd for SearchHit {
     }
 }
 
+/// The largest stored payload a phrase check decompresses, as for `wok
+/// doctor` and reindex. Only a compressed payload needs it.
+const PHRASE_PAYLOAD_BOUND: usize = 16 * 1024 * 1024;
+
 /// Resumable NIP-50 posting intersection and relevance ranking.
 struct SearchScan {
     query: SearchQuery,
@@ -385,6 +389,7 @@ impl SearchGroupScan {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process<H>(
         &mut self,
         snapshot: &ReadSnapshot<'_>,
@@ -392,6 +397,7 @@ impl SearchGroupScan {
         latest_event_id: u64,
         time_budget_us: u64,
         visibility: &ReadVisibility,
+        decompressor: &mut Decompressor,
         mut handle_event: H,
     ) -> Result<bool, wok_db::DbError>
     where
@@ -408,6 +414,7 @@ impl SearchGroupScan {
                     latest_event_id,
                     remaining_us,
                     visibility,
+                    decompressor,
                 )?;
                 if !complete {
                     return Ok(false);
@@ -491,7 +498,7 @@ impl SearchScan {
     }
 
     // `is_multiple_of` is not available at Wok's Rust 1.85 MSRV.
-    #[allow(clippy::manual_is_multiple_of)]
+    #[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
     fn gather(
         &mut self,
         snapshot: &ReadSnapshot<'_>,
@@ -499,6 +506,9 @@ impl SearchScan {
         latest_event_id: u64,
         time_budget_us: u64,
         visibility: &ReadVisibility,
+        // Reads a match's content for its phrase boost. The caller's, so a
+        // paused search holds no decompression buffer.
+        decompressor: &mut Decompressor,
     ) -> Result<bool, wok_db::DbError> {
         let txn = snapshot.txn();
         if self.gathering_complete {
@@ -532,12 +542,15 @@ impl SearchScan {
             .collect();
         let base_score = self.base_score();
         let starting_work = self.approx_work;
+        let mut read_content = false;
         let mut error = None;
         let completed = search_postings(txn, &primary, self.resume_lev_id, |lev_id| {
             // Check before consuming this candidate so every miss path yields,
-            // and resume still points at the first unprocessed posting.
+            // and resume still points at the first unprocessed posting. A
+            // match whose content was read for its phrase boost can cost far
+            // more than 128 posting lookups, so the clock is read after each.
             if self.approx_work > starting_work
-                && self.approx_work % 128 == 0
+                && (std::mem::take(&mut read_content) || self.approx_work % 128 == 0)
                 && (self.approx_work - starting_work >= 4096
                     || start.elapsed().as_micros() as u64 > time_budget_us)
             {
@@ -582,15 +595,22 @@ impl SearchScan {
                 }
             }
             let mut score = base_score;
-            for (first, second) in &phrase_pairs {
-                match search_bigram_posting_exists(txn, first, second, lev_id) {
-                    Ok(true) => score = score.saturating_add(2_000_000_000),
-                    Ok(false) => {}
+            if !phrase_pairs.is_empty() {
+                read_content = true;
+                // A payload that does not decode ranks without the boost;
+                // sending the event reports it.
+                let pairs = match txn.get_u64(txn.env().dbis().event_payload, lev_id) {
+                    Ok(Some(raw)) => decompressor
+                        .decode(txn, raw, PHRASE_PAYLOAD_BOUND)
+                        .and_then(|json| count_phrase_pairs(json, &phrase_pairs))
+                        .unwrap_or(0),
+                    Ok(None) => 0,
                     Err(err) => {
                         error = Some(err);
                         return false;
                     }
-                }
+                };
+                score = score.saturating_add((pairs as u64).saturating_mul(2_000_000_000));
             }
             let mut id = [0u8; 32];
             id.copy_from_slice(packed.id());
@@ -619,6 +639,7 @@ impl SearchScan {
         Ok(completed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan<H>(
         &mut self,
         snapshot: &ReadSnapshot<'_>,
@@ -626,6 +647,7 @@ impl SearchScan {
         latest_event_id: u64,
         time_budget_us: u64,
         visibility: &ReadVisibility,
+        decompressor: &mut Decompressor,
         mut handle_event: H,
     ) -> Result<bool, wok_db::DbError>
     where
@@ -637,6 +659,7 @@ impl SearchScan {
             latest_event_id,
             time_budget_us,
             visibility,
+            decompressor,
         )? {
             return Ok(false);
         }
@@ -1298,8 +1321,24 @@ impl DbQuery {
     pub fn process<F>(
         &mut self,
         txn: &RoTxn<'_>,
+        cb: F,
+        time_budget_us: u64,
+    ) -> Result<bool, wok_db::DbError>
+    where
+        F: FnMut(&Subscription, u64),
+    {
+        self.process_with(txn, cb, time_budget_us, &mut Decompressor::new())
+    }
+
+    /// [`Self::process`], reading a search's matches through `decompressor`.
+    /// A scheduler lends every query the same one, so its buffer, sized for
+    /// the largest payload, is held once rather than by each paused search.
+    pub fn process_with<F>(
+        &mut self,
+        txn: &RoTxn<'_>,
         mut cb: F,
         time_budget_us: u64,
+        decompressor: &mut Decompressor,
     ) -> Result<bool, wok_db::DbError>
     where
         F: FnMut(&Subscription, u64),
@@ -1336,6 +1375,7 @@ impl DbQuery {
                 self.sub.latest_event_id,
                 time_budget_us,
                 &self.visibility,
+                decompressor,
                 |lev_id| {
                     let pubkey = match Self::visible_event_pubkey(
                         &snapshot,
@@ -1492,6 +1532,7 @@ impl DbQuery {
                     latest,
                     time_budget_us.saturating_sub(elapsed_us()),
                     &self.visibility,
+                    decompressor,
                     &mut handle,
                 )?,
             };
@@ -1637,10 +1678,19 @@ fn foreach_visible_match(
     cb: &mut impl FnMut(u64),
 ) -> Result<(), wok_db::DbError> {
     let snapshot = ReadSnapshot::for_stored(txn);
+    let mut decompressor = Decompressor::new();
     if !filters.is_empty() && filters.iter().all(|f| f.search.is_some()) {
         // A REQ's searches are ranked together, as `DbQuery` does.
         let mut group = SearchGroupScan::new(filters, txn)?;
-        while !group.process(&snapshot, filters, u64::MAX, u64::MAX, visibility, &mut *cb)? {}
+        while !group.process(
+            &snapshot,
+            filters,
+            u64::MAX,
+            u64::MAX,
+            visibility,
+            &mut decompressor,
+            &mut *cb,
+        )? {}
         return Ok(());
     }
     let mut sent = Vec::with_capacity(filters.len());
@@ -1687,7 +1737,15 @@ fn foreach_visible_match(
             if f.search.is_some() {
                 let mut scan = SearchScan::new(f, txn)?;
                 // A search yields every few thousand postings.
-                while !scan.scan(&snapshot, f, u64::MAX, u64::MAX, visibility, &mut handle)? {}
+                while !scan.scan(
+                    &snapshot,
+                    f,
+                    u64::MAX,
+                    u64::MAX,
+                    visibility,
+                    &mut decompressor,
+                    &mut handle,
+                )? {}
             } else {
                 DbScan::new(f, txn).scan(txn, f, &mut handle, |_| false)?;
             }

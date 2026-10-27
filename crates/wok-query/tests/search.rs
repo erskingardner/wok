@@ -2,11 +2,13 @@ use secp256k1::{Keypair, SECP256K1};
 use serde_json::json;
 use tempfile::TempDir;
 use wok_db::{
-    delete_events, event_json_owned, write_events, Decompressor, Env, EnvOptions, EventToWrite,
-    NoopNegentropy,
+    delete_events, encode_zstd_payload, event_json_owned, insert_compression_dictionary,
+    write_events, Decompressor, Env, EnvOptions, EventToWrite, NoopNegentropy,
 };
 use wok_event::{parse_and_verify_event, EventLimits};
-use wok_query::{foreach_by_filter, DbQuery, NostrFilterGroup, SubId, Subscription};
+use wok_query::{
+    foreach_by_filter, DbQuery, NostrFilterGroup, QueryScheduler, SubId, Subscription,
+};
 
 fn sign(kind: u64, content: &str, created_at: u64) -> EventToWrite {
     let mut rng = rand::thread_rng();
@@ -202,4 +204,75 @@ fn multiple_search_filters_are_merged_by_quality() {
         .process(&txn, |_, lev| capped_hits.push(lev), u64::MAX)
         .unwrap());
     assert_eq!(capped_hits.len(), 1);
+}
+
+/// Store every payload zstd-compressed with a dictionary, as `wok dict` does.
+fn compress_payloads(env: &Env) {
+    let txn = env.begin_ro().unwrap();
+    let mut lev_ids = Vec::new();
+    foreach_by_filter(&txn, &json!({}), 100, 3, 16, |lev_id| lev_ids.push(lev_id)).unwrap();
+    let mut decompressor = Decompressor::new();
+    let stored: Vec<_> = lev_ids
+        .into_iter()
+        .map(|lev_id| {
+            let json = event_json_owned(&txn, &mut decompressor, lev_id, 1_000_000).unwrap();
+            (lev_id, json)
+        })
+        .collect();
+    drop(txn);
+    let dict = br#"{"content":"alpha beta gamma","kind":1,"tags":[]}"#.repeat(32);
+    let mut txn = env.begin_rw().unwrap();
+    let dict_id = u32::try_from(insert_compression_dictionary(&mut txn, &dict).unwrap()).unwrap();
+    for (lev_id, json) in stored {
+        let compressed = zstd::bulk::Compressor::with_dictionary(3, &dict)
+            .unwrap()
+            .compress(json.as_bytes())
+            .unwrap();
+        let payload = encode_zstd_payload(dict_id, &compressed);
+        txn.put_u64(env.dbis().event_payload, lev_id, &payload, 0)
+            .unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+fn compressed_matches_get_the_phrase_boost_through_the_scheduler() {
+    let temp = TempDir::new().unwrap();
+    let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    // Without the phrase boost, the newer note ranks first.
+    let mut events = vec![sign(1, "alpha beta", 100), sign(1, "alpha gamma beta", 200)];
+    let mut txn = env.begin_rw().unwrap();
+    write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+    txn.commit().unwrap();
+    compress_payloads(&env);
+
+    // Every filter's phrase check reads a compressed payload through the
+    // scheduler's one decompressor.
+    let filter = json!({"search": "alpha beta", "limit": 1});
+    let group = NostrFilterGroup::from_value(&json!([filter, filter, filter]), 100, 3, 16).unwrap();
+    let txn = env.begin_ro().unwrap();
+    let mut scheduler = QueryScheduler::new(1, 0, 0);
+    scheduler
+        .add_sub(
+            &txn,
+            Subscription::new(1, SubId::new("phrase").unwrap(), group, false),
+        )
+        .unwrap();
+    let mut hits = Vec::new();
+    while scheduler.has_running() {
+        scheduler
+            .process(
+                &txn,
+                u64::MAX,
+                |_, lev_id, _| {
+                    hits.push(lev_id);
+                    true
+                },
+                |_, _, _, _, _| {},
+            )
+            .unwrap();
+    }
+    drop(txn);
+    assert_eq!(contents(&env, &hits), vec!["alpha beta"]);
 }

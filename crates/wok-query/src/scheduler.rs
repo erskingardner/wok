@@ -1,7 +1,7 @@
 use crate::scan::{Completeness, DbQuery};
 use crate::subid::{SubId, Subscription};
 use std::collections::{HashMap, VecDeque};
-use wok_db::{most_recent_levid_ro, RoTxn};
+use wok_db::{most_recent_levid_ro, Decompressor, RoTxn};
 
 /// A connection's queries, by subscription id and whether they answer a COUNT.
 /// REQ and COUNT ids are separate namespaces: neither replaces the other.
@@ -49,6 +49,9 @@ pub struct QueryScheduler {
     max_total_events_per_req: u64,
     count_dedup_budget: u64,
     completeness: bool,
+    /// Lent to each query's time slice, for a search's phrase check, so the
+    /// worker holds one decompression buffer however many searches wait.
+    decompressor: Decompressor,
 }
 
 impl QueryScheduler {
@@ -69,6 +72,7 @@ impl QueryScheduler {
             max_total_events_per_req,
             count_dedup_budget,
             completeness: false,
+            decompressor: Decompressor::new(),
         }
     }
 
@@ -312,7 +316,7 @@ impl QueryScheduler {
             let q = self.queries[idx].as_mut().unwrap();
             q.set_visibility(visibility(&q.sub));
             let mut undelivered = false;
-            let result = q.process(
+            let result = q.process_with(
                 txn,
                 |sub, lev| {
                     let payload = if ensure_exists {
@@ -331,6 +335,7 @@ impl QueryScheduler {
                     }
                 },
                 time_budget_us,
+                &mut self.decompressor,
             );
             if undelivered {
                 q.mark_incomplete();

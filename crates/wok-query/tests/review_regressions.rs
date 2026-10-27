@@ -42,6 +42,46 @@ fn review_nonmatching_search_respects_timeslice() {
     }
 }
 
+/// A multi-word search reads each match's content for its phrase boost, which
+/// can cost far more than a posting lookup. A slice checks its budget after
+/// every such match, not every 128 postings, and resumes at the next one.
+#[test]
+fn phrase_scored_search_checks_the_budget_after_each_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    // The pair is never adjacent, so each check reads the whole content.
+    let content = format!("alpha {}beta", "filler ".repeat(16_384));
+    let mut events = Vec::new();
+    for i in 1u64..=8 {
+        let mut id = [0; 32];
+        id[..8].copy_from_slice(&i.to_be_bytes());
+        let packed =
+            PackedEventBuilder::build(&id, &[7; 32], i, 1, 0, &PackedEventTagBuilder::default())
+                .unwrap();
+        events.push(EventToWrite::new(
+            packed.into_bytes(),
+            json!({ "content": content }).to_string(),
+        ));
+    }
+    let mut txn = env.begin_rw().unwrap();
+    wok_db::write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+    txn.commit().unwrap();
+    let txn = env.begin_ro().unwrap();
+    let group =
+        NostrFilterGroup::from_value(&json!({"search":"alpha beta", "limit":8}), 500, 3, 16)
+            .unwrap();
+    let sub = Subscription::new(1, SubId::new("phrase").unwrap(), group, false);
+    let mut query = DbQuery::new(sub, 2000, 0);
+    let (mut slices, mut sent) = (0, 0);
+    while !query.process(&txn, |_, _| sent += 1, 0).unwrap() {
+        slices += 1;
+    }
+    slices += 1;
+    assert_eq!(sent, 8);
+    assert_eq!(slices, 8, "a zero-budget slice should score one match");
+}
+
 /// Work-count regression for the bounded author/tag planner.
 #[test]
 fn broad_tag_uses_selective_author_without_skipping_filter_checks() {

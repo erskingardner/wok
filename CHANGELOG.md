@@ -945,6 +945,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The NIP-50 search index keeps only word postings (#257). It also kept a
+  posting for each pair of adjacent words, up to 256 an event, which only
+  boosted a match whose content holds the query's words in order; that
+  boost is now read from a match's content when it is ranked. A published
+  event writes about half as many postings, and a phrase late in a long
+  event, past the old 256 pairs, now counts. The index is rebuilt on the
+  first open, in 10,000-event transactions before the relay serves.
 - `[relay.filter_validation]` rules now apply to NEG-OPEN as they do to REQ
   and COUNT, refused with `NEG-ERR blocked: filter validation failed: ...`.
   Before, a sync could list the ids of every event a REQ's filter was

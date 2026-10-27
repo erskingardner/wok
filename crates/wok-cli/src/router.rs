@@ -711,7 +711,7 @@ fn flush_router_batch(env: &Env, cfg: &Config, batch: &mut Vec<Value>) -> Result
     let mut txn = env.begin_rw()?;
     let mut sink = wok_negentropy::DeferredSink::default();
     wok_db::write_events_with_policy(&mut txn, &mut sink, &mut evs, false, &cfg.vanish_policy())?;
-    let mut cache = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
+    let mut cache = wok_negentropy::NegentropyFilterCache::default();
     sink.apply(&mut cache, &mut txn)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     txn.commit()?;

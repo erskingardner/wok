@@ -874,7 +874,7 @@ fn commit_import(
 ) -> Result<bool> {
     let mut txn = env.begin_rw()?;
     let deferred_tag_kind = wok_db::defer_tag_kind_postings(&mut txn)?;
-    let mut sink = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
+    let mut sink = wok_negentropy::NegentropyFilterCache::default();
     write_events_with_policy(&mut txn, &mut sink, batch, false, &cfg.vanish_policy())?;
     txn.commit()?;
     for ev in batch.drain(..) {
@@ -1093,7 +1093,7 @@ fn cmd_delete(cfg: &Config, age: Option<u64>, filter: Option<String>, dry_run: b
     }
     tracing::info!("Deleting {} events", levs.len());
     let mut txn = env.begin_rw()?;
-    let mut sink = wok_negentropy::NegentropyFilterCache::new(cfg.relay.max_tags_per_filter);
+    let mut sink = wok_negentropy::NegentropyFilterCache::default();
     delete_events(&mut txn, &mut sink, levs)?;
     txn.commit()?;
     Ok(())
@@ -1121,10 +1121,9 @@ fn cmd_purge_superseded(cfg: &Config, dry_run: bool, json: bool) -> Result<()> {
         let txn = env.begin_ro()?;
         wok_db::count_superseded_ro(&txn)?
     } else {
-        let max_tags = cfg.relay.max_tags_per_filter;
         wok_db::purge_superseded(
             &open_env(cfg)?,
-            || wok_negentropy::NegentropyFilterCache::new(max_tags),
+            wok_negentropy::NegentropyFilterCache::default,
             PURGE_SUPERSEDED_BATCH,
         )?
     };
@@ -1416,24 +1415,16 @@ fn cmd_neg(cfg: &Config, cmd: NegCmd) -> Result<()> {
         }
         NegCmd::Add { filter } => {
             let v: serde_json::Value = serde_json::from_str(&filter)?;
-            let compiled = wok_query::NostrFilterGroup::from_value(
-                &v,
-                u64::MAX,
-                64,
-                cfg.relay.max_and_entries,
-            )?;
-            if compiled.filters.is_empty() {
+            let filter_str = v.to_string();
+            // Check the stored text with the parser every tree writer uses,
+            // so no setting can make a write fail on it (#243).
+            let compiled = wok_negentropy::parse_negentropy_filter(&filter_str)?;
+            if compiled.never_match {
                 bail!("filter will never match");
             }
-            if compiled.requires_content() {
-                bail!("negentropy filters do not support content search");
+            if compiled.since != 0 || compiled.until != u64::MAX {
+                bail!("negentropy filters should not have since/until");
             }
-            if compiled.filters.len() == 1
-                && (compiled.filters[0].since != 0 || compiled.filters[0].until != u64::MAX)
-            {
-                bail!("single filters should not have since/until");
-            }
-            let filter_str = v.to_string();
             let mut txn = env.begin_rw()?;
             wok_db::bump_negentropy_mod_counter(&mut txn)?;
             let mut exists = false;
@@ -1828,6 +1819,54 @@ mod main_tests {
             commands, documented,
             "the wok commands and the Commands table of docs/attack-surface.md differ"
         );
+    }
+
+    #[test]
+    fn negentropy_add_stores_only_filters_every_write_can_parse() {
+        // #243: add checked filters with its own limits, so it stored trees
+        // every later write failed on.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            db: dir.path().join("db"),
+            ..Config::default()
+        };
+        cfg.relay.max_tags_per_filter = 0;
+        let add = |filter: &str| {
+            cmd_neg(
+                &cfg,
+                NegCmd::Add {
+                    filter: filter.into(),
+                },
+            )
+        };
+        // The cache parses one filter object; a stored array failed every write.
+        let refused = add(r#"[{"kinds":[1]},{"kinds":[7]}]"#).unwrap_err();
+        assert!(refused.to_string().contains("not an object"), "{refused}");
+        // Ten tag letters, past the default of 8 and the setting of 0.
+        let filter: serde_json::Map<_, _> = "abcdfghijk"
+            .chars()
+            .map(|letter| (format!("#{letter}"), json!(["x"])))
+            .collect();
+        let filter = serde_json::Value::Object(filter).to_string();
+        add(&filter).unwrap();
+
+        let env = open_env(&cfg).unwrap();
+        let mut events = vec![signed_event(1)];
+        let (mut written, mut rejected, mut duplicates) = (0, 0, 0);
+        commit_import(
+            &cfg,
+            &env,
+            &mut events,
+            &mut written,
+            &mut rejected,
+            &mut duplicates,
+            false,
+        )
+        .unwrap();
+        assert_eq!((written, rejected, duplicates), (1, 0, 0));
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(wok_negentropy::verify_tree(&txn, 1, "{}").unwrap(), 1);
+        assert_eq!(wok_negentropy::verify_tree(&txn, 2, &filter).unwrap(), 0);
     }
 
     #[test]

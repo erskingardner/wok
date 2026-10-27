@@ -155,6 +155,12 @@ it is not a promise to reproduce upstream bugs.
   using different wording is counted as `upload_rejected`, and the run exits
   nonzero even if replacement semantics explain the difference. Arbitrary
   human-readable rejection text is not treated as evidence of supersession.
+- Negentropy tree filters are parsed without `relay.max_tags_per_filter` or
+  `relay.max_and_entries`, which bound client filters. strfry parses stored
+  tree filters with `relay__maxTagsPerFilter`, so lowering it below a tree's
+  tag-letter count makes every write fail. `wok negentropy add` checks a new
+  filter with the parser the writer uses, so it refuses an array of filters,
+  which strfry stores and then fails every write on.
 
 ## Compatibility-sensitive behavior retained
 

@@ -1075,6 +1075,43 @@ on the same host and corpus, as for `monitor_index`.
 
 CI runs a small version as unit tests (`db_write::tests`).
 
+## Codec CPU (`codec_cpu`)
+
+This Wok-only scenario measures the CPU each message costs on the publish
+and delivery paths, in process on one thread, so it measures the code
+compiled into this `wok-bench` build, and a trial records this binary's
+hash. For every corpus event (`--corpus`, or one generated from `--events`
+and any `--event-mix`) it times:
+
+- **ws decode:** the client's masked `["EVENT", …]` frame through a
+  connection's `WsParser`;
+- **EVENT message parse:** `ClientCommand::parse`, the relay's JSON parse of
+  the message;
+- **event pack:** `parse_and_verify_event` without verification: the packed
+  event and the normalized stored JSON;
+- **id hash** and **signature verify:** the NIP-01 id and the Schnorr
+  signature;
+- **ws decode + inflate:** the same message compressed by a client with
+  permessage-deflate and context takeover;
+- **ws encode** and **ws encode + deflate:** the relay's
+  `["EVENT", sub, …]` frame for one subscriber, at the relay's deflate level
+  with context takeover.
+
+Each step runs over every event twice: timing each call, for the
+percentiles, and untimed, for the mean and rate, so the clock's own cost
+does not inflate the shortest steps. Only the codec call is timed: its
+output is checked after the clock stops, and kept from the optimizer on
+both passes. A parser, encoder or deflate context lasts one pass, as one
+connection's does. The ratio column is compressed over uncompressed bytes.
+A result that does not check out is a mismatch: an id or signature that
+fails, an inbound frame that decodes to other bytes, or an outbound frame
+that a client, inflating with the same context, does not read back as the
+delivery.
+The trial's throughput is the uncompressed publications per second one core
+takes through the five inbound steps; its latency columns are unused.
+
+CI runs a small version as unit tests (`codec::tests`).
+
 ## Portable Docker lab
 
 For a repeatable local setup or fresh two-VM deployment, start with the

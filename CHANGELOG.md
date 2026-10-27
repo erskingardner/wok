@@ -405,6 +405,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and pages per commit; duplicates and superseded or deleted events are
   counted apart. The database lives under `--dataset-dir`, so a tmpfs `/tmp`
   does not hide the disk.
+- `wok-bench --scenario codec_cpu` measures the CPU each message costs on
+  the publish and delivery paths (#257), in process on one thread: the
+  client's EVENT message parsed as the relay parses it, the event packed,
+  its id hashed and its signature verified, and WebSocket frames decoded
+  and encoded with and without permessage-deflate. Every result is checked,
+  and the summary gives the publications per second one core can take
+  through the inbound steps.
 - Writer metrics (#257): histograms of how many messages were queued when
   the writer started a batch, how many events each commit holds, and how
   long the batch's checks, writes, commit and replies took

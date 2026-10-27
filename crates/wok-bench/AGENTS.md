@@ -16,6 +16,7 @@ Never opens a user database. Each trial uses a disposable temp dir, a determinis
 - `src/catchup.rs` — `--scenario nip77_catchup`: NIP-77 catch-up against a relay holding a corpus (time windows of the whole corpus, or one `#h` 445 filter per Marmot group), then fetching what the client lacks, checked against the corpus
 - `src/corpus.rs` — what the read scenarios (`ws_query_latency`, `deep_history_pagination`, `mixed_read_write`) expect, from a corpus streamed into a compact index of about 250 bytes an event: the events a relay keeps of a corpus, the `ws_query_latency` plan (#226's archive reads on a social corpus), and expected replies that accept any of a second's events where a `limit` cuts through it
 - `src/db_write.rs` — `--scenario db_write`: the relay writer's storage calls in process on a preloaded corpus, at several batch sizes, with µs and bytes per event
+- `src/codec.rs` — `--scenario codec_cpu`: CPU per message of EVENT parse, pack, id hash, Schnorr verify, and WebSocket decode/encode with and without deflate, in process
 - `src/live.rs` — `--scenario monitor_index` (the req monitor's index in process) and `--scenario live_subscriptions` (fan-out latency under REQ/CLOSE churn and a reconnect storm, deliveries checked against an independent matcher)
 
 Methodology: `docs/benchmarks.md`. Campaign wrappers: `scripts/benchmark-*.sh`. Do not treat `bench-results/` at the repo root as source.

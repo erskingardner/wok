@@ -14,6 +14,7 @@
 mod author_kinds;
 mod catchup;
 mod clients;
+mod codec;
 mod corpus;
 mod db_write;
 mod live;
@@ -49,9 +50,13 @@ const READ_SCENARIOS: [&str; 3] = [
 ];
 /// Scenarios that run code compiled into this binary rather than a relay, so
 /// a trial records this binary's hash.
-const IN_PROCESS_SCENARIOS: [&str; 2] = ["monitor_index", "db_write"];
-/// In-process scenarios that read the corpus as it is, of any event mix.
-const ANY_MIX_SCENARIOS: [&str; 1] = ["db_write"];
+const IN_PROCESS_SCENARIOS: [&str; 3] = ["monitor_index", "db_write", "codec_cpu"];
+/// In-process scenarios that read a corpus's events as they are, so a social
+/// corpus suits them as well as a realistic one.
+const ANY_MIX_SCENARIOS: [&str; 2] = ["db_write", "codec_cpu"];
+/// Of those, the ones a lifecycle corpus suits too. `db_write` measures
+/// storage, and a lifecycle corpus holds ephemeral events a relay never stores.
+const LIFECYCLE_MIX_SCENARIOS: [&str; 1] = ["codec_cpu"];
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -374,6 +379,8 @@ struct Trial {
     nip77_catchup: Option<catchup::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     db_write: Option<db_write::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codec_cpu: Option<codec::Report>,
 }
 
 #[derive(Serialize)]
@@ -525,6 +532,7 @@ fn main() -> Result<()> {
         "tag_kinds",
         "nip77_catchup",
         "db_write",
+        "codec_cpu",
     ];
     let scenarios: Vec<&str> = if let Some(scenario) = args.scenario.as_deref() {
         if !known_scenarios.contains(&scenario) {
@@ -604,21 +612,7 @@ fn main() -> Result<()> {
         anyhow::bail!("--scenario nip77_catchup syncs over WebSocket only");
     }
 
-    if args.event_mix == EventMix::Lifecycle
-        && scenarios.iter().any(|scenario| {
-            !matches!(
-                *scenario,
-                "ws_publish_1conn"
-                    | "ws_publish_8conn"
-                    | "ws_publish_scaled"
-                    | "live_fanout"
-                    | "idle_connections"
-            )
-        })
-    {
-        anyhow::bail!("--event-mix lifecycle is only valid for live publication scenarios");
-    }
-    check_social_mix(&args, &scenarios)?;
+    check_event_mix(&args, &scenarios)?;
 
     let default_event_count = if args.profile == "smoke" {
         2_000
@@ -766,6 +760,7 @@ fn main() -> Result<()> {
                     | "monitor_index"
                     | "live_subscriptions"
                     | "db_write"
+                    | "codec_cpu"
             ) {
                 vec!["wok"]
             } else {
@@ -850,6 +845,7 @@ fn run_trial(
     let mut rate_report = None;
     let mut catchup_report = None;
     let mut db_write_report = None;
+    let mut codec_report = None;
 
     let bin = if args.has_external_target() || IN_PROCESS_SCENARIOS.contains(&scenario) {
         None
@@ -1335,6 +1331,23 @@ fn run_trial(
                 notes = format!("{e:#}");
             }
         },
+        "codec_cpu" => match codec::run(corpus_path) {
+            Ok(report) => {
+                throughput = report.inbound_rate();
+                mismatches += report.mismatches;
+                ok = report.mismatches == 0;
+                notes = format!(
+                    "in-process codec CPU on {} events; throughput is uncompressed publications per core through the inbound steps; see the codec_cpu table",
+                    report.events
+                );
+                codec_report = Some(report);
+            }
+            Err(e) => {
+                ok = false;
+                errors += 1;
+                notes = format!("{e:#}");
+            }
+        },
         _ => {
             notes = "unrecognized scenario".into();
             ok = false;
@@ -1351,6 +1364,7 @@ fn run_trial(
         publish_rate: rate_report,
         nip77_catchup: catchup_report,
         db_write: db_write_report,
+        codec_cpu: codec_report,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -1389,9 +1403,28 @@ fn measured_binary_sha256(bin: Option<&Path>, scenario: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Only the read scenarios check a social corpus's import against what a
-/// relay keeps of it; the any-mix scenarios read its events as they are.
-fn check_social_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
+/// A lifecycle corpus suits only live publication and the lifecycle-mix
+/// scenarios, and only the read scenarios check a social corpus's import
+/// against what a relay keeps of it; the any-mix scenarios read a corpus's
+/// events as they are.
+fn check_event_mix(args: &Args, scenarios: &[&str]) -> Result<()> {
+    if args.event_mix == EventMix::Lifecycle
+        && scenarios.iter().any(|scenario| {
+            !matches!(
+                *scenario,
+                "ws_publish_1conn"
+                    | "ws_publish_8conn"
+                    | "ws_publish_scaled"
+                    | "live_fanout"
+                    | "idle_connections"
+            ) && !LIFECYCLE_MIX_SCENARIOS.contains(scenario)
+        })
+    {
+        anyhow::bail!(
+            "--event-mix lifecycle is only valid for live publication scenarios and {}",
+            LIFECYCLE_MIX_SCENARIOS.join(", ")
+        );
+    }
     if args.event_mix == EventMix::Social
         && !args.generate_corpus_only
         && scenarios.iter().any(|scenario| {
@@ -1437,6 +1470,7 @@ fn failed_trial(
         publish_rate: None,
         nip77_catchup: None,
         db_write: None,
+        codec_cpu: None,
         client_tcp_nodelay: args.tcp_nodelay,
         relay: relay.into(),
         scenario: scenario.into(),
@@ -3596,6 +3630,9 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(report) = &t.db_write {
             s.push_str(&db_write::render_markdown(report));
         }
+        if let Some(report) = &t.codec_cpu {
+            s.push_str(&codec::render_markdown(report));
+        }
     }
     let mut selection = args.scenario.as_ref().map_or_else(
         || format!("--profile {}", args.profile),
@@ -4133,8 +4170,8 @@ mod tests {
             Args::try_parse_from(argv).unwrap()
         };
         let social = parse(&["--event-mix", "social"]);
-        assert!(check_social_mix(&social, &["db_write"]).is_ok());
-        assert!(check_social_mix(&social, &["ws_publish_1conn"]).is_err());
+        assert!(check_event_mix(&social, &["db_write"]).is_ok());
+        assert!(check_event_mix(&social, &["ws_publish_1conn"]).is_err());
         // Without --events, the generated corpus holds the default steps
         // and a history to write them on.
         let default = parse(&[]);
@@ -4147,9 +4184,28 @@ mod tests {
     }
 
     #[test]
+    fn the_any_mix_scenarios_take_social_and_lifecycle_corpora() {
+        let check = |scenario: &str, mix: &str| {
+            let args =
+                Args::try_parse_from(["wok-bench", "--scenario", scenario, "--event-mix", mix])
+                    .unwrap();
+            check_event_mix(&args, &[scenario])
+        };
+        assert!(check("codec_cpu", "social").is_ok());
+        assert!(check("codec_cpu", "lifecycle").is_ok());
+        assert!(check("db_write", "social").is_ok());
+        assert!(check("db_write", "lifecycle").is_err());
+        assert!(check("ws_query_latency", "social").is_ok());
+        assert!(check("ws_publish_1conn", "social").is_err());
+        assert!(check("ws_publish_1conn", "lifecycle").is_ok());
+        assert!(check("ws_query_latency", "lifecycle").is_err());
+    }
+
+    #[test]
     fn in_process_trials_record_this_binary() {
         let this = sha256_file(&std::env::current_exe().unwrap()).unwrap();
         assert_eq!(measured_binary_sha256(None, "db_write"), this);
+        assert_eq!(measured_binary_sha256(None, "codec_cpu"), this);
         assert_eq!(measured_binary_sha256(None, "ws_publish_1conn"), "");
     }
 

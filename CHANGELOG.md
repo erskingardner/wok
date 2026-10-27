@@ -1092,6 +1092,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wok scan` and `wok scan --count` read the whole database (#256). They
+  clamped a filter to `relay.max_filter_limit`, which bounds client REQs, so
+  at the default of 2000 `wok scan --count '{"kinds":[1]}'` printed 2000 on
+  a database holding millions of notes, and `wok scan '{}'` stopped after
+  2000 events without saying so. strfry's `scan` has no such cap, nor do
+  `wok delete` and `wok dict`; a `limit` in the filter still applies.
+  Operator scans (`wok scan`, `wok delete`, `wok dict`) now hand each event
+  over as they find it, not once the scan is done, and remember only what a
+  filter cut by its `limit`, or a `search`, sent: counting every event takes
+  memory for the events sharing one `created_at`, not for every match. A
+  `search` filter whose rarest term has more than 4,096 postings returned
+  nothing to them; it now runs to the end.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

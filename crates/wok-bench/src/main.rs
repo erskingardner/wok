@@ -3579,7 +3579,7 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
     ));
     if let Some(corpus) = &args.corpus {
         s.push_str(&format!(
-            "corpus={} (supplied; the seed and event mix did not generate it)\n\n",
+            "corpus={} (supplied; this run did not generate it)\n\n",
             corpus.display()
         ));
     }

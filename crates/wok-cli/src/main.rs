@@ -871,7 +871,8 @@ fn parse_fried(line: &str) -> Result<(Vec<u8>, String)> {
 
 /// Write `batch` in one transaction. Returns whether it left its events'
 /// `(tag, kind, created_at)` postings to a key-ordered pass: it does while
-/// the index is unbuilt, a new database's included, and no pass runs.
+/// the index is unbuilt, a new database's included, and no pass runs. With
+/// `relay.tag_kind_index_enabled` off it puts none, and none are built.
 fn commit_import(
     cfg: &Config,
     env: &Env,
@@ -882,7 +883,12 @@ fn commit_import(
     show_rejected: bool,
 ) -> Result<bool> {
     let mut txn = env.begin_rw()?;
-    let deferred_tag_kind = wok_db::defer_tag_kind_postings(&mut txn)?;
+    let deferred_tag_kind = if cfg.relay.tag_kind_index_enabled {
+        wok_db::defer_tag_kind_postings(&mut txn)?
+    } else {
+        wok_db::skip_tag_kind_postings(&mut txn);
+        false
+    };
     let mut sink = wok_negentropy::NegentropyFilterCache::default();
     write_events_with_policy(&mut txn, &mut sink, batch, false, &cfg.vanish_policy())?;
     txn.commit()?;
@@ -2293,6 +2299,54 @@ mod main_tests {
         let parsed =
             parse_and_verify_event(&event, &EventLimits::default(), None, true, false).unwrap();
         EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+    }
+
+    #[test]
+    fn import_with_the_tag_kind_index_off_puts_and_builds_no_postings() {
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let mut events: Vec<_> = (0..3u64)
+            .map(|i| {
+                let mut event = json!({
+                    "created_at": 1_700_000_000 + i,
+                    "kind": 1,
+                    "tags": [["p", format!("{i:064x}")]],
+                    "content": "",
+                    "pubkey": hex::encode(key.x_only_public_key().0.serialize()),
+                });
+                let id = wok_event::event_id_hash(&event).unwrap();
+                event["id"] = json!(hex::encode(id));
+                event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+                let parsed =
+                    parse_and_verify_event(&event, &EventLimits::default(), None, true, false)
+                        .unwrap();
+                EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            db: dir.path().join("db"),
+            ..Config::default()
+        };
+        cfg.relay.tag_kind_index_enabled = false;
+        let env = open_env(&cfg).unwrap();
+        let (mut written, mut rejected, mut duplicates) = (0, 0, 0);
+        let deferred = commit_import(
+            &cfg,
+            &env,
+            &mut events,
+            &mut written,
+            &mut rejected,
+            &mut duplicates,
+            false,
+        )
+        .unwrap();
+        assert!(!deferred, "nothing for a pass to build");
+        assert_eq!(written, 3);
+        let report = check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:#?}", report.issues);
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert!(!tag_kind.complete);
+        assert_eq!(tag_kind.actual_entries, 0);
     }
 
     #[test]

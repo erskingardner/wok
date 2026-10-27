@@ -33,6 +33,12 @@
 //! does neither while another process has the database open: a relay's
 //! writer would begin the pass under the load.
 //!
+//! A relay with `relay.tag_kind_index_enabled` off keeps no postings for the
+//! events it inserts ([`skip_tag_kind_postings`]) and takes no backfill
+//! steps, so the marker stays where it was and queries read `Event__tag`.
+//! Deletions still remove whatever postings their events have. Turned back
+//! on, the backfill indexes the events above the marker.
+//!
 //! An earlier Wok release does not open these tables. The events it inserts take
 //! ids above the marker, so the index stays incomplete until they are indexed.
 //! The events it deletes leave their entries behind. Local ids are never
@@ -301,6 +307,15 @@ pub fn defer_tag_kind_postings(txn: &mut RwTxn<'_>) -> Result<bool, DbError> {
     let defer = unbuilt && !txn.env().open_in_another_process()?;
     txn.defer_tag_kind = defer;
     Ok(defer)
+}
+
+/// Put no postings for the events `txn` inserts, and leave the marker where
+/// it is, whatever the table's state: for a relay with the index turned off.
+/// The index is then incomplete once `txn` stores an event, and queries read
+/// `Event__tag` until a backfill indexes the events above the marker.
+/// Deletions still remove postings.
+pub fn skip_tag_kind_postings(txn: &mut RwTxn<'_>) {
+    txn.defer_tag_kind = true;
 }
 
 /// Empty the table and restart its marker at 0, so that the backfill indexes
@@ -1197,6 +1212,33 @@ mod tests {
         assert_eq!(postings(&env), 0);
         build(&env);
         assert_eq!(postings(&env), 3);
+        assert_complete_and_consistent(&env);
+    }
+
+    #[test]
+    fn skipped_postings_leave_the_marker_for_a_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let indexed = write(&env, 100);
+        write(&env, 101);
+        assert_eq!(state(&env).indexed_through, 2);
+        // With the index off, even a complete table gets no postings and
+        // keeps its marker; deletions still remove postings.
+        let mut events: Vec<_> = (102..105).map(event).collect();
+        let mut txn = env.begin_rw().unwrap();
+        skip_tag_kind_postings(&mut txn);
+        crate::write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        crate::delete_events(&mut txn, &mut NoopNegentropy, [indexed.lev_id]).unwrap();
+        txn.commit().unwrap();
+        let skipped = state(&env);
+        assert_eq!((skipped.indexed_through, skipped.high_water), (2, 5));
+        assert!(!skipped.complete());
+        assert_eq!(postings(&env), 1);
+        assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
+        // Back on, the backfill indexes the events above the marker.
+        build(&env);
+        assert_eq!(postings(&env), 4);
         assert_complete_and_consistent(&env);
     }
 

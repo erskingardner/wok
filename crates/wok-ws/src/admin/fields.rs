@@ -355,6 +355,13 @@ pub(super) const SECTIONS: &[Section] = &[
                 &[Input::new("limits", "search_enabled", "relay.search_enabled", Unit::Switch)],
             ),
             field(
+                "Tag and kind index",
+                "Keep an index that lets a filter with one tag and kinds, such as a DM inbox, read only those kinds. Off, publishing writes less and such filters read the tag value's whole history; back on, the relay builds what it left out.",
+                "",
+                "",
+                &[Input::new("limits", "tag_kind_index_enabled", "relay.tag_kind_index_enabled", Unit::Switch)],
+            ),
+            field(
                 "Query work ceiling",
                 "The most index work a REQ, COUNT or NEG-OPEN may need, estimated before its scan. Requests over it are refused with blocked:.",
                 "Normal batched and outbox queries are refused.",

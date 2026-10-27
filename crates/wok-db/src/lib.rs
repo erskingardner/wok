@@ -78,7 +78,7 @@ pub use search::{
     SEARCH_BUILD_STEP_BUDGET, SEARCH_BUILD_STEP_EVENTS,
 };
 pub use tag_kind::{
-    backfill_tag_kind_index, defer_tag_kind_postings, reset_tag_kind_index,
+    backfill_tag_kind_index, defer_tag_kind_postings, reset_tag_kind_index, skip_tag_kind_postings,
     tag_kind_index_complete_ro, tag_kind_index_state_ro, tag_kind_key, TagKindBackfillStep,
     TagKindBulkPass, TagKindIndexState, TAG_KIND_SCHEMA_VERSION, TAG_KIND_STEP_BUDGET,
     TAG_KIND_STEP_ENTRIES,

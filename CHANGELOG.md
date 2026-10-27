@@ -353,6 +353,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/benchmark-campaign.sh` records what each phase made the relay
+  write (#257): the relay host's helper marks the relay process's storage
+  I/O before and after every phase, and each phase's results get a
+  `relay-io.json` with the bytes read and written, and for a fixed-rate step
+  the bytes written per newly stored event. It works for any relay, strfry
+  included.
 - `wok-bench`'s `live_fanout` keeps up to `--fanout-window` publications
   unacknowledged (256 by default; `FANOUT_WINDOW` in the campaign scripts)
   instead of waiting for each OK before the next (#257). It measured publish

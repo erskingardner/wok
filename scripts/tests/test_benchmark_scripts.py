@@ -231,6 +231,45 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('stop wok before reconciling', result.stderr)
 
+    def test_io_marks_bracket_phases_in_the_relays_io(self):
+        self.write_target('wok', self.valid())
+        artifacts = self.prefix/'opt/relay-bench/campaigns/c1/runs/r1-wok/server'
+        artifacts.mkdir(parents=True)
+        (artifacts/'main.pid').write_text('4242\n')
+        io = self.prefix/'proc/4242/io'
+        io.parent.mkdir(parents=True)
+
+        def mark(label, read, written):
+            io.write_text(f'rchar: 1\nwchar: 2\nread_bytes: {read}\nwrite_bytes: {written}\n'
+                          'cancelled_write_bytes: 0\n')
+            return self.control('io_mark wok "$1" "$2"', str(artifacts), label)
+
+        for label, read, written in [('query-start', 100, 1000), ('query-end', 900, 1500),
+                                     ('rate-1000-start', 900, 1500),
+                                     ('rate-1000-end', 950, 801500),
+                                     ('rate-2000-start', 950, 801500)]:
+            result = mark(label, read, written)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(mark('bad label', 0, 0).returncode, 0)
+        marks = (artifacts/'io-marks.tsv').read_text().splitlines()
+        self.assertEqual([line.split('\t')[0] for line in marks],
+                         ['query-start', 'query-end', 'rate-1000-start', 'rate-1000-end',
+                          'rate-2000-start'])
+
+        result = self.control('io_phases "$1"', str(artifacts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [line.split('\t') for line in
+                (artifacts/'io-phases.tsv').read_text().splitlines()]
+        self.assertEqual(rows[0], ['phase', 'secs', 'read_bytes', 'write_bytes'])
+        # A phase without its end mark (the relay died) is left out.
+        self.assertEqual([(row[0], row[2], row[3]) for row in rows[1:]],
+                         [('query', '800', '500'), ('rate-1000', '50', '800000')])
+
+        (artifacts/'main.pid').unlink()
+        result = mark('lifecycle-start', 0, 0)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('no recorded main PID', result.stderr)
+
     def test_rejects_target_names(self):
         for name in ['', 'Wok', '.hidden', '-wok', 'a/b', 'snapshots', 'x' * 64]:
             with self.subTest(name=name):
@@ -525,7 +564,8 @@ class CampaignSettings(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             calls = Path(tmp)/'calls'
             fake_ssh = (f'ssh() {{ printf "%s\\n---\\n" "$*" >>"{calls}"; }}; '
-                        'LOAD_ROOT=/opt/wok-load/results/c1; ')
+                        'LOAD_ROOT=/opt/wok-load/results/c1 '
+                        'RELAY_ROOT=/opt/relay-bench/campaigns/c1; ')
             for cpus, pinned in [('', False), ('16-47', True)]:
                 with self.subTest(load_cpus=cpus):
                     calls.unlink(missing_ok=True)
@@ -543,6 +583,63 @@ class CampaignSettings(unittest.TestCase):
                     self.assertEqual('AllowedCPUs=16-47' in bench, pinned)
                     stop = "root@load systemctl stop 'relay-bench-load-*.service'"
                     self.assertTrue(any(stop in command for command in sent), sent)
+
+    def test_phases_mark_the_relays_io_and_keep_their_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp)/'calls'
+            for bench_status in [0, 3]:
+                with self.subTest(bench_status=bench_status):
+                    calls.unlink(missing_ok=True)
+                    result = self.campaign(
+                        f'remote_command() {{ printf "%s\\n" "$*" >>"{calls}"; }}; '
+                        f'ssh() {{ echo bench >>"{calls}"; return {bench_status}; }}; '
+                        'LOAD_ROOT=/l RELAY_ROOT=/r; '
+                        'status=0; launch_bench wok 2 ws://10.0.0.2:7777 rate-1000 7 '
+                        '--scenario x || status=$?; '
+                        'echo "status=$status phases=${PHASES_LAUNCHED[*]}"',
+                        CAMPAIGN_ID='c1')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f'status={bench_status} phases=rate-1000', result.stdout)
+                    sent = calls.read_text().splitlines()
+                    marks = [i for i, line in enumerate(sent) if ' io-mark ' in line]
+                    bench = sent.index('bench')
+                    self.assertEqual(len(marks), 2, sent)
+                    self.assertLess(marks[0], bench)
+                    self.assertGreater(marks[1], bench)
+                    self.assertTrue(sent[marks[0]].endswith(
+                        'io-mark wok /r/runs/r2-wok/server rate-1000-start'), sent)
+                    self.assertTrue(sent[marks[1]].endswith(
+                        'io-mark wok /r/runs/r2-wok/server rate-1000-end'), sent)
+
+    def test_phase_io_gives_bytes_per_stored_event_for_rate_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root/'runs/r1-wok'
+            (run/'server').mkdir(parents=True)
+            (run/'server/io-phases.tsv').write_text(
+                'phase\tsecs\tread_bytes\twrite_bytes\n'
+                'query\t12.5\t800\t500\n'
+                'rate-1000\t190.0\t50\t800000\n')
+            for phase, results in [
+                    ('query', {'ok': True}),
+                    ('rate-1000', {'publish_rate': {'accepted': 1000, 'duplicates': 200}}),
+                    ('lifecycle', {'ok': True})]:
+                (run/f'load/{phase}').mkdir(parents=True)
+                (run/f'load/{phase}/results.jsonl').write_text(json.dumps(results) + '\n')
+            result = self.campaign(
+                'remote_command() { shift; "$@"; }; '
+                f'LOAD_ROOT={root}; PHASES_LAUNCHED=(query rate-1000 lifecycle); '
+                'phase_io wok 1')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            query = json.loads((run/'load/query/relay-io.json').read_text())
+            self.assertEqual(query, {'phase': 'query', 'secs': 12.5, 'read_bytes': 800,
+                                     'write_bytes': 500})
+            rate = json.loads((run/'load/rate-1000/relay-io.json').read_text())
+            self.assertEqual(rate['stored_events'], 800)
+            self.assertEqual(rate['write_bytes_per_stored_event'], 1000)
+            # No marks for lifecycle (the relay died): no summary, no file.
+            self.assertFalse((run/'load/lifecycle/relay-io.json').exists())
+            self.assertFalse((run/'load/lifecycle/relay-io.json.tmp').exists())
 
     def test_file_limit_reaches_import_and_start(self):
         with tempfile.TemporaryDirectory() as tmp:

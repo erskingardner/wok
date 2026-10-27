@@ -1256,6 +1256,17 @@ cross-stream ingestion ordering as a distinct experiment. The historical
 corpus keeps one fixed timestamp and byte-identical signatures; each lifecycle
 phase uses a freshly recorded timestamp so short-lived ephemerals remain valid.
 
+Around each phase, the helper's `io-mark` records the relay process's
+cumulative storage I/O (`read_bytes` and `write_bytes` of `/proc/<pid>/io`,
+every thread included) in the server evidence's `io-marks.tsv`. When the
+run stops, `io-phases.tsv` gives each phase's seconds and the bytes the
+relay read and wrote during it. `write_bytes` counts pages dirtied for the
+disk, so a relay on tmpfs shows 0. Once the evidence reaches the load host,
+each phase gets a `relay-io.json` beside its results; for a fixed-rate step
+it adds the events the step newly stored (accepted less duplicates) and the
+bytes written per such event. This works for strfry as well as Wok. A
+missing mark leaves that phase's bytes out and does not fail the run.
+
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`
 and `mpstat` output, and a copy of each server-side evidence directory.

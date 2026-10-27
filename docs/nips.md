@@ -60,6 +60,12 @@ the request's other filters still apply. A REQ whose filters all have an empty
 list gets EOSE and stays open, a COUNT reports 0, and a NEG-OPEN reconciles
 against no events. Filter-validation limits still count the skipped filters.
 
+A `#x` filter matches the values of the event's own tags. `#d:[""]` matches
+events with a `d` tag of that value, and addressable events without a `d`,
+whose address NIP-01 takes to be the empty string. It does not match other
+replaceable or addressable events, though Wok packs an empty `d` into them to
+key replacement; see [known differences](known-differences.md).
+
 A filter with `limit: 0` returns no stored events. The subscription still gets
 EOSE once its other filters have sent theirs, and stays open for new events.
 

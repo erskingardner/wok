@@ -1014,10 +1014,12 @@ fn cmd_scan(cfg: &Config, filter: &str, count: bool) -> Result<()> {
     let filter: serde_json::Value = serde_json::from_str(filter)?;
     let mut n = 0u64;
     let mut decomp = Decompressor::new();
+    // relay.max_filter_limit bounds client REQs; an operator scan covers the
+    // whole database unless the filter sets its own limit.
     foreach_by_filter_scan(
         &txn,
         &filter,
-        cfg.relay.max_filter_limit,
+        u64::MAX,
         cfg.relay.max_tags_per_filter,
         cfg.relay.max_and_entries,
         |lev| {

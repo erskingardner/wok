@@ -4,6 +4,8 @@
 !rust-toolchain.toml
 !crates/
 !crates/**
+!vendor/
+!vendor/**
 !contrib/
 !contrib/lab/
 !contrib/lab/**

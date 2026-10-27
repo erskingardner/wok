@@ -220,8 +220,30 @@ fn upgrade_v4_marker(txn: *mut MDB_txn, dbi: MDB_dbi) -> Result<(), DbError> {
     Ok(())
 }
 
+/// The LMDB this binary is linked with: major, minor and patch.
+pub fn lmdb_version() -> (i32, i32, i32) {
+    let (mut major, mut minor, mut patch) = (0, 0, 0);
+    // Writes the three numbers and returns a static string.
+    unsafe { mdb_version(&mut major, &mut minor, &mut patch) };
+    (major, minor, patch)
+}
+
+/// Wok's databases, and the strfry ones it imports, are LMDB 0.9 files.
+/// LMDB 1.0 changed the file format: it refuses to open a 0.9 file, and would
+/// create a new database that strfry and earlier Wok releases cannot read. So
+/// any LMDB but 0.9 is refused before it opens or creates one.
+fn check_lmdb_version((major, minor, patch): (i32, i32, i32)) -> Result<(), DbError> {
+    if (major, minor) == (0, 9) {
+        return Ok(());
+    }
+    Err(DbError::msg(format!(
+        "Wok needs LMDB 0.9, but this binary is linked with LMDB {major}.{minor}.{patch}"
+    )))
+}
+
 impl Env {
     pub fn open(path: impl AsRef<Path>, opts: EnvOptions) -> Result<Self, DbError> {
+        check_lmdb_version(lmdb_version())?;
         let path = path.as_ref();
         if opts.create_dir {
             std::fs::create_dir_all(path).map_err(|e| DbError::msg(e.to_string()))?;
@@ -627,6 +649,16 @@ fn _schema_touch() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_the_bundled_lmdb_and_refuses_any_but_0_9() {
+        // vendor/lmdb-sys, not a system liblmdb.
+        assert_eq!(lmdb_version(), (0, 9, 37));
+        assert!(check_lmdb_version((0, 9, 21)).is_ok());
+        let err = check_lmdb_version((1, 0, 2)).unwrap_err();
+        assert!(err.to_string().contains("linked with LMDB 1.0.2"), "{err}");
+        assert!(check_lmdb_version((0, 10, 0)).is_err());
+    }
 
     #[test]
     fn explicit_read_only_environment_supports_reads_and_refuses_writes() {

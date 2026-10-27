@@ -964,6 +964,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Wok bundles LMDB 0.9.37, up from 0.9.21 (#257). The newer releases fix
+  DUPSORT deletes and alignment, a race freeing spilled pages at the end of
+  a write, and fdatasync and metapage syncs on macOS. The source is vendored
+  and always built, so a system liblmdb found by pkg-config is no longer
+  linked in its place. The file format is unchanged, so existing databases
+  and strfry imports open as before; a binary linked with any LMDB but 0.9
+  refuses to open one, and the relay logs its LMDB version at startup.
 - Opening a database no longer fails when the search index is being rebuilt
   and an event has no payload, or a payload that does not decode (#257).
   The event is left out of the index, and `wok doctor` reports it.

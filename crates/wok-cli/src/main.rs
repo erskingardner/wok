@@ -498,9 +498,11 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 }
 
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
+    let (major, minor, patch) = wok_db::lmdb_version();
     tracing::info!(
         preset = %cfg.preset,
         wok = env!("CARGO_PKG_VERSION"),
+        lmdb = %format_args!("{major}.{minor}.{patch}"),
         "starting relay"
     );
     let warnings = [

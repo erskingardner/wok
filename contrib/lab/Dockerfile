@@ -3,6 +3,7 @@ FROM rust:1.99.0-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
+COPY vendor vendor
 RUN cargo build --release --locked -p wok-cli -p wok-bench
 
 FROM debian:bookworm-slim

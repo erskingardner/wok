@@ -263,3 +263,45 @@ fn enabling_quota_counts_preexisting_events_and_disabling_keeps_cache_current() 
     assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 3);
     txn.commit().unwrap();
 }
+
+/// A counter below the author's stored events, as earlier releases left
+/// when they missed events at created_at 0, does not abort the deletion
+/// that would take it below zero: that deletion drops it, and the next
+/// request counts the author index again.
+#[test]
+fn a_deletion_drops_a_counter_below_the_authors_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let state = env.dbis().state.unwrap();
+    let mut counter = vec![b'a'];
+    counter.extend_from_slice(&[9; 32]);
+    let mut txn = env.begin_rw().unwrap();
+    let mut events = [
+        stored_event(1, 1, 1),
+        stored_event(2, 2, 1),
+        stored_event(3, 3, 1),
+    ];
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+    txn.put(state, &counter, &1u64.to_le_bytes(), 0).unwrap();
+    txn.commit().unwrap();
+
+    let drift = wok_db::state::AUTHOR_COUNT_DRIFT.load(std::sync::atomic::Ordering::Relaxed);
+    let mut txn = env.begin_rw().unwrap();
+    assert_eq!(
+        wok_db::delete_events(&mut txn, &mut wok_db::NoopNegentropy, [1, 2]).unwrap(),
+        2
+    );
+    txn.commit().unwrap();
+    assert!(wok_db::state::AUTHOR_COUNT_DRIFT.load(std::sync::atomic::Ordering::Relaxed) > drift);
+    let txn = env.begin_ro().unwrap();
+    assert_eq!(txn.get(state, &counter).unwrap(), None);
+    assert!(wok_db::check_integrity(&txn).unwrap().ok());
+    drop(txn);
+    let mut txn = env.begin_rw().unwrap();
+    assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 1);
+    txn.commit().unwrap();
+    assert!(wok_db::check_integrity(&env.begin_ro().unwrap())
+        .unwrap()
+        .ok());
+}

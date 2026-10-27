@@ -1021,8 +1021,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   word. A stream now waits at the first event a connected peer has no room
   for and resumes there as that peer catches up. **A slow peer now holds
   back the other peers in its stream**, and a peer that takes longer than
-  `connectionTimeout` to accept a frame is disconnected and reconnected. A
-  reload that removes a URL, or changes a stream's `dir` or `filter`, now
+  `connectionTimeout` to accept a frame is disconnected, with a log line,
+  and reconnected. Up streams stay live-only: like any peer that
+  disconnects, it misses the events queued for it, and `wok sync` repairs
+  the gap. A reload that removes a URL, or changes a stream's `dir` or `filter`, now
   closes the connection even when its queue is full; before, the close
   waited in that queue, was lost when it was full, and left the old
   connection running and storing what it downloaded.

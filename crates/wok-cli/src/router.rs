@@ -866,14 +866,16 @@ async fn run_conn(
     // sees it resolve ends the loop, so it is never polled again after that.
     // The loop is unbiased so neither reads nor queued sends starve the other.
     let (mut wtx, mut wrx) = ws.split();
-    let mut open = true;
+    let mut sent = Ok(());
+    // An up frame was taken off the queue but not sent.
+    let mut lost_frame = false;
     if dir == "down" || dir == "both" {
         let mut f = remote_filter;
         f["limit"] = json!(0);
         let msg = json!(["REQ", "X", f]).to_string();
-        open = send_frame(&mut wtx, Message::Text(msg.into()), timeout, &mut close_rx).await;
+        sent = send_frame(&mut wtx, Message::Text(msg.into()), timeout, &mut close_rx).await;
     }
-    while open {
+    while sent.is_ok() {
         tokio::select! {
             _ = &mut close_rx => break,
             msg = wrx.next() => {
@@ -886,7 +888,7 @@ async fn run_conn(
                         handle_conn_text(&tx, &group, &url, &t, max_event_size, &budget).await;
                     }
                     Some(Ok(Message::Ping(p))) => {
-                        open = send_frame(&mut wtx, Message::Pong(p), timeout, &mut close_rx).await;
+                        sent = send_frame(&mut wtx, Message::Pong(p), timeout, &mut close_rx).await;
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     _ => {}
@@ -894,34 +896,63 @@ async fn run_conn(
             }
             frame = conn_rx.recv() => {
                 let Some(frame) = frame else { break };
-                open = send_frame(&mut wtx, Message::Text(frame.into()), timeout, &mut close_rx).await;
-                if open && conn_rx.len() == UP_QUEUE_LOW_WATER {
+                sent = send_frame(&mut wtx, Message::Text(frame.into()), timeout, &mut close_rx).await;
+                lost_frame = sent.is_err();
+                if sent.is_ok() && conn_rx.len() == UP_QUEUE_LOW_WATER {
                     let _ = tx.send(ManagerMsg::Drained).await;
                 }
             }
         }
     }
+    // Up streams are live-only: what was queued for a dropped peer is not
+    // resent when it reconnects.
+    if let Err(SendStop::Peer(reason)) = sent {
+        let unsent = conn_rx.len() + usize::from(lost_frame);
+        let _ = tx
+            .send(ManagerMsg::Log {
+                group: group.clone(),
+                url: url.clone(),
+                text: format!("disconnecting: {reason}; {unsent} queued up events not sent"),
+            })
+            .await;
+    }
     let _ = tokio::time::timeout(CLOSE_FRAME_TIMEOUT, wtx.send(Message::Close(None))).await;
     let _ = tx.send(ManagerMsg::Disconnected { group, url, id }).await;
 }
 
+/// Why a connection stopped sending.
+enum SendStop {
+    /// The manager dropped the connection's handle.
+    Closed,
+    /// The write failed, or the peer took longer than the timeout to accept it.
+    Peer(String),
+}
+
 /// Send one frame unless the manager closes the connection first or the peer
 /// takes longer than `timeout` to accept it, so a peer that stops reading
-/// can't hold up its stream. False ends the connection.
+/// can't hold up its stream. An error ends the connection.
 async fn send_frame<S>(
     wtx: &mut S,
     frame: tokio_tungstenite::tungstenite::Message,
     timeout: Duration,
     close_rx: &mut oneshot::Receiver<()>,
-) -> bool
+) -> Result<(), SendStop>
 where
     S: futures_util::Sink<tokio_tungstenite::tungstenite::Message> + Unpin,
+    S::Error: std::fmt::Display,
 {
     use futures_util::SinkExt;
     tokio::select! {
         biased;
-        _ = &mut *close_rx => false,
-        sent = tokio::time::timeout(timeout, wtx.send(frame)) => matches!(sent, Ok(Ok(()))),
+        _ = &mut *close_rx => Err(SendStop::Closed),
+        sent = tokio::time::timeout(timeout, wtx.send(frame)) => match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(SendStop::Peer(format!("send failed: {error}"))),
+            Err(_) => Err(SendStop::Peer(format!(
+                "peer took longer than {}s to accept a frame",
+                timeout.as_secs()
+            ))),
+        },
     }
 }
 
@@ -1236,9 +1267,17 @@ mod tests {
         assert_eq!(groups["full"].up_cursor, head);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reload_closes_a_connection_whose_up_queue_is_full() {
-        // A peer that completes the handshake and then never reads.
+    /// An up connection, with its queue filled, to a peer that completes the
+    /// handshake and then never reads. Also returns the manager's end of the
+    /// connection's reports and the peer's task.
+    async fn stalled_up_conn(
+        write_timeout: Duration,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<ManagerMsg>,
+        ConnHandle,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let peer = tokio::spawn(async move {
@@ -1250,16 +1289,14 @@ mod tests {
         // sends while the queue fills never block it.
         let (manager_tx, mut manager_rx) = mpsc::channel(4096);
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_EVENT_BYTES));
-        // A write timeout far beyond the test's wait, so only the close can
-        // end the connection in time.
         let conn = tokio::spawn(run_conn(
             "g".into(),
-            url.clone(),
+            url,
             1,
             "up".into(),
             json!({}),
             manager_tx,
-            Duration::from_secs(600),
+            write_timeout,
             65536,
             budget,
         ));
@@ -1274,8 +1311,30 @@ mod tests {
                 Err(mpsc::error::TrySendError::Closed(_)) => panic!("the connection ended early"),
             }
         }
+        (conn, manager_rx, handle, peer)
+    }
 
-        let mut groups = HashMap::from([("g".to_string(), up_group(&url, handle))]);
+    /// The connection's reports up to its disconnect, without `Drained`.
+    async fn reports_until_disconnect(manager_rx: &mut mpsc::Receiver<ManagerMsg>) -> Vec<String> {
+        let mut logs = Vec::new();
+        loop {
+            match manager_rx.recv().await {
+                Some(ManagerMsg::Disconnected { id, .. }) => break assert_eq!(id, 1),
+                Some(ManagerMsg::Drained) => {}
+                Some(ManagerMsg::Log { text, .. }) => logs.push(text),
+                _ => panic!("the connection did not report its disconnect"),
+            }
+        }
+        logs
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_closes_a_connection_whose_up_queue_is_full() {
+        // A write timeout far beyond the test's wait, so only the close can
+        // end the connection in time.
+        let (conn, mut manager_rx, handle, peer) = stalled_up_conn(Duration::from_secs(600)).await;
+        let url = "ws://stalled.invalid";
+        let mut groups = HashMap::from([("g".to_string(), up_group(url, handle))]);
         let router_cfg = RouterConfig {
             connection_timeout: Duration::from_secs(20),
             verbose: false,
@@ -1287,13 +1346,24 @@ mod tests {
             .await
             .expect("the close was held back by the full queue")
             .unwrap();
-        loop {
-            match manager_rx.recv().await {
-                Some(ManagerMsg::Disconnected { id, .. }) => break assert_eq!(id, 1),
-                Some(ManagerMsg::Drained) => {}
-                _ => panic!("the connection did not report its disconnect"),
-            }
-        }
+        assert!(reports_until_disconnect(&mut manager_rx).await.is_empty());
+        peer.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_that_stops_reading_is_dropped_and_logged() {
+        let (conn, mut manager_rx, _handle, peer) = stalled_up_conn(Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_secs(15), conn)
+            .await
+            .expect("the write timeout did not drop the peer")
+            .unwrap();
+        let logs = reports_until_disconnect(&mut manager_rx).await;
+        assert!(
+            logs.iter().any(|text| text
+                .starts_with("disconnecting: peer took longer than 2s to accept a frame;")
+                && text.ends_with("queued up events not sent")),
+            "{logs:?}"
+        );
         peer.abort();
     }
 

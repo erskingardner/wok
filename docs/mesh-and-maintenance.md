@@ -171,8 +171,11 @@ time. Each connection queues up to 256 events. When a peer's queue is full,
 its stream waits at that event and resumes as the peer catches up, so
 nothing is skipped, but a slow peer holds back the other peers in its
 stream: give peers of very different speeds streams of their own. A peer
-that takes longer than `connectionTimeout` to accept a frame is disconnected
-and reconnected like any other dropped connection. A reload that removes a
+that takes longer than `connectionTimeout` to accept a frame is disconnected,
+with a log line giving the reason and how many queued events it missed, and
+reconnected. Like any peer that disconnects, it misses the events queued for
+it and those stored before it reconnects; `wok sync` repairs the gap. A
+reload that removes a
 URL, or changes a stream's `dir` or `filter`, closes those connections at
 once; a changed stream then sends the events stored from then on.
 

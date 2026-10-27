@@ -125,8 +125,8 @@ it is not a promise to reproduce upstream bugs.
   stream that reaches a peer whose queue is full waits at that event and
   resumes as the peer drains it, so a slow peer slows the other peers in its
   stream, and a peer that takes longer than `connectionTimeout` to accept a
-  frame is disconnected. The pinned strfry queues these sends without a
-  bound.
+  frame is disconnected, missing what was queued for it. The pinned strfry
+  queues these sends without a bound.
 - Mesh client connections do not currently offer permessage-deflate. Wok's
   WebSocket server does negotiate it, and refuses a compressed message that
   inflates past half of `relay.max_websocket_payload_size` plus 64 KiB and

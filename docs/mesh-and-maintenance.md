@@ -147,6 +147,29 @@ status unless `pipefail` is set. `--no-verify` skips the id, signature and
 Unlike `wok import --no-verify`, which still stops at a line of
 `max_event_size` bytes or more, it then prints oversized events too.
 
+## One-shot uploads
+
+`wok upload <url> [--pipeline <n>]` sends each line of standard input to the
+relay as an EVENT, with at most `--pipeline` events (default 50, at least 1)
+awaiting the relay's OK. It matches each OK to an event it sent by id and
+counts it as accepted, a duplicate (`OK true` with a `duplicate:` reason),
+superseded (`blocked: have a newer version`, or `replaced:` from strfry and
+earlier Wok releases) or refused, and logs each refusal with its reason. A
+line that is not JSON with a lowercase 32-byte hex `id` is not sent; it is
+logged, as `wok import` logs lines it cannot parse. The relay checks the rest
+of the event. NOTICE and CLOSED messages are logged and acknowledge nothing.
+The command ends with a summary on stderr:
+
+```text
+Upload complete: lines=3 sent=3 accepted=2 duplicates=1 superseded=0 refused=0 invalid=0 unacknowledged=0
+```
+
+It exits nonzero, and the summary starts `Upload failed`, when the relay
+refused an event, a line was not sent, or the connection closed with
+acknowledgments outstanding or input left unsent. As in `wok sync`, a
+superseded event is not a failure. A relay that never answers an EVENT keeps
+the command waiting.
+
 ## Persistent mesh links
 
 Use `wok router` for new long-running replication setups. It supports multiple

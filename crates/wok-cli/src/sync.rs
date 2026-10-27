@@ -78,7 +78,7 @@ pub async fn run(cfg: &Config, options: Options) -> Result<()> {
 
 /// True when a peer refused an upload because it stores a newer version.
 /// strfry and earlier Wok releases reply `replaced:` instead.
-fn upload_superseded(reason: &str) -> bool {
+pub(crate) fn upload_superseded(reason: &str) -> bool {
     reason.starts_with(wok_relay::protocol::SUPERSEDED_OK_REASON) || reason.starts_with("replaced:")
 }
 

@@ -418,6 +418,49 @@ mod tests {
     }
 
     #[test]
+    fn filter_tags_leave_out_the_added_d() {
+        let filter_tags = |kind: u64, tags: Value| {
+            let v = json!({
+                "id": "11".repeat(32),
+                "pubkey": "22".repeat(32),
+                "created_at": 1,
+                "kind": kind,
+                "content": "",
+                "tags": tags,
+                "sig": "00".repeat(64),
+            });
+            let packed = nostr_json_to_packed_event(&v, &EventLimits::default()).unwrap();
+            let mut out = Vec::new();
+            packed.view().foreach_filter_tag(|name, value| {
+                out.push(format!("{name}={}", String::from_utf8_lossy(value)));
+                true
+            });
+            out
+        };
+        // Replaceable: the leading empty d is added, a d of the event's own
+        // is kept.
+        assert!(filter_tags(0, json!([])).is_empty());
+        assert_eq!(filter_tags(10002, json!([["r", "x"]])), ["r=x"]);
+        assert_eq!(filter_tags(10002, json!([["d", ""]])), ["d="]);
+        assert_eq!(
+            filter_tags(3, json!([["d", "x"], ["d", ""]])),
+            ["d=x", "d="]
+        );
+        // Addressable: the trailing empty d is the address of an event
+        // without a d, and added otherwise.
+        assert_eq!(filter_tags(30023, json!([["t", "x"]])), ["t=x", "d="]);
+        assert_eq!(filter_tags(30023, json!([["d", "intro"]])), ["d=intro"]);
+        assert_eq!(filter_tags(30023, json!([["d", ""]])), ["d="]);
+        assert_eq!(
+            filter_tags(30023, json!([["d", "intro"], ["d", ""], ["t", "x"]])),
+            ["d=intro", "d=", "t=x"]
+        );
+        // Other kinds add nothing.
+        assert_eq!(filter_tags(1, json!([["d", ""]])), ["d="]);
+        assert!(filter_tags(1, json!([])).is_empty());
+    }
+
+    #[test]
     fn long_tag_values_are_packed_by_hash() {
         let event = |kind: u64, tags: Value| {
             json!({

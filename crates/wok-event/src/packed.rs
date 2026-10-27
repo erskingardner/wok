@@ -19,7 +19,9 @@
 
 use std::borrow::Cow;
 
-use crate::{sha256, EventError, MAX_INDEXED_TAG_VAL_SIZE};
+use crate::{
+    is_param_replaceable_kind, is_replaceable_kind, sha256, EventError, MAX_INDEXED_TAG_VAL_SIZE,
+};
 
 pub const PACKED_HEADER_LEN: usize = 88;
 
@@ -129,6 +131,40 @@ impl<'a> PackedEventView<'a> {
     where
         F: FnMut(char, &[u8]) -> bool,
     {
+        self.walk_tags(|name, val, _| cb(name, val));
+    }
+
+    /// Iterate the tags NIP-01 tag filters match: the indexable tags without
+    /// the empty `d` packing adds so the first `d` keys replacement. That is
+    /// the first tag of a replaceable event, and the last tag of an
+    /// addressable event that has a `d` tag of its own. An addressable event
+    /// without one keeps it, because its address is the empty `d`.
+    ///
+    /// The tag indexes hold the added `d` too, so only the stored event can
+    /// tell whether an entry for the empty `d` matches.
+    pub fn foreach_filter_tag<F>(&self, mut cb: F)
+    where
+        F: FnMut(char, &[u8]) -> bool,
+    {
+        let kind = self.kind();
+        let replaceable = is_replaceable_kind(kind);
+        let addressable = is_param_replaceable_kind(kind);
+        let (mut first, mut d_seen) = (true, false);
+        self.walk_tags(|name, val, last| {
+            let added = name == 'd'
+                && val.is_empty()
+                && ((replaceable && first) || (addressable && d_seen && last));
+            first = false;
+            d_seen |= name == 'd';
+            added || cb(name, val)
+        });
+    }
+
+    /// Each tag, and whether it ends the record.
+    fn walk_tags<F>(&self, mut cb: F)
+    where
+        F: FnMut(char, &[u8], bool) -> bool,
+    {
         let mut b = &self.buf[PACKED_HEADER_LEN..];
         while b.len() >= 2 {
             let tag_name = b[0] as char;
@@ -136,11 +172,11 @@ impl<'a> PackedEventView<'a> {
             if tag_len > b.len() - 2 {
                 break;
             }
-            let val = &b[2..2 + tag_len];
-            if !cb(tag_name, val) {
+            let (val, rest) = b[2..].split_at(tag_len);
+            if !cb(tag_name, val, rest.is_empty()) {
                 break;
             }
-            b = &b[2 + tag_len..];
+            b = rest;
         }
     }
 

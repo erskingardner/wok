@@ -129,7 +129,6 @@
 <wok_negentropy::vector::Vector>::allocated_bytes
 <wok_negentropy::vector::Vector>::check_bounds
 <wok_negentropy::vector::Vector>::check_sealed
-<wok_negentropy::vector::Vector>::is_sealed
 <wok_negentropy::vector::Vector>::new
 <wok_negentropy::vector::Vector>::seal
 <wok_query::filter::FilterSetBytes>::at
@@ -618,6 +617,7 @@ wok_event::validate::require_canonical_addresses
 wok_event::validate::verify_event_json_size
 wok_event::validate::verify_event_timestamp
 wok_event::validate::verify_nostr_event_with
+wok_negentropy::btree::check_encoded
 wok_negentropy::cache::parse_negentropy_filter
 wok_negentropy::encoding::decode_varint
 wok_negentropy::encoding::encode_varint

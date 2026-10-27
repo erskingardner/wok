@@ -866,6 +866,9 @@ enum NegMsg {
         conn_id: u64,
         sub_id: SubId,
         payload: Vec<u8>,
+        /// When the ingester took it. One taken before the worker sent its
+        /// session's last reply was sent before the client could read it.
+        received: std::time::Instant,
     },
     SetAuth {
         conn_id: u64,
@@ -3930,6 +3933,7 @@ fn ingest_neg(
             conn_id,
             sub_id: sid,
             payload: decode()?,
+            received: std::time::Instant::now(),
         });
         return Ok(());
     };

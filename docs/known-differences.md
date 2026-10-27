@@ -165,6 +165,11 @@ it is not a promise to reproduce upstream bugs.
   none is in flight, refusals included. Wok also sends only lines that are
   JSON with a lowercase 32-byte hex `id`, and refuses `--pipeline 0`, with
   which strfry's sends nothing and waits.
+- `wok download` exits nonzero on a NOTICE before the first event whose
+  text starts with `error:` or a NIP-01 refusal prefix, and after `--timeout`
+  seconds (default 60) without the handshake, an event or EOSE. The pinned
+  strfry's `download` logs every NOTICE and waits for EOSE without a bound.
+  Both exit nonzero on CLOSED.
 - Negentropy tree filters are parsed without `relay.max_tags_per_filter` or
   `relay.max_and_entries`, which bound client filters. strfry parses stored
   tree filters with `relay__maxTagsPerFilter`, so lowering it below a tree's
@@ -237,13 +242,16 @@ regression test. Differential parity alone is not a reason to retain it.
   Pinned strfry reads the whole message and stops only when its reply fills
   the 500,000-byte frame, so a crafted message can cost it more; a heavily
   diverged sync can take Wok a few more rounds.
-- NIP-77: a NEG-MSG sent before the reply to its session's NEG-OPEN, while
-  the view built in memory is still being scanned, closes the session with
-  NEG-ERR `invalid: NEG-MSG sent before the reply to NEG-OPEN`. The client
-  and relay take turns, so the message answers nothing. Pinned strfry sends
-  a NOTICE, `negentropy error: got NEG-MSG before NEG-OPEN complete`, which
-  names no session, and keeps the session, whose next reply answers the
-  NEG-OPEN.
+- NIP-77: a NEG-MSG sent before the relay's reply to its session's NEG-OPEN
+  or previous NEG-MSG closes the session with NEG-ERR `invalid: NEG-MSG sent
+  before the reply to NEG-OPEN` or `invalid: NEG-MSG sent before the reply
+  to the previous NEG-MSG`, whether a tree or a view built in memory serves
+  it. The client and relay take turns, so the message answers nothing, and
+  a client cannot queue a burst of messages' work on a negentropy worker.
+  Pinned strfry answers every such NEG-MSG, except one sent while the view
+  built in memory is still being scanned: for that it sends a NOTICE,
+  `negentropy error: got NEG-MSG before NEG-OPEN complete`, which names no
+  session, and keeps the session, whose next reply answers the NEG-OPEN.
 - NIP-70: a repost (kind 6 or 16) is refused with `blocked: reposts can't
   embed protected events` when its content parses as an event object with a
   tag named `-`. Content that starts as a JSON object but that the strict

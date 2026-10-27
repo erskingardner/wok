@@ -5196,7 +5196,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_vanish_markers_block_old_authored_events_and_all_gift_wraps() {
+    fn batch_vanish_markers_block_old_authored_events_and_gift_wraps() {
         let author = [1u8; 32];
         let mut markers = HashMap::new();
         markers.insert(author, 200);
@@ -5209,11 +5209,133 @@ mod tests {
         assert!(!event_matches_vanish_markers(newer.view(), &markers));
         assert!(!event_matches_vanish_markers(request.view(), &markers));
 
+        // A wrap to the author vanishes only up to the request, like the
+        // author's own events (#249).
         let mut gift_tags = PackedEventTagBuilder::default();
         gift_tags.add('p', &author).unwrap();
-        let gift =
-            PackedEventBuilder::build(&[5; 32], &[6; 32], 999, 21059, 0, &gift_tags).unwrap();
-        assert!(event_matches_vanish_markers(gift.view(), &markers));
+        for (created_at, vanished) in [(100, true), (200, true), (201, false), (999, false)] {
+            for kind in [1059, 21059] {
+                let gift =
+                    PackedEventBuilder::build(&[5; 32], &[6; 32], created_at, kind, 0, &gift_tags)
+                        .unwrap();
+                assert_eq!(
+                    event_matches_vanish_markers(gift.view(), &markers),
+                    vanished,
+                    "kind {kind} at {created_at}"
+                );
+            }
+        }
+    }
+
+    /// A vanish request, its author's events and gift wraps to the author
+    /// in one writer batch, the request last: what is dated at or before the
+    /// request is refused and what is dated after it is written (#249).
+    #[test]
+    fn same_batch_vanish_request_refuses_only_what_it_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut config = Config::default();
+        config.db = dir.path().to_path_buf();
+        config.relay.nip62.enabled = true;
+        // Gift wraps are refused where AUTH cannot let their recipient read
+        // them.
+        config.relay.auth.service_url = "wss://relay.example.com".into();
+        let config = Arc::new(parking_lot::RwLock::new(config));
+        let conns = Arc::new(ConnTable::new());
+        let moderation = Arc::new(parking_lot::RwLock::new(
+            env.begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                .unwrap(),
+        ));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+
+        let (author, wrapper) = ([10u8; 32], [11u8; 32]);
+        // Id, author, created_at, kind, and whether it is written.
+        let events = [
+            ([20u8; 32], wrapper, 1000, 1059, false),
+            ([21; 32], wrapper, 1001, 1059, true),
+            ([22; 32], author, 1000, 1, false),
+            ([23; 32], author, 1001, 1, true),
+            ([24; 32], author, 1000, VANISH_KIND, true),
+        ];
+        let (writer_tx, writer_rx) = bounded(events.len());
+        for (id, pubkey, created_at, kind, _) in events {
+            let mut tags = PackedEventTagBuilder::default();
+            let json_tags = match kind {
+                1059 => {
+                    tags.add('p', &author).unwrap();
+                    json!([["p", to_hex(&author)]])
+                }
+                VANISH_KIND => {
+                    tags.add('r', wok_db::ALL_RELAYS).unwrap();
+                    json!([["relay", "ALL_RELAYS"]])
+                }
+                _ => json!([]),
+            };
+            let packed =
+                PackedEventBuilder::build(&id, &pubkey, created_at, kind, 0, &tags).unwrap();
+            let json = json!({
+                "id": to_hex(&id),
+                "pubkey": to_hex(&pubkey),
+                "created_at": created_at,
+                "kind": kind,
+                "tags": json_tags,
+                "content": "",
+                "sig": "00".repeat(64),
+            })
+            .to_string();
+            writer_tx
+                .send(WriterMsg::AddEvent {
+                    conn_id: 1,
+                    source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                    packed: packed.into_bytes(),
+                    json,
+                    authed: None,
+                    grant: WriteGrant {
+                        authenticated: false,
+                        as_author: false,
+                        challenged: false,
+                        member: None,
+                        inbox: false,
+                    },
+                })
+                .unwrap();
+        }
+        drop(writer_tx);
+        run_writer(
+            env.clone(),
+            config,
+            conns,
+            Arc::new(Metrics::default()),
+            writer_rx,
+            Vec::new(),
+            moderation,
+            TAG_KIND_STEP,
+        );
+
+        let mut responses = Vec::new();
+        while let Ok(message) = out_rx.try_recv() {
+            responses.push(message.into_text());
+        }
+        let txn = env.begin_ro().unwrap();
+        for (id, _, created_at, kind, written) in events {
+            let response = responses
+                .iter()
+                .find(|response| response.contains(&to_hex(&id)))
+                .unwrap_or_else(|| panic!("no OK for kind {kind}: {responses:?}"));
+            if written {
+                assert!(response.contains("true"), "{response}");
+            } else {
+                assert!(response.contains("requested vanish"), "{response}");
+            }
+            assert_eq!(
+                lookup_event_by_id_ro(&txn, &id).unwrap().is_some(),
+                written,
+                "kind {kind} at {created_at}"
+            );
+        }
     }
 
     fn revocation(pubkey: [u8; 32], ban: bool) -> ManagementCmd {

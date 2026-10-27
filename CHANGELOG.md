@@ -1092,6 +1092,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `#d` filter for the empty string matches only events with a `d` tag of
+  that value, and addressable events without a `d` tag, whose address it is
+  (#245). Packing adds an empty `d` to every replaceable and addressable
+  event, so that the first `d` sets the address and a missing one means the
+  empty string, and filters matched it: `{"kinds":[30023],"authors":[pk],
+  "#d":[""],"limit":1}`, which resolves an `naddr` with an empty
+  identifier, returned pk's newest article whatever its `d`, a live
+  subscription to it got each new one, and `{"kinds":[10002],"#d":[""]}`
+  matched every relay list. REQ, live subscriptions, COUNT, NIP-77 and
+  NIP-91 `&d` now leave the added tag out. The tag indexes still hold it,
+  so a filter for the empty `d` reads each candidate event instead of
+  answering from the index alone. **Clients that relied on `#d:[""]`
+  selecting every replaceable or addressable event get fewer events.** A
+  persistent negentropy tree whose filter selects the empty `d` still holds
+  the events the old matching put there: `wok doctor` reports it, and
+  `wok reindex --confirm-relay-stopped` rebuilds it. A tag with no value,
+  such as `["t"]`, is still packed and matched as `["t",""]`, and kind 41
+  history that earlier releases packed as replaceable keeps its added `d`.
 - `wok upload` exits nonzero unless the relay acknowledged every event it
   sent and refused none (#252). It counted any message that contained `"OK"`
   as an acknowledgment, `OK false` and a NOTICE included, and exited 0 when
@@ -1106,6 +1124,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event JSON is no longer sent**: it is logged and the command exits
   nonzero, as `wok import` does. **`--pipeline 0`**, which sent nothing and
   exited 0, **is refused**.
+- `wok scan` and `wok scan --count` read the whole database (#256). They
+  clamped a filter to `relay.max_filter_limit`, which bounds client REQs, so
+  at the default of 2000 `wok scan --count '{"kinds":[1]}'` printed 2000 on
+  a database holding millions of notes, and `wok scan '{}'` stopped after
+  2000 events without saying so. strfry's `scan` has no such cap, nor do
+  `wok delete` and `wok dict`; a `limit` in the filter still applies.
+  Operator scans (`wok scan`, `wok delete`, `wok dict`) now hand each event
+  over as they find it, not once the scan is done, and remember only what a
+  filter cut by its `limit`, or a `search`, sent: counting every event takes
+  memory for the events sharing one `created_at`, not for every match. A
+  `search` filter whose rarest term has more than 4,096 postings returned
+  nothing to them; it now runs to the end.
 - A second copy of an event in one writer batch, as two connections or a
   client that retries can send, is answered as the first copy was (#255).
   When the first copy was refused, as superseded by a newer version, over

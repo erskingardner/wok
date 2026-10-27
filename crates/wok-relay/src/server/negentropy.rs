@@ -72,7 +72,11 @@ enum View {
 struct Session {
     view: View,
     reservation: Reservation,
+    /// When the relay sent its last reply, and the client's turn began;
+    /// `None` until it answers the NEG-OPEN.
     waiting_since: Option<Instant>,
+    /// Whether that reply answered a NEG-MSG rather than the NEG-OPEN.
+    answered_msg: bool,
     expires_at: u64,
     /// The serialized size of the filter it keeps.
     filter_bytes: usize,
@@ -571,17 +575,18 @@ pub(super) fn run_negentropy(
                         view,
                         reservation,
                         waiting_since: None,
+                        answered_msg: false,
                         expires_at: u64::MAX,
                         filter_bytes: filter_str.len(),
                         filter,
                     };
                     if let View::Tree { sub, tree_id } = &session.view {
-                        if !reconcile_tree(
+                        let Some(sent) = reconcile_tree(
                             &txn, &conns, &metrics, conn, &sid, *tree_id, sub, &payload,
-                        ) {
+                        ) else {
                             continue;
-                        }
-                        session.waiting_since = Some(Instant::now());
+                        };
+                        session.waiting_since = Some(sent);
                     }
                     sessions.insert(key, session);
                 }
@@ -589,6 +594,7 @@ pub(super) fn run_negentropy(
                     conn_id,
                     sub_id,
                     payload,
+                    received,
                 } => {
                     let key = (conn_id, sub_id.to_string());
                     // Sent before the NEG-ERR of the sweep that closed its
@@ -597,8 +603,28 @@ pub(super) fn run_negentropy(
                     // Whether its session answered with its NEG-MSG, or with
                     // the NEG-ERR that closes it; `None` when it has none.
                     let answered = sessions.get_mut(&key).map(|session| {
-                        let answered = match &mut session.view {
-                            View::Memory { items, .. } if items.is_sealed() => send_vector(
+                        // NIP-77 has the two sides take turns, and this
+                        // message came before the relay's last reply, or
+                        // before any, so it answers nothing. Taking turns
+                        // also keeps a session from queueing its messages'
+                        // work on this worker (#254).
+                        if session.waiting_since.is_none_or(|sent| received < sent) {
+                            let unanswered = if session.answered_msg {
+                                "the previous NEG-MSG"
+                            } else {
+                                "NEG-OPEN"
+                            };
+                            fail(
+                                &conns,
+                                &metrics,
+                                conn_id,
+                                sub_id.as_str(),
+                                &format!("invalid: NEG-MSG sent before the reply to {unanswered}"),
+                            );
+                            return false;
+                        }
+                        let sent = match &mut session.view {
+                            View::Memory { items, .. } => send_vector(
                                 &conns,
                                 &metrics,
                                 conn_id,
@@ -620,28 +646,16 @@ pub(super) fn run_negentropy(
                                     ),
                                     Some(reason) => {
                                         fail(&conns, &metrics, conn_id, sub_id.as_str(), reason);
-                                        false
+                                        None
                                     }
                                 }
                             }
-                            // NIP-77 has the two sides take turns, and the
-                            // relay has not yet answered the NEG-OPEN, so
-                            // this message answers nothing.
-                            View::Memory { .. } => {
-                                fail(
-                                    &conns,
-                                    &metrics,
-                                    conn_id,
-                                    sub_id.as_str(),
-                                    "invalid: NEG-MSG sent before the reply to NEG-OPEN",
-                                );
-                                false
-                            }
                         };
-                        if answered {
-                            session.waiting_since = Some(Instant::now());
+                        if sent.is_some() {
+                            session.waiting_since = sent;
+                            session.answered_msg = true;
                         }
-                        answered
+                        sent.is_some()
                     });
                     match answered {
                         Some(true) => {}
@@ -798,7 +812,7 @@ pub(super) fn run_negentropy(
             }
             if let Some(session) = sessions.get_mut(&key) {
                 if let View::Memory { initial, items } = &mut session.view {
-                    let answered = if items.seal().is_ok() {
+                    let sent = if items.seal().is_ok() {
                         send_vector(&conns, &metrics, key.0, &key.1, items, initial)
                     } else {
                         fail(
@@ -808,25 +822,26 @@ pub(super) fn run_negentropy(
                             &key.1,
                             "error: synchronization reconciliation failed",
                         );
-                        false
+                        None
                     };
-                    if !answered {
+                    let Some(sent) = sent else {
                         sessions.remove(&key);
                         continue;
-                    }
+                    };
                     *initial = Vec::new();
                     session
                         .reservation
                         .shrink(ROUND_BYTES + items.allocated_bytes() as u64);
-                    session.waiting_since = Some(Instant::now());
+                    session.waiting_since = Some(sent);
                 }
             }
         }
     }
 }
 
-/// Reconcile one message against a session's in-memory view. Returns false
-/// on protocol error, after its NEG-ERR (caller removes the view).
+/// Reconcile one message against a session's in-memory view. Returns when
+/// it sent the reply, or `None` on protocol error, after its NEG-ERR (caller
+/// removes the view).
 fn send_vector(
     conns: &ConnTable,
     metrics: &Metrics,
@@ -834,14 +849,14 @@ fn send_vector(
     sid: &str,
     items: &mut Vector,
     payload: &[u8],
-) -> bool {
+) -> Option<Instant> {
     let resp = Negentropy::new(items, 500_000).and_then(|mut ne| ne.reconcile(payload));
     answer(conns, metrics, conn, sid, resp)
 }
 
 /// Reconcile one message against a precomputed tree ("stateless" view in
-/// C++). Returns false on protocol error, after its NEG-ERR (caller removes
-/// the view).
+/// C++). Returns when it sent the reply, or `None` on protocol error, after
+/// its NEG-ERR (caller removes the view).
 #[allow(clippy::too_many_arguments)]
 fn reconcile_tree(
     txn: &wok_db::RoTxn<'_>,
@@ -852,7 +867,7 @@ fn reconcile_tree(
     tree_id: u64,
     sub: &Subscription,
     payload: &[u8],
-) -> bool {
+) -> Option<Instant> {
     let resp = (|| -> Result<Vec<u8>, String> {
         let mut tree = wok_negentropy::open_ro(txn, tree_id).map_err(|e| e.to_string())?;
         let f = sub.filter_group.filters.first();
@@ -873,26 +888,30 @@ fn reconcile_tree(
 }
 
 /// Send either view's reply: the NEG-MSG, or the one NEG-ERR that closes the
-/// session when the message did not reconcile. Returns whether it was the
-/// NEG-MSG.
+/// session when the message did not reconcile. Returns when it sent the
+/// NEG-MSG, or `None` for the NEG-ERR.
 fn answer<E>(
     conns: &ConnTable,
     metrics: &Metrics,
     conn: u64,
     sid: &str,
     resp: Result<Vec<u8>, E>,
-) -> bool {
+) -> Option<Instant> {
     match resp {
         Ok(r) => {
+            let payload_hex = hex::encode(r);
+            // Read before the reply leaves, so any NEG-MSG the ingester took
+            // later was sent after the client could have read it.
+            let sent = Instant::now();
             conns.send(
                 conn,
                 RelayMessage::NegMsg {
                     sub_id: sid.to_string(),
-                    payload_hex: hex::encode(r),
+                    payload_hex,
                 },
                 metrics,
             );
-            true
+            Some(sent)
         }
         Err(_) => {
             fail(
@@ -902,7 +921,7 @@ fn answer<E>(
                 sid,
                 "error: invalid reconciliation message",
             );
-            false
+            None
         }
     }
 }
@@ -1097,6 +1116,7 @@ mod tests {
             conn_id: 1,
             sub_id: SubId::new(sub_id).unwrap(),
             payload: init.clone(),
+            received: Instant::now(),
         };
         let served = |reply: Value, sub_id: &str| {
             assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!(sub_id)));
@@ -1251,6 +1271,7 @@ mod tests {
             conn_id: 1,
             sub_id: SubId::new(sub_id).unwrap(),
             payload: payload.to_vec(),
+            received: Instant::now(),
         };
         let served = |reply: Value, sub_id: &str| {
             assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!(sub_id)));
@@ -1330,6 +1351,7 @@ mod tests {
             conn_id: 1,
             sub_id: SubId::new("tree").unwrap(),
             payload: init.clone(),
+            received: Instant::now(),
         };
         let served = |reply: Value| {
             assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!("tree")));
@@ -1497,6 +1519,7 @@ mod tests {
             conn_id: 1,
             sub_id: SubId::new(sub_id).unwrap(),
             payload: init.clone(),
+            received: Instant::now(),
         };
         let err = |sub_id: &str, reason: &str| json!(["NEG-ERR", sub_id, reason]);
 
@@ -1528,6 +1551,105 @@ mod tests {
         drop(tx);
         worker.join().unwrap();
         assert!(out_rx.try_recv().is_err(), "a reply to the closed session");
+    }
+
+    /// Sessions take turns with their client on a tree as on a view built
+    /// in memory. A NEG-MSG sent before the reply to the session's NEG-OPEN,
+    /// or to its previous NEG-MSG, answers nothing: its session is closed
+    /// with one NEG-ERR that names the reply it did not wait for, and the
+    /// messages sent with it are not answered either. So a burst of
+    /// NEG-MSGs costs the worker one reply's work, not one each (#254).
+    #[test]
+    fn sessions_take_turns_on_either_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut cfg = Config::default();
+        cfg.db = dir.path().to_path_buf();
+        let cfg = Arc::new(parking_lot::RwLock::new(cfg));
+        let conns = Arc::new(ConnTable::new());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        conns.insert(1, Outbound::new(out_tx, 0));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let conns = conns.clone();
+            let metrics = Arc::new(Metrics::default());
+            let pool = Arc::new(MemoryPool::default());
+            thread::spawn(move || run_negentropy(env, cfg, conns, metrics, rx, pool))
+        };
+        let mut store = wok_negentropy::Vector::new();
+        store.seal().unwrap();
+        let init = wok_negentropy::Negentropy::new(store, 60_000)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let open = |sub_id: &str, filter: &Value| {
+            let group = NostrFilterGroup::from_value(filter, 1_000_001, 8, 16).unwrap();
+            NegMsg::Open {
+                sub: Subscription::new(1, SubId::new(sub_id).unwrap(), group, false),
+                filter_str: filter.to_string(),
+                payload: init.clone(),
+            }
+        };
+        // Taken by the ingester, so sent by the client, when it is made.
+        let msg = |sub_id: &str| NegMsg::Msg {
+            conn_id: 1,
+            sub_id: SubId::new(sub_id).unwrap(),
+            payload: init.clone(),
+            received: Instant::now(),
+        };
+        let served = |reply: Value, sub_id: &str| {
+            assert_eq!((&reply[0], &reply[1]), (&json!("NEG-MSG"), &json!(sub_id)));
+        };
+        let early = |sub_id: &str, unanswered: &str| {
+            json!([
+                "NEG-ERR",
+                sub_id,
+                format!("invalid: NEG-MSG sent before the reply to {unanswered}")
+            ])
+        };
+        let unknown =
+            |sub_id: &str| json!(["NEG-ERR", sub_id, "closed: unknown subscription handle"]);
+
+        // `{}` is answered from the tree the database starts with, and
+        // `{"kinds":[1]}`, which no tree has, from memory.
+        for (sub_id, filter) in [("tree", json!({})), ("memory", json!({"kinds": [1]}))] {
+            // Sent right behind the NEG-OPEN. A tree answers the NEG-OPEN
+            // at once; a view in memory may not have, and then never does.
+            let sent = msg(sub_id);
+            tx.send(open(sub_id, &filter)).unwrap();
+            tx.send(sent).unwrap();
+            let mut reply = next(&mut out_rx);
+            if sub_id == "tree" || reply[0] == "NEG-MSG" {
+                served(reply, sub_id);
+                reply = next(&mut out_rx);
+            }
+            assert_eq!(reply, early(sub_id, "NEG-OPEN"));
+            tx.send(msg(sub_id)).unwrap();
+            assert_eq!(next(&mut out_rx), unknown(sub_id));
+
+            // Sent in turn, each is answered.
+            tx.send(open(sub_id, &filter)).unwrap();
+            served(next(&mut out_rx), sub_id);
+            for _ in 0..3 {
+                tx.send(msg(sub_id)).unwrap();
+                served(next(&mut out_rx), sub_id);
+            }
+
+            // A burst sent before the reply to its first message.
+            let burst: Vec<NegMsg> = (0..50).map(|_| msg(sub_id)).collect();
+            for sent in burst {
+                tx.send(sent).unwrap();
+            }
+            served(next(&mut out_rx), sub_id);
+            assert_eq!(next(&mut out_rx), early(sub_id, "the previous NEG-MSG"));
+            for _ in 2..50 {
+                assert_eq!(next(&mut out_rx), unknown(sub_id));
+            }
+        }
+        drop(tx);
+        worker.join().unwrap();
+        assert!(out_rx.try_recv().is_err(), "a reply to a closed session");
     }
 
     /// A reload that made AUTH unusable ended every login, so the sessions
@@ -1677,6 +1799,7 @@ mod tests {
             conn_id: 1,
             sub_id: SubId::new("kept").unwrap(),
             payload: init.clone(),
+            received: Instant::now(),
         })
         .unwrap();
         assert_eq!(
@@ -1763,6 +1886,7 @@ mod tests {
             conn_id: 1,
             sub_id: SubId::new("a").unwrap(),
             payload: init.clone(),
+            received: Instant::now(),
         })
         .unwrap();
         assert_eq!(
@@ -1885,6 +2009,7 @@ mod tests {
             conn_id: 1,
             sub_id: SubId::new("a").unwrap(),
             payload: init.clone(),
+            received: Instant::now(),
         })
         .unwrap();
         let reply = until(&mut out_rx, "NEG-ERR", "a");

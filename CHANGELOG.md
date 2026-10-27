@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so such a socket gives each local user a channel that only proof of work,
   the storage quotas and the per-author EVENT budget limit, and an
   unauthenticated connection starts that budget afresh with each new key.
+  NIP-62 vanish requests skip proof of work and the quotas (#248), so the
+  disk reserve is what bounds a peer that signs one with each new key.
   docs/production-deployment.md now says what a write-policy plugin's
   request carries: `authed` is present only for NIP-70 protected events and
   owner-only kinds, so a plugin cannot use it to tell who is logged in, and
@@ -279,12 +281,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLI's outbound `wss://` and HTTPS clients (mesh, router, upload/download,
   NIP-11 fetches) and the benchmark harness; the relay listener does not
   terminate TLS.
-- NIP-62 vanish requests (kind 62) now pay NIP-13 proof of work and the
-  per-author EVENT budget like any other event. Before, a validly signed vanish
-  request skipped both and only the per-address budget limited them. They
-  still bypass the write-policy plugin, now documented: NIP-62 requires relays
-  that restrict who can post to honor vanish regardless of the user's status
-  (#48).
+- NIP-62 vanish requests (kind 62) now pay the per-author EVENT budget like
+  any other event. Before, a validly signed vanish request skipped it and only
+  the per-address budget limited them. They still bypass the write-policy
+  plugin and NIP-13 proof of work, now documented: NIP-62 requires relays that
+  restrict who can post to honor vanish regardless of the user's status
+  (#48, #248).
+- A NIP-62 vanish request that targets the relay is now stored when the
+  relay is at its global storage quota (`relay.abuse.max_stored_events`), and
+  its author's events are then deleted (#248). Before, the request was
+  refused with the rest of its writer batch, so nobody could vanish from a
+  full relay, though NIP-62 says a relay MUST honor the request. The quota no
+  longer counts a batch's vanish requests: when the rest of the batch is over
+  it, they are written on their own and everything else is refused as
+  before. On a full relay, or one that requires proof of work, anyone can
+  therefore store a vanish request with each fresh key. The per-address
+  EVENT budget (which a Unix connection skips), the per-author EVENT budget
+  and the disk reserve (`database.min_free_disk_bytes`) bound them, and the
+  NIP-86 kind policy,
+  event-id bans, blocked addresses and `relay.nip62.enabled` still refuse
+  them (see docs/attack-surface.md).
 - NIP-62 vanish requests are now honored from banned authors and, with
   `relay.auth.restrict_writes`, from pubkeys not on the write allowlist. Before,
   both were refused, so an author who lost write access could not erase what
@@ -412,6 +428,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copy the progress. An earlier release's `wok integrity` reports the
   progress records and their `vanish-markers` counter as unknown `wok_State`
   keys.
+- A NIP-77 message to a session served from a negentropy tree costs a
+  tenth of the worker time it did, and sessions take turns with their
+  client (#254). To read the item count of each node it passed, a lookup in
+  the tree decoded all 3,952 bytes of it, again for every lookup, so one
+  crafted 82 KB NEG-MSG cost about 2.7 s of CPU on a tree of 2 million
+  events. A connection could send `relay.abuse.per_connection.neg_msg_burst`
+  (200) of them at once and queue minutes of work on one of the two
+  negentropy workers, ahead of every other sync it serves. Lookups now read
+  only a passed node's count and accumulator, in place, as strfry does, and
+  keep them for the rest of the message, so that message costs about
+  0.2 s. A NEG-MSG sent before the relay's reply to its session's NEG-OPEN
+  or previous NEG-MSG now closes the session with `invalid: NEG-MSG sent
+  before the reply to NEG-OPEN` or `invalid: NEG-MSG sent before the reply
+  to the previous NEG-MSG`, whether a tree or a view built in memory serves
+  it; before, only one sent while a view in memory was still being scanned
+  did. **A client that sends a NEG-MSG before reading the reply to its last
+  one now gets NEG-ERR**: NIP-77 has the two sides take turns, and `wok
+  sync` waits for each reply.
 
 ### Added
 
@@ -1111,6 +1145,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wok sync` with a NIP-91 `&` filter no longer fails against a peer that
+  does not advertise NIP-91 (#250). Such a peer is sent each `&x` set folded
+  into its `#x` clause, a superset of the filter, but the local side
+  reconciled the exact filter, so each remote event of the superset outside
+  it was a false `need`: it was downloaded, counted `rejected`, and the run
+  exited `sync incomplete` every time, and `--check`, `--print-missing` and
+  `--dir none` reported the same false differences. Sync now reconciles the
+  superset on both sides and narrows the differences to the exact filter:
+  local events outside it are not uploaded, remote ones are fetched and
+  discarded, and both are counted in a new `narrowed` summary field instead
+  of `have`, `need` or `rejected`. **With such a filter, `--check`,
+  `--print-missing`, `--dir none` and `--dir up` now fetch the peer's
+  remote-only events of the superset**, without storing them, since only an
+  event shows its tags. The local view, and its `relay.max_sync_events` and
+  sync memory budget, now cover the superset. **Sync now refuses an `&`
+  filter with a `limit` for such a peer**, which would apply the limit to
+  the superset; bound the sync with `--range` instead.
 - A `#d` filter for the empty string matches only events with a `d` tag of
   that value, and addressable events without a `d` tag, whose address it is
   (#245). Packing adds an empty `d` to every replaceable and addressable
@@ -1143,6 +1194,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event JSON is no longer sent**: it is logged and the command exits
   nonzero, as `wok import` does. **`--pipeline 0`**, which sent nothing and
   exited 0, **is refused**.
+- `wok scan` and `wok scan --count` read the whole database (#256). They
+  clamped a filter to `relay.max_filter_limit`, which bounds client REQs, so
+  at the default of 2000 `wok scan --count '{"kinds":[1]}'` printed 2000 on
+  a database holding millions of notes, and `wok scan '{}'` stopped after
+  2000 events without saying so. strfry's `scan` has no such cap, nor do
+  `wok delete` and `wok dict`; a `limit` in the filter still applies.
+  Operator scans (`wok scan`, `wok delete`, `wok dict`) now hand each event
+  over as they find it, not once the scan is done, and remember only what a
+  filter cut by its `limit`, or a `search`, sent: counting every event takes
+  memory for the events sharing one `created_at`, not for every match. A
+  `search` filter whose rarest term has more than 4,096 postings returned
+  nothing to them; it now runs to the end.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one

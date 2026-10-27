@@ -1127,6 +1127,159 @@ async fn expired_ephemeral_events_are_reported_without_failing_sync() {
     }
 }
 
+fn tagged(values: &[&str]) -> Value {
+    let tags: Vec<_> = values.iter().map(|value| json!(["t", value])).collect();
+    sign(
+        json!({"kind":1,"created_at":now(),"tags":tags,"content":"sync"}),
+        &key(),
+    )
+}
+
+/// A peer without NIP-91 reconciles the `#t` compatibility filter of an `&t`
+/// filter. Events tagged only `t=a`, on either side, match that superset but
+/// not the AND filter: they are neither differences, transfers nor failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn and_filters_against_a_peer_without_nip91_narrow_both_directions() {
+    let auth = "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n";
+    // Direction, have, need, written and uploaded of one run.
+    type Run = (&'static str, u64, u64, u64, u64);
+    let scenarios: [&[Run]; 2] = [
+        &[("both", 1, 1, 1, 1)],
+        &[("down", 1, 1, 1, 0), ("up", 1, 0, 0, 1)],
+    ];
+    for runs in scenarios {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let lc = config(local.path(), auth);
+        // A zero AND budget turns NIP-91 off and out of supported_nips.
+        let rc = config(
+            remote.path(),
+            &format!("[relay]\nmax_and_entries=0\n{auth}"),
+        );
+        let (local_ab, local_a) = (tagged(&["a", "b"]), tagged(&["a"]));
+        let (remote_ab, remote_a) = (tagged(&["a", "b"]), tagged(&["a"]));
+        import(&lc, &[local_ab.clone(), local_a.clone()]);
+        import(&rc, &[remote_ab.clone(), remote_a.clone()]);
+        let server = serve(&rc).await;
+        let and_sync = |args: &[&str]| {
+            let mut all = vec!["--filter", r#"{"&t":["a","b"]}"#];
+            all.extend_from_slice(args);
+            sync(&lc, &server.url, &all)
+        };
+        let missing = |output: Output| {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let pair = |have: &Value, need: &Value| {
+            std::collections::BTreeSet::from([
+                format!("have,{}", have["id"].as_str().unwrap()),
+                format!("need,{}", need["id"].as_str().unwrap()),
+            ])
+        };
+
+        assert_eq!(
+            missing(and_sync(&["--print-missing"])),
+            pair(&local_ab, &remote_ab)
+        );
+        let output = and_sync(&["--check", "--json"]);
+        let report = summary(&output);
+        assert!(!output.status.success(), "{report}");
+        assert!(report["error"]
+            .as_str()
+            .unwrap()
+            .contains("sync sets differ: have 1 need 1"));
+        assert_eq!(report["narrowed"], 2, "{report}");
+        assert_eq!(report["rejected"], 0, "{report}");
+
+        for &(direction, have, need, written, uploaded) in runs {
+            let output = and_sync(&["--dir", direction, "--json"]);
+            let report = summary(&output);
+            assert!(output.status.success(), "{direction}: {report}");
+            assert_eq!(report["have"], have, "{direction}: {report}");
+            assert_eq!(report["need"], need, "{direction}: {report}");
+            assert_eq!(report["narrowed"], 2, "{direction}: {report}");
+            assert_eq!(report["downloaded"], written, "{direction}: {report}");
+            assert_eq!(report["written"], written, "{direction}: {report}");
+            assert_eq!(report["uploaded"], uploaded, "{direction}: {report}");
+            for outcome in ["rejected", "unavailable", "upload_rejected"] {
+                assert_eq!(report[outcome], 0, "{direction}: {report}");
+            }
+        }
+
+        let output = and_sync(&["--check", "--json"]);
+        let report = summary(&output);
+        assert!(output.status.success(), "{report}");
+        assert_eq!(report["have"], 0, "{report}");
+        assert_eq!(report["need"], 0, "{report}");
+        assert_eq!(report["narrowed"], 2, "{report}");
+        // The events tagged only t=a stayed on their own side.
+        assert_eq!(
+            missing(sync(
+                &lc,
+                &server.url,
+                &["--filter", r##"{"#t":["a"]}"##, "--print-missing"]
+            )),
+            pair(&local_a, &remote_a)
+        );
+    }
+}
+
+/// A peer without NIP-91 can only apply `limit` to the compatibility
+/// superset. Here its newest event is a shared `t=a` one, so both sides
+/// would offer only that and report no differences, though each side's
+/// newest AND match differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limit_on_an_and_filter_is_refused_only_for_a_peer_without_nip91() {
+    let auth = "[relay.auth]\nenabled=false\nrecipient_only_kinds=[]\n";
+    let older = |key: &Keypair| {
+        sign(
+            json!({"kind":1,"created_at":now() - 10,"tags":[["t","a"],["t","b"]],"content":"sync"}),
+            key,
+        )
+    };
+    let shared = tagged(&["a"]);
+    let (local_ab, remote_ab) = (older(&key()), older(&key()));
+    let local = tempfile::tempdir().unwrap();
+    let lc = config(local.path(), auth);
+    import(&lc, &[shared.clone(), local_ab]);
+    for (nip91, extra) in [(false, "[relay]\nmax_and_entries=0\n"), (true, "")] {
+        let remote = tempfile::tempdir().unwrap();
+        let rc = config(remote.path(), &format!("{extra}{auth}"));
+        import(&rc, &[shared.clone(), remote_ab.clone()]);
+        let server = serve(&rc).await;
+        let output = sync(
+            &lc,
+            &server.url,
+            &[
+                "--filter",
+                r#"{"&t":["a","b"],"limit":1}"#,
+                "--check",
+                "--json",
+            ],
+        );
+        let report = summary(&output);
+        assert!(!output.status.success(), "{report}");
+        let error = report["error"].as_str().unwrap();
+        if nip91 {
+            assert!(
+                error.contains("sync sets differ: have 1 need 1"),
+                "{report}"
+            );
+        } else {
+            assert!(error.contains("remove `limit`"), "{report}");
+            assert_eq!(report["reconciled"], false, "{report}");
+        }
+    }
+}
+
 #[test]
 fn filtered_sync_view_respects_the_configured_event_budget() {
     let dir = tempfile::tempdir().unwrap();

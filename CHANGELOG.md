@@ -1108,6 +1108,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `wok sync` with a NIP-91 `&` filter no longer fails against a peer that
+  does not advertise NIP-91 (#250). Such a peer is sent each `&x` set folded
+  into its `#x` clause, a superset of the filter, but the local side
+  reconciled the exact filter, so each remote event of the superset outside
+  it was a false `need`: it was downloaded, counted `rejected`, and the run
+  exited `sync incomplete` every time, and `--check`, `--print-missing` and
+  `--dir none` reported the same false differences. Sync now reconciles the
+  superset on both sides and narrows the differences to the exact filter:
+  local events outside it are not uploaded, remote ones are fetched and
+  discarded, and both are counted in a new `narrowed` summary field instead
+  of `have`, `need` or `rejected`. **With such a filter, `--check`,
+  `--print-missing`, `--dir none` and `--dir up` now fetch the peer's
+  remote-only events of the superset**, without storing them, since only an
+  event shows its tags. The local view, and its `relay.max_sync_events` and
+  sync memory budget, now cover the superset. **Sync now refuses an `&`
+  filter with a `limit` for such a peer**, which would apply the limit to
+  the superset; bound the sync with `--range` instead.
 - A `#d` filter for the empty string matches only events with a `d` tag of
   that value, and addressable events without a `d` tag, whose address it is
   (#245). Packing adds an empty `d` to every replaceable and addressable

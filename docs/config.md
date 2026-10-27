@@ -727,6 +727,11 @@ What bounds a sync instead:
   runs at once, with its NEG-OPENs counted apart from its REQs and COUNTs.
   More wait their turn, and `relay.query_timeslice_budget_us` shares the
   negentropy workers between running scans.
+- The work of one round. A reply reads the client's ranges until its
+  lookups and fingerprints have cost 65,536 B-tree descents, or it fills
+  500,000 bytes, then answers the rest of the range with one fingerprint,
+  which the client splits in its next message. A message is never refused
+  for the number of ranges it holds.
 
 With `negentropy_enabled` off, the relay still keeps its negentropy trees
 current as it stores and deletes events. Turning NIP-77 back on, which

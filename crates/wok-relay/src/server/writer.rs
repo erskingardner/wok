@@ -32,8 +32,7 @@ pub(super) fn run_writer(
     tag_kind_step: TagKindStep,
 ) {
     let mut plugin = PluginEventSifter::new(cfg.read().relay.write_policy_timeout_secs);
-    let mut negentropy_max_tags = cfg.read().relay.max_tags_per_filter;
-    let mut negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
+    let mut negentropy_cache = NegentropyFilterCache::default();
     let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
     let mut event_batch = Vec::with_capacity(WRITER_BATCH_MAX);
     let mut maintenance_cursor = Vec::new();
@@ -454,10 +453,6 @@ pub(super) fn run_writer(
         let mut commit_started = None;
         let write_res = (|| {
             let mut txn = env.begin_rw()?;
-            if negentropy_max_tags != cfg_snap.relay.max_tags_per_filter {
-                negentropy_max_tags = cfg_snap.relay.max_tags_per_filter;
-                negentropy_cache = NegentropyFilterCache::new(negentropy_max_tags);
-            }
             let mut tree_batch = negentropy_cache.batch();
             wok_db::write::write_events_with_quota(
                 &mut txn,
@@ -1015,7 +1010,7 @@ pub(super) fn run_maintenance(env: &Env, cfg_snap: &Config, vanish_cursor: &mut 
             cfg_snap.relay.nip62.deletion_batch_size,
             &mut next_cursor,
         )?;
-        let mut cache = NegentropyFilterCache::new(cfg_snap.relay.max_tags_per_filter);
+        let mut cache = NegentropyFilterCache::default();
         sink.apply(&mut cache, &mut txn)
             .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
         txn.commit()?;
@@ -1246,6 +1241,110 @@ mod tests {
         assert_eq!(
             metrics.writer_storage_bytes_total.load(Ordering::Relaxed),
             0
+        );
+    }
+
+    #[test]
+    fn a_tree_with_more_tag_letters_than_max_tags_per_filter_keeps_writes_and_maintenance_working()
+    {
+        // #243: the writer and maintenance parsed stored tree filters with
+        // relay.max_tags_per_filter, so a tree naming more tag letters than
+        // it made every write and every maintenance tick fail.
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let recipient = [0xa1; 32];
+        let filter = json!({"#p": [to_hex(&recipient)], "#t": ["nostr"]}).to_string();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::bump_negentropy_mod_counter(&mut txn).unwrap();
+        let tree_id = wok_db::insert_negentropy_filter(&mut txn, &filter).unwrap();
+        txn.commit().unwrap();
+        let event = |n: u8, expiration: u64| {
+            let (id, author) = ([n; 32], [0x40 + n; 32]);
+            let mut tags = PackedEventTagBuilder::default();
+            tags.add('p', &recipient).unwrap();
+            tags.add('t', b"nostr").unwrap();
+            let packed =
+                PackedEventBuilder::build(&id, &author, 1_700_000_000, 1, expiration, &tags)
+                    .unwrap();
+            let json = json!({
+                "id": to_hex(&id),
+                "pubkey": to_hex(&author),
+                "created_at": 1_700_000_000u64,
+                "kind": 1,
+                "tags": [
+                    ["p", to_hex(&recipient)],
+                    ["t", "nostr"],
+                    ["expiration", expiration.to_string()],
+                ],
+                "content": "",
+                "sig": "00".repeat(64),
+            })
+            .to_string();
+            (packed.into_bytes(), json)
+        };
+        // An event that has expired, for maintenance to delete.
+        let (packed, json) = event(1, 1_700_000_001);
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(
+            &mut txn,
+            &mut NegentropyFilterCache::default(),
+            &mut [EventToWrite::new(packed, json)],
+            false,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let mut config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.relay.max_tags_per_filter = 1;
+        let (writer_tx, writer_rx) = bounded(1);
+        let (packed, json) = event(2, 0);
+        writer_tx
+            .send(WriterMsg::AddEvent {
+                conn_id: 1,
+                source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+                packed,
+                json,
+                authed: None,
+                grant: Default::default(),
+            })
+            .unwrap();
+        drop(writer_tx);
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config.clone())),
+            Arc::new(ConnTable::new()),
+            Arc::new(Metrics::default()),
+            writer_rx,
+            Vec::new(),
+            moderation(&env),
+            TAG_KIND_STEP,
+        );
+        let tree_size = |txn: &wok_db::RoTxn<'_>| {
+            wok_negentropy::open_ro(txn, tree_id)
+                .unwrap()
+                .size_mut()
+                .unwrap()
+        };
+        assert_eq!(
+            tree_size(&env.begin_ro().unwrap()),
+            2,
+            "the publication was stored in the tree"
+        );
+
+        run_maintenance(&env, &config, &mut Vec::new());
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(txn.entries(env.dbis().event).unwrap(), 1);
+        assert!(wok_db::lookup_event_by_id_ro(&txn, &[1; 32])
+            .unwrap()
+            .is_none());
+        assert_eq!(tree_size(&txn), 1, "maintenance removed the expired event");
+        assert_eq!(
+            wok_negentropy::verify_tree(&txn, tree_id, &filter).unwrap(),
+            1
         );
     }
 

@@ -71,6 +71,7 @@ scrape_configs:
 | `wok_writer_commit_seconds` | histogram | none | Committing a batch, its flushes to storage included. |
 | `wok_writer_reply_seconds` | histogram | none | Sending a committed batch's OKs and handing its events to the req monitors. |
 | `wok_writer_storage_bytes_total` | counter | none | Bytes the writer's committed event transactions sent to storage: pages they dirtied, from `/proc/thread-self/io`, so 0 on tmpfs. Linux only; 0 elsewhere. |
+| `wok_author_count_drift_total` | counter | none | Per-author event counters that a deletion found below that author's stored events. Each is dropped, with a warning naming the author, and counted again from the author index when a quota check next needs it. Counters kept by earlier releases can be low; `wok reindex` repairs them all. |
 
 The `wok_writer_*` metrics cover each writer batch whose transaction
 committed, so their counts agree. Batches whose events are all refused

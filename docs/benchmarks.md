@@ -178,8 +178,11 @@ latency + rate), `ws_query_latency` (mixed REQs: id, author+kind, time
 window, tag; on a social corpus, the shapes above), `deep_history_pagination`
 (progressively older 500-event author+kind+until pages), `mixed_read_write`
 (historical REQs while another
-connection continuously publishes), `live_fanout` (configurable publisher and
-subscriber delivery completeness), `ws_publish_scaled` (configurable
+connection continuously publishes), `live_fanout` (delivery completeness and
+throughput to configurable subscribers; the publisher keeps up to
+`--fanout-window` publications unacknowledged, 256 by default, so delivery
+rather than each OK's round trip bounds it; `--fanout-window 1` waits for
+each OK, as earlier builds did), `ws_publish_scaled` (configurable
 connection count), `ws_publish_rate` (fixed-rate publication with a
 per-event outcome log), `idle_connections` (open-and-hold connection capacity),
 `duplicate_import`, `cold_start`, and Wok-only
@@ -1206,7 +1209,7 @@ host reaches it) and `TARGETS` are required. The other settings are
 `RELAY_CPUS`, `RELAY_MEMORY`, `CACHE`, `SNAPSHOTS`, `READY_TIMEOUT`,
 `LOAD_CPUS`, `BENCH_BIN`, `RELAY_BENCH_BIN`, `CAMPAIGN_ID`, `EVENTS`,
 `CORPUS_MIX`, `SOCIAL_AUTHORS`, `QUERIES`, `DEEP_PAGES`, `REPETITIONS`,
-`PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`,
+`PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`, `FANOUT_WINDOW`,
 `IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`,
 `LIFECYCLE_CONNECTIONS`, `RATE_STEPS`, `RATE_SECS`, `RATE_DRAIN_SECS`,
 `RATE_CONNECTIONS`, `RATE_P99_MS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED`

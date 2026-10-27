@@ -143,8 +143,10 @@ pub fn mark_vanished(txn: &mut RwTxn<'_>, pubkey: &[u8], timestamp: u64) -> Resu
         .dbis()
         .vanish_pubkey
         .ok_or_else(|| DbError::msg("NIP-62 marker database is unavailable"))?;
-    let existing = txn.get(dbi, pubkey)?.and_then(read_timestamp).unwrap_or(0);
-    if timestamp > existing {
+    // No marker sorts below any: a request at created_at 0 still leaves one,
+    // which covers the author's events at 0 and the gift wraps that p-tag
+    // the author.
+    if txn.get(dbi, pubkey)?.and_then(read_timestamp) < Some(timestamp) {
         txn.put(dbi, pubkey, &timestamp.to_ne_bytes(), 0)?;
         crate::state::invalidate_visibility(txn)?;
     }
@@ -170,7 +172,8 @@ pub fn backfill_vanish_markers(
     txn.foreach_full(
         txn.env().dbis().event_kind,
         &start,
-        &[],
+        // The first duplicate, or requests at created_at 0 are skipped.
+        &0u64.to_ne_bytes(),
         false,
         |key, value| {
             if key.len() != 16 || value.len() != 8 {
@@ -224,7 +227,7 @@ pub fn backfill_vanish_markers(
     let mut updated = 0;
     let mut txn = env.begin_rw()?;
     for (pubkey, timestamp) in markers {
-        if vanish_timestamp_rw(&txn, &pubkey)?.unwrap_or(0) < timestamp {
+        if vanish_timestamp_rw(&txn, &pubkey)? < Some(timestamp) {
             mark_vanished(&mut txn, &pubkey, timestamp)?;
             updated += 1;
         }

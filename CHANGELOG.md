@@ -350,6 +350,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access. Existing files keep their mode: `chmod g-w,o= data.mdb lock.mdb`
   in the database directory narrows them. The example systemd unit's
   `UMask=0077` and `0700` state directory already kept other users out.
+- Any key could stop expiry and NIP-62 deletion for the whole relay (#240).
+  The count of a key's events that `relay.abuse.max_stored_events_per_pubkey`
+  checks against, built from the author index the first time it is needed,
+  skipped the key's events at `created_at` 0. A kind 62, which the quota
+  does not check, could be stored at 0 before the count was built. Once the
+  key's counted events were deleted, the next deletion found the count at
+  zero and aborted its transaction: maintenance retried the same expired
+  events every 2 seconds and failed each time, and a deletion request
+  aborted the writer batch it was in, other clients' events included, with
+  `error: author count overflow or drift`. The count now includes those
+  events. A count that a deletion still finds at zero, as an earlier release
+  may have stored, is dropped with a warning and counted again from the
+  author index when next needed; `wok_author_count_drift_total` counts them,
+  and `wok reindex --confirm-relay-stopped` drops every stored count. The
+  same scan let a NEG-OPEN be answered from the persistent negentropy tree
+  while it held an event of a restricted kind at `created_at` 0, and made
+  the NIP-62 backfill miss requests at 0. A request at `created_at` 0 now
+  leaves a marker like any other, so the key's events at 0 and the gift
+  wraps that p-tag it are deleted; before, it was stored and did nothing.
 
 ### Added
 
@@ -359,6 +378,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`wok_writer_*`), plus the bytes its transactions sent to storage on
   Linux. Publishing is bound by the single writer, so these show where an
   event's EVENT→OK time goes and what each event costs to write.
+- `wok-bench`'s `live_fanout` keeps up to `--fanout-window` publications
+  unacknowledged (256 by default; `FANOUT_WINDOW` in the campaign scripts)
+  instead of waiting for each OK before the next (#257). It measured publish
+  round trips rather than delivery: 128 subscribers took 64,000 events in
+  4.2 s on Wok master, about one event per 8 ms OK. `--fanout-window 1`
+  keeps the old behavior, so earlier results are comparable only with it.
 
 - `scripts/benchmark-campaign.sh` compares any number of relay targets
   (#226), each described by a file on the relay host, instead of one Wok and
@@ -1021,6 +1046,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A negentropy tree whose filter names more tag letters than
+  `relay.max_tags_per_filter` no longer makes every write fail (#243). The
+  writer parsed stored tree filters with that client-filter limit, so
+  lowering it, or a `wok negentropy add` of a filter with 9 or more tag
+  letters at the default of 8, refused every EVENT with `error: too many
+  tags in filter` and aborted every maintenance tick, stopping NIP-40 expiry
+  and NIP-62 sweeps. Stored trees now parse without the client-filter
+  limits, as `wok doctor` already checked them, and `wok negentropy add`
+  checks a new filter with that same parser. **It now refuses an array of
+  filters**, which it stored before though every write then failed on it.
 - A NEG-MSG sent before the relay replied to its session's NEG-OPEN, while
   the view built in memory is still being scanned, gets `invalid: NEG-MSG
   sent before the reply to NEG-OPEN`, and the session and its scan close

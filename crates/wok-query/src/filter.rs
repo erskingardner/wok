@@ -323,7 +323,16 @@ impl NostrFilter {
             f.limit = max_filter_limit;
         }
         let num_major = num_major_non_tag + tag_key_count as u64;
+        // The tag indexes also hold the empty `d` that packing adds to
+        // replaceable and addressable events, which filters do not match
+        // (`PackedEventView::foreach_filter_tag`), so a filter for the empty
+        // `d` checks each stored event.
+        let empty_d = f
+            .tags
+            .get(&'d')
+            .is_some_and(|values| values.does_match(b""));
         f.index_only_scans = f.and_tags.is_empty()
+            && !empty_d
             && (num_major <= 1 || (num_major == 2 && f.authors.is_some() && f.kinds.is_some()));
         Ok(f)
     }
@@ -360,7 +369,7 @@ impl NostrFilter {
         }
         for (tag, filt) in &self.tags {
             let mut found = false;
-            ev.foreach_tag(|name, val| {
+            ev.foreach_filter_tag(|name, val| {
                 if name == *tag && filt.does_match(val) {
                     found = true;
                     return false;
@@ -374,7 +383,7 @@ impl NostrFilter {
         for (tag, required) in &self.and_tags {
             for value in required.iter() {
                 let mut found = false;
-                ev.foreach_tag(|name, candidate| {
+                ev.foreach_filter_tag(|name, candidate| {
                     if name == *tag && candidate == value {
                         found = true;
                         return false;
@@ -801,6 +810,48 @@ mod tests {
             .collect();
         assert!(NostrFilter::parse(&json!({"#r": many}), 500, 3, 16).is_err());
         assert!(NostrFilter::parse(&json!({"#r": &many[..65]}), 500, 3, 16).is_ok());
+    }
+
+    #[test]
+    fn empty_d_matches_only_an_empty_address() {
+        let packed = |kind: u64, tags: Value| {
+            let v = json!({
+                "id": "11".repeat(32),
+                "pubkey": "22".repeat(32),
+                "created_at": 15,
+                "kind": kind,
+                "content": "",
+                "tags": tags,
+                "sig": "00".repeat(64),
+            });
+            wok_event::nostr_json_to_packed_event(&v, &Default::default()).unwrap()
+        };
+        let cases = [
+            (packed(30023, json!([])), true),
+            (packed(30023, json!([["d", ""]])), true),
+            (packed(30023, json!([["d", "intro"], ["d", ""]])), true),
+            (packed(30023, json!([["d", "intro"]])), false),
+            (packed(0, json!([])), false),
+            (packed(10002, json!([["r", "wss://relay.test"]])), false),
+            (packed(10002, json!([["d", ""]])), true),
+        ];
+        for filter in [
+            json!({"#d": [""]}),
+            json!({"&d": [""]}),
+            json!({"kinds": [0, 10002, 30023], "#d": [""]}),
+        ] {
+            let f = NostrFilter::parse(&filter, 500, 3, 16).unwrap();
+            assert!(!f.index_only_scans, "{filter}");
+            for (event, expected) in &cases {
+                let view = event.view();
+                assert_eq!(f.does_match(view), *expected, "{filter} {:?}", view.tags());
+            }
+        }
+        // Other values are matched as before, and from the index alone.
+        let f = NostrFilter::parse(&json!({"#d": ["intro"]}), 500, 3, 16).unwrap();
+        assert!(f.index_only_scans);
+        let matched: Vec<_> = cases.iter().map(|(e, _)| f.does_match(e.view())).collect();
+        assert_eq!(matched, [false, false, true, true, false, false, false]);
     }
 
     #[test]

@@ -354,6 +354,17 @@ regression test. Differential parity alone is not a reason to retain it.
   versions that a deletion with such a long `a` tag names. The repair keeps a
   record that packs differently in any other way, such as kind 41 history
   packed with a virtual `d`.
+- NIP-01 `#d` filters: the empty `d` that packing adds to replaceable and
+  addressable events, so that the first `d` sets the address, is not a tag
+  filters match. `#d:[""]` matches events with a `d` tag of that value, and
+  addressable events without a `d`, whose address it is. The pinned strfry
+  matches the added tag, so `#d:[""]` selects every replaceable event and
+  every addressable event whatever its `d`, and an `naddr` with an empty
+  identifier resolves to the author's newest event of that kind. The tag
+  indexes still hold the added tag, so a filter for the empty `d` reads each
+  candidate event. Kind 41 history packed by releases that treated it as
+  replaceable keeps its added `d`, and a tag with no value, such as `["t"]`,
+  is still matched as `["t",""]`, as in strfry.
 - NIP-01 kind ranges: kind 41 (NIP-28 channel metadata) is regular. The pinned
   strfry treats it as replaceable per author, so metadata for a second channel
   deleted the first channel's. Migrated kind 41 history stays stored and

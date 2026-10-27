@@ -1305,8 +1305,25 @@ host reaches it) and `TARGETS` are required. The other settings are
 `PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`, `FANOUT_WINDOW`,
 `IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`,
 `LIFECYCLE_CONNECTIONS`, `RATE_STEPS`, `RATE_SECS`, `RATE_DRAIN_SECS`,
-`RATE_CONNECTIONS`, `RATE_P99_MS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED`
-and `BASE_TIMESTAMP`.
+`RATE_CONNECTIONS`, `RATE_P99_MS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED`,
+`BASE_TIMESTAMP` and `RELAY_COPY_SSH`.
+
+The campaign copies the corpus, each fixed-rate step's outcome log and
+reconciliation, and each run's server artifacts between the hosts. By default
+every copy passes through the operator host, at the speed of its own links,
+which for a large corpus can take hours. Set `RELAY_COPY_SSH` to the relay
+host's SSH destination as the load host reaches it, such as
+`root@RELAY_PRIVATE_IP`, and the load host copies directly. It needs a key the
+relay host accepts without a prompt, and the campaign checks that before it
+starts. Limit that key in the relay host's `authorized_keys` to the load host's
+address, with no forwarding:
+
+```text
+from="LOAD_PRIVATE_IP",no-agent-forwarding,no-port-forwarding,no-X11-forwarding ssh-ed25519 AAAA...
+```
+
+Also pin the relay host's key in the load host's `known_hosts`, so the first
+copy does not trust whatever key it is offered.
 
 A social corpus needs targets that accept its largest events: its manifest
 gives `needed_max_event_size`, and strfry's default `events.maxEventSize` of

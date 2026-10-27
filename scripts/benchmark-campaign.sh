@@ -397,7 +397,8 @@ run_target() {
     remote_command "$LOAD_SSH" mkdir -p "$run_root/load" "$run_root/server"
     # Only this run's evidence may replace it: a rerun under the same
     # campaign ID whose collect fails must leave every phase's bytes out.
-    remote_command "$LOAD_SSH" rm -f -- "$run_root/server/io-phases.tsv"
+    remote_command "$LOAD_SSH" rm -f -- "$run_root/server/io-phases.tsv" \
+        "$run_root/server/writer-phases.tsv"
     RATE_LAUNCHED=()
     PHASES_LAUNCHED=()
 

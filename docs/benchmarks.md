@@ -1364,6 +1364,16 @@ marks, and each phase starts from an empty directory, so under a reused
 campaign ID a phase that runs never reports an earlier run's results or
 bytes. A phase the rerun does not reach keeps the earlier run's files.
 
+When the target sets `METRICS_URL`, each mark also saves the relay's metrics
+as `metrics-marks/<label>.prom`, and `writer-phases.tsv` gives, for each
+phase with both snapshots, the Wok writer's commits and stored events, its
+mean events per commit and the queue it found, its mean milliseconds per
+commit in each stage (prepare, write, commit, reply), and the bytes its
+commits sent to storage per stored event. These come from the writer's
+cumulative histograms, so a step's batches show apart from the load before
+it. A scrape that fails leaves that phase out; strfry's summary is only its
+header.
+
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`
 and `mpstat` output, and a copy of each server-side evidence directory.

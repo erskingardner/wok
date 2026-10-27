@@ -231,6 +231,69 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('stop wok before reconciling', result.stderr)
 
+    def test_io_marks_keep_metrics_that_give_each_phases_writer_batches(self):
+        self.write_target('wok', self.valid(METRICS_URL='http://127.0.0.1:9784/metrics'))
+        artifacts = self.prefix/'opt/relay-bench/campaigns/c1/runs/r1-wok/server'
+        artifacts.mkdir(parents=True)
+        (artifacts/'main.pid').write_text('4242\n')
+        io = self.prefix/'proc/4242/io'
+        io.parent.mkdir(parents=True)
+        io.write_text('read_bytes: 0\nwrite_bytes: 0\n')
+        scrape = self.prefix/'metrics.prom'
+
+        def mark(label, commits, events, commit_seconds, stored_bytes):
+            if commits is None:
+                scrape.unlink(missing_ok=True)
+            else:
+                scrape.write_text(
+                    '# HELP wok_writer_commit_events Events each writer commit stored\n'
+                    f'wok_writer_commit_events_bucket{{le="+Inf"}} {commits}\n'
+                    f'wok_writer_commit_events_sum {events}\n'
+                    f'wok_writer_commit_events_count {commits}\n'
+                    f'wok_writer_queue_depth_sum {2 * events}\n'
+                    f'wok_writer_queue_depth_count {commits}\n'
+                    f'wok_writer_commit_seconds_sum {commit_seconds}\n'
+                    f'wok_writer_commit_seconds_count {commits}\n'
+                    f'wok_writer_storage_bytes_total {stored_bytes}\n'
+                    'wok_connections 3\n')
+            # A scrape that fails leaves no snapshot, like curl --fail.
+            return self.control(f'curl() {{ cat "{scrape}"; }}; io_mark wok "$1" "$2"',
+                                str(artifacts), label)
+
+        for label, *metrics in [('query-start', 10, 100, 0.5, 1000),
+                                ('query-end', 10, 100, 0.5, 1000),
+                                ('rate-1000-start', 10, 100, 0.5, 1000),
+                                ('rate-1000-end', 30, 2100, 1.5, 401000),
+                                ('rate-2000-start', None, 0, 0, 0),
+                                ('rate-2000-end', 40, 4100, 2.0, 801000)]:
+            result = mark(label, *metrics)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((artifacts/'metrics-marks/rate-2000-start.prom').exists())
+
+        result = self.control('writer_phases "$1"', str(artifacts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [line.split('\t') for line in
+                (artifacts/'writer-phases.tsv').read_text().splitlines()]
+        self.assertEqual(rows[0], ['phase', 'commits', 'events', 'events_per_commit',
+                                   'queue_depth', 'prepare_ms', 'write_ms', 'commit_ms',
+                                   'reply_ms', 'storage_bytes_per_event'])
+        # No commits, no means. A phase missing a snapshot is left out.
+        self.assertEqual(rows[1:], [
+            ['query', '0', '0', '', '', '', '', '', '', ''],
+            ['rate-1000', '20', '2000', '100.00', '200.00', '0.00', '0.00', '50.00',
+             '0.00', '200'],
+        ])
+
+        # Without METRICS_URL, as for strfry, marks keep no snapshots and the
+        # summary is its header.
+        self.write_target('wok', self.valid())
+        result = self.control('rm -r "$1/metrics-marks"; io_mark wok "$1" query-start'
+                              ' && io_mark wok "$1" query-end && writer_phases "$1"',
+                              str(artifacts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((artifacts/'metrics-marks').exists())
+        self.assertEqual(len((artifacts/'writer-phases.tsv').read_text().splitlines()), 1)
+
     def test_io_marks_bracket_phases_in_the_relays_io(self):
         self.write_target('wok', self.valid())
         artifacts = self.prefix/'opt/relay-bench/campaigns/c1/runs/r1-wok/server'
@@ -687,7 +750,8 @@ class CampaignSettings(unittest.TestCase):
                 line = next(line for line in sent if f'control {command} ' in line)
                 self.assertIn('--nofile 1048576', line)
             # An earlier run's I/O summary is gone before this run starts.
-            clear = sent.index('root@load rm -f -- /l/runs/r1-strfry-1.1.3/server/io-phases.tsv')
+            clear = sent.index('root@load rm -f -- /l/runs/r1-strfry-1.1.3/server/io-phases.tsv'
+                               ' /l/runs/r1-strfry-1.1.3/server/writer-phases.tsv')
             self.assertLess(clear, next(i for i, line in enumerate(sent)
                                         if 'control start ' in line))
 

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Update zstd to 0.14.3 (zstd-safe 8.2.0, zstd-sys 2.1.2) for
+  RUSTSEC-2026-0391, -0398, -0403 and -0410 (stream state reused after an
+  abandoned stream, `Seekable::decompress`, legacy-frame streaming
+  decompression, and the WebAssembly allocator shim). Wok uses only zstd's
+  bulk compressor, decompressor and dictionary training, none of which the
+  advisories affect, and the bundled libzstd stays at 1.5.7, so stored
+  payloads compress and decompress as before.
 - NIP-42 AUTH compares the scheme and path of its `relay` tag with those of
   `relay.auth.service_url` (#167). Only the host and port were compared, as
   in strfry, so where one host serves several relays by path, a relay at
@@ -350,21 +357,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access. Existing files keep their mode: `chmod g-w,o= data.mdb lock.mdb`
   in the database directory narrows them. The example systemd unit's
   `UMask=0077` and `0700` state directory already kept other users out.
+- Any key could stop expiry and NIP-62 deletion for the whole relay (#240).
+  The count of a key's events that `relay.abuse.max_stored_events_per_pubkey`
+  checks against, built from the author index the first time it is needed,
+  skipped the key's events at `created_at` 0. A kind 62, which the quota
+  does not check, could be stored at 0 before the count was built. Once the
+  key's counted events were deleted, the next deletion found the count at
+  zero and aborted its transaction: maintenance retried the same expired
+  events every 2 seconds and failed each time, and a deletion request
+  aborted the writer batch it was in, other clients' events included, with
+  `error: author count overflow or drift`. The count now includes those
+  events. A count that a deletion still finds at zero, as an earlier release
+  may have stored, is dropped with a warning and counted again from the
+  author index when next needed; `wok_author_count_drift_total` counts them,
+  and `wok reindex --confirm-relay-stopped` drops every stored count. The
+  same scan let a NEG-OPEN be answered from the persistent negentropy tree
+  while it held an event of a restricted kind at `created_at` 0, and made
+  the NIP-62 backfill miss requests at 0. A request at `created_at` 0 now
+  leaves a marker like any other, so the key's events at 0 and the gift
+  wraps that p-tag it are deleted; before, it was stored and did nothing.
+- `wok reindex` keeps the NIP-86 moderation records (#241). It copied the
+  other tables that events don't derive but not `wok_Moderation`, so the
+  database it promoted had no bans, allowlist entries, roles, kind policy,
+  IP blocks or reports: banned pubkeys and events were served again, every
+  kind was accepted, pubkeys given the `admin` or `moderator` role lost
+  management access, and under the `members` policies only `admin.pubkeys`
+  were still members. **A database reindexed by an earlier release has lost
+  these records**, but the backup reindex kept
+  (`<database>.pre-reindex-<timestamp>`, or the `--backup` path) still holds
+  them. With the relay stopped, `mdb_dump -s wok_Moderation <backup> |
+  mdb_load -s wok_Moderation <database>` copies them back. Each replaces
+  the record with the same key, and records under other keys stay. That also
+  undoes what changed since the reindex, such as a lifted ban, a revoked
+  role or a new kind map, so then repeat, in order, every NIP-86
+  management call made since, before letting clients back in. After more
+  than one such reindex, restore from the backup the first one kept and
+  repeat every call made since then.
 
 ### Added
 
-- `scripts/benchmark-campaign.sh` records what each phase made the relay
-  write (#257): the relay host's helper marks the relay process's storage
-  I/O before and after every phase, and each phase's results get a
-  `relay-io.json` with the bytes read and written, and for a fixed-rate step
-  the bytes written per newly stored event. It works for any relay, strfry
-  included.
+- Writer metrics (#257): histograms of how many messages were queued when
+  the writer started a batch, how many events each commit holds, and how
+  long the batch's checks, writes, commit and replies took
+  (`wok_writer_*`), plus the bytes its transactions sent to storage on
+  Linux. Publishing is bound by the single writer, so these show where an
+  event's EVENT→OK time goes and what each event costs to write.
 - `wok-bench`'s `live_fanout` keeps up to `--fanout-window` publications
   unacknowledged (256 by default; `FANOUT_WINDOW` in the campaign scripts)
   instead of waiting for each OK before the next (#257). It measured publish
   round trips rather than delivery: 128 subscribers took 64,000 events in
   4.2 s on Wok master, about one event per 8 ms OK. `--fanout-window 1`
   keeps the old behavior, so earlier results are comparable only with it.
+- `scripts/benchmark-campaign.sh` records what each phase made the relay
+  write (#257): the relay host's helper marks the relay process's storage
+  I/O before and after every phase, and each phase's results get a
+  `relay-io.json` with the bytes read and written, and for a fixed-rate step
+  the bytes written per newly stored event. It works for any relay, strfry
+  included.
 
 - `scripts/benchmark-campaign.sh` compares any number of relay targets
   (#226), each described by a file on the relay host, instead of one Wok and
@@ -1037,6 +1086,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limits, as `wok doctor` already checked them, and `wok negentropy add`
   checks a new filter with that same parser. **It now refuses an array of
   filters**, which it stored before though every write then failed on it.
+- NIP-77 reconciliation accepts a message whatever number of ranges it
+  holds (#242). One with more than 4096 was refused, though the relay itself
+  answers with 500,000-byte frames, which hold about 23,000: `wok sync`
+  failed with `negentropy message has too many bounds` against Wok or strfry
+  once the two sets differed by more than a few thousand events, and the
+  relay sent `NEG-ERR "error: invalid reconciliation message"` to a client
+  that used large frames. Storage work bounds a round instead: once its
+  lookups and fingerprints have cost 65,536 B-tree descents, the reply
+  answers the rest of its range with one fingerprint, as it does when it
+  fills its frame, and the peer splits that range in its next message. A
+  crafted message costs no more than the range cap let one cost (#254).
 - A NEG-MSG sent before the relay replied to its session's NEG-OPEN, while
   the view built in memory is still being scanned, gets `invalid: NEG-MSG
   sent before the reply to NEG-OPEN`, and the session and its scan close

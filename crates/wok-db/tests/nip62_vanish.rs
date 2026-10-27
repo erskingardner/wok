@@ -231,3 +231,71 @@ fn existing_request_records_are_backfilled_for_migrations() {
         0
     );
 }
+
+/// A request at created_at 0 leaves a marker, written live or by the
+/// backfill, which reads the kind index from its first entry: it covers the
+/// author's events at created_at 0 and the gift wraps that p-tag the author.
+#[test]
+fn a_request_at_created_at_zero_leaves_a_marker() {
+    let policy = VanishPolicy {
+        enabled: true,
+        service_url: String::new(),
+    };
+    let mut rng = rand::thread_rng();
+    let recipient = Keypair::new(SECP256K1, &mut rng).x_only_public_key().0;
+    for backfilled in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let env = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let author = Keypair::new(SECP256K1, &mut rng);
+        let (pubkey, _) = author.x_only_public_key();
+        let (_, mut request) = signed(&author, 62, 0, json!([["relay", "ALL_RELAYS"]]));
+        if backfilled {
+            let mut txn = env.begin_rw().unwrap();
+            write_events(
+                &mut txn,
+                &mut NoopNegentropy,
+                std::slice::from_mut(&mut request),
+                false,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+            assert_eq!(
+                backfill_vanish_markers(&env, &policy, 1_000_000).unwrap(),
+                1
+            );
+        } else {
+            write_one(&env, &policy, &mut request);
+        }
+        assert_eq!(request.status, EventWriteStatus::Written);
+        assert_eq!(
+            vanish_timestamp_ro(&env.begin_ro().unwrap(), &pubkey.serialize()).unwrap(),
+            Some(0),
+            "backfilled: {backfilled}"
+        );
+
+        let (_, mut at_zero) = signed(&author, 1, 0, json!([]));
+        write_one(&env, &policy, &mut at_zero);
+        assert_eq!(at_zero.status, EventWriteStatus::Deleted);
+        let (_, mut later) = signed(&author, 1, 1, json!([]));
+        write_one(&env, &policy, &mut later);
+        assert_eq!(later.status, EventWriteStatus::Written);
+        let sender = Keypair::new(SECP256K1, &mut rng);
+        let (_, mut wrap) = signed(
+            &sender,
+            1059,
+            100,
+            json!([["p", hex::encode(pubkey.serialize())]]),
+        );
+        write_one(&env, &policy, &mut wrap);
+        assert_eq!(wrap.status, EventWriteStatus::Deleted);
+        let (_, mut other) = signed(
+            &sender,
+            1059,
+            100,
+            json!([["p", hex::encode(recipient.serialize())]]),
+        );
+        write_one(&env, &policy, &mut other);
+        assert_eq!(other.status, EventWriteStatus::Written);
+    }
+}

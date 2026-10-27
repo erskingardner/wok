@@ -379,6 +379,7 @@ struct Trial {
     nip77_catchup: Option<catchup::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     db_write: Option<db_write::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     codec_cpu: Option<codec::Report>,
 }
 

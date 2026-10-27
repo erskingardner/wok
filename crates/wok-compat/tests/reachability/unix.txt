@@ -1,7 +1,7 @@
 # Relay functions reached in the `unix` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 761
+## anonymous: 760
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -11,11 +11,12 @@
 <wok_db::payload::Decompressor>::decode
 <wok_db::payload::Decompressor>::decode_rw
 <wok_db::search::Tag>::name_and_value
+<wok_db::txn::Cursor>::count
 <wok_db::txn::RoTxn>::cursor
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
-<wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::SearchScan>::gather::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
+<wok_db::txn::RoTxn>::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::search::build_search_index::{closure}>
@@ -219,8 +220,6 @@
 <wok_query::scan::SearchGroupScan>::process::<<wok_query::scan::DbQuery>::process_with<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
 <wok_query::scan::SearchScan>::base_score
 <wok_query::scan::SearchScan>::consider
-<wok_query::scan::SearchScan>::consider::{closure}
-<wok_query::scan::SearchScan>::consider::{closure}::{closure}
 <wok_query::scan::SearchScan>::gather
 <wok_query::scan::SearchScan>::gather::{closure}
 <wok_query::scan::SearchScan>::new
@@ -511,7 +510,6 @@ wok_db::payload::parse_payload
 wok_db::search::build_search_index
 wok_db::search::build_search_index::{closure}
 wok_db::search::build_search_index::{closure}::{closure}
-wok_db::search::event_search_terms
 wok_db::search::for_each_document_term::<wok_db::search::indexed_terms::{closure}>
 wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>
 wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>::{closure}
@@ -530,6 +528,8 @@ wok_db::search::search_document::{closure}
 wok_db::search::search_index_entries
 wok_db::search::search_index_entries::{closure}
 wok_db::search::search_posting_count
+wok_db::search::search_postings::<<wok_query::scan::SearchScan>::gather::{closure}>
+wok_db::search::search_postings::<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}
 wok_db::search::term_key
 wok_db::state::allocate_event_id
 wok_db::state::author_count
@@ -546,11 +546,11 @@ wok_db::tag_kind::tag_kind_key
 wok_db::tag_kind::tag_kind_keys
 wok_db::tag_kind::tag_kind_keys::{closure}
 wok_db::txn::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
-wok_db::txn::foreach_full::<<wok_query::scan::SearchScan>::gather::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 wok_db::txn::foreach_full::<wok_db::search::build_search_index::{closure}>
+wok_db::txn::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::state::author_count::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
@@ -637,7 +637,6 @@ wok_query::monitor::remove_from::<[u8; 32], [u8]>
 wok_query::monitor::remove_from::<alloc::boxed::Box<[u8]>, [u8]>
 wok_query::monitor::remove_from::<u64, u64>
 wok_query::monitor::swap_remove
-wok_query::scan::event_text
 wok_query::scan::plans_pubkey_kind
 wok_query::scan::plans_tag_kind
 wok_query::scan::slice_spent

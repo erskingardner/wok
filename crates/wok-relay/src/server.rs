@@ -1537,6 +1537,16 @@ pub fn start(env: Env, config: Config) -> Result<RelayHandle, String> {
             .and_then(|txn| load_moderation_snapshot_ro(&txn))
             .map_err(|e| format!("NIP-86 moderation load failed: {e}"))?,
     ));
+    // The writer keeps this current, but searches and NIP-11 consult it from
+    // the first request, which may come before the writer thread reads it.
+    if let Ok(Some(state)) = env
+        .begin_ro()
+        .and_then(|txn| wok_db::search_index_state_ro(&txn))
+    {
+        metrics
+            .search_index_lag_events
+            .store(state.lag(), Ordering::Relaxed);
+    }
 
     let handle = RelayHandle {
         ingest: ingest_txs.clone(),

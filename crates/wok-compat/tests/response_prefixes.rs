@@ -381,12 +381,11 @@ async fn search_filters_are_refused_while_the_search_index_builds() {
         handle: wok_relay::start(env, cfg).unwrap(),
         _dir: dir,
     };
-    // The writer reads how far the index lags as it starts.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while relay.handle.supported_nips().contains(&50) {
-        assert!(std::time::Instant::now() < deadline, "NIP-50 still listed");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    // Read as the relay starts, before any request.
+    assert!(
+        !relay.handle.supported_nips().contains(&50),
+        "NIP-50 listed"
+    );
 
     let (conn, mut rx) = relay.connection().await;
     let reason = "error: search index is building";

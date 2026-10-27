@@ -45,7 +45,7 @@ async fn reach_anonymous() {
     let (_, cfg) = profile();
     let relay = Relay::start(cfg.clone()).await;
     let mut conn = Conn::Ws(Box::new(Wire::connect(relay.addr).await));
-    anonymous_messages(&mut conn, &cfg).await;
+    anonymous_messages(&mut conn, &relay, &cfg).await;
     conn.close().await;
     deflated_messages(&relay).await;
     anonymous_http(&relay, &cfg).await;
@@ -221,7 +221,7 @@ async fn reach_local() {
     if let Some((_dir, path)) = unix_listener(&relay, &cfg, my_uid()).await {
         let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         let mut conn = Conn::Unix(stream, Vec::new());
-        anonymous_messages(&mut conn, &cfg).await;
+        anonymous_messages(&mut conn, &relay, &cfg).await;
         conn.close().await;
     }
     stop(relay, &cfg).await;
@@ -229,7 +229,7 @@ async fn reach_local() {
 
 /// Every client message, valid and not, from a connection that never
 /// authenticates.
-async fn anonymous_messages(wire: &mut Conn, cfg: &wok_relay::Config) {
+async fn anonymous_messages(wire: &mut Conn, relay: &Relay, cfg: &wok_relay::Config) {
     let stranger = key(2);
     let note = event(&stranger, 1, json!([]), "hello");
     let mut forged = note.clone();
@@ -264,6 +264,9 @@ async fn anonymous_messages(wire: &mut Conn, cfg: &wok_relay::Config) {
         })
         .await;
     }
+    // Until the writer indexes these events, a search scans them rather than
+    // read their postings; which one it does would depend on timing.
+    until_indexed(relay, cfg).await;
     for (sub, filter) in [
         ("ids", json!({"ids": [UNKNOWN_ID]})),
         ("kinds", json!({"kinds": [1], "limit": 5})),
@@ -595,27 +598,40 @@ async fn unix_listener(
 /// they exit, but get the connection's `Close` only if it reached the
 /// ingester first. The gauge drops once `Close` is queued.
 ///
-/// With search on, it also waits for the writer to index the phase's events
-/// for search, which it does once idle, and to store nothing more for
-/// 100 ms, so that build runs in this phase on every run too.
+/// It then waits for the phase's events to be indexed, so that build runs in
+/// this phase on every run too.
 async fn stop(relay: Relay, cfg: &wok_relay::Config) {
     let metrics = relay.handle.metrics.clone();
+    for _ in 0..500 {
+        if metrics.active_connections.load(Ordering::Relaxed) == 0 {
+            until_indexed(&relay, cfg).await;
+            return relay.stop().await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the relay still holds a connection 5 s after the probe closed its last");
+}
+
+/// With search on, wait for the writer to index every event it stored for
+/// search, which it does once idle, and to store nothing more for 100 ms.
+async fn until_indexed(relay: &Relay, cfg: &wok_relay::Config) {
     // Read from the profile: a relay function called here would count as
     // startup, and so leave every phase's list.
-    let searchable = cfg.relay.search_enabled;
+    if !cfg.relay.search_enabled {
+        return;
+    }
+    let metrics = &relay.handle.metrics;
     let (mut written, mut quiet) = (u64::MAX, 0);
     for _ in 0..500 {
         let now = metrics.written_events_total.load(Ordering::Relaxed);
         quiet = if now == written { quiet + 1 } else { 0 };
         written = now;
-        let indexed = !searchable
-            || (quiet >= 10 && metrics.search_index_lag_events.load(Ordering::Relaxed) == 0);
-        if metrics.active_connections.load(Ordering::Relaxed) == 0 && indexed {
-            return relay.stop().await;
+        if quiet >= 10 && metrics.search_index_lag_events.load(Ordering::Relaxed) == 0 {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the relay still holds a connection, or unindexed events, 5 s after the probe closed its last");
+    panic!("the writer has not indexed the phase's events for search 5 s after storing them");
 }
 
 /// The probe's own user ID, read from a file it creates.

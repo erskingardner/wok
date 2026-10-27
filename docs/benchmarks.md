@@ -1266,8 +1266,9 @@ each phase gets a `relay-io.json` beside its results; for a fixed-rate step
 it adds the events the step newly stored (accepted less duplicates) and the
 bytes written per such event. This works for strfry as well as Wok. A
 missing mark leaves that phase's bytes out and does not fail the run. Each
-relay start begins new marks, and each phase removes its old summary, so a
-rerun under the same campaign ID never reports an earlier run's bytes.
+run removes the earlier copy of `io-phases.tsv`, each relay start begins new
+marks, and each phase removes its old summary, so a rerun under the same
+campaign ID never reports an earlier run's bytes.
 
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`

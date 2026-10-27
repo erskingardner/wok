@@ -685,6 +685,10 @@ class CampaignSettings(unittest.TestCase):
             for command in ['prepare', 'start']:
                 line = next(line for line in sent if f'control {command} ' in line)
                 self.assertIn('--nofile 1048576', line)
+            # An earlier run's I/O summary is gone before this run starts.
+            clear = sent.index('root@load rm -f -- /l/runs/r1-strfry-1.1.3/server/io-phases.tsv')
+            self.assertLess(clear, next(i for i, line in enumerate(sent)
+                                        if 'control start ' in line))
 
     def test_rejects_incomplete_or_invalid_settings(self):
         cases = {

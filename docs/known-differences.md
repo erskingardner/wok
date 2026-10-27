@@ -164,6 +164,11 @@ it is not a promise to reproduce upstream bugs.
   none is in flight, refusals included. Wok also sends only lines that are
   JSON with a lowercase 32-byte hex `id`, and refuses `--pipeline 0`, with
   which strfry's sends nothing and waits.
+- `wok download` exits nonzero on a NOTICE before the first event whose
+  text starts with `error:` or a NIP-01 refusal prefix, and after `--timeout`
+  seconds (default 60) without the handshake, an event or EOSE. The pinned
+  strfry's `download` logs every NOTICE and waits for EOSE without a bound.
+  Both exit nonzero on CLOSED.
 - Negentropy tree filters are parsed without `relay.max_tags_per_filter` or
   `relay.max_and_entries`, which bound client filters. strfry parses stored
   tree filters with `relay__maxTagsPerFilter`, so lowering it below a tree's

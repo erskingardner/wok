@@ -13,13 +13,18 @@ way; see [Search](config.md#search).
 ## Query semantics
 
 - Free text is split into Unicode alphanumeric terms and lowercased.
-- Every unique free-text term must occur in `content` (AND semantics).
+- Every unique free-text term must be one of the event's searchable terms
+  (AND semantics): the first 256 unique terms of its `content`, in document
+  order. A word an event first uses after that, such as the 300th distinct
+  word of a long article, is not searchable, in history, COUNT, NEG-OPEN or a
+  live subscription alike.
 - Words containing a non-empty `key:value` pair are treated as extensions and
   ignored. Wok does not currently implement the optional `domain`, `language`,
   `sentiment`, `nsfw`, or `include:spam` extensions.
 - Results are ranked by inverse term document frequency, then boosted for each
-  adjacent query-term pair found in the content. Ties use newer `created_at`,
-  then lexical event id, for deterministic output.
+  adjacent query-term pair among the first 256 unique adjacent pairs of the
+  content. Ties use newer `created_at`, then lexical event id, for
+  deterministic output.
 - `limit` is applied only after ranking. Multiple search filters in one REQ are
   evaluated independently and duplicate events are emitted once.
 - After historical results and EOSE, matching new events continue to be sent
@@ -28,14 +33,20 @@ way; see [Search](config.md#search).
 Queries are limited to 1,024 UTF-8 bytes and 16 searchable terms. Individual
 normalized terms are limited to 64 bytes. These
 bounds prevent a single REQ from creating unbounded parser or index work.
+Each event is searchable by at most 256 unique terms and ranked by at most 256
+unique adjacent pairs, so one small event of many distinct words cannot
+amplify into thousands of index writes. Live matching uses the same bounded
+terms the index stores, so a search finds the same events whether it is open
+when they arrive or sent later.
 Events rejected by Wok's admission/write policy never enter the database or
 the search index and therefore do not appear in search results.
 
 ## Index and recovery
 
-The rebuildable `wok_Event__search` LMDB DBI stores unique normalized terms and
-adjacent term pairs mapped to local event ids. It is maintained in the same
-write transaction as Event, EventPayload, replacement, and deletion changes.
+The rebuildable `wok_Event__search` LMDB DBI stores each event's first 256
+unique normalized terms and first 256 unique adjacent term pairs, mapped to
+local event ids. It is maintained in the same write transaction as Event,
+EventPayload, replacement, and deletion changes.
 Queries count postings, start with the rarest term, intersect remaining terms
 with exact LMDB lookups, and retain only the best `limit` candidates in a
 bounded heap.

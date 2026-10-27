@@ -15,6 +15,7 @@ Storage integration tests. They open disposable LMDB environments.
 | `state_integrity.rs` | Corrupt state detection and valid lazy/deleted-tail state |
 | `nip59_gift_wrap.rs` | Gift-wrap deletion / recipient semantics |
 | `nip62_vanish.rs` | Request to Vanish markers and sweep |
+| `batch_copies.rs` | Copies of one event in one write batch share the first copy's refusal; only a stored event's copies are duplicates |
 | `cpp_roundtrip.rs` | Optional differential vs strfry (needs `STRFRY_BIN`) |
 
 `cpp_roundtrip` may skip locally when strfry is absent. `WOK_REQUIRE_STRFRY=1` turns a missing reference into a failure; the dedicated CI migration job sets it. Query/search behavior is also covered in `crates/wok-query/tests/` and `crates/wok-compat/tests/`.

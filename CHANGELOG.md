@@ -964,6 +964,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Publishing an event no longer writes its NIP-50 search postings (#257).
+  The relay's writer indexes stored events afterwards, in steps of up to
+  10,000 events whenever it is idle, and before a batch once 1,000 events
+  wait, so a common word's pages are written once per step rather than once
+  per event. With search off, nothing is indexed. Searches stay complete:
+  they read the events the index lacks directly. While more than 100,000
+  wait, as when a relay starts on a database whose index must be rebuilt, a
+  search is refused with `error: search index is building` and NIP-11 omits
+  NIP-50 until the build catches up. `wok import` and `wok migrate strfry`
+  build the index before they exit. `wok_search_index_lag_events` reports
+  the events waiting.
 - Wok bundles LMDB 0.9.37, up from 0.9.21 (#257). The newer releases fix
   DUPSORT deletes and alignment, a race freeing spilled pages at the end of
   a write, and fdatasync and metapage syncs on macOS. The source is vendored
@@ -991,8 +1002,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boosted a match whose content holds the query's words in order; that
   boost is now read from a match's content when it is ranked. A published
   event writes about half as many postings, and a phrase late in a long
-  event, past the old 256 pairs, now counts. The index is rebuilt on the
-  first open, in 10,000-event transactions before the relay serves.
+  event, past the old 256 pairs, now counts. The index is rebuilt after the
+  upgrade.
 - `[relay.filter_validation]` rules now apply to NEG-OPEN as they do to REQ
   and COUNT, refused with `NEG-ERR blocked: filter validation failed: ...`.
   Before, a sync could list the ids of every event a REQ's filter was

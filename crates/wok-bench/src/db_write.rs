@@ -10,6 +10,12 @@
 //! A step writes at least `--db-step-events` events and at least
 //! [`MIN_COMMITS`] transactions.
 //!
+//! Publishing writes no search postings. As on a busy relay writer, a search
+//! build step runs after a batch once [`wok_db::SEARCH_BUILD_BUSY_LAG`]
+//! events wait, and a step's last events are indexed at its end, as an idle
+//! writer indexes them. Both count in the step's time and bytes. The preload
+//! builds the index for the history after loading it.
+//!
 //! Per step it reports transaction and commit times, and on Linux the bytes
 //! the process wrote (`write_bytes` of `/proc/self/io`, which counts each page
 //! dirtied once per commit). The relay writer's checks before its write
@@ -88,6 +94,9 @@ pub struct Step {
     pub pages_per_commit: Option<f64>,
     /// Growth of `data.mdb` over the step.
     pub file_growth_bytes: u64,
+    /// Events the search build indexed during the step, and its time.
+    pub search_built: u64,
+    pub search_build_secs: f64,
     /// Transaction times in µs, kept for the trial's latency columns.
     #[serde(skip)]
     pub txn_us: Vec<u64>,
@@ -126,6 +135,74 @@ fn step_sizes(batches: &[usize], step_events: u64) -> Vec<u64> {
 /// plus a preloaded history of [`DEFAULT_PRELOAD`].
 pub fn default_corpus_events(batches: &[usize], step_events: u64) -> u64 {
     step_sizes(batches, step_events).iter().sum::<u64>() + DEFAULT_PRELOAD
+}
+
+/// The relay writer's search index build: steps of
+/// [`wok_db::SEARCH_BUILD_STEP_EVENTS`] events and
+/// [`wok_db::SEARCH_BUILD_STEP_BUDGET`], each in its own transaction.
+struct SearchBuild {
+    state: Option<wok_db::SearchIndexState>,
+    events: u64,
+    secs: f64,
+}
+
+impl SearchBuild {
+    fn new(env: &wok_db::Env) -> Result<Self> {
+        Ok(Self {
+            state: wok_db::search_index_state_ro(&env.begin_ro()?)?,
+            events: 0,
+            secs: 0.0,
+        })
+    }
+
+    fn lag(&self) -> u64 {
+        self.state.map_or(0, |state| state.lag())
+    }
+
+    /// A batch stored `events`.
+    fn note_stored(&mut self, events: &[wok_db::EventToWrite]) {
+        let newest = events
+            .iter()
+            .filter(|event| matches!(event.status, wok_db::EventWriteStatus::Written))
+            .map(|event| event.lev_id)
+            .max();
+        if let (Some(state), Some(newest)) = (self.state.as_mut(), newest) {
+            state.high_water = state.high_water.max(newest);
+        }
+    }
+
+    fn step(&mut self, env: &wok_db::Env) -> Result<()> {
+        let started = Instant::now();
+        let mut txn = env.begin_rw()?;
+        let step = wok_db::build_search_index(
+            &mut txn,
+            wok_db::SEARCH_BUILD_STEP_EVENTS,
+            wok_db::SEARCH_BUILD_STEP_BUDGET,
+        )?;
+        txn.commit()?;
+        self.secs += started.elapsed().as_secs_f64();
+        self.state = step.map(|step| {
+            self.events += step.events;
+            step.state
+        });
+        Ok(())
+    }
+
+    /// The step a busy writer takes before its next batch.
+    fn step_if_behind(&mut self, env: &wok_db::Env) -> Result<()> {
+        if self.lag() >= wok_db::SEARCH_BUILD_BUSY_LAG {
+            self.step(env)?;
+        }
+        Ok(())
+    }
+
+    /// The steps an idle writer takes until the index is complete.
+    fn finish(&mut self, env: &wok_db::Env) -> Result<()> {
+        while self.lag() > 0 {
+            self.step(env)?;
+        }
+        Ok(())
+    }
 }
 
 /// What a batch of events came to.
@@ -189,6 +266,7 @@ pub fn run(opts: &Options) -> Result<Report> {
             batch.clear();
         }
     }
+    SearchBuild::new(&env)?.finish(&env)?;
     let preload_secs = started.elapsed().as_secs_f64();
     anyhow::ensure!(
         preload.unfinished == 0,
@@ -206,13 +284,17 @@ pub fn run(opts: &Options) -> Result<Report> {
         let mut txn_us = Vec::new();
         let mut commit_hist = Histogram::<u64>::new(3)?;
         let mut outcomes = Outcomes::default();
+        let mut search = SearchBuild::new(&env)?;
         let started = Instant::now();
         for chunk in pending.chunks_mut(batch_size) {
             let times = write_batch(&env, &mut trees, chunk)?;
             txn_us.push(times.txn_us);
             commit_hist.record(times.commit_us.max(1))?;
             outcomes.add(chunk);
+            search.note_stored(chunk);
+            search.step_if_behind(&env)?;
         }
+        search.finish(&env)?;
         let secs = started.elapsed().as_secs_f64();
         let bytes_written = match (io_before, process_write_bytes()) {
             (Some(before), Some(after)) => Some(after.saturating_sub(before)),
@@ -246,6 +328,8 @@ pub fn run(opts: &Options) -> Result<Report> {
             bytes_per_stored: bytes_written.map(|bytes| bytes as f64 / stored),
             pages_per_commit: bytes_written.map(|bytes| bytes as f64 / PAGE_BYTES / commits as f64),
             file_growth_bytes: std::fs::metadata(&data)?.len().saturating_sub(size_before),
+            search_built: search.events,
+            search_build_secs: search.secs,
             txn_us,
         });
         pending.clear();
@@ -321,13 +405,13 @@ fn process_write_bytes() -> Option<u64> {
 
 pub fn render_markdown(report: &Report) -> String {
     let mut s = format!(
-        "\n## db_write: {} events preloaded ({} stored) in {:.1} s\n\nEach step writes its own slice of the corpus's last events in transactions of `batch` events, each committed durably, as the relay writer does. Stored events were inserted; settled ones are duplicates, older versions of replaceable events, or deleted, with no row of their own. Rates, times and bytes per event count stored events. Transaction time runs from `begin_rw` to the end of the commit. Bytes are what the process wrote, from `/proc/self/io`; a page counts once per commit that dirties it. With few commits, p99 is close to the step's maximum.\n\n| batch | events | stored | settled | unfinished | commits | stored/s | µs/stored | txn p50 µs | txn p99 µs | txn max µs | commit p50 µs | commit p99 µs | bytes/stored | pages/commit | file growth MB |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "\n## db_write: {} events preloaded ({} stored) in {:.1} s\n\nEach step writes its own slice of the corpus's last events in transactions of `batch` events, each committed durably, as the relay writer does. Stored events were inserted; settled ones are duplicates, older versions of replaceable events, or deleted, with no row of their own. Rates, times and bytes per event count stored events. Transaction time runs from `begin_rw` to the end of the commit. Bytes are what the process wrote, from `/proc/self/io`; a page counts once per commit that dirties it. With few commits, p99 is close to the step's maximum. The search index is built as the relay writer builds it: a step after a batch once 1,000 events wait, and the rest at the step's end. Its time and bytes count in the step's; `search built` and `build s` are its events and time, and commits count only event batches.\n\n| batch | events | stored | settled | unfinished | commits | stored/s | µs/stored | txn p50 µs | txn p99 µs | txn max µs | commit p50 µs | commit p99 µs | bytes/stored | pages/commit | file growth MB | search built | build s |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         report.preloaded, report.preload_stored, report.preload_secs
     );
     let optional = |value: Option<f64>| value.map_or_else(|| "n/a".into(), |v| format!("{v:.0}"));
     for step in &report.steps {
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {:.0} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {:.1} |\n",
+            "| {} | {} | {} | {} | {} | {} | {:.0} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {:.2} |\n",
             step.batch,
             step.events,
             step.stored,
@@ -344,6 +428,8 @@ pub fn render_markdown(report: &Report) -> String {
             optional(step.bytes_per_stored),
             optional(step.pages_per_commit),
             step.file_growth_bytes as f64 / 1e6,
+            step.search_built,
+            step.search_build_secs,
         ));
     }
     if !report.io_counted {
@@ -381,6 +467,9 @@ mod tests {
             .map(|step| (step.batch, step.events, step.stored, step.commits))
             .collect();
         assert_eq!(shape, vec![(1, 40, 40, 40), (4, 80, 80, 20)]);
+        // Each step's events are indexed for search by its end.
+        let built: Vec<_> = report.steps.iter().map(|step| step.search_built).collect();
+        assert_eq!(built, vec![40, 80]);
         assert_eq!(report.preload_stored, 180);
         assert_eq!(report.failed_steps(), 0);
         assert!(report

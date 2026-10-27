@@ -1,20 +1,23 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 693
+## anonymous: 704
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
 <wok_db::moderation::ModerationView>::hides
+<wok_db::payload::Decompressor>::decode_rw
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
+<wok_db::txn::RwTxn>::foreach_full::<wok_db::search::build_search_index::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::state::author_count::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
+<wok_db::txn::RwTxn>::largest_integer_key
 <wok_db::vanish::VanishPolicy>::targets_this_relay_json
 <wok_db::vanish::VanishPolicy>::targets_this_relay_json::{closure}
 <wok_db::vanish::VanishPolicy>::targets_this_relay_value
@@ -279,6 +282,7 @@
 <wok_relay::metrics::Histogram>::observe
 <wok_relay::metrics::Histogram>::observe::{closure}
 <wok_relay::metrics::Metrics>::refused
+<wok_relay::metrics::Metrics>::search_index_building
 <wok_relay::metrics::Refusals>::add
 <wok_relay::metrics::Setting>::of_filter_limit
 <wok_relay::metrics::Setting>::of_read_class
@@ -420,6 +424,9 @@
 <wok_relay::server::sub_gate::SubGate>::is_open
 <wok_relay::server::sub_gate::SubGate>::len
 <wok_relay::server::sub_gate::SubGate>::open
+<wok_relay::server::writer::SearchBuild>::note_stored
+<wok_relay::server::writer::SearchBuild>::step
+<wok_relay::server::writer::SearchBuild>::step::{closure}
 <wok_relay::server::writer::ThreadStorageWrites>::bytes
 <wok_relay::source::TransportSource>::ip
 <wok_relay::source::TransportSource>::ip_address
@@ -461,14 +468,16 @@ wok_db::moderation::moderation_reason_inner
 wok_db::moderation::moderation_reason_ro
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
+wok_db::payload::parse_payload
+wok_db::search::build_search_index
+wok_db::search::build_search_index::{closure}
+wok_db::search::build_search_index::{closure}::{closure}
 wok_db::search::for_each_document_term::<wok_db::search::indexed_terms::{closure}>
 wok_db::search::for_each_term::<wok_db::search::normalize_search_terms_with_overflow::{closure}>
 wok_db::search::for_each_term::<wok_db::search::normalize_search_terms_with_overflow::{closure}>::{closure}
-wok_db::search::index_event_search
 wok_db::search::indexed_terms
 wok_db::search::normalize_search_terms_with_overflow
 wok_db::search::normalize_search_terms_with_overflow::{closure}
-wok_db::search::note_search_indexed_through
 wok_db::search::parse_event::<wok_db::search::EventContent>
 wok_db::search::parse_search_query
 wok_db::search::parse_search_query::{closure}
@@ -487,6 +496,7 @@ wok_db::state::policy_generation::{closure}
 wok_db::state::preserve_high_water
 wok_db::state::vanish_marker_changes
 wok_db::state::vanish_marker_changes::{closure}
+wok_db::tag_kind::high_water::{closure}
 wok_db::tag_kind::note_tag_kind_indexed
 wok_db::tag_kind::put_tag_kind_entries
 wok_db::tag_kind::tag_kind_key
@@ -495,6 +505,7 @@ wok_db::tag_kind::tag_kind_keys::{closure}
 wok_db::txn::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
+wok_db::txn::foreach_full::<wok_db::search::build_search_index::{closure}>
 wok_db::txn::foreach_full::<wok_db::state::author_count::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>

@@ -435,6 +435,13 @@ pub struct Metrics {
     /// transactions took.
     pub tag_kind_backfill_entries_total: AtomicU64,
     pub tag_kind_backfill_micros_total: AtomicU64,
+    /// Events stored above the search index's marker when the writer last
+    /// looked: every search reads them directly.
+    pub search_index_lag_events: AtomicU64,
+    /// Events the writer's background search build indexed, and the time its
+    /// transactions took.
+    pub search_index_build_events_total: AtomicU64,
+    pub search_index_build_micros_total: AtomicU64,
     /// Each writer batch that commits: the messages queued when it started,
     /// the events it stored, and how long each step took.
     pub writer_queue_depth: CountHistogram,
@@ -449,7 +456,17 @@ pub struct Metrics {
     pub history: MetricsHistory,
 }
 
+/// While more events than this are stored above the search index's marker,
+/// the relay refuses searches and does not advertise NIP-50: each search
+/// would read that many events itself.
+pub const SEARCH_INDEX_BUILDING_LAG: u64 = 100_000;
+
 impl Metrics {
+    /// Whether the search index is too far behind to serve searches.
+    pub fn search_index_building(&self) -> bool {
+        self.search_index_lag_events.load(Ordering::Relaxed) > SEARCH_INDEX_BUILDING_LAG
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         let g = |n: &AtomicU64| n.load(Ordering::Relaxed);
         MetricsSnapshot {
@@ -577,6 +594,13 @@ impl Metrics {
                 "wok_tag_kind_backfill_entries_total {}\n",
                 "# TYPE wok_tag_kind_backfill_seconds_total counter\n",
                 "wok_tag_kind_backfill_seconds_total {}\n",
+                "# HELP wok_search_index_lag_events Events stored above the search index's marker, which every search reads directly\n",
+                "# TYPE wok_search_index_lag_events gauge\n",
+                "wok_search_index_lag_events {}\n",
+                "# TYPE wok_search_index_build_events_total counter\n",
+                "wok_search_index_build_events_total {}\n",
+                "# TYPE wok_search_index_build_seconds_total counter\n",
+                "wok_search_index_build_seconds_total {}\n",
                 "# HELP wok_author_count_drift_total Author counters a deletion found below the author's stored events, and dropped to be counted again\n",
                 "# TYPE wok_author_count_drift_total counter\n",
                 "wok_author_count_drift_total {}\n",
@@ -626,6 +650,9 @@ impl Metrics {
             g(&self.tag_kind_tag_entries),
             g(&self.tag_kind_backfill_entries_total),
             g(&self.tag_kind_backfill_micros_total) as f64 / 1e6,
+            g(&self.search_index_lag_events),
+            g(&self.search_index_build_events_total),
+            g(&self.search_index_build_micros_total) as f64 / 1e6,
             g(&wok_db::state::AUTHOR_COUNT_DRIFT),
         );
         self.writer_queue_depth.0.render(

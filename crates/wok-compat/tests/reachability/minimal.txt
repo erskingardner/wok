@@ -1,12 +1,11 @@
 # Relay functions reached in the `minimal` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 633
+## anonymous: 621
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
 <wok_db::moderation::ModerationView>::hides
 <wok_db::payload::Decompressor>::decode
-<wok_db::search::Tag>::name_and_value
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
@@ -14,6 +13,7 @@
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
+<wok_db::txn::RwTxn>::largest_integer_key
 <wok_db::write::EventToWrite>::new
 <wok_db::write::EventToWrite>::with_context::<u64>
 <wok_event::error::EventError>::broken_limit
@@ -248,6 +248,7 @@
 <wok_relay::metrics::Histogram>::observe
 <wok_relay::metrics::Histogram>::observe::{closure}
 <wok_relay::metrics::Metrics>::refused
+<wok_relay::metrics::Metrics>::search_index_building
 <wok_relay::metrics::Refusals>::add
 <wok_relay::metrics::Setting>::of_filter_limit
 <wok_relay::metrics::Setting>::of_read_class
@@ -387,6 +388,7 @@
 <wok_relay::server::sub_gate::SubGate>::is_open
 <wok_relay::server::sub_gate::SubGate>::len
 <wok_relay::server::sub_gate::SubGate>::open
+<wok_relay::server::writer::SearchBuild>::note_stored
 <wok_relay::server::writer::ThreadStorageWrites>::bytes
 <wok_relay::source::TransportSource>::ip
 <wok_relay::source::TransportSource>::ip_address
@@ -431,20 +433,6 @@ wok_db::moderation::moderation_reason_ro
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
 wok_db::payload::parse_payload
-wok_db::search::for_each_document_term::<wok_db::search::indexed_terms::{closure}>
-wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>
-wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>::{closure}
-wok_db::search::index_event_search
-wok_db::search::indexed_terms
-wok_db::search::indexed_terms::{closure}
-wok_db::search::note_search_indexed_through
-wok_db::search::parse_event::<wok_db::search::EventContent>
-wok_db::search::parse_event::<wok_db::search::EventText>
-wok_db::search::search_document
-wok_db::search::search_document::{closure}
-wok_db::search::search_index_entries
-wok_db::search::search_index_entries::{closure}
-wok_db::search::term_key
 wok_db::state::allocate_event_id
 wok_db::state::author_count
 wok_db::state::author_key

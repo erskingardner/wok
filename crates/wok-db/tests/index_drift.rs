@@ -154,6 +154,7 @@ fn integrity_detects_search_index_drift() {
     let mut txn = env.begin_rw().unwrap();
     write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
     txn.commit().unwrap();
+    wok_db::finish_search_index(&env).unwrap();
 
     let lev = events[0].lev_id.to_ne_bytes();
     let mut txn = env.begin_rw().unwrap();
@@ -186,7 +187,8 @@ fn integrity_detects_search_index_drift() {
         .any(|issue| issue.category == "unexpected-index" && issue.table == "event_search"));
 }
 
-/// Write `contents` as kind-1 notes and return their local ids.
+/// Write `contents` as kind-1 notes, index them for search, and return their
+/// local ids.
 fn write_notes(env: &Env, contents: &[&str]) -> Vec<u64> {
     let mut events = contents
         .iter()
@@ -199,6 +201,7 @@ fn write_notes(env: &Env, contents: &[&str]) -> Vec<u64> {
     let mut txn = env.begin_rw().unwrap();
     write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
     txn.commit().unwrap();
+    wok_db::finish_search_index(env).unwrap();
     events.iter().map(|event| event.lev_id).collect()
 }
 

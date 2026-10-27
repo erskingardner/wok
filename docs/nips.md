@@ -177,14 +177,20 @@ fetched and discarded. Those differences are counted as `narrowed`, not in
 
 NIP-62 accepts a signed kind 62 request containing either a matching
 `["relay", "<public relay URL>"]` tag or `["relay", "ALL_RELAYS"]`. The
-relay immediately suppresses qualifying authored events and gift wraps for the
-requesting recipient, prevents rebroadcast, then physically deletes them in
-bounded background batches. The request itself remains stored and cannot be
-deleted with kind 5. NIP-62 says relays MUST honor a request that targets
-them, so one is accepted without proof of work, over both storage quotas, and
-whatever the write policy, the write-policy plugin or an author ban says (see
-[attack-surface.md](attack-surface.md#messages)). See `relay.nip62`
-in the sample configuration.
+relay immediately suppresses the requester's events and the NIP-59 gift
+wraps (kinds 1059 and 21059) that p-tag the requester, refuses them when they
+are sent again, then physically deletes them in bounded background batches.
+Both are covered only up to the `created_at` of the requester's newest
+request: NIP-62 resets what a key published and received until then, and
+does not retire the key, so events and wraps dated after it are accepted.
+NIP-59 dates a wrap up to two days in the past, so a wrap sent in the two
+days after a request can be dated before it and refused. The request itself
+remains stored and cannot be deleted with kind 5. NIP-62 says relays MUST
+honor a request that targets them, so one is accepted without proof of work,
+over both storage quotas, and whatever the write policy, the write-policy
+plugin or an author ban says (see
+[attack-surface.md](attack-surface.md#messages)). See `relay.nip62` in the
+sample configuration.
 
 NIP-86 management calls are JSON-RPC-like POSTs to the relay URI authorized
 by NIP-98 events from operator admins or role-holding moderators. They follow

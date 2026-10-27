@@ -1147,5 +1147,17 @@ mod tests {
         txn.commit().unwrap();
         assert_eq!(step(&env, 10), (2, 2));
         assert_eq!(postings(&env), 1);
+        // `wok doctor` reports the missing payload, and expects no postings
+        // for its event.
+        let report = crate::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert_eq!(report.missing_payloads, [1]);
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| issue.table != "event_search"),
+            "{:#?}",
+            report.issues
+        );
     }
 }

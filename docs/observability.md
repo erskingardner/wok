@@ -73,8 +73,11 @@ scrape_configs:
 | `wok_writer_storage_bytes_total` | counter | none | Bytes the writer's committed event transactions sent to storage: pages they dirtied, from `/proc/thread-self/io`, so 0 on tmpfs. Linux only; 0 elsewhere. |
 
 The `wok_writer_*` metrics cover each writer batch whose transaction
-committed, so their counts agree. Batches that only refuse events or run
-management commands, and transactions that fail, are not counted. A
+committed, so their counts agree. Batches whose events are all refused
+before the write transaction opens, batches that only run management
+commands, and transactions that fail are not counted. A transaction can
+commit with no event stored, for example when every event is a duplicate or
+over its author's quota; it counts, with 0 in `wok_writer_commit_events`. A
 publication's EVENT→OK time on the writer is roughly the wait for the batch
 in progress plus its own batch's prepare, write, commit and reply. While the
 `(tag, kind, created_at)` index is being built, a build step also runs

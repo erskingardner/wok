@@ -54,8 +54,16 @@ fn detects_regressed_sequence_and_malformed_state() {
         ),
         (b"sequence", vec![1], "malformed-value"),
         (b"visibility", vec![1], "malformed-value"),
+        (b"vanish-markers", vec![1], "malformed-value"),
         (b"unknown", 0u64.to_le_bytes().to_vec(), "malformed-key"),
         (b"a", 0u64.to_le_bytes().to_vec(), "malformed-key"),
+        (b"V", vec![0; 33], "malformed-key"),
+        (&[b'V'; 33], vec![0; 32], "malformed-value"),
+        (
+            &[b'V'; 33],
+            [vec![0; 16], vec![3], vec![0; 16]].concat(),
+            "malformed-value",
+        ),
     ] {
         let (_dir, env, _) = fixture();
         let mut txn = env.begin_rw().unwrap();

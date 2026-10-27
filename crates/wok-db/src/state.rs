@@ -15,6 +15,12 @@ pub(crate) const SUPERSEDED_EVENTS: &[u8] = b"superseded-versions";
 /// count may be stale.
 pub(crate) const LEGACY_SUPERSEDED_EVENTS: &[u8] = b"superseded-events";
 pub const POLICY_GENERATION: &[u8] = b"visibility";
+/// Key prefix of a vanish marker's sweep progress, followed by its pubkey
+/// (`vanish::SweepProgress`).
+pub(crate) const VANISH_SWEEP: u8 = b'V';
+/// How many times a vanish marker was added or raised, which is when the
+/// sweep gets more work.
+pub(crate) const VANISH_MARKER_CHANGES: &[u8] = b"vanish-markers";
 
 pub(crate) fn decode(raw: &[u8]) -> Result<u64, DbError> {
     Ok(u64::from_le_bytes(
@@ -151,6 +157,28 @@ pub fn policy_generation(txn: &RoTxn<'_>) -> Result<u64, DbError> {
         .map(decode)
         .transpose()
         .map(|v| v.unwrap_or(0))
+}
+
+pub(crate) fn vanish_marker_changes(txn: &RwTxn<'_>) -> Result<u64, DbError> {
+    let Some(dbi) = txn.env().dbis().state else {
+        return Ok(0);
+    };
+    txn.get(dbi, VANISH_MARKER_CHANGES)?
+        .map(decode)
+        .transpose()
+        .map(|v| v.unwrap_or(0))
+}
+
+/// Only equality matters to the sweep, so the count wraps rather than fail.
+pub(crate) fn count_vanish_marker_change(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
+    let dbi = txn
+        .env()
+        .dbis()
+        .state
+        .ok_or_else(|| DbError::msg("missing Wok state table"))?;
+    let changes = vanish_marker_changes(txn)?.wrapping_add(1);
+    txn.put(dbi, VANISH_MARKER_CHANGES, &changes.to_le_bytes(), 0)?;
+    Ok(())
 }
 
 pub fn invalidate_visibility(txn: &mut RwTxn<'_>) -> Result<(), DbError> {

@@ -35,7 +35,7 @@ pub(super) fn run_writer(
     let mut negentropy_cache = NegentropyFilterCache::default();
     let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
     let mut event_batch = Vec::with_capacity(WRITER_BATCH_MAX);
-    let mut maintenance_cursor = Vec::new();
+    let mut maintenance_cursor = wok_db::VanishSweepCursor::default();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
     let mut events: Vec<EventToWrite<u64>> = Vec::with_capacity(256);
     // Bytes of committed events the req monitors still hold.
@@ -1024,7 +1024,11 @@ pub(super) fn run_cron(writer: Sender<WriterMsg>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-pub(super) fn run_maintenance(env: &Env, cfg_snap: &Config, vanish_cursor: &mut Vec<u8>) {
+pub(super) fn run_maintenance(
+    env: &Env,
+    cfg_snap: &Config,
+    vanish_cursor: &mut wok_db::VanishSweepCursor,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1071,7 +1075,8 @@ pub(super) fn run_maintenance(env: &Env, cfg_snap: &Config, vanish_cursor: &mut 
             &mut sink,
             cfg_snap.relay.nip62.deletion_batch_size,
             &mut next_cursor,
-        )?;
+        )?
+        .deleted;
         let mut cache = NegentropyFilterCache::default();
         sink.apply(&mut cache, &mut txn)
             .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
@@ -1593,7 +1598,7 @@ mod tests {
             assert!(is_event_vanished_ro(&txn, PackedEventView::new(&note).unwrap()).unwrap());
         }
         // Maintenance then deletes the note.
-        run_maintenance(&env, &config, &mut Vec::new());
+        run_maintenance(&env, &config, &mut Default::default());
         let txn = env.begin_ro().unwrap();
         assert!(wok_db::lookup_event_by_id_ro(&txn, &[1; 32])
             .unwrap()
@@ -1704,7 +1709,7 @@ mod tests {
             "the publication was stored in the tree"
         );
 
-        run_maintenance(&env, &config, &mut Vec::new());
+        run_maintenance(&env, &config, &mut Default::default());
         let txn = env.begin_ro().unwrap();
         assert_eq!(txn.entries(env.dbis().event).unwrap(), 1);
         assert!(wok_db::lookup_event_by_id_ro(&txn, &[1; 32])

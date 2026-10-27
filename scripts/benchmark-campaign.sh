@@ -11,6 +11,10 @@ RELAY_SSH=${RELAY_SSH:-}
 LOAD_SSH=${LOAD_SSH:-}
 # The relay host's address as the load host reaches it.
 RELAY_HOST=${RELAY_HOST:-}
+# The relay host's SSH destination as the load host reaches it. When set, the
+# load host copies to and from the relay host directly; otherwise every copy
+# between them passes through this host.
+RELAY_COPY_SSH=${RELAY_COPY_SSH:-}
 # Target names, each defined on the relay host by
 # /etc/relay-bench/targets/<name>.env (see benchmark-relay-control.sh).
 TARGETS=${TARGETS:-}
@@ -141,6 +145,33 @@ remote_command() {
     local rendered
     printf -v rendered '%q ' "$@"
     ssh "${SSH_OPTIONS[@]}" "$host" "$rendered"
+}
+
+# copy_to_relay LOAD_PATH RELAY_PATH copies a file from the load host to the
+# relay host.
+copy_to_relay() {
+    if [[ -n $RELAY_COPY_SSH ]]; then
+        remote_command "$LOAD_SSH" scp -o BatchMode=yes -q "$1" "$RELAY_COPY_SSH:$2"
+    else
+        scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$1" "$RELAY_SSH:$2"
+    fi
+}
+
+# copy_to_load [-r] RELAY_PATH LOAD_PATH copies a file, or with -r a
+# directory, from the relay host to the load host.
+copy_to_load() {
+    local recursive=()
+    if [[ $1 == -r ]]; then
+        recursive=(-r)
+        shift
+    fi
+    if [[ -n $RELAY_COPY_SSH ]]; then
+        remote_command "$LOAD_SSH" scp -o BatchMode=yes -q ${recursive[@]+"${recursive[@]}"} \
+            "$RELAY_COPY_SSH:$1" "$2"
+    else
+        scp "${SSH_OPTIONS[@]}" -3 -q ${recursive[@]+"${recursive[@]}"} \
+            "$RELAY_SSH:$1" "$LOAD_SSH:$2"
+    fi
 }
 
 # Sets LOAD_UNIT_COMMAND to run a command on the load host as the transient
@@ -354,8 +385,7 @@ reconcile_rate_steps() {
             continue
         fi
         if ! remote_command "$RELAY_SSH" mkdir -p "$relay/rate-$rate" ||
-            ! scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$log" \
-                "$RELAY_SSH:$relay/rate-$rate/outcomes.jsonl"; then
+            ! copy_to_relay "$log" "$relay/rate-$rate/outcomes.jsonl"; then
             echo "$target step $rate: could not copy its outcome log to the relay host" >&2
             remote_command "$RELAY_SSH" rm -rf -- "$relay/rate-$rate" || true
             status=1
@@ -367,8 +397,8 @@ reconcile_rate_steps() {
     remote_command "$RELAY_SSH" "$CONTROL_REMOTE" reconcile "$target" "$RELAY_BENCH_BIN" \
         "$relay" --nofile "$NOFILE_LIMIT" || status=1
     for rate in "${ran[@]}"; do
-        if ! scp "${SSH_OPTIONS[@]}" -3 -q "$RELAY_SSH:$relay/rate-$rate/reconciliation.json" \
-            "$LOAD_SSH:$load/rate-$rate/reconciliation.json"; then
+        if ! copy_to_load "$relay/rate-$rate/reconciliation.json" \
+            "$load/rate-$rate/reconciliation.json"; then
             status=1
             continue
         fi
@@ -452,8 +482,7 @@ run_target() {
     if [[ -n $RATE_STEPS ]] && ! reconcile_rate_steps "$target" "$repetition"; then
         status=1
     fi
-    if scp "${SSH_OPTIONS[@]}" -3 -q -r "$RELAY_SSH:$server_artifacts/." \
-        "$LOAD_SSH:$run_root/server/"; then
+    if copy_to_load -r "$server_artifacts/." "$run_root/server/"; then
         phase_io "$target" "$repetition"
     else
         status=1
@@ -564,6 +593,10 @@ main() {
         die "the load host needs mpstat (sysstat)"
     remote_command "$LOAD_SSH" sh -c 'command -v systemd-run >/dev/null' ||
         die "the load host needs systemd-run"
+    if [[ -n $RELAY_COPY_SSH ]]; then
+        remote_command "$LOAD_SSH" ssh -o BatchMode=yes -o ConnectTimeout=10 "$RELAY_COPY_SSH" true ||
+            die "the load host cannot reach the relay host over SSH at $RELAY_COPY_SSH"
+    fi
     if [[ -n $RATE_STEPS ]]; then
         remote_command "$RELAY_SSH" test -x "$RELAY_BENCH_BIN" ||
             die "RATE_STEPS needs wok-bench on the relay host at $RELAY_BENCH_BIN"
@@ -580,7 +613,7 @@ main() {
     remote_command "$LOAD_SSH" "${LOAD_UNIT_COMMAND[@]}"
     RETAINED=$(retained_events)
     write_campaign_metadata
-    scp "${SSH_OPTIONS[@]}" -3 -q "$LOAD_SSH:$LOAD_CORPUS" "$RELAY_SSH:$RELAY_CORPUS"
+    copy_to_relay "$LOAD_CORPUS" "$RELAY_CORPUS"
 
     local load_sha relay_sha
     load_sha=$(ssh "${SSH_OPTIONS[@]}" "$LOAD_SSH" "sha256sum $(printf '%q' "$LOAD_CORPUS") | awk '{print \$1}'")

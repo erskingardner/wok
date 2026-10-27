@@ -87,29 +87,16 @@ impl Node {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NegError> {
-        if bytes.len() != NODE_SIZE {
-            return Err(NegError::msg(format!(
-                "negentropy node size {} != {NODE_SIZE}",
-                bytes.len()
-            )));
-        }
-        let mut offset = 0;
+        let num_items = check_encoded(bytes)?;
+        let mut offset = 8;
         let mut read_u64 = || {
             let value = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
             offset += 8;
             value
         };
-        let num_items = read_u64();
         let accum_count = read_u64();
         let next_sibling = read_u64();
         let prev_sibling = read_u64();
-        // Zero-item nodes are never persisted (erase deletes them) and larger
-        // counts are impossible: both indicate crafted/corrupt data at rest.
-        if num_items == 0 || num_items > MAX_ITEMS as u64 {
-            return Err(NegError::msg(format!(
-                "negentropy node item count {num_items} out of range 1..={MAX_ITEMS}"
-            )));
-        }
         let mut accum = crate::types::Accumulator::default();
         accum
             .buf
@@ -134,6 +121,39 @@ impl Node {
             items,
         })
     }
+
+    /// The `accum_count` and accumulator of an encoded node, read in place
+    /// as C++ reads them through the mmap. A descent reads these of every
+    /// sibling it passes, and decoding all of each one for them cost most of
+    /// a lookup (#254).
+    pub fn summary_from_bytes(bytes: &[u8]) -> Result<(u64, Accumulator), NegError> {
+        check_encoded(bytes)?;
+        let accum_count = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+        let mut accum = Accumulator::default();
+        accum
+            .buf
+            .copy_from_slice(&bytes[HEADER_SIZE..HEADER_SIZE + ACCUMULATOR_SIZE]);
+        Ok((accum_count, accum))
+    }
+}
+
+/// An encoded node's item count, once its size and count are checked.
+fn check_encoded(bytes: &[u8]) -> Result<u64, NegError> {
+    if bytes.len() != NODE_SIZE {
+        return Err(NegError::msg(format!(
+            "negentropy node size {} != {NODE_SIZE}",
+            bytes.len()
+        )));
+    }
+    let num_items = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+    // Zero-item nodes are never persisted (erase deletes them) and larger
+    // counts are impossible: both indicate crafted/corrupt data at rest.
+    if num_items == 0 || num_items > MAX_ITEMS as u64 {
+        return Err(NegError::msg(format!(
+            "negentropy node item count {num_items} out of range 1..={MAX_ITEMS}"
+        )));
+    }
+    Ok(num_items)
 }
 
 #[cfg(test)]
@@ -277,6 +297,15 @@ struct Breadcrumb {
 /// mmap; never return a borrow that could outlive the transaction.
 pub trait BTreeBackend {
     fn get_node_read(&mut self, node_id: u64) -> Result<NodePtr, NegError>;
+    /// A node's `accum_count` and accumulator, what its parent sums, or
+    /// zeros for a node that does not exist. Lookups read these of each
+    /// sibling they pass, so a backend that keeps nodes encoded should read
+    /// them in place (`Node::summary_from_bytes`) rather than decode the
+    /// whole node.
+    fn get_node_summary(&mut self, node_id: u64) -> Result<(u64, Accumulator), NegError> {
+        let np = self.get_node_read(node_id)?;
+        Ok((np.node.accum_count, np.node.accum))
+    }
     fn get_node_write(&mut self, node_id: u64) -> Result<NodePtr, NegError>;
     fn put_node(&mut self, node_id: u64, node: &Node) -> Result<(), NegError>;
     fn make_node(&mut self) -> Result<u64, NegError>;
@@ -673,7 +702,7 @@ impl<B: BTreeBackend> BTreeCore<B> {
     ) -> Result<(), NegError>
     where
         F: FnMut(&Node, usize),
-        C: FnMut(&Node),
+        C: FnMut(&Accumulator),
     {
         let root = self.backend.get_node_read(self.backend.root_node_id())?;
         if !root.exists {
@@ -682,33 +711,36 @@ impl<B: BTreeBackend> BTreeCore<B> {
         if index as u64 > root.node.accum_count {
             return Err(NegError::msg("out of range"));
         }
-        self.traverse_aux(index, root.node_id, &mut cb, &mut custom)
+        self.traverse_aux(index, &root.node, &mut cb, &mut custom)
     }
 
+    /// Descends from `node` to the item at `index` below it, passing `custom`
+    /// the accumulator of each child it passes. Only the nodes on the path
+    /// are decoded; the children passed are read for their summaries.
     fn traverse_aux<F, C>(
         &mut self,
         mut index: usize,
-        node_id: u64,
+        node: &Node,
         cb: &mut F,
         custom: &mut C,
     ) -> Result<(), NegError>
     where
         F: FnMut(&Node, usize),
-        C: FnMut(&Node),
+        C: FnMut(&Accumulator),
     {
-        let np = self.backend.get_node_read(node_id)?;
-        let node = np.node;
         if node.num_items == node.accum_count {
-            cb(&node, index);
+            cb(node, index);
             return Ok(());
         }
         for i in 0..node.num_items as usize {
-            let child = self.backend.get_node_read(node.items[i].node_id)?;
-            if (index as u64) < child.node.accum_count {
-                return self.traverse_aux(index, child.node_id, cb, custom);
+            let child_id = node.items[i].node_id;
+            let (accum_count, accum) = self.backend.get_node_summary(child_id)?;
+            if (index as u64) < accum_count {
+                let child = self.backend.get_node_read(child_id)?;
+                return self.traverse_aux(index, &child.node, cb, custom);
             }
-            index -= child.node.accum_count as usize;
-            custom(&child.node);
+            index -= accum_count as usize;
+            custom(&accum);
         }
         Ok(())
     }
@@ -748,11 +780,8 @@ impl<B: BTreeBackend> Storage for BTreeCore<B> {
 
 impl<B: BTreeBackend> BTreeCore<B> {
     pub fn size_mut(&mut self) -> Result<u64, NegError> {
-        let root = self.backend.get_node_read(self.backend.root_node_id())?;
-        if !root.exists {
-            return Ok(0);
-        }
-        Ok(root.node.accum_count)
+        let root = self.backend.root_node_id();
+        Ok(self.backend.get_node_summary(root)?.0)
     }
 
     pub fn get_item_mut(&mut self, index: usize) -> Result<Item, NegError> {
@@ -849,11 +878,7 @@ impl<B: BTreeBackend> BTreeCore<B> {
                 let child = self.backend.get_node_read(node.items[i - 1].node_id)?;
                 return self.find_lower_bound_aux(value, child, num_to_left);
             } else if node.items[i - 1].node_id != 0 {
-                num_to_left += self
-                    .backend
-                    .get_node_read(node.items[i - 1].node_id)?
-                    .node
-                    .accum_count;
+                num_to_left += self.backend.get_node_summary(node.items[i - 1].node_id)?.0;
             } else {
                 num_to_left += 1;
             }
@@ -884,8 +909,8 @@ impl<B: BTreeBackend> BTreeCore<B> {
                     items.push(node.items[i].item);
                 }
             },
-            |node| {
-                accs.push(node.accum);
+            |accum| {
+                accs.push(*accum);
             },
         )?;
         let mut accum = Accumulator::default();

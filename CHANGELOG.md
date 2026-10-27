@@ -409,6 +409,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   management call made since, before letting clients back in. After more
   than one such reindex, restore from the backup the first one kept and
   repeat every call made since then.
+- A NIP-77 message to a session served from a negentropy tree costs a
+  tenth of the worker time it did, and sessions take turns with their
+  client (#254). To read the item count of each node it passed, a lookup in
+  the tree decoded all 3,952 bytes of it, again for every lookup, so one
+  crafted 82 KB NEG-MSG cost about 2.7 s of CPU on a tree of 2 million
+  events. A connection could send `relay.abuse.per_connection.neg_msg_burst`
+  (200) of them at once and queue minutes of work on one of the two
+  negentropy workers, ahead of every other sync it serves. Lookups now read
+  only a passed node's count and accumulator, in place, as strfry does, and
+  keep them for the rest of the message, so that message costs about
+  0.2 s. A NEG-MSG sent before the relay's reply to its session's NEG-OPEN
+  or previous NEG-MSG now closes the session with `invalid: NEG-MSG sent
+  before the reply to NEG-OPEN` or `invalid: NEG-MSG sent before the reply
+  to the previous NEG-MSG`, whether a tree or a view built in memory serves
+  it; before, only one sent while a view in memory was still being scanned
+  did. **A client that sends a NEG-MSG before reading the reply to its last
+  one now gets NEG-ERR**: NIP-77 has the two sides take turns, and `wok
+  sync` waits for each reply.
 
 ### Added
 

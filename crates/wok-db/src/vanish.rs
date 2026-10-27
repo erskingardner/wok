@@ -1,6 +1,6 @@
 //! Persistent NIP-62 markers, immediate query suppression, and bounded sweep.
 
-use crate::keys::{make_key_string_u64, make_key_u64_u64};
+use crate::keys::{make_key_string_u64, make_key_u64_u64, parse_key_string_u64};
 use crate::payload::{event_json_owned, Decompressor};
 use crate::txn::{RoTxn, RwTxn};
 use crate::write::{delete_events, NegentropySink};
@@ -149,6 +149,7 @@ pub fn mark_vanished(txn: &mut RwTxn<'_>, pubkey: &[u8], timestamp: u64) -> Resu
     if txn.get(dbi, pubkey)?.and_then(read_timestamp) < Some(timestamp) {
         txn.put(dbi, pubkey, &timestamp.to_ne_bytes(), 0)?;
         crate::state::invalidate_visibility(txn)?;
+        crate::state::count_vanish_marker_change(txn)?;
     }
     Ok(())
 }
@@ -349,99 +350,376 @@ fn next_marker(txn: &RwTxn<'_>, cursor: &[u8]) -> Result<Option<([u8; 32], u64)>
     Ok(selected)
 }
 
-/// Delete at most `batch_limit` records for one marker. If a full batch was
-/// found the cursor stays before that marker so the next call continues it;
-/// otherwise the cursor advances fairly to the next vanished pubkey.
+/// How far the sweep has carried out one vanish marker, kept in `wok_State`
+/// under [`VANISH_SWEEP`](crate::state::VANISH_SWEEP) and the pubkey. A pass
+/// examines the author's events, then the events that `p`-tag the author,
+/// and resumes where it stopped, after a restart too. The write path refuses
+/// the events a finished pass covered, so it is not repeated: a request that
+/// raises the marker starts a pass over only what the raise adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SweepProgress {
+    /// The marker timestamp the pass deletes through.
+    target: u64,
+    /// The first `created_at` the pass examines: 0 on the marker's first
+    /// pass, one past the target of the pass before on a later one.
+    from: u64,
+    step: SweepStep,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepStep {
+    /// The next author index entry to examine.
+    Authored(Position),
+    /// The next `p` tag index entry to examine.
+    Tagged(Position),
+    Done,
+}
+
+/// An entry of an index keyed by a string and `created_at`, with local IDs
+/// as its duplicates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Position {
+    created_at: u64,
+    lev_id: u64,
+}
+
+const SWEEP_PROGRESS_LEN: usize = 33;
+
+impl SweepProgress {
+    fn start(from: u64, target: u64) -> Self {
+        Self {
+            target,
+            from,
+            step: SweepStep::Authored(Position {
+                created_at: from,
+                lev_id: 0,
+            }),
+        }
+    }
+
+    fn encode(self) -> [u8; SWEEP_PROGRESS_LEN] {
+        let (step, position) = match self.step {
+            SweepStep::Authored(position) => (0, position),
+            SweepStep::Tagged(position) => (1, position),
+            SweepStep::Done => (
+                2,
+                Position {
+                    created_at: 0,
+                    lev_id: 0,
+                },
+            ),
+        };
+        let mut raw = [0u8; SWEEP_PROGRESS_LEN];
+        raw[..8].copy_from_slice(&self.target.to_le_bytes());
+        raw[8..16].copy_from_slice(&self.from.to_le_bytes());
+        raw[16] = step;
+        raw[17..25].copy_from_slice(&position.created_at.to_le_bytes());
+        raw[25..].copy_from_slice(&position.lev_id.to_le_bytes());
+        raw
+    }
+
+    pub(crate) fn decode(raw: &[u8]) -> Result<Self, DbError> {
+        let raw: &[u8; SWEEP_PROGRESS_LEN] = raw
+            .try_into()
+            .map_err(|_| DbError::msg("invalid vanish sweep progress"))?;
+        let word = |at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+        let position = Position {
+            created_at: word(17),
+            lev_id: word(25),
+        };
+        let step = match raw[16] {
+            0 => SweepStep::Authored(position),
+            1 => SweepStep::Tagged(position),
+            2 => SweepStep::Done,
+            _ => return Err(DbError::msg("invalid vanish sweep step")),
+        };
+        Ok(Self {
+            target: word(0),
+            from: word(8),
+            step,
+        })
+    }
+}
+
+fn sweep_progress_key(pubkey: &[u8; 32]) -> [u8; 33] {
+    let mut key = [crate::state::VANISH_SWEEP; 33];
+    key[1..].copy_from_slice(pubkey);
+    key
+}
+
+/// A malformed record, which `wok integrity` reports, starts the marker's
+/// passes again rather than stopping maintenance.
+fn sweep_progress(txn: &RwTxn<'_>, pubkey: &[u8; 32]) -> Result<Option<SweepProgress>, DbError> {
+    let Some(dbi) = txn.env().dbis().state else {
+        return Ok(None);
+    };
+    Ok(txn.get(dbi, &sweep_progress_key(pubkey))?.and_then(|raw| {
+        match SweepProgress::decode(raw) {
+            Ok(progress) => Some(progress),
+            Err(error) => {
+                tracing::warn!(
+                    pubkey = %wok_event::to_hex(pubkey),
+                    %error,
+                    "vanish sweep progress unreadable; sweeping the marker again"
+                );
+                None
+            }
+        }
+    }))
+}
+
+fn put_sweep_progress(
+    txn: &mut RwTxn<'_>,
+    pubkey: &[u8; 32],
+    progress: SweepProgress,
+) -> Result<(), DbError> {
+    let dbi = txn
+        .env()
+        .dbis()
+        .state
+        .ok_or_else(|| DbError::msg("missing Wok state table"))?;
+    txn.put(dbi, &sweep_progress_key(pubkey), &progress.encode(), 0)?;
+    Ok(())
+}
+
+/// Where [`sweep_vanished_events`] goes on from, held by its caller between
+/// calls. Each marker's own progress is stored.
+#[derive(Clone, Debug, Default)]
+pub struct VanishSweepCursor {
+    /// The pubkey of the marker visited last.
+    marker: Vec<u8>,
+    /// The count of marker changes, and the first of the markers visited
+    /// since, all of whose passes had finished.
+    finished_since: Option<(u64, [u8; 32])>,
+    /// The count of marker changes at which every marker's pass had finished.
+    /// Only a new or raised marker gives the sweep more work, and it adds one
+    /// to the count.
+    idle_at: Option<u64>,
+}
+
+/// What one call of [`sweep_vanished_events`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VanishSweepStep {
+    /// Records deleted.
+    pub deleted: u64,
+    /// Index entries examined, at most the call's `batch_limit`.
+    pub examined: usize,
+    /// Markers visited, at most the call's `batch_limit`.
+    pub markers: usize,
+}
+
+/// Carry the vanish markers' passes a bounded step further: visit at most
+/// `batch_limit` markers and examine at most `batch_limit` index entries, so
+/// delete no more records than that. Markers take turns in key order from
+/// `cursor`, and each one's pass resumes where it stopped. Once every
+/// marker's pass has finished, a call does nothing until a marker is added
+/// or raised.
 pub fn sweep_vanished_events<N: NegentropySink>(
     txn: &mut RwTxn<'_>,
     ne: &mut N,
     batch_limit: usize,
-    cursor: &mut Vec<u8>,
-) -> Result<u64, DbError> {
-    if batch_limit == 0 {
-        return Ok(0);
+    cursor: &mut VanishSweepCursor,
+) -> Result<VanishSweepStep, DbError> {
+    let changes = crate::state::vanish_marker_changes(txn)?;
+    if batch_limit == 0 || cursor.idle_at == Some(changes) {
+        return Ok(VanishSweepStep::default());
     }
-    let Some((pubkey, timestamp)) = next_marker(txn, cursor)? else {
-        cursor.clear();
-        return Ok(0);
+    cursor.idle_at = None;
+    let mut sweep = Sweep {
+        entries: batch_limit,
+        lev_ids: Vec::new(),
+        seen: HashSet::new(),
     };
-    let previous_cursor = cursor.clone();
-    let mut lev_ids = Vec::new();
-    let mut seen = HashSet::new();
-    let pubkey_start = make_key_string_u64(&pubkey, 0);
-    txn.foreach_full(
-        txn.env().dbis().event_pubkey,
-        &pubkey_start,
-        &0u64.to_ne_bytes(),
-        false,
-        |key, value| {
-            if !key.starts_with(&pubkey) || key.len() != 40 || value.len() != 8 {
-                return false;
-            }
-            let created_at = u64::from_ne_bytes(key[32..40].try_into().unwrap());
-            if created_at > timestamp {
-                return false;
-            }
-            let lev_id = u64::from_ne_bytes(value.try_into().unwrap());
-            if let Ok(Some(raw)) = txn.get_u64(txn.env().dbis().event, lev_id) {
-                if PackedEventView::new(raw).is_ok_and(|event| event.kind() != VANISH_KIND)
-                    && seen.insert(lev_id)
-                {
-                    lev_ids.push(lev_id);
-                }
-            }
-            lev_ids.len() < batch_limit
-        },
-    )?;
-
-    if lev_ids.len() < batch_limit {
-        let mut tag_prefix = Vec::with_capacity(33);
-        tag_prefix.push(b'p');
-        tag_prefix.extend_from_slice(&pubkey);
-        let tag_start = make_key_string_u64(&tag_prefix, 0);
-        txn.foreach_full(
-            txn.env().dbis().event_tag,
-            &tag_start,
-            &0u64.to_ne_bytes(),
-            false,
-            |key, value| {
-                if !key.starts_with(&tag_prefix)
-                    || key.len() != tag_prefix.len() + 8
-                    || value.len() != 8
-                {
-                    return false;
-                }
-                let created_at = u64::from_ne_bytes(key[tag_prefix.len()..].try_into().unwrap());
-                if !gift_wrap_vanished(created_at, timestamp) {
-                    return false;
-                }
-                let lev_id = u64::from_ne_bytes(value.try_into().unwrap());
-                if seen.insert(lev_id) {
-                    if let Ok(Some(raw)) = txn.get_u64(txn.env().dbis().event, lev_id) {
-                        if PackedEventView::new(raw)
-                            .is_ok_and(|event| GIFT_WRAP_KINDS.contains(&event.kind()))
-                        {
-                            lev_ids.push(lev_id);
+    let mut markers = 0;
+    while markers < batch_limit && sweep.entries > 0 {
+        let Some((pubkey, timestamp)) = next_marker(txn, &cursor.marker)? else {
+            cursor.idle_at = Some(changes);
+            break;
+        };
+        markers += 1;
+        let stored = sweep_progress(txn, &pubkey)?;
+        let progress = match stored {
+            Some(SweepProgress {
+                target,
+                step: SweepStep::Done,
+                ..
+            }) if target >= timestamp => {
+                match cursor.finished_since {
+                    Some((since, first)) if since == changes => {
+                        if first == pubkey {
+                            // A whole round of markers, every one finished.
+                            cursor.idle_at = Some(changes);
+                            break;
                         }
                     }
+                    _ => cursor.finished_since = Some((changes, pubkey)),
                 }
-                lev_ids.len() < batch_limit
-            },
-        )?;
+                cursor.marker = pubkey.to_vec();
+                continue;
+            }
+            // A later request raised the marker.
+            Some(SweepProgress {
+                target,
+                step: SweepStep::Done,
+                ..
+            }) => SweepProgress::start(target + 1, timestamp),
+            Some(progress) => progress,
+            None => SweepProgress::start(0, timestamp),
+        };
+        cursor.finished_since = None;
+        cursor.marker = pubkey.to_vec();
+        let progress = sweep.advance(txn, &pubkey, progress)?;
+        if stored != Some(progress) {
+            put_sweep_progress(txn, &pubkey, progress)?;
+        }
+    }
+    Ok(VanishSweepStep {
+        examined: batch_limit - sweep.entries,
+        markers,
+        deleted: delete_events(txn, ne, sweep.lev_ids)?,
+    })
+}
+
+/// One call's budget, and the events it deletes.
+struct Sweep {
+    /// Index entries left to examine.
+    entries: usize,
+    lev_ids: Vec<u64>,
+    seen: HashSet<u64>,
+}
+
+impl Sweep {
+    /// Carry `progress` as far as the budget allows.
+    fn advance(
+        &mut self,
+        txn: &RwTxn<'_>,
+        pubkey: &[u8; 32],
+        mut progress: SweepProgress,
+    ) -> Result<SweepProgress, DbError> {
+        if let SweepStep::Authored(position) = progress.step {
+            // Vanish requests stay stored.
+            let next = self.walk(
+                txn,
+                txn.env().dbis().event_pubkey,
+                pubkey,
+                position,
+                |created_at| created_at <= progress.target,
+                |event| event.kind() != VANISH_KIND,
+            )?;
+            // A later pass starts past the wraps the pass before covered:
+            // `gift_wrap_vanished` covers every wrap created up to a request.
+            progress.step = next.map_or(
+                SweepStep::Tagged(Position {
+                    created_at: progress.from,
+                    lev_id: 0,
+                }),
+                SweepStep::Authored,
+            );
+        }
+        if let SweepStep::Tagged(position) = progress.step {
+            let mut tag = [b'p'; 33];
+            tag[1..].copy_from_slice(pubkey);
+            let next = self.walk(
+                txn,
+                txn.env().dbis().event_tag,
+                &tag,
+                position,
+                |created_at| gift_wrap_vanished(created_at, progress.target),
+                |event| GIFT_WRAP_KINDS.contains(&event.kind()),
+            )?;
+            progress.step = next.map_or(SweepStep::Done, SweepStep::Tagged);
+        }
+        Ok(progress)
     }
 
-    if lev_ids.len() >= batch_limit {
-        *cursor = previous_cursor;
-    } else {
-        *cursor = pubkey.to_vec();
+    /// Examine the entries of `dbi` under `prefix`, from `position` while
+    /// `within` takes their `created_at`, keeping the events `deletes` picks.
+    /// Returns the first entry left unexamined, or `None` once the range is
+    /// done.
+    fn walk(
+        &mut self,
+        txn: &RwTxn<'_>,
+        dbi: lmdb_sys::MDB_dbi,
+        prefix: &[u8],
+        position: Position,
+        within: impl Fn(u64) -> bool,
+        deletes: impl Fn(PackedEventView<'_>) -> bool,
+    ) -> Result<Option<Position>, DbError> {
+        let mut next = None;
+        let mut error = None;
+        txn.foreach_full(
+            dbi,
+            &make_key_string_u64(prefix, position.created_at),
+            // Always a duplicate: without one, the entries at the start key
+            // would be skipped.
+            &position.lev_id.to_ne_bytes(),
+            false,
+            |key, value| {
+                let (Ok((string, created_at)), Ok(lev_id)) =
+                    (parse_key_string_u64(key), <[u8; 8]>::try_from(value))
+                else {
+                    return false;
+                };
+                if string != prefix || !within(created_at) {
+                    return false;
+                }
+                let lev_id = u64::from_ne_bytes(lev_id);
+                if self.entries == 0 {
+                    next = Some(Position { created_at, lev_id });
+                    return false;
+                }
+                self.entries -= 1;
+                match txn.get_u64(txn.env().dbis().event, lev_id) {
+                    Ok(Some(raw)) => {
+                        if PackedEventView::new(raw).is_ok_and(&deletes) && self.seen.insert(lev_id)
+                        {
+                            self.lev_ids.push(lev_id);
+                        }
+                        true
+                    }
+                    Ok(None) => true,
+                    Err(err) => {
+                        error = Some(err);
+                        false
+                    }
+                }
+            },
+        )?;
+        match error {
+            Some(error) => Err(error),
+            None => Ok(next),
+        }
     }
-    delete_events(txn, ne, lev_ids)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
+
+    #[test]
+    fn sweep_progress_round_trips() {
+        let position = Position {
+            created_at: 7,
+            lev_id: u64::MAX,
+        };
+        for step in [
+            SweepStep::Authored(position),
+            SweepStep::Tagged(position),
+            SweepStep::Done,
+        ] {
+            let progress = SweepProgress {
+                target: 200,
+                from: 101,
+                step,
+            };
+            assert_eq!(SweepProgress::decode(&progress.encode()).unwrap(), progress);
+        }
+        let mut raw = SweepProgress::start(0, 1).encode();
+        raw[16] = 3;
+        assert!(SweepProgress::decode(&raw).is_err());
+        assert!(SweepProgress::decode(&raw[1..]).is_err());
+    }
 
     #[test]
     fn policy_matches_global_and_normalized_service_urls() {

@@ -459,8 +459,25 @@ fn check_state(
                     report.issue("malformed-value", "author_counts", error.to_string());
                 }
             }
+        } else if key.first() == Some(&crate::state::VANISH_SWEEP) {
+            if key.len() != 33 {
+                report.metadata_errors += 1;
+                report.issue(
+                    "malformed-key",
+                    "state",
+                    format!("vanish sweep key has {} bytes, expected 33", key.len()),
+                );
+            } else if let Err(error) = crate::vanish::SweepProgress::decode(raw) {
+                report.metadata_errors += 1;
+                report.issue(
+                    "malformed-value",
+                    "state",
+                    format!("vanish sweep {}: {error}", wok_event::to_hex(&key[1..])),
+                );
+            }
         } else if key == crate::state::HIGH_WATER
             || key == crate::state::POLICY_GENERATION
+            || key == crate::state::VANISH_MARKER_CHANGES
             || key == crate::state::SUPERSEDED_EVENTS
             || key == crate::state::LEGACY_SUPERSEDED_EVENTS
         {

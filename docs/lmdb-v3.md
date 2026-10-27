@@ -327,6 +327,14 @@ initialization deletes both keys and counts again under NIP-01 kind ranges.
 Kind 41 records packed by those releases keep their virtual `d=""` tag, so a
 `#d` filter for the empty string still matches them.
 
+`wok_State` also keeps how far the NIP-62 sweep has carried out each vanish
+marker, under `V` and the pubkey: the marker timestamp the pass deletes
+through, the `created_at` it started from, and the next author or `p`-tag
+index entry to examine, or that it finished. A missing or unreadable record
+starts the marker's passes over, so a reindex, which does not copy these
+records, costs one more pass per marker. Earlier releases' integrity check
+reports them as unknown keys.
+
 The sequence never decreases after deleting the newest record. Reindex retains
 that high-water mark while rebuilding author counts lazily from authoritative
 indexes. An aborted transaction changes neither sequence nor counts. Older Wok

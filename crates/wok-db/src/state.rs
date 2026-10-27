@@ -15,6 +15,9 @@ pub(crate) const SUPERSEDED_EVENTS: &[u8] = b"superseded-versions";
 /// count may be stale.
 pub(crate) const LEGACY_SUPERSEDED_EVENTS: &[u8] = b"superseded-events";
 pub const POLICY_GENERATION: &[u8] = b"visibility";
+/// Key prefix of a vanish marker's sweep progress, followed by its pubkey
+/// (`vanish::SweepProgress`).
+pub(crate) const VANISH_SWEEP: u8 = b'V';
 
 pub(crate) fn decode(raw: &[u8]) -> Result<u64, DbError> {
     Ok(u64::from_le_bytes(
@@ -144,6 +147,16 @@ pub fn change_author_count(
 }
 
 pub fn policy_generation(txn: &RoTxn<'_>) -> Result<u64, DbError> {
+    let Some(dbi) = txn.env().dbis().state else {
+        return Ok(0);
+    };
+    txn.get(dbi, POLICY_GENERATION)?
+        .map(decode)
+        .transpose()
+        .map(|v| v.unwrap_or(0))
+}
+
+pub(crate) fn policy_generation_rw(txn: &RwTxn<'_>) -> Result<u64, DbError> {
     let Some(dbi) = txn.env().dbis().state else {
         return Ok(0);
     };

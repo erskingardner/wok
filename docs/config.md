@@ -775,11 +775,13 @@ dashboard's history. All reload live.
 | `relay.max_live_buffer_bytes` | `262144` | Live matches held for one subscription while its history is sent. Past it, stored events are re-read from the database after the history, and the oldest ephemeral events are dropped (`wok_live_buffer_dropped_ephemeral_total`). `0` is unlimited. New subscriptions; file-only. | Busy subscriptions re-read more from the database, and lose ephemeral events. | — |
 | `relay.write_policy_plugin` | empty | An external executable that decides on each event; empty turns it off. Vanish requests skip it. File-only. | — | — |
 | `relay.write_policy_timeout_secs` | `10` | Writes, from a hung plugin: the longest wait for its verdict. Dashboard. | A slow plugin's verdicts time out, and its events are refused. | — |
-| `relay.nip62.deletion_batch_size` | `1000` | The writer: records physically removed per transaction while a vanish request is carried out. Dashboard. | A vanish request takes more, smaller transactions. | — |
+| `relay.nip62.deletion_batch_size` | `1000` | The writer: index entries the vanish sweep examines, and vanished keys it visits, in each maintenance transaction (every 2 s), so also the records it removes. Dashboard. | A vanish request takes more, smaller transactions: at 1000, a key that a million events tag takes about half an hour. | — |
 
 Valid vanish requests are hidden immediately, deletion markers stay enforced
 if NIP-62 is later turned off, and physical removal continues in bounded
-batches.
+batches. The sweep examines a vanished key's events, then the events that tag
+it, once: it resumes where it stopped, after a restart too, and a later
+request from the key sweeps only the events it adds.
 
 ## Listener and protocol
 

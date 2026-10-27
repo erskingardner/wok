@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Update zstd to 0.14.3 (zstd-safe 8.2.0, zstd-sys 2.1.2) for
+  RUSTSEC-2026-0391, -0398, -0403 and -0410 (stream state reused after an
+  abandoned stream, `Seekable::decompress`, legacy-frame streaming
+  decompression, and the WebAssembly allocator shim). Wok uses only zstd's
+  bulk compressor, decompressor and dictionary training, none of which the
+  advisories affect, and the bundled libzstd stays at 1.5.7, so stored
+  payloads compress and decompress as before.
 - NIP-42 AUTH compares the scheme and path of its `relay` tag with those of
   `relay.auth.service_url` (#167). Only the host and port were compared, as
   in strfry, so where one host serves several relays by path, a relay at

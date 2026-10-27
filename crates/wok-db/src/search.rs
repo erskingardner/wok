@@ -75,8 +75,11 @@ pub fn normalize_search_terms(text: &str) -> Vec<String> {
     normalize_search_terms_with_overflow(text).0
 }
 
+/// The terms of `content` a search can find: its first
+/// `MAX_INDEXED_UNIQUE_TERMS` unique terms, in document order, as the index
+/// stores them for an event whose search text is `content` alone.
 pub fn search_term_set(content: &str) -> SearchTermSet {
-    normalize_search_terms(content).into_iter().collect()
+    indexed_terms(&[Cow::Borrowed(content)])
 }
 
 /// Parse the free-text portion of a NIP-50 query. `key:value` extension words
@@ -798,6 +801,25 @@ mod tests {
             count_phrase_pairs(4, &json, &pairs(&["nostr", "apps"])).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn live_terms_are_the_indexed_terms() {
+        let mut words = vec!["inside".to_string()];
+        words.extend((1..MAX_INDEXED_UNIQUE_TERMS).map(|n| format!("filler{n}")));
+        words.extend(["inside".into(), "zebra".into()]);
+        let json = serde_json::json!({"content": words.join(" ")}).to_string();
+        let indexed: SearchTermSet = search_index_entries(9, 1, &json)
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| key.first() == Some(&TERM_PREFIX))
+            .map(|(key, _)| search_term_from_key(&key).unwrap().to_owned())
+            .collect();
+        let live = event_search_terms(1, &json).unwrap();
+        assert_eq!(live, indexed);
+        assert_eq!(live.len(), MAX_INDEXED_UNIQUE_TERMS);
+        assert!(live.contains("inside"));
+        assert!(!live.contains("zebra"));
     }
 
     #[test]

@@ -139,10 +139,10 @@ and the session then closes with `closed: visibility changed; reopen
 synchronization`. A session opened while no tree is provably public is built
 in memory.
 
-NIP-50 matches normalized search terms against the text of text kinds and
-profiles, intersects
-them with every other supplied filter field, ranks before applying `limit`,
-and supports matching live events after EOSE. See
+NIP-50 matches normalized search terms against the first 256 unique terms of
+the text of text kinds and profiles, intersects them with every other supplied
+filter field, ranks before applying `limit`, and matches live events after
+EOSE against the same terms. See
 [NIP-50 search](nip50-search.md) for exact query and scoring semantics.
 
 NIP-45 responses include a 512-character HLL register value for a single

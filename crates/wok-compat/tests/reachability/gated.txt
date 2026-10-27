@@ -1,7 +1,7 @@
 # Relay functions reached in the `gated` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 448
+## anonymous: 451
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::is_member
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
@@ -267,12 +267,15 @@ wok_db::moderation::moderation_reason_ignoring_author_ro
 wok_db::moderation::moderation_reason_inner
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
-wok_db::search::for_each_document_term::<wok_db::search::indexed_terms::{closure}>
+wok_db::search::bounded_index_keys
+wok_db::search::event_content
+wok_db::search::for_each_term::<wok_db::search::search_term_set::{closure}>
+wok_db::search::for_each_term::<wok_db::search::search_term_set::{closure}>::{closure}
 wok_db::search::index_event_search
-wok_db::search::indexed_terms
 wok_db::search::note_search_indexed_through
-wok_db::search::search_document
+wok_db::search::parse_event_content
 wok_db::search::search_index_entries
+wok_db::search::search_term_set
 wok_db::state::allocate_event_id
 wok_db::state::author_key
 wok_db::state::change_author_count
@@ -451,12 +454,11 @@ wok_ws::upgrade_ws::{closure}::{closure}
 wok_ws::with_cors
 wok_ws::ws_accept_key
 
-## authenticated: 313
+## authenticated: 310
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
 <wok_db::payload::Decompressor>::decode
-<wok_db::search::Tag>::name_and_value
 <wok_db::txn::RoTxn as wok_db::moderation::ReadOps>::get_record
 <wok_db::txn::RoTxn as wok_db::moderation::ReadOps>::moderation_dbi
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
@@ -686,11 +688,9 @@ wok_db::moderation::get_reason::<wok_db::txn::RoTxn>
 wok_db::moderation::moderation_reason_ro
 wok_db::moderation::pubkey_roles_ro::<wok_db::txn::RoTxn>
 wok_db::payload::parse_payload
-wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>
-wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>::{closure}
-wok_db::search::indexed_terms::{closure}
-wok_db::search::parse_event::<wok_db::search::EventText>
+wok_db::search::bounded_index_keys::{closure}
 wok_db::search::search_index_entries::{closure}
+wok_db::search::search_term_set::{closure}
 wok_db::search::term_key
 wok_db::state::author_count
 wok_db::state::change_replacement_count

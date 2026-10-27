@@ -435,16 +435,16 @@ pub struct Metrics {
     /// transactions took.
     pub tag_kind_backfill_entries_total: AtomicU64,
     pub tag_kind_backfill_micros_total: AtomicU64,
-    /// Each writer batch that commits events: the messages queued when it
-    /// started, the events it commits, and how long each step took.
+    /// Each writer batch that commits: the messages queued when it started,
+    /// the events it stored, and how long each step took.
     pub writer_queue_depth: CountHistogram,
     pub writer_commit_events: CountHistogram,
     pub writer_prepare: DurationHistogram,
     pub writer_write: DurationHistogram,
     pub writer_commit: DurationHistogram,
     pub writer_reply: DurationHistogram,
-    /// Bytes the writer's event transactions sent to storage, where the OS
-    /// reports it.
+    /// Bytes the writer's committed event transactions sent to storage,
+    /// where the OS reports it.
     pub writer_storage_bytes_total: AtomicU64,
     pub history: MetricsHistory,
 }
@@ -627,17 +627,17 @@ impl Metrics {
         self.writer_queue_depth.0.render(
             &mut out,
             "wok_writer_queue_depth",
-            "Messages queued for the writer when it started a batch that commits events, the first included",
+            "Messages queued for the writer when it started a batch that committed, the first included",
         );
         self.writer_commit_events.0.render(
             &mut out,
             "wok_writer_commit_events",
-            "Events in each writer commit",
+            "Events each writer commit stored, leaving out duplicates and replaced, deleted or refused events",
         );
         self.writer_prepare.0.render(
             &mut out,
             "wok_writer_prepare_seconds",
-            "From the start of a writer batch to its write transaction: management commands, maintenance and per-event checks",
+            "From the start of a committed writer batch to its write transaction: management commands, maintenance and per-event checks",
         );
         self.writer_write.0.render(
             &mut out,
@@ -656,7 +656,7 @@ impl Metrics {
         );
         out.push_str(&format!(
             concat!(
-                "# HELP wok_writer_storage_bytes_total Bytes the writer's event transactions sent to storage (Linux only)\n",
+                "# HELP wok_writer_storage_bytes_total Bytes the writer's committed event transactions sent to storage (Linux only)\n",
                 "# TYPE wok_writer_storage_bytes_total counter\n",
                 "wok_writer_storage_bytes_total {}\n",
             ),

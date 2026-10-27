@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const MAX_HISTORY_POINTS: usize = 100_000;
 
@@ -275,6 +275,105 @@ impl MetricsHistory {
     }
 }
 
+/// Upper bounds, in microseconds, of a [`DurationHistogram`]'s buckets.
+const DURATION_BOUNDS_US: [u64; 15] = [
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000,
+];
+/// Upper bounds of a [`CountHistogram`]'s buckets.
+const COUNT_BOUNDS: [u64; 17] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536,
+];
+
+/// A Prometheus histogram over fixed bucket bounds. Observations are whole
+/// units; `/metrics` shows them divided by `scale`.
+struct Histogram {
+    bounds: &'static [u64],
+    scale: f64,
+    /// Observations per bucket, not cumulative, then those above every bound.
+    counts: Box<[AtomicU64]>,
+    sum: AtomicU64,
+}
+
+impl Histogram {
+    fn new(bounds: &'static [u64], scale: f64) -> Self {
+        Self {
+            bounds,
+            scale,
+            counts: (0..=bounds.len()).map(|_| AtomicU64::new(0)).collect(),
+            sum: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, value: u64) {
+        let bucket = self.bounds.partition_point(|&bound| bound < value);
+        self.counts[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn count(&self) -> u64 {
+        self.counts.iter().map(|n| n.load(Ordering::Relaxed)).sum()
+    }
+
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+        let mut cumulative = 0;
+        for (bound, count) in self.bounds.iter().zip(self.counts.iter()) {
+            cumulative += count.load(Ordering::Relaxed);
+            let le = *bound as f64 / self.scale;
+            out.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {cumulative}\n"));
+        }
+        cumulative += self.counts[self.bounds.len()].load(Ordering::Relaxed);
+        let sum = self.sum.load(Ordering::Relaxed) as f64 / self.scale;
+        out.push_str(&format!(
+            "{name}_bucket{{le=\"+Inf\"}} {cumulative}\n{name}_sum {sum}\n{name}_count {cumulative}\n"
+        ));
+    }
+}
+
+/// Durations, observed in microseconds and shown in seconds.
+pub struct DurationHistogram(Histogram);
+
+impl Default for DurationHistogram {
+    fn default() -> Self {
+        Self(Histogram::new(&DURATION_BOUNDS_US, 1e6))
+    }
+}
+
+impl DurationHistogram {
+    pub fn observe(&self, elapsed: Duration) {
+        self.0
+            .observe(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    pub fn count(&self) -> u64 {
+        self.0.count()
+    }
+}
+
+/// Counts, such as events per batch.
+pub struct CountHistogram(Histogram);
+
+impl Default for CountHistogram {
+    fn default() -> Self {
+        Self(Histogram::new(&COUNT_BOUNDS, 1.0))
+    }
+}
+
+impl CountHistogram {
+    pub fn observe(&self, n: u64) {
+        self.0.observe(n);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.0.count()
+    }
+
+    pub fn sum(&self) -> u64 {
+        self.0.sum.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Default)]
 pub struct Metrics {
     pub active_connections: AtomicU64,
@@ -336,6 +435,17 @@ pub struct Metrics {
     /// transactions took.
     pub tag_kind_backfill_entries_total: AtomicU64,
     pub tag_kind_backfill_micros_total: AtomicU64,
+    /// Each writer batch that commits: the messages queued when it started,
+    /// the events it stored, and how long each step took.
+    pub writer_queue_depth: CountHistogram,
+    pub writer_commit_events: CountHistogram,
+    pub writer_prepare: DurationHistogram,
+    pub writer_write: DurationHistogram,
+    pub writer_commit: DurationHistogram,
+    pub writer_reply: DurationHistogram,
+    /// Bytes the writer's committed event transactions sent to storage,
+    /// where the OS reports it.
+    pub writer_storage_bytes_total: AtomicU64,
     pub history: MetricsHistory,
 }
 
@@ -518,6 +628,44 @@ impl Metrics {
             g(&self.tag_kind_backfill_micros_total) as f64 / 1e6,
             g(&wok_db::state::AUTHOR_COUNT_DRIFT),
         );
+        self.writer_queue_depth.0.render(
+            &mut out,
+            "wok_writer_queue_depth",
+            "Messages queued for the writer when it started a batch that committed, the first included",
+        );
+        self.writer_commit_events.0.render(
+            &mut out,
+            "wok_writer_commit_events",
+            "Events each writer commit stored, leaving out duplicates and replaced, deleted or refused events",
+        );
+        self.writer_prepare.0.render(
+            &mut out,
+            "wok_writer_prepare_seconds",
+            "From the start of a committed writer batch to its write transaction: management commands, maintenance and per-event checks",
+        );
+        self.writer_write.0.render(
+            &mut out,
+            "wok_writer_write_seconds",
+            "Writing a batch's events and index entries, before the commit",
+        );
+        self.writer_commit.0.render(
+            &mut out,
+            "wok_writer_commit_seconds",
+            "Committing a batch, flushes to storage included",
+        );
+        self.writer_reply.0.render(
+            &mut out,
+            "wok_writer_reply_seconds",
+            "Sending a committed batch's OKs and handing its events to the req monitors",
+        );
+        out.push_str(&format!(
+            concat!(
+                "# HELP wok_writer_storage_bytes_total Bytes the writer's committed event transactions sent to storage (Linux only)\n",
+                "# TYPE wok_writer_storage_bytes_total counter\n",
+                "wok_writer_storage_bytes_total {}\n",
+            ),
+            g(&self.writer_storage_bytes_total),
+        ));
         out.push_str(concat!(
             "# HELP wok_refusals_total Requests and events refused, by the config key that refused them\n",
             "# TYPE wok_refusals_total counter\n",
@@ -622,6 +770,36 @@ mod tests {
         // After a gap longer than the window, counting starts afresh.
         refusals.mark(start + 60 * 3600);
         assert_eq!(refusals.recent().unwrap().0, start + 60 * 3600);
+    }
+
+    #[test]
+    fn histograms_render_cumulative_buckets_in_display_units() {
+        let metrics = Metrics::default();
+        for micros in [40, 50, 700, 3_000_000] {
+            metrics.writer_commit.observe(Duration::from_micros(micros));
+        }
+        metrics.writer_commit_events.observe(3);
+        metrics.writer_commit_events.observe(100_000);
+        let rendered = metrics.render();
+        for line in [
+            "# TYPE wok_writer_commit_seconds histogram\n",
+            "wok_writer_commit_seconds_bucket{le=\"0.00005\"} 2\n",
+            "wok_writer_commit_seconds_bucket{le=\"0.0005\"} 2\n",
+            "wok_writer_commit_seconds_bucket{le=\"0.001\"} 3\n",
+            "wok_writer_commit_seconds_bucket{le=\"2.5\"} 3\n",
+            "wok_writer_commit_seconds_bucket{le=\"+Inf\"} 4\n",
+            "wok_writer_commit_seconds_sum 3.00079\n",
+            "wok_writer_commit_seconds_count 4\n",
+            "wok_writer_commit_events_bucket{le=\"2\"} 0\n",
+            "wok_writer_commit_events_bucket{le=\"4\"} 1\n",
+            "wok_writer_commit_events_bucket{le=\"65536\"} 1\n",
+            "wok_writer_commit_events_bucket{le=\"+Inf\"} 2\n",
+            "wok_writer_commit_events_sum 100003\n",
+            "wok_writer_queue_depth_count 0\n",
+            "wok_writer_storage_bytes_total 0\n",
+        ] {
+            assert!(rendered.contains(line), "{line}");
+        }
     }
 
     #[test]

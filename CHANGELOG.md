@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Update zstd to 0.14.3 (zstd-safe 8.2.0, zstd-sys 2.1.2) for
+  RUSTSEC-2026-0391, -0398, -0403 and -0410 (stream state reused after an
+  abandoned stream, `Seekable::decompress`, legacy-frame streaming
+  decompression, and the WebAssembly allocator shim). Wok uses only zstd's
+  bulk compressor, decompressor and dictionary training, none of which the
+  advisories affect, and the bundled libzstd stays at 1.5.7, so stored
+  payloads compress and decompress as before.
 - NIP-42 AUTH compares the scheme and path of its `relay` tag with those of
   `relay.auth.service_url` (#167). Only the host and port were compared, as
   in strfry, so where one host serves several relays by path, a relay at
@@ -381,6 +388,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and pages per commit; duplicates and superseded or deleted events are
   counted apart. The database lives under `--dataset-dir`, so a tmpfs `/tmp`
   does not hide the disk.
+- Writer metrics (#257): histograms of how many messages were queued when
+  the writer started a batch, how many events each commit holds, and how
+  long the batch's checks, writes, commit and replies took
+  (`wok_writer_*`), plus the bytes its transactions sent to storage on
+  Linux. Publishing is bound by the single writer, so these show where an
+  event's EVENT→OK time goes and what each event costs to write.
 - `wok-bench`'s `live_fanout` keeps up to `--fanout-window` publications
   unacknowledged (256 by default; `FANOUT_WINDOW` in the campaign scripts)
   instead of waiting for each OK before the next (#257). It measured publish
@@ -1059,6 +1072,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limits, as `wok doctor` already checked them, and `wok negentropy add`
   checks a new filter with that same parser. **It now refuses an array of
   filters**, which it stored before though every write then failed on it.
+- NIP-77 reconciliation accepts a message whatever number of ranges it
+  holds (#242). One with more than 4096 was refused, though the relay itself
+  answers with 500,000-byte frames, which hold about 23,000: `wok sync`
+  failed with `negentropy message has too many bounds` against Wok or strfry
+  once the two sets differed by more than a few thousand events, and the
+  relay sent `NEG-ERR "error: invalid reconciliation message"` to a client
+  that used large frames. Storage work bounds a round instead: once its
+  lookups and fingerprints have cost 65,536 B-tree descents, the reply
+  answers the rest of its range with one fingerprint, as it does when it
+  fills its frame, and the peer splits that range in its next message. A
+  crafted message costs no more than the range cap let one cost (#254).
 - A NEG-MSG sent before the relay replied to its session's NEG-OPEN, while
   the view built in memory is still being scanned, gets `invalid: NEG-MSG
   sent before the reply to NEG-OPEN`, and the session and its scan close

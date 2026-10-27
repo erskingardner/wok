@@ -215,6 +215,12 @@ regression test. Differential parity alone is not a reason to retain it.
   gets one NEG-ERR, `error: invalid reconciliation message`, whether a tree
   or a view built in memory serves the session. strfry sends
   `PROTOCOL-ERROR`, which has no NIP-01 prefix.
+- NIP-77: a reply stops reading the message once its lookups and
+  fingerprints have cost 65,536 B-tree descents, and answers the rest of the
+  range with one fingerprint, which the client splits in its next message.
+  Pinned strfry reads the whole message and stops only when its reply fills
+  the 500,000-byte frame, so a crafted message can cost it more; a heavily
+  diverged sync can take Wok a few more rounds.
 - NIP-77: a NEG-MSG sent before the reply to its session's NEG-OPEN, while
   the view built in memory is still being scanned, closes the session with
   NEG-ERR `invalid: NEG-MSG sent before the reply to NEG-OPEN`. The client

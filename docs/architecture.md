@@ -94,7 +94,10 @@ The writer fills a gap in the background: before each batch of messages, and
 while idle, it runs one step bounded to 10 ms of indexing, so publications
 are not held up. A table that starts from nothing is built in key order by
 walking the tag index; the writer resumes that walk from a cursor after a
-restart.
+restart. `relay.tag_kind_index_enabled` turns the index off: the writer then
+keeps no entries for new events and builds none, so the tag index plan
+stands, and turned back on it fills the gap the same way (see
+[config](config.md#tag-and-kind-index)).
 
 ## REQ lifecycle
 

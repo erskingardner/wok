@@ -741,6 +741,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adds a `tag-kind-index` check: those leftover entries and a build in
   progress are warnings, and entries missing below the index's progress
   marker are a failure.
+- `relay.tag_kind_index_enabled` (default `true`, live, on the dashboard)
+  turns the `(tag, kind, created_at)` index off. Off, the writer and
+  `wok import` put no entries for the events they store and build none, and
+  tag filters with `kinds` read the tag index, as while the index is
+  incomplete. Publishing then writes 11–16% fewer bytes per event on a
+  typical mix and 18–32% fewer on a follow-list-heavy one, measured with
+  `db_write`. Turned back on, the writer builds the missing entries in the
+  background. `wok doctor` reports the index as off rather than incomplete.
 - `relay.max_filter_bytes_per_connection` (default 2097152, 2 MiB) bounds the
   filter bytes of the REQ subscriptions open on one connection. Live filters
   stay in memory until closed, so without it a larger

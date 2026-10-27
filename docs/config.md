@@ -387,6 +387,7 @@ may keep open. All reload live and are on the dashboard.
 | `relay.max_and_entries` | `16` | NIP-91 checks on each candidate event: the values across all `&` keys of one filter. `0` turns NIP-91 off. | NIP-91 queries that require several tags are refused. | `max_and_entries`; NIP-91 in `supported_nips` while it and `max_tags_per_filter` are above 0 |
 | `relay.max_filter_limit_count` | `1000000` | COUNT de-duplication memory: the most events one COUNT filter counts. `0` turns COUNT off, as `marmot` does. | Counts of popular events, such as followers or reactions, are capped, and the reply carries `limited: true`. | NIP-45 in `supported_nips` while above 0 |
 | `relay.search_enabled` | `true` | Answering NIP-50 `search` filters, and advertising NIP-50. Off, a REQ or COUNT with one is refused with `blocked: bad req: search disabled`, and a NEG-OPEN with `blocked: search disabled`. See [Search](#search). | Off: clients' searches are refused here, and NIP-50 clients look for search on relays that advertise it. | NIP-50 in `supported_nips` while on |
+| `relay.tag_kind_index_enabled` | `true` | Fast tag filters with `kinds`, such as a DM inbox `{"#p":[me],"kinds":[1059]}`: the `(tag, kind, created_at)` index lets them read only those kinds. Keeping it costs publishing 11–16% of the bytes it writes per event on a typical mix, and 18–32% on a follow-list-heavy one. See [Tag and kind index](#tag-and-kind-index). | Off: such a filter reads the tag value's whole history. For a sparse kind under a busy pubkey, that was 4–8× slower cold in the benchmark. | — |
 | `relay.abuse.max_query_work` | `20000` | Query workers, from requests whose estimated index work is too large. `0` is unlimited. See [Query work](#query-work). | Batched and outbox queries are refused with `blocked: query too broad`. | `max_query_work`, while abuse protection is on and it is set |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Query workers' fairness: scans one connection runs at once, counted separately for its REQs and COUNTs and its NEG-OPENs. More wait in arrival order. `0` runs none. | Busy clients see slow first results. | `max_concurrent_historical_queries` |
 | `relay.filter_validation.require_scoped_filters` | `false` | Enumeration: every filter must name `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. Refuses `{"kinds":[445]}`, `{"since":…}` or a bare `search`. On in `marmot`. | — | — |
@@ -427,6 +428,20 @@ read the events the index lacks directly, and while more than 100,000 wait
 they are refused with `error: search index is building` and NIP-11 omits
 NIP-50. See [NIP-50 search](nip50-search.md#index-and-recovery).
 
+### Tag and kind index
+
+`relay.tag_kind_index_enabled` keeps `wok_Event__tagKind`, the tag index
+again with each event's kind, so a filter with one tag and `kinds` reads only
+those kinds (see [architecture](architecture.md#indexes)). A write-heavy
+relay, such as an archive or an aggregator, whose clients rarely send such
+filters, can turn it off. While it is off, the writer puts no entries for the
+events it stores and builds none, and those filters read the single-letter
+tag index, as they do while the index is incomplete. Deletions still remove
+entries. Turning it back on, which reloads live, builds the entries it left
+out in the background, and queries use the index again once it covers every
+stored event. `wok import` follows the setting, and `wok doctor` reports the
+index as off rather than incomplete; `wok reindex` builds it either way.
+
 ### Filter validation
 
 The `filter_validation` rules apply to REQ, COUNT and NEG-OPEN, each when it
@@ -458,8 +473,8 @@ cursors the plan opens:
 
 - one per id for `ids`;
 - for tags, one per value of the tag the scan seeds from (one for a NIP-91
-  `&` tag). Once the `(tag, kind, created_at)` index is complete, one tag
-  with `kinds` costs one per (value, kind) pair;
+  `&` tag). While the `(tag, kind, created_at)` index is on and complete,
+  one tag with `kinds` costs one per (value, kind) pair;
 - one per (author, kind) pair for `authors` with `kinds`, whichever index
   the scan reads;
 - one per author for `authors` alone, one per kind for `kinds` alone, and

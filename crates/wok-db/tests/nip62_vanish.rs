@@ -2,10 +2,10 @@ use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use wok_db::{
-    backfill_vanish_markers, check_integrity, get_packed_ro, is_event_vanished_ro,
+    backfill_vanish_markers, check_integrity, delete_events, get_packed_ro, is_event_vanished_ro,
     lookup_event_by_id_ro, sweep_vanished_events, vanish_timestamp_ro, write_events,
     write_events_with_policy, Env, EnvOptions, EventToWrite, EventWriteStatus, NoopNegentropy,
-    VanishPolicy, VanishSweepCursor,
+    VanishPolicy, VanishSweepCursor, VanishSweepStep,
 };
 use wok_event::{parse_and_verify_event, EventLimits, PackedEventView};
 
@@ -228,6 +228,18 @@ fn the_sweep_examines_each_mention_of_a_vanished_key_once_in_bounded_steps() {
     }
     idle(&mut cursor);
     idle(&mut VanishSweepCursor::default());
+
+    // Deleting an event changes what reads may see, not the markers.
+    let (lev_id, _) = lookup_event_by_id_ro(&env.begin_ro().unwrap(), &mentions[0])
+        .unwrap()
+        .unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    assert_eq!(
+        delete_events(&mut txn, &mut NoopNegentropy, vec![lev_id]).unwrap(),
+        1
+    );
+    txn.commit().unwrap();
+    assert_eq!(sweep(&mut cursor), VanishSweepStep::default());
 
     // A later request raises the marker: one pass over the author's events
     // it adds, and none of the mentions again.

@@ -332,8 +332,10 @@ marker, under `V` and the pubkey: the marker timestamp the pass deletes
 through, the `created_at` it started from, and the next author or `p`-tag
 index entry to examine, or that it finished. A missing or unreadable record
 starts the marker's passes over, so a reindex, which does not copy these
-records, costs one more pass per marker. Earlier releases' integrity check
-reports them as unknown keys.
+records, costs one more pass per marker. The `vanish-markers` counter goes up
+each time a marker is added or raised: while it stays where it was when every
+pass had finished, the sweep has nothing to do. Earlier releases' integrity
+check reports these keys as unknown.
 
 The sequence never decreases after deleting the newest record. Reindex retains
 that high-water mark while rebuilding author counts lazily from authoritative

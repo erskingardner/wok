@@ -410,7 +410,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an hour to sweep at the default 1000. Each key stored before this release
   is swept once more, and so is each after a `wok reindex`, which does not
   copy the progress. An earlier release's `wok integrity` reports the
-  progress records as unknown `wok_State` keys.
+  progress records and their `vanish-markers` counter as unknown `wok_State`
+  keys.
 
 ### Added
 

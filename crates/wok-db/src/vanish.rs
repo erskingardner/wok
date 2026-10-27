@@ -149,6 +149,7 @@ pub fn mark_vanished(txn: &mut RwTxn<'_>, pubkey: &[u8], timestamp: u64) -> Resu
     if txn.get(dbi, pubkey)?.and_then(read_timestamp) < Some(timestamp) {
         txn.put(dbi, pubkey, &timestamp.to_ne_bytes(), 0)?;
         crate::state::invalidate_visibility(txn)?;
+        crate::state::count_vanish_marker_change(txn)?;
     }
     Ok(())
 }
@@ -484,12 +485,12 @@ fn put_sweep_progress(
 pub struct VanishSweepCursor {
     /// The pubkey of the marker visited last.
     marker: Vec<u8>,
-    /// The visibility generation, and the first of the markers visited since,
-    /// all of whose passes had finished.
+    /// The count of marker changes, and the first of the markers visited
+    /// since, all of whose passes had finished.
     finished_since: Option<(u64, [u8; 32])>,
-    /// The visibility generation at which every marker's pass had finished.
-    /// Only a new or raised marker gives the sweep more work, and it changes
-    /// the generation.
+    /// The count of marker changes at which every marker's pass had finished.
+    /// Only a new or raised marker gives the sweep more work, and it adds one
+    /// to the count.
     idle_at: Option<u64>,
 }
 
@@ -516,8 +517,8 @@ pub fn sweep_vanished_events<N: NegentropySink>(
     batch_limit: usize,
     cursor: &mut VanishSweepCursor,
 ) -> Result<VanishSweepStep, DbError> {
-    let generation = crate::state::policy_generation_rw(txn)?;
-    if batch_limit == 0 || cursor.idle_at == Some(generation) {
+    let changes = crate::state::vanish_marker_changes(txn)?;
+    if batch_limit == 0 || cursor.idle_at == Some(changes) {
         return Ok(VanishSweepStep::default());
     }
     cursor.idle_at = None;
@@ -529,7 +530,7 @@ pub fn sweep_vanished_events<N: NegentropySink>(
     let mut markers = 0;
     while markers < batch_limit && sweep.entries > 0 {
         let Some((pubkey, timestamp)) = next_marker(txn, &cursor.marker)? else {
-            cursor.idle_at = Some(generation);
+            cursor.idle_at = Some(changes);
             break;
         };
         markers += 1;
@@ -541,14 +542,14 @@ pub fn sweep_vanished_events<N: NegentropySink>(
                 ..
             }) if target >= timestamp => {
                 match cursor.finished_since {
-                    Some((since, first)) if since == generation => {
+                    Some((since, first)) if since == changes => {
                         if first == pubkey {
                             // A whole round of markers, every one finished.
-                            cursor.idle_at = Some(generation);
+                            cursor.idle_at = Some(changes);
                             break;
                         }
                     }
-                    _ => cursor.finished_since = Some((generation, pubkey)),
+                    _ => cursor.finished_since = Some((changes, pubkey)),
                 }
                 cursor.marker = pubkey.to_vec();
                 continue;

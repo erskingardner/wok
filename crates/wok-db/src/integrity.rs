@@ -476,6 +476,7 @@ fn check_state(
             }
         } else if key == crate::state::HIGH_WATER
             || key == crate::state::POLICY_GENERATION
+            || key == crate::state::VANISH_MARKER_CHANGES
             || key == crate::state::SUPERSEDED_EVENTS
             || key == crate::state::LEGACY_SUPERSEDED_EVENTS
         {

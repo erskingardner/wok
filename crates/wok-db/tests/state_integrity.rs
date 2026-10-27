@@ -54,6 +54,7 @@ fn detects_regressed_sequence_and_malformed_state() {
         ),
         (b"sequence", vec![1], "malformed-value"),
         (b"visibility", vec![1], "malformed-value"),
+        (b"vanish-markers", vec![1], "malformed-value"),
         (b"unknown", 0u64.to_le_bytes().to_vec(), "malformed-key"),
         (b"a", 0u64.to_le_bytes().to_vec(), "malformed-key"),
         (b"V", vec![0; 33], "malformed-key"),

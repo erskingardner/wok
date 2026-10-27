@@ -157,6 +157,14 @@ replacement, NIP-09 deletion, NIP-40 expiry, the NIP-62 sweep,
 build anyway, it leaves the entries to that pass (see
 [After an import](#after-an-import)).
 
+`relay.tag_kind_index_enabled = false` turns the index off. The relay's
+writer and `wok import` then put no entries for the events they insert and
+build none, so the marker stops below them and queries read `Event__tag`.
+Deletions on every path still remove entries. `wok sync` and `wok router`
+still put the entries of the events they insert; the marker does not pass
+the gap below them, so the index stays incomplete. Turned back on, the
+writer builds the gap in the background, as below.
+
 Two markers share the table. Their keys are shorter than the 16 bytes of a
 posting's integers, so the comparator sorts them before every posting, and
 their values are native-endian u64s:
@@ -171,7 +179,7 @@ their values are native-endian u64s:
   earlier ID, so a gap of unindexed events stops it.
 
 A new database is complete from its first open, and again once an import
-into it ends. One written before this
+into it ends, while the index is on. One written before this
 table existed, or migrated from strfry, gets an empty table at marker 0 on
 its first writable open. The relay's writer then builds it in the background,
 one bounded transaction at a time (see
@@ -187,8 +195,9 @@ the index only when its read snapshot shows it complete.
 
 ### Building in the background
 
-The writer runs one backfill step before each batch of messages it takes,
-and keeps going while it is idle, until the index is complete. A step ends
+While the index is on, the writer runs one backfill step before each batch
+of messages it takes, and keeps going while it is idle, until the index is
+complete. A step ends
 after 5,000 postings or 10 ms of indexing, whichever comes first, then
 commits; it reads entries ahead 64 at a time, so the time limit covers
 preparing them too. While free disk space is below

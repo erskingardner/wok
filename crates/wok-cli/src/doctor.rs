@@ -407,11 +407,19 @@ fn check_tag_kind_index(
     const NAME: &str = "tag-kind-index";
     const REINDEX: &str = "`wok reindex --confirm-relay-stopped`";
     let Some(tag_kind) = tag_kind else {
-        report.add(
-            NAME,
-            CheckStatus::Warn,
-            format!("the (tag, kind, created_at) index is absent; the relay creates it on its next start and builds it in the background, or {REINDEX} builds it now"),
-        );
+        if enabled {
+            report.add(
+                NAME,
+                CheckStatus::Warn,
+                format!("the (tag, kind, created_at) index is absent; the relay creates it on its next start and builds it in the background, or {REINDEX} builds it now"),
+            );
+        } else {
+            report.add(
+                NAME,
+                CheckStatus::Pass,
+                "off (`relay.tag_kind_index_enabled = false`) and absent, so queries read the tag index; the relay creates it on its next start and builds it once the setting is back on",
+            );
+        }
         return;
     };
     let state = tag_kind.state;
@@ -1081,6 +1089,17 @@ mod tests {
             "{}",
             tag_kind.detail
         );
+    }
+
+    #[test]
+    fn an_absent_tag_kind_index_warns_only_while_it_is_on() {
+        let status = |enabled| {
+            let mut report = DoctorReport::new();
+            check_tag_kind_index(None, enabled, &mut report);
+            check(&report, "tag-kind-index").status
+        };
+        assert_eq!(status(true), CheckStatus::Warn);
+        assert_eq!(status(false), CheckStatus::Pass);
     }
 
     #[test]

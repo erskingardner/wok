@@ -69,7 +69,8 @@ table is derived from them and rebuilt by `wok reindex`: strfry's indexes by
 id, pubkey, kind, pubkey and kind, single-letter tag, `created_at`,
 expiration, replacement address and deletion, then Wok's NIP-50 search
 postings and `(tag, kind, created_at)` postings. All but the search postings
-are written and removed in the transaction that inserts or deletes the event.
+are written and removed in the transaction that inserts or deletes the event,
+and `(tag, kind, created_at)` postings only while that index is on.
 The writer writes an event's search postings later, in a build step of its
 own, and a deletion removes them only once that step has run; see
 [NIP-50 search](nip50-search.md#index-and-recovery). Layouts are in

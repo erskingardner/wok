@@ -70,10 +70,10 @@ pub use purge::{count_superseded_ro, purge_superseded, SupersededHistory};
 pub use reindex::{rebuild_primary_and_event_indices, PackedEventRebuild, ReindexStats};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use search::{
-    count_phrase_pairs, event_content, event_search_terms, index_event_search,
-    normalize_search_terms, parse_search_query, remove_event_search, search_posting_count,
-    search_posting_exists, search_postings, search_term_set, SearchQuery, SearchTermSet,
-    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TERMS,
+    count_phrase_pairs, event_search_terms, index_event_search, normalize_search_terms,
+    parse_search_query, remove_event_search, search_posting_count, search_posting_exists,
+    search_postings, search_term_set, SearchQuery, SearchTermSet, MAX_SEARCH_QUERY_BYTES,
+    MAX_SEARCH_TERMS,
 };
 pub use tag_kind::{
     backfill_tag_kind_index, defer_tag_kind_postings, reset_tag_kind_index,
@@ -85,7 +85,7 @@ pub use txn::{RoTxn, RwTxn};
 pub use vanish::{
     backfill_vanish_markers, gift_wrap_vanished, is_event_vanished_ro, is_event_vanished_rw,
     mark_vanished, normalize_relay_url, sweep_vanished_events, vanish_timestamp_ro,
-    vanish_timestamp_rw, VanishPolicy, ALL_RELAYS, VANISH_KIND,
+    vanish_timestamp_rw, VanishPolicy, VanishSweepCursor, VanishSweepStep, ALL_RELAYS, VANISH_KIND,
 };
 pub use write::{
     delete_event_basic, delete_events, lookup_event_by_id, most_recent_levid, write_events,

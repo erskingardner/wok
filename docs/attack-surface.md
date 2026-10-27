@@ -167,6 +167,14 @@ itself. An operator who means to refuse vanish requests still can, with
 `relay.nip62.enabled = false`, a NIP-86 `disallowkind` of 62, an event-id
 ban or a blocked address.
 
+A vanish marker costs the writer one pass over the key's events and the
+events that `p`-tag it, which anyone can add to. Each maintenance
+transaction, every 2 seconds, examines at most
+`relay.nip62.deletion_batch_size` index entries and visits as many markers.
+A pass resumes where it stopped and runs once, so tagging a vanished key
+costs the writer one index entry and one event read per event, not one per
+tick.
+
 ## Management API
 
 NIP-86 requests are a `POST` to `/` with

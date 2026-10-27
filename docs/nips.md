@@ -140,9 +140,9 @@ synchronization`. A session opened while no tree is provably public is built
 in memory.
 
 NIP-50 matches normalized search terms against the first 256 unique terms of
-event `content`, intersects them with every other supplied filter field, ranks
-before applying `limit`, and matches live events after EOSE against the same
-terms. See
+the text of text kinds and profiles, intersects them with every other supplied
+filter field, ranks before applying `limit`, and matches live events after
+EOSE against the same terms. See
 [NIP-50 search](nip50-search.md) for exact query and scoring semantics.
 
 NIP-45 responses include a 512-character HLL register value for a single

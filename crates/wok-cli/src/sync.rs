@@ -142,10 +142,9 @@ fn stored_event_in_filter(
         return Ok(exact.does_match(packed));
     }
     let event = event_json_owned(txn, &mut Decompressor::new(), lev, max_event_size)?;
-    let event = wok_event::json::parse_strict(&event)?;
-    Ok(event["content"]
-        .as_str()
-        .is_some_and(|content| exact.does_match_with_content(packed, content)))
+    // The text the search index holds for this event, so sync agrees with it.
+    let terms = wok_db::event_search_terms(packed.kind(), &event)?;
+    Ok(exact.does_match_with_search_terms(packed, Some(&terms)))
 }
 
 fn store_downloads(
@@ -677,6 +676,79 @@ mod tests {
         assert!(!upload_superseded("blocked: user requested deletion"));
         assert!(!upload_superseded("blocked: author storage quota exceeded"));
         assert!(!upload_superseded("have a newer version"));
+    }
+
+    #[test]
+    fn a_stored_event_matches_a_search_by_the_text_the_index_holds() {
+        use secp256k1::{Keypair, SECP256K1};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            db: dir.path().join("db"),
+            ..Config::default()
+        };
+        let env = open_env(&cfg).unwrap();
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let event = |kind: u64, content: &str| {
+            let mut event = json!({
+                "created_at": 1_700_000_000u64,
+                "kind": kind,
+                "tags": [],
+                "content": content,
+                "pubkey": hex::encode(key.x_only_public_key().0.serialize()),
+            });
+            let id = wok_event::event_id_hash(&event).unwrap();
+            event["id"] = json!(hex::encode(id));
+            event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+            event
+        };
+        let note = event(1, "alpha beta");
+        // Kind 4's content is ciphertext, which search does not read.
+        let dm = event(4, "alpha beta");
+        let profile = event(0, r#"{"name":"alpha","website":"https://beta.example"}"#);
+        let mut batch = [&note, &dm, &profile]
+            .into_iter()
+            .map(|event| {
+                let parsed = wok_event::parse_and_verify_event(
+                    event,
+                    &EventLimits::default(),
+                    None,
+                    true,
+                    false,
+                )
+                .unwrap();
+                EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let (mut written, mut rejected, mut duplicates) = (0, 0, 0);
+        commit_import(
+            &cfg,
+            &env,
+            &mut batch,
+            &mut written,
+            &mut rejected,
+            &mut duplicates,
+            false,
+        )
+        .unwrap();
+        assert_eq!(written, 3);
+
+        let txn = env.begin_ro().unwrap();
+        let in_filter = |search: &str, event: &Value| {
+            let exact = wok_query::NostrFilterGroup::from_value(
+                &json!({"search": search}),
+                u64::MAX,
+                8,
+                16,
+            )
+            .unwrap();
+            let id = hex::decode(event["id"].as_str().unwrap()).unwrap();
+            stored_event_in_filter(&txn, &exact, &id, cfg.events.max_event_size).unwrap()
+        };
+        assert!(in_filter("alpha", &note));
+        assert!(!in_filter("alpha", &dm));
+        assert!(in_filter("alpha", &profile));
+        // A profile is searched by its name and about, not its other fields.
+        assert!(!in_filter("example", &profile));
     }
 
     #[test]

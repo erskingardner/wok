@@ -532,11 +532,12 @@ class CampaignSettings(unittest.TestCase):
                     self.assertIn('left no fixed-rate report', result.stderr)
             self.assertFalse((load/'rate-capacity.txt').exists())
 
-    def reconcile(self, root, launched, log_lines, fail_copy=''):
+    def reconcile(self, root, launched, log_lines, fail_copy='', copy_ssh=''):
         """Runs reconcile_rate_steps for repetition 2 of target wok, with
         the steps in launched started and each step's outcome log holding
         log_lines[rate] of its 10 planned events (none when absent). Copying
-        step fail_copy's log to the relay host fails."""
+        step fail_copy's log to the relay host fails. copy_ssh is
+        RELAY_COPY_SSH."""
         load = root/'l/runs/r2-wok/load'
         for rate in launched:
             self.write_rate_results(load, rate)
@@ -558,7 +559,7 @@ class CampaignSettings(unittest.TestCase):
                 f'echo "scp $from $to" >>"{calls}"; cp "${{from#*:}}" "${{to#*:}}"; }}; '
                 f'LOAD_ROOT={root}/l RELAY_ROOT={root}/r; '
                 f'RATE_LAUNCHED=({" ".join(map(str, launched))}); reconcile_rate_steps wok 2')
-        result = self.campaign(body, RATE_STEPS='1000 2000 4000')
+        result = self.campaign(body, RATE_STEPS='1000 2000 4000', RELAY_COPY_SSH=copy_ssh)
         sent = calls.read_text().splitlines() if calls.exists() else []
         return result, sent, load, f'{root}/r/runs/r2-wok/rate'
 
@@ -583,6 +584,41 @@ class CampaignSettings(unittest.TestCase):
             result, sent, _, _ = self.reconcile(Path(tmp), [], {})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(sent, [])
+
+    def test_copies_go_directly_between_the_hosts_when_the_load_host_can(self):
+        stub = ('remote_command() { echo "on $*"; }; scp() { echo "scp $*"; }; '
+                'copy_to_relay /l/c /r/c; copy_to_load /r/x /l/x; copy_to_load -r /r/s/. /l/s/')
+        through = self.campaign(stub)
+        self.assertEqual(through.returncode, 0, through.stderr)
+        options = '-o ControlMaster=auto -o ControlPersist=300 -o ControlPath=/tmp/wok-bench-%C'
+        self.assertEqual(through.stdout.splitlines(), [
+            f'scp {options} -3 -q root@load:/l/c root@relay:/r/c',
+            f'scp {options} -3 -q root@relay:/r/x root@load:/l/x',
+            f'scp {options} -3 -q -r root@relay:/r/s/. root@load:/l/s/',
+        ])
+        # The load host runs each copy itself, to the relay host's address
+        # as it reaches it.
+        direct = self.campaign(stub, RELAY_COPY_SSH='root@10.0.0.2')
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        self.assertEqual(direct.stdout.splitlines(), [
+            'on root@load scp -o BatchMode=yes -q /l/c root@10.0.0.2:/r/c',
+            'on root@load scp -o BatchMode=yes -q root@10.0.0.2:/r/x /l/x',
+            'on root@load scp -o BatchMode=yes -q -r root@10.0.0.2:/r/s/. /l/s/',
+        ])
+
+    def test_reconciles_with_direct_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, sent, load, relay = self.reconcile(
+                Path(tmp), [1000], {1000: 10}, copy_ssh='root@10.0.0.2')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sent, [
+                f'scp {load}/rate-1000/outcomes-wok-r2-r1.jsonl '
+                f'root@10.0.0.2:{relay}/rate-1000/outcomes.jsonl',
+                f'control reconcile wok /opt/relay-bench/bin/wok-bench/wok-bench {relay} '
+                '--nofile 524288',
+                f'scp root@10.0.0.2:{relay}/rate-1000/reconciliation.json '
+                f'{load}/rate-1000/reconciliation.json',
+            ])
 
     def test_reconciliation_fails_without_every_started_steps_whole_log(self):
         with tempfile.TemporaryDirectory() as tmp:

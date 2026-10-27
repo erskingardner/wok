@@ -205,7 +205,7 @@ pub fn rebuild_primary_and_event_indices(
             error = Some(err);
             return false;
         }
-        if let Err(err) = index_event_search(target, lev_id, &json) {
+        if let Err(err) = index_event_search(target, lev_id, packed.kind(), &json) {
             error = Some(err);
             return false;
         }

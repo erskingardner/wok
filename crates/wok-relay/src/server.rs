@@ -4672,7 +4672,7 @@ fn send_stored_range(
             return true;
         };
         if requires_content {
-            let search_terms = wok_db::event_search_terms(json).unwrap_or_default();
+            let search_terms = wok_db::event_search_terms(packed.kind(), json).unwrap_or_default();
             if !sub
                 .filter_group
                 .does_match_with_search_terms(packed, Some(&search_terms))
@@ -5005,7 +5005,10 @@ fn run_req_monitor(
                             continue;
                         }
                         let search_terms = if monitors.event_requires_content(event) {
-                            Some(wok_db::event_search_terms(&held.json).unwrap_or_default())
+                            Some(
+                                wok_db::event_search_terms(event.kind(), &held.json)
+                                    .unwrap_or_default(),
+                            )
                         } else {
                             None
                         };
@@ -5087,7 +5090,8 @@ fn run_req_monitor(
                         let Ok(json) = decomp.decode(&txn, raw, max_event_size) else {
                             return true;
                         };
-                        let search_terms = wok_db::event_search_terms(json).unwrap_or_default();
+                        let search_terms =
+                            wok_db::event_search_terms(packed.kind(), json).unwrap_or_default();
                         monitors.process(lev, packed, Some(&search_terms))
                     } else {
                         monitors.process(lev, packed, None)
@@ -5134,7 +5138,7 @@ fn run_req_monitor(
                 }
                 let recipients = if monitors.event_requires_content(packed) {
                     let search_terms = event.search_terms.get_or_init(|| {
-                        wok_db::event_search_terms(&event.json).unwrap_or_default()
+                        wok_db::event_search_terms(packed.kind(), &event.json).unwrap_or_default()
                     });
                     monitors.process(event.lev_id, packed, Some(search_terms))
                 } else {

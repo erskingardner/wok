@@ -6,7 +6,9 @@ use crate::keys::{
     u64_from_ne_checked,
 };
 use crate::payload::{encode_raw_payload, Decompressor};
-use crate::search::{index_event_search, note_search_indexed_through, remove_event_search};
+use crate::search::{
+    index_event_search, note_search_indexed_through, payload_kind, remove_event_search,
+};
 use crate::tag_kind::{
     del_tag_kind_entries, note_tag_kind_indexed, put_tag_kind_entries, tag_kind_keys,
 };
@@ -470,10 +472,14 @@ fn del_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
 pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbError> {
     let dbis = txn.env().dbis();
     crate::state::preserve_high_water(txn)?;
-    if let Some(raw) = txn.get_u64(dbis.event, lev_id)?.map(<[u8]>::to_vec) {
-        crate::state::change_author_count(txn, PackedEventView::new(&raw)?.pubkey(), false)?;
+    let kind = if let Some(raw) = txn.get_u64(dbis.event, lev_id)?.map(<[u8]>::to_vec) {
+        let packed = PackedEventView::new(&raw)?;
+        crate::state::change_author_count(txn, packed.pubkey(), false)?;
         crate::state::invalidate_visibility(txn)?;
-    }
+        Some(packed.kind())
+    } else {
+        None
+    };
     let json = if let Some(raw) = txn.get_u64(dbis.event_payload, lev_id)?.map(<[u8]>::to_vec) {
         let mut decompressor = Decompressor::new();
         Some(
@@ -488,7 +494,10 @@ pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbEr
     // whether a payload existed, independent of the primary record.
     let deleted = txn.del_u64(dbis.event_payload, lev_id, None)?;
     if let Some(json) = json {
-        remove_event_search(txn, lev_id, &json)?;
+        // A payload with no PackedEvent was indexed under its own kind.
+        if let Some(kind) = kind.or_else(|| payload_kind(&json)) {
+            remove_event_search(txn, lev_id, kind, &json)?;
+        }
     }
     if let Some(buf) = txn.get_u64(dbis.event, lev_id)?.map(|b| b.to_vec()) {
         let packed = PackedEventView::new(&buf)?;
@@ -528,7 +537,7 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
         }
     }
     put_indices(txn, lev_id, &idx)?;
-    index_event_search(txn, lev_id, json)?;
+    index_event_search(txn, lev_id, view.kind(), json)?;
     Ok(lev_id)
 }
 

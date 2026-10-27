@@ -3,7 +3,9 @@
 
 use crate::fbs::{decode_compression_dictionary, decode_meta, decode_negentropy_filter};
 use crate::payload::{parse_payload, Decompressor, PayloadView};
-use crate::search::{is_search_marker, search_index_entries, search_term_from_key};
+use crate::search::{
+    check_event_text, is_search_marker, payload_kind, search_index_entries, search_term_from_key,
+};
 use crate::tag_kind::{
     is_tag_kind_marker, is_valid_pass_record, tag_kind_index_state_ro, tag_kind_keys,
     TagKindIndexState, TAG_KIND_SCHEMA_VERSION,
@@ -247,7 +249,8 @@ fn readable_event(txn: &RoTxn<'_>, lev_id: u64) -> bool {
 }
 
 /// Whether the event at `lev_id`, whose payload is `payload`, derives the
-/// search posting `key`.
+/// search posting `key`. With no readable PackedEvent, the payload's own kind
+/// is the one it was indexed under.
 fn derives_search_posting(
     txn: &RoTxn<'_>,
     decompressor: &mut Decompressor,
@@ -255,10 +258,15 @@ fn derives_search_posting(
     lev_id: u64,
     key: &[u8],
 ) -> bool {
-    decompressor
-        .decode(txn, payload, 16 * 1024 * 1024)
-        .ok()
-        .and_then(|json| search_index_entries(lev_id, json).ok())
+    let Ok(json) = decompressor.decode(txn, payload, 16 * 1024 * 1024) else {
+        return false;
+    };
+    let kind = match txn.get_u64(txn.env().dbis().event, lev_id) {
+        Ok(Some(raw)) => PackedEventView::new(raw).ok().map(|packed| packed.kind()),
+        _ => None,
+    };
+    kind.or_else(|| payload_kind(json))
+        .and_then(|kind| search_index_entries(lev_id, kind, json).ok())
         .is_some_and(|entries| entries.iter().any(|(expected, _)| expected == key))
 }
 
@@ -459,8 +467,25 @@ fn check_state(
                     report.issue("malformed-value", "author_counts", error.to_string());
                 }
             }
+        } else if key.first() == Some(&crate::state::VANISH_SWEEP) {
+            if key.len() != 33 {
+                report.metadata_errors += 1;
+                report.issue(
+                    "malformed-key",
+                    "state",
+                    format!("vanish sweep key has {} bytes, expected 33", key.len()),
+                );
+            } else if let Err(error) = crate::vanish::SweepProgress::decode(raw) {
+                report.metadata_errors += 1;
+                report.issue(
+                    "malformed-value",
+                    "state",
+                    format!("vanish sweep {}: {error}", wok_event::to_hex(&key[1..])),
+                );
+            }
         } else if key == crate::state::HIGH_WATER
             || key == crate::state::POLICY_GENERATION
+            || key == crate::state::VANISH_MARKER_CHANGES
             || key == crate::state::SUPERSEDED_EVENTS
             || key == crate::state::LEGACY_SUPERSEDED_EVENTS
         {
@@ -879,7 +904,9 @@ fn check_integrity_with_buckets(
             ) {
                 report.legacy_long_tag_records += 1;
             }
-            match search_index_entries(lev_id, &json) {
+            match check_event_text(&json)
+                .and_then(|()| search_index_entries(lev_id, packed.kind(), &json))
+            {
                 Ok(entries) => {
                     for (key, value) in entries {
                         let entry = EventIndexEntry {

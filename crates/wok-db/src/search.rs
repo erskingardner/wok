@@ -1,28 +1,49 @@
-//! Rebuildable, transactionally maintained NIP-50 content search postings.
+//! Rebuildable, transactionally maintained NIP-50 search postings.
 //!
-//! Each normalized content term is a DUPSORT key whose duplicate values are
-//! local event ids. Query execution can therefore start with the rarest term
-//! and use exact duplicate lookups to intersect the remaining terms without
-//! scanning event payloads that cannot match. Word adjacency, which only
-//! ranks matches, is read from a matching event's content at query time.
+//! An event is searched by its `search_document`: the text of a kind the
+//! allow-list names, and nothing for any other kind. Each normalized term of
+//! it is a DUPSORT key whose duplicate values are local event ids. Query
+//! execution can therefore start with the rarest term and use exact duplicate
+//! lookups to intersect the remaining terms without scanning event payloads
+//! that cannot match. Word adjacency, which only ranks matches, is read from
+//! a matching event's text at query time.
 
 use crate::{DbError, Decompressor, Env, RoTxn, RwTxn};
 use lmdb_sys::{MDB_GET_BOTH, MDB_NODUPDATA, MDB_SET};
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
+use wok_event::PackedEventView;
 
 const TERM_PREFIX: u8 = 1;
 const INDEXED_THROUGH_KEY: &[u8] = b"\0indexed-through";
 const SEARCH_SCHEMA_KEY: &[u8] = b"\0schema";
-/// 3 dropped the adjacent-term postings (prefix 2) that version 2 kept.
-const SEARCH_SCHEMA_VERSION: u64 = 3;
+/// 3 dropped the adjacent-term postings (prefix 2) that version 2 kept. 4
+/// indexes only the kinds [`TEXT_KINDS`] names, and profiles.
+const SEARCH_SCHEMA_VERSION: u64 = 4;
 const MAX_INDEXED_TERM_BYTES: usize = 64;
 const BACKFILL_BATCH_SIZE: usize = 10_000;
 
 pub const MAX_SEARCH_QUERY_BYTES: usize = 1_024;
 pub const MAX_SEARCH_TERMS: usize = 16;
 pub const MAX_INDEXED_UNIQUE_TERMS: usize = 256;
+
+/// The kinds whose title tags and content search indexes, in ascending order:
+/// the text kinds of the pinned NIPs. Ciphertext, embedded events, lists and
+/// other structured content are not indexed. See docs/nip50-search.md.
+const TEXT_KINDS: [u64; 31] = [
+    1, 9, 11, 20, 21, 22, 42, 54, 1063, 1068, 1111, 1311, 1337, 1618, 1621, 2003, 2004, 7516, 9041,
+    9802, 30023, 30402, 30818, 31922, 31923, 31924, 34235, 34236, 37516, 37517, 39701,
+];
+/// Tags that name a text event, then tags that summarize one. Their values
+/// are indexed ahead of its content, names first, so a long summary or
+/// content cannot push a title past the unique-term cap. `alt` is in neither:
+/// it describes the event for clients that cannot show its kind.
+const NAME_TAGS: [&str; 3] = ["title", "subject", "name"];
+const SUMMARY_TAGS: [&str; 2] = ["summary", "description"];
+/// A profile's metadata fields that search indexes, in indexing order.
+const PROFILE_FIELDS: [&str; 4] = ["name", "display_name", "nip05", "about"];
 
 type SearchIndexEntry = (Vec<u8>, Vec<u8>);
 pub type SearchTermSet = HashSet<String>;
@@ -55,24 +76,10 @@ pub fn normalize_search_terms(text: &str) -> Vec<String> {
 }
 
 /// The terms of `content` a search can find: its first
-/// `MAX_INDEXED_UNIQUE_TERMS` unique terms, in document order. The index
-/// stores exactly these, so live matching against this set agrees with
-/// history, COUNT and NEG-OPEN.
-///
-/// The event itself remains bounded by `events.max_event_size`, but without
-/// this separate limit one small event containing many distinct words can
-/// amplify into thousands of LMDB writes, so the walk stops at the limit.
+/// `MAX_INDEXED_UNIQUE_TERMS` unique terms, in document order, as the index
+/// stores them for an event whose search text is `content` alone.
 pub fn search_term_set(content: &str) -> SearchTermSet {
-    let mut terms = SearchTermSet::new();
-    for_each_term(content, |term| {
-        if let Some(term) = term {
-            if !terms.contains(term) {
-                terms.insert(term.to_owned());
-            }
-        }
-        terms.len() < MAX_INDEXED_UNIQUE_TERMS
-    });
-    terms
+    indexed_terms(&[Cow::Borrowed(content)])
 }
 
 /// Parse the free-text portion of a NIP-50 query. `key:value` extension words
@@ -123,21 +130,109 @@ struct EventContent<'a> {
     content: Cow<'a, str>,
 }
 
-fn parse_event_content(json: &str) -> Result<Cow<'_, str>, DbError> {
-    let event: EventContent<'_> = serde_json::from_str(json)
-        .map_err(|error| DbError::msg(format!("event JSON parse failed: {error}")))?;
-    Ok(event.content)
+#[derive(Deserialize)]
+struct EventText<'a> {
+    #[serde(borrow, default)]
+    tags: Vec<Tag<'a>>,
+    #[serde(borrow)]
+    content: Cow<'a, str>,
 }
 
-pub fn event_content(json: &str) -> Result<String, DbError> {
-    parse_event_content(json).map(Cow::into_owned)
+/// A tag as search reads it. strfry stores tags whose elements are not all
+/// strings, such as a NIP-13 nonce's numeric difficulty: search skips what it
+/// does not read rather than fail the event.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Tag<'a> {
+    Elements(#[serde(borrow)] Vec<TagElement<'a>>),
+    Other(IgnoredAny),
 }
 
-/// Extract only the event content field and normalize it once for all live
-/// search subscriptions, into the bounded `search_term_set` the index stores.
-/// This avoids building a full JSON DOM per event.
-pub fn event_search_terms(json: &str) -> Result<SearchTermSet, DbError> {
-    Ok(search_term_set(&parse_event_content(json)?))
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TagElement<'a> {
+    Text(#[serde(borrow)] Cow<'a, str>),
+    Other(IgnoredAny),
+}
+
+impl<'a> Tag<'a> {
+    /// The tag's name and first value, when both are strings.
+    fn name_and_value(self) -> Option<(Cow<'a, str>, Cow<'a, str>)> {
+        let Tag::Elements(elements) = self else {
+            return None;
+        };
+        let mut elements = elements.into_iter();
+        match (elements.next()?, elements.next()?) {
+            (TagElement::Text(name), TagElement::Text(value)) => Some((name, value)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct EventKind {
+    kind: u64,
+}
+
+fn parse_event<'a, T: Deserialize<'a>>(json: &'a str) -> Result<T, DbError> {
+    serde_json::from_str(json)
+        .map_err(|error| DbError::msg(format!("event JSON parse failed: {error}")))
+}
+
+/// The text an event of `kind` is searched by, in indexing order: for a text
+/// kind, its name tags, its summary tags, then its content; for a profile, the metadata fields
+/// a person is looked up by. Nothing for any other kind. The index, removal,
+/// `wok doctor`, reindex, live matching and the phrase boost all read this,
+/// so a stored event and a live one match the same searches.
+fn search_document(kind: u64, json: &str) -> Result<Vec<Cow<'_, str>>, DbError> {
+    if kind == 0 {
+        let content = parse_event::<EventContent<'_>>(json)?.content;
+        // Metadata that is not a JSON object has nothing to search.
+        let fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&content).unwrap_or_default();
+        return Ok(PROFILE_FIELDS
+            .iter()
+            .filter_map(|field| fields.get(*field)?.as_str())
+            .map(|value| Cow::Owned(value.to_owned()))
+            .collect());
+    }
+    if TEXT_KINDS.binary_search(&kind).is_err() {
+        return Ok(Vec::new());
+    }
+    let event = parse_event::<EventText<'_>>(json)?;
+    let (names, summaries): (Vec<_>, Vec<_>) = event
+        .tags
+        .into_iter()
+        .filter_map(Tag::name_and_value)
+        .filter(|(name, _)| {
+            NAME_TAGS.contains(&name.as_ref()) || SUMMARY_TAGS.contains(&name.as_ref())
+        })
+        .partition(|(name, _)| NAME_TAGS.contains(&name.as_ref()));
+    let mut document: Vec<_> = names
+        .into_iter()
+        .chain(summaries)
+        .map(|(_, value)| value)
+        .collect();
+    document.push(event.content);
+    Ok(document)
+}
+
+/// Parse `json` as far as search reads an event of a text kind, whatever its
+/// kind. `wok doctor` reports every payload that fails, not only those of the
+/// kinds search indexes.
+pub(crate) fn check_event_text(json: &str) -> Result<(), DbError> {
+    parse_event::<EventText<'_>>(json).map(drop)
+}
+
+/// The `kind` of a stored payload, for one whose PackedEvent cannot be read.
+pub(crate) fn payload_kind(json: &str) -> Option<u64> {
+    parse_event::<EventKind>(json).ok().map(|event| event.kind)
+}
+
+/// The terms an event of `kind` is indexed by, which a live search matches
+/// it by too.
+pub fn event_search_terms(kind: u64, json: &str) -> Result<SearchTermSet, DbError> {
+    Ok(indexed_terms(&search_document(kind, json)?))
 }
 
 fn term_key(term: &str) -> Vec<u8> {
@@ -149,29 +244,51 @@ fn term_key(term: &str) -> Vec<u8> {
 
 pub(crate) fn search_index_entries(
     lev_id: u64,
+    kind: u64,
     json: &str,
 ) -> Result<Vec<SearchIndexEntry>, DbError> {
-    let content = event_content(json)?;
     let value = lev_id.to_ne_bytes().to_vec();
-    let keys = bounded_index_keys(&content);
-    Ok(keys.into_iter().map(|key| (key, value.clone())).collect())
-}
-
-/// The postings one event's content adds to the index: the keys of its
-/// `search_term_set`, so indexing and live matching cannot disagree.
-fn bounded_index_keys(content: &str) -> BTreeSet<Vec<u8>> {
-    let keys: BTreeSet<Vec<u8>> = search_term_set(content)
+    let keys: BTreeSet<_> = indexed_terms(&search_document(kind, json)?)
         .iter()
         .map(|term| term_key(term))
         .collect();
-    keys
+    Ok(keys.into_iter().map(|key| (key, value.clone())).collect())
+}
+
+/// Build a deterministic, bounded index for untrusted event text.
+///
+/// The event itself remains bounded by `events.max_event_size`, but without
+/// this separate limit one small event containing many distinct words can
+/// amplify into thousands of LMDB writes. We retain the first unique terms in
+/// document order and stop adding postings after that.
+fn indexed_terms(document: &[Cow<'_, str>]) -> SearchTermSet {
+    let mut terms = SearchTermSet::new();
+    for_each_document_term(document, |term| {
+        if let Some(term) = term {
+            if !terms.contains(term) {
+                terms.insert(term.to_owned());
+            }
+        }
+        terms.len() < MAX_INDEXED_UNIQUE_TERMS
+    });
+    terms
+}
+
+/// [`for_each_term`] over each piece of `document` in turn. Words in
+/// different pieces are not adjacent: `f` sees `None` between them.
+fn for_each_document_term(document: &[Cow<'_, str>], mut f: impl FnMut(Option<&str>) -> bool) {
+    for text in document {
+        if !for_each_term(text, &mut f) || !f(None) {
+            return;
+        }
+    }
 }
 
 /// Calls `f` with each normalized term of `text` in document order, or with
 /// `None` for a word longer than [`MAX_INDEXED_TERM_BYTES`]: it is never
 /// indexed, and it separates the words on either side. Stops once `f`
-/// returns false.
-fn for_each_term(text: &str, mut f: impl FnMut(Option<&str>) -> bool) {
+/// returns false, and returns false if it did.
+fn for_each_term(text: &str, mut f: impl FnMut(Option<&str>) -> bool) -> bool {
     let mut current = String::new();
     let mut finish = |current: &mut String| {
         if current.is_empty() {
@@ -185,24 +302,28 @@ fn for_each_term(text: &str, mut f: impl FnMut(Option<&str>) -> bool) {
         if ch.is_alphanumeric() {
             current.extend(ch.to_lowercase());
         } else if !finish(&mut current) {
-            return;
+            return false;
         }
     }
-    finish(&mut current);
+    finish(&mut current)
 }
 
-/// How many of `pairs` occur in the event's content as adjacent words: the
-/// phrase boost a search ranks a match by. A pair listed twice counts twice,
-/// as the query named it twice.
-pub fn count_phrase_pairs(json: &str, pairs: &[(String, String)]) -> Result<usize, DbError> {
+/// How many of `pairs` occur in the `search_document` of an event of `kind`
+/// as adjacent words: the phrase boost a search ranks a match by. A pair
+/// listed twice counts twice, as the query named it twice.
+pub fn count_phrase_pairs(
+    kind: u64,
+    json: &str,
+    pairs: &[(String, String)],
+) -> Result<usize, DbError> {
     if pairs.is_empty() {
         return Ok(0);
     }
-    let content = parse_event_content(json)?;
+    let document = search_document(kind, json)?;
     let mut found = vec![false; pairs.len()];
     let mut remaining = pairs.len();
     let mut previous = String::new();
-    for_each_term(&content, |term| {
+    for_each_document_term(&document, |term| {
         let Some(term) = term else {
             previous.clear();
             return true;
@@ -246,17 +367,27 @@ fn search_dbi_rw(txn: &RwTxn<'_>) -> Result<lmdb_sys::MDB_dbi, DbError> {
         .ok_or_else(|| DbError::msg("NIP-50 search index is unavailable"))
 }
 
-pub fn index_event_search(txn: &mut RwTxn<'_>, lev_id: u64, json: &str) -> Result<(), DbError> {
+pub fn index_event_search(
+    txn: &mut RwTxn<'_>,
+    lev_id: u64,
+    kind: u64,
+    json: &str,
+) -> Result<(), DbError> {
     let dbi = search_dbi_rw(txn)?;
-    for (key, value) in search_index_entries(lev_id, json)? {
+    for (key, value) in search_index_entries(lev_id, kind, json)? {
         txn.put(dbi, &key, &value, MDB_NODUPDATA)?;
     }
     Ok(())
 }
 
-pub fn remove_event_search(txn: &mut RwTxn<'_>, lev_id: u64, json: &str) -> Result<(), DbError> {
+pub fn remove_event_search(
+    txn: &mut RwTxn<'_>,
+    lev_id: u64,
+    kind: u64,
+    json: &str,
+) -> Result<(), DbError> {
     let dbi = search_dbi_rw(txn)?;
-    for (key, value) in search_index_entries(lev_id, json)? {
+    for (key, value) in search_index_entries(lev_id, kind, json)? {
         txn.del(dbi, &key, Some(&value))?;
     }
     Ok(())
@@ -382,11 +513,15 @@ pub(crate) fn ensure_search_index(env: &Env) -> Result<(), DbError> {
             &start.to_ne_bytes(),
             &[],
             false,
-            |key, _| {
+            |key, packed| {
                 if key.len() != 8 {
                     return true;
                 }
-                batch.push(u64::from_ne_bytes(key.try_into().unwrap()));
+                // `wok doctor` reports a PackedEvent too short to read.
+                let kind = PackedEventView::new(packed)
+                    .ok()
+                    .map(|packed| packed.kind());
+                batch.push((u64::from_ne_bytes(key.try_into().unwrap()), kind));
                 batch.len() < BACKFILL_BATCH_SIZE
             },
         )?;
@@ -398,17 +533,20 @@ pub(crate) fn ensure_search_index(env: &Env) -> Result<(), DbError> {
         }
 
         let mut decompressor = Decompressor::new();
-        for lev_id in &batch {
+        for &(lev_id, kind) in &batch {
+            let Some(kind) = kind else {
+                continue;
+            };
             let payload = txn
-                .get_u64(txn.env().dbis().event_payload, *lev_id)?
+                .get_u64(txn.env().dbis().event_payload, lev_id)?
                 .ok_or_else(|| DbError::msg(format!("event {lev_id} has no payload")))?
                 .to_vec();
             let json = decompressor
                 .decode_rw(&txn, &payload, 16 * 1024 * 1024)?
                 .to_owned();
-            index_event_search(&mut txn, *lev_id, &json)?;
+            index_event_search(&mut txn, lev_id, kind, &json)?;
         }
-        set_indexed_through(&mut txn, *batch.last().unwrap())?;
+        set_indexed_through(&mut txn, batch.last().unwrap().0)?;
         let done = batch.len() < BACKFILL_BATCH_SIZE;
         txn.commit()?;
         if done {
@@ -445,10 +583,151 @@ mod tests {
 
     #[test]
     fn event_terms_parse_only_content_and_handle_escapes() {
-        let terms =
-            event_search_terms(r#"{"content":"A CAF\u00c9\nNostr","ignored":{"nested":[1,2,3]}}"#)
-                .unwrap();
+        let terms = event_search_terms(
+            1,
+            r#"{"content":"A CAF\u00c9\nNostr","ignored":{"nested":[1,2,3]}}"#,
+        )
+        .unwrap();
         assert_eq!(terms, search_term_set("A CAFÉ\nNostr"));
+    }
+
+    #[test]
+    fn only_text_kinds_and_profiles_are_searched() {
+        assert!(TEXT_KINDS.windows(2).all(|pair| pair[0] < pair[1]));
+        let json = serde_json::json!({"content": "plain words"}).to_string();
+        for kind in TEXT_KINDS {
+            assert_eq!(
+                event_search_terms(kind, &json).unwrap(),
+                search_term_set("plain words"),
+                "kind {kind}"
+            );
+        }
+        // Ciphertext, a repost's embedded event, a follow list, a reaction.
+        for kind in [4, 6, 3, 7, 1059, 30000] {
+            assert!(
+                event_search_terms(kind, &json).unwrap().is_empty(),
+                "kind {kind}"
+            );
+            assert!(search_index_entries(9, kind, &json).unwrap().is_empty());
+        }
+        // A kind search does not read is not even parsed.
+        assert!(event_search_terms(3, "not json").unwrap().is_empty());
+        assert!(event_search_terms(1, "not json").is_err());
+    }
+
+    #[test]
+    fn title_tags_come_before_content_and_alt_is_not_indexed() {
+        let content = (0..1_000)
+            .map(|n| format!("word{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let json = serde_json::json!({
+            "tags": [
+                ["d", "slug"],
+                ["summary", format!("Why LMDB {content}")],
+                ["alt", "Long-form article: fallback"],
+                ["title", "Relay Design"],
+                ["t", "hashtag"],
+            ],
+            "content": "body",
+        })
+        .to_string();
+        // The title is indexed first, though a long summary comes before it.
+        let terms = event_search_terms(30023, &json).unwrap();
+        assert_eq!(terms.len(), MAX_INDEXED_UNIQUE_TERMS);
+        for term in ["relay", "design", "why", "lmdb", "word0", "word251"] {
+            assert!(terms.contains(term), "{term}");
+        }
+        for term in ["slug", "fallback", "hashtag", "word252", "body"] {
+            assert!(!terms.contains(term), "{term}");
+        }
+    }
+
+    /// strfry stores tags whose elements are not all strings, such as a
+    /// NIP-13 nonce's numeric difficulty. Search skips them: rebuilding the
+    /// index on open, deleting and the doctor all handle such a note.
+    #[test]
+    fn a_tag_element_that_is_not_a_string_is_skipped() {
+        let json = |id: u8| {
+            serde_json::json!({
+                "id": wok_event::to_hex(&[id; 32]),
+                "pubkey": wok_event::to_hex(&[9; 32]),
+                "created_at": 1,
+                "kind": 1,
+                "tags": [["nonce", "7", 21], ["title", 3], [5, "x"], 6, ["subject", "Mined"]],
+                "content": "hello world",
+                "sig": "00".repeat(64),
+            })
+            .to_string()
+        };
+        assert_eq!(
+            event_search_terms(1, &json(1)).unwrap(),
+            search_term_set("mined hello world")
+        );
+        assert!(check_event_text(&json(1)).is_ok());
+
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut events: Vec<_> = (1..=2)
+                .map(|id| {
+                    let packed = wok_event::PackedEventBuilder::build(
+                        &[id; 32],
+                        &[9; 32],
+                        1,
+                        1,
+                        0,
+                        &wok_event::PackedEventTagBuilder::default(),
+                    )
+                    .unwrap();
+                    crate::EventToWrite::new(packed.into_bytes(), json(id))
+                })
+                .collect();
+            let mut txn = env.begin_rw().unwrap();
+            crate::write_events(&mut txn, &mut crate::NoopNegentropy, &mut events, false).unwrap();
+            // An index on another schema is rebuilt on the next open.
+            let dbi = env.dbis().event_search.unwrap();
+            txn.del(dbi, SEARCH_SCHEMA_KEY, None).unwrap();
+            txn.put(dbi, SEARCH_SCHEMA_KEY, &99_u64.to_ne_bytes(), 0)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let env = Env::open(temp.path(), EnvOptions::for_tests()).unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(search_posting_count(&txn, "mined").unwrap(), 2);
+        let report = crate::check_integrity(&txn).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
+        drop(txn);
+        let mut txn = env.begin_rw().unwrap();
+        assert!(crate::delete_event_basic(&mut txn, 1).unwrap());
+        txn.commit().unwrap();
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(search_posting_count(&txn, "mined").unwrap(), 1);
+        let report = crate::check_integrity(&txn).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
+    }
+
+    #[test]
+    fn profiles_are_searched_by_their_names_and_about() {
+        let profile = |content: &str| serde_json::json!({ "content": content }).to_string();
+        let json = profile(
+            r#"{"name":"satoshi","display_name":"Satoshi N","about":"Bitcoin author",
+                "nip05":"sn@example.com","picture":"https://example.com/a.png",
+                "website":"https://bitcoin.org","lud16":12}"#,
+        );
+        assert_eq!(
+            event_search_terms(0, &json).unwrap(),
+            search_term_set("satoshi n sn example com bitcoin author")
+        );
+        // Metadata that is not a JSON object, and fields that are not
+        // strings, have nothing to search.
+        assert!(event_search_terms(0, &profile("satoshi"))
+            .unwrap()
+            .is_empty());
+        assert!(event_search_terms(0, &profile(r#"{"name":7}"#))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -458,7 +737,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let json = serde_json::json!({"content": content}).to_string();
-        let entries = search_index_entries(7, &json).unwrap();
+        let entries = search_index_entries(7, 1, &json).unwrap();
         assert_eq!(entries.len(), MAX_INDEXED_UNIQUE_TERMS);
         assert!(entries
             .iter()
@@ -477,23 +756,23 @@ mod tests {
         let event = |content: &str| serde_json::json!({ "content": content }).to_string();
         let json = event("The Best NOSTR apps, best of all");
         assert_eq!(
-            count_phrase_pairs(&json, &pairs(&["best", "nostr", "apps"])).unwrap(),
+            count_phrase_pairs(1, &json, &pairs(&["best", "nostr", "apps"])).unwrap(),
             2
         );
         assert_eq!(
-            count_phrase_pairs(&json, &pairs(&["nostr", "best"])).unwrap(),
+            count_phrase_pairs(1, &json, &pairs(&["nostr", "best"])).unwrap(),
             0
         );
         // A pair the query names twice counts twice.
         assert_eq!(
-            count_phrase_pairs(&json, &pairs(&["best", "nostr", "best", "nostr"])).unwrap(),
+            count_phrase_pairs(1, &json, &pairs(&["best", "nostr", "best", "nostr"])).unwrap(),
             2
         );
         // A word too long to index separates its neighbours.
         let long = "x".repeat(MAX_INDEXED_TERM_BYTES + 1);
         let json = event(&format!("best {long} nostr"));
         assert_eq!(
-            count_phrase_pairs(&json, &pairs(&["best", "nostr"])).unwrap(),
+            count_phrase_pairs(1, &json, &pairs(&["best", "nostr"])).unwrap(),
             0
         );
         // Unlike the old adjacent-term postings, there is no cap: a pair is
@@ -502,10 +781,26 @@ mod tests {
         words.extend(["late".into(), "pair".into()]);
         let json = event(&words.join(" "));
         assert_eq!(
-            count_phrase_pairs(&json, &pairs(&["late", "pair"])).unwrap(),
+            count_phrase_pairs(1, &json, &pairs(&["late", "pair"])).unwrap(),
             1
         );
-        assert_eq!(count_phrase_pairs(&json, &[]).unwrap(), 0);
+        assert_eq!(count_phrase_pairs(1, &json, &[]).unwrap(), 0);
+        // A title and the content are separate: words across them are not
+        // adjacent.
+        let json = serde_json::json!({
+            "tags": [["title", "the best"]],
+            "content": "nostr apps",
+        })
+        .to_string();
+        assert_eq!(
+            count_phrase_pairs(11, &json, &pairs(&["the", "best", "nostr", "apps"])).unwrap(),
+            2
+        );
+        // A kind search does not read has no phrases.
+        assert_eq!(
+            count_phrase_pairs(4, &json, &pairs(&["nostr", "apps"])).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -514,13 +809,13 @@ mod tests {
         words.extend((1..MAX_INDEXED_UNIQUE_TERMS).map(|n| format!("filler{n}")));
         words.extend(["inside".into(), "zebra".into()]);
         let json = serde_json::json!({"content": words.join(" ")}).to_string();
-        let indexed: SearchTermSet = search_index_entries(9, &json)
+        let indexed: SearchTermSet = search_index_entries(9, 1, &json)
             .unwrap()
             .into_iter()
             .filter(|(key, _)| key.first() == Some(&TERM_PREFIX))
             .map(|(key, _)| search_term_from_key(&key).unwrap().to_owned())
             .collect();
-        let live = event_search_terms(&json).unwrap();
+        let live = event_search_terms(1, &json).unwrap();
         assert_eq!(live, indexed);
         assert_eq!(live.len(), MAX_INDEXED_UNIQUE_TERMS);
         assert!(live.contains("inside"));
@@ -532,7 +827,7 @@ mod tests {
         let mut words = vec!["repeat".to_string(); MAX_INDEXED_UNIQUE_TERMS * 2];
         words.push("last".into());
         let json = serde_json::json!({"content": words.join(" ")}).to_string();
-        let entries = search_index_entries(8, &json).unwrap();
+        let entries = search_index_entries(8, 1, &json).unwrap();
         assert!(entries.iter().any(|(key, _)| key == &term_key("last")));
     }
 

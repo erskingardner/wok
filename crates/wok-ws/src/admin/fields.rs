@@ -631,7 +631,7 @@ pub(super) const SECTIONS: &[Section] = &[
             ),
             field(
                 "Vanish deletion batch",
-                "Records removed per transaction while a vanish request is carried out.",
+                "Index entries the vanish sweep examines, and so records it removes, per maintenance transaction.",
                 "A vanish request takes more, smaller transactions.",
                 "Each transaction holds the writer longer.",
                 &[Input::new("nip62", "deletion_batch_size", "relay.nip62.deletion_batch_size", Unit::Count)],

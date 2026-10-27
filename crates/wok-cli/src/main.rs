@@ -1209,7 +1209,7 @@ fn cmd_monitor(cfg: &Config) -> Result<()> {
         if let Ok(p) = wok_event::PackedEventView::new(packed) {
             if let Ok(json) = event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size) {
                 let search_terms = if monitors.requires_content() {
-                    Some(wok_db::event_search_terms(&json).unwrap_or_default())
+                    Some(wok_db::event_search_terms(p.kind(), &json).unwrap_or_default())
                 } else {
                     None
                 };
@@ -1650,11 +1650,10 @@ fn downloaded_event_matches(
     wok_event::nostr_json_to_packed_event(event, limits)
         .map(|packed| {
             if filter_group.requires_content() {
-                event
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|content| filter_group.does_match_with_content(packed.view(), content))
-                    .unwrap_or(false)
+                let view = packed.view();
+                wok_db::event_search_terms(view.kind(), &event.to_string()).is_ok_and(|terms| {
+                    filter_group.does_match_with_search_terms(view, Some(&terms))
+                })
             } else {
                 filter_group.does_match(packed.view())
             }

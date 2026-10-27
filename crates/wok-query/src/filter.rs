@@ -3,7 +3,7 @@
 use crate::subid::{FilterLimit, QueryError};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use wok_db::{parse_search_query, search_term_set, SearchQuery, SearchTermSet};
+use wok_db::{parse_search_query, SearchQuery, SearchTermSet};
 use wok_event::{
     from_lower_hex_exact, indexed_tag_value, PackedEventView, MAX_INDEXED_TAG_VAL_SIZE,
 };
@@ -389,11 +389,6 @@ impl NostrFilter {
         true
     }
 
-    pub fn does_match_with_content(&self, ev: PackedEventView<'_>, content: &str) -> bool {
-        let terms = search_term_set(content);
-        self.does_match_with_search_terms(ev, Some(&terms))
-    }
-
     pub fn does_match_with_search_terms(
         &self,
         ev: PackedEventView<'_>,
@@ -483,11 +478,6 @@ impl NostrFilterGroup {
 
     pub fn does_match(&self, ev: PackedEventView<'_>) -> bool {
         self.filters.iter().any(|f| f.does_match(ev))
-    }
-
-    pub fn does_match_with_content(&self, ev: PackedEventView<'_>, content: &str) -> bool {
-        let terms = search_term_set(content);
-        self.does_match_with_search_terms(ev, Some(&terms))
     }
 
     pub fn does_match_with_search_terms(
@@ -834,7 +824,7 @@ mod tests {
     fn search_matching_accepts_precomputed_event_terms() {
         let filter = NostrFilter::parse(&json!({"search":"café nostr"}), 500, 3, 16).unwrap();
         let event = packed_note(1, 2, 15, 1, &[]);
-        let terms = search_term_set("A NOSTR relay with Café support");
+        let terms = wok_db::search_term_set("A NOSTR relay with Café support");
 
         assert!(!filter.does_match(event.view()));
         assert!(!filter.does_match_with_search_terms(event.view(), None));

@@ -1,7 +1,7 @@
 # Relay functions reached in the `proxied` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 733
+## anonymous: 736
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -489,21 +489,24 @@ wok_db::moderation::moderation_reason_inner
 wok_db::moderation::moderation_reason_ro
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
-wok_db::search::bounded_index_keys
-wok_db::search::bounded_index_keys::{closure}
-wok_db::search::event_content
-wok_db::search::for_each_term::<wok_db::search::bounded_index_keys::{closure}>
-wok_db::search::for_each_term::<wok_db::search::bounded_index_keys::{closure}>::{closure}
+wok_db::search::for_each_document_term::<wok_db::search::indexed_terms::{closure}>
+wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>
+wok_db::search::for_each_term::<&mut wok_db::search::indexed_terms::{closure}>::{closure}
 wok_db::search::for_each_term::<wok_db::search::normalize_search_terms_with_overflow::{closure}>
 wok_db::search::for_each_term::<wok_db::search::normalize_search_terms_with_overflow::{closure}>::{closure}
 wok_db::search::index_event_search
+wok_db::search::indexed_terms
+wok_db::search::indexed_terms::{closure}
 wok_db::search::normalize_search_terms_with_overflow
 wok_db::search::normalize_search_terms_with_overflow::{closure}
 wok_db::search::note_search_indexed_through
-wok_db::search::parse_event_content
+wok_db::search::parse_event::<wok_db::search::EventContent>
+wok_db::search::parse_event::<wok_db::search::EventText>
 wok_db::search::parse_search_query
 wok_db::search::parse_search_query::{closure}
 wok_db::search::search_dbi_ro
+wok_db::search::search_document
+wok_db::search::search_document::{closure}
 wok_db::search::search_index_entries
 wok_db::search::search_index_entries::{closure}
 wok_db::search::search_posting_count

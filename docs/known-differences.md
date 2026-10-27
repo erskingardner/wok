@@ -30,8 +30,9 @@ it is not a promise to reproduce upstream bugs.
   `sourceType: "unix"` for those connections.
 - `wok event <levId>` prints one event by local event ID.
 - NIP-11 `software` is Wok's homepage, `https://github.com/erskingardner/wok`.
-- Wok implements NIP-50 ranked content search using a Wok-owned derived LMDB
-  index. The pinned strfry revision has no NIP-50 implementation.
+- Wok implements NIP-50 ranked search of text kinds and profiles using a
+  Wok-owned derived LMDB index. The pinned strfry revision has no NIP-50
+  implementation.
 - Wok returns mergeable NIP-45 HyperLogLog sketches for canonical
   single-target COUNT filters, including address and hashed-string offsets;
   this is not present in the pinned strfry revision.

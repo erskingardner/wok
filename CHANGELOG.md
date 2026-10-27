@@ -911,6 +911,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- NIP-50 search covers only kinds whose content is text a person wrote, such
+  as notes, articles, comments and chat, plus profiles (#257). It matched
+  any kind whose `content` held the words, so a search without `kinds`
+  returned reposts, whose embedded JSON repeats the original, and random
+  fragments of encrypted messages, and every such event wrote postings. A
+  profile is now searched by its name, display name, NIP-05 and about
+  rather than its raw JSON, so "https" no longer matches every profile with
+  a picture, and the title, subject, name, summary and description tags of
+  articles and other text kinds are searched with their content. A live
+  event matches by the same first 256 words the index keeps. The list is in
+  [NIP-50 search](docs/nip50-search.md); the index is rebuilt on the first
+  open.
 - The NIP-50 search index keeps only word postings (#257). It also kept a
   posting for each pair of adjacent words, up to 256 an event, which only
   boosted a match whose content holds the query's words in order; that

@@ -603,8 +603,20 @@ impl Engine for Rocks {
     }
 
     fn newest_by_author(&self, pubkey: &[u8], limit: usize) -> Result<usize> {
+        // One snapshot for the index and the payloads, as an LMDB read
+        // transaction has: otherwise an event replaced in between has an
+        // index entry and no payload.
+        let snapshot = self.db.snapshot();
+        let opts = || {
+            let mut opts = rocksdb::ReadOptions::default();
+            opts.set_snapshot(&snapshot);
+            opts
+        };
         let payload = self.cf_named(PAYLOAD_TABLE);
-        let mut it = self.db.raw_iterator_cf(self.cf_named(PUBKEY_TABLE));
+        let mut it = self
+            .db
+            .raw_iterator_cf_opt(self.cf_named(PUBKEY_TABLE), opts());
+        let get_opts = opts();
         let mut seek = pubkey.to_vec();
         seek.extend_from_slice(&[0xFF; 16]);
         it.seek_for_prev(&seek);
@@ -617,7 +629,7 @@ impl Engine for Rocks {
             let lev_id = &key[key.len() - 8..];
             let value = self
                 .db
-                .get_pinned_cf(payload, lev_id)?
+                .get_pinned_cf_opt(payload, lev_id, &get_opts)?
                 .context("payload missing")?;
             std::hint::black_box(&*value);
             read += 1;
@@ -703,6 +715,8 @@ struct Report {
     steps_background_per_logical_byte: f64,
     footprint_bytes: u64,
     divergent_ops: u64,
+    /// Reader queries that failed; the first is printed.
+    read_errors: u64,
 }
 
 fn process_write_bytes() -> Option<u64> {
@@ -867,8 +881,10 @@ fn main() -> Result<()> {
                                         let us = started.elapsed().as_micros() as u64;
                                         let _ = reads.lock().unwrap().record(us.max(1));
                                     }
-                                    Err(_) => {
-                                        errors.fetch_add(1, Ordering::Relaxed);
+                                    Err(error) => {
+                                        if errors.fetch_add(1, Ordering::Relaxed) == 0 {
+                                            eprintln!("read failed: {error:#}");
+                                        }
                                     }
                                 }
                             }
@@ -1002,12 +1018,13 @@ fn main() -> Result<()> {
             / steps_logical.max(1) as f64,
         footprint_bytes: dir_bytes(&args.dir),
         divergent_ops,
+        read_errors: read_errors.load(Ordering::Relaxed),
     };
-    ensure!(
-        read_errors.load(Ordering::Relaxed) == 0,
-        "{} reads failed",
-        read_errors.load(Ordering::Relaxed)
-    );
     std::fs::write(&args.out, serde_json::to_string_pretty(&report)?)?;
+    ensure!(
+        report.read_errors == 0,
+        "{} reads failed",
+        report.read_errors
+    );
     Ok(())
 }

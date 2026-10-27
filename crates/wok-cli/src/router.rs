@@ -1246,7 +1246,9 @@ mod tests {
             let _ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             std::future::pending::<()>().await;
         });
-        let (manager_tx, mut manager_rx) = mpsc::channel(16);
+        // As roomy as the router's, so the `Drained` reports the connection
+        // sends while the queue fills never block it.
+        let (manager_tx, mut manager_rx) = mpsc::channel(4096);
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_EVENT_BYTES));
         // A write timeout far beyond the test's wait, so only the close can
         // end the connection in time.
@@ -1285,10 +1287,13 @@ mod tests {
             .await
             .expect("the close was held back by the full queue")
             .unwrap();
-        assert!(matches!(
-            manager_rx.recv().await,
-            Some(ManagerMsg::Disconnected { id: 1, .. })
-        ));
+        loop {
+            match manager_rx.recv().await {
+                Some(ManagerMsg::Disconnected { id, .. }) => break assert_eq!(id, 1),
+                Some(ManagerMsg::Drained) => {}
+                _ => panic!("the connection did not report its disconnect"),
+            }
+        }
         peer.abort();
     }
 

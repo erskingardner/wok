@@ -3577,6 +3577,12 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
+    if let Some(corpus) = &args.corpus {
+        s.push_str(&format!(
+            "corpus={} (supplied; this run did not generate it)\n\n",
+            corpus.display()
+        ));
+    }
     if let Some(target_url) = args.target_endpoint() {
         s.push_str(&format!(
             "external_target={} ({})\n\n",
@@ -3678,9 +3684,6 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
                     .collect();
                 selection.push_str(&format!(" --target-recipient-kinds {}", kinds.join(",")));
             }
-            if let Some(corpus) = &args.corpus {
-                selection.push_str(&format!(" --corpus \"{}\"", corpus.display()));
-            }
         }
     }
     if args.scenario.as_deref() == Some("ws_transport") {
@@ -3765,6 +3768,11 @@ fn render_markdown(args: &Args, trials: &[Trial]) -> String {
         if let Some(path) = &args.wok_baseline {
             selection.push_str(&format!(" --wok-baseline \"{}\"", path.display()));
         }
+    }
+    // A supplied corpus replaces the one --seed and --event-mix would
+    // generate, so the run cannot be repeated without it.
+    if let Some(corpus) = &args.corpus {
+        selection.push_str(&format!(" --corpus \"{}\"", corpus.display()));
     }
     let target = if let Some(path) = &args.target_unix {
         format!(
@@ -4181,6 +4189,31 @@ mod tests {
             db_write::default_corpus_events(&default.db_batches, default.db_step_events)
         );
         assert_eq!(generated_corpus_events(&default, &["import"], 2_000), 2_000);
+    }
+
+    #[test]
+    fn a_supplied_corpus_is_in_the_reproduction_command() {
+        for scenario in ["db_write", "codec_cpu", "ws_query_latency"] {
+            let args = Args::try_parse_from([
+                "wok-bench",
+                "--scenario",
+                scenario,
+                "--corpus",
+                "/data/social.jsonl",
+            ])
+            .unwrap();
+            let md = render_markdown(&args, &[]);
+            assert!(md.contains("corpus=/data/social.jsonl (supplied"), "{md}");
+            let repro = md
+                .lines()
+                .find(|l| l.starts_with("./target/release/wok-bench"));
+            assert!(
+                repro.unwrap().contains(" --corpus \"/data/social.jsonl\""),
+                "{md}"
+            );
+        }
+        let generated = Args::try_parse_from(["wok-bench", "--scenario", "db_write"]).unwrap();
+        assert!(!render_markdown(&generated, &[]).contains("--corpus"));
     }
 
     #[test]

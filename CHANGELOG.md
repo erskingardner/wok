@@ -964,6 +964,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Opening a database no longer fails when the search index is being rebuilt
+  and an event has no payload, or a payload that does not decode (#257).
+  The event is left out of the index, and `wok doctor` reports it.
 - NIP-50 search covers only kinds whose content is text a person wrote, such
   as notes, articles, comments and chat, plus profiles (#257). It matched
   any kind whose `content` held the words, so a search without `kinds`

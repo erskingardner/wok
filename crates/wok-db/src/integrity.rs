@@ -4,7 +4,8 @@
 use crate::fbs::{decode_compression_dictionary, decode_meta, decode_negentropy_filter};
 use crate::payload::{parse_payload, Decompressor, PayloadView};
 use crate::search::{
-    check_event_text, is_search_marker, payload_kind, search_index_entries, search_term_from_key,
+    check_event_text, is_search_marker, payload_kind, search_index_entries,
+    search_indexed_through_ro, search_term_from_key,
 };
 use crate::tag_kind::{
     is_tag_kind_marker, is_valid_pass_record, tag_kind_index_state_ro, tag_kind_keys,
@@ -636,6 +637,7 @@ fn check_tag_kind_postings(
 fn check_search_postings(
     txn: &RoTxn<'_>,
     dbi: MDB_dbi,
+    indexed_through: u64,
     balance: &mut PostingBalance,
     report: &mut IntegrityReport,
 ) -> Result<(), DbError> {
@@ -684,10 +686,18 @@ fn check_search_postings(
                 return true;
             }
         };
-        // The event pass derived the entries of a readable event. A payload
-        // without one, orphaned or under a PackedEvent too short, is rare:
-        // derive it here.
-        if readable_event(txn, lev_id) {
+        // No event above the marker has postings yet. The event pass derived
+        // the entries of a readable event at or below it. A payload without
+        // one, orphaned or under a PackedEvent too short, is rare: derive it
+        // here.
+        if lev_id > indexed_through {
+            report.extra_index_entries += 1;
+            report.issue(
+                "unexpected-index",
+                TABLE,
+                format!("term {term:?}, levId {lev_id} above indexed-through {indexed_through}"),
+            );
+        } else if readable_event(txn, lev_id) {
             balance.stored(lev_id);
         } else if !derives_search_posting(txn, &mut decompressor, payload, lev_id, key) {
             report.extra_index_entries += 1;
@@ -770,6 +780,11 @@ fn check_integrity_with_buckets(
     let mut report = IntegrityReport::default();
     let mut search_decompressor = Decompressor::new();
     let mut search_balance = PostingBalance::new(buckets);
+    // Only the events at or below the search marker have postings.
+    let search_through = match dbis.event_search {
+        Some(_) => search_indexed_through_ro(txn)?,
+        None => 0,
+    };
     let mut tag_kind_balance = PostingBalance::new(buckets);
     // The strfry-layout indexes share one balance, except `event_replace`:
     // superseded history is counted from the postings their versions derive,
@@ -904,9 +919,14 @@ fn check_integrity_with_buckets(
             ) {
                 report.legacy_long_tag_records += 1;
             }
-            match check_event_text(&json)
-                .and_then(|()| search_index_entries(lev_id, packed.kind(), &json))
-            {
+            let entries = check_event_text(&json).and_then(|()| {
+                if lev_id <= search_through {
+                    search_index_entries(lev_id, packed.kind(), &json)
+                } else {
+                    Ok(Vec::new())
+                }
+            });
+            match entries {
                 Ok(entries) => {
                     for (key, value) in entries {
                         let entry = EventIndexEntry {
@@ -1056,7 +1076,13 @@ fn check_integrity_with_buckets(
     drop(index_balance);
 
     if let Some(search_dbi) = dbis.event_search {
-        check_search_postings(txn, search_dbi, &mut search_balance, &mut report)?;
+        check_search_postings(
+            txn,
+            search_dbi,
+            search_through,
+            &mut search_balance,
+            &mut report,
+        )?;
     }
 
     if let (Some(dbi), Some(tag_kind)) = (dbis.event_tag_kind, tag_kind.as_mut()) {

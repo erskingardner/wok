@@ -1267,8 +1267,9 @@ it adds the events the step newly stored (accepted less duplicates) and the
 bytes written per such event. This works for strfry as well as Wok. A
 missing mark leaves that phase's bytes out and does not fail the run. Each
 run removes the earlier copy of `io-phases.tsv`, each relay start begins new
-marks, and each phase starts from an empty directory, so a rerun under the
-same campaign ID never reports an earlier run's results or bytes.
+marks, and each phase starts from an empty directory, so under a reused
+campaign ID a phase that runs never reports an earlier run's results or
+bytes. A phase the rerun does not reach keeps the earlier run's files.
 
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`

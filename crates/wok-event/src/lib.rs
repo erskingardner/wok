@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod bech32;
+mod deletion_protection;
 mod error;
 mod hash;
 pub mod json;
@@ -15,6 +16,7 @@ mod parse;
 mod validate;
 
 pub use bech32::{decode_npub, encode_npub};
+pub use deletion_protection::{deletion_protection, DELETION_PROTECTION_NIP, NO_DELETE_TAG};
 pub use error::{EventError, EventLimit};
 pub use hash::{
     event_id_hash, legacy_event_id_hash, sha256, verify_id, verify_id_allowing_legacy, verify_sig,

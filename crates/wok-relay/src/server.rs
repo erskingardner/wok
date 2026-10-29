@@ -24,7 +24,7 @@ use crate::protocol::{
     has_reason_prefix, push_json_str, ClientCommand, EoseHints, ParseFailure, RelayMessage,
 };
 use crate::source::TransportSource;
-use crate::supported_nips;
+use crate::{supported_nips, NipId};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 use rand::Rng;
@@ -34,12 +34,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
+#[cfg(test)]
+use wok_db::is_event_vanished_ro;
 use wok_db::{
-    backfill_vanish_markers, is_event_vanished_ro, load_moderation_snapshot_ro,
-    lookup_event_by_id_ro, moderation_reason_ignoring_author_ro, moderation_reason_ro,
-    most_recent_levid_ro, normalize_relay_url, report_event, sweep_vanished_events, Decompressor,
-    Env, EventToWrite, EventWriteStatus, ModerationSnapshot, SearchTermSet, MAX_MODERATION_RECORDS,
-    MAX_REASON_BYTES, VANISH_KIND,
+    backfill_vanish_markers, load_moderation_snapshot_ro, lookup_event_by_id_ro,
+    moderation_reason_ignoring_author_ro, moderation_reason_ro, most_recent_levid_ro,
+    normalize_relay_url, report_event, sweep_vanished_events, Decompressor, Env, EventToWrite,
+    EventWriteStatus, ModerationSnapshot, SearchTermSet, MAX_MODERATION_RECORDS, MAX_REASON_BYTES,
+    VANISH_KIND,
 };
 use wok_event::{
     parse_and_verify_event, to_hex, PackedEventView, AUTH_CHALLENGE_LEN, AUTH_KIND,
@@ -1433,10 +1435,10 @@ impl RelayHandle {
 
     /// The NIPs to advertise: those the configuration enables, less NIP-50
     /// while the search index is too far behind to serve searches.
-    pub fn supported_nips(&self) -> Vec<u64> {
+    pub fn supported_nips(&self) -> Vec<NipId> {
         let mut nips = supported_nips(&self.config.read());
         if self.metrics.search_index_building() {
-            nips.retain(|&nip| nip != 50);
+            nips.retain(|nip| *nip != NipId::Number(50));
         }
         nips
     }
@@ -2769,7 +2771,7 @@ fn ingest_event(
                 RelayMessage::Ok {
                     event_id: id,
                     accepted: false,
-                    message: format!("invalid: {e}"),
+                    message: format!("{}: {e}", e.rejection_prefix()),
                 },
                 metrics,
             );
@@ -5249,9 +5251,13 @@ mod tests {
         let newer = PackedEventBuilder::build(&[3; 32], &author, 201, 1, 0, &tags).unwrap();
         let request =
             PackedEventBuilder::build(&[4; 32], &author, 200, VANISH_KIND, 0, &tags).unwrap();
-        assert!(event_matches_vanish_markers(old.view(), &markers));
-        assert!(!event_matches_vanish_markers(newer.view(), &markers));
-        assert!(!event_matches_vanish_markers(request.view(), &markers));
+        assert!(event_matches_vanish_markers(old.view(), &markers, "{}"));
+        assert!(!event_matches_vanish_markers(newer.view(), &markers, "{}"));
+        assert!(!event_matches_vanish_markers(
+            request.view(),
+            &markers,
+            "{}"
+        ));
 
         // A wrap to the author vanishes only up to the request, like the
         // author's own events (#249).
@@ -5263,11 +5269,42 @@ mod tests {
                     PackedEventBuilder::build(&[5; 32], &[6; 32], created_at, kind, 0, &gift_tags)
                         .unwrap();
                 assert_eq!(
-                    event_matches_vanish_markers(gift.view(), &markers),
+                    event_matches_vanish_markers(gift.view(), &markers, "{}"),
                     vanished,
                     "kind {kind} at {created_at}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn batch_vanish_markers_exempt_signed_no_delete_but_preserve_recipient_authority() {
+        let author = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let pubkey = author.x_only_public_key().0.serialize();
+        let markers = HashMap::from([(pubkey, 200)]);
+        for (kind, tags, vanished) in [
+            (445, json!([["no_delete"]]), false),
+            (445, json!([]), true),
+            (1059, json!([["no_delete"], ["p", to_hex(&pubkey)]]), true),
+        ] {
+            let event = sign_event_with_key(
+                json!({
+                    "created_at": 100, "kind": kind, "tags": tags, "content": "history",
+                }),
+                &author,
+            );
+            let parsed = parse_and_verify_event(
+                &event,
+                &wok_event::EventLimits::default(),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                event_matches_vanish_markers(parsed.packed.view(), &markers, &parsed.json),
+                vanished
+            );
         }
     }
 

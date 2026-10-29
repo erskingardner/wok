@@ -251,45 +251,55 @@ pub fn gift_wrap_vanished(created_at: u64, timestamp: u64) -> bool {
 }
 
 pub fn is_event_vanished_ro(txn: &RoTxn<'_>, packed: PackedEventView<'_>) -> Result<bool, DbError> {
-    if packed.kind() != VANISH_KIND
-        && vanish_timestamp_ro(txn, packed.pubkey())?
-            .is_some_and(|timestamp| packed.created_at() <= timestamp)
-    {
-        return Ok(true);
-    }
-    if GIFT_WRAP_KINDS.contains(&packed.kind()) {
-        let mut vanished = false;
-        let mut error = None;
-        packed.foreach_tag(|name, value| {
-            if name == 'p' {
-                match vanish_timestamp_ro(txn, value) {
-                    Ok(Some(timestamp)) if gift_wrap_vanished(packed.created_at(), timestamp) => {
-                        vanished = true;
-                        return false;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        error = Some(err);
-                        return false;
-                    }
-                }
-            }
-            true
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-        if vanished {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    event_vanished(
+        packed,
+        |key| vanish_timestamp_ro(txn, key),
+        || crate::deletion_protection::is_deletion_protected_ro(txn, packed),
+    )
+}
+
+/// The incoming event is not stored yet: read its signed marker from the
+/// supplied payload, rather than mistaking an absent record for no protection.
+pub fn is_event_vanished_ro_with_json(
+    txn: &RoTxn<'_>,
+    packed: PackedEventView<'_>,
+    json: &str,
+) -> Result<bool, DbError> {
+    event_vanished(
+        packed,
+        |key| vanish_timestamp_ro(txn, key),
+        || crate::is_deletion_protected_json(packed, json),
+    )
 }
 
 pub fn is_event_vanished_rw(txn: &RwTxn<'_>, packed: PackedEventView<'_>) -> Result<bool, DbError> {
+    event_vanished(
+        packed,
+        |key| vanish_timestamp_rw(txn, key),
+        || crate::deletion_protection::is_stored_deletion_protected_rw(txn, packed),
+    )
+}
+
+pub(crate) fn is_event_vanished_rw_with_json(
+    txn: &RwTxn<'_>,
+    packed: PackedEventView<'_>,
+    json: &str,
+) -> Result<bool, DbError> {
+    event_vanished(
+        packed,
+        |key| vanish_timestamp_rw(txn, key),
+        || crate::is_deletion_protected_json(packed, json),
+    )
+}
+
+fn event_vanished(
+    packed: PackedEventView<'_>,
+    mut timestamp: impl FnMut(&[u8]) -> Result<Option<u64>, DbError>,
+    protected: impl FnOnce() -> Result<bool, DbError>,
+) -> Result<bool, DbError> {
     if packed.kind() != VANISH_KIND
-        && vanish_timestamp_rw(txn, packed.pubkey())?
-            .is_some_and(|timestamp| packed.created_at() <= timestamp)
+        && timestamp(packed.pubkey())?.is_some_and(|timestamp| packed.created_at() <= timestamp)
+        && !protected()?
     {
         return Ok(true);
     }
@@ -298,7 +308,7 @@ pub fn is_event_vanished_rw(txn: &RwTxn<'_>, packed: PackedEventView<'_>) -> Res
         let mut error = None;
         packed.foreach_tag(|name, value| {
             if name == 'p' {
-                match vanish_timestamp_rw(txn, value) {
+                match timestamp(value) {
                     Ok(Some(timestamp)) if gift_wrap_vanished(packed.created_at(), timestamp) => {
                         vanished = true;
                         return false;
@@ -604,7 +614,10 @@ impl Sweep {
                 pubkey,
                 position,
                 |created_at| created_at <= progress.target,
-                |event| event.kind() != VANISH_KIND,
+                |lev, event| {
+                    Ok(event.kind() != VANISH_KIND
+                        && !crate::deletion_protection::is_deletion_protected_rw(txn, lev, event)?)
+                },
             )?;
             // A later pass starts past the wraps the pass before covered:
             // `gift_wrap_vanished` covers every wrap created up to a request.
@@ -625,7 +638,7 @@ impl Sweep {
                 &tag,
                 position,
                 |created_at| gift_wrap_vanished(created_at, progress.target),
-                |event| GIFT_WRAP_KINDS.contains(&event.kind()),
+                |_, event| Ok(GIFT_WRAP_KINDS.contains(&event.kind())),
             )?;
             progress.step = next.map_or(SweepStep::Done, SweepStep::Tagged);
         }
@@ -643,7 +656,7 @@ impl Sweep {
         prefix: &[u8],
         position: Position,
         within: impl Fn(u64) -> bool,
-        deletes: impl Fn(PackedEventView<'_>) -> bool,
+        deletes: impl Fn(u64, PackedEventView<'_>) -> Result<bool, DbError>,
     ) -> Result<Option<Position>, DbError> {
         let mut next = None;
         let mut error = None;
@@ -671,9 +684,16 @@ impl Sweep {
                 self.entries -= 1;
                 match txn.get_u64(txn.env().dbis().event, lev_id) {
                     Ok(Some(raw)) => {
-                        if PackedEventView::new(raw).is_ok_and(&deletes) && self.seen.insert(lev_id)
+                        match PackedEventView::new(raw)
+                            .map_err(DbError::from)
+                            .and_then(|event| deletes(lev_id, event))
                         {
-                            self.lev_ids.push(lev_id);
+                            Ok(true) if self.seen.insert(lev_id) => self.lev_ids.push(lev_id),
+                            Ok(_) => {}
+                            Err(err) => {
+                                error = Some(err);
+                                return false;
+                            }
                         }
                         true
                     }

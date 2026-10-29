@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- NIP-D9 Deletion Request Protection from NIPs proposal #2531: eligible
+  events signed with `["no_delete"]` survive their author's kind-5 deletion
+  and kind-62 purge requests, regardless of arrival order or republication.
+  Recipient gift-wrap deletion, expiration and operator policy still apply.
+  Invalid markers and expiration metadata are refused, and replaceable,
+  addressable and ephemeral kinds cannot opt in. NIP-11 advertises the string
+  `"D9"` in `supported_nips`; the landing page labels it NIP-D9 and
+  links to the draft.
+- NIP-59 kind-5 recipient deletion sweeps stored p-tagged gift wraps even
+  without explicit target IDs, including wraps carrying `no_delete`.
+- NIP-11 capability handling supports numeric and named identifiers together.
+  Outbound sync/router discovery accepts mixed integer/string arrays while
+  keeping names literal, so a string such as `"5A"` cannot alias numeric NIP-90.
+
 ### Security
 
 - Update zstd to 0.14.3 (zstd-safe 8.2.0, zstd-sys 2.1.2) for

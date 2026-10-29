@@ -128,6 +128,16 @@ impl Model {
                 .retain(|_, old| !(old["kind"] == 0 && old["pubkey"] == event["pubkey"]));
         }
         if event["kind"] == 5 {
+            // NIP-59 recipients can clear their stored gift wraps without
+            // listing wrapper IDs, independently of the request's e tags.
+            self.events.retain(|_, old| {
+                !(old["kind"] == 1059
+                    && old["tags"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tag| tag[0] == "p" && tag[1] == event["pubkey"]))
+            });
             for tag in event["tags"].as_array().unwrap() {
                 if tag[0] == "e" {
                     let id = tag[1].as_str().unwrap();

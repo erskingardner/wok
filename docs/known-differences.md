@@ -400,6 +400,20 @@ regression test. Differential parity alone is not a reason to retain it.
   block a kind 5 from being stored. The pinned strfry exempts neither, so
   deleting a deletion removed it with its tombstone and the original event
   could be published again.
+- NIP-D9 Deletion Request Protection (nips#2531 at `56fd367`): a signed
+  `["no_delete"]` on an eligible event exempts it from its signing key's
+  kind-5 deletion and kind-62 author purge, including old tombstones and
+  later republication. The pinned strfry ignores this tag. Recipient deletion,
+  expiration and independent operator policy still apply. Malformed markers
+  and expiration metadata are refused; replaceable, addressable and ephemeral
+  kinds cannot opt in. NIP-11 advertises the literal string `"D9"` in
+  `supported_nips` alongside integer identifiers for numeric NIPs. Outbound
+  sync/router discovery also accepts these mixed arrays and preserves named
+  identifiers without converting them to integers; see [NIP support](nips.md).
+- NIP-59 recipient deletion: a kind-5 request sweeps stored gift wraps whose
+  `p` tag names the requester even without an `e` tag naming the wrap. This
+  includes marked wraps and a wrap whose recipient is also its signer. The
+  pinned strfry only checks the recipient for explicitly referenced IDs.
 - NIP-09 `a` tags of replaceable events: a deletion naming
   `<kind>:<pubkey>:`, for kinds 0, 3 and 10000–19999, deletes its author's
   versions up to its `created_at` and refuses such versions that arrive

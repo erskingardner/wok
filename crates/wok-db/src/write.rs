@@ -11,7 +11,7 @@ use crate::tag_kind::{
     del_tag_kind_entries, note_tag_kind_indexed, put_tag_kind_entries, tag_kind_keys,
 };
 use crate::txn::RwTxn;
-use crate::vanish::{is_event_vanished_rw, mark_vanished, VanishPolicy, VANISH_KIND};
+use crate::vanish::{is_event_vanished_rw_with_json, mark_vanished, VanishPolicy, VANISH_KIND};
 use crate::DbError;
 use lmdb_sys::{MDB_dbi, MDB_APPEND, MDB_NOOVERWRITE};
 use std::collections::HashMap;
@@ -754,7 +754,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
             continue;
         }
 
-        if !is_vanish_request && is_event_vanished_rw(txn, packed)? {
+        if !is_vanish_request && is_event_vanished_rw_with_json(txn, packed, json)? {
             *status = EventWriteStatus::Deleted;
             continue;
         }
@@ -766,6 +766,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         if !is_vanish_request
             && packed.kind() != DELETION_KIND
             && deletion_exists(txn, packed.id(), packed.pubkey())?
+            && !crate::is_deletion_protected_json(packed, json)?
         {
             *status = EventWriteStatus::Deleted;
             continue;
@@ -898,6 +899,17 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                                 let mut can_delete = other.kind() != VANISH_KIND
                                     && other.kind() != DELETION_KIND
                                     && other.pubkey() == packed.pubkey();
+                                if can_delete {
+                                    match crate::deletion_protection::is_deletion_protected_rw(
+                                        txn, lev, other,
+                                    ) {
+                                        Ok(protected) => can_delete = !protected,
+                                        Err(err) => {
+                                            scan_err = Some(err);
+                                            return false;
+                                        }
+                                    }
+                                }
                                 if !can_delete && GIFT_WRAP_KINDS.contains(&other.kind()) {
                                     other.foreach_tag(|on, ov| {
                                         if on == 'p' && ov == packed.pubkey() {
@@ -933,6 +945,9 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
             if let Some(e) = scan_err {
                 return Err(e);
             }
+            // NIP-59 recipient authority is a p-tag sweep, even without an
+            // e tag naming a wrap. A sender's no_delete cannot waive it.
+            push_recipient_deletions(txn, packed.pubkey(), &mut lev_ids_to_delete)?;
         }
 
         // A later tombstone/policy rejection must not apply proposed cleanup.
@@ -981,6 +996,45 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
     }
 
     Ok(())
+}
+
+fn push_recipient_deletions(
+    txn: &RwTxn<'_>,
+    pubkey: &[u8],
+    lev_ids: &mut Vec<u64>,
+) -> Result<(), DbError> {
+    let mut tag = Vec::with_capacity(33);
+    tag.push(b'p');
+    tag.extend_from_slice(pubkey);
+    let mut error = None;
+    txn.foreach_full(
+        txn.env().dbis().event_tag,
+        &make_key_string_u64(&tag, 0),
+        &0u64.to_ne_bytes(),
+        false,
+        |key, value| {
+            let result = (|| {
+                if parse_key_string_u64(key)?.0 != tag {
+                    return Ok(false);
+                }
+                let lev = u64_from_ne_checked(value)?;
+                if let Some(raw) = txn.get_u64(txn.env().dbis().event, lev)? {
+                    if GIFT_WRAP_KINDS.contains(&PackedEventView::new(raw)?.kind()) {
+                        lev_ids.push(lev);
+                    }
+                }
+                Ok::<_, DbError>(true)
+            })();
+            match result {
+                Ok(more) => more,
+                Err(err) => {
+                    error = Some(err);
+                    false
+                }
+            }
+        },
+    )?;
+    error.map_or(Ok(()), Err)
 }
 
 pub fn delete_events<N: NegentropySink>(

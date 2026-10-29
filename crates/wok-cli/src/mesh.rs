@@ -9,6 +9,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use wok_relay::NipId;
 
 const NIP11_TIMEOUT: Duration = Duration::from_secs(3);
 const NIP11_VALID_TTL: Duration = Duration::from_secs(60 * 60);
@@ -18,7 +19,7 @@ const NIP11_CACHE_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 struct CapabilityResult {
-    supported_nips: Result<Arc<HashSet<u64>>, Arc<str>>,
+    supported_nips: Result<Arc<HashSet<NipId>>, Arc<str>>,
     expires_at: Instant,
 }
 
@@ -106,7 +107,7 @@ async fn fetch_nip11(http_url: String) -> Arc<CapabilityResult> {
     }
 }
 
-fn parse_supported_nips(document: &Value) -> anyhow::Result<HashSet<u64>> {
+fn parse_supported_nips(document: &Value) -> anyhow::Result<HashSet<NipId>> {
     let Some(nips) = document.get("supported_nips") else {
         return Ok(HashSet::new());
     };
@@ -115,13 +116,14 @@ fn parse_supported_nips(document: &Value) -> anyhow::Result<HashSet<u64>> {
         .ok_or_else(|| anyhow::anyhow!("supported_nips is not an array"))?;
     nips.iter()
         .map(|nip| {
-            nip.as_u64()
-                .ok_or_else(|| anyhow::anyhow!("supported_nips contains a non-integer"))
+            serde_json::from_value(nip.clone()).map_err(|_| {
+                anyhow::anyhow!("supported_nips identifiers must be integers or strings")
+            })
         })
         .collect()
 }
 
-async fn relay_supported_nips(relay_url: &str) -> Result<Arc<HashSet<u64>>, Arc<str>> {
+async fn relay_supported_nips(relay_url: &str) -> Result<Arc<HashSet<NipId>>, Arc<str>> {
     let Some(http_url) = nip11_url(relay_url) else {
         return Err(Arc::from("invalid relay URL"));
     };
@@ -266,7 +268,7 @@ pub(crate) async fn outbound_filter_for_relay(
     };
 
     match relay_supported_nips(relay_url).await {
-        Ok(nips) if nips.contains(&91) => return Ok(filter.clone()),
+        Ok(nips) if nips.contains(&NipId::Number(91)) => return Ok(filter.clone()),
         Ok(_) => {}
         Err(error) => {
             tracing::warn!(url = relay_url, %error, "NIP-11 unavailable; assuming no NIP-91 support")
@@ -349,19 +351,24 @@ mod tests {
 
     #[tokio::test]
     async fn advertised_nip91_preserves_and_fields() {
-        let (url, requests, server) = nip11_server(r#"{"supported_nips":[1,11,91]}"#).await;
-        let filter = serde_json::json!({"&t":["a","b"],"#t":["a","b","c"]});
-        assert_eq!(
-            outbound_filter_for_relay(&url, &filter).await.unwrap(),
-            filter
-        );
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-        server.abort();
+        for document in [
+            r#"{"supported_nips":[1,11,91]}"#,
+            r#"{"supported_nips":[1,11,91,"5A","D9"]}"#,
+        ] {
+            let (url, requests, server) = nip11_server(document).await;
+            let filter = serde_json::json!({"&t":["a","b"],"#t":["a","b","c"]});
+            assert_eq!(
+                outbound_filter_for_relay(&url, &filter).await.unwrap(),
+                filter
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
     }
 
     #[tokio::test]
     async fn unsupported_nip91_folds_and_values_into_the_compatibility_clause() {
-        let (url, requests, server) = nip11_server(r#"{"supported_nips":[1,11]}"#).await;
+        let (url, requests, server) = nip11_server(r#"{"supported_nips":[1,11,"91","D9"]}"#).await;
         let filter = serde_json::json!({
             "&t":["a","b"],
             "#t":["b","c"],
@@ -497,10 +504,31 @@ mod tests {
     }
 
     #[test]
-    fn supported_nips_require_integer_entries() {
-        let nips = parse_supported_nips(&serde_json::json!({"supported_nips":[77,91]})).unwrap();
-        assert!(nips.contains(&77));
-        assert!(nips.contains(&91));
-        assert!(parse_supported_nips(&serde_json::json!({"supported_nips":["91"]})).is_err());
+    fn supported_nips_preserve_integer_and_named_identifiers() {
+        let nips =
+            parse_supported_nips(&serde_json::json!({"supported_nips":[77,91,"5A","D9"]})).unwrap();
+        assert!(nips.contains(&NipId::Number(77)));
+        assert!(nips.contains(&NipId::Number(91)));
+        assert!(nips.contains(&NipId::named("5A")));
+        assert!(nips.contains(&NipId::named("D9")));
+        assert!(!nips.contains(&NipId::Number(90)));
+        assert!(!nips.contains(&NipId::Number(217)));
+
+        let named_only =
+            parse_supported_nips(&serde_json::json!({"supported_nips":["91"]})).unwrap();
+        assert!(named_only.contains(&NipId::named("91")));
+        assert!(!named_only.contains(&NipId::Number(91)));
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(91.5),
+            serde_json::json!(true),
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                parse_supported_nips(&serde_json::json!({"supported_nips":[91,invalid]})).is_err()
+            );
+        }
     }
 }

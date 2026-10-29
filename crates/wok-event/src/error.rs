@@ -4,6 +4,9 @@ use thiserror::Error;
 pub enum EventError {
     #[error("{0}")]
     Message(String),
+    /// Valid protocol metadata that this relay cannot accept under policy.
+    #[error("{0}")]
+    Restricted(Box<str>),
     /// The event is over a limit the caller chose, in [`EventLimits`] or a
     /// [`TimestampPolicy`], so a relay can say which of its settings
     /// refused it. Boxed, so the error and every `Result` that carries it
@@ -42,10 +45,22 @@ impl EventError {
         Self::Limit(Box::new((limit, msg.into())))
     }
 
+    pub fn restricted(msg: impl Into<String>) -> Self {
+        Self::Restricted(msg.into().into_boxed_str())
+    }
+
+    /// NIP-01 rejection category, without the trailing colon.
+    pub fn rejection_prefix(&self) -> &'static str {
+        match self {
+            Self::Restricted(_) => "restricted",
+            _ => "invalid",
+        }
+    }
+
     /// The limit this error reports, when it is one.
     pub fn broken_limit(&self) -> Option<EventLimit> {
         match self {
-            Self::Message(_) => None,
+            Self::Message(_) | Self::Restricted(_) => None,
             Self::Limit(limit) => Some(limit.0),
         }
     }

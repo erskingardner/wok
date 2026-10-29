@@ -25,6 +25,57 @@ arbitrary list.
 | 78 | Arbitrary custom app data | kinds 78 and 30078 served only to, and accepted only from, a connection authenticated as their author | `nip_conformance.rs`, `access_model.rs` | usable AUTH and kinds 78 and 30078 in `relay.auth.owner_only_kinds` |
 | 86 | Relay management API | `wok-ws` RPC + `wok-db` moderation tables + `wok-relay` enforcement | `e2e_transports.rs` | `admin.enabled` with operator pubkeys |
 | 91 | AND operator in filters | `wok-query` compiled AND tags + full-event verification | matcher property tests, historical/live/COUNT conformance | both tag-filter limits are nonzero |
+| D9 | Deletion Request Protection | signed marker validation + `wok-db` deletion and vanish exemptions | `nip_conformance.rs`, `e2e_transports.rs`, `deletion_protection.rs` | always |
+
+Wok uses **NIP-D9** for **Deletion Request Protection**, following
+[nostr-protocol/nips#2531](https://github.com/nostr-protocol/nips/pull/2531),
+at revision `56fd3677949b9cae3fdaee403adc9e33a8de2921` (whose source still
+uses the temporary name XX). NIP-11 advertises the literal string **"D9"**
+in `supported_nips`, alongside integers for numeric NIPs. For example:
+
+```json
+{"supported_nips": [1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91, "D9"]}
+```
+
+Wok uses strings for lettered NIP identifiers without hexadecimal-to-integer
+conversion: `"5A"` and numeric `90` remain different identifiers. This is an
+interim extension to NIP-11's currently integer-only schema. Wok's outbound
+sync/router discovery accepts mixed integer/string arrays, preserving each
+identifier's type and spelling; numeric NIP-91 still requires integer `91`.
+
+The landing page labels the capability NIP-D9 and links to the proposal. Clients
+requiring protection must establish relay support; `OK true` alone is
+insufficient. This draft is pinned separately from the main NIPs revision.
+
+An event opts in with exactly one `["no_delete"]` tag. The tag must have no
+value. Replaceable, addressable, and ephemeral events (kinds 0, 3, and
+10000–39999) cannot opt in and are refused with `restricted:`. Repeated or
+valued markers are refused with `invalid:`. A marked event may have one
+`expiration` tag with exactly one canonical ASCII decimal u64 value, without
+leading zeros except `0`; malformed or repeated expiration tags receive
+`invalid:`. Wok's existing storage representation accepts explicit expiration
+timestamps from 100 through `18446744073709551615`; smaller valid timestamps
+on marked events receive `restricted:` rather than being reinterpreted as
+the no-expiry or ephemeral sentinel. Unmarked expiration handling is unchanged.
+
+After ID and signature verification, marked events are exempt from their
+signing key's kind-5 deletion and kind-62 author purge, including existing
+tombstones, events received after a request, imports, republication, live
+delivery, REQ, COUNT, and NIP-77. A marker on a request protects only that
+request's record, not its targets. Kinds 5 and 62 may themselves be marked.
+The marker is read from the signed payload, so existing stored records and
+migration bytes need no rewrite. Legacy tao-preimage IDs remain importable
+but do not acquire this extension's NIP-01 protection.
+
+Recipient gift-wrap deletion remains effective, even if the recipient and
+signer are the same key. A kind-5 recipient request sweeps stored p-tagged
+wraps without needing their IDs; kind-62 recipient suppression and cleanup
+keep their existing timestamp semantics. Wok does not implement NIP-26
+delegation, so this extension adds no delegator authority. Original NIP-40
+expiration, NIP-70 `-` authentication, moderation, quotas, operator deletion,
+and retention still apply. Expiration does not revoke protection against
+author requests for any expired copies still retained; protection does not
+promise permanent storage.
 
 NIP-11 `limitation` also says what a client must do before it reads or writes,
 as each is enforced:
@@ -177,7 +228,7 @@ fetched and discarded. Those differences are counted as `narrowed`, not in
 
 NIP-62 accepts a signed kind 62 request containing either a matching
 `["relay", "<public relay URL>"]` tag or `["relay", "ALL_RELAYS"]`. The
-relay immediately suppresses the requester's events and the NIP-59 gift
+relay immediately suppresses the requester's unmarked events and the NIP-59 gift
 wraps (kinds 1059 and 21059) that p-tag the requester, refuses them when they
 are sent again, then physically deletes them in bounded background batches.
 Both are covered only up to the `created_at` of the requester's newest
@@ -191,6 +242,8 @@ over both storage quotas, and whatever the write policy, the write-policy
 plugin or an author ban says (see
 [attack-surface.md](attack-surface.md#messages)). See `relay.nip62` in the
 sample configuration.
+Marked events are exempt from the author portion of this purge as described
+above; recipient-based gift-wrap purges still apply.
 
 NIP-86 management calls are JSON-RPC-like POSTs to the relay URI authorized
 by NIP-98 events from operator admins or role-holding moderators. They follow

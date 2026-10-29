@@ -1197,7 +1197,7 @@ async fn nip11_http_document() {
         .any(|n| n == 1));
     assert_eq!(
         client["supported_nips"],
-        json!([1, 9, 11, 13, 40, 45, 50, 62, 67, 70, 77, 91])
+        json!([1, 9, 11, 13, 40, 45, 50, 62, 67, 70, 77, 91, "D9"])
     );
     assert_eq!(client["limitation"]["max_event_tags"], 5000);
     assert_eq!(client["limitation"]["max_message_length"], 2_097_152);

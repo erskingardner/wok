@@ -1,7 +1,7 @@
 # Relay functions reached in the `marmot` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 704
+## anonymous: 736
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -50,10 +50,16 @@
 <wok_event::packed::PackedEventView>::foreach_tag::<<wok_event::packed::PackedEventView>::first_d_tag::{closure}>::{closure}
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::tag_kind::tag_kind_keys::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::tag_kind::tag_kind_keys::{closure}>::{closure}
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_ro::{closure}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_ro::{closure}>::{closure}
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_rw::{closure}>
-<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::is_event_vanished_rw::{closure}>::{closure}
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>::{closure}>::{closure}
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>::{closure}>::{closure}
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>::{closure}>::{closure}
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::recipient_deleted<wok_db::vanish::recipient_deleted_ro::{closure}, wok_db::vanish::recipient_deleted_ro::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::recipient_deleted<wok_db::vanish::recipient_deleted_ro::{closure}, wok_db::vanish::recipient_deleted_ro::{closure}>::{closure}>::{closure}
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::recipient_deleted<wok_db::vanish::recipient_deleted_rw::{closure}, wok_db::vanish::recipient_deleted_rw::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::foreach_tag::<wok_db::vanish::recipient_deleted<wok_db::vanish::recipient_deleted_rw::{closure}, wok_db::vanish::recipient_deleted_rw::{closure}>::{closure}>::{closure}
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::index_event::{closure}>
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::index_event::{closure}>::{closure}
 <wok_event::packed::PackedEventView>::foreach_tag::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
@@ -68,8 +74,11 @@
 <wok_event::packed::PackedEventView>::pubkey
 <wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<<wok_event::packed::PackedEventView>::first_d_tag::{closure}>::{closure}>
 <wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::tag_kind::tag_kind_keys::{closure}>::{closure}>
-<wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::vanish::is_event_vanished_ro::{closure}>::{closure}>
-<wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::vanish::is_event_vanished_rw::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::vanish::event_vanished<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::vanish::recipient_deleted<wok_db::vanish::recipient_deleted_ro::{closure}, wok_db::vanish::recipient_deleted_ro::{closure}>::{closure}>::{closure}>
+<wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::vanish::recipient_deleted<wok_db::vanish::recipient_deleted_rw::{closure}, wok_db::vanish::recipient_deleted_rw::{closure}>::{closure}>::{closure}>
 <wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::write::index_event::{closure}>::{closure}>
 <wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
 <wok_event::packed::PackedEventView>::walk_tags::<<wok_event::packed::PackedEventView>::foreach_tag<wok_relay::server::check_author_auth::{closure}>::{closure}>
@@ -270,6 +279,8 @@
 <wok_relay::abuse::Principal>::address
 <wok_relay::capabilities::CapabilityCondition>::is_enabled
 <wok_relay::capabilities::CapabilityCondition>::is_enabled::{closure}
+<wok_relay::capabilities::NipId as core::fmt::Display>::fmt
+<wok_relay::capabilities::NipId>::named
 <wok_relay::config::Config>::accepts_kind
 <wok_relay::config::Config>::auth_required
 <wok_relay::config::Config>::event_limits
@@ -511,13 +522,31 @@ wok_db::txn::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::wr
 wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
 wok_db::txn::position_reverse_dup
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>::{closure}
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>::{closure}
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>::{closure}
 wok_db::vanish::is_event_vanished_ro
 wok_db::vanish::is_event_vanished_ro::{closure}
-wok_db::vanish::is_event_vanished_rw
-wok_db::vanish::is_event_vanished_rw::{closure}
+wok_db::vanish::is_event_vanished_ro_with_json
+wok_db::vanish::is_event_vanished_ro_with_json::{closure}
+wok_db::vanish::is_event_vanished_rw_with_json
+wok_db::vanish::is_event_vanished_rw_with_json::{closure}
+wok_db::vanish::mark_recipient_deleted
 wok_db::vanish::mark_vanished
 wok_db::vanish::normalize_relay_url
 wok_db::vanish::normalize_relay_url::{closure}
+wok_db::vanish::recipient_deleted::<wok_db::vanish::recipient_deleted_ro::{closure}, wok_db::vanish::recipient_deleted_ro::{closure}>
+wok_db::vanish::recipient_deleted::<wok_db::vanish::recipient_deleted_ro::{closure}, wok_db::vanish::recipient_deleted_ro::{closure}>::{closure}
+wok_db::vanish::recipient_deleted::<wok_db::vanish::recipient_deleted_rw::{closure}, wok_db::vanish::recipient_deleted_rw::{closure}>
+wok_db::vanish::recipient_deleted::<wok_db::vanish::recipient_deleted_rw::{closure}, wok_db::vanish::recipient_deleted_rw::{closure}>::{closure}
+wok_db::vanish::recipient_deleted_ro
+wok_db::vanish::recipient_deleted_ro::{closure}
+wok_db::vanish::recipient_deleted_rw
+wok_db::vanish::recipient_deleted_rw::{closure}
+wok_db::vanish::state_key
 wok_db::vanish::vanish_timestamp_ro
 wok_db::vanish::vanish_timestamp_rw
 wok_db::write::deletion_exists
@@ -532,6 +561,9 @@ wok_db::write::put_indices
 wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
+wok_event::deletion_protection::deletion_protection
+wok_event::deletion_protection::deletion_protection::{closure}
+wok_event::deletion_protection::deletion_protection::{closure}::{closure}
 wok_event::hash::id_preimage
 wok_event::hash::sha256
 wok_event::hash::verify_id

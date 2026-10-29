@@ -145,6 +145,7 @@ pub struct EnvInner {
     pub dbis: Dbis,
     pub path: PathBuf,
     pub read_only: bool,
+    pub(crate) protection_cache: std::sync::Mutex<crate::deletion_protection::ProtectionCache>,
 }
 
 // SAFETY: LMDB permits one environment handle to be shared across threads.
@@ -418,6 +419,7 @@ impl Env {
             dbis,
             path: path.to_path_buf(),
             read_only: opts.read_only,
+            protection_cache: Default::default(),
         });
         Ok(Self { inner })
     }

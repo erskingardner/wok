@@ -16,7 +16,7 @@ pub mod source;
 
 pub use abuse::ConnectionSlot;
 pub use capabilities::{
-    relay_capabilities, supported_nips, CapabilityCondition, RelayCapability,
+    relay_capabilities, supported_nips, CapabilityCondition, NipId, RelayCapability,
     RELAY_CAPABILITY_CATALOG,
 };
 pub use config::{AccessPolicy, Config, EphemeralPersistence, Preset, StrfryConfigTranslation};

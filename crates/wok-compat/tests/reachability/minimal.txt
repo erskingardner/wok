@@ -1,7 +1,7 @@
 # Relay functions reached in the `minimal` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 621
+## anonymous: 644
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
 <wok_db::moderation::ModerationView>::hides
@@ -19,6 +19,7 @@
 <wok_event::error::EventError>::broken_limit
 <wok_event::error::EventError>::msg::<&str>
 <wok_event::error::EventError>::msg::<alloc::string::String>
+<wok_event::error::EventError>::rejection_prefix
 <wok_event::json::Parser>::bump
 <wok_event::json::Parser>::consume_digits
 <wok_event::json::Parser>::err
@@ -235,6 +236,8 @@
 <wok_relay::abuse::OpenConnections>::release
 <wok_relay::abuse::Principal>::address
 <wok_relay::capabilities::CapabilityCondition>::is_enabled
+<wok_relay::capabilities::NipId as core::fmt::Display>::fmt
+<wok_relay::capabilities::NipId>::named
 <wok_relay::config::Config>::accepts_kind
 <wok_relay::config::Config>::auth_required
 <wok_relay::config::Config>::auth_usable
@@ -438,9 +441,13 @@ wok_db::state::author_count
 wok_db::state::author_key
 wok_db::state::change_author_count
 wok_db::state::change_replacement_count
+wok_db::state::count_vanish_marker_change
+wok_db::state::invalidate_visibility
 wok_db::state::policy_generation
 wok_db::state::policy_generation::{closure}
 wok_db::state::preserve_high_water
+wok_db::state::vanish_marker_changes
+wok_db::state::vanish_marker_changes::{closure}
 wok_db::tag_kind::note_tag_kind_indexed
 wok_db::tag_kind::put_tag_kind_entries
 wok_db::tag_kind::tag_kind_key
@@ -454,8 +461,21 @@ wok_db::txn::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::wr
 wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
 wok_db::txn::position_reverse_dup
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>
 wok_db::vanish::is_event_vanished_ro
-wok_db::vanish::is_event_vanished_rw
+wok_db::vanish::is_event_vanished_ro::{closure}
+wok_db::vanish::is_event_vanished_ro_with_json
+wok_db::vanish::is_event_vanished_ro_with_json::{closure}
+wok_db::vanish::is_event_vanished_rw_with_json
+wok_db::vanish::is_event_vanished_rw_with_json::{closure}
+wok_db::vanish::mark_recipient_deleted
+wok_db::vanish::recipient_deleted::<wok_db::vanish::recipient_deleted_ro::{closure}, wok_db::vanish::recipient_deleted_ro::{closure}>
+wok_db::vanish::recipient_deleted::<wok_db::vanish::recipient_deleted_rw::{closure}, wok_db::vanish::recipient_deleted_rw::{closure}>
+wok_db::vanish::recipient_deleted_ro
+wok_db::vanish::recipient_deleted_rw
+wok_db::vanish::state_key
 wok_db::vanish::vanish_timestamp_ro
 wok_db::vanish::vanish_timestamp_rw
 wok_db::write::deletion_exists
@@ -471,6 +491,9 @@ wok_db::write::put_indices
 wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
+wok_event::deletion_protection::deletion_protection
+wok_event::deletion_protection::deletion_protection::{closure}
+wok_event::deletion_protection::deletion_protection::{closure}::{closure}
 wok_event::hash::id_preimage
 wok_event::hash::sha256
 wok_event::hash::verify_id

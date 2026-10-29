@@ -18,8 +18,11 @@ pub const POLICY_GENERATION: &[u8] = b"visibility";
 /// Key prefix of a vanish marker's sweep progress, followed by its pubkey
 /// (`vanish::SweepProgress`).
 pub(crate) const VANISH_SWEEP: u8 = b'V';
-/// How many times a vanish marker was added or raised, which is when the
-/// sweep gets more work.
+/// Recipient kind-5 cutoff (local sequence) and its resumable sweep progress.
+pub(crate) const RECIPIENT_DELETE: u8 = b'R';
+pub(crate) const RECIPIENT_SWEEP: u8 = b'D';
+/// How many times an author-vanish or recipient-deletion marker was added or
+/// raised, which is when maintenance gets more work.
 pub(crate) const VANISH_MARKER_CHANGES: &[u8] = b"vanish-markers";
 
 pub(crate) fn decode(raw: &[u8]) -> Result<u64, DbError> {
@@ -219,12 +222,43 @@ pub(crate) fn flush(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Rebuild derived counters lazily while retaining the source sequence across
-/// deleted tails. Caller has already cleared the target state table.
+/// Retain authoritative state: the sequence across deleted tails and pending
+/// recipient deletion cutoffs. Counters and sweep positions are derived again
+/// against the rebuilt indexes. Caller has cleared the target state table.
 pub(crate) fn reset_for_reindex(source: &RoTxn<'_>, target: &mut RwTxn<'_>) -> Result<(), DbError> {
     target.author_counts.clear();
     target.superseded_events = None;
     target.event_sequence = high_water_ro(source)?;
+    let Some(source_dbi) = source.env().dbis().state else {
+        return Ok(());
+    };
+    let target_dbi = target
+        .env()
+        .dbis()
+        .state
+        .ok_or_else(|| DbError::msg("missing Wok state table"))?;
+    let mut error = None;
+    source.foreach_full(source_dbi, &[RECIPIENT_DELETE], &[], false, |key, value| {
+        if key.first() != Some(&RECIPIENT_DELETE) {
+            return false;
+        }
+        let result = (|| {
+            if key.len() != 33 {
+                return Err(DbError::msg("invalid recipient deletion key"));
+            }
+            decode(value)?;
+            target.put(target_dbi, key, value, 0)?;
+            Ok::<_, DbError>(())
+        })();
+        if let Err(err) = result {
+            error = Some(err);
+            return false;
+        }
+        true
+    })?;
+    if let Some(error) = error {
+        return Err(error);
+    }
     Ok(())
 }
 

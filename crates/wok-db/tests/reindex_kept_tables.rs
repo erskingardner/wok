@@ -18,9 +18,9 @@ fn kept_table(dbis: Dbis, name: &str) -> Option<MDB_dbi> {
         DBI_EVENT_PAYLOAD => Some(dbis.event_payload),
         DBI_VANISH_PUBKEY => Some(dbis.vanish_pubkey.unwrap()),
         DBI_MODERATION => Some(dbis.moderation.unwrap()),
-        // Reindex recounts the state table and keeps only its sequence
-        // (`review_regressions`); the visibility generation it resets only
-        // signals a running relay.
+        // Reindex keeps the sequence and pending recipient deletion cutoffs
+        // (`deletion_protection`), recounting derived state and restarting
+        // sweeps. The visibility generation only signals a running relay.
         DBI_EVENT_ID
         | DBI_EVENT_PUBKEY_KIND
         | DBI_EVENT_TAG

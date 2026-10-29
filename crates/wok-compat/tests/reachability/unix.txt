@@ -1,7 +1,7 @@
 # Relay functions reached in the `unix` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 760
+## anonymous: 776
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -14,10 +14,8 @@
 <wok_db::txn::Cursor>::count
 <wok_db::txn::RoTxn>::cursor
 <wok_db::txn::RoTxn>::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
-<wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
-<wok_db::txn::RoTxn>::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::search::build_search_index::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::state::author_count::{closure}>
@@ -33,6 +31,7 @@
 <wok_event::error::EventError>::broken_limit
 <wok_event::error::EventError>::msg::<&str>
 <wok_event::error::EventError>::msg::<alloc::string::String>
+<wok_event::error::EventError>::rejection_prefix
 <wok_event::json::Parser>::bump
 <wok_event::json::Parser>::consume_digits
 <wok_event::json::Parser>::err
@@ -293,6 +292,8 @@
 <wok_relay::abuse::OpenConnections>::release
 <wok_relay::abuse::Principal>::address
 <wok_relay::capabilities::CapabilityCondition>::is_enabled
+<wok_relay::capabilities::NipId as core::fmt::Display>::fmt
+<wok_relay::capabilities::NipId>::named
 <wok_relay::config::Config>::accepts_kind
 <wok_relay::config::Config>::auth_required
 <wok_relay::config::Config>::auth_usable
@@ -496,8 +497,6 @@ wok_db::env::statvfs_u64::<u64>
 wok_db::fbs::decode_negentropy_filter
 wok_db::fbs::get_bytes
 wok_db::fbs::get_string
-wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>
-wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}
 wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>
 wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}
 wok_db::lookup::lookup_event_by_id_ro
@@ -536,9 +535,13 @@ wok_db::state::author_count
 wok_db::state::author_key
 wok_db::state::change_author_count
 wok_db::state::change_replacement_count
+wok_db::state::count_vanish_marker_change
+wok_db::state::invalidate_visibility
 wok_db::state::policy_generation
 wok_db::state::policy_generation::{closure}
 wok_db::state::preserve_high_water
+wok_db::state::vanish_marker_changes
+wok_db::state::vanish_marker_changes::{closure}
 wok_db::tag_kind::high_water::{closure}
 wok_db::tag_kind::note_tag_kind_indexed
 wok_db::tag_kind::put_tag_kind_entries
@@ -546,7 +549,6 @@ wok_db::tag_kind::tag_kind_key
 wok_db::tag_kind::tag_kind_keys
 wok_db::tag_kind::tag_kind_keys::{closure}
 wok_db::txn::foreach_full::<<wok_query::scan::ScanCursor>::collect::{closure}>
-wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 wok_db::txn::foreach_full::<wok_db::search::build_search_index::{closure}>
@@ -555,11 +557,23 @@ wok_db::txn::foreach_full::<wok_db::state::author_count::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
-wok_db::txn::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
 wok_db::txn::position_reverse_dup
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>
 wok_db::vanish::is_event_vanished_ro
-wok_db::vanish::is_event_vanished_rw
+wok_db::vanish::is_event_vanished_ro::{closure}
+wok_db::vanish::is_event_vanished_ro_with_json
+wok_db::vanish::is_event_vanished_ro_with_json::{closure}
+wok_db::vanish::is_event_vanished_rw_with_json
+wok_db::vanish::is_event_vanished_rw_with_json::{closure}
+wok_db::vanish::mark_recipient_deleted
 wok_db::vanish::normalize_relay_url
+wok_db::vanish::recipient_deleted::<wok_db::vanish::recipient_deleted_ro::{closure}, wok_db::vanish::recipient_deleted_ro::{closure}>
+wok_db::vanish::recipient_deleted::<wok_db::vanish::recipient_deleted_rw::{closure}, wok_db::vanish::recipient_deleted_rw::{closure}>
+wok_db::vanish::recipient_deleted_ro
+wok_db::vanish::recipient_deleted_rw
+wok_db::vanish::state_key
 wok_db::vanish::vanish_timestamp_ro
 wok_db::vanish::vanish_timestamp_rw
 wok_db::write::deletion_exists
@@ -575,6 +589,9 @@ wok_db::write::put_indices
 wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
+wok_event::deletion_protection::deletion_protection
+wok_event::deletion_protection::deletion_protection::{closure}
+wok_event::deletion_protection::deletion_protection::{closure}::{closure}
 wok_event::hash::id_preimage
 wok_event::hash::sha256
 wok_event::hash::verify_id
@@ -685,7 +702,6 @@ wok_relay::server::neg_err
 wok_relay::server::negentropy::answer::<wok_negentropy::error::NegError>
 wok_relay::server::negentropy::fail
 wok_relay::server::negentropy::public_tree_allowed
-wok_relay::server::negentropy::public_tree_allowed::{closure}
 wok_relay::server::negentropy::run_negentropy::{closure}
 wok_relay::server::negentropy::run_negentropy::{closure}::{closure}
 wok_relay::server::negentropy::send_vector

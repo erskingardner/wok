@@ -383,7 +383,10 @@ async fn search_filters_are_refused_while_the_search_index_builds() {
     };
     // Read as the relay starts, before any request.
     assert!(
-        !relay.handle.supported_nips().contains(&50),
+        !relay
+            .handle
+            .supported_nips()
+            .contains(&wok_relay::NipId::Number(50)),
         "NIP-50 listed"
     );
 

@@ -111,12 +111,6 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
     write_one(&env, &policy, &mut new_gift);
     assert_eq!(new_gift.status, EventWriteStatus::Written);
 
-    // A kind 5 after the request has no effect on the stored bookkeeping event.
-    let (_, mut delete_vanish) = signed(&author, 5, 201, json!([["e", hex::encode(vanish_id)]]));
-    write_one(&env, &policy, &mut delete_vanish);
-    assert_eq!(delete_vanish.status, EventWriteStatus::Written);
-    assert!(stored(&env, &vanish_id));
-
     // Sweep one record per transaction to prove the deletion lock is bounded.
     let mut cursor = Default::default();
     let mut total_deleted = 0;
@@ -140,6 +134,29 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
     assert!(stored(&env, &vanish_id));
     assert!(stored(&env, &later_gift_id));
     assert!(stored(&env, &new_gift_id));
+
+    // A kind 5 cannot undo the bookkeeping event. Its independent NIP-59
+    // recipient sweep still clears the wraps left outside the vanish cutoff.
+    let (_, mut delete_vanish) = signed(&author, 5, 201, json!([["e", hex::encode(vanish_id)]]));
+    write_one(&env, &policy, &mut delete_vanish);
+    assert_eq!(delete_vanish.status, EventWriteStatus::Written);
+    assert!(stored(&env, &vanish_id));
+    for id in [later_gift_id, new_gift_id] {
+        let txn = env.begin_ro().unwrap();
+        let (_, packed) = lookup_event_by_id_ro(&txn, &id).unwrap().unwrap();
+        assert!(is_event_vanished_ro(&txn, PackedEventView::new(&packed).unwrap()).unwrap());
+    }
+    for _ in 0..20 {
+        let mut txn = env.begin_rw().unwrap();
+        let step = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut cursor).unwrap();
+        assert!(step.examined <= 1 && step.deleted <= 1);
+        txn.commit().unwrap();
+        if !stored(&env, &later_gift_id) && !stored(&env, &new_gift_id) {
+            break;
+        }
+    }
+    assert!(!stored(&env, &later_gift_id));
+    assert!(!stored(&env, &new_gift_id));
 
     drop(env);
     let reopened = Env::open(directory.path(), EnvOptions::for_tests()).unwrap();

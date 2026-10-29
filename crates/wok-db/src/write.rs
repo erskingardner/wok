@@ -11,7 +11,10 @@ use crate::tag_kind::{
     del_tag_kind_entries, note_tag_kind_indexed, put_tag_kind_entries, tag_kind_keys,
 };
 use crate::txn::RwTxn;
-use crate::vanish::{is_event_vanished_rw, mark_vanished, VanishPolicy, VANISH_KIND};
+use crate::vanish::{
+    is_event_vanished_rw_with_json, mark_recipient_deleted, mark_vanished, VanishPolicy,
+    VANISH_KIND,
+};
 use crate::DbError;
 use lmdb_sys::{MDB_dbi, MDB_APPEND, MDB_NOOVERWRITE};
 use std::collections::HashMap;
@@ -754,7 +757,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
             continue;
         }
 
-        if !is_vanish_request && is_event_vanished_rw(txn, packed)? {
+        if !is_vanish_request && is_event_vanished_rw_with_json(txn, packed, json)? {
             *status = EventWriteStatus::Deleted;
             continue;
         }
@@ -766,6 +769,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         if !is_vanish_request
             && packed.kind() != DELETION_KIND
             && deletion_exists(txn, packed.id(), packed.pubkey())?
+            && !crate::is_deletion_protected_json(packed, json)?
         {
             *status = EventWriteStatus::Deleted;
             continue;
@@ -898,6 +902,17 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
                                 let mut can_delete = other.kind() != VANISH_KIND
                                     && other.kind() != DELETION_KIND
                                     && other.pubkey() == packed.pubkey();
+                                if can_delete {
+                                    match crate::deletion_protection::is_deletion_protected_rw(
+                                        txn, lev, other,
+                                    ) {
+                                        Ok(protected) => can_delete = !protected,
+                                        Err(err) => {
+                                            scan_err = Some(err);
+                                            return false;
+                                        }
+                                    }
+                                }
                                 if !can_delete && GIFT_WRAP_KINDS.contains(&other.kind()) {
                                     other.foreach_tag(|on, ov| {
                                         if on == 'p' && ov == packed.pubkey() {
@@ -961,6 +976,11 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         first_inserted.get_or_insert(inserted_lev_id);
         last_inserted = Some(inserted_lev_id);
         *lev_id = inserted_lev_id;
+        if packed.kind() == DELETION_KIND {
+            // Hide existing recipient wraps immediately. Maintenance performs
+            // the p-tag sweep in bounded, persisted batches, even without e tags.
+            mark_recipient_deleted(txn, packed.pubkey(), inserted_lev_id)?;
+        }
         ne.update(txn, packed, true)?;
         *status = EventWriteStatus::Written;
 

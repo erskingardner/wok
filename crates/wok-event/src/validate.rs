@@ -428,6 +428,15 @@ pub fn parse_and_verify_event_with(
     if !orig.is_object() {
         return Err(EventError::msg("event is not an object"));
     }
+    if crate::deletion_protection(orig)?
+        && crate::expiration_tag(orig).is_some_and(|expiration| expiration < 100)
+    {
+        // The existing storage format reserves 0 and 1, and represents
+        // explicit expiration timestamps only from 100 onwards.
+        return Err(EventError::restricted(
+            "expiration is outside the supported storage range",
+        ));
+    }
     let (packed, expiration) = pack_event(orig, limits)?;
     if packed.view().kind() == DELETION_KIND {
         require_canonical_addresses(orig)?;

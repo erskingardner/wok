@@ -44,6 +44,8 @@ indexes and author counts while retaining the original database as a backup.
 It copies the records events don't derive unchanged: negentropy filters,
 compression dictionaries, NIP-62 vanish markers and NIP-86 moderation records.
 It preserves the stored sequence even when the newest events have been deleted.
+Pending NIP-59 recipient-deletion cutoffs also survive reindex, so affected
+wraps stay hidden while bounded cleanup restarts against the rebuilt indexes.
 A malformed or regressed sequence is metadata corruption and blocks reindex:
 surviving records cannot establish the lost deletion history. Use a trusted
 backup for recovery. See [storage integrity and upgrade](lmdb-v3.md#integrity)

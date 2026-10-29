@@ -9,6 +9,7 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
 pub mod comparators;
+mod deletion_protection;
 pub mod env;
 pub mod error;
 pub mod fbs;
@@ -28,6 +29,7 @@ pub mod txn;
 pub mod vanish;
 pub mod write;
 
+pub use deletion_protection::is_deletion_protected_json;
 pub use env::{lmdb_version, Env, EnvOptions, EnvironmentStats};
 pub use error::DbError;
 pub use fbs::{
@@ -85,9 +87,10 @@ pub use tag_kind::{
 };
 pub use txn::{RoTxn, RwTxn};
 pub use vanish::{
-    backfill_vanish_markers, gift_wrap_vanished, is_event_vanished_ro, is_event_vanished_rw,
-    mark_vanished, normalize_relay_url, sweep_vanished_events, vanish_timestamp_ro,
-    vanish_timestamp_rw, VanishPolicy, VanishSweepCursor, VanishSweepStep, ALL_RELAYS, VANISH_KIND,
+    backfill_vanish_markers, gift_wrap_vanished, has_deletion_markers_ro, is_event_vanished_ro,
+    is_event_vanished_ro_with_json, is_event_vanished_rw, mark_vanished, normalize_relay_url,
+    sweep_vanished_events, vanish_timestamp_ro, vanish_timestamp_rw, VanishPolicy,
+    VanishSweepCursor, VanishSweepStep, ALL_RELAYS, VANISH_KIND,
 };
 pub use write::{
     delete_event_basic, delete_events, lookup_event_by_id, most_recent_levid, write_events,

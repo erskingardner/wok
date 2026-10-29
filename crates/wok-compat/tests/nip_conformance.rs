@@ -7,7 +7,7 @@ use wok_compat::{sign_event, sign_event_with_key};
 use wok_event::{parse_and_verify_event, EventLimits};
 use wok_query::NostrFilterGroup;
 use wok_relay::{
-    ClientCommand, ConnectionGuard, Outbound, OutboundFrame, RelayHandle, RelayMessage,
+    ClientCommand, ConnectionGuard, NipId, Outbound, OutboundFrame, RelayHandle, RelayMessage,
     TransportSource,
 };
 
@@ -585,6 +585,317 @@ async fn nip09_deleting_a_deletion_request_has_no_effect() {
     assert_eq!(stored, ids(&[&d1, &d2]));
 }
 
+/// NIP-D9 (nips#2531), pinned separately from the main NIPs revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nipd9_validates_metadata_and_reports_required_prefixes() {
+    let relay = Relay::new(|cfg| cfg.relay.abuse.enabled = false);
+    let mut conn = relay.connect().await;
+    let mut cases = vec![
+        (1, json!([["no_delete", "1"]]), "invalid:"),
+        (1, json!([["no_delete"], ["no_delete"]]), "invalid:"),
+        (1, json!([["no_delete"], ["expiration"]]), "invalid:"),
+        (
+            1,
+            json!([
+                ["no_delete"],
+                ["expiration", "18446744073709551615", "extra"]
+            ]),
+            "invalid:",
+        ),
+        (
+            1,
+            json!([
+                ["no_delete"],
+                ["expiration", "18446744073709551615"],
+                ["expiration", "18446744073709551615"]
+            ]),
+            "invalid:",
+        ),
+    ];
+    for value in [
+        "",
+        "-1",
+        "+100",
+        "01",
+        "00",
+        " 100",
+        "100 ",
+        "1.0",
+        "1e3",
+        "١٠٠",
+        "18446744073709551616",
+    ] {
+        cases.push((1, json!([["no_delete"], ["expiration", value]]), "invalid:"));
+    }
+    // Wok's existing storage format represents explicit expiration at 100
+    // or above. Valid smaller timestamps receive a policy rejection.
+    for expiration in ["0", "1", "99"] {
+        cases.push((
+            1,
+            json!([["no_delete"], ["expiration", expiration]]),
+            "restricted:",
+        ));
+    }
+    for kind in [
+        0, 3, 10000, 10002, 19999, 20000, 21059, 29999, 30000, 30023, 39999,
+    ] {
+        cases.push((kind, json!([["no_delete"]]), "restricted:"));
+    }
+    for (kind, tags, prefix) in cases {
+        let event =
+            sign_event(json!({"created_at": now(), "kind": kind, "tags": tags, "content": ""}));
+        let reply = conn.publish(&event).await;
+        assert_eq!(reply[2], false, "{event}: {reply}");
+        assert!(
+            reply[3].as_str().unwrap().starts_with(prefix),
+            "{event}: {reply}"
+        );
+    }
+    for (kind, tags) in [
+        (
+            1,
+            json!([["no_delete"], ["expiration", "18446744073709551615"]]),
+        ),
+        (41, json!([["no_delete"]])),
+        (9999, json!([["no_delete"]])),
+        (40000, json!([["no_delete"]])),
+        (65535, json!([["no_delete"]])),
+        // Case-sensitive, so neither spelling opts in or restricts kinds.
+        (10002, json!([["No_Delete", "1"], ["NO_DELETE"]])),
+    ] {
+        let event =
+            sign_event(json!({"created_at": now(), "kind": kind, "tags": tags, "content": ""}));
+        assert_eq!(conn.publish(&event).await[2], true, "{event}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nipd9_survives_requests_in_both_orders_on_every_read_path() {
+    for request_kind in [5, 62] {
+        for request_first in [false, true] {
+            let relay = Relay::new(|cfg| cfg.relay.abuse.enabled = false);
+            let mut conn = relay.connect().await;
+            let author = key();
+            let signed = |tags: Value, content: &str| {
+                sign_event_with_key(
+                    json!({
+                        "created_at": now() - 10, "kind": 445, "tags": tags, "content": content,
+                    }),
+                    &author,
+                )
+            };
+            let marked = signed(json!([["no_delete"]]), "marked");
+            let plain = signed(json!([]), "plain");
+            let tags = if request_kind == 5 {
+                json!([["e", marked["id"]], ["e", plain["id"]]])
+            } else {
+                json!([["relay", "ALL_RELAYS"]])
+            };
+            let request = sign_event_with_key(
+                json!({
+                    "created_at": now(), "kind": request_kind, "tags": tags, "content": "",
+                }),
+                &author,
+            );
+            if request_first {
+                assert_eq!(conn.publish(&request).await[2], true);
+            }
+            assert_eq!(conn.publish(&marked).await[2], true);
+            let plain_reply = conn.publish(&plain).await;
+            assert_eq!(plain_reply[2], !request_first, "{plain_reply}");
+            if !request_first {
+                assert_eq!(conn.publish(&request).await[2], true);
+            }
+            assert_eq!(
+                conn.history(json!({"kinds": [445]})).await,
+                vec![marked.clone()]
+            );
+            conn.send(json!(["COUNT", "protected-count", {"kinds": [445]}]))
+                .await;
+            assert_eq!(
+                conn.recv().await,
+                json!(["COUNT", "protected-count", {"count": 1}])
+            );
+
+            let mut store = wok_negentropy::Vector::new();
+            store.seal().unwrap();
+            let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+            let init = client.initiate().unwrap();
+            conn.send(json!(["NEG-OPEN", "protected-neg", {"kinds": [445]}, hex::encode(init)]))
+                .await;
+            let reply = conn.recv().await;
+            assert_eq!(reply[0], "NEG-MSG", "{reply}");
+            let (mut have, mut need) = (Vec::new(), Vec::new());
+            client
+                .reconcile_with_ids(
+                    &hex::decode(reply[2].as_str().unwrap()).unwrap(),
+                    &mut have,
+                    &mut need,
+                )
+                .unwrap();
+            assert!(have.is_empty());
+            assert_eq!(need.len(), 1);
+            assert_eq!(hex::encode(&need[0]), marked["id"].as_str().unwrap());
+            conn.send(json!(["NEG-CLOSE", "protected-neg"])).await;
+
+            // Anonymous publication and live delivery still work for an old
+            // marked event after its author has requested a purge.
+            conn.subscribe("protected-live", json!({"kinds": [445], "limit": 0}))
+                .await;
+            let mut publisher = relay.connect().await;
+            let live = signed(json!([["no_delete"]]), "later backfill");
+            assert_eq!(publisher.publish(&live).await[2], true);
+            assert_eq!(conn.recv().await, json!(["EVENT", "protected-live", live]));
+            assert_eq!(publisher.publish(&marked).await[2], true);
+
+            // A claimed marker never bypasses signature verification.
+            let mut forged = signed(json!([["no_delete"]]), "forged");
+            forged["sig"] = json!("00".repeat(64));
+            let reply = publisher.publish(&forged).await;
+            assert_eq!(reply[2], false);
+            assert!(reply[3].as_str().unwrap().starts_with("invalid:"));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip59_recipient_sweeps_hide_marked_wraps_on_every_read_path() {
+    for indexed in [false, true] {
+        for same_signer in [false, true] {
+            let relay = Relay::new(|cfg| {
+                cfg.relay.auth.service_url = AUTH_RELAY.into();
+                cfg.relay.abuse.enabled = false;
+                cfg.relay.tag_kind_index_enabled = indexed;
+                cfg.relay.nip62.enabled = same_signer;
+                cfg.relay.nip62.deletion_batch_size = 1;
+                if same_signer {
+                    // Exercise globally visible physical trees as well as
+                    // the default recipient-scoped synchronization view.
+                    cfg.relay.auth.recipient_only_kinds.clear();
+                }
+            });
+            let recipient = key();
+            let sender = if same_signer { recipient } else { key() };
+            let mut publisher = relay.connect().await;
+            assert_eq!(publisher.recv().await[0], "AUTH");
+            let mut inbox = relay.connect().await;
+            inbox.auth(&recipient).await;
+            let wrap = |content| {
+                sign_event_with_key(
+                    json!({
+                        "created_at": now() - 10, "kind": 1059,
+                        "tags": [["p", pubkey_hex(&recipient)], ["no_delete"]], "content": content,
+                    }),
+                    &sender,
+                )
+            };
+            let gift = wrap("before recipient request");
+            assert_eq!(publisher.publish(&gift).await[2], true);
+            let filter = json!({"kinds": [1059], "#p": [pubkey_hex(&recipient)]});
+            assert_eq!(inbox.history(filter.clone()).await, vec![gift]);
+            let request = sign_event_with_key(
+                json!({
+                    "created_at": now(), "kind": 5, "tags": [], "content": "clear existing inbox",
+                }),
+                &recipient,
+            );
+            assert_eq!(publisher.publish(&request).await[2], true);
+            assert!(inbox.history(filter.clone()).await.is_empty());
+            inbox.send(json!(["COUNT", "cleared-inbox", filter])).await;
+            let count = inbox.recv().await;
+            assert_eq!(count[0], "COUNT", "{count}");
+            assert_eq!(count[1], "cleared-inbox", "{count}");
+            assert_eq!(count[2]["count"], 0, "{count}");
+
+            let mut store = wok_negentropy::Vector::new();
+            store.seal().unwrap();
+            let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+            inbox
+                .send(json!([
+                    "NEG-OPEN",
+                    "cleared-inbox",
+                    filter,
+                    hex::encode(client.initiate().unwrap())
+                ]))
+                .await;
+            let reply = inbox.recv().await;
+            assert_eq!(reply[0], "NEG-MSG", "{reply}");
+            let (mut have, mut need) = (Vec::new(), Vec::new());
+            client
+                .reconcile_with_ids(
+                    &hex::decode(reply[2].as_str().unwrap()).unwrap(),
+                    &mut have,
+                    &mut need,
+                )
+                .unwrap();
+            assert!(have.is_empty() && need.is_empty());
+            inbox.send(json!(["NEG-CLOSE", "cleared-inbox"])).await;
+
+            // Backdated wraps published after the request remain eligible.
+            let later = wrap("after recipient request");
+            assert_eq!(publisher.publish(&later).await[2], true);
+            assert_eq!(inbox.history(filter).await, vec![later]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nipd9_preserves_expiration_and_nip70_authentication() {
+    let relay = auth_relay();
+    let mut conn = relay.connect().await;
+    let challenge = conn.recv().await;
+    assert_eq!(challenge[0], "AUTH");
+    let author = key();
+    let expiry = now() + 3600;
+    let signed = |tags: Value| {
+        sign_event_with_key(
+            json!({
+                "created_at": now(), "kind": 445, "tags": tags, "content": "same content",
+            }),
+            &author,
+        )
+    };
+    let event = signed(json!([["no_delete"], ["expiration", expiry.to_string()]]));
+    assert_eq!(conn.publish(&event).await[2], true);
+    let request = sign_event_with_key(
+        json!({
+            "created_at": now(), "kind": 5, "tags": [["e", event["id"]]], "content": "",
+        }),
+        &author,
+    );
+    assert_eq!(conn.publish(&request).await[2], true);
+    assert_eq!(
+        conn.history(json!({"ids": [event["id"]]})).await,
+        vec![event.clone()]
+    );
+    let other = signed(json!([
+        ["no_delete"],
+        ["expiration", (expiry + 1).to_string()]
+    ]));
+    assert_ne!(event["id"], other["id"]);
+    assert_eq!(conn.publish(&other).await[2], true);
+
+    let policy = wok_event::TimestampPolicy {
+        now_secs: expiry,
+        reject_newer_than_secs: 900,
+        reject_older_than_secs: 0,
+        reject_ephemeral_older_than_secs: 60,
+    };
+    let error = parse_and_verify_event(&event, &EventLimits::default(), Some(&policy), true, true)
+        .unwrap_err();
+    assert!(error.to_string().contains("expired"));
+    assert!(
+        parse_and_verify_event(&other, &EventLimits::default(), Some(&policy), true, true).is_ok()
+    );
+
+    let protected = signed(json!([["no_delete"], ["-"]]));
+    let reply = conn.publish(&protected).await;
+    assert_eq!(reply[2], false);
+    assert!(reply[3].as_str().unwrap().starts_with("auth-required:"));
+    assert_eq!(conn.answer(&author, &challenge, now()).await[2], true);
+    assert_eq!(conn.publish(&protected).await[2], true);
+}
+
 #[test]
 fn nip40_expiration_too_small_rejected() {
     let ev = json!({
@@ -1007,10 +1318,22 @@ fn nip50_search_filter_and_extensions() {
 fn nip11_software_not_strfry_when_unconfigured() {
     let cfg = wok_relay::Config::default();
     let nips = wok_relay::supported_nips(&cfg);
-    assert_eq!(nips, vec![1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91]);
-    assert!(!nips.contains(&2), "client-side NIP-02 is not advertised");
-    assert!(!nips.contains(&4), "client-side NIP-04 is not advertised");
-    assert!(!nips.contains(&28), "client-side NIP-28 is not advertised");
+    assert_eq!(
+        serde_json::to_value(&nips).unwrap(),
+        json!([1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91, "D9"])
+    );
+    assert!(
+        !nips.contains(&NipId::Number(2)),
+        "client-side NIP-02 is not advertised"
+    );
+    assert!(
+        !nips.contains(&NipId::Number(4)),
+        "client-side NIP-04 is not advertised"
+    );
+    assert!(
+        !nips.contains(&NipId::Number(28)),
+        "client-side NIP-28 is not advertised"
+    );
 }
 
 #[test]
@@ -1134,7 +1457,7 @@ async fn nip59_ephemeral_gift_wraps_reach_only_their_recipient() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip78_app_data_is_served_to_and_accepted_from_its_author_only() {
     let relay = auth_relay();
-    assert!(wok_relay::supported_nips(&relay.handle.config.read()).contains(&78));
+    assert!(wok_relay::supported_nips(&relay.handle.config.read()).contains(&NipId::Number(78)));
     let (owner, stranger_key) = (key(), key());
     for kind in wok_event::APP_DATA_KINDS {
         let settings = |content: &str| {
@@ -1478,9 +1801,9 @@ async fn nip62_a_full_relay_that_requires_proof_of_work_still_honors_vanish() {
 #[test]
 fn nip62_is_enabled_by_default_and_can_be_disabled() {
     let mut cfg = wok_relay::Config::default();
-    assert!(wok_relay::supported_nips(&cfg).contains(&62));
+    assert!(wok_relay::supported_nips(&cfg).contains(&NipId::Number(62)));
     cfg.relay.nip62.enabled = false;
-    assert!(!wok_relay::supported_nips(&cfg).contains(&62));
+    assert!(!wok_relay::supported_nips(&cfg).contains(&NipId::Number(62)));
 }
 
 #[test]
@@ -1517,13 +1840,29 @@ fn nip91_and_tags_take_precedence_over_compatibility_or_tags() {
 #[test]
 fn advertised_nips_are_subset_of_tested() {
     // NIP-86 coverage lives in e2e_transports.rs (management API e2e tests).
-    let tested = [
-        1u64, 9, 11, 13, 40, 42, 45, 50, 59, 62, 67, 70, 77, 78, 86, 91,
+    let tested: [NipId; 17] = [
+        1.into(),
+        9.into(),
+        11.into(),
+        13.into(),
+        40.into(),
+        42.into(),
+        45.into(),
+        50.into(),
+        59.into(),
+        62.into(),
+        67.into(),
+        70.into(),
+        77.into(),
+        78.into(),
+        86.into(),
+        91.into(),
+        "D9".into(),
     ];
     assert_eq!(
         wok_relay::RELAY_CAPABILITY_CATALOG
             .iter()
-            .map(|capability| capability.nip)
+            .map(|capability| capability.nip.clone())
             .collect::<Vec<_>>(),
         tested
     );

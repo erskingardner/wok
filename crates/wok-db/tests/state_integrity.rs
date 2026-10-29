@@ -59,6 +59,10 @@ fn detects_regressed_sequence_and_malformed_state() {
         (b"a", 0u64.to_le_bytes().to_vec(), "malformed-key"),
         (b"V", vec![0; 33], "malformed-key"),
         (&[b'V'; 33], vec![0; 32], "malformed-value"),
+        (b"R", vec![0; 8], "malformed-key"),
+        (&[b'R'; 33], vec![0; 7], "malformed-value"),
+        (b"D", vec![0; 33], "malformed-key"),
+        (&[b'D'; 33], vec![0; 33], "malformed-value"),
         (
             &[b'V'; 33],
             [vec![0; 16], vec![3], vec![0; 16]].concat(),

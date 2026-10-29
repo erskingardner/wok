@@ -4411,7 +4411,7 @@ negentropy_enabled = true
         // MDK never sends COUNT or offers permessage-deflate (#166).
         assert_eq!(marmot.relay.max_filter_limit_count, 0);
         assert!(!marmot.relay.compression_enabled);
-        assert!(!crate::supported_nips(&marmot).contains(&45));
+        assert!(!crate::supported_nips(&marmot).contains(&crate::NipId::Number(45)));
         // NIP-77 sized to MDK's syncs (#166).
         assert_eq!(marmot.relay.max_sync_events, 65_536);
         assert_eq!(marmot.relay.sync_memory_per_connection, 128 * 1024 * 1024);

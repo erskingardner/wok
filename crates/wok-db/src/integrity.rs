@@ -468,7 +468,9 @@ fn check_state(
                     report.issue("malformed-value", "author_counts", error.to_string());
                 }
             }
-        } else if key.first() == Some(&crate::state::VANISH_SWEEP) {
+        } else if key.first() == Some(&crate::state::VANISH_SWEEP)
+            || key.first() == Some(&crate::state::RECIPIENT_SWEEP)
+        {
             if key.len() != 33 {
                 report.metadata_errors += 1;
                 report.issue(
@@ -476,13 +478,23 @@ fn check_state(
                     "state",
                     format!("vanish sweep key has {} bytes, expected 33", key.len()),
                 );
-            } else if let Err(error) = crate::vanish::SweepProgress::decode(raw) {
+            } else if let Err(error) = crate::vanish::SweepProgress::decode_for(
+                raw, key.first() == Some(&crate::state::RECIPIENT_SWEEP),
+            ) {
                 report.metadata_errors += 1;
                 report.issue(
                     "malformed-value",
                     "state",
                     format!("vanish sweep {}: {error}", wok_event::to_hex(&key[1..])),
                 );
+            }
+        } else if key.first() == Some(&crate::state::RECIPIENT_DELETE) {
+            if key.len() != 33 {
+                report.metadata_errors += 1;
+                report.issue("malformed-key", "state", "invalid recipient deletion key".into());
+            } else if crate::state::decode(raw).is_err() {
+                report.metadata_errors += 1;
+                report.issue("malformed-value", "state", "invalid recipient deletion marker".into());
             }
         } else if key == crate::state::HIGH_WATER
             || key == crate::state::POLICY_GENERATION

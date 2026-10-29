@@ -1,4 +1,4 @@
-//! NIP-D9 (nips#2531 at 56fd367): stored, imported, and republished copies.
+//! NIP-D9 (nips#2531 at 807264f): stored, imported, and republished copies.
 
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
@@ -205,12 +205,16 @@ fn gift_wrap_recipient_authority_overrides_marker_even_when_recipient_is_signer(
             };
             let mut request = signed(&recipient, kind, 200, tags);
             write(&env, &mut request);
-            if kind == 62 {
+            if kind == 62 || !explicit_id {
                 assert!(is_event_vanished_ro(
                     &env.begin_ro().unwrap(),
                     PackedEventView::new(&gift.packed).unwrap()
                 )
                 .unwrap());
+                assert!(
+                    stored(&env, &gift).is_some(),
+                    "cleanup is deferred to bounded maintenance"
+                );
                 sweep(&env);
             }
             assert!(stored(&env, &gift).is_none());
@@ -298,4 +302,242 @@ fn compressed_historical_payloads_keep_protection_without_repacking() {
         event.packed
     );
     assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
+}
+
+#[test]
+fn recipient_cleanup_is_bounded_resumes_after_restart_and_preserves_later_arrivals() {
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let recipient = key();
+        let sender = key();
+        let recipient_hex = hex::encode(recipient.x_only_public_key().0.serialize());
+        let mut mentions = Vec::new();
+        let mut gifts = Vec::new();
+        for n in 0..20 {
+            mentions.push(signed(&sender, 1, n, json!([["p", recipient_hex]])));
+        }
+        for kind in [1059, 21059] {
+            for at in [0, 100, u64::MAX] {
+                let mut tags = json!([["p", recipient_hex]]);
+                if kind == 1059 {
+                    tags.as_array_mut().unwrap().push(json!(["no_delete"]));
+                }
+                gifts.push(signed(&sender, kind, at, tags));
+            }
+        }
+        for event in mentions.iter_mut().chain(gifts.iter_mut()) {
+            let mut txn = env.begin_rw().unwrap();
+            if !indexed {
+                wok_db::skip_tag_kind_postings(&mut txn);
+            }
+            wok_db::write_events(
+                &mut txn,
+                &mut NoopNegentropy,
+                std::slice::from_mut(event),
+                false,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        let mut request = signed(&recipient, 5, 200, json!([]));
+        let before = wok_db::state::policy_generation(&env.begin_ro().unwrap()).unwrap();
+        write(&env, &mut request);
+        assert!(wok_db::state::policy_generation(&env.begin_ro().unwrap()).unwrap() > before);
+        for gift in &gifts {
+            assert!(
+                stored(&env, gift).is_some(),
+                "publication only records a cutoff"
+            );
+            assert!(is_event_vanished_ro(
+                &env.begin_ro().unwrap(),
+                PackedEventView::new(&gift.packed).unwrap()
+            )
+            .unwrap());
+        }
+        let mut later = signed(
+            &sender,
+            1059,
+            0,
+            json!([["p", recipient_hex], ["x", "later"]]),
+        );
+        write(&env, &mut later);
+        assert_eq!(later.status, EventWriteStatus::Written);
+        assert!(!is_event_vanished_ro(
+            &env.begin_ro().unwrap(),
+            PackedEventView::new(&later.packed).unwrap()
+        )
+        .unwrap());
+
+        // An aborted maintenance transaction cannot advance persisted progress
+        // or remove records. The caller discards its speculative cursor too.
+        {
+            let mut txn = env.begin_rw().unwrap();
+            let step =
+                sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut Default::default())
+                    .unwrap();
+            assert!(step.examined <= 1 && step.deleted <= 1 && step.markers <= 1);
+        }
+        assert!(gifts.iter().all(|gift| stored(&env, gift).is_some()));
+        let mut cursor = Default::default();
+        let mut txn = env.begin_rw().unwrap();
+        let first = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut cursor).unwrap();
+        txn.commit().unwrap();
+        let mut examined = first.examined;
+        let mut deleted = first.deleted;
+        drop(env);
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        let mut cursor = Default::default();
+        let mut done = false;
+        for _ in 0..100 {
+            let mut txn = env.begin_rw().unwrap();
+            let step =
+                sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut cursor).unwrap();
+            assert!(step.examined <= 1 && step.deleted <= 1 && step.markers <= 1);
+            examined += step.examined;
+            deleted += step.deleted;
+            txn.commit().unwrap();
+            if step.markers == 0 {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(deleted, gifts.len() as u64);
+        assert_eq!(
+            examined,
+            gifts.len() + 1 + if indexed { 0 } else { mentions.len() }
+        );
+        assert!(gifts.iter().all(|gift| stored(&env, gift).is_none()));
+        for mention in &mentions {
+            assert!(stored(&env, mention).is_some());
+            assert!(!is_event_vanished_ro(
+                &env.begin_ro().unwrap(),
+                PackedEventView::new(&mention.packed).unwrap()
+            )
+            .unwrap());
+        }
+        assert!(stored(&env, &later).is_some());
+        assert!(
+            !wok_db::has_deletion_markers_ro(&env.begin_ro().unwrap()).unwrap(),
+            "completed recipient work releases its read-time marker"
+        );
+
+        // A raised cutoff wakes an idle cursor. Only arrivals before this
+        // second request join the next pass, including backdated wraps.
+        let mut second = signed(&recipient, 5, 201, json!([]));
+        write(&env, &mut second);
+        let mut newest = signed(
+            &sender,
+            1059,
+            0,
+            json!([["p", recipient_hex], ["x", "newest"]]),
+        );
+        write(&env, &mut newest);
+        let mut txn = env.begin_rw().unwrap();
+        let step = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut cursor).unwrap();
+        assert_eq!(step.markers, 1);
+        txn.commit().unwrap();
+        sweep(&env);
+        assert!(stored(&env, &later).is_none());
+        assert!(stored(&env, &newest).is_some());
+        assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
+    }
+}
+
+#[test]
+fn recipient_sweep_handles_a_raised_cutoff_and_index_reset_mid_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let recipient = key();
+    let sender = key();
+    let recipient_hex = hex::encode(recipient.x_only_public_key().0.serialize());
+    let mut gifts = Vec::new();
+    for at in 0..4 {
+        let mut gift = signed(
+            &sender,
+            1059,
+            at,
+            json!([["p", recipient_hex], ["no_delete"]]),
+        );
+        write(&env, &mut gift);
+        gifts.push(gift);
+    }
+    write(&env, &mut signed(&recipient, 5, 100, json!([])));
+    let mut txn = env.begin_rw().unwrap();
+    let step =
+        sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut Default::default()).unwrap();
+    assert_eq!(step.deleted, 1);
+    txn.commit().unwrap();
+    let mut later = signed(
+        &sender,
+        1059,
+        1,
+        json!([["p", recipient_hex], ["x", "later"]]),
+    );
+    write(&env, &mut later);
+    write(&env, &mut signed(&recipient, 5, 101, json!([])));
+    let mut txn = env.begin_rw().unwrap();
+    wok_db::reset_tag_kind_index(&mut txn).unwrap();
+    txn.commit().unwrap();
+    sweep(&env);
+    assert!(gifts.iter().all(|gift| stored(&env, gift).is_none()));
+    assert!(stored(&env, &later).is_none());
+    assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
+}
+
+#[test]
+fn verification_cache_respects_payload_changes_and_old_read_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let author = key();
+    let mut event = signed(&author, 1, 100, json!([["no_delete"]]));
+    write(&env, &mut event);
+    let lev = stored(&env, &event).unwrap();
+    write(
+        &env,
+        &mut signed(&author, 62, 200, json!([["relay", "ALL_RELAYS"]])),
+    );
+    let packed = PackedEventView::new(&event.packed).unwrap();
+    let old = env.begin_ro().unwrap();
+    assert!(!is_event_vanished_ro(&old, packed).unwrap());
+    // LMDB permits one read transaction per OS thread. Query newer snapshots
+    // on another thread while this reader retains its original snapshot.
+    let fresh = || {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| is_event_vanished_ro(&env.begin_ro().unwrap(), packed).unwrap())
+                .join()
+                .unwrap()
+        })
+    };
+    let change_payload = |json: &str| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut txn = env.begin_rw().unwrap();
+                    txn.put_u64(
+                        env.dbis().event_payload,
+                        lev,
+                        &wok_db::encode_raw_payload(json),
+                        0,
+                    )
+                    .unwrap();
+                    txn.commit().unwrap();
+                })
+                .join()
+                .unwrap();
+        })
+    };
+    let mut invalid = wok_event::json::parse_strict(&event.json).unwrap();
+    invalid["sig"] = json!("00".repeat(64));
+    let json = wok_event::normalize_event_json(&invalid).unwrap();
+    change_payload(&json);
+    assert!(fresh());
+    assert!(!is_event_vanished_ro(&old, packed).unwrap());
+    change_payload(&event.json);
+    assert!(!fresh());
 }

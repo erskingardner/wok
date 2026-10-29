@@ -10,7 +10,10 @@ pub fn physical_tree_is_globally_visible(
     filter: &NostrFilter,
 ) -> Result<bool, wok_db::DbError> {
     let db = txn.env().dbis();
-    for dbi in [db.moderation, db.vanish_pubkey].into_iter().flatten() {
+    if wok_db::has_deletion_markers_ro(txn)? {
+        return Ok(false);
+    }
+    if let Some(dbi) = db.moderation {
         if txn.entries(dbi)? != 0 {
             return Ok(false);
         }
@@ -249,8 +252,8 @@ impl ReadRestrictor {
 pub struct ReadSnapshot<'t> {
     txn: &'t wok_db::RoTxn<'t>,
     now: u64,
-    /// The NIP-62 vanish table may hold a marker.
-    vanish: bool,
+    /// An author-vanish or kind-5 recipient marker may hide an event.
+    deletions: bool,
     moderation: wok_db::ModerationView<'t>,
     /// A replaceable or addressable event checked may lose replacement.
     superseded: bool,
@@ -259,16 +262,13 @@ pub struct ReadSnapshot<'t> {
 impl<'t> ReadSnapshot<'t> {
     /// For any event, stored in `txn` or not.
     pub fn new(txn: &'t wok_db::RoTxn<'t>) -> Self {
-        let dbis = txn.env().dbis();
         Self {
             txn,
             now: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            vanish: dbis
-                .vanish_pubkey
-                .is_some_and(|dbi| txn.entries(dbi).map_or(true, |entries| entries != 0)),
+            deletions: wok_db::has_deletion_markers_ro(txn).unwrap_or(true),
             moderation: wok_db::ModerationView::new(txn),
             superseded: true,
         }
@@ -374,7 +374,7 @@ impl ReadVisibility {
         }
         let txn = snapshot.txn;
         Ok(
-            !(snapshot.vanish && wok_db::is_event_vanished_ro(txn, event)?)
+            !(snapshot.deletions && wok_db::is_event_vanished_ro(txn, event)?)
                 && !snapshot.moderation.hides(event)?
                 && !(snapshot.superseded && wok_db::is_event_superseded_ro(txn, event)?),
         )

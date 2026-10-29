@@ -173,6 +173,18 @@ pub fn tag_kind_index_complete_ro(txn: &RoTxn<'_>) -> Result<bool, DbError> {
     Ok(tag_kind_index_state_ro(txn)?.is_some_and(|state| state.complete()))
 }
 
+/// Whether a maintenance pass may rely on every posting through its fixed
+/// local-ID cutoff, even if later publications leave the index incomplete.
+pub(crate) fn tag_kind_index_covers_rw(txn: &RwTxn<'_>, cutoff: u64) -> Result<bool, DbError> {
+    let Some(dbi) = txn.env().dbis().event_tag_kind else {
+        return Ok(false);
+    };
+    Ok(
+        marker(txn.get(dbi, SCHEMA_KEY)?) == Some(TAG_KIND_SCHEMA_VERSION)
+            && marker(txn.get(dbi, INDEXED_THROUGH_KEY)?).is_some_and(|through| through >= cutoff),
+    )
+}
+
 /// The greatest local id ever allocated. The stored sequence covers deleted
 /// tails, and the newest record covers a database whose sequence was never
 /// stored. A malformed sequence is integrity's to report; the newest record

@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"D9"` in `supported_nips`; the landing page labels it NIP-D9 and
   links to the draft.
 - NIP-59 kind-5 recipient deletion sweeps stored p-tagged gift wraps even
-  without explicit target IDs, including wraps carrying `no_delete`.
+  without explicit target IDs, including wraps carrying `no_delete`. A
+  persisted cutoff hides them immediately while bounded maintenance batches
+  perform the cleanup and resume after a restart.
 - NIP-11 capability handling supports numeric and named identifiers together.
   Outbound sync/router discovery accepts mixed integer/string arrays while
   keeping names literal, so a string such as `"5A"` cannot alias numeric NIP-90.

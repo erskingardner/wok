@@ -87,7 +87,7 @@ pub use tag_kind::{
 };
 pub use txn::{RoTxn, RwTxn};
 pub use vanish::{
-    backfill_vanish_markers, gift_wrap_vanished, is_event_vanished_ro,
+    backfill_vanish_markers, gift_wrap_vanished, has_deletion_markers_ro, is_event_vanished_ro,
     is_event_vanished_ro_with_json, is_event_vanished_rw, mark_vanished, normalize_relay_url,
     sweep_vanished_events, vanish_timestamp_ro, vanish_timestamp_rw, VanishPolicy,
     VanishSweepCursor, VanishSweepStep, ALL_RELAYS, VANISH_KIND,

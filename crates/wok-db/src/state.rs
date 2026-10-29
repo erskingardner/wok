@@ -18,8 +18,11 @@ pub const POLICY_GENERATION: &[u8] = b"visibility";
 /// Key prefix of a vanish marker's sweep progress, followed by its pubkey
 /// (`vanish::SweepProgress`).
 pub(crate) const VANISH_SWEEP: u8 = b'V';
-/// How many times a vanish marker was added or raised, which is when the
-/// sweep gets more work.
+/// Recipient kind-5 cutoff (local sequence) and its resumable sweep progress.
+pub(crate) const RECIPIENT_DELETE: u8 = b'R';
+pub(crate) const RECIPIENT_SWEEP: u8 = b'D';
+/// How many times an author-vanish or recipient-deletion marker was added or
+/// raised, which is when maintenance gets more work.
 pub(crate) const VANISH_MARKER_CHANGES: &[u8] = b"vanish-markers";
 
 pub(crate) fn decode(raw: &[u8]) -> Result<u64, DbError> {

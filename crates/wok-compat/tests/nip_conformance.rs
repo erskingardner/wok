@@ -759,6 +759,87 @@ async fn nipd9_survives_requests_in_both_orders_on_every_read_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip59_recipient_sweeps_hide_marked_wraps_on_every_read_path() {
+    for indexed in [false, true] {
+        for same_signer in [false, true] {
+            let relay = Relay::new(|cfg| {
+                cfg.relay.auth.service_url = AUTH_RELAY.into();
+                cfg.relay.abuse.enabled = false;
+                cfg.relay.tag_kind_index_enabled = indexed;
+                cfg.relay.nip62.enabled = same_signer;
+                cfg.relay.nip62.deletion_batch_size = 1;
+                if same_signer {
+                    // Exercise globally visible physical trees as well as
+                    // the default recipient-scoped synchronization view.
+                    cfg.relay.auth.recipient_only_kinds.clear();
+                }
+            });
+            let recipient = key();
+            let sender = if same_signer { recipient } else { key() };
+            let mut publisher = relay.connect().await;
+            assert_eq!(publisher.recv().await[0], "AUTH");
+            let mut inbox = relay.connect().await;
+            inbox.auth(&recipient).await;
+            let wrap = |content| {
+                sign_event_with_key(
+                    json!({
+                        "created_at": now() - 10, "kind": 1059,
+                        "tags": [["p", pubkey_hex(&recipient)], ["no_delete"]], "content": content,
+                    }),
+                    &sender,
+                )
+            };
+            let gift = wrap("before recipient request");
+            assert_eq!(publisher.publish(&gift).await[2], true);
+            let filter = json!({"kinds": [1059], "#p": [pubkey_hex(&recipient)]});
+            assert_eq!(inbox.history(filter.clone()).await, vec![gift]);
+            let request = sign_event_with_key(
+                json!({
+                    "created_at": now(), "kind": 5, "tags": [], "content": "clear existing inbox",
+                }),
+                &recipient,
+            );
+            assert_eq!(publisher.publish(&request).await[2], true);
+            assert!(inbox.history(filter.clone()).await.is_empty());
+            inbox.send(json!(["COUNT", "cleared-inbox", filter])).await;
+            let count = inbox.recv().await;
+            assert_eq!(count[0], "COUNT", "{count}");
+            assert_eq!(count[1], "cleared-inbox", "{count}");
+            assert_eq!(count[2]["count"], 0, "{count}");
+
+            let mut store = wok_negentropy::Vector::new();
+            store.seal().unwrap();
+            let mut client = wok_negentropy::Negentropy::new(store, 60_000).unwrap();
+            inbox
+                .send(json!([
+                    "NEG-OPEN",
+                    "cleared-inbox",
+                    filter,
+                    hex::encode(client.initiate().unwrap())
+                ]))
+                .await;
+            let reply = inbox.recv().await;
+            assert_eq!(reply[0], "NEG-MSG", "{reply}");
+            let (mut have, mut need) = (Vec::new(), Vec::new());
+            client
+                .reconcile_with_ids(
+                    &hex::decode(reply[2].as_str().unwrap()).unwrap(),
+                    &mut have,
+                    &mut need,
+                )
+                .unwrap();
+            assert!(have.is_empty() && need.is_empty());
+            inbox.send(json!(["NEG-CLOSE", "cleared-inbox"])).await;
+
+            // Backdated wraps published after the request remain eligible.
+            let later = wrap("after recipient request");
+            assert_eq!(publisher.publish(&later).await[2], true);
+            assert_eq!(inbox.history(filter).await, vec![later]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nipd9_preserves_expiration_and_nip70_authentication() {
     let relay = auth_relay();
     let mut conn = relay.connect().await;

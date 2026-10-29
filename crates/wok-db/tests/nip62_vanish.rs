@@ -141,6 +141,20 @@ fn vanish_is_immediate_persistent_bounded_and_cannot_be_undone() {
     write_one(&env, &policy, &mut delete_vanish);
     assert_eq!(delete_vanish.status, EventWriteStatus::Written);
     assert!(stored(&env, &vanish_id));
+    for id in [later_gift_id, new_gift_id] {
+        let txn = env.begin_ro().unwrap();
+        let (_, packed) = lookup_event_by_id_ro(&txn, &id).unwrap().unwrap();
+        assert!(is_event_vanished_ro(&txn, PackedEventView::new(&packed).unwrap()).unwrap());
+    }
+    for _ in 0..20 {
+        let mut txn = env.begin_rw().unwrap();
+        let step = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut cursor).unwrap();
+        assert!(step.examined <= 1 && step.deleted <= 1);
+        txn.commit().unwrap();
+        if !stored(&env, &later_gift_id) && !stored(&env, &new_gift_id) {
+            break;
+        }
+    }
     assert!(!stored(&env, &later_gift_id));
     assert!(!stored(&env, &new_gift_id));
 

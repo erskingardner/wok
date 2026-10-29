@@ -29,9 +29,9 @@ arbitrary list.
 
 Wok uses **NIP-D9** for **Deletion Request Protection**, following
 [nostr-protocol/nips#2531](https://github.com/nostr-protocol/nips/pull/2531),
-at revision `56fd3677949b9cae3fdaee403adc9e33a8de2921` (whose source still
-uses the temporary name XX). NIP-11 advertises the literal string **"D9"**
-in `supported_nips`, alongside integers for numeric NIPs. For example:
+at revision `807264f308bef304779e347704842738b6e16ba5`.
+NIP-11 advertises the literal string **"D9"** in `supported_nips`, alongside
+integers for numeric NIPs. For example:
 
 ```json
 {"supported_nips": [1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91, "D9"]}
@@ -63,14 +63,21 @@ signing key's kind-5 deletion and kind-62 author purge, including existing
 tombstones, events received after a request, imports, republication, live
 delivery, REQ, COUNT, and NIP-77. A marker on a request protects only that
 request's record, not its targets. Kinds 5 and 62 may themselves be marked.
-The marker is read from the signed payload, so existing stored records and
-migration bytes need no rewrite. Legacy tao-preimage IDs remain importable
-but do not acquire this extension's NIP-01 protection.
+The marker is read from the signed payload, with a bounded cache of verified
+results keyed by local ID and a fingerprint of both stored primary records.
+Existing stored records and migration bytes need no rewrite. Legacy
+tao-preimage IDs remain importable but do not acquire this extension's
+NIP-01 protection.
 
 Recipient gift-wrap deletion remains effective, even if the recipient and
 signer are the same key. A kind-5 recipient request sweeps stored p-tagged
-wraps without needing their IDs; kind-62 recipient suppression and cleanup
-keep their existing timestamp semantics. Wok does not implement NIP-26
+wraps without needing their IDs. Stored wraps are hidden immediately through
+a persisted local-sequence cutoff; physical cleanup shares the bounded,
+restartable maintenance sweep with NIP-62. Later arrivals are outside that
+cutoff unless explicitly tombstoned. The sweep uses the tag-kind index when
+it covers the cutoff, with a bounded tag-index fallback otherwise.
+Kind-62 recipient suppression and cleanup keep their existing timestamp
+semantics. Wok does not implement NIP-26
 delegation, so this extension adds no delegator authority. Original NIP-40
 expiration, NIP-70 `-` authentication, moderation, quotas, operator deletion,
 and retention still apply. Expiration does not revoke protection against

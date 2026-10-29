@@ -276,33 +276,17 @@ async fn the_marmot_preset_serves_mdk_traffic() {
     );
 }
 
-/// An inviter adding 250 members publishes a commit and 250 Welcomes from
-/// one address, which the public preset's EVENT burst of 100 cuts.
+/// An inviter's commit and 250 Welcomes fit one address's Marmot EVENT burst
+/// without needing refill. The public-versus-Marmot capacity comparison uses
+/// a fixed clock in wok-relay's abuse unit tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_marmot_preset_fits_an_add_member_burst_from_one_address() {
-    let public =
-        Config::parse_toml(&format!("[relay.auth]\nservice_url = \"{AUTH_RELAY}\"\n")).unwrap();
-    for (config, fits) in [(marmot_config(""), true), (public, false)] {
-        let relay = Relay::start(config);
-        let mut inviter = relay.client("198.51.100.7").await;
-        let commit = signed(&key(), 445, json!([["h", GROUP]]), "add commit");
-        assert_eq!(inviter.refusal(&commit).await, None);
-        let mut refused = Vec::new();
-        for _ in 0..250 {
-            if let Some(reason) = inviter.refusal(&gift_wrap(&key(), "welcome")).await {
-                refused.push(reason);
-            }
-        }
-        if fits {
-            assert!(refused.is_empty(), "{refused:?}");
-        } else {
-            assert!(
-                refused
-                    .iter()
-                    .all(|r| r == "rate-limited: EVENT budget exhausted"),
-                "{refused:?}"
-            );
-            assert!(!refused.is_empty());
-        }
+    let relay = Relay::start(marmot_config(""));
+    let mut inviter = relay.client("198.51.100.7").await;
+    let commit = signed(&key(), 445, json!([["h", GROUP]]), "add commit");
+    assert_eq!(inviter.refusal(&commit).await, None);
+    for _ in 0..250 {
+        let welcome = gift_wrap(&key(), "welcome");
+        assert_eq!(inviter.refusal(&welcome).await, None, "{welcome}");
     }
 }

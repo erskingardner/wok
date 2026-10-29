@@ -222,12 +222,43 @@ pub(crate) fn flush(txn: &mut RwTxn<'_>) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Rebuild derived counters lazily while retaining the source sequence across
-/// deleted tails. Caller has already cleared the target state table.
+/// Retain authoritative state: the sequence across deleted tails and pending
+/// recipient deletion cutoffs. Counters and sweep positions are derived again
+/// against the rebuilt indexes. Caller has cleared the target state table.
 pub(crate) fn reset_for_reindex(source: &RoTxn<'_>, target: &mut RwTxn<'_>) -> Result<(), DbError> {
     target.author_counts.clear();
     target.superseded_events = None;
     target.event_sequence = high_water_ro(source)?;
+    let Some(source_dbi) = source.env().dbis().state else {
+        return Ok(());
+    };
+    let target_dbi = target
+        .env()
+        .dbis()
+        .state
+        .ok_or_else(|| DbError::msg("missing Wok state table"))?;
+    let mut error = None;
+    source.foreach_full(source_dbi, &[RECIPIENT_DELETE], &[], false, |key, value| {
+        if key.first() != Some(&RECIPIENT_DELETE) {
+            return false;
+        }
+        let result = (|| {
+            if key.len() != 33 {
+                return Err(DbError::msg("invalid recipient deletion key"));
+            }
+            decode(value)?;
+            target.put(target_dbi, key, value, 0)?;
+            Ok::<_, DbError>(())
+        })();
+        if let Err(err) = result {
+            error = Some(err);
+            return false;
+        }
+        true
+    })?;
+    if let Some(error) = error {
+        return Err(error);
+    }
     Ok(())
 }
 

@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NIP-59 kind-5 recipient deletion sweeps stored p-tagged gift wraps even
   without explicit target IDs, including wraps carrying `no_delete`. A
   persisted cutoff hides them immediately while bounded maintenance batches
-  perform the cleanup and resume after a restart.
+  perform the cleanup and resume after a restart. Reindex preserves pending
+  cutoffs and restarts cleanup against the rebuilt indexes.
 - NIP-11 capability handling supports numeric and named identifiers together.
   Outbound sync/router discovery accepts mixed integer/string arrays while
   keeping names literal, so a string such as `"5A"` cannot alias numeric NIP-90.

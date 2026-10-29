@@ -354,6 +354,15 @@ each time a marker is added or raised: while it stays where it was when every
 pass had finished, the sweep has nothing to do. Earlier releases' integrity
 check reports these keys as unknown.
 
+Pending kind-5 recipient deletion uses `R` and the recipient pubkey for an
+authoritative local-ID cutoff. Its bounded sweep position is stored under
+`D` and that pubkey. Reindex copies the cutoffs unchanged, even if the request
+record has been removed, and restarts their sweep positions against the
+rebuilt indexes. Covered wraps remain hidden until cleanup removes them;
+later local IDs stay outside the cutoff. Completion removes both records.
+The `vanish-markers` counter also advances when a recipient cutoff is added
+or raised.
+
 The sequence never decreases after deleting the newest record. Reindex retains
 that high-water mark while rebuilding author counts lazily from authoritative
 indexes. An aborted transaction changes neither sequence nor counts. Older Wok

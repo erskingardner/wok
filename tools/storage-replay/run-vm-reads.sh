@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # #257 item 12, read follow-up: replay each recorded log on LMDB and on
 # RocksDB variants, then run the read suite on each settled database.
-# Databases are kept under <base> for profiling; remove them when done.
+# Each replay's database is kept under <base>, and the suite reopens it;
+# remove them when done.
 #
 #   run-vm-reads.sh <commit> <base dir> <log dir> [arm ...]
 #
@@ -41,13 +42,22 @@ if (($# == 0)); then
 fi
 for item in "$@"; do
   mix=${item%%:*} arm=${item#*:}
-  out=$base/$mix-$arm.json
-  [[ -s $out ]] && continue
   db=$base/db-$mix-$arm
-  rm -rf "$db"
-  # shellcheck disable=SC2086
-  /usr/bin/time -v "$replay" --log "$logs/$mix.ops.zst" ${arms[$arm]} \
-    --read-suite-secs 20 --dir "$db" --out "$out" > "$base/$mix-$arm.log" 2>&1
-  echo "$mix $arm exit $? footprint $(du -sb "$db" | cut -f1)" >> "$status"
+  out=$base/$mix-$arm.json
+  if [[ ! -s $out ]]; then
+    rm -rf "$db"
+    # shellcheck disable=SC2086
+    /usr/bin/time -v "$replay" --log "$logs/$mix.ops.zst" ${arms[$arm]} \
+      --dir "$db" --out "$out" > "$base/$mix-$arm.log" 2>&1
+    echo "$mix $arm exit $? footprint $(du -sb "$db" | cut -f1)" >> "$status"
+  fi
+  # The suite reopens the settled database, without RocksDB statistics.
+  suite=$base/$mix-$arm-suite.json
+  if [[ ! -s $suite ]]; then
+    # shellcheck disable=SC2086
+    "$replay" --open-existing --log "$logs/$mix.ops.zst" ${arms[$arm]} \
+      --read-suite-secs 20 --dir "$db" --out "$suite" > "$base/$mix-$arm-suite.log" 2>&1
+    echo "$mix $arm suite exit $?" >> "$status"
+  fi
 done
 echo done >> "$status"

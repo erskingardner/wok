@@ -586,6 +586,21 @@ fn feed_newest_first(heap: FeedHeap) -> Vec<(u64, Vec<u8>)> {
     kept.into_iter().map(|(_, id, v)| (id, v)).collect()
 }
 
+/// Position `cursor` on the newest posting under `prefix`, or on the one
+/// before it.
+fn lmdb_newest<'t>(
+    cursor: &mut wok_db::txn::Cursor<'t>,
+    prefix: &[u8],
+) -> Result<Option<(&'t [u8], &'t [u8])>> {
+    use lmdb_sys::{MDB_LAST, MDB_PREV, MDB_SET_RANGE};
+    let mut seek = prefix.to_vec();
+    seek.extend_from_slice(&u64::MAX.to_ne_bytes());
+    Ok(match cursor.get(Some(&seek), None, MDB_SET_RANGE)? {
+        Some(_) => cursor.get(None, None, MDB_PREV)?,
+        None => cursor.get(None, None, MDB_LAST)?,
+    })
+}
+
 struct Lmdb {
     env: wok_db::Env,
     dbis: Vec<lmdb_sys::MDB_dbi>,
@@ -697,17 +712,8 @@ impl Engine for Lmdb {
     }
 
     fn query(&self, q: &Query) -> Result<Answer> {
-        use lmdb_sys::{MDB_LAST, MDB_PREV, MDB_SET_RANGE};
+        use lmdb_sys::MDB_PREV;
         let ro = self.env.begin_ro()?;
-        // Position `cursor` on the newest posting under `prefix`, or past it.
-        let newest = |cursor: &mut wok_db::txn::Cursor<'_>, prefix: &[u8]| {
-            let mut seek = prefix.to_vec();
-            seek.extend_from_slice(&u64::MAX.to_ne_bytes());
-            Ok::<_, anyhow::Error>(match cursor.get(Some(&seek), None, MDB_SET_RANGE)? {
-                Some(_) => cursor.get(None, None, MDB_PREV)?,
-                None => cursor.get(None, None, MDB_LAST)?,
-            })
-        };
         let mut answer = Answer::default();
         match *q {
             Query::Newest {
@@ -717,7 +723,7 @@ impl Engine for Lmdb {
                 packed,
             } => {
                 let mut cursor = ro.cursor(self.index(index))?;
-                let mut at = newest(&mut cursor, prefix)?;
+                let mut at = lmdb_newest(&mut cursor, prefix)?;
                 while let Some((key, lev_id)) = at {
                     if answer.events == limit
                         || key.len() != prefix.len() + 8
@@ -733,7 +739,7 @@ impl Engine for Lmdb {
                 let mut cursor = ro.cursor(self.pubkey)?;
                 let mut heap = FeedHeap::new();
                 for author in authors {
-                    let mut at = newest(&mut cursor, author)?;
+                    let mut at = lmdb_newest(&mut cursor, author)?;
                     while let Some((key, lev_id)) = at {
                         if key.len() != 40 || !key.starts_with(author) {
                             break;

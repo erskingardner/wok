@@ -65,11 +65,16 @@ counted again rather than abort its transaction (`wok_author_count_drift_total`)
 
 Events are stored in `Event` (PackedEvent) and `EventPayload` (JSON), keyed
 by a local ID that the writer allocates and never reuses. Every other event
-table is derived from them, written and removed in the transaction that
-inserts or deletes the event, and rebuilt by `wok reindex`: strfry's indexes
-by id, pubkey, kind, pubkey and kind, single-letter tag, `created_at`,
+table is derived from them and rebuilt by `wok reindex`: strfry's indexes by
+id, pubkey, kind, pubkey and kind, single-letter tag, `created_at`,
 expiration, replacement address and deletion, then Wok's NIP-50 search
-postings and `(tag, kind, created_at)` postings. Layouts are in
+postings and `(tag, kind, created_at)` postings. All but the search postings
+are written in the transaction that inserts the event (`(tag, kind,
+created_at)` postings only while that index is on) and removed in the one
+that deletes it.
+The writer writes an event's search postings later, in a build step of its
+own, and a deletion removes them only once that step has run; see
+[NIP-50 search](nip50-search.md#index-and-recovery). Layouts are in
 [lmdb-v3.md](lmdb-v3.md).
 
 The `(tag, kind, created_at)` table, `wok_Event__tagKind`, holds the tag
@@ -91,7 +96,10 @@ The writer fills a gap in the background: before each batch of messages, and
 while idle, it runs one step bounded to 10 ms of indexing, so publications
 are not held up. A table that starts from nothing is built in key order by
 walking the tag index; the writer resumes that walk from a cursor after a
-restart.
+restart. `relay.tag_kind_index_enabled` turns the index off: the writer then
+keeps no entries for new events and builds none, so the tag index plan
+stands, and turned back on it fills the gap the same way (see
+[config](config.md#tag-and-kind-index)).
 
 ## REQ lifecycle
 

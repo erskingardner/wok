@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod admin;
+mod extension;
 pub mod forwarded;
 pub mod frame;
 mod nip86;
@@ -31,9 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use wok_relay::{
-    supported_nips, Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource,
-};
+use wok_relay::{Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource};
 
 /// NIP-11 `software` MUST be the project's homepage URL.
 const SOFTWARE: &str = "https://github.com/erskingardner/wok";
@@ -379,10 +378,11 @@ async fn dispatch(
                 .unwrap_or_else(|_| empty(StatusCode::OK)),
         );
     }
+    let supported_nips = handle.supported_nips();
     let mut response = if wants_nip11 {
-        json_response(&nip11(&cfg))
+        json_response(&nip11(&cfg, &supported_nips))
     } else {
-        html_response(&landing(&cfg, &handle.supported_nips()))
+        html_response(&landing(&cfg, &supported_nips))
     };
     // `/` serves two documents, so caches must key on Accept too.
     response.headers_mut().insert(
@@ -480,14 +480,16 @@ fn maybe_npub(s: &str) -> String {
     s.to_string()
 }
 
-pub(crate) fn nip11(cfg: &Config) -> serde_json::Value {
+/// The NIP-11 document, advertising `supported_nips`: the relay handle's,
+/// which follow the index state as well as the configuration.
+pub(crate) fn nip11(cfg: &Config, supported_nips: &[u64]) -> serde_json::Value {
     let min_pow_difficulty = if cfg.relay.abuse.enabled {
         cfg.relay.abuse.min_pow_difficulty
     } else {
         0
     };
     let mut v = serde_json::json!({
-        "supported_nips": supported_nips(cfg),
+        "supported_nips": supported_nips,
         "software": SOFTWARE,
         "version": VERSION,
         "negentropy": PROTOCOL_NEG,
@@ -862,9 +864,9 @@ async fn upgrade_ws(
             "rate-limited: too many connections from this address",
         );
     };
-    // permessage-deflate negotiation mirroring uWS as strfry configures it:
-    // respond with plain `permessage-deflate` (our context takeover per
-    // compression.slidingWindow), echoing client_no_context_takeover.
+    // permessage-deflate: accept the first offer we can honour (RFC 7692 §7),
+    // our context takeover per compression.slidingWindow unless the client
+    // offered server_no_context_takeover.
     let (compression_on, sliding) = {
         let cfg = handle.config.read();
         (
@@ -872,36 +874,13 @@ async fn upgrade_ws(
             cfg.relay.compression_sliding_window,
         )
     };
-    let mut ext_response: Option<String> = None;
-    let mut deflate = None;
-    if compression_on {
-        if let Some(offer) = req
-            .headers()
-            .get("sec-websocket-extensions")
-            .and_then(|v| v.to_str().ok())
-        {
-            if offer
-                .split(';')
-                .next()
-                .map(|t| t.trim().eq_ignore_ascii_case("permessage-deflate"))
-                .unwrap_or(false)
-            {
-                let mut resp = "permessage-deflate".to_string();
-                let client_no_takeover = offer
-                    .split(';')
-                    .skip(1)
-                    .any(|t| t.trim().eq_ignore_ascii_case("client_no_context_takeover"));
-                if client_no_takeover {
-                    resp.push_str("; client_no_context_takeover");
-                }
-                ext_response = Some(resp);
-                deflate = Some(Deflate {
-                    server_takeover: sliding,
-                    client_takeover: !client_no_takeover,
-                });
-            }
-        }
-    }
+    let (ext_response, deflate) = compression_on
+        .then(|| {
+            let offers = req.headers().get_all("sec-websocket-extensions");
+            extension::negotiate(offers.iter().filter_map(|v| v.to_str().ok()), sliding)
+        })
+        .flatten()
+        .unzip();
     let max = handle.config.read().relay.max_websocket_payload_size;
     tokio::spawn(async move {
         let _slot = slot;
@@ -938,7 +917,8 @@ fn ws_accept_key(key: &[u8]) -> String {
 /// What a WebSocket upgrade negotiated for permessage-deflate.
 #[derive(Clone, Copy)]
 struct Deflate {
-    /// Our compressor keeps history between messages (slidingWindow).
+    /// Our compressor keeps history between messages: slidingWindow is on
+    /// and the client did not offer server_no_context_takeover.
     server_takeover: bool,
     /// The client did not agree to client_no_context_takeover, so its
     /// compressor may refer back into earlier messages.

@@ -683,6 +683,147 @@ async fn nip50_ranked_historical_and_live_search() {
     handle.request_shutdown();
 }
 
+/// The search index keeps an event's first `MAX_INDEXED_UNIQUE_TERMS` unique
+/// terms (#247). Live matching used every term, so a search open when an
+/// event arrived received it and the same search sent later never did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip50_live_and_history_agree_past_the_term_cap() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path());
+    env.ensure_initialized().unwrap();
+    let cfg = test_cfg(dir.path());
+    let handle = wok_relay::start(env, cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let relay = handle.clone();
+    tokio::spawn(async move {
+        let _ = wok_ws::serve_listener(relay, listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .unwrap();
+    // "inside" is the article's first unique term, "zebra" the first past the cap.
+    let searches = [("inside", "inside"), ("past", "zebra")];
+    for (sub, search) in searches {
+        ws.send(Message::Text(
+            json!(["REQ", format!("live-{sub}"), {"search":search, "kinds":[1]}])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let eose = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+        assert!(eose.iter().any(|text| text.contains("EOSE")), "{eose:?}");
+    }
+
+    let mut words = vec!["inside".to_string()];
+    words.extend((1..wok_db::search::MAX_INDEXED_UNIQUE_TERMS).map(|n| format!("filler{n}")));
+    words.push("zebra".into());
+    let now = now_secs();
+    let article = sign_event(json!({
+        "created_at": now,
+        "kind": 1,
+        "tags": [],
+        "content": words.join(" "),
+    }));
+    // Matches both searches. Live events arrive in commit order, so once it
+    // reaches both subscriptions the article has had its chance to.
+    let marker = sign_event(json!({
+        "created_at": now + 1,
+        "kind": 1,
+        "tags": [],
+        "content": "zebra inside",
+    }));
+    let article_id = article["id"].as_str().unwrap().to_string();
+    let marker_id = marker["id"].as_str().unwrap().to_string();
+
+    let event_ids = |messages: &[String]| {
+        let mut ids = BTreeMap::<String, BTreeSet<String>>::new();
+        for text in messages {
+            let message: serde_json::Value = serde_json::from_str(text).unwrap();
+            if message[0] == "EVENT" {
+                ids.entry(message[1].as_str().unwrap().to_string())
+                    .or_default()
+                    .insert(message[2]["id"].as_str().unwrap().to_string());
+            }
+        }
+        ids
+    };
+    let mut live = Vec::new();
+    for event in [article, marker] {
+        let id = event["id"].as_str().unwrap().to_string();
+        ws.send(Message::Text(json!(["EVENT", event]).to_string().into()))
+            .await
+            .unwrap();
+        let replies = recv_until(&mut ws, |text| {
+            text.contains("\"OK\"") && text.contains(&id)
+        })
+        .await;
+        assert!(
+            replies
+                .iter()
+                .any(|text| text.contains("\"OK\"") && text.contains("true")),
+            "{replies:?}"
+        );
+        live.extend(replies);
+    }
+    let marker_delivered = |live: &[String]| {
+        let ids = event_ids(live);
+        searches.iter().all(|(sub, _)| {
+            ids.get(&format!("live-{sub}"))
+                .is_some_and(|ids| ids.contains(&marker_id))
+        })
+    };
+    while !marker_delivered(&live) {
+        let more = recv_until(&mut ws, |text| text.contains(&marker_id)).await;
+        assert!(!more.is_empty(), "live marker never arrived: {live:?}");
+        live.extend(more);
+    }
+    let live = event_ids(&live);
+
+    for (sub, search) in searches {
+        ws.send(Message::Text(
+            json!(["REQ", format!("history-{sub}"), {"search":search, "kinds":[1]}])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let history = recv_until(&mut ws, |text| text.contains("EOSE")).await;
+        let history = event_ids(&history)
+            .remove(&format!("history-{sub}"))
+            .unwrap_or_default();
+        assert_eq!(
+            live[&format!("live-{sub}")],
+            history,
+            "live and history disagree on {search:?}"
+        );
+
+        ws.send(Message::Text(
+            json!(["COUNT", format!("count-{sub}"), {"search":search, "kinds":[1]}])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let count = recv_until(&mut ws, |text| text.contains("\"COUNT\"")).await;
+        let count: serde_json::Value =
+            serde_json::from_str(count.last().expect("COUNT reply")).unwrap();
+        assert_eq!(count[2]["count"], history.len(), "{search:?}: {count}");
+    }
+    assert_eq!(
+        live["live-inside"],
+        BTreeSet::from([article_id.clone(), marker_id.clone()])
+    );
+    assert_eq!(live["live-past"], BTreeSet::from([marker_id]));
+
+    handle.request_shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ephemeral_events_are_live_only_by_default() {
     let dir = tempfile::tempdir().unwrap();

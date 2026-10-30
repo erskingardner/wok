@@ -409,6 +409,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   management call made since, before letting clients back in. After more
   than one such reindex, restore from the backup the first one kept and
   repeat every call made since then.
+- The NIP-62 sweep no longer reads every event that tags a vanished key on
+  every maintenance tick (#253). To find the gift wraps to each vanished
+  key, the writer read each event with a `p` tag naming it, every 2 seconds
+  and forever, inside its write transaction: only the gift wraps counted
+  toward `relay.nip62.deletion_batch_size`, and a finished sweep started
+  over. When a widely mentioned key vanished, or anyone vanished a key and
+  tagged it from throwaway keys, event writes waited behind that walk. A
+  tick now examines at most `deletion_batch_size` index entries and visits
+  at most as many vanished keys. Each key's pass resumes where it stopped,
+  after a restart too, from progress kept in `wok_State`, and runs once: the
+  relay refuses the events it covered, and a later request from the same
+  key sweeps only the events it adds. Once every pass has finished, the
+  sweep does nothing until another request arrives. Events stay hidden from
+  the request on, but a key that a million events tag now takes about half
+  an hour to sweep at the default 1000. Each key stored before this release
+  is swept once more, and so is each after a `wok reindex`, which does not
+  copy the progress. An earlier release's `wok integrity` reports the
+  progress records and their `vanish-markers` counter as unknown `wok_State`
+  keys.
 - A NIP-77 message to a session served from a negentropy tree costs a
   tenth of the worker time it did, and sessions take turns with their
   client (#254). To read the item count of each node it passed, a lookup in
@@ -722,6 +741,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adds a `tag-kind-index` check: those leftover entries and a build in
   progress are warnings, and entries missing below the index's progress
   marker are a failure.
+- `relay.tag_kind_index_enabled` (default `true`, live, on the dashboard)
+  turns the `(tag, kind, created_at)` index off. Off, the writer and
+  `wok import` put no entries for the events they store and build none, and
+  tag filters with `kinds` read the tag index, as while the index is
+  incomplete. Publishing then writes 11–16% fewer bytes per event on a
+  typical mix and 18–32% fewer on a follow-list-heavy one, measured with
+  `db_write`. Turned back on, the writer builds the missing entries in the
+  background. `wok doctor` reports the index as off rather than incomplete.
 - `relay.max_filter_bytes_per_connection` (default 2097152, 2 MiB) bounds the
   filter bytes of the REQ subscriptions open on one connection. Live filters
   stay in memory until closed, so without it a larger
@@ -945,6 +972,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Publishing an event no longer writes its NIP-50 search postings (#257).
+  The relay's writer indexes stored events afterwards, in steps of up to
+  10,000 events whenever it is idle, and before a batch once 1,000 events
+  wait, so a common word's pages are written once per step rather than once
+  per event. With search off, nothing is indexed. Searches stay complete:
+  they read the events the index lacks directly. While more than 100,000
+  wait, as when a relay starts on a database whose index must be rebuilt, a
+  search is refused with `error: search index is building` and NIP-11 omits
+  NIP-50 until the build catches up. `wok import` and `wok migrate strfry`
+  build the index before they exit. `wok_search_index_lag_events` reports
+  the events waiting.
+- Wok bundles LMDB 0.9.37, up from 0.9.21 (#257). The newer releases fix
+  DUPSORT deletes and alignment, a race freeing spilled pages at the end of
+  a write, and fdatasync and metapage syncs on macOS. The source is vendored
+  and always built, so a system liblmdb found by pkg-config is no longer
+  linked in its place. The file format is unchanged, so existing databases
+  and strfry imports open as before; a binary linked with any LMDB but 0.9
+  refuses to open one, and the relay logs its LMDB version at startup.
+- Opening a database no longer fails when the search index is being rebuilt
+  and an event has no payload, or a payload that does not decode (#257).
+  The event is left out of the index, and `wok doctor` reports it.
+- NIP-50 search covers only kinds whose content is text a person wrote, such
+  as notes, articles, comments and chat, plus profiles (#257). It matched
+  any kind whose `content` held the words, so a search without `kinds`
+  returned reposts, whose embedded JSON repeats the original, and random
+  fragments of encrypted messages, and every such event wrote postings. A
+  profile is now searched by its name, display name, NIP-05 and about
+  rather than its raw JSON, so "https" no longer matches every profile with
+  a picture, and the title, subject, name, summary and description tags of
+  articles and other text kinds are searched with their content. A live
+  event matches by the same first 256 words the index keeps. The list is in
+  [NIP-50 search](docs/nip50-search.md); the index is rebuilt on the first
+  open.
+- The NIP-50 search index keeps only word postings (#257). It also kept a
+  posting for each pair of adjacent words, up to 256 an event, which only
+  boosted a match whose content holds the query's words in order; that
+  boost is now read from a match's content when it is ranked. A published
+  event writes about half as many postings, and a phrase late in a long
+  event, past the old 256 pairs, now counts. The index is rebuilt after the
+  upgrade.
 - `[relay.filter_validation]` rules now apply to NEG-OPEN as they do to REQ
   and COUNT, refused with `NEG-ERR blocked: filter validation failed: ...`.
   Before, a sync could list the ids of every event a REQ's filter was
@@ -1126,6 +1193,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A NIP-59 gift wrap to a pubkey that sent a NIP-62 vanish request is
+  refused, hidden and deleted only when it is dated at or before the
+  request, as the pubkey's own events are (#249). Every wrap that p-tagged
+  the pubkey was refused for good, so once a key vanished nobody could send
+  it a DM through this relay again, though NIP-62 resets the key rather than
+  retiring it. NIP-59 dates a wrap up to two days in the past, so **a wrap
+  sent in the two days after a request can still be refused**. Wraps refused
+  or deleted before this fix do not come back.
+- A NIP-50 search finds the same events live as in history, COUNT and
+  NEG-OPEN (#247). The search index keeps each event's first 256 unique
+  terms, so that one event of many distinct words cannot amplify into
+  thousands of index writes, but live matching used every word: a long
+  article whose 300th distinct word was `zebra` reached a
+  `{"search":"zebra"}` subscription open when it arrived, and the same
+  search sent later never found it. **Live search no longer matches a word
+  an event first uses after its 256th unique term**, and `wok sync` with a
+  `search` filter checks the events it downloads the same way.
+  docs/nip50-search.md now states the cap.
 - `wok sync` with a NIP-91 `&` filter no longer fails against a peer that
   does not advertise NIP-91 (#250). Such a peer is sent each `&x` set folded
   into its `#x` clause, a superset of the filter, but the local side
@@ -1198,6 +1283,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NOTICEs are logged. A new `--timeout` (default 60 seconds, 0 disables),
   like `wok sync`'s, ends it nonzero after that long without the WebSocket
   handshake, an event or EOSE.
+- A second copy of an event in one writer batch, as two connections or a
+  client that retries can send, is answered as the first copy was (#255).
+  When the first copy was refused, as superseded by a newer version, over
+  the author's storage quota, or deleted or vanished, the second was told
+  `true, "duplicate: have this event"` though the relay did not hold the
+  event, so its client stopped retrying. It now gets the same refusal, and
+  `duplicate:` only when the first copy was stored. A copy of a vanish
+  request that a relay at its global storage quota still stores is
+  answered `duplicate:` too, not with the quota's refusal. The relay's
+  metrics, `wok import` and `wok sync` count a refused copy with the
+  refusals, not as a duplicate.
+- permessage-deflate is negotiated as RFC 7692 §7 says (#246). The relay
+  answered plain `permessage-deflate` to any offer and kept its compression
+  context between messages, so a client that offered
+  `server_no_context_takeover` or a `server_max_window_bits` below 15
+  either refused the handshake, as Python `websockets` does, or failed to
+  inflate from about its second message. The relay now accepts the first
+  offer in the client's list it can honour: it echoes
+  `server_no_context_takeover` and compresses each of that connection's
+  messages on its own, echoes `server_max_window_bits=15`, still echoes
+  `client_no_context_takeover`, and accepts `client_max_window_bits`.
+  **An offer with an unknown, repeated or invalid parameter, or a
+  `server_max_window_bits` below 15, is declined**, and a connection with
+  no offer left is not compressed. Browsers, which offer only
+  `client_max_window_bits`, negotiate as before.
 - `wok router` no longer drops up-direction events when a peer's queue is
   full (#244). Each connection queued at most 256 events, and the rest of a
   burst, such as the up to 1,000 events a `both` stream downloads in one
@@ -1281,15 +1391,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   16 MiB and spent about 75 µs per compressed event zeroing it, more than a
   Schnorr signature check takes; relay reads bound it by
   `events.max_event_size`.
-- `wok integrity` derives each event's NIP-50 search postings and
-  `wok_Event__tagKind` entries once, not once per posting. A note with N
-  search terms was decompressed and tokenized N times, and a follow list
-  with N `p` tags had its tag-kind keys built N times: on a 1M-event social
-  database the check had not finished after 25 minutes. Each posting of the
-  two tables is now checked by looking up the event it names, and balanced
-  against the entries the event pass found, in 16 MiB of counters whatever
-  the size of the database. Reports are unchanged, except that a table's
-  unexpected entries are listed after its other issues.
+- `wok integrity` derives each event's NIP-50 search postings,
+  `wok_Event__tagKind` entries and strfry-layout index entries once, not
+  once per posting. A note with N search terms was decompressed and
+  tokenized N times, and a follow list with N `p` tags had its tag-kind keys
+  and all of its index entries built N times: on a 1M-event social database
+  the check had not finished after 25 minutes. Each posting is now checked
+  by looking up the event it names, and balanced against the entries the
+  event pass found, in 24 MiB of counters whatever the size of the
+  database. `Event__replace` postings, from which superseded history is
+  counted, are still each checked against their event's replacement key.
+  Reports are unchanged, except that a table's unexpected entries are listed
+  after its other issues, and those of the strfry-layout indexes after the
+  other issues of all ten.
 - An `authors` and `kinds` filter past 1,000 (author, kind) pairs under a
   small `limit` no longer reads every event the authors wrote when they
   rarely publish those kinds. A picture feed (`kinds [20,21]`, `limit 50`) of

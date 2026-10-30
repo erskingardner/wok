@@ -273,6 +273,8 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
     )
     .context("reopen migrated Wok database")?;
     target.ensure_initialized()?;
+    // A relay started on the database can search it at once.
+    wok_db::finish_search_index(&target).context("build the search index")?;
     let target_integrity = check_integrity(&target.begin_ro()?)?;
     if !target_integrity.ok() {
         bail!("migrated database failed integrity checks: {target_integrity:?}");

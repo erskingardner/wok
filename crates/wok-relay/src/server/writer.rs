@@ -2,6 +2,7 @@
 use super::*;
 use crate::protocol::SUPERSEDED_OK_REASON;
 use std::time::Instant;
+use wok_db::SEARCH_BUILD_BUSY_LAG;
 
 /// Bounds on one `(tag, kind, created_at)` backfill transaction. The writer
 /// runs one before each batch of messages it takes, so a publication waits
@@ -21,6 +22,11 @@ pub(super) const TAG_KIND_STEP: TagKindStep = TagKindStep {
 /// How often a running backfill logs its progress.
 const TAG_KIND_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
+/// A writer that receives no message for this long is idle, and builds.
+const SEARCH_BUILD_IDLE: Duration = Duration::from_millis(20);
+/// A build that starts this far behind logs its start, progress and end.
+const SEARCH_BUILD_LOG_LAG: u64 = 10_000;
+
 pub(super) fn run_writer(
     env: Env,
     cfg: Arc<parking_lot::RwLock<Config>>,
@@ -35,13 +41,15 @@ pub(super) fn run_writer(
     let mut negentropy_cache = NegentropyFilterCache::default();
     let mut batch = Vec::with_capacity(WRITER_BATCH_MAX);
     let mut event_batch = Vec::with_capacity(WRITER_BATCH_MAX);
-    let mut maintenance_cursor = Vec::new();
+    let mut maintenance_cursor = wok_db::VanishSweepCursor::default();
     let mut batch_vanish: HashMap<[u8; 32], u64> = HashMap::new();
     let mut events: Vec<EventToWrite<u64>> = Vec::with_capacity(256);
     // Bytes of committed events the req monitors still hold.
     let stored_in_flight = Arc::new(AtomicUsize::new(0));
     let mut tag_kind = TagKindBackfill::new(tag_kind_step);
-    tag_kind.recheck(&env, &metrics);
+    tag_kind.recheck(&env, &metrics, cfg.read().relay.tag_kind_index_enabled);
+    let mut search = SearchBuild::new();
+    search.recheck(&env, &metrics, cfg.read().relay.search_enabled);
     let mut storage_writes = ThreadStorageWrites::open();
     let mut stop = false;
     while !stop {
@@ -54,6 +62,27 @@ pub(super) fn run_writer(
                 Ok(msg) => msg,
                 Err(crossbeam_channel::TryRecvError::Empty) => continue,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        } else if search.lag() >= SEARCH_BUILD_BUSY_LAG && search.pending() {
+            // Far enough behind: one step before each batch, as for the
+            // tag-kind index.
+            let reserve = cfg.read().db_min_free_disk_bytes;
+            search.step(&env, &metrics, reserve);
+            match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        } else if search.pending() {
+            // Behind by a little: build once the writer is idle.
+            match rx.recv_timeout(SEARCH_BUILD_IDLE) {
+                Ok(msg) => msg,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    let reserve = cfg.read().db_min_free_disk_bytes;
+                    search.step(&env, &metrics, reserve);
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         } else {
             let Ok(msg) = rx.recv() else { break };
@@ -101,9 +130,12 @@ pub(super) fn run_writer(
         }
         let cfg_snap = cfg.read().clone();
         plugin.set_timeout(cfg_snap.relay.write_policy_timeout_secs);
+        search.set_enabled(cfg_snap.relay.search_enabled);
+        tag_kind.set_enabled(cfg_snap.relay.tag_kind_index_enabled);
         if maintenance_requested {
             run_maintenance(&env, &cfg_snap, &mut maintenance_cursor);
-            tag_kind.recheck(&env, &metrics);
+            tag_kind.recheck(&env, &metrics, cfg_snap.relay.tag_kind_index_enabled);
+            search.recheck(&env, &metrics, cfg_snap.relay.search_enabled);
         }
         let vanish_policy = cfg_snap.vanish_policy();
         // A valid vanish request and an ephemeral gift wrap can arrive in the
@@ -456,10 +488,20 @@ pub(super) fn run_writer(
         // NIP-62 requires a vanish request that targets this relay to be
         // honored whatever the user's status, so the global quota does not
         // count the ones a batch records and never refuses a batch for them.
-        let records_vanish = |event: &EventToWrite<u64>| {
+        let honors_vanish = |event: &EventToWrite<u64>| {
             vanish_policy.enabled
-                && event.status == EventWriteStatus::Written
                 && PackedEventView::new(&event.packed).is_ok_and(|e| e.kind() == VANISH_KIND)
+        };
+        let records_vanish = |event: &EventToWrite<u64>| {
+            event.status == EventWriteStatus::Written && honors_vanish(event)
+        };
+        // A copy of a request the batch recorded, or of one already stored,
+        // is answered `duplicate:`, as the batch without the quota would.
+        let keeps_vanish = |event: &EventToWrite<u64>| {
+            matches!(
+                event.status,
+                EventWriteStatus::Written | EventWriteStatus::Duplicate
+            ) && honors_vanish(event)
         };
         let write_started = Instant::now();
         let storage_before = storage_writes.bytes();
@@ -467,6 +509,9 @@ pub(super) fn run_writer(
         // `None` when the global quota refuses the batch.
         let mut write_batch = |events: &mut Vec<EventToWrite<u64>>| {
             let mut txn = env.begin_rw()?;
+            if !cfg_snap.relay.tag_kind_index_enabled {
+                wok_db::skip_tag_kind_postings(&mut txn);
+            }
             let mut tree_batch = negentropy_cache.batch();
             wok_db::write::write_events_with_quota(
                 &mut txn,
@@ -504,7 +549,7 @@ pub(super) fn run_writer(
         if matches!(write_res, Ok(None)) {
             // The quota refuses everything else in the batch, and the
             // vanish requests it held are written on their own.
-            let (vanishing, refused): (Vec<_>, Vec<_>) = events.drain(..).partition(records_vanish);
+            let (vanishing, refused): (Vec<_>, Vec<_>) = events.drain(..).partition(keeps_vanish);
             metrics
                 .abuse_global_quota_rejections
                 .fetch_add(refused.len() as u64, Ordering::Relaxed);
@@ -575,6 +620,14 @@ pub(super) fn run_writer(
             .filter(|event| matches!(event.status, EventWriteStatus::Written))
             .count();
         metrics.writer_commit_events.observe(stored as u64);
+        let newest = events
+            .iter()
+            .filter(|event| matches!(event.status, EventWriteStatus::Written))
+            .map(|event| event.lev_id)
+            .max();
+        if let Some(newest) = newest {
+            search.note_stored(newest, &metrics);
+        }
         if let (Some(before), Some(after)) = (storage_before, storage_writes.bytes()) {
             metrics
                 .writer_storage_bytes_total
@@ -679,9 +732,10 @@ impl ThreadStorageWrites {
 /// Builds `wok_Event__tagKind` in the background, one bounded write
 /// transaction at a time: by a key-ordered pass for a database from before
 /// the index, and in local-id order for the events an earlier release
-/// inserted.
+/// inserted. Nothing is built while `relay.tag_kind_index_enabled` is off.
 pub(super) struct TagKindBackfill {
     step: TagKindStep,
+    enabled: bool,
     pending: bool,
     paused_for_disk: bool,
     run: Option<TagKindBackfillRun>,
@@ -698,21 +752,28 @@ impl TagKindBackfill {
     pub(super) fn new(step: TagKindStep) -> Self {
         Self {
             step,
+            enabled: false,
             pending: false,
             paused_for_disk: false,
             run: None,
         }
     }
 
+    /// Whether a step would index anything.
     pub(super) fn pending(&self) -> bool {
-        self.pending
+        self.enabled && self.pending
+    }
+
+    pub(super) fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
     /// Read where the index stands and start a backfill if it is behind.
     /// The writer does this at start and on every maintenance tick: another
     /// process, such as an earlier release's `wok import`, may have stored
     /// events without entries.
-    pub(super) fn recheck(&mut self, env: &Env, metrics: &Metrics) {
+    pub(super) fn recheck(&mut self, env: &Env, metrics: &Metrics, enabled: bool) {
+        self.enabled = enabled;
         let state = env.begin_ro().and_then(|txn| {
             let tag_entries = txn.entries(txn.env().dbis().event_tag)? as u64;
             Ok(wok_db::tag_kind_index_state_ro(&txn)?.map(|state| (state, tag_entries)))
@@ -848,6 +909,192 @@ impl TagKindBackfill {
             }
         }
         self.pending = !complete;
+    }
+}
+
+/// The NIP-50 search index's background build. Publishing writes no
+/// postings: the writer indexes the events above the index's marker in
+/// transactions of their own, whenever it is idle, and before each batch
+/// once [`SEARCH_BUILD_BUSY_LAG`] events wait, so each step indexes many at
+/// once. Nothing is built while search is off.
+pub(super) struct SearchBuild {
+    enabled: bool,
+    /// Where the index stands: read at start and on each maintenance tick,
+    /// then moved by each step and each committed batch, as only this writer
+    /// moves the marker.
+    state: Option<wok_db::SearchIndexState>,
+    /// Free disk space ran short, or a step failed: no steps until a
+    /// maintenance tick rechecks.
+    stalled: bool,
+    paused_for_disk: bool,
+    run: Option<SearchBuildRun>,
+}
+
+struct SearchBuildRun {
+    started: std::time::Instant,
+    last_log: std::time::Instant,
+    events: u64,
+    slowest: Duration,
+}
+
+impl SearchBuild {
+    pub(super) fn new() -> Self {
+        Self {
+            enabled: false,
+            state: None,
+            stalled: false,
+            paused_for_disk: false,
+            run: None,
+        }
+    }
+
+    /// Events stored above the marker.
+    pub(super) fn lag(&self) -> u64 {
+        self.state.map_or(0, |state| state.lag())
+    }
+
+    /// Whether a step would index anything.
+    pub(super) fn pending(&self) -> bool {
+        self.enabled && !self.stalled && self.lag() > 0
+    }
+
+    pub(super) fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Read where the index stands. The writer does this at start and on
+    /// every maintenance tick, which also retries a stalled build.
+    pub(super) fn recheck(&mut self, env: &Env, metrics: &Metrics, enabled: bool) {
+        self.enabled = enabled;
+        self.stalled = false;
+        match env
+            .begin_ro()
+            .and_then(|txn| wok_db::search_index_state_ro(&txn))
+        {
+            Ok(state) => {
+                self.state = state;
+                self.publish(metrics);
+            }
+            Err(error) => tracing::warn!(%error, "could not read the search index state"),
+        }
+    }
+
+    /// A batch committed, storing events up to local id `newest`.
+    pub(super) fn note_stored(&mut self, newest: u64, metrics: &Metrics) {
+        if let Some(state) = self.state.as_mut() {
+            state.high_water = state.high_water.max(newest);
+            self.publish(metrics);
+        }
+    }
+
+    fn publish(&self, metrics: &Metrics) {
+        metrics
+            .search_index_lag_events
+            .store(self.lag(), Ordering::Relaxed);
+    }
+
+    /// Index one bounded step in its own write transaction, unless free disk
+    /// space is below `min_free_disk_bytes`, the reserve that also refuses
+    /// publications: the build then waits for a maintenance tick that finds
+    /// the space.
+    pub(super) fn step(&mut self, env: &Env, metrics: &Metrics, min_free_disk_bytes: u64) {
+        if min_free_disk_bytes != 0 {
+            let available = env.available_disk_bytes();
+            if !matches!(available, Ok(bytes) if bytes >= min_free_disk_bytes) {
+                if !self.paused_for_disk {
+                    match available {
+                        Ok(bytes) => tracing::warn!(
+                            available = bytes,
+                            reserve = min_free_disk_bytes,
+                            "pausing the search index build: free disk space is below database.min_free_disk_bytes"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "pausing the search index build: free disk space could not be checked"
+                        ),
+                    }
+                }
+                self.paused_for_disk = true;
+                self.stalled = true;
+                return;
+            }
+            if std::mem::take(&mut self.paused_for_disk) {
+                tracing::info!("resuming the search index build");
+            }
+        }
+        let lag_before = self.lag();
+        let started = std::time::Instant::now();
+        let result = (|| {
+            let mut txn = env.begin_rw()?;
+            let step = wok_db::build_search_index(
+                &mut txn,
+                wok_db::SEARCH_BUILD_STEP_EVENTS,
+                wok_db::SEARCH_BUILD_STEP_BUDGET,
+            )?;
+            txn.commit()?;
+            Ok::<_, wok_db::DbError>(step)
+        })();
+        let elapsed = started.elapsed();
+        let step = match result {
+            Ok(Some(step)) => step,
+            Ok(None) => {
+                self.state = None;
+                self.publish(metrics);
+                return;
+            }
+            Err(error) => {
+                // The next maintenance tick retries, rather than a tight loop.
+                tracing::error!(%error, "search index build transaction aborted");
+                self.stalled = true;
+                self.run = None;
+                return;
+            }
+        };
+        self.state = Some(step.state);
+        self.publish(metrics);
+        metrics
+            .search_index_build_events_total
+            .fetch_add(step.events, Ordering::Relaxed);
+        metrics.search_index_build_micros_total.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let lag = step.state.lag();
+        if self.run.is_none() && lag_before >= SEARCH_BUILD_LOG_LAG {
+            tracing::info!(
+                indexed_through = step.state.indexed_through,
+                high_water = step.state.high_water,
+                "building the search index in the background"
+            );
+            self.run = Some(SearchBuildRun {
+                started,
+                last_log: started,
+                events: 0,
+                slowest: Duration::ZERO,
+            });
+        }
+        if let Some(run) = self.run.as_mut() {
+            run.events += step.events;
+            run.slowest = run.slowest.max(elapsed);
+            if lag < SEARCH_BUILD_BUSY_LAG {
+                tracing::info!(
+                    events = run.events,
+                    seconds = run.started.elapsed().as_secs_f64(),
+                    slowest_step_ms = run.slowest.as_secs_f64() * 1000.0,
+                    lag,
+                    "the search index has caught up"
+                );
+                self.run = None;
+            } else if run.last_log.elapsed() >= TAG_KIND_PROGRESS_INTERVAL {
+                run.last_log = std::time::Instant::now();
+                tracing::info!(
+                    indexed_through = step.state.indexed_through,
+                    high_water = step.state.high_water,
+                    events = run.events,
+                    "search index build progress"
+                );
+            }
+        }
     }
 }
 
@@ -990,7 +1237,9 @@ pub(super) fn event_matches_vanish_markers(
             if name == 'p' && value.len() == 32 {
                 let mut recipient = [0u8; 32];
                 recipient.copy_from_slice(value);
-                if markers.contains_key(&recipient) {
+                if markers.get(&recipient).is_some_and(|timestamp| {
+                    wok_db::gift_wrap_vanished(packed.created_at(), *timestamp)
+                }) {
                     matched = true;
                     return false;
                 }
@@ -1012,7 +1261,11 @@ pub(super) fn run_cron(writer: Sender<WriterMsg>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-pub(super) fn run_maintenance(env: &Env, cfg_snap: &Config, vanish_cursor: &mut Vec<u8>) {
+pub(super) fn run_maintenance(
+    env: &Env,
+    cfg_snap: &Config,
+    vanish_cursor: &mut wok_db::VanishSweepCursor,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1059,7 +1312,8 @@ pub(super) fn run_maintenance(env: &Env, cfg_snap: &Config, vanish_cursor: &mut 
             &mut sink,
             cfg_snap.relay.nip62.deletion_batch_size,
             &mut next_cursor,
-        )?;
+        )?
+        .deleted;
         let mut cache = NegentropyFilterCache::default();
         sink.apply(&mut cache, &mut txn)
             .map_err(|e| wok_db::DbError::msg(e.to_string()))?;
@@ -1263,6 +1517,181 @@ mod tests {
         }
     }
 
+    /// An unsigned event `id` from `author`, sent by connection `conn_id`.
+    /// A vanish request names every relay.
+    fn copy_of(conn_id: u64, id: u8, author: [u8; 32], created_at: u64, kind: u64) -> WriterMsg {
+        let mut tags = PackedEventTagBuilder::default();
+        if wok_event::is_replaceable_kind(kind) {
+            tags.add('d', b"").unwrap();
+        }
+        let packed =
+            PackedEventBuilder::build(&[id; 32], &author, created_at, kind, 0, &tags).unwrap();
+        let json = json!({
+            "id": to_hex(&[id; 32]),
+            "pubkey": to_hex(&author),
+            "created_at": created_at,
+            "kind": kind,
+            "tags": if kind == VANISH_KIND { json!([["relay", "ALL_RELAYS"]]) } else { json!([]) },
+            "content": "",
+            "sig": "00".repeat(64),
+        })
+        .to_string();
+        WriterMsg::AddEvent {
+            conn_id,
+            source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+            packed: packed.into_bytes(),
+            json,
+            authed: None,
+            grant: Default::default(),
+        }
+    }
+
+    /// The `[accepted, message]` of the OK each of `copies`' connections
+    /// gets when the writer takes them in one batch.
+    fn replies_to(config: Config, env: &Env, copies: Vec<WriterMsg>) -> Vec<Value> {
+        let conns = Arc::new(ConnTable::new());
+        let mut receivers = Vec::new();
+        for copy in &copies {
+            let WriterMsg::AddEvent { conn_id, .. } = copy else {
+                unreachable!()
+            };
+            let (out, rx) = tokio::sync::mpsc::unbounded_channel();
+            conns.insert(*conn_id, Outbound::new(out, 0));
+            receivers.push(rx);
+        }
+        let moderation = Arc::new(parking_lot::RwLock::new(
+            env.begin_ro()
+                .and_then(|txn| load_moderation_snapshot_ro(&txn))
+                .unwrap(),
+        ));
+        let (writer_tx, writer_rx) = bounded(copies.len());
+        for copy in copies {
+            writer_tx.send(copy).unwrap();
+        }
+        drop(writer_tx);
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config)),
+            conns,
+            Arc::new(Metrics::default()),
+            writer_rx,
+            Vec::new(),
+            moderation,
+            TAG_KIND_STEP,
+        );
+        receivers
+            .iter_mut()
+            .map(|rx| {
+                let ok: Value = serde_json::from_str(&rx.try_recv().unwrap().into_text()).unwrap();
+                json!([ok[2], ok[3]])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_copy_in_one_batch_is_answered_like_the_first() {
+        let author = [0x55; 32];
+        let fresh = || {
+            let dir = tempfile::tempdir().unwrap();
+            let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+            env.ensure_initialized().unwrap();
+            let mut config = Config {
+                db: dir.path().to_path_buf(),
+                ..Config::default()
+            };
+            config.db_min_free_disk_bytes = 0;
+            (dir, env, config)
+        };
+
+        // Stored, then a copy from each of two connections.
+        let (_dir, env, config) = fresh();
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 1, author, 100, 1), copy_of(2, 1, author, 100, 1)],
+        );
+        assert_eq!(
+            replies,
+            [
+                json!([true, ""]),
+                json!([true, "duplicate: have this event"])
+            ]
+        );
+
+        // Superseded by a stored newer version: neither copy is a duplicate.
+        let (_dir, env, config) = fresh();
+        replies_to(
+            config.clone(),
+            &env,
+            vec![copy_of(1, 1, author, 200, 10002)],
+        );
+        let replies = replies_to(
+            config,
+            &env,
+            vec![
+                copy_of(1, 2, author, 100, 10002),
+                copy_of(2, 2, author, 100, 10002),
+            ],
+        );
+        let superseded = json!([false, SUPERSEDED_OK_REASON]);
+        assert_eq!(replies, [superseded.clone(), superseded]);
+
+        // The author is at the per-author quota.
+        let (_dir, env, mut config) = fresh();
+        config.relay.abuse.enabled = true;
+        config.relay.abuse.max_stored_events_per_pubkey = 1;
+        replies_to(config.clone(), &env, vec![copy_of(1, 1, author, 100, 1)]);
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 2, author, 200, 1), copy_of(2, 2, author, 200, 1)],
+        );
+        let over_quota = json!([false, "blocked: author storage quota exceeded"]);
+        assert_eq!(replies, [over_quota.clone(), over_quota]);
+        assert_eq!(
+            env.begin_ro().unwrap().entries(env.dbis().event).unwrap(),
+            1
+        );
+
+        // Refusals made before the write see no other copy and decide each
+        // one alike.
+        let (_dir, env, config) = fresh();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::ban_event(&mut txn, &[3; 32], "").unwrap();
+        txn.commit().unwrap();
+        let replies = replies_to(
+            config,
+            &env,
+            vec![copy_of(1, 3, author, 100, 1), copy_of(2, 3, author, 100, 1)],
+        );
+        let banned = json!([false, "restricted: event is banned by the relay operator"]);
+        assert_eq!(replies, [banned.clone(), banned]);
+
+        // A full relay still stores a vanish request, and answers its copy
+        // as a duplicate, not with the global quota's refusal.
+        let (_dir, env, mut config) = fresh();
+        config.relay.abuse.max_stored_events = 1;
+        config.relay.nip62.service_url = "wss://relay.example.com".into();
+        replies_to(config.clone(), &env, vec![copy_of(1, 1, author, 100, 1)]);
+        let replies = replies_to(
+            config,
+            &env,
+            vec![
+                copy_of(1, 4, author, 200, VANISH_KIND),
+                copy_of(2, 4, author, 200, VANISH_KIND),
+                copy_of(3, 5, [0x66; 32], 200, 1),
+            ],
+        );
+        assert_eq!(
+            replies,
+            [
+                json!([true, ""]),
+                json!([true, "duplicate: have this event"]),
+                json!([false, "error: global storage quota of 1 events exceeded"]),
+            ]
+        );
+    }
+
     #[test]
     fn writer_metrics_leave_out_batches_that_did_not_commit() {
         let dir = tempfile::tempdir().unwrap();
@@ -1406,7 +1835,7 @@ mod tests {
             assert!(is_event_vanished_ro(&txn, PackedEventView::new(&note).unwrap()).unwrap());
         }
         // Maintenance then deletes the note.
-        run_maintenance(&env, &config, &mut Vec::new());
+        run_maintenance(&env, &config, &mut Default::default());
         let txn = env.begin_ro().unwrap();
         assert!(wok_db::lookup_event_by_id_ro(&txn, &[1; 32])
             .unwrap()
@@ -1517,7 +1946,7 @@ mod tests {
             "the publication was stored in the tree"
         );
 
-        run_maintenance(&env, &config, &mut Vec::new());
+        run_maintenance(&env, &config, &mut Default::default());
         let txn = env.begin_ro().unwrap();
         assert_eq!(txn.entries(env.dbis().event).unwrap(), 1);
         assert!(wok_db::lookup_event_by_id_ro(&txn, &[1; 32])
@@ -1762,5 +2191,270 @@ mod tests {
                 .load(Ordering::Relaxed),
             100
         );
+    }
+
+    #[test]
+    fn with_the_tag_kind_index_off_the_writer_neither_posts_nor_builds() {
+        let (dir, env) = unindexed_database(50);
+        let mut config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.relay.tag_kind_index_enabled = false;
+        // The gift wraps are stored only while someone could read them.
+        config.relay.auth.service_url = "wss://relay.example.com".into();
+        let config = Arc::new(parking_lot::RwLock::new(config));
+        let metrics = Arc::new(Metrics::default());
+        let (writer_tx, writer_rx) = bounded(4);
+        let writer = {
+            let (env, config, metrics, moderation) = (
+                env.clone(),
+                config.clone(),
+                metrics.clone(),
+                moderation(&env),
+            );
+            std::thread::spawn(move || {
+                run_writer(
+                    env,
+                    config,
+                    Arc::new(ConnTable::new()),
+                    metrics,
+                    writer_rx,
+                    Vec::new(),
+                    moderation,
+                    TEN_ENTRIES,
+                )
+            })
+        };
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // The writer takes its messages in order, so once the second
+        // publication is stored, the maintenance tick before it has run.
+        writer_tx.send(add_event(50)).unwrap();
+        writer_tx.send(WriterMsg::Maintenance).unwrap();
+        writer_tx.send(add_event(51)).unwrap();
+        wait_for("publications not stored", &|| {
+            metrics.written_events_total.load(Ordering::Relaxed) == 2
+        });
+        let off = tag_kind_state(&env);
+        assert_eq!((off.indexed_through, off.high_water), (0, 52));
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert_eq!(report.tag_kind_index.unwrap().actual_entries, 0);
+        assert_eq!(
+            metrics
+                .tag_kind_backfill_entries_total
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Back on, the next maintenance tick starts the build, which covers
+        // the publications too.
+        config.write().relay.tag_kind_index_enabled = true;
+        writer_tx.send(WriterMsg::Maintenance).unwrap();
+        wait_for("backfill stalled", &|| {
+            metrics.tag_kind_index_complete.load(Ordering::Relaxed) == 1
+        });
+        writer_tx.send(WriterMsg::Stop).unwrap();
+        writer.join().unwrap();
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert!(tag_kind.complete && tag_kind.missing_entries == 0);
+        assert_eq!(tag_kind.actual_entries, 52);
+    }
+
+    /// An unsigned note saying "hello world".
+    fn hello(n: u64) -> (Vec<u8>, String) {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&n.to_be_bytes());
+        let author = [0x51; 32];
+        let packed = PackedEventBuilder::build(
+            &id,
+            &author,
+            1_700_000_000 + n,
+            1,
+            0,
+            &PackedEventTagBuilder::default(),
+        )
+        .unwrap();
+        let json = json!({
+            "id": to_hex(&id),
+            "pubkey": to_hex(&author),
+            "created_at": 1_700_000_000 + n,
+            "kind": 1,
+            "tags": [],
+            "content": "hello world",
+            "sig": "00".repeat(64),
+        })
+        .to_string();
+        (packed.into_bytes(), json)
+    }
+
+    fn add_hello(n: u64) -> WriterMsg {
+        let (packed, json) = hello(n);
+        WriterMsg::AddEvent {
+            conn_id: 1,
+            source: TransportSource::ip_address("127.0.0.1".parse().unwrap()),
+            packed,
+            json,
+            authed: None,
+            grant: Default::default(),
+        }
+    }
+
+    /// A database of `events` notes, stored as publishing stores them: with
+    /// no search postings.
+    fn unsearched_database(events: u64) -> (tempfile::TempDir, Env) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut stored: Vec<_> = (0..events)
+            .map(|n| {
+                let (packed, json) = hello(n);
+                EventToWrite::new(packed, json)
+            })
+            .collect();
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut stored, false).unwrap();
+        txn.commit().unwrap();
+        (dir, env)
+    }
+
+    fn search_state(env: &Env) -> (u64, usize) {
+        let txn = env.begin_ro().unwrap();
+        let state = wok_db::search_index_state_ro(&txn).unwrap().unwrap();
+        (
+            state.indexed_through,
+            wok_db::search_posting_count(&txn, "hello").unwrap(),
+        )
+    }
+
+    /// Run a writer on `env` over `queued` publications until the channel
+    /// closes behind them.
+    fn run_queued(env: &Env, search_enabled: bool, queued: &[u64]) -> Arc<Metrics> {
+        let mut config = Config {
+            db: env.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.relay.search_enabled = search_enabled;
+        let metrics = Arc::new(Metrics::default());
+        let (writer_tx, writer_rx) = bounded(queued.len().max(1));
+        for &n in queued {
+            writer_tx.send(add_hello(n)).unwrap();
+        }
+        drop(writer_tx);
+        run_writer(
+            env.clone(),
+            Arc::new(parking_lot::RwLock::new(config)),
+            Arc::new(ConnTable::new()),
+            metrics.clone(),
+            writer_rx,
+            Vec::new(),
+            moderation(env),
+            TAG_KIND_STEP,
+        );
+        metrics
+    }
+
+    #[test]
+    fn a_busy_writer_builds_the_search_index_once_1000_events_wait() {
+        let (_dir, env) = unsearched_database(SEARCH_BUILD_BUSY_LAG - 2);
+        // The publication is stored with no postings, and with 999 events
+        // waiting, a writer with messages to take does not build.
+        let metrics = run_queued(&env, true, &[SEARCH_BUILD_BUSY_LAG - 2]);
+        assert_eq!(search_state(&env), (0, 0));
+        assert_eq!(
+            metrics.search_index_lag_events.load(Ordering::Relaxed),
+            SEARCH_BUILD_BUSY_LAG - 1
+        );
+        assert_eq!(
+            metrics
+                .search_index_build_events_total
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // The next makes 1,000, and one step runs before the writer takes
+        // another message.
+        let metrics = run_queued(&env, true, &[SEARCH_BUILD_BUSY_LAG - 1]);
+        let built = metrics
+            .search_index_build_events_total
+            .load(Ordering::Relaxed);
+        assert!(built > 0);
+        assert_eq!(search_state(&env), (built, built as usize));
+    }
+
+    #[test]
+    fn an_idle_writer_builds_the_search_index_while_search_is_on() {
+        let (dir, env) = unsearched_database(50);
+        let mut config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.relay.search_enabled = false;
+        let config = Arc::new(parking_lot::RwLock::new(config));
+        let metrics = Arc::new(Metrics::default());
+        let (writer_tx, writer_rx) = bounded(4);
+        let writer = {
+            let (env, config, metrics, moderation) = (
+                env.clone(),
+                config.clone(),
+                metrics.clone(),
+                moderation(&env),
+            );
+            std::thread::spawn(move || {
+                run_writer(
+                    env,
+                    config,
+                    Arc::new(ConnTable::new()),
+                    metrics,
+                    writer_rx,
+                    Vec::new(),
+                    moderation,
+                    TAG_KIND_STEP,
+                )
+            })
+        };
+        let wait_until_built = |events: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while metrics
+                .search_index_build_events_total
+                .load(Ordering::Relaxed)
+                < events
+            {
+                assert!(std::time::Instant::now() < deadline, "build stalled");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // With search off, an idle writer builds nothing.
+        writer_tx.send(add_hello(50)).unwrap();
+        std::thread::sleep(SEARCH_BUILD_IDLE * 10);
+        assert_eq!(search_state(&env), (0, 0));
+        assert_eq!(metrics.search_index_lag_events.load(Ordering::Relaxed), 51);
+
+        // A reload turns search on: the next message the writer takes
+        // starts the build.
+        config.write().relay.search_enabled = true;
+        writer_tx.send(WriterMsg::Maintenance).unwrap();
+        wait_until_built(51);
+        assert_eq!(search_state(&env), (51, 51));
+        assert!(metrics
+            .render()
+            .contains("\nwok_search_index_lag_events 0\n"));
+
+        // A publication is indexed once the writer is idle again.
+        writer_tx.send(add_hello(51)).unwrap();
+        wait_until_built(52);
+        writer_tx.send(WriterMsg::Stop).unwrap();
+        writer.join().unwrap();
+        assert_eq!(search_state(&env), (52, 52));
+        assert_eq!(metrics.search_index_lag_events.load(Ordering::Relaxed), 0);
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:?}", report.issues);
     }
 }

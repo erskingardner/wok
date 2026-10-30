@@ -231,6 +231,86 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('stop wok before reconciling', result.stderr)
 
+    def test_io_marks_keep_metrics_that_give_each_phases_writer_batches(self):
+        self.write_target('wok', self.valid(METRICS_URL='http://127.0.0.1:9784/metrics'))
+        artifacts = self.prefix/'opt/relay-bench/campaigns/c1/runs/r1-wok/server'
+        artifacts.mkdir(parents=True)
+        (artifacts/'main.pid').write_text('4242\n')
+        io = self.prefix/'proc/4242/io'
+        io.parent.mkdir(parents=True)
+        io.write_text('read_bytes: 0\nwrite_bytes: 0\n')
+        scrape = self.prefix/'metrics.prom'
+
+        scraped_at = self.prefix/'scraped-at'
+
+        def mark(label, commits, events=0, seconds=0.0, stored_bytes=0):
+            if commits is None:
+                scrape.unlink(missing_ok=True)
+            elif commits == 'old':
+                # Wok before #258 serves metrics without the writer's series.
+                scrape.write_text('wok_connections 3\n')
+            else:
+                scrape.write_text(
+                    '# HELP wok_writer_commit_events Events each writer commit stored\n'
+                    f'wok_writer_commit_events_bucket{{le="+Inf"}} {commits}\n'
+                    f'wok_writer_commit_events_sum {events}\n'
+                    f'wok_writer_commit_events_count {commits}\n'
+                    f'wok_writer_queue_depth_sum {2 * events}\n'
+                    f'wok_writer_queue_depth_count {commits}\n'
+                    f'wok_writer_prepare_seconds_sum {seconds / 10}\n'
+                    f'wok_writer_write_seconds_sum {seconds / 2}\n'
+                    f'wok_writer_commit_seconds_sum {seconds}\n'
+                    f'wok_writer_reply_seconds_sum {seconds / 5}\n'
+                    f'wok_writer_storage_bytes_total {stored_bytes}\n'
+                    'wok_connections 3\n')
+            # A scrape that fails leaves no snapshot, like curl --fail. Each
+            # records how many marks were written when it ran.
+            return self.control(
+                f'curl() {{ wc -l <"{artifacts}/io-marks.tsv" >>"{scraped_at}" 2>/dev/null'
+                f' || echo 0 >>"{scraped_at}"; cat "{scrape}"; }}; io_mark wok "$1" "$2"',
+                str(artifacts), label)
+
+        for label, *metrics in [('query-start', 10, 100, 0.5, 1000),
+                                ('query-end', 10, 100, 0.5, 1000),
+                                ('rate-1000-start', 10, 100, 0.5, 1000),
+                                ('rate-1000-end', 30, 2100, 1.5, 401000),
+                                ('rate-2000-start', None),
+                                ('rate-2000-end', 40, 4100, 2.0, 801000),
+                                ('rate-3000-start', 'old'),
+                                ('rate-3000-end', 50, 5100, 2.5, 901000)]:
+            result = mark(label, *metrics)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((artifacts/'metrics-marks/rate-2000-start.prom').exists())
+        # A start is scraped before its mark and an end after, so the scrape
+        # is outside the interval io-phases.tsv times.
+        self.assertEqual([int(n) for n in scraped_at.read_text().split()],
+                         [0, 2, 2, 4, 4, 6, 6, 8])
+
+        result = self.control('writer_phases "$1"', str(artifacts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [line.split('\t') for line in
+                (artifacts/'writer-phases.tsv').read_text().splitlines()]
+        self.assertEqual(rows[0], ['phase', 'commits', 'events', 'events_per_commit',
+                                   'queue_depth', 'prepare_ms', 'write_ms', 'commit_ms',
+                                   'reply_ms', 'storage_bytes_per_event'])
+        # No commits, no means. A phase missing a snapshot, or the writer's
+        # series in one, is left out.
+        self.assertEqual(rows[1:], [
+            ['query', '0', '0', '', '', '', '', '', '', ''],
+            ['rate-1000', '20', '2000', '100.00', '200.00', '5.00', '25.00', '50.00',
+             '10.00', '200'],
+        ])
+
+        # Without METRICS_URL, as for strfry, marks keep no snapshots and the
+        # summary is its header.
+        self.write_target('wok', self.valid())
+        result = self.control('rm -r "$1/metrics-marks"; io_mark wok "$1" query-start'
+                              ' && io_mark wok "$1" query-end && writer_phases "$1"',
+                              str(artifacts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((artifacts/'metrics-marks').exists())
+        self.assertEqual(len((artifacts/'writer-phases.tsv').read_text().splitlines()), 1)
+
     def test_io_marks_bracket_phases_in_the_relays_io(self):
         self.write_target('wok', self.valid())
         artifacts = self.prefix/'opt/relay-bench/campaigns/c1/runs/r1-wok/server'
@@ -452,11 +532,12 @@ class CampaignSettings(unittest.TestCase):
                     self.assertIn('left no fixed-rate report', result.stderr)
             self.assertFalse((load/'rate-capacity.txt').exists())
 
-    def reconcile(self, root, launched, log_lines, fail_copy=''):
+    def reconcile(self, root, launched, log_lines, fail_copy='', copy_ssh=''):
         """Runs reconcile_rate_steps for repetition 2 of target wok, with
         the steps in launched started and each step's outcome log holding
         log_lines[rate] of its 10 planned events (none when absent). Copying
-        step fail_copy's log to the relay host fails."""
+        step fail_copy's log to the relay host fails. copy_ssh is
+        RELAY_COPY_SSH."""
         load = root/'l/runs/r2-wok/load'
         for rate in launched:
             self.write_rate_results(load, rate)
@@ -478,7 +559,7 @@ class CampaignSettings(unittest.TestCase):
                 f'echo "scp $from $to" >>"{calls}"; cp "${{from#*:}}" "${{to#*:}}"; }}; '
                 f'LOAD_ROOT={root}/l RELAY_ROOT={root}/r; '
                 f'RATE_LAUNCHED=({" ".join(map(str, launched))}); reconcile_rate_steps wok 2')
-        result = self.campaign(body, RATE_STEPS='1000 2000 4000')
+        result = self.campaign(body, RATE_STEPS='1000 2000 4000', RELAY_COPY_SSH=copy_ssh)
         sent = calls.read_text().splitlines() if calls.exists() else []
         return result, sent, load, f'{root}/r/runs/r2-wok/rate'
 
@@ -503,6 +584,41 @@ class CampaignSettings(unittest.TestCase):
             result, sent, _, _ = self.reconcile(Path(tmp), [], {})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(sent, [])
+
+    def test_copies_go_directly_between_the_hosts_when_the_load_host_can(self):
+        stub = ('remote_command() { echo "on $*"; }; scp() { echo "scp $*"; }; '
+                'copy_to_relay /l/c /r/c; copy_to_load /r/x /l/x; copy_to_load -r /r/s/. /l/s/')
+        through = self.campaign(stub)
+        self.assertEqual(through.returncode, 0, through.stderr)
+        options = '-o ControlMaster=auto -o ControlPersist=300 -o ControlPath=/tmp/wok-bench-%C'
+        self.assertEqual(through.stdout.splitlines(), [
+            f'scp {options} -3 -q root@load:/l/c root@relay:/r/c',
+            f'scp {options} -3 -q root@relay:/r/x root@load:/l/x',
+            f'scp {options} -3 -q -r root@relay:/r/s/. root@load:/l/s/',
+        ])
+        # The load host runs each copy itself, to the relay host's address
+        # as it reaches it.
+        direct = self.campaign(stub, RELAY_COPY_SSH='root@10.0.0.2')
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        self.assertEqual(direct.stdout.splitlines(), [
+            'on root@load scp -o BatchMode=yes -q /l/c root@10.0.0.2:/r/c',
+            'on root@load scp -o BatchMode=yes -q root@10.0.0.2:/r/x /l/x',
+            'on root@load scp -o BatchMode=yes -q -r root@10.0.0.2:/r/s/. /l/s/',
+        ])
+
+    def test_reconciles_with_direct_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, sent, load, relay = self.reconcile(
+                Path(tmp), [1000], {1000: 10}, copy_ssh='root@10.0.0.2')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sent, [
+                f'scp {load}/rate-1000/outcomes-wok-r2-r1.jsonl '
+                f'root@10.0.0.2:{relay}/rate-1000/outcomes.jsonl',
+                f'control reconcile wok /opt/relay-bench/bin/wok-bench/wok-bench {relay} '
+                '--nofile 524288',
+                f'scp root@10.0.0.2:{relay}/rate-1000/reconciliation.json '
+                f'{load}/rate-1000/reconciliation.json',
+            ])
 
     def test_reconciliation_fails_without_every_started_steps_whole_log(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -687,9 +803,14 @@ class CampaignSettings(unittest.TestCase):
                 line = next(line for line in sent if f'control {command} ' in line)
                 self.assertIn('--nofile 1048576', line)
             # An earlier run's I/O summary is gone before this run starts.
-            clear = sent.index('root@load rm -f -- /l/runs/r1-strfry-1.1.3/server/io-phases.tsv')
-            self.assertLess(clear, next(i for i, line in enumerate(sent)
-                                        if 'control start ' in line))
+            start = next(i for i, line in enumerate(sent) if 'control start ' in line)
+            clear = sent.index('root@load rm -f -- /l/runs/r1-strfry-1.1.3/server/io-phases.tsv'
+                               ' /l/runs/r1-strfry-1.1.3/server/writer-phases.tsv')
+            self.assertLess(clear, start)
+            # And its metrics snapshots, which the copy back would only add to.
+            snapshots = sent.index(
+                'root@load rm -rf -- /l/runs/r1-strfry-1.1.3/server/metrics-marks')
+            self.assertLess(snapshots, start)
 
     def test_rejects_incomplete_or_invalid_settings(self):
         cases = {

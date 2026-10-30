@@ -1044,10 +1044,17 @@ Settled ones were duplicates, older versions of a replaceable event, or
 deleted, and have no row of their own; a social corpus has many. An event
 left pending or over a quota is unfinished and fails the trial.
 
+Publishing writes no NIP-50 search postings; the relay writer indexes
+stored events in later steps of their own. The scenario takes the steps a
+busy writer takes: one after a batch once 1,000 events wait, and, at the
+end of each step, the ones an idle writer takes to index the rest. Their
+time and bytes count in the step's. The preload builds the index for the
+history.
+
 Per step the table gives those counts, transactions, stored events per
 second and µs per stored event, transaction time (from `begin_rw` to the
-end of the commit) and commit time at p50 and p99, and the growth of
-`data.mdb`. On Linux it also gives the bytes the process wrote per stored
+end of the commit) and commit time at p50 and p99, the growth of
+`data.mdb`, and the events the search build indexed and its time. On Linux it also gives the bytes the process wrote per stored
 event and the 4 KiB pages per commit, from `write_bytes` in
 `/proc/self/io`, which counts each page once per commit that dirties it.
 With the minimum of 20 commits, a step's p99 is close to its maximum. The
@@ -1305,8 +1312,25 @@ host reaches it) and `TARGETS` are required. The other settings are
 `PUBLISH_CONNECTIONS`, `FANOUT_SUBSCRIBERS`, `FANOUT_EVENTS`, `FANOUT_WINDOW`,
 `IDLE_CONNECTIONS`, `HOLD_SECONDS`, `LIFECYCLE_EVENTS`,
 `LIFECYCLE_CONNECTIONS`, `RATE_STEPS`, `RATE_SECS`, `RATE_DRAIN_SECS`,
-`RATE_CONNECTIONS`, `RATE_P99_MS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED`
-and `BASE_TIMESTAMP`.
+`RATE_CONNECTIONS`, `RATE_P99_MS`, `NOFILE_LIMIT`, `COOLDOWN_SECONDS`, `SEED`,
+`BASE_TIMESTAMP` and `RELAY_COPY_SSH`.
+
+The campaign copies the corpus, each fixed-rate step's outcome log and
+reconciliation, and each run's server artifacts between the hosts. By default
+every copy passes through the operator host, at the speed of its own links,
+which for a large corpus can take hours. Set `RELAY_COPY_SSH` to the relay
+host's SSH destination as the load host reaches it, such as
+`root@RELAY_PRIVATE_IP`, and the load host copies directly. It needs a key the
+relay host accepts without a prompt, and the campaign checks that before it
+starts. Limit that key in the relay host's `authorized_keys` to the load host's
+address, with no forwarding:
+
+```text
+from="LOAD_PRIVATE_IP",no-agent-forwarding,no-port-forwarding,no-X11-forwarding ssh-ed25519 AAAA...
+```
+
+Also pin the relay host's key in the load host's `known_hosts`, so the first
+copy does not trust whatever key it is offered.
 
 A social corpus needs targets that accept its largest events: its manifest
 gives `needed_max_event_size`, and strfry's default `events.maxEventSize` of
@@ -1363,6 +1387,18 @@ run removes the earlier copy of `io-phases.tsv`, each relay start begins new
 marks, and each phase starts from an empty directory, so under a reused
 campaign ID a phase that runs never reports an earlier run's results or
 bytes. A phase the rerun does not reach keeps the earlier run's files.
+
+When the target sets `METRICS_URL`, each mark also saves the relay's metrics
+as `metrics-marks/<label>.prom`, and `writer-phases.tsv` gives, for each
+phase with both snapshots, the Wok writer's commits and stored events, its
+mean events per commit and the queue it found, its mean milliseconds per
+commit in each stage (prepare, write, commit, reply), and the bytes its
+commits sent to storage per stored event. These come from the writer's
+cumulative histograms, so a step's batches show apart from the load before
+it. A start is scraped before its I/O mark and an end after, so a slow scrape
+never lengthens the phase's seconds. A phase is left out when a scrape fails
+or a snapshot lacks the writer's series, as strfry's and those of Wok before
+#258 do.
 
 Load-side artifacts live under `/opt/wok-load/results/<campaign-id>` and
 contain the corpus, campaign metadata, every harness result, `/usr/bin/time`

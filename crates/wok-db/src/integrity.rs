@@ -3,13 +3,16 @@
 
 use crate::fbs::{decode_compression_dictionary, decode_meta, decode_negentropy_filter};
 use crate::payload::{parse_payload, Decompressor, PayloadView};
-use crate::search::{is_search_marker, search_index_entries, search_term_from_key};
+use crate::search::{
+    check_event_text, is_search_marker, payload_kind, search_index_entries,
+    search_indexed_through_ro, search_term_from_key,
+};
 use crate::tag_kind::{
     is_tag_kind_marker, is_valid_pass_record, tag_kind_index_state_ro, tag_kind_keys,
     TagKindIndexState, TAG_KIND_SCHEMA_VERSION,
 };
 use crate::txn::RoTxn;
-use crate::write::{event_index_entries, EventIndexEntry};
+use crate::write::{event_index_entries, replace_key, EventIndexEntry};
 use crate::DbError;
 use lmdb_sys::MDB_dbi;
 use serde::Serialize;
@@ -156,8 +159,9 @@ fn read_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_ne_bytes(bytes.try_into().ok()?))
 }
 
-/// Balances one table's postings against the entries their events derive, so
-/// that each event's entries are derived once rather than once per posting.
+/// Balances the postings of one table, or of several, against the entries
+/// their events derive, so that each event's entries are derived once rather
+/// than once per posting.
 /// The event pass subtracts, in the bucket of the event's local id, each entry
 /// it derives and finds stored; the postings pass adds each posting that names
 /// an event the event pass derived, a lookup with no derivation. Every bucket
@@ -203,19 +207,19 @@ impl PostingBalance {
     }
 }
 
-/// Report the postings of `dbi` that `balance` counted as unexpected, in key
-/// order, while the report has room. `unexpected` derives the event of a
-/// posting in a suspect bucket and gives the issue's detail when it is one
-/// that the balance counted and that its event does not derive.
+/// Report the `remaining` postings of `dbi` that `balance` counted as
+/// unexpected, in key order, while the report has room. `unexpected` derives
+/// the event of a posting in a suspect bucket and gives the issue's detail
+/// when it is one that the balance counted and that its event does not derive.
 fn name_unexpected_postings(
     txn: &RoTxn<'_>,
     dbi: MDB_dbi,
     table: &'static str,
+    mut remaining: u64,
     balance: &mut PostingBalance,
     report: &mut IntegrityReport,
     mut unexpected: impl FnMut(&[u8], u64) -> Option<String>,
 ) -> Result<(), DbError> {
-    let mut remaining = balance.unexpected();
     if remaining == 0 || report.issues.len() >= MAX_REPORTED_ISSUES {
         return Ok(());
     }
@@ -246,7 +250,8 @@ fn readable_event(txn: &RoTxn<'_>, lev_id: u64) -> bool {
 }
 
 /// Whether the event at `lev_id`, whose payload is `payload`, derives the
-/// search posting `key`.
+/// search posting `key`. With no readable PackedEvent, the payload's own kind
+/// is the one it was indexed under.
 fn derives_search_posting(
     txn: &RoTxn<'_>,
     decompressor: &mut Decompressor,
@@ -254,10 +259,15 @@ fn derives_search_posting(
     lev_id: u64,
     key: &[u8],
 ) -> bool {
-    decompressor
-        .decode(txn, payload, 16 * 1024 * 1024)
-        .ok()
-        .and_then(|json| search_index_entries(lev_id, json).ok())
+    let Ok(json) = decompressor.decode(txn, payload, 16 * 1024 * 1024) else {
+        return false;
+    };
+    let kind = match txn.get_u64(txn.env().dbis().event, lev_id) {
+        Ok(Some(raw)) => PackedEventView::new(raw).ok().map(|packed| packed.kind()),
+        _ => None,
+    };
+    kind.or_else(|| payload_kind(json))
+        .and_then(|kind| search_index_entries(lev_id, kind, json).ok())
         .is_some_and(|entries| entries.iter().any(|(expected, _)| expected == key))
 }
 
@@ -458,8 +468,25 @@ fn check_state(
                     report.issue("malformed-value", "author_counts", error.to_string());
                 }
             }
+        } else if key.first() == Some(&crate::state::VANISH_SWEEP) {
+            if key.len() != 33 {
+                report.metadata_errors += 1;
+                report.issue(
+                    "malformed-key",
+                    "state",
+                    format!("vanish sweep key has {} bytes, expected 33", key.len()),
+                );
+            } else if let Err(error) = crate::vanish::SweepProgress::decode(raw) {
+                report.metadata_errors += 1;
+                report.issue(
+                    "malformed-value",
+                    "state",
+                    format!("vanish sweep {}: {error}", wok_event::to_hex(&key[1..])),
+                );
+            }
         } else if key == crate::state::HIGH_WATER
             || key == crate::state::POLICY_GENERATION
+            || key == crate::state::VANISH_MARKER_CHANGES
             || key == crate::state::SUPERSEDED_EVENTS
             || key == crate::state::LEGACY_SUPERSEDED_EVENTS
         {
@@ -593,8 +620,9 @@ fn check_tag_kind_postings(
         }
         true
     })?;
-    tag_kind.unexpected_entries += balance.unexpected();
-    name_unexpected_postings(txn, dbi, TABLE, balance, report, |key, lev_id| {
+    let count = balance.unexpected();
+    tag_kind.unexpected_entries += count;
+    name_unexpected_postings(txn, dbi, TABLE, count, balance, report, |key, lev_id| {
         if is_tag_kind_marker(key) || key.len() <= 16 {
             return None;
         }
@@ -609,6 +637,7 @@ fn check_tag_kind_postings(
 fn check_search_postings(
     txn: &RoTxn<'_>,
     dbi: MDB_dbi,
+    indexed_through: u64,
     balance: &mut PostingBalance,
     report: &mut IntegrityReport,
 ) -> Result<(), DbError> {
@@ -657,10 +686,18 @@ fn check_search_postings(
                 return true;
             }
         };
-        // The event pass derived the entries of a readable event. A payload
-        // without one, orphaned or under a PackedEvent too short, is rare:
-        // derive it here.
-        if readable_event(txn, lev_id) {
+        // No event above the marker has postings yet. The event pass derived
+        // the entries of a readable event at or below it. A payload without
+        // one, orphaned or under a PackedEvent too short, is rare: derive it
+        // here.
+        if lev_id > indexed_through {
+            report.extra_index_entries += 1;
+            report.issue(
+                "unexpected-index",
+                TABLE,
+                format!("term {term:?}, levId {lev_id} above indexed-through {indexed_through}"),
+            );
+        } else if readable_event(txn, lev_id) {
             balance.stored(lev_id);
         } else if !derives_search_posting(txn, &mut decompressor, payload, lev_id, key) {
             report.extra_index_entries += 1;
@@ -672,8 +709,9 @@ fn check_search_postings(
         }
         true
     })?;
-    report.extra_index_entries += balance.unexpected();
-    name_unexpected_postings(txn, dbi, TABLE, balance, report, |key, lev_id| {
+    let count = balance.unexpected();
+    report.extra_index_entries += count;
+    name_unexpected_postings(txn, dbi, TABLE, count, balance, report, |key, lev_id| {
         let term = search_term_from_key(key)?;
         let payload = txn.get_u64(payloads, lev_id).ok()??;
         (readable_event(txn, lev_id)
@@ -706,6 +744,14 @@ fn check_tag_kind_pass(
     Ok(())
 }
 
+/// The position of `dbi` among `indexes`.
+fn index_of(indexes: &[(&'static str, MDB_dbi)], dbi: MDB_dbi) -> usize {
+    indexes
+        .iter()
+        .position(|&(_, index)| index == dbi)
+        .expect("an event-derived index")
+}
+
 fn index_specs(txn: &RoTxn<'_>) -> [(&'static str, MDB_dbi); 10] {
     let dbis = txn.env().dbis();
     [
@@ -734,7 +780,21 @@ fn check_integrity_with_buckets(
     let mut report = IntegrityReport::default();
     let mut search_decompressor = Decompressor::new();
     let mut search_balance = PostingBalance::new(buckets);
+    // Only the events at or below the search marker have postings.
+    let search_through = match dbis.event_search {
+        Some(_) => search_indexed_through_ro(txn)?,
+        None => 0,
+    };
     let mut tag_kind_balance = PostingBalance::new(buckets);
+    // The strfry-layout indexes share one balance, except `event_replace`:
+    // superseded history is counted from the postings their versions derive,
+    // so each of its postings is checked against its event's replacement key.
+    // Per index, the entries the event pass found stored and the postings
+    // naming a readable event; the difference is the unexpected postings.
+    let indexes = index_specs(txn);
+    let mut index_balance = PostingBalance::new(buckets);
+    let mut found = [0u64; 10];
+    let mut stored = [0u64; 10];
     let mut authors = HashMap::<[u8; 32], u64>::new();
     let mut largest_id = 0;
     let tag_entries = txn.entries(dbis.event_tag)? as u64;
@@ -785,7 +845,11 @@ fn check_integrity_with_buckets(
         let mut lacks_legacy_entries = false;
         for entry in event_index_entries(dbis, lev_id, packed) {
             match entry_exists(txn, &entry) {
-                Ok(true) => {}
+                Ok(true) if entry.dbi == dbis.event_replace => {}
+                Ok(true) => {
+                    index_balance.derived(lev_id);
+                    found[index_of(&indexes, entry.dbi)] += 1;
+                }
                 Ok(false) if entry.legacy_optional => {
                     lacks_legacy_entries = true;
                     continue;
@@ -855,7 +919,14 @@ fn check_integrity_with_buckets(
             ) {
                 report.legacy_long_tag_records += 1;
             }
-            match search_index_entries(lev_id, &json) {
+            let entries = check_event_text(&json).and_then(|()| {
+                if lev_id <= search_through {
+                    search_index_entries(lev_id, packed.kind(), &json)
+                } else {
+                    Ok(Vec::new())
+                }
+            });
+            match entries {
                 Ok(entries) => {
                     for (key, value) in entries {
                         let entry = EventIndexEntry {
@@ -921,7 +992,7 @@ fn check_integrity_with_buckets(
         true
     })?;
 
-    for (name, dbi) in index_specs(txn) {
+    for (index, &(name, dbi)) in indexes.iter().enumerate() {
         let mut replacement_key = Vec::new();
         let mut replacement_count = 0u64;
         txn.foreach_full(dbi, &[], &[], false, |key, value| {
@@ -956,16 +1027,14 @@ fn check_integrity_with_buckets(
                     return true;
                 }
             };
-            let expected = event_index_entries(dbis, lev_id, packed);
-            if !expected
-                .iter()
-                .any(|entry| entry.name == name && entry.key == key && entry.value == value)
-            {
+            if dbi != dbis.event_replace {
+                stored[index] += 1;
+                index_balance.stored(lev_id);
+            } else if replace_key(packed).as_deref() != Some(key) {
                 report.extra_index_entries += 1;
                 report.issue("unexpected-index", name, format!("levId {lev_id}"));
-            } else if name == "event_replace"
-                && (wok_event::is_replaceable_kind(packed.kind())
-                    || wok_event::is_param_replaceable_kind(packed.kind()))
+            } else if wok_event::is_replaceable_kind(packed.kind())
+                || wok_event::is_param_replaceable_kind(packed.kind())
             {
                 // DUPSORT groups each address contiguously; constant extra memory.
                 if replacement_key != key {
@@ -983,9 +1052,37 @@ fn check_integrity_with_buckets(
             true
         })?;
     }
+    for (index, &(name, dbi)) in indexes.iter().enumerate() {
+        // Lookup errors, already reported, can leave either count short.
+        let count = stored[index].saturating_sub(found[index]);
+        report.extra_index_entries += count;
+        name_unexpected_postings(
+            txn,
+            dbi,
+            name,
+            count,
+            &mut index_balance,
+            &mut report,
+            |key, lev_id| {
+                let raw = txn.get_u64(dbis.event, lev_id).ok()??;
+                let packed = PackedEventView::new(raw).ok()?;
+                (!event_index_entries(dbis, lev_id, packed)
+                    .iter()
+                    .any(|entry| entry.dbi == dbi && entry.key == key))
+                .then(|| format!("levId {lev_id}"))
+            },
+        )?;
+    }
+    drop(index_balance);
 
     if let Some(search_dbi) = dbis.event_search {
-        check_search_postings(txn, search_dbi, &mut search_balance, &mut report)?;
+        check_search_postings(
+            txn,
+            search_dbi,
+            search_through,
+            &mut search_balance,
+            &mut report,
+        )?;
     }
 
     if let (Some(dbi), Some(tag_kind)) = (dbis.event_tag_kind, tag_kind.as_mut()) {
@@ -1022,6 +1119,7 @@ fn check_integrity_with_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::make_key_string_u64;
     use crate::tag_kind::tag_kind_key;
     use crate::{write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
     use serde_json::json;
@@ -1057,6 +1155,7 @@ mod tests {
         let mut txn = env.begin_rw().unwrap();
         write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
         txn.commit().unwrap();
+        crate::finish_search_index(&env).unwrap();
 
         let lev = |i: usize| events[i].lev_id.to_ne_bytes();
         let search = env.dbis().event_search.unwrap();
@@ -1104,6 +1203,81 @@ mod tests {
                     "event_tag_kind",
                     format!("levId {}", events[2].lev_id).as_str()
                 ),
+            ]
+        );
+        let many = check_integrity(&txn).unwrap();
+        assert_eq!(
+            serde_json::to_value(&shared).unwrap(),
+            serde_json::to_value(&many).unwrap()
+        );
+    }
+
+    /// The strfry-layout indexes share one balance: unexpected postings of
+    /// several indexes, in the buckets of the same events, are named in
+    /// index and key order whatever the buckets.
+    #[test]
+    fn one_bucket_names_the_same_index_postings_as_many() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let mut events = (0..4)
+            .map(|i| note(1_000 + i, &format!("n{i}")))
+            .collect::<Vec<_>>();
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+
+        let dbis = env.dbis();
+        let lev = |i: usize| events[i].lev_id;
+        // The entry of event `i` in `table` whose key starts with `prefix`.
+        let entry = |i: usize, table: &str, prefix: &[u8]| {
+            let packed = PackedEventView::new(&events[i].packed).unwrap();
+            event_index_entries(dbis, lev(i), packed)
+                .into_iter()
+                .find(|entry| entry.name == table && entry.key.starts_with(prefix))
+                .unwrap()
+        };
+        let mut txn = env.begin_rw().unwrap();
+        for (i, table, prefix, other) in [
+            (0, "event_tag", &b"t"[..], 1),
+            (2, "event_tag", b"p", 3),
+            (3, "event_created_at", b"", 0),
+            (0, "event_kind", b"", 2),
+        ] {
+            let entry = entry(i, table, prefix);
+            txn.put(entry.dbi, &entry.key, &lev(other).to_ne_bytes(), 0)
+                .unwrap();
+        }
+        let id = entry(1, "event_id", b"");
+        assert!(txn.del(id.dbi, &id.key, Some(&id.value)).unwrap());
+        let pubkey = entry(2, "event_pubkey", b"");
+        txn.put(pubkey.dbi, &pubkey.key, &99u64.to_ne_bytes(), 0)
+            .unwrap();
+        let author = PackedEventView::new(&events[0].packed).unwrap().pubkey();
+        let address = make_key_string_u64(&[author, b"x"].concat(), 1);
+        txn.put(dbis.event_replace, &address, &lev(0).to_ne_bytes(), 0)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro().unwrap();
+        let shared = check_integrity_with_buckets(&txn, 1).unwrap();
+        assert_eq!(shared.missing_index_entries, 1, "{shared:#?}");
+        assert_eq!(shared.extra_index_entries, 6, "{shared:#?}");
+        let unexpected = shared
+            .issues
+            .iter()
+            .filter(|issue| issue.category == "unexpected-index")
+            .map(|issue| (issue.table, issue.detail.clone()))
+            .collect::<Vec<_>>();
+        let detail = |i: usize| format!("levId {}", lev(i));
+        assert_eq!(
+            unexpected,
+            [
+                ("event_replace", detail(0)),
+                ("event_tag", detail(3)),
+                ("event_tag", detail(1)),
+                ("event_created_at", detail(0)),
+                ("event_kind", detail(2)),
             ]
         );
         let many = check_integrity(&txn).unwrap();

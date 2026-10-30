@@ -30,8 +30,9 @@ it is not a promise to reproduce upstream bugs.
   `sourceType: "unix"` for those connections.
 - `wok event <levId>` prints one event by local event ID.
 - NIP-11 `software` is Wok's homepage, `https://github.com/erskingardner/wok`.
-- Wok implements NIP-50 ranked content search using a Wok-owned derived LMDB
-  index. The pinned strfry revision has no NIP-50 implementation.
+- Wok implements NIP-50 ranked search of text kinds and profiles using a
+  Wok-owned derived LMDB index. The pinned strfry revision has no NIP-50
+  implementation.
 - Wok returns mergeable NIP-45 HyperLogLog sketches for canonical
   single-target COUNT filters, including address and hashed-string offsets;
   this is not present in the pinned strfry revision.
@@ -134,6 +135,20 @@ it is not a promise to reproduce upstream bugs.
   inflates past half of `relay.max_websocket_payload_size` plus 64 KiB and
   to more than 32 times its compressed size; strfry inflates any message up
   to its maximum size.
+- permessage-deflate is negotiated as RFC 7692 §7 says. Wok accepts the
+  first offer in the client's list that it can honour and answers with no
+  extension when none can be. An offer is declined when a parameter is
+  unknown, repeated or has an invalid value, or when it asks for a
+  `server_max_window_bits` below 15, since Wok compresses only with a
+  32 KiB window. `server_no_context_takeover` and
+  `client_no_context_takeover` are echoed when offered, and the first turns
+  context takeover off for that connection's messages whatever
+  `relay.compression_sliding_window` says; `client_max_window_bits` is
+  accepted and left out of the answer. The pinned strfry's uWebSockets
+  reads only the first `permessage-deflate` offer, ignores window bits and
+  any parameter it does not know, and always answers with
+  `client_no_context_takeover`, adding `server_no_context_takeover` when
+  offered.
 - A WebSocket client that breaks RFC 6455 or RFC 7692 gets a Close frame
   with the status code for the breach before the connection drops: 1002 for
   a framing error, such as a ping, pong, close or continuation frame marked

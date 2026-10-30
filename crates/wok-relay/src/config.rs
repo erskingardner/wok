@@ -271,6 +271,11 @@ pub struct RelayConfig {
     /// COUNT or NEG-OPEN whose filters carry `search` is refused before
     /// they are parsed.
     pub search_enabled: bool,
+    /// Keep the `(tag, kind, created_at)` index, which lets a filter with one
+    /// tag and `kinds` read only those kinds. Off, the writer puts none of
+    /// its postings and builds none, and such filters read the tag index;
+    /// back on, the writer builds the postings it left out.
+    pub tag_kind_index_enabled: bool,
     pub max_total_events_per_req: u64,
     pub max_subs_per_connection: usize,
     /// Per-subscription bytes of live matches held while its history is
@@ -540,6 +545,7 @@ impl Default for Config {
                 max_and_entries: default_max_and_entries(),
                 max_filter_limit_count: 1_000_000,
                 search_enabled: true,
+                tag_kind_index_enabled: true,
                 max_total_events_per_req: 10_000,
                 max_subs_per_connection: 200,
                 max_live_buffer_bytes: default_max_live_buffer_bytes(),

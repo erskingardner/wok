@@ -6,7 +6,7 @@ use crate::keys::{
     u64_from_ne_checked,
 };
 use crate::payload::{encode_raw_payload, Decompressor};
-use crate::search::{index_event_search, note_search_indexed_through, remove_event_search};
+use crate::search::{payload_kind, remove_event_search, search_indexed_through_rw};
 use crate::tag_kind::{
     del_tag_kind_entries, note_tag_kind_indexed, put_tag_kind_entries, tag_kind_keys,
 };
@@ -188,6 +188,16 @@ fn original_tag_value(json: &str, name: &str, packed_value: &[u8]) -> Result<Vec
         .ok_or_else(|| DbError::msg(format!("event JSON lacks its hashed {name} tag")))
 }
 
+/// The `event_replace` key of an event: its author and the value of its first
+/// `d` tag, then its kind. An event without a `d` tag has none.
+pub(crate) fn replace_key(packed: PackedEventView<'_>) -> Option<Vec<u8>> {
+    let d = packed.first_d_tag()?;
+    let mut s = Vec::with_capacity(32 + d.len());
+    s.extend_from_slice(packed.pubkey());
+    s.extend_from_slice(&d);
+    Some(make_key_string_u64(&s, packed.kind()))
+}
+
 fn index_event(packed: PackedEventView<'_>) -> EventIndices {
     let index_time = packed.created_at();
     let mut idx = EventIndices {
@@ -204,7 +214,7 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
         tag_kind: tag_kind_keys(packed),
         deletion: Vec::new(),
         expiration: Vec::new(),
-        replace: Vec::new(),
+        replace: replace_key(packed).into_iter().collect(),
         replace_deletion: Vec::new(),
         canonical_replace_deletion: Vec::new(),
     };
@@ -215,12 +225,7 @@ fn index_event(packed: PackedEventView<'_>) -> EventIndices {
         tag_key.extend_from_slice(tag_val);
         idx.tag.push(make_key_string_u64(&tag_key, index_time));
 
-        if tag_name == 'd' && idx.replace.is_empty() {
-            let mut s = Vec::with_capacity(32 + tag_val.len());
-            s.extend_from_slice(packed.pubkey());
-            s.extend_from_slice(tag_val);
-            idx.replace.push(make_key_string_u64(&s, packed.kind()));
-        } else if tag_name == 'e' && packed.kind() == 5 {
+        if tag_name == 'e' && packed.kind() == 5 {
             let mut s = Vec::with_capacity(tag_val.len() + 32);
             s.extend_from_slice(tag_val);
             s.extend_from_slice(packed.pubkey());
@@ -465,25 +470,35 @@ fn del_indices(txn: &mut RwTxn<'_>, lev_id: u64, idx: &EventIndices) -> Result<(
 pub fn delete_event_basic(txn: &mut RwTxn<'_>, lev_id: u64) -> Result<bool, DbError> {
     let dbis = txn.env().dbis();
     crate::state::preserve_high_water(txn)?;
-    if let Some(raw) = txn.get_u64(dbis.event, lev_id)?.map(<[u8]>::to_vec) {
-        crate::state::change_author_count(txn, PackedEventView::new(&raw)?.pubkey(), false)?;
+    let kind = if let Some(raw) = txn.get_u64(dbis.event, lev_id)?.map(<[u8]>::to_vec) {
+        let packed = PackedEventView::new(&raw)?;
+        crate::state::change_author_count(txn, packed.pubkey(), false)?;
         crate::state::invalidate_visibility(txn)?;
-    }
-    let json = if let Some(raw) = txn.get_u64(dbis.event_payload, lev_id)?.map(<[u8]>::to_vec) {
-        let mut decompressor = Decompressor::new();
-        Some(
-            decompressor
-                .decode_rw(txn, &raw, 16 * 1024 * 1024)?
-                .to_owned(),
-        )
+        Some(packed.kind())
     } else {
         None
+    };
+    // Only an event at or below the search marker has postings to remove.
+    let indexed = search_indexed_through_rw(txn)?.is_some_and(|through| lev_id <= through);
+    let json = match txn.get_u64(dbis.event_payload, lev_id)?.map(<[u8]>::to_vec) {
+        Some(raw) if indexed => {
+            let mut decompressor = Decompressor::new();
+            Some(
+                decompressor
+                    .decode_rw(txn, &raw, 16 * 1024 * 1024)?
+                    .to_owned(),
+            )
+        }
+        _ => None,
     };
     // C++ deleteEventBasic: payload row first; the return value reports
     // whether a payload existed, independent of the primary record.
     let deleted = txn.del_u64(dbis.event_payload, lev_id, None)?;
     if let Some(json) = json {
-        remove_event_search(txn, lev_id, &json)?;
+        // A payload with no PackedEvent was indexed under its own kind.
+        if let Some(kind) = kind.or_else(|| payload_kind(&json)) {
+            remove_event_search(txn, lev_id, kind, &json)?;
+        }
     }
     if let Some(buf) = txn.get_u64(dbis.event, lev_id)?.map(|b| b.to_vec()) {
         let packed = PackedEventView::new(&buf)?;
@@ -523,7 +538,7 @@ fn insert_event(txn: &mut RwTxn<'_>, packed: &[u8], json: &str) -> Result<u64, D
         }
     }
     put_indices(txn, lev_id, &idx)?;
-    index_event_search(txn, lev_id, json)?;
+    // Search postings are built in later transactions, from the marker up.
     Ok(lev_id)
 }
 
@@ -695,12 +710,11 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
     });
 
     let mut first_inserted = None;
-    let mut indexed_through = None;
+    let mut last_inserted = None;
 
     for i in 0..evs.len() {
         let mut lev_ids_to_delete: Vec<u64> = Vec::new();
         let (previous, current_and_after) = evs.split_at_mut(i);
-        let previous_packed = previous.last().map(|event| event.packed.as_slice());
         let EventToWrite {
             packed: packed_bytes,
             json,
@@ -710,10 +724,23 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         } = &mut current_and_after[0];
         let packed = PackedEventView::new(packed_bytes)?;
 
-        if lookup_event_by_id(txn, packed.id())?.is_some()
-            || previous_packed
-                .is_some_and(|previous| packed_bytes.get(0..32) == previous.get(0..32))
+        // Copies of one event sort next to each other, and the loop never
+        // revisits an event, so the previous copy's status is final. A copy
+        // has the event only when that one was stored or found stored;
+        // otherwise it shares that copy's refusal.
+        if let Some(copy) = previous
+            .last()
+            .filter(|previous| previous.packed.get(0..32) == packed_bytes.get(0..32))
         {
+            *status = match copy.status {
+                EventWriteStatus::Written | EventWriteStatus::Duplicate => {
+                    EventWriteStatus::Duplicate
+                }
+                refused => refused,
+            };
+            continue;
+        }
+        if lookup_event_by_id(txn, packed.id())?.is_some() {
             *status = EventWriteStatus::Duplicate;
             continue;
         }
@@ -932,7 +959,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
         let inserted_lev_id = insert_event(txn, packed_bytes, json)?;
         first_inserted.get_or_insert(inserted_lev_id);
-        indexed_through = Some(inserted_lev_id);
+        last_inserted = Some(inserted_lev_id);
         *lev_id = inserted_lev_id;
         ne.update(txn, packed, true)?;
         *status = EventWriteStatus::Written;
@@ -945,13 +972,7 @@ pub fn write_events_with_quota<N: NegentropySink, C>(
         }
     }
 
-    // The search watermark is transaction-level progress. Updating the
-    // DUPSORT metadata key after every event needlessly deletes and reinserts
-    // the same record throughout a batch.
-    if let Some(lev_id) = indexed_through {
-        note_search_indexed_through(txn, lev_id)?;
-    }
-    if let (Some(first), Some(last)) = (first_inserted, indexed_through) {
+    if let (Some(first), Some(last)) = (first_inserted, last_inserted) {
         // Moving the marker past events whose postings were deferred would
         // mark the table complete without them.
         if !txn.defer_tag_kind {

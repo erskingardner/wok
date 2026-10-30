@@ -1,0 +1,17 @@
+# lmdb-sys 0.8.0 with LMDB 0.9.37 in place of the 0.9.21 it bundles, always
+# built from this copy. See README.md.
+[package]
+name = "lmdb-sys"
+version = "0.8.0"
+authors = ["Dan Burkert <dan@danburkert.com>"]
+license = "Apache-2.0"
+description = "Rust bindings for liblmdb, built from the LMDB in this crate."
+repository = "https://github.com/danburkert/lmdb-rs.git"
+publish = false
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"

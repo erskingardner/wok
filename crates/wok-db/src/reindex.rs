@@ -205,7 +205,7 @@ pub fn rebuild_primary_and_event_indices(
             error = Some(err);
             return false;
         }
-        if let Err(err) = index_event_search(target, lev_id, &json) {
+        if let Err(err) = index_event_search(target, lev_id, packed.kind(), &json) {
             error = Some(err);
             return false;
         }
@@ -223,6 +223,9 @@ pub fn rebuild_primary_and_event_indices(
         meta.db_version = wok_event::WOK_DB_VERSION;
         target.put_u64(target_dbis.meta, 1, &crate::encode_meta(&meta), 0)?;
     }
+    // Every event has its postings. The marker says so before the deletions
+    // below, which remove postings only at or below it.
+    initialize_search_index_state(target, last_lev_id)?;
     // The sequence is set, so deleting the newest record cannot lower it.
     let deleted_versions = delete_versions_under_repaired_addresses(
         source,
@@ -231,7 +234,6 @@ pub fn rebuild_primary_and_event_indices(
         &repaired_requests,
     )?;
     crate::state::superseded_events(target)?;
-    initialize_search_index_state(target, last_lev_id)?;
     // Every stored event is indexed, and the deleted tail needs no entries.
     initialize_tag_kind_index_state(target, sequence)?;
     let deleted = deleted_versions.lev_ids.len() as u64;

@@ -16,7 +16,7 @@ arbitrary list.
 | 40 | Expiration | packed expiration + cron | `nip_conformance.rs` | always |
 | 42 | AUTH | ingest AUTH, multiple authenticated keys per connection, kind 22242 refused as EVENT and by CLI downloads/import, and hidden from every read | unit + multi-key e2e when serviceUrl set, `nip_conformance.rs`, `wok-cli/tests/sync.rs` | AUTH enabled and serviceUrl set |
 | 45 | COUNT + mergeable HyperLogLog | REQ worker + `wok-query` HLL | `nip_conformance.rs`, `e2e_transports.rs`, HLL unit vectors | `maxFilterLimitCount > 0` |
-| 50 | Search capability | transactional LMDB term/bigram index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs`, `response_prefixes.rs` | `relay.search_enabled` |
+| 50 | Search capability | transactional LMDB term index + ranked query scanner | `nip_conformance.rs`, `search.rs`, `e2e_transports.rs`, `response_prefixes.rs` | `relay.search_enabled` |
 | 59 | Gift wrap | recipient-only restricted reads, recipient-authorized deletion, and live-only kind 21059 | restrict + DB/live tests | usable AUTH, kinds 1059 and 21059 in `relay.auth.recipient_only_kinds` and no stricter class, and `events.ephemeral_persistence = "live_only"` |
 | 62 | Request to Vanish | persistent maximum-timestamp markers, immediate query/rebroadcast suppression, gift-wrap recipient cleanup, and bounded physical deletion | `nip62_vanish.rs`, relay e2e | `relay.nip62.enabled` |
 | 67 | EOSE completeness hint | `wok-query` scan completeness and bounded peek, req worker, monitor EOSE | `nip_conformance.rs`, `completeness.rs`, `e2e_transports.rs` | always |
@@ -139,9 +139,10 @@ and the session then closes with `closed: visibility changed; reopen
 synchronization`. A session opened while no tree is provably public is built
 in memory.
 
-NIP-50 matches normalized search terms against event `content`, intersects
-them with every other supplied filter field, ranks before applying `limit`,
-and supports matching live events after EOSE. See
+NIP-50 matches normalized search terms against the first 256 unique terms of
+the text of text kinds and profiles, intersects them with every other supplied
+filter field, ranks before applying `limit`, and matches live events after
+EOSE against the same terms. See
 [NIP-50 search](nip50-search.md) for exact query and scoring semantics.
 
 NIP-45 responses include a 512-character HLL register value for a single
@@ -176,14 +177,20 @@ fetched and discarded. Those differences are counted as `narrowed`, not in
 
 NIP-62 accepts a signed kind 62 request containing either a matching
 `["relay", "<public relay URL>"]` tag or `["relay", "ALL_RELAYS"]`. The
-relay immediately suppresses qualifying authored events and gift wraps for the
-requesting recipient, prevents rebroadcast, then physically deletes them in
-bounded background batches. The request itself remains stored and cannot be
-deleted with kind 5. NIP-62 says relays MUST honor a request that targets
-them, so one is accepted without proof of work, over both storage quotas, and
-whatever the write policy, the write-policy plugin or an author ban says (see
-[attack-surface.md](attack-surface.md#messages)). See `relay.nip62`
-in the sample configuration.
+relay immediately suppresses the requester's events and the NIP-59 gift
+wraps (kinds 1059 and 21059) that p-tag the requester, refuses them when they
+are sent again, then physically deletes them in bounded background batches.
+Both are covered only up to the `created_at` of the requester's newest
+request: NIP-62 resets what a key published and received until then, and
+does not retire the key, so events and wraps dated after it are accepted.
+NIP-59 dates a wrap up to two days in the past, so a wrap sent in the two
+days after a request can be dated before it and refused. The request itself
+remains stored and cannot be deleted with kind 5. NIP-62 says relays MUST
+honor a request that targets them, so one is accepted without proof of work,
+over both storage quotas, and whatever the write policy, the write-policy
+plugin or an author ban says (see
+[attack-surface.md](attack-surface.md#messages)). See `relay.nip62` in the
+sample configuration.
 
 NIP-86 management calls are JSON-RPC-like POSTs to the relay URI authorized
 by NIP-98 events from operator admins or role-holding moderators. They follow

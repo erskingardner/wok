@@ -337,6 +337,77 @@ async fn search_filters_are_blocked_while_search_is_off() {
     conn.close().await;
 }
 
+/// While more than 100,000 stored events wait for the search index, as after
+/// search is turned back on, NIP-11 omits NIP-50 and a REQ, COUNT or NEG-OPEN
+/// with a `search` filter gets `error:`. Filters without `search` are served.
+/// Free disk space below the reserve holds the build back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_filters_are_refused_while_the_search_index_builds() {
+    let (dir, env) = wok_compat::temp_db();
+    // Unsigned gift wraps: the writer does not check signatures.
+    let mut stored: Vec<_> = (0..100_001u64)
+        .map(|n| {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            let packed = wok_event::PackedEventBuilder::build(
+                &id,
+                &[0x51; 32],
+                1_700_000_000 + n,
+                1059,
+                0,
+                &wok_event::PackedEventTagBuilder::default(),
+            )
+            .unwrap();
+            let json = json!({
+                "id": hex::encode(id),
+                "pubkey": hex::encode([0x51; 32]),
+                "created_at": 1_700_000_000 + n,
+                "kind": 1059,
+                "tags": [],
+                "content": "",
+                "sig": "00".repeat(64),
+            })
+            .to_string();
+            wok_db::EventToWrite::new(packed.into_bytes(), json)
+        })
+        .collect();
+    let mut txn = env.begin_rw().unwrap();
+    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut stored, false).unwrap();
+    txn.commit().unwrap();
+    let mut cfg = Config::default();
+    cfg.db = dir.path().to_path_buf();
+    cfg.db_min_free_disk_bytes = u64::MAX;
+    let relay = Relay {
+        handle: wok_relay::start(env, cfg).unwrap(),
+        _dir: dir,
+    };
+    // Read as the relay starts, before any request.
+    assert!(
+        !relay.handle.supported_nips().contains(&50),
+        "NIP-50 listed"
+    );
+
+    let (conn, mut rx) = relay.connection().await;
+    let reason = "error: search index is building";
+    for req in [
+        json!(["REQ", "s", {"search": "nostr"}]),
+        json!(["REQ", "s", {"kinds": [1]}, {"search": "nostr", "kinds": [1]}]),
+        json!(["COUNT", "s", {"search": "nostr"}]),
+    ] {
+        send(&conn, req.clone()).await;
+        assert_eq!(recv(&mut rx).await, json!(["CLOSED", "s", reason]), "{req}");
+    }
+    send(
+        &conn,
+        json!(["NEG-OPEN", "n", {"search": "nostr"}, neg_initial()]),
+    )
+    .await;
+    assert_eq!(recv(&mut rx).await, json!(["NEG-ERR", "n", reason]));
+    send(&conn, json!(["REQ", "plain", {"kinds": [1]}])).await;
+    assert_eq!(recv(&mut rx).await[0], "EOSE");
+    conn.close().await;
+}
+
 /// NIP-42 flow: `auth-required:` and a challenge, AUTH, then the same REQ id
 /// is re-sent and served. Once authenticated, a COUNT not scoped to an
 /// authenticated key is `restricted:` rather than another `auth-required:`, so

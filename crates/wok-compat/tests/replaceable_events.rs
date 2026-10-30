@@ -239,20 +239,30 @@ fn equal_timestamps_choose_lowest_id_independently_of_insertion_order() {
 #[test]
 fn filters_cannot_resurrect_superseded_events_and_limits_count_only_winners() {
     let key = key();
-    for kind in [3, 10002, 30443] {
+    for kind in [0, 3, 10002, 30023, 30443] {
+        // Search reads a profile's metadata and an article's content, and
+        // nothing of the other kinds.
+        let searched = matches!(kind, 0 | 30023);
+        let content = |word: &str| {
+            if kind == 0 {
+                json!({ "name": word }).to_string()
+            } else {
+                word.to_string()
+            }
+        };
         let old = event(
             &key,
             kind,
             100,
             json!([["d", "a"], ["t", "obsolete"]]),
-            "obsoleteword",
+            &content("obsoleteword"),
         );
         let newest = event(
             &key,
             kind,
             300,
             json!([["d", "a"], ["t", "current"]]),
-            "currentword",
+            &content("currentword"),
         );
         let (_dir, env) = snapshot(&[old.clone(), newest.clone()]);
         for filter in [
@@ -269,17 +279,21 @@ fn filters_cannot_resurrect_superseded_events_and_limits_count_only_winners() {
             }
         }
         // Both the all-search merge and mixed search/chronological paths.
-        for filters in [
-            vec![
-                json!({"search":"obsoleteword"}),
-                json!({"search":"currentword"}),
-            ],
-            vec![json!({"search":"obsoleteword"}), json!({"kinds":[kind]})],
+        let winner = ids(std::slice::from_ref(&newest));
+        for (filters, expected) in [
+            (
+                vec![
+                    json!({"search":"obsoleteword"}),
+                    json!({"search":"currentword"}),
+                ],
+                if searched { winner.clone() } else { Vec::new() },
+            ),
+            (
+                vec![json!({"search":"obsoleteword"}), json!({"kinds":[kind]})],
+                winner.clone(),
+            ),
         ] {
-            assert_eq!(
-                query(&env, &filters, false),
-                ids(std::slice::from_ref(&newest))
-            );
+            assert_eq!(query(&env, &filters, false), expected, "kind {kind}");
         }
     }
     let old = event(&key, 30443, 200, json!([["d", "a"]]), "old");
@@ -729,9 +743,10 @@ fn read_snapshots_answer_as_the_policy_lookups_do() {
             "a disallowed kind",
             Box::new(|txn| wok_db::disallow_kind(txn, 7).unwrap()),
         ),
+        // A request covers the wraps dated up to it, so at the wrap's date.
         (
             "a vanished recipient",
-            Box::new(|txn| wok_db::mark_vanished(txn, &pubkey(&recipient), 1).unwrap()),
+            Box::new(|txn| wok_db::mark_vanished(txn, &pubkey(&recipient), 103).unwrap()),
         ),
         (
             "a vanished author",
@@ -1608,17 +1623,17 @@ fn reindex_restores_long_tag_values_to_legacy_records() {
         "z".repeat(400),
     );
     let url = format!("https://example.com/{}", "r".repeat(300));
-    let target_address = format!("30443:{pubkey}:{d400}");
-    let gone_address = format!("30441:{pubkey}:{d400}");
+    let target_address = format!("30023:{pubkey}:{d400}");
+    let gone_address = format!("30402:{pubkey}:{d400}");
     // A d short enough to index whole still makes an a tag over 255 bytes.
-    let short_d_address = format!("30440:{pubkey}:{d200}");
-    let list_address = format!("30442:{pubkey}:{d400}");
+    let short_d_address = format!("30818:{pubkey}:{d200}");
+    let list_address = format!("31922:{pubkey}:{d400}");
     let empty_d = event(&key, 30000, 100, json!([["d", ""]]), "empty d");
     let long301 = event(&key, 30000, 150, json!([["d", &d301]]), "301");
     let long300 = event(&key, 30000, 200, json!([["d", &d300]]), "300");
     let newer300 = event(&key, 30000, 300, json!([["d", &d300]]), "300 again");
     // Versions of long addresses on both sides of a deletion naming them.
-    let target = event(&key, 30443, 400, json!([["d", &d400]]), "target");
+    let target = event(&key, 30023, 400, json!([["d", &d400]]), "target");
     let deletion = event(
         &key,
         5,
@@ -1630,15 +1645,15 @@ fn reindex_restores_long_tag_values_to_legacy_records() {
         ]),
         "",
     );
-    let edited_target = event(&key, 30443, 500, json!([["d", &d400]]), "edited");
-    let newest_target = event(&key, 30443, 600, json!([["d", &d400]]), "newest");
-    let gone = event(&key, 30441, 450, json!([["d", &d400]]), "gone");
-    let short_d = event(&key, 30440, 300, json!([["d", &d200]]), "short d");
+    let edited_target = event(&key, 30023, 500, json!([["d", &d400]]), "edited");
+    let newest_target = event(&key, 30023, 600, json!([["d", &d400]]), "newest");
+    let gone = event(&key, 30402, 450, json!([["d", &d400]]), "gone");
+    let short_d = event(&key, 30818, 300, json!([["d", &d200]]), "short d");
     // A deletion packed with its tombstone, against a legacy version: the
     // same d under another kind is another address.
-    let old_list = event(&key, 30442, 100, json!([["d", &d400]]), "old list");
+    let old_list = event(&key, 31922, 100, json!([["d", &d400]]), "old list");
     let list_deletion = event(&key, 5, 200, json!([["a", &list_address]]), "");
-    let newer_list = event(&key, 30442, 300, json!([["d", &d400]]), "newer list");
+    let newer_list = event(&key, 31922, 300, json!([["d", &d400]]), "newer list");
     let legacy_note = event(&key, 1, 100, json!([["r", &url]]), "legacy");
     let current_note = event(&key, 1, 200, json!([["r", &url]]), "current");
     let plain = event(&key, 1, 300, json!([["t", "short"]]), "plain");
@@ -1725,7 +1740,7 @@ fn reindex_restores_long_tag_values_to_legacy_records() {
     assert_eq!(
         query(
             &env,
-            &[json!({"kinds": [30440, 30441, 30442, 30443]})],
+            &[json!({"kinds": [30818, 30402, 31922, 30023]})],
             false
         ),
         ids(&[
@@ -1738,7 +1753,7 @@ fn reindex_restores_long_tag_values_to_legacy_records() {
     );
     assert!(query(&env, &[json!({"#a": [&target_address]})], false).is_empty());
     let older301 = event(&key, 30000, 120, json!([["d", &d301]]), "older 301");
-    let stale_gone = event(&key, 30441, 480, json!([["d", &d400]]), "stale");
+    let stale_gone = event(&key, 30402, 480, json!([["d", &d400]]), "stale");
     for probe in [&older301, &stale_gone] {
         assert_eq!(
             write_with_quota(&env, probe, 0, false),
@@ -1837,7 +1852,7 @@ fn reindex_restores_long_tag_values_to_legacy_records() {
     assert_eq!(
         query(
             &repaired,
-            &[json!({"kinds": [30440, 30441, 30442, 30443]})],
+            &[json!({"kinds": [30818, 30402, 31922, 30023]})],
             false
         ),
         ids(&[newest_target, newer_list])

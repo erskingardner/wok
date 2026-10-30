@@ -387,6 +387,7 @@ may keep open. All reload live and are on the dashboard.
 | `relay.max_and_entries` | `16` | NIP-91 checks on each candidate event: the values across all `&` keys of one filter. `0` turns NIP-91 off. | NIP-91 queries that require several tags are refused. | `max_and_entries`; NIP-91 in `supported_nips` while it and `max_tags_per_filter` are above 0 |
 | `relay.max_filter_limit_count` | `1000000` | COUNT de-duplication memory: the most events one COUNT filter counts. `0` turns COUNT off, as `marmot` does. | Counts of popular events, such as followers or reactions, are capped, and the reply carries `limited: true`. | NIP-45 in `supported_nips` while above 0 |
 | `relay.search_enabled` | `true` | Answering NIP-50 `search` filters, and advertising NIP-50. Off, a REQ or COUNT with one is refused with `blocked: bad req: search disabled`, and a NEG-OPEN with `blocked: search disabled`. See [Search](#search). | Off: clients' searches are refused here, and NIP-50 clients look for search on relays that advertise it. | NIP-50 in `supported_nips` while on |
+| `relay.tag_kind_index_enabled` | `true` | Fast tag filters with `kinds`, such as a DM inbox `{"#p":[me],"kinds":[1059]}`: the `(tag, kind, created_at)` index lets them read only those kinds. Keeping it costs publishing 11–16% of the bytes it writes per event on a typical mix, and 18–32% on a follow-list-heavy one. See [Tag and kind index](#tag-and-kind-index). | Off: such a filter reads the tag value's whole history. For a sparse kind under a busy pubkey, that was 4–8× slower cold in the benchmark. | — |
 | `relay.abuse.max_query_work` | `20000` | Query workers, from requests whose estimated index work is too large. `0` is unlimited. See [Query work](#query-work). | Batched and outbox queries are refused with `blocked: query too broad`. | `max_query_work`, while abuse protection is on and it is set |
 | `relay.abuse.max_concurrent_historical_queries` | `8` | Query workers' fairness: scans one connection runs at once, counted separately for its REQs and COUNTs and its NEG-OPENs. More wait in arrival order. `0` runs none. | Busy clients see slow first results. | `max_concurrent_historical_queries` |
 | `relay.filter_validation.require_scoped_filters` | `false` | Enumeration: every filter must name `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. Refuses `{"kinds":[445]}`, `{"since":…}` or a bare `search`. On in `marmot`. | — | — |
@@ -420,10 +421,26 @@ historical queries waiting on this connection`.
 `relay.search_enabled` gates the NIP-50 query parser and the ranked search
 scan: while it is off, a request with a `search` filter is refused before its
 filters are parsed, whatever else it asks for. Subscriptions already open
-when a reload turns it off keep their search filters until they close. The
-writer keeps the search index current as it stores and deletes events either
-way, so turning search back on, which reloads live, answers from a complete
-index at once.
+when a reload turns it off keep their search filters until they close.
+While it is off, the writer does not build the search index. Turning search
+back on, which reloads live, starts the build in the background: searches
+read the events the index lacks directly, and while more than 100,000 wait
+they are refused with `error: search index is building` and NIP-11 omits
+NIP-50. See [NIP-50 search](nip50-search.md#index-and-recovery).
+
+### Tag and kind index
+
+`relay.tag_kind_index_enabled` keeps `wok_Event__tagKind`, the tag index
+again with each event's kind, so a filter with one tag and `kinds` reads only
+those kinds (see [architecture](architecture.md#indexes)). A write-heavy
+relay, such as an archive or an aggregator, whose clients rarely send such
+filters, can turn it off. While it is off, the writer puts no entries for the
+events it stores and builds none, and those filters read the single-letter
+tag index, as they do while the index is incomplete. Deletions still remove
+entries. Turning it back on, which reloads live, builds the entries it left
+out in the background, and queries use the index again once it covers every
+stored event. `wok import` follows the setting, and `wok doctor` reports the
+index as off rather than incomplete; `wok reindex` builds it either way.
 
 ### Filter validation
 
@@ -456,8 +473,8 @@ cursors the plan opens:
 
 - one per id for `ids`;
 - for tags, one per value of the tag the scan seeds from (one for a NIP-91
-  `&` tag). Once the `(tag, kind, created_at)` index is complete, one tag
-  with `kinds` costs one per (value, kind) pair;
+  `&` tag). While the `(tag, kind, created_at)` index is on and complete,
+  one tag with `kinds` costs one per (value, kind) pair;
 - one per (author, kind) pair for `authors` with `kinds`, whichever index
   the scan reads;
 - one per author for `authors` alone, one per kind for `kinds` alone, and
@@ -790,11 +807,13 @@ dashboard's history. All reload live.
 | `relay.max_live_buffer_bytes` | `262144` | Live matches held for one subscription while its history is sent. Past it, stored events are re-read from the database after the history, and the oldest ephemeral events are dropped (`wok_live_buffer_dropped_ephemeral_total`). `0` is unlimited. New subscriptions; file-only. | Busy subscriptions re-read more from the database, and lose ephemeral events. | — |
 | `relay.write_policy_plugin` | empty | An external executable that decides on each event; empty turns it off. Vanish requests skip it. File-only. | — | — |
 | `relay.write_policy_timeout_secs` | `10` | Writes, from a hung plugin: the longest wait for its verdict. Dashboard. | A slow plugin's verdicts time out, and its events are refused. | — |
-| `relay.nip62.deletion_batch_size` | `1000` | The writer: records physically removed per transaction while a vanish request is carried out. Dashboard. | A vanish request takes more, smaller transactions. | — |
+| `relay.nip62.deletion_batch_size` | `1000` | The writer: index entries the vanish sweep examines, and vanished keys it visits, in each maintenance transaction (every 2 s), so also the records it removes. Dashboard. | A vanish request takes more, smaller transactions: at 1000, a key that a million events tag takes about half an hour. | — |
 
 Valid vanish requests are hidden immediately, deletion markers stay enforced
 if NIP-62 is later turned off, and physical removal continues in bounded
-batches.
+batches. The sweep examines a vanished key's events, then the events that tag
+it, once: it resumes where it stopped, after a restart too, and a later
+request from the key sweeps only the events it adds.
 
 ## Listener and protocol
 
@@ -812,8 +831,8 @@ Restart settings, unless noted, and file-only.
 | `relay.frame_read_timeout_secs` | `30` | Longest idle gap between socket reads while a partial WebSocket frame or unfinished fragmented message is buffered (slow-trickle guard); zero disables it. Live, for new connections. |
 | `relay.message_read_timeout_secs` | `120` | Longest a WebSocket message or control frame may take to arrive, from its first byte to its last, so a client that sends a little at a time within the frame gap cannot keep a message buffered for long; zero disables it. A pause while the relay does not read, because the connection's hold is full, does not count. 120 seconds lets a 2 MiB message arrive at about 140 kbit/s. Live, for new connections. |
 | `relay.nodeinfo_enabled` | `false` | Serve [NodeInfo](https://nodeinfo.diaspora.software/) at `/.well-known/nodeinfo` and `/nodeinfo/2.1`, for fediverse-style crawlers; no Nostr client uses it, and NIP-11 carries the same software and version. Off: both paths answer 404. Discovery links to `/nodeinfo/2.1` on the origin of `relay.auth.service_url` (`wss` read as `https`), or else `admin.public_url`, never the request's `Host` header; with neither set it answers 404, and the relay and `wok doctor` warn. Live. |
-| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. Off in `marmot`. A compressed message may inflate to half of `relay.max_websocket_payload_size` plus 64 KiB, and past that to at most 32 times its compressed size, never past the maximum. |
-| `relay.compression_sliding_window` | `true` | Reuse compression context between messages. With context takeover, a connection's compressor can reference bytes from previous messages, the precondition for CRIME/BREACH-style oracles when secret and attacker-influenced bytes share a compression context. Relay traffic is essentially all public data, so practical impact is nil for most operators; if you serve auth-bearing or otherwise secret traffic over the same client connections, prefer `false`. |
+| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. Off in `marmot`. The relay accepts the first offer it can honour and declines one asking for a `server_max_window_bits` below 15 (see [known differences](known-differences.md)). A compressed message may inflate to half of `relay.max_websocket_payload_size` plus 64 KiB, and past that to at most 32 times its compressed size, never past the maximum. |
+| `relay.compression_sliding_window` | `true` | Reuse compression context between messages, except on a connection whose client offered `server_no_context_takeover`. With context takeover, a connection's compressor can reference bytes from previous messages, the precondition for CRIME/BREACH-style oracles when secret and attacker-influenced bytes share a compression context. Relay traffic is essentially all public data, so practical impact is nil for most operators; if you serve auth-bearing or otherwise secret traffic over the same client connections, prefer `false`. |
 | `relay.ingester_threads` | `3` | Event-ingestion worker count. |
 | `relay.req_worker_threads` | `3` | Historical query worker count. |
 | `relay.req_monitor_threads` | `3` | Query monitor worker count. |

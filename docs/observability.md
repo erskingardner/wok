@@ -64,6 +64,9 @@ scrape_configs:
 | `wok_tag_kind_index_tag_entries` | gauge | none | Tag-index entries stored, which a key-ordered build visits once. |
 | `wok_tag_kind_backfill_entries_total` | counter | none | Postings the writer's background build put. |
 | `wok_tag_kind_backfill_seconds_total` | counter | none | Time the writer spent in background build transactions, commits included. |
+| `wok_search_index_lag_events` | gauge | none | Events stored above the NIP-50 search index's marker, which each search reads directly. Over 100,000, searches are refused and NIP-11 omits NIP-50. |
+| `wok_search_index_build_events_total` | counter | none | Events the writer's background search build indexed. |
+| `wok_search_index_build_seconds_total` | counter | none | Time the writer spent in search build transactions, commits included. |
 | `wok_writer_queue_depth` | histogram | none | Messages queued for the writer when it started a batch that committed, the one it took first included. |
 | `wok_writer_commit_events` | histogram | none | Events each writer commit stored. Duplicates, and events replaced, deleted or refused by an author's quota, are left out. |
 | `wok_writer_prepare_seconds` | histogram | none | From the start of a writer batch to its write transaction: management commands, maintenance and each event's checks against committed state. |
@@ -83,9 +86,11 @@ publication's EVENT→OK time on the writer is roughly the wait for the batch
 in progress plus its own batch's prepare, write, commit and reply. While the
 `(tag, kind, created_at)` index is being built, a build step also runs
 before each batch; its time is in `wok_tag_kind_backfill_seconds_total`, not
-in these. The storage bytes divided by `wok_writer_commit_events_sum` is
-what each stored event costs to write; on a disk-bound writer, commit time
-follows it.
+in these. So does a search build step while 1,000 or more events wait for
+the search index, in `wok_search_index_build_seconds_total`. The storage
+bytes divided by `wok_writer_commit_events_sum` is what each stored event
+costs to write, less its search postings, which build steps write; on a
+disk-bound writer, commit time follows it.
 
 The `wok_tag_kind_*` gauges are updated after each build step and on the
 writer's maintenance tick (every 2 seconds). While a key-ordered build runs,

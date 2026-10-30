@@ -498,9 +498,11 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 }
 
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
+    let (major, minor, patch) = wok_db::lmdb_version();
     tracing::info!(
         preset = %cfg.preset,
         wok = env!("CARGO_PKG_VERSION"),
+        lmdb = %format_args!("{major}.{minor}.{patch}"),
         "starting relay"
     );
     let warnings = [
@@ -741,6 +743,7 @@ fn cmd_import(
     if deferred_tag_kind {
         build_tag_kind_index(&env)?;
     }
+    build_search_index(&env)?;
     tracing::info!(
         "Done. Processed {total_processed} lines. {total_written} added, {total_rejected} rejected, {total_dups} dups"
     );
@@ -868,7 +871,8 @@ fn parse_fried(line: &str) -> Result<(Vec<u8>, String)> {
 
 /// Write `batch` in one transaction. Returns whether it left its events'
 /// `(tag, kind, created_at)` postings to a key-ordered pass: it does while
-/// the index is unbuilt, a new database's included, and no pass runs.
+/// the index is unbuilt, a new database's included, and no pass runs. With
+/// `relay.tag_kind_index_enabled` off it puts none, and none are built.
 fn commit_import(
     cfg: &Config,
     env: &Env,
@@ -879,7 +883,12 @@ fn commit_import(
     show_rejected: bool,
 ) -> Result<bool> {
     let mut txn = env.begin_rw()?;
-    let deferred_tag_kind = wok_db::defer_tag_kind_postings(&mut txn)?;
+    let deferred_tag_kind = if cfg.relay.tag_kind_index_enabled {
+        wok_db::defer_tag_kind_postings(&mut txn)?
+    } else {
+        wok_db::skip_tag_kind_postings(&mut txn);
+        false
+    };
     let mut sink = wok_negentropy::NegentropyFilterCache::default();
     write_events_with_policy(&mut txn, &mut sink, batch, false, &cfg.vanish_policy())?;
     txn.commit()?;
@@ -896,6 +905,53 @@ fn commit_import(
         }
     }
     Ok(deferred_tag_kind)
+}
+
+/// Index the imported events for NIP-50 search, which publishing leaves to
+/// later steps, so that a relay started on the database can search it at
+/// once. Like the tag-kind build, it leaves the rest to the relay's writer
+/// once another process has the database open.
+fn build_search_index(env: &Env) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut last_log = started;
+    let mut events = 0u64;
+    loop {
+        if env.open_in_another_process()? {
+            tracing::info!(
+                "Another process has the database open; a relay on it builds the rest of the search index in the background"
+            );
+            return Ok(());
+        }
+        let mut txn = env.begin_rw()?;
+        let step = wok_db::build_search_index(
+            &mut txn,
+            wok_db::SEARCH_BUILD_STEP_EVENTS,
+            std::time::Duration::MAX,
+        )?;
+        txn.commit()?;
+        let Some(step) = step else {
+            return Ok(());
+        };
+        events += step.events;
+        if step.state.lag() == 0 {
+            break;
+        }
+        if last_log.elapsed() >= std::time::Duration::from_secs(10) {
+            last_log = std::time::Instant::now();
+            tracing::info!(
+                "Search index: indexed through {} of {}",
+                step.state.indexed_through,
+                step.state.high_water
+            );
+        }
+    }
+    if events > 0 {
+        tracing::info!(
+            "Built the search index for {events} events in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
 }
 
 /// Build the `(tag, kind, created_at)` index that import batches left to a
@@ -1217,7 +1273,7 @@ fn cmd_monitor(cfg: &Config) -> Result<()> {
         if let Ok(p) = wok_event::PackedEventView::new(packed) {
             if let Ok(json) = event_json_owned(&txn, &mut decomp, lev, cfg.events.max_event_size) {
                 let search_terms = if monitors.requires_content() {
-                    Some(wok_db::event_search_terms(&json).unwrap_or_default())
+                    Some(wok_db::event_search_terms(p.kind(), &json).unwrap_or_default())
                 } else {
                     None
                 };
@@ -1658,11 +1714,10 @@ fn downloaded_event_matches(
     wok_event::nostr_json_to_packed_event(event, limits)
         .map(|packed| {
             if filter_group.requires_content() {
-                event
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|content| filter_group.does_match_with_content(packed.view(), content))
-                    .unwrap_or(false)
+                let view = packed.view();
+                wok_db::event_search_terms(view.kind(), &event.to_string()).is_ok_and(|terms| {
+                    filter_group.does_match_with_search_terms(view, Some(&terms))
+                })
             } else {
                 filter_group.does_match(packed.view())
             }
@@ -2244,6 +2299,54 @@ mod main_tests {
         let parsed =
             parse_and_verify_event(&event, &EventLimits::default(), None, true, false).unwrap();
         EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+    }
+
+    #[test]
+    fn import_with_the_tag_kind_index_off_puts_and_builds_no_postings() {
+        let key = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let mut events: Vec<_> = (0..3u64)
+            .map(|i| {
+                let mut event = json!({
+                    "created_at": 1_700_000_000 + i,
+                    "kind": 1,
+                    "tags": [["p", format!("{i:064x}")]],
+                    "content": "",
+                    "pubkey": hex::encode(key.x_only_public_key().0.serialize()),
+                });
+                let id = wok_event::event_id_hash(&event).unwrap();
+                event["id"] = json!(hex::encode(id));
+                event["sig"] = json!(hex::encode(SECP256K1.sign_schnorr(&id, &key).as_ref()));
+                let parsed =
+                    parse_and_verify_event(&event, &EventLimits::default(), None, true, false)
+                        .unwrap();
+                EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            db: dir.path().join("db"),
+            ..Config::default()
+        };
+        cfg.relay.tag_kind_index_enabled = false;
+        let env = open_env(&cfg).unwrap();
+        let (mut written, mut rejected, mut duplicates) = (0, 0, 0);
+        let deferred = commit_import(
+            &cfg,
+            &env,
+            &mut events,
+            &mut written,
+            &mut rejected,
+            &mut duplicates,
+            false,
+        )
+        .unwrap();
+        assert!(!deferred, "nothing for a pass to build");
+        assert_eq!(written, 3);
+        let report = check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert!(report.ok(), "{:#?}", report.issues);
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert!(!tag_kind.complete);
+        assert_eq!(tag_kind.actual_entries, 0);
     }
 
     #[test]

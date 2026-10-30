@@ -355,6 +355,13 @@ pub(super) const SECTIONS: &[Section] = &[
                 &[Input::new("limits", "search_enabled", "relay.search_enabled", Unit::Switch)],
             ),
             field(
+                "Tag and kind index",
+                "Keep an index that lets a filter with one tag and kinds, such as a DM inbox, read only those kinds. Off, publishing writes less and such filters read the tag value's whole history; back on, the relay builds what it left out.",
+                "",
+                "",
+                &[Input::new("limits", "tag_kind_index_enabled", "relay.tag_kind_index_enabled", Unit::Switch)],
+            ),
+            field(
                 "Query work ceiling",
                 "The most index work a REQ, COUNT or NEG-OPEN may need, estimated before its scan. Requests over it are refused with blocked:.",
                 "Normal batched and outbox queries are refused.",
@@ -631,7 +638,7 @@ pub(super) const SECTIONS: &[Section] = &[
             ),
             field(
                 "Vanish deletion batch",
-                "Records removed per transaction while a vanish request is carried out.",
+                "Index entries the vanish sweep examines, and so records it removes, per maintenance transaction.",
                 "A vanish request takes more, smaller transactions.",
                 "Each transaction holds the writer longer.",
                 &[Input::new("nip62", "deletion_batch_size", "relay.nip62.deletion_batch_size", Unit::Count)],

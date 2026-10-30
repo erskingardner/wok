@@ -1,7 +1,7 @@
 # Relay functions reached in the `minimal` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 627
+## anonymous: 621
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::moderation::ModerationSnapshot>::kind_allowed
 <wok_db::moderation::ModerationView>::hides
@@ -154,15 +154,15 @@
 <wok_query::scan::DbQuery>::new
 <wok_query::scan::DbQuery>::new::{closure}
 <wok_query::scan::DbQuery>::note
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>
-<wok_query::scan::DbQuery>::process::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}
+<wok_query::scan::DbQuery>::process_with::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>
+<wok_query::scan::DbQuery>::process_with::<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}
 <wok_query::scan::DbQuery>::sent_count
 <wok_query::scan::DbQuery>::set_visibility
 <wok_query::scan::DbQuery>::track_completeness
 <wok_query::scan::DbQuery>::visible_event_pubkey
 <wok_query::scan::DbScan>::new
 <wok_query::scan::DbScan>::new_unplanned
-<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}, <wok_query::scan::DbQuery>::process<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
+<wok_query::scan::DbScan>::scan::<&mut <wok_query::scan::DbQuery>::process_with<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}, <wok_query::scan::DbQuery>::process_with<<wok_query::scheduler::QueryScheduler>::process_visible<<wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}, <wok_relay::server::ReqWorker>::slice::{closure}>::{closure}>::{closure}>
 <wok_query::scan::DbScan>::settle
 <wok_query::scan::ScanCursor>::active
 <wok_query::scan::ScanCursor>::collect
@@ -248,6 +248,7 @@
 <wok_relay::metrics::Histogram>::observe
 <wok_relay::metrics::Histogram>::observe::{closure}
 <wok_relay::metrics::Metrics>::refused
+<wok_relay::metrics::Metrics>::search_index_building
 <wok_relay::metrics::Refusals>::add
 <wok_relay::metrics::Setting>::of_filter_limit
 <wok_relay::metrics::Setting>::of_read_class
@@ -387,6 +388,7 @@
 <wok_relay::server::sub_gate::SubGate>::is_open
 <wok_relay::server::sub_gate::SubGate>::len
 <wok_relay::server::sub_gate::SubGate>::open
+<wok_relay::server::writer::SearchBuild>::note_stored
 <wok_relay::server::writer::ThreadStorageWrites>::bytes
 <wok_relay::source::TransportSource>::ip
 <wok_relay::source::TransportSource>::ip_address
@@ -431,15 +433,6 @@ wok_db::moderation::moderation_reason_ro
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
 wok_db::payload::parse_payload
-wok_db::search::bounded_index_keys
-wok_db::search::bounded_index_keys::{closure}
-wok_db::search::event_content
-wok_db::search::index_event_search
-wok_db::search::note_search_indexed_through
-wok_db::search::parse_event_content
-wok_db::search::search_index_entries
-wok_db::search::search_index_entries::{closure}
-wok_db::search::term_key
 wok_db::state::allocate_event_id
 wok_db::state::author_count
 wok_db::state::author_key
@@ -475,6 +468,7 @@ wok_db::write::lookup_event_by_id
 wok_db::write::lookup_event_by_id::{closure}
 wok_db::write::original_tag_value
 wok_db::write::put_indices
+wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
 wok_event::hash::id_preimage

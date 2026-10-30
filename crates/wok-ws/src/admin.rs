@@ -77,6 +77,7 @@ struct LimitsPatch {
     max_and_entries: Option<usize>,
     max_filter_limit_count: Option<u64>,
     search_enabled: Option<bool>,
+    tag_kind_index_enabled: Option<bool>,
     max_total_events_per_req: Option<u64>,
     max_subs_per_connection: Option<usize>,
     max_pending_outbound_bytes: Option<usize>,
@@ -501,7 +502,7 @@ fn overview(handle: &RelayHandle) -> Response<Full<Bytes>> {
             "sections": fields::SECTIONS,
             "config": dashboard_config(&cfg),
             "preset_config": dashboard_config(&cfg.preset_defaults()),
-            "nip11": crate::nip11(&cfg)["limitation"],
+            "nip11": crate::nip11(&cfg, &[])["limitation"],
             "refusals": refusals(&handle.metrics),
             "warnings": cfg.zero_guards().into_iter().chain(cfg.message_caps()).map(|warning| {
                 serde_json::json!({"keys": warning.keys, "warning": warning.warning})
@@ -580,6 +581,7 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
             "max_and_entries": cfg.relay.max_and_entries,
             "max_filter_limit_count": cfg.relay.max_filter_limit_count,
             "search_enabled": cfg.relay.search_enabled,
+            "tag_kind_index_enabled": cfg.relay.tag_kind_index_enabled,
             "max_total_events_per_req": cfg.relay.max_total_events_per_req,
             "max_subs_per_connection": cfg.relay.max_subs_per_connection,
             "max_pending_outbound_bytes": cfg.relay.max_pending_outbound_bytes,
@@ -807,6 +809,9 @@ fn apply_patch(config: &mut Config, patch: ConfigPatch) {
         }
         if let Some(value) = limits.search_enabled {
             config.relay.search_enabled = value;
+        }
+        if let Some(value) = limits.tag_kind_index_enabled {
+            config.relay.tag_kind_index_enabled = value;
         }
         if let Some(value) = limits.max_total_events_per_req {
             config.relay.max_total_events_per_req = value;
@@ -1991,7 +1996,7 @@ event_burst = 500
         // Every field NIP-11 can advertise: a lower bound set, abuse on.
         let mut cfg = Config::default();
         cfg.events.reject_older_than_secs = 3600;
-        let advertised = crate::nip11(&cfg)["limitation"]
+        let advertised = crate::nip11(&cfg, &[])["limitation"]
             .as_object()
             .unwrap()
             .clone();
@@ -2025,7 +2030,7 @@ event_burst = 500
             }
         }
         // A limit that is off is not advertised, so its chip is not shown.
-        let limitation = crate::nip11(&Config::default())["limitation"].clone();
+        let limitation = crate::nip11(&Config::default(), &[])["limitation"].clone();
         assert!(limitation.get("created_at_lower_limit").is_none());
     }
 

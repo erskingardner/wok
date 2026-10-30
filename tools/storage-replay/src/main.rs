@@ -132,6 +132,10 @@ struct Args {
     /// with the same engine options, and run the read suite.
     #[arg(long)]
     open_existing: bool,
+    /// RocksDB, with `--open-existing`: compact every table down to one
+    /// sorted run before the suite. This changes the database in place.
+    #[arg(long)]
+    rocks_compact: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
@@ -447,6 +451,14 @@ trait Engine: Send + Sync {
     /// (`--rocks-covering`).
     fn covering_misses(&self) -> u64 {
         0
+    }
+    /// Compact every table down to one sorted run (RocksDB).
+    fn compact(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Files per level of the tables the suite reads (RocksDB).
+    fn layout(&self) -> String {
+        String::new()
     }
     /// An author's newest `limit` events with their payloads: events read.
     fn newest_by_author(&self, pubkey: &[u8], limit: usize) -> Result<Answer> {
@@ -1325,6 +1337,47 @@ impl Engine for Rocks {
     fn covering_misses(&self) -> u64 {
         self.covering_misses.load(Ordering::Relaxed)
     }
+
+    fn compact(&self) -> Result<()> {
+        let mut opts = rocksdb::CompactOptions::default();
+        opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        for t in 0..self.tables.len() {
+            self.db
+                .compact_range_cf_opt(self.cf(t), None::<&[u8]>, None::<&[u8]>, &opts);
+        }
+        Ok(())
+    }
+
+    fn layout(&self) -> String {
+        [
+            PUBKEY_TABLE,
+            TAG_TABLE,
+            ID_TABLE,
+            EVENT_TABLE,
+            PAYLOAD_TABLE,
+        ]
+        .iter()
+        .map(|name| {
+            let cf = self.cf_named(name);
+            let files: Vec<String> = (0..7)
+                .map(|level| {
+                    self.db
+                        .property_int_value_cf(cf, format!("rocksdb.num-files-at-level{level}"))
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0)
+                        .to_string()
+                })
+                .collect();
+            format!(
+                "{}: {}",
+                name.rsplit("__").next().unwrap_or(name),
+                files.join("/")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+    }
 }
 
 // ---------------------------------------------------------------- report
@@ -1417,6 +1470,8 @@ struct Report {
     /// Digest of the newest events of the first sampled authors after the
     /// last step: equal across engines that replayed the same log once.
     read_digest: String,
+    /// RocksDB: files per level of the tables the suite reads, when it ran.
+    lsm_layout: String,
     read_suite: Vec<ShapeResult>,
 }
 
@@ -1737,6 +1792,10 @@ fn main() -> Result<()> {
                 && args.rocks_profile == RocksProfile::V1),
         "--rocks-* options are for RocksDB"
     );
+    ensure!(
+        !args.rocks_compact || (args.open_existing && args.engine == EngineKind::Rocksdb),
+        "--rocks-compact is for RocksDB with --open-existing"
+    );
     let shifts: Vec<LocalIds> = tables.iter().map(local_ids).collect();
     let engine: Arc<dyn Engine> = match args.engine {
         EngineKind::Lmdb => Arc::new(Lmdb::open(&args.dir, &tables, false)?),
@@ -1753,6 +1812,17 @@ fn main() -> Result<()> {
     };
 
     if args.open_existing {
+        eprintln!("layout: {}", engine.layout());
+        if args.rocks_compact {
+            let started = Instant::now();
+            engine.compact()?;
+            eprintln!(
+                "compacted in {:.0} s; layout: {}",
+                started.elapsed().as_secs_f64(),
+                engine.layout()
+            );
+        }
+        let lsm_layout = engine.layout();
         let read_suite = run_suite(engine.as_ref(), &shapes, args.read_suite_secs, args.readers)?;
         let report = Report {
             engine: args.engine,
@@ -1772,6 +1842,7 @@ fn main() -> Result<()> {
             divergent_ops: 0,
             read_errors: 0,
             read_digest: String::new(),
+            lsm_layout,
             read_suite,
         };
         std::fs::write(&args.out, serde_json::to_string_pretty(&report)?)?;
@@ -2020,6 +2091,7 @@ fn main() -> Result<()> {
         divergent_ops,
         read_errors: read_errors.load(Ordering::Relaxed),
         read_digest: format!("{read_digest:016x}"),
+        lsm_layout: engine.layout(),
         read_suite,
     };
     std::fs::write(&args.out, serde_json::to_string_pretty(&report)?)?;

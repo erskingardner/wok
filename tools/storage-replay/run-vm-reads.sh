@@ -42,6 +42,19 @@ if (($# == 0)); then
 fi
 for item in "$@"; do
   mix=${item%%:*} arm=${item#*:}
+  # <arm>+compact: compact <arm>'s kept database in place, then run the
+  # suite; run it after <arm>'s own suite.
+  if [[ $arm == *+compact ]]; then
+    of=${arm%+compact}
+    suite=$base/$mix-$arm-suite.json
+    if [[ ! -s $suite ]]; then
+      # shellcheck disable=SC2086
+      "$replay" --open-existing --rocks-compact --log "$logs/$mix.ops.zst" ${arms[$of]} \
+        --read-suite-secs 20 --dir "$base/db-$mix-$of" --out "$suite" > "$base/$mix-$arm-suite.log" 2>&1
+      echo "$mix $arm suite exit $?" >> "$status"
+    fi
+    continue
+  fi
   db=$base/db-$mix-$arm
   out=$base/$mix-$arm.json
   if [[ ! -s $out ]]; then

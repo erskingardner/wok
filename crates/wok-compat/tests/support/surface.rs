@@ -68,8 +68,23 @@ impl Relay {
         Self::try_start(cfg).await.unwrap()
     }
 
+    /// A relay without the maintenance timer, for the reachability probe
+    /// (`wok_relay::start_without_maintenance`).
+    pub async fn start_without_maintenance(cfg: Config) -> Self {
+        Self::serve(cfg, wok_relay::start_without_maintenance)
+            .await
+            .unwrap()
+    }
+
     /// Start a relay, or return why Wok refuses to serve `cfg`.
-    pub async fn try_start(mut cfg: Config) -> Result<Self, String> {
+    pub async fn try_start(cfg: Config) -> Result<Self, String> {
+        Self::serve(cfg, wok_relay::start).await
+    }
+
+    async fn serve(
+        mut cfg: Config,
+        start: fn(Env, Config) -> Result<wok_relay::RelayHandle, String>,
+    ) -> Result<Self, String> {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(
             dir.path(),
@@ -87,7 +102,7 @@ impl Relay {
         // answer 429 long before the probe has tried every path.
         cfg.relay.abuse.connection_rate_per_second = 0;
         let wants_metrics_listener = !cfg.observability.metrics_listen.is_empty();
-        let handle = wok_relay::start(env, cfg)?;
+        let handle = start(env, cfg)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let serving = handle.clone();

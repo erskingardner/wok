@@ -1362,7 +1362,10 @@ impl Engine for Rocks {
             let files: Vec<String> = (0..7)
                 .map(|level| {
                     self.db
-                        .property_int_value_cf(cf, format!("rocksdb.num-files-at-level{level}"))
+                        .property_int_value_cf(
+                            cf,
+                            format!("rocksdb.num-files-at-level{level}").as_str(),
+                        )
                         .ok()
                         .flatten()
                         .unwrap_or(0)

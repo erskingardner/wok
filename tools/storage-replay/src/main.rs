@@ -799,6 +799,7 @@ impl Rocks {
         newest_first: bool,
         profile: RocksProfile,
         covering: bool,
+        statistics: bool,
     ) -> Result<Self> {
         use rocksdb::{
             BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
@@ -853,7 +854,10 @@ impl Rocks {
         opts.set_db_write_buffer_size(2 << 30);
         opts.set_max_total_wal_size(1 << 30);
         opts.set_bytes_per_sync(1 << 20);
-        opts.enable_statistics();
+        // Statistics cost reads ~6% (`recordTick`); only the replay needs them.
+        if statistics {
+            opts.enable_statistics();
+        }
         let cfs = tables
             .iter()
             .map(|t| ColumnFamilyDescriptor::new(&t.name, cf_opts(&t.name)))
@@ -1265,12 +1269,10 @@ impl Engine for Rocks {
                             break;
                         }
                         let (created_at, lev_id) = self.posting(key);
-                        let value = if self.covering {
-                            it.value().unwrap()
-                        } else {
-                            &[][..]
-                        };
-                        if !feed_offer(&mut heap, limit, created_at, lev_id, value) {
+                        // Covering values are not copied: most postings a
+                        // feed offers are dropped again, so it fetches the
+                        // `limit` it keeps instead.
+                        if !feed_offer(&mut heap, limit, created_at, lev_id, &[]) {
                             break;
                         }
                         if self.newest_first {
@@ -1746,6 +1748,7 @@ fn main() -> Result<()> {
             args.rocks_newest_first,
             args.rocks_profile,
             args.rocks_covering,
+            !args.open_existing,
         )?),
     };
 

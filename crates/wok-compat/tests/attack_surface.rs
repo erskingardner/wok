@@ -55,7 +55,7 @@ fn every_profile_loads_and_keeps_its_properties() {
 
 /// The properties `docs/attack-surface.md` gives each profile.
 fn check_profile(name: &str, cfg: &Config) {
-    let nips: BTreeSet<u64> = wok_relay::supported_nips(cfg).into_iter().collect();
+    let nips: BTreeSet<wok_relay::NipId> = wok_relay::supported_nips(cfg).into_iter().collect();
     match name {
         "default" => {
             assert_eq!(
@@ -74,7 +74,7 @@ fn check_profile(name: &str, cfg: &Config) {
             assert!(!cfg.admin.enabled);
             assert!(!cfg.relay.unix.enabled);
             assert!(
-                nips.contains(&42) && nips.contains(&59) && nips.contains(&78),
+                nips.contains(&42.into()) && nips.contains(&59.into()) && nips.contains(&78.into()),
                 "{nips:?}"
             );
         }
@@ -83,7 +83,7 @@ fn check_profile(name: &str, cfg: &Config) {
             assert_eq!(cfg.relay.auth.read_policy, AccessPolicy::Members);
             assert_eq!(cfg.relay.auth.write_policy, AccessPolicy::Members);
             assert!(cfg.admin.enabled);
-            assert!(nips.contains(&86), "{nips:?}");
+            assert!(nips.contains(&86.into()), "{nips:?}");
             assert_eq!(
                 cfg.admin.pubkeys,
                 [hex::encode(key(1).x_only_public_key().0.serialize())],
@@ -97,8 +97,11 @@ fn check_profile(name: &str, cfg: &Config) {
             assert!(cfg.relay.filter_validation.require_scoped_filters);
             assert_eq!(cfg.relay.auth.write_policy, AccessPolicy::Open);
             assert!(!cfg.admin.enabled);
-            assert!(nips.contains(&42) && nips.contains(&59), "{nips:?}");
-            assert!(!nips.contains(&45), "{nips:?}");
+            assert!(
+                nips.contains(&42.into()) && nips.contains(&59.into()),
+                "{nips:?}"
+            );
+            assert!(!nips.contains(&45.into()), "{nips:?}");
             assert!(!cfg.relay.compression_enabled);
         }
         "monitored" => {
@@ -108,10 +111,10 @@ fn check_profile(name: &str, cfg: &Config) {
             assert!(!cfg.metrics_on_relay_listener());
         }
         "minimal" => {
-            let always: BTreeSet<u64> = RELAY_CAPABILITY_CATALOG
+            let always: BTreeSet<wok_relay::NipId> = RELAY_CAPABILITY_CATALOG
                 .iter()
                 .filter(|capability| capability.enabled_when == CapabilityCondition::Always)
-                .map(|capability| capability.nip)
+                .map(|capability| capability.nip.clone())
                 .collect();
             assert_eq!(
                 nips, always,

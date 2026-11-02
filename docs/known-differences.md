@@ -400,6 +400,17 @@ regression test. Differential parity alone is not a reason to retain it.
   block a kind 5 from being stored. The pinned strfry exempts neither, so
   deleting a deletion removed it with its tombstone and the original event
   could be published again.
+- NIP-D9 Deletion Request Protection (nips#2531 at `807264f`): a signed
+  `["no_delete"]` on an eligible event exempts it from its signing key's
+  kind-5 deletion and kind-62 author purge, including old tombstones and
+  later republication. The pinned strfry ignores this tag. Recipient deletion,
+  expiration and independent operator policy still apply. Malformed markers
+  and expiration metadata are refused; replaceable, addressable and ephemeral
+  kinds cannot opt in. NIP-11 keeps `supported_nips` integer-only and advertises
+  `"D9"` in the provisional Wok extension `wok.supported_nips`. Strict readers
+  can parse the standard document while D9-aware clients inspect the extension.
+  Outbound discovery ignores this extension and unknown standard-array entries
+  without integer conversion; see [NIP support](nips.md).
 - NIP-09 `a` tags of replaceable events: a deletion naming
   `<kind>:<pubkey>:`, for kinds 0, 3 and 10000–19999, deletes its author's
   versions up to its `created_at` and refuses such versions that arrive

@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use wok_relay::{Config, HeldMessages, Outbound, OutboundFrame, RelayHandle, TransportSource};
+use wok_relay::{
+    Config, HeldMessages, NipId, Outbound, OutboundFrame, RelayHandle, TransportSource,
+};
 
 /// NIP-11 `software` MUST be the project's homepage URL.
 const SOFTWARE: &str = "https://github.com/erskingardner/wok";
@@ -480,16 +482,25 @@ fn maybe_npub(s: &str) -> String {
     s.to_string()
 }
 
-/// The NIP-11 document, advertising `supported_nips`: the relay handle's,
-/// which follow the index state as well as the configuration.
-pub(crate) fn nip11(cfg: &Config, supported_nips: &[u64]) -> serde_json::Value {
+/// NIP-11 keeps standard identifiers integer-only. Provisional named
+/// capabilities live in `wok.supported_nips`, from the same runtime catalog.
+pub(crate) fn nip11(cfg: &Config, supported_nips: &[NipId]) -> serde_json::Value {
     let min_pow_difficulty = if cfg.relay.abuse.enabled {
         cfg.relay.abuse.min_pow_difficulty
     } else {
         0
     };
     let mut v = serde_json::json!({
-        "supported_nips": supported_nips,
+        "supported_nips": supported_nips.iter().filter_map(|nip| match nip {
+            NipId::Number(number) => Some(*number),
+            NipId::Named(_) => None,
+        }).collect::<Vec<_>>(),
+        "wok": {
+            "supported_nips": supported_nips.iter().filter_map(|nip| match nip {
+                NipId::Named(name) => Some(name.as_ref()),
+                NipId::Number(_) => None,
+            }).collect::<Vec<_>>(),
+        },
         "software": SOFTWARE,
         "version": VERSION,
         "negentropy": PROTOCOL_NEG,
@@ -577,7 +588,13 @@ where
     let _ = tokio::time::timeout(FAIL_CLOSE_WRITE, write_bytes(wr, &close)).await;
 }
 
-fn nip_description(nip: u64) -> Option<&'static str> {
+fn nip_description(nip: &NipId) -> Option<&'static str> {
+    if nip == &NipId::named(wok_event::DELETION_PROTECTION_NIP) {
+        return Some("Protects signed no_delete events from author deletion requests while preserving recipient deletion and expiration.");
+    }
+    let NipId::Number(nip) = nip else {
+        return None;
+    };
     match nip {
         1 => Some("Defines the core event format, filters, and client-relay message flow."),
         9 => Some("Lets event authors request deletion of their own published events."),
@@ -588,7 +605,7 @@ fn nip_description(nip: u64) -> Option<&'static str> {
         45 => Some("Adds COUNT requests and mergeable HyperLogLog estimates without transferring every event."),
         50 => Some("Adds full-text search queries and relevance-ordered results to relay filters."),
         59 => Some("Encapsulates events in encrypted gift wraps to reduce exposed messaging metadata."),
-        62 => Some("Lets a key request complete, durable deletion of its relay-hosted footprint."),
+        62 => Some("Lets a key request deletion of its relay-hosted events, subject to signed deletion protection."),
         70 => Some("Restricts publication of protected events to their authenticated author."),
         77 => Some("Synchronizes event sets efficiently with the Negentropy reconciliation protocol."),
         91 => Some("Requires every value in an &-prefixed tag filter while preserving compatible #-filter fallback."),
@@ -647,15 +664,18 @@ fn contact_href(value: &str) -> Option<String> {
         .then(|| format!("mailto:{value}"))
 }
 
-fn landing(cfg: &Config, supported_nips: &[u64]) -> String {
+fn landing(cfg: &Config, supported_nips: &[NipId]) -> String {
     let info = &cfg.relay.info;
     let nip_items = supported_nips
         .iter()
         .filter_map(|nip| {
-            nip_description(*nip).map(|description| {
-                format!(
-                    "<li><a href=\"https://github.com/nostr-protocol/nips/blob/master/{nip:02}.md\">NIP-{nip:02}</a><span>{description}</span></li>"
-                )
+            nip_description(nip).map(|description| {
+                let url = if nip == &NipId::named(wok_event::DELETION_PROTECTION_NIP) {
+                    "https://github.com/nostr-protocol/nips/pull/2531".to_owned()
+                } else {
+                    format!("https://github.com/nostr-protocol/nips/blob/master/{nip}.md")
+                };
+                format!("<li><a href=\"{url}\">NIP-{nip}</a><span>{description}</span></li>")
             })
         })
         .collect::<String>();
@@ -1136,6 +1156,22 @@ mod landing_tests {
     use super::*;
 
     #[test]
+    fn nip11_remains_readable_by_integer_only_consumers() {
+        #[derive(serde::Deserialize)]
+        struct StrictInformationDocument {
+            supported_nips: Vec<u16>,
+        }
+        let cfg = Config::default();
+        let document = nip11(&cfg, &wok_relay::supported_nips(&cfg));
+        let strict: StrictInformationDocument = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(
+            strict.supported_nips,
+            vec![1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91]
+        );
+        assert_eq!(document["wok"]["supported_nips"], serde_json::json!(["D9"]));
+    }
+
+    #[test]
     fn landing_has_hierarchy_links_descriptions_and_revision() {
         let mut cfg = Config::default();
         cfg.relay.info.name = "A <useful> relay".into();
@@ -1149,7 +1185,15 @@ mod landing_tests {
         cfg.relay.info.banner = "https://relay.example/banner.jpg".into();
         cfg.relay.info.privacy = "https://relay.example/privacy".into();
         cfg.relay.info.terms = "javascript:alert('no')".into();
-        let html = landing(&cfg, &[1, 62, 77]);
+        let html = landing(
+            &cfg,
+            &[
+                1.into(),
+                62.into(),
+                77.into(),
+                NipId::named(wok_event::DELETION_PROTECTION_NIP),
+            ],
+        );
 
         assert!(html.contains("<h1>A &lt;useful&gt; relay</h1>"));
         assert!(html.contains("<h2>Fast &amp; friendly</h2>"));
@@ -1167,7 +1211,10 @@ mod landing_tests {
         assert!(html.contains("nostr-protocol/nips/blob/master/01.md"));
         assert!(html.contains("Defines the core event format"));
         assert!(html.contains("nostr-protocol/nips/blob/master/62.md"));
-        assert!(html.contains("durable deletion"));
+        assert!(html.contains("subject to signed deletion protection"));
+        assert!(html.contains(">NIP-D9</a>"));
+        assert!(html.contains("Protects signed no_delete events"));
+        assert!(html.contains("nostr-protocol/nips/pull/2531"));
         assert!(html.contains("nostr-protocol/nips/blob/master/77.md"));
         assert!(html.contains(&format!("Wok {VERSION}")));
         if GIT_HASH == "unknown" {

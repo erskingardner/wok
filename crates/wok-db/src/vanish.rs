@@ -251,18 +251,62 @@ pub fn gift_wrap_vanished(created_at: u64, timestamp: u64) -> bool {
 }
 
 pub fn is_event_vanished_ro(txn: &RoTxn<'_>, packed: PackedEventView<'_>) -> Result<bool, DbError> {
-    if packed.kind() != VANISH_KIND
-        && vanish_timestamp_ro(txn, packed.pubkey())?
-            .is_some_and(|timestamp| packed.created_at() <= timestamp)
-    {
-        return Ok(true);
+    event_vanished(
+        packed,
+        |key| vanish_timestamp_ro(txn, key),
+        |timestamp| {
+            if survived_author_sweep(txn, packed, timestamp)? {
+                return Ok(true);
+            }
+            crate::deletion_protection::is_deletion_protected_ro(txn, packed)
+        },
+    )
+}
+
+/// The incoming event is not stored yet: read its signed marker from the
+/// supplied payload, rather than mistaking an absent record for no protection.
+pub fn is_event_vanished_ro_with_json(
+    txn: &RoTxn<'_>,
+    packed: PackedEventView<'_>,
+    json: &str,
+) -> Result<bool, DbError> {
+    event_vanished(
+        packed,
+        |key| vanish_timestamp_ro(txn, key),
+        |_| crate::is_deletion_protected_json(packed, json),
+    )
+}
+
+pub(crate) fn is_event_vanished_rw_with_json(
+    txn: &RwTxn<'_>,
+    packed: PackedEventView<'_>,
+    json: &str,
+) -> Result<bool, DbError> {
+    event_vanished(
+        packed,
+        |key| vanish_timestamp_rw(txn, key),
+        |_| crate::is_deletion_protected_json(packed, json),
+    )
+}
+
+fn event_vanished(
+    packed: PackedEventView<'_>,
+    mut timestamp: impl FnMut(&[u8]) -> Result<Option<u64>, DbError>,
+    protected: impl FnOnce(u64) -> Result<bool, DbError>,
+) -> Result<bool, DbError> {
+    if packed.kind() != VANISH_KIND {
+        if let Some(cutoff) = timestamp(packed.pubkey())? {
+            if packed.created_at() <= cutoff && !protected(cutoff)? {
+                return Ok(true);
+            }
+        }
     }
     if GIFT_WRAP_KINDS.contains(&packed.kind()) {
         let mut vanished = false;
         let mut error = None;
         packed.foreach_tag(|name, value| {
             if name == 'p' {
-                match vanish_timestamp_ro(txn, value) {
+                match timestamp(value) {
                     Ok(Some(timestamp)) if gift_wrap_vanished(packed.created_at(), timestamp) => {
                         vanished = true;
                         return false;
@@ -286,40 +330,33 @@ pub fn is_event_vanished_ro(txn: &RoTxn<'_>, packed: PackedEventView<'_>) -> Res
     Ok(false)
 }
 
-pub fn is_event_vanished_rw(txn: &RwTxn<'_>, packed: PackedEventView<'_>) -> Result<bool, DbError> {
-    if packed.kind() != VANISH_KIND
-        && vanish_timestamp_rw(txn, packed.pubkey())?
-            .is_some_and(|timestamp| packed.created_at() <= timestamp)
+/// A finished author pass has verified all surviving records under its cutoff.
+/// Later writes under that cutoff also verify protection before admission.
+/// The progress and primary must belong to this read snapshot; arbitrary live
+/// candidates and reindexed databases cannot inherit that proof. Recipient
+/// vanish checks still run independently after this author-only exemption.
+fn survived_author_sweep(
+    txn: &RoTxn<'_>,
+    packed: PackedEventView<'_>,
+    cutoff: u64,
+) -> Result<bool, DbError> {
+    let Some(dbi) = txn.env().dbis().state else {
+        return Ok(false);
+    };
+    let Some(raw) = txn.get(dbi, &sweep_progress_key(packed.pubkey()))? else {
+        return Ok(false);
+    };
+    let Ok(progress) = SweepProgress::decode(raw) else {
+        return Ok(false);
+    };
+    if !progress.verified
+        || progress.target < cutoff
+        || matches!(progress.step, SweepStep::Authored(_))
     {
-        return Ok(true);
+        return Ok(false);
     }
-    if GIFT_WRAP_KINDS.contains(&packed.kind()) {
-        let mut vanished = false;
-        let mut error = None;
-        packed.foreach_tag(|name, value| {
-            if name == 'p' {
-                match vanish_timestamp_rw(txn, value) {
-                    Ok(Some(timestamp)) if gift_wrap_vanished(packed.created_at(), timestamp) => {
-                        vanished = true;
-                        return false;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        error = Some(err);
-                        return false;
-                    }
-                }
-            }
-            true
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-        if vanished {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(crate::lookup_event_by_id_ro(txn, packed.id())?
+        .is_some_and(|(_, stored)| stored == packed.as_bytes()))
 }
 
 fn next_marker(txn: &RwTxn<'_>, cursor: &[u8]) -> Result<Option<([u8; 32], u64)>, DbError> {
@@ -364,6 +401,9 @@ pub(crate) struct SweepProgress {
     /// pass, one past the target of the pass before on a later one.
     from: u64,
     step: SweepStep,
+    /// False when a pass retained an unreadable record. Maintenance continues,
+    /// but this progress cannot certify survivors until reindex starts over.
+    verified: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,12 +424,14 @@ struct Position {
 }
 
 const SWEEP_PROGRESS_LEN: usize = 33;
+const SWEEP_UNVERIFIED: u8 = 0x80;
 
 impl SweepProgress {
     fn start(from: u64, target: u64) -> Self {
         Self {
             target,
             from,
+            verified: true,
             step: SweepStep::Authored(Position {
                 created_at: from,
                 lev_id: 0,
@@ -412,7 +454,7 @@ impl SweepProgress {
         let mut raw = [0u8; SWEEP_PROGRESS_LEN];
         raw[..8].copy_from_slice(&self.target.to_le_bytes());
         raw[8..16].copy_from_slice(&self.from.to_le_bytes());
-        raw[16] = step;
+        raw[16] = step | if self.verified { 0 } else { SWEEP_UNVERIFIED };
         raw[17..25].copy_from_slice(&position.created_at.to_le_bytes());
         raw[25..].copy_from_slice(&position.lev_id.to_le_bytes());
         raw
@@ -427,7 +469,7 @@ impl SweepProgress {
             created_at: word(17),
             lev_id: word(25),
         };
-        let step = match raw[16] {
+        let step = match raw[16] & !SWEEP_UNVERIFIED {
             0 => SweepStep::Authored(position),
             1 => SweepStep::Tagged(position),
             2 => SweepStep::Done,
@@ -437,11 +479,12 @@ impl SweepProgress {
             target: word(0),
             from: word(8),
             step,
+            verified: raw[16] & SWEEP_UNVERIFIED == 0,
         })
     }
 }
 
-fn sweep_progress_key(pubkey: &[u8; 32]) -> [u8; 33] {
+fn sweep_progress_key(pubkey: &[u8]) -> [u8; 33] {
     let mut key = [crate::state::VANISH_SWEEP; 33];
     key[1..].copy_from_slice(pubkey);
     key
@@ -529,6 +572,7 @@ pub fn sweep_vanished_events<N: NegentropySink>(
         entries: batch_limit,
         lev_ids: Vec::new(),
         seen: HashSet::new(),
+        unverified: false,
     };
     let mut markers = 0;
     while markers < batch_limit && sweep.entries > 0 {
@@ -561,8 +605,12 @@ pub fn sweep_vanished_events<N: NegentropySink>(
             Some(SweepProgress {
                 target,
                 step: SweepStep::Done,
+                verified,
                 ..
-            }) => SweepProgress::start(target + 1, timestamp),
+            }) => SweepProgress {
+                verified,
+                ..SweepProgress::start(target + 1, timestamp)
+            },
             Some(progress) => progress,
             None => SweepProgress::start(0, timestamp),
         };
@@ -586,6 +634,7 @@ struct Sweep {
     entries: usize,
     lev_ids: Vec<u64>,
     seen: HashSet<u64>,
+    unverified: bool,
 }
 
 impl Sweep {
@@ -596,6 +645,7 @@ impl Sweep {
         pubkey: &[u8; 32],
         mut progress: SweepProgress,
     ) -> Result<SweepProgress, DbError> {
+        self.unverified = false;
         if let SweepStep::Authored(position) = progress.step {
             // Vanish requests stay stored.
             let next = self.walk(
@@ -604,7 +654,10 @@ impl Sweep {
                 pubkey,
                 position,
                 |created_at| created_at <= progress.target,
-                |event| event.kind() != VANISH_KIND,
+                |lev, event| {
+                    Ok(event.kind() != VANISH_KIND
+                        && !crate::deletion_protection::is_deletion_protected_rw(txn, lev, event)?)
+                },
             )?;
             // A later pass starts past the wraps the pass before covered:
             // `gift_wrap_vanished` covers every wrap created up to a request.
@@ -625,10 +678,11 @@ impl Sweep {
                 &tag,
                 position,
                 |created_at| gift_wrap_vanished(created_at, progress.target),
-                |event| GIFT_WRAP_KINDS.contains(&event.kind()),
+                |_, event| Ok(GIFT_WRAP_KINDS.contains(&event.kind())),
             )?;
             progress.step = next.map_or(SweepStep::Done, SweepStep::Tagged);
         }
+        progress.verified &= !self.unverified;
         Ok(progress)
     }
 
@@ -643,7 +697,7 @@ impl Sweep {
         prefix: &[u8],
         position: Position,
         within: impl Fn(u64) -> bool,
-        deletes: impl Fn(PackedEventView<'_>) -> bool,
+        deletes: impl Fn(u64, PackedEventView<'_>) -> Result<bool, DbError>,
     ) -> Result<Option<Position>, DbError> {
         let mut next = None;
         let mut error = None;
@@ -671,9 +725,23 @@ impl Sweep {
                 self.entries -= 1;
                 match txn.get_u64(txn.env().dbis().event, lev_id) {
                     Ok(Some(raw)) => {
-                        if PackedEventView::new(raw).is_ok_and(&deletes) && self.seen.insert(lev_id)
+                        match PackedEventView::new(raw)
+                            .map_err(DbError::from)
+                            .and_then(|event| deletes(lev_id, event))
                         {
-                            self.lev_ids.push(lev_id);
+                            Ok(true) if self.seen.insert(lev_id) => self.lev_ids.push(lev_id),
+                            Ok(_) => {}
+                            Err(err @ DbError::Lmdb(..)) => {
+                                error = Some(err);
+                                return false;
+                            }
+                            Err(err) => {
+                                // Keep primary evidence for integrity/repair. A
+                                // skipped record must never become proof of D9
+                                // protection just because its pass has finished.
+                                self.unverified = true;
+                                tracing::warn!(lev_id, %err, "vanish sweep retained an unreadable record");
+                            }
                         }
                         true
                     }
@@ -698,6 +766,181 @@ mod tests {
     use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
 
     #[test]
+    fn completed_author_sweeps_avoid_payload_checks_beyond_cache_capacity() {
+        use crate::{write_events, EnvOptions, EventToWrite, EventWriteStatus, NoopNegentropy};
+        use secp256k1::{Keypair, SECP256K1};
+        use serde_json::json;
+        fn checks(env: &Env) -> usize {
+            env.inner.protection_cache.lock().unwrap().payload_checks
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let author = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let pubkey = author.x_only_public_key().0.serialize();
+        let signed = |n, marked, valid| {
+            let mut event = json!({
+                "pubkey": hex::encode(pubkey), "created_at": 100, "kind": 1,
+                "tags": if marked { json!([["no_delete"]]) } else { json!([]) },
+                "content": format!("event {n}"),
+            });
+            let id = wok_event::event_id_hash(&event).unwrap();
+            event["id"] = json!(hex::encode(id));
+            event["sig"] = if valid {
+                json!(hex::encode(SECP256K1.sign_schnorr(&id, &author).as_ref()))
+            } else {
+                json!("00".repeat(64))
+            };
+            let packed =
+                wok_event::nostr_json_to_packed_event(&event, &Default::default()).unwrap();
+            EventToWrite::new(
+                packed.into_bytes(),
+                wok_event::normalize_event_json(&event).unwrap(),
+            )
+        };
+        // Exceed the actual cache capacity: a second scan used to miss every
+        // entry and repeat all signature checks, even after cleanup finished.
+        let mut events: Vec<_> = (0..4097).map(|n| signed(n, true, true)).collect();
+        let mut plain = signed(5000, false, true);
+        let mut forged = signed(5001, true, false);
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        for event in [&mut plain, &mut forged] {
+            write_events(
+                &mut txn,
+                &mut NoopNegentropy,
+                std::slice::from_mut(event),
+                false,
+            )
+            .unwrap();
+        }
+        mark_vanished(&mut txn, &pubkey, 200).unwrap();
+        txn.commit().unwrap();
+        let old = env.begin_ro().unwrap();
+        let before = checks(&env);
+        assert!(
+            !is_event_vanished_ro(&old, PackedEventView::new(&events[0].packed).unwrap()).unwrap()
+        );
+        assert!(
+            checks(&env) > before,
+            "pending passes still verify protection"
+        );
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut cursor = VanishSweepCursor::default();
+                    for _ in 0..100 {
+                        let mut txn = env.begin_rw().unwrap();
+                        let step =
+                            sweep_vanished_events(&mut txn, &mut NoopNegentropy, 128, &mut cursor)
+                                .unwrap();
+                        txn.commit().unwrap();
+                        if step.markers == 0 {
+                            return;
+                        }
+                    }
+                    panic!("sweep did not finish");
+                })
+                .join()
+                .unwrap()
+        });
+        let before = checks(&env);
+        assert!(is_event_vanished_ro(&old, PackedEventView::new(&forged.packed).unwrap()).unwrap());
+        assert!(
+            checks(&env) > before,
+            "old snapshots cannot borrow newer progress"
+        );
+        drop(old);
+        let before = checks(&env);
+        {
+            let txn = env.begin_ro().unwrap();
+            for _ in 0..2 {
+                for event in &events {
+                    assert!(!is_event_vanished_ro(
+                        &txn,
+                        PackedEventView::new(&event.packed).unwrap()
+                    )
+                    .unwrap());
+                }
+            }
+            assert_eq!(
+                checks(&env),
+                before,
+                "completed passes must not touch payloads"
+            );
+            for event in [&plain, &forged] {
+                assert!(crate::lookup_event_by_id_ro(
+                    &txn,
+                    PackedEventView::new(&event.packed).unwrap().id()
+                )
+                .unwrap()
+                .is_none());
+                assert!(
+                    is_event_vanished_ro(&txn, PackedEventView::new(&event.packed).unwrap())
+                        .unwrap()
+                );
+            }
+        }
+        // A supplied candidate isn't covered just because its author finished
+        // a pass; admission and live candidates still need their own signature.
+        let mut incoming = signed(5002, true, false);
+        let mut txn = env.begin_rw().unwrap();
+        write_events(
+            &mut txn,
+            &mut NoopNegentropy,
+            std::slice::from_mut(&mut incoming),
+            false,
+        )
+        .unwrap();
+        assert_eq!(incoming.status, EventWriteStatus::Deleted);
+        txn.commit().unwrap();
+        drop(env);
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        {
+            let txn = env.begin_ro().unwrap();
+            assert!(
+                !is_event_vanished_ro(&txn, PackedEventView::new(&events[0].packed).unwrap())
+                    .unwrap()
+            );
+            assert_eq!(
+                checks(&env),
+                0,
+                "persisted proof survives a cold cache and restart"
+            );
+        }
+        let mut txn = env.begin_rw().unwrap();
+        mark_vanished(&mut txn, &pubkey, 300).unwrap();
+        txn.commit().unwrap();
+        {
+            let txn = env.begin_ro().unwrap();
+            assert!(
+                !is_event_vanished_ro(&txn, PackedEventView::new(&events[0].packed).unwrap())
+                    .unwrap()
+            );
+            assert!(checks(&env) > 0, "a raised cutoff requires a new pass");
+        }
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = Env::open(target_dir.path(), EnvOptions::for_tests()).unwrap();
+        let source = env.begin_ro().unwrap();
+        let mut rebuilt = target.begin_rw().unwrap();
+        crate::rebuild_primary_and_event_indices(
+            &source,
+            &mut rebuilt,
+            crate::PackedEventRebuild::Copy,
+        )
+        .unwrap();
+        rebuilt.commit().unwrap();
+        let txn = target.begin_ro().unwrap();
+        assert!(
+            !is_event_vanished_ro(&txn, PackedEventView::new(&events[0].packed).unwrap()).unwrap()
+        );
+        assert!(
+            checks(&target) > 0,
+            "reindex discards sweep proof and revalidates survivors"
+        );
+    }
+
+    #[test]
     fn sweep_progress_round_trips() {
         let position = Position {
             created_at: 7,
@@ -712,8 +955,15 @@ mod tests {
                 target: 200,
                 from: 101,
                 step,
+                verified: true,
             };
-            assert_eq!(SweepProgress::decode(&progress.encode()).unwrap(), progress);
+            for verified in [true, false] {
+                let progress = SweepProgress {
+                    verified,
+                    ..progress
+                };
+                assert_eq!(SweepProgress::decode(&progress.encode()).unwrap(), progress);
+            }
         }
         let mut raw = SweepProgress::start(0, 1).encode();
         raw[16] = 3;

@@ -233,7 +233,11 @@ pub(super) fn run_writer(
                                 )
                             } else {
                                 (
-                                    is_event_vanished_ro(&txn, packed_view)?,
+                                    wok_db::is_event_vanished_ro_with_json(
+                                        &txn,
+                                        packed_view,
+                                        &json,
+                                    )?,
                                     moderation_reason_ro(&txn, packed_view)?,
                                     grant.stored_admits(&txn, &cfg_snap, packed_view.kind())?,
                                 )
@@ -245,7 +249,11 @@ pub(super) fn run_writer(
                             // first is a setting.
                             Ok((vanished, moderated, write_allowed)) => (
                                 vanished
-                                    || event_matches_vanish_markers(packed_view, &batch_vanish),
+                                    || event_matches_vanish_markers(
+                                        packed_view,
+                                        &batch_vanish,
+                                        &json,
+                                    ),
                                 moderated.map(|reason| (reason, None)).or((!cfg_snap
                                     .accepts_kind(packed_view.kind()))
                                 .then_some((
@@ -1220,6 +1228,7 @@ pub(super) fn apply_management(
 pub(super) fn event_matches_vanish_markers(
     packed: PackedEventView<'_>,
     markers: &HashMap<[u8; 32], u64>,
+    json: &str,
 ) -> bool {
     if packed.kind() != VANISH_KIND {
         let mut author = [0u8; 32];
@@ -1227,6 +1236,7 @@ pub(super) fn event_matches_vanish_markers(
         if markers
             .get(&author)
             .is_some_and(|timestamp| packed.created_at() <= *timestamp)
+            && !wok_db::is_deletion_protected_json(packed, json).unwrap_or(false)
         {
             return true;
         }

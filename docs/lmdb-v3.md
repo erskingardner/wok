@@ -351,7 +351,16 @@ index entry to examine, or that it finished. A missing or unreadable record
 starts the marker's passes over, so a reindex, which does not copy these
 records, costs one more pass per marker. The `vanish-markers` counter goes up
 each time a marker is added or raised: while it stays where it was when every
-pass had finished, the sweep has nothing to do. Earlier releases' integrity
+pass had finished, the sweep has nothing to do. An author step that verified
+all its survivors also proves their deletion protection. Read snapshots use
+that progress to avoid rechecking payloads while still checking recipient
+vanish markers. Missing or unreadable event payloads and malformed packed
+records are retained with a warning, so one record cannot stop unrelated
+expiry and vanish cleanup. The progress step byte's high bit records that
+verification was incomplete; it disables the read shortcut, survives restart
+and raised cutoffs, and keeps retained records available to integrity/repair.
+LMDB errors still abort the transaction. After repairing damaged records,
+reindex drops progress and allows a new pass to verify the survivors again. Earlier releases' integrity
 check reports these keys as unknown.
 
 The sequence never decreases after deleting the newest record. Reindex retains

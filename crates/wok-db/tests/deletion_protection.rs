@@ -369,6 +369,84 @@ fn unrelated_and_replayed_kind5_requests_preserve_recipient_wraps() {
 }
 
 #[test]
+fn unreadable_payloads_do_not_stall_maintenance_or_gain_sweep_proof() {
+    for damage in ["missing", "json", "compressed"] {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let author = key();
+        let pubkey = author.x_only_public_key().0.serialize();
+        let mut broken = signed(&author, 445, 100, json!([["no_delete"]]));
+        let mut plain = signed(&author, 1, 101, json!([]));
+        let mut expired = signed(&key(), 1, 90, json!([["expiration", "150"]]));
+        for event in [&mut broken, &mut plain, &mut expired] {
+            write(&env, event);
+        }
+        let lev = stored(&env, &broken).unwrap();
+        let expired_lev = stored(&env, &expired).unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        match damage {
+            "missing" => {
+                txn.del_u64(env.dbis().event_payload, lev, None).unwrap();
+            }
+            "json" => {
+                txn.put_u64(
+                    env.dbis().event_payload,
+                    lev,
+                    &wok_db::encode_raw_payload("{"),
+                    0,
+                )
+                .unwrap();
+            }
+            _ => {
+                txn.put_u64(env.dbis().event_payload, lev, &[255], 0)
+                    .unwrap();
+            }
+        }
+        wok_db::mark_vanished(&mut txn, &pubkey, 200).unwrap();
+        txn.commit().unwrap();
+        // Expiry cleanup shares the vanish transaction. One unreadable record
+        // must not roll back unrelated expiry or pin the bounded cursor.
+        let mut txn = env.begin_rw().unwrap();
+        delete_events(&mut txn, &mut NoopNegentropy, [expired_lev]).unwrap();
+        let step = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut Default::default())
+            .unwrap();
+        assert_eq!(step.examined, 1);
+        txn.commit().unwrap();
+        assert!(stored(&env, &expired).is_none());
+        drop(env);
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        sweep(&env);
+        assert!(stored(&env, &plain).is_none());
+        assert!(
+            stored(&env, &broken).is_some(),
+            "retain corrupt primary evidence"
+        );
+        assert!(
+            is_event_vanished_ro(
+                &env.begin_ro().unwrap(),
+                PackedEventView::new(&broken.packed).unwrap()
+            )
+            .is_err(),
+            "skipped payloads must not gain protection from completed progress"
+        );
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::mark_vanished(&mut txn, &pubkey, 300).unwrap();
+        txn.commit().unwrap();
+        sweep(&env);
+        assert!(
+            is_event_vanished_ro(
+                &env.begin_ro().unwrap(),
+                PackedEventView::new(&broken.packed).unwrap()
+            )
+            .is_err(),
+            "a later pass must retain the earlier incomplete-verification flag"
+        );
+        assert!(!check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
+    }
+}
+
+#[test]
 fn verification_cache_respects_payload_changes_and_old_read_snapshots() {
     let dir = tempfile::tempdir().unwrap();
     let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();

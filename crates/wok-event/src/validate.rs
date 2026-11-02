@@ -7,7 +7,7 @@ use crate::hash::{verify_id, verify_id_allowing_legacy, verify_sig};
 use crate::packed::PackedEventView;
 use crate::parse::{
     from_hex_exact, from_lower_hex_array, normalize_event_json, pack_event, parse_uint64, to_hex,
-    EventLimits, ParsedEvent,
+    EventLimits, ParsedEvent, MIN_REPRESENTABLE_EXPIRATION,
 };
 use crate::{
     indexed_tag_value, is_ephemeral_kind, is_param_replaceable_kind, is_replaceable_kind,
@@ -429,7 +429,8 @@ pub fn parse_and_verify_event_with(
         return Err(EventError::msg("event is not an object"));
     }
     if crate::deletion_protection(orig)?
-        && crate::expiration_tag(orig).is_some_and(|expiration| expiration < 100)
+        && crate::expiration_tag(orig)
+            .is_some_and(|expiration| expiration < MIN_REPRESENTABLE_EXPIRATION)
     {
         // The existing storage format reserves 0 and 1, and represents
         // explicit expiration timestamps only from 100 onwards.

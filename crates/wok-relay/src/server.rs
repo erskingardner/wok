@@ -3222,13 +3222,13 @@ fn ingest_auth_inner(
         ));
     }
     // NIP-42's window of about ten minutes, not `[events]`: the challenge
-    // already prevents replay. An AUTH event that fails validation is
-    // `invalid:`, as it would be if sent as EVENT.
+    // already prevents replay. Keep the same structured validation prefix
+    // as EVENT, including D9's restriction on ephemeral AUTH events.
     let policy = cfg.timestamp_policy_for_kind(AUTH_KIND);
     let parsed = parse_and_verify_event(event_json, &cfg.event_limits(), Some(&policy), true, true)
         .map_err(|e| {
             count_event_limit(metrics, AUTH_KIND, &e);
-            format!("invalid: {e}")
+            format!("{}: {e}", e.rejection_prefix())
         })?;
     let packed = parsed.packed.view();
     let mut pk = [0u8; 32];

@@ -585,6 +585,29 @@ async fn nip09_deleting_a_deletion_request_has_no_effect() {
     assert_eq!(stored, ids(&[&d1, &d2]));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nipd9_auth_uses_the_same_restriction_prefix_as_event() {
+    let relay = auth_relay();
+    let mut conn = relay.connect().await;
+    let challenge = conn.recv().await;
+    let event = sign_event_with_key(
+        json!({
+            "created_at": now(), "kind": 22242,
+            "tags": [["relay", AUTH_RELAY], ["challenge", challenge[1]], ["no_delete"]],
+            "content": "",
+        }),
+        &key(),
+    );
+    conn.send(json!(["AUTH", event])).await;
+    let reply = conn.recv().await;
+    assert_eq!(reply[0], "OK", "{reply}");
+    assert_eq!(reply[2], false, "{reply}");
+    assert!(
+        reply[3].as_str().unwrap().starts_with("restricted:"),
+        "{reply}"
+    );
+}
+
 /// NIP-D9 (nips#2531), pinned separately from the main NIPs revision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nipd9_validates_metadata_and_reports_required_prefixes() {

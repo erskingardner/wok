@@ -349,7 +349,10 @@ fn survived_author_sweep(
     let Ok(progress) = SweepProgress::decode(raw) else {
         return Ok(false);
     };
-    if progress.target < cutoff || matches!(progress.step, SweepStep::Authored(_)) {
+    if !progress.verified
+        || progress.target < cutoff
+        || matches!(progress.step, SweepStep::Authored(_))
+    {
         return Ok(false);
     }
     Ok(crate::lookup_event_by_id_ro(txn, packed.id())?
@@ -398,6 +401,9 @@ pub(crate) struct SweepProgress {
     /// pass, one past the target of the pass before on a later one.
     from: u64,
     step: SweepStep,
+    /// False when a pass retained an unreadable record. Maintenance continues,
+    /// but this progress cannot certify survivors until reindex starts over.
+    verified: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,12 +424,14 @@ struct Position {
 }
 
 const SWEEP_PROGRESS_LEN: usize = 33;
+const SWEEP_UNVERIFIED: u8 = 0x80;
 
 impl SweepProgress {
     fn start(from: u64, target: u64) -> Self {
         Self {
             target,
             from,
+            verified: true,
             step: SweepStep::Authored(Position {
                 created_at: from,
                 lev_id: 0,
@@ -446,7 +454,7 @@ impl SweepProgress {
         let mut raw = [0u8; SWEEP_PROGRESS_LEN];
         raw[..8].copy_from_slice(&self.target.to_le_bytes());
         raw[8..16].copy_from_slice(&self.from.to_le_bytes());
-        raw[16] = step;
+        raw[16] = step | if self.verified { 0 } else { SWEEP_UNVERIFIED };
         raw[17..25].copy_from_slice(&position.created_at.to_le_bytes());
         raw[25..].copy_from_slice(&position.lev_id.to_le_bytes());
         raw
@@ -461,7 +469,7 @@ impl SweepProgress {
             created_at: word(17),
             lev_id: word(25),
         };
-        let step = match raw[16] {
+        let step = match raw[16] & !SWEEP_UNVERIFIED {
             0 => SweepStep::Authored(position),
             1 => SweepStep::Tagged(position),
             2 => SweepStep::Done,
@@ -471,6 +479,7 @@ impl SweepProgress {
             target: word(0),
             from: word(8),
             step,
+            verified: raw[16] & SWEEP_UNVERIFIED == 0,
         })
     }
 }
@@ -563,6 +572,7 @@ pub fn sweep_vanished_events<N: NegentropySink>(
         entries: batch_limit,
         lev_ids: Vec::new(),
         seen: HashSet::new(),
+        unverified: false,
     };
     let mut markers = 0;
     while markers < batch_limit && sweep.entries > 0 {
@@ -595,8 +605,12 @@ pub fn sweep_vanished_events<N: NegentropySink>(
             Some(SweepProgress {
                 target,
                 step: SweepStep::Done,
+                verified,
                 ..
-            }) => SweepProgress::start(target + 1, timestamp),
+            }) => SweepProgress {
+                verified,
+                ..SweepProgress::start(target + 1, timestamp)
+            },
             Some(progress) => progress,
             None => SweepProgress::start(0, timestamp),
         };
@@ -620,6 +634,7 @@ struct Sweep {
     entries: usize,
     lev_ids: Vec<u64>,
     seen: HashSet<u64>,
+    unverified: bool,
 }
 
 impl Sweep {
@@ -630,6 +645,7 @@ impl Sweep {
         pubkey: &[u8; 32],
         mut progress: SweepProgress,
     ) -> Result<SweepProgress, DbError> {
+        self.unverified = false;
         if let SweepStep::Authored(position) = progress.step {
             // Vanish requests stay stored.
             let next = self.walk(
@@ -666,6 +682,7 @@ impl Sweep {
             )?;
             progress.step = next.map_or(SweepStep::Done, SweepStep::Tagged);
         }
+        progress.verified &= !self.unverified;
         Ok(progress)
     }
 
@@ -714,9 +731,16 @@ impl Sweep {
                         {
                             Ok(true) if self.seen.insert(lev_id) => self.lev_ids.push(lev_id),
                             Ok(_) => {}
-                            Err(err) => {
+                            Err(err @ DbError::Lmdb(..)) => {
                                 error = Some(err);
                                 return false;
+                            }
+                            Err(err) => {
+                                // Keep primary evidence for integrity/repair. A
+                                // skipped record must never become proof of D9
+                                // protection just because its pass has finished.
+                                self.unverified = true;
+                                tracing::warn!(lev_id, %err, "vanish sweep retained an unreadable record");
                             }
                         }
                         true
@@ -931,8 +955,15 @@ mod tests {
                 target: 200,
                 from: 101,
                 step,
+                verified: true,
             };
-            assert_eq!(SweepProgress::decode(&progress.encode()).unwrap(), progress);
+            for verified in [true, false] {
+                let progress = SweepProgress {
+                    verified,
+                    ..progress
+                };
+                assert_eq!(SweepProgress::decode(&progress.encode()).unwrap(), progress);
+            }
         }
         let mut raw = SweepProgress::start(0, 1).encode();
         raw[16] = 3;

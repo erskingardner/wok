@@ -351,7 +351,11 @@ index entry to examine, or that it finished. A missing or unreadable record
 starts the marker's passes over, so a reindex, which does not copy these
 records, costs one more pass per marker. The `vanish-markers` counter goes up
 each time a marker is added or raised: while it stays where it was when every
-pass had finished, the sweep has nothing to do. Earlier releases' integrity
+pass had finished, the sweep has nothing to do. A completed author step also
+proves that its surviving records under that cutoff passed deletion-protection
+verification. Read snapshots use that progress to avoid rechecking their
+payloads, while still checking recipient vanish markers. Reindex drops the
+progress and forces verification again. Earlier releases' integrity
 check reports these keys as unknown.
 
 The sequence never decreases after deleting the newest record. Reindex retains

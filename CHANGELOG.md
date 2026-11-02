@@ -17,9 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   addressable and ephemeral kinds cannot opt in. NIP-11 keeps its standard
   `supported_nips` integer-only and advertises `"D9"` in the provisional
   `wok.supported_nips` extension; the landing page links to the draft.
-- Outbound sync/router discovery reads the provisional `wok.supported_nips`
-  extension and tolerates mixed integer/string standard arrays from peers,
-  keeping names literal so `"5A"` cannot alias numeric NIP-90.
+- Outbound sync/router discovery tolerates mixed integer/string standard
+  arrays from peers, keeping names literal so `"5A"` cannot alias numeric
+  NIP-90. Routing ignores the provisional `wok` extension.
+- Reads reuse a completed NIP-62 author sweep's verification of protected
+  survivors, avoiding repeated payload hashing and signature verification
+  when a query exceeds the bounded protection cache. Raised cutoffs and
+  reindex require verification again.
 
 ### Security
 

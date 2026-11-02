@@ -254,7 +254,12 @@ pub fn is_event_vanished_ro(txn: &RoTxn<'_>, packed: PackedEventView<'_>) -> Res
     event_vanished(
         packed,
         |key| vanish_timestamp_ro(txn, key),
-        || crate::deletion_protection::is_deletion_protected_ro(txn, packed),
+        |timestamp| {
+            if survived_author_sweep(txn, packed, timestamp)? {
+                return Ok(true);
+            }
+            crate::deletion_protection::is_deletion_protected_ro(txn, packed)
+        },
     )
 }
 
@@ -268,15 +273,7 @@ pub fn is_event_vanished_ro_with_json(
     event_vanished(
         packed,
         |key| vanish_timestamp_ro(txn, key),
-        || crate::is_deletion_protected_json(packed, json),
-    )
-}
-
-pub fn is_event_vanished_rw(txn: &RwTxn<'_>, packed: PackedEventView<'_>) -> Result<bool, DbError> {
-    event_vanished(
-        packed,
-        |key| vanish_timestamp_rw(txn, key),
-        || crate::deletion_protection::is_stored_deletion_protected_rw(txn, packed),
+        |_| crate::is_deletion_protected_json(packed, json),
     )
 }
 
@@ -288,20 +285,21 @@ pub(crate) fn is_event_vanished_rw_with_json(
     event_vanished(
         packed,
         |key| vanish_timestamp_rw(txn, key),
-        || crate::is_deletion_protected_json(packed, json),
+        |_| crate::is_deletion_protected_json(packed, json),
     )
 }
 
 fn event_vanished(
     packed: PackedEventView<'_>,
     mut timestamp: impl FnMut(&[u8]) -> Result<Option<u64>, DbError>,
-    protected: impl FnOnce() -> Result<bool, DbError>,
+    protected: impl FnOnce(u64) -> Result<bool, DbError>,
 ) -> Result<bool, DbError> {
-    if packed.kind() != VANISH_KIND
-        && timestamp(packed.pubkey())?.is_some_and(|timestamp| packed.created_at() <= timestamp)
-        && !protected()?
-    {
-        return Ok(true);
+    if packed.kind() != VANISH_KIND {
+        if let Some(cutoff) = timestamp(packed.pubkey())? {
+            if packed.created_at() <= cutoff && !protected(cutoff)? {
+                return Ok(true);
+            }
+        }
     }
     if GIFT_WRAP_KINDS.contains(&packed.kind()) {
         let mut vanished = false;
@@ -330,6 +328,32 @@ fn event_vanished(
         }
     }
     Ok(false)
+}
+
+/// A finished author pass has verified all surviving records under its cutoff.
+/// Later writes under that cutoff also verify protection before admission.
+/// The progress and primary must belong to this read snapshot; arbitrary live
+/// candidates and reindexed databases cannot inherit that proof. Recipient
+/// vanish checks still run independently after this author-only exemption.
+fn survived_author_sweep(
+    txn: &RoTxn<'_>,
+    packed: PackedEventView<'_>,
+    cutoff: u64,
+) -> Result<bool, DbError> {
+    let Some(dbi) = txn.env().dbis().state else {
+        return Ok(false);
+    };
+    let Some(raw) = txn.get(dbi, &sweep_progress_key(packed.pubkey()))? else {
+        return Ok(false);
+    };
+    let Ok(progress) = SweepProgress::decode(raw) else {
+        return Ok(false);
+    };
+    if progress.target < cutoff || matches!(progress.step, SweepStep::Authored(_)) {
+        return Ok(false);
+    }
+    Ok(crate::lookup_event_by_id_ro(txn, packed.id())?
+        .is_some_and(|(_, stored)| stored == packed.as_bytes()))
 }
 
 fn next_marker(txn: &RwTxn<'_>, cursor: &[u8]) -> Result<Option<([u8; 32], u64)>, DbError> {
@@ -451,7 +475,7 @@ impl SweepProgress {
     }
 }
 
-fn sweep_progress_key(pubkey: &[u8; 32]) -> [u8; 33] {
+fn sweep_progress_key(pubkey: &[u8]) -> [u8; 33] {
     let mut key = [crate::state::VANISH_SWEEP; 33];
     key[1..].copy_from_slice(pubkey);
     key
@@ -716,6 +740,181 @@ impl Sweep {
 mod tests {
     use super::*;
     use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
+
+    #[test]
+    fn completed_author_sweeps_avoid_payload_checks_beyond_cache_capacity() {
+        use crate::{write_events, EnvOptions, EventToWrite, EventWriteStatus, NoopNegentropy};
+        use secp256k1::{Keypair, SECP256K1};
+        use serde_json::json;
+        fn checks(env: &Env) -> usize {
+            env.inner.protection_cache.lock().unwrap().payload_checks
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let author = Keypair::new(SECP256K1, &mut rand::thread_rng());
+        let pubkey = author.x_only_public_key().0.serialize();
+        let signed = |n, marked, valid| {
+            let mut event = json!({
+                "pubkey": hex::encode(pubkey), "created_at": 100, "kind": 1,
+                "tags": if marked { json!([["no_delete"]]) } else { json!([]) },
+                "content": format!("event {n}"),
+            });
+            let id = wok_event::event_id_hash(&event).unwrap();
+            event["id"] = json!(hex::encode(id));
+            event["sig"] = if valid {
+                json!(hex::encode(SECP256K1.sign_schnorr(&id, &author).as_ref()))
+            } else {
+                json!("00".repeat(64))
+            };
+            let packed =
+                wok_event::nostr_json_to_packed_event(&event, &Default::default()).unwrap();
+            EventToWrite::new(
+                packed.into_bytes(),
+                wok_event::normalize_event_json(&event).unwrap(),
+            )
+        };
+        // Exceed the actual cache capacity: a second scan used to miss every
+        // entry and repeat all signature checks, even after cleanup finished.
+        let mut events: Vec<_> = (0..4097).map(|n| signed(n, true, true)).collect();
+        let mut plain = signed(5000, false, true);
+        let mut forged = signed(5001, true, false);
+        let mut txn = env.begin_rw().unwrap();
+        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
+        for event in [&mut plain, &mut forged] {
+            write_events(
+                &mut txn,
+                &mut NoopNegentropy,
+                std::slice::from_mut(event),
+                false,
+            )
+            .unwrap();
+        }
+        mark_vanished(&mut txn, &pubkey, 200).unwrap();
+        txn.commit().unwrap();
+        let old = env.begin_ro().unwrap();
+        let before = checks(&env);
+        assert!(
+            !is_event_vanished_ro(&old, PackedEventView::new(&events[0].packed).unwrap()).unwrap()
+        );
+        assert!(
+            checks(&env) > before,
+            "pending passes still verify protection"
+        );
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut cursor = VanishSweepCursor::default();
+                    for _ in 0..100 {
+                        let mut txn = env.begin_rw().unwrap();
+                        let step =
+                            sweep_vanished_events(&mut txn, &mut NoopNegentropy, 128, &mut cursor)
+                                .unwrap();
+                        txn.commit().unwrap();
+                        if step.markers == 0 {
+                            return;
+                        }
+                    }
+                    panic!("sweep did not finish");
+                })
+                .join()
+                .unwrap()
+        });
+        let before = checks(&env);
+        assert!(is_event_vanished_ro(&old, PackedEventView::new(&forged.packed).unwrap()).unwrap());
+        assert!(
+            checks(&env) > before,
+            "old snapshots cannot borrow newer progress"
+        );
+        drop(old);
+        let before = checks(&env);
+        {
+            let txn = env.begin_ro().unwrap();
+            for _ in 0..2 {
+                for event in &events {
+                    assert!(!is_event_vanished_ro(
+                        &txn,
+                        PackedEventView::new(&event.packed).unwrap()
+                    )
+                    .unwrap());
+                }
+            }
+            assert_eq!(
+                checks(&env),
+                before,
+                "completed passes must not touch payloads"
+            );
+            for event in [&plain, &forged] {
+                assert!(crate::lookup_event_by_id_ro(
+                    &txn,
+                    PackedEventView::new(&event.packed).unwrap().id()
+                )
+                .unwrap()
+                .is_none());
+                assert!(
+                    is_event_vanished_ro(&txn, PackedEventView::new(&event.packed).unwrap())
+                        .unwrap()
+                );
+            }
+        }
+        // A supplied candidate isn't covered just because its author finished
+        // a pass; admission and live candidates still need their own signature.
+        let mut incoming = signed(5002, true, false);
+        let mut txn = env.begin_rw().unwrap();
+        write_events(
+            &mut txn,
+            &mut NoopNegentropy,
+            std::slice::from_mut(&mut incoming),
+            false,
+        )
+        .unwrap();
+        assert_eq!(incoming.status, EventWriteStatus::Deleted);
+        txn.commit().unwrap();
+        drop(env);
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        {
+            let txn = env.begin_ro().unwrap();
+            assert!(
+                !is_event_vanished_ro(&txn, PackedEventView::new(&events[0].packed).unwrap())
+                    .unwrap()
+            );
+            assert_eq!(
+                checks(&env),
+                0,
+                "persisted proof survives a cold cache and restart"
+            );
+        }
+        let mut txn = env.begin_rw().unwrap();
+        mark_vanished(&mut txn, &pubkey, 300).unwrap();
+        txn.commit().unwrap();
+        {
+            let txn = env.begin_ro().unwrap();
+            assert!(
+                !is_event_vanished_ro(&txn, PackedEventView::new(&events[0].packed).unwrap())
+                    .unwrap()
+            );
+            assert!(checks(&env) > 0, "a raised cutoff requires a new pass");
+        }
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = Env::open(target_dir.path(), EnvOptions::for_tests()).unwrap();
+        let source = env.begin_ro().unwrap();
+        let mut rebuilt = target.begin_rw().unwrap();
+        crate::rebuild_primary_and_event_indices(
+            &source,
+            &mut rebuilt,
+            crate::PackedEventRebuild::Copy,
+        )
+        .unwrap();
+        rebuilt.commit().unwrap();
+        let txn = target.begin_ro().unwrap();
+        assert!(
+            !is_event_vanished_ro(&txn, PackedEventView::new(&events[0].packed).unwrap()).unwrap()
+        );
+        assert!(
+            checks(&target) > 0,
+            "reindex discards sweep proof and revalidates survivors"
+        );
+    }
 
     #[test]
     fn sweep_progress_round_trips() {

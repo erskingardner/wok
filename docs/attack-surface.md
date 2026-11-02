@@ -48,6 +48,19 @@ does. The relay at startup, and `wok doctor` in its `unix-access` check,
 warn when the socket's mode lets every local user connect and
 `auth_uids` and `auth_gids` are both empty.
 
+## Deletion protection read cost
+
+NIP-D9 survivors under an author-vanish cutoff require signed-payload
+verification until that author's bounded sweep pass finishes, and again after
+reindex or a raised cutoff. These reads hash the stored primary bytes and, on
+a miss in the 4096-entry cache, decompress, parse and verify the event's
+signature. Queries exceeding that cache can repeat this cost while cleanup is
+pending; query-work limits bound the number of events, not their cryptographic
+cost. After the author pass finishes, reads use its persisted progress and
+matching stored PackedEvent in the same snapshot instead, without touching
+the payload. Recipient-vanish checks still apply independently. See
+[NIP support](nips.md).
+
 ## Network listener
 
 Every request on the listener passes these steps before Wok looks at its path:

@@ -46,11 +46,11 @@ whole document. The namespaced extension preserves compatibility; it is
 Wok-specific, not a standardized hexadecimal NIP discovery convention.
 Clients requiring D9 must explicitly inspect `wok.supported_nips`.
 
-Wok's outbound sync/router discovery reads both the standard array and this
-extension. It also tolerates mixed integer/string standard arrays from peers.
-Names retain their literal spelling: `"5A"` and numeric `90` remain different
-identifiers, and numeric NIP-91 still requires integer `91` in the standard
-array. A name in the Wok extension never enables a numeric capability.
+Wok's outbound sync/router discovery consults only the standard array for
+numeric NIP-91. It tolerates mixed integer/string arrays from peers without
+converting names to integers: `"5A"` and numeric `90` remain different
+identifiers. The provisional Wok extension is ignored by routing; its shape
+cannot disable numeric NIP-91 or enable a numeric capability.
 
 The landing page labels the capability NIP-D9 and links to the proposal. Clients
 requiring protection must establish relay support; `OK true` alone is
@@ -74,6 +74,11 @@ delivery, REQ, COUNT, and NIP-77. A marker on a request protects only that
 request's record, not its targets. Kinds 5 and 62 may themselves be marked.
 The marker is read from the signed payload, with a bounded cache of verified
 results keyed by local ID and a fingerprint of both stored primary records.
+After an author's sweep pass finishes, its persisted progress proves that
+surviving stored events under that cutoff were verified. Reads use that proof
+without hashing or verifying payloads again; it applies only to the same stored
+PackedEvent in the read snapshot. Pending passes, raised cutoffs and reindex
+require verification again. Recipient vanish checks remain independent.
 Existing stored records and migration bytes need no rewrite. Legacy
 tao-preimage IDs remain importable but do not acquire this extension's
 NIP-01 protection.

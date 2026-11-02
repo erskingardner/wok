@@ -1,7 +1,7 @@
 //! Resolve the signed marker from payloads without changing PackedEvent or
 //! migration bytes. Call only when author deletion would otherwise apply.
 
-use crate::{lookup_event_by_id, lookup_event_by_id_ro, DbError, Decompressor, RoTxn, RwTxn};
+use crate::{lookup_event_by_id_ro, DbError, Decompressor, RoTxn, RwTxn};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -18,6 +18,8 @@ const CACHE_CAPACITY: usize = 4096;
 /// allocated again after an aborted transaction. No mmap bytes are retained.
 #[derive(Default)]
 pub(crate) struct ProtectionCache {
+    #[cfg(test)]
+    pub(crate) payload_checks: usize,
     values: HashMap<(u64, [u8; 32]), bool>,
     order: VecDeque<(u64, [u8; 32])>,
 }
@@ -29,6 +31,10 @@ fn cached_protection(
     raw: &[u8],
     verify: impl FnOnce() -> Result<bool, DbError>,
 ) -> Result<bool, DbError> {
+    #[cfg(test)]
+    {
+        cache.lock().unwrap().payload_checks += 1;
+    }
     let mut hash = Sha256::new();
     hash.update((packed.as_bytes().len() as u64).to_le_bytes());
     hash.update(packed.as_bytes());
@@ -116,16 +122,6 @@ pub(crate) fn is_deletion_protected_rw(
         let mut decomp = Decompressor::new();
         is_deletion_protected_json(packed, decomp.decode_rw(txn, raw, MAX_PAYLOAD_JSON)?)
     })
-}
-
-pub(crate) fn is_stored_deletion_protected_rw(
-    txn: &RwTxn<'_>,
-    packed: PackedEventView<'_>,
-) -> Result<bool, DbError> {
-    match lookup_event_by_id(txn, packed.id())? {
-        Some((lev, _)) => is_deletion_protected_rw(txn, lev, packed),
-        None => Ok(false),
-    }
 }
 
 #[cfg(test)]

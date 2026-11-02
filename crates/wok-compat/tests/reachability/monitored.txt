@@ -519,7 +519,6 @@ wok_db::env::statvfs_u64::<u64>
 wok_db::fbs::decode_negentropy_filter
 wok_db::fbs::get_bytes
 wok_db::fbs::get_string
-wok_db::lookup::foreach_event_from::<wok_relay::server::run_req_monitor::{closure}>::{closure}
 wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>
 wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}
 wok_db::lookup::lookup_event_by_id_ro
@@ -583,7 +582,6 @@ wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
 wok_db::txn::position_reverse_dup
 wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>
-wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro::{closure}, wok_db::vanish::is_event_vanished_ro::{closure}>::{closure}
 wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>
 wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>::{closure}
 wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>
@@ -598,6 +596,8 @@ wok_db::vanish::mark_vanished
 wok_db::vanish::normalize_relay_url
 wok_db::vanish::normalize_relay_url::{closure}
 wok_db::vanish::read_timestamp
+wok_db::vanish::survived_author_sweep
+wok_db::vanish::sweep_progress_key
 wok_db::vanish::vanish_timestamp_ro
 wok_db::vanish::vanish_timestamp_rw
 wok_db::write::deletion_exists

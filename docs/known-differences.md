@@ -409,8 +409,8 @@ regression test. Differential parity alone is not a reason to retain it.
   kinds cannot opt in. NIP-11 keeps `supported_nips` integer-only and advertises
   `"D9"` in the provisional Wok extension `wok.supported_nips`. Strict readers
   can parse the standard document while D9-aware clients inspect the extension.
-  Outbound discovery reads this extension and tolerates mixed arrays from peers,
-  preserving literal names without integer conversion; see [NIP support](nips.md).
+  Outbound discovery ignores this extension and tolerates mixed standard arrays
+  from peers without integer conversion; see [NIP support](nips.md).
 - NIP-09 `a` tags of replaceable events: a deletion naming
   `<kind>:<pubkey>:`, for kinds 0, 3 and 10000–19999, deletes its author's
   versions up to its `created_at` and refuses such versions that arrive

@@ -14,17 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and kind-62 purge requests, regardless of arrival order or republication.
   Recipient gift-wrap deletion, expiration and operator policy still apply.
   Invalid markers and expiration metadata are refused, and replaceable,
-  addressable and ephemeral kinds cannot opt in. NIP-11 advertises the string
-  `"D9"` in `supported_nips`; the landing page labels it NIP-D9 and
-  links to the draft.
-- NIP-59 kind-5 recipient deletion sweeps stored p-tagged gift wraps even
-  without explicit target IDs, including wraps carrying `no_delete`. A
-  persisted cutoff hides them immediately while bounded maintenance batches
-  perform the cleanup and resume after a restart. Reindex preserves pending
-  cutoffs and restarts cleanup against the rebuilt indexes.
-- NIP-11 capability handling supports numeric and named identifiers together.
-  Outbound sync/router discovery accepts mixed integer/string arrays while
-  keeping names literal, so a string such as `"5A"` cannot alias numeric NIP-90.
+  addressable and ephemeral kinds cannot opt in. NIP-11 keeps its standard
+  `supported_nips` integer-only and advertises `"D9"` in the provisional
+  `wok.supported_nips` extension; the landing page links to the draft.
+- Outbound sync/router discovery reads the provisional `wok.supported_nips`
+  extension and tolerates mixed integer/string standard arrays from peers,
+  keeping names literal so `"5A"` cannot alias numeric NIP-90.
 
 ### Security
 

@@ -482,8 +482,8 @@ fn maybe_npub(s: &str) -> String {
     s.to_string()
 }
 
-/// The NIP-11 document, advertising `supported_nips`: the relay handle's,
-/// which follow the index state as well as the configuration.
+/// NIP-11 keeps standard identifiers integer-only. Provisional named
+/// capabilities live in `wok.supported_nips`, from the same runtime catalog.
 pub(crate) fn nip11(cfg: &Config, supported_nips: &[NipId]) -> serde_json::Value {
     let min_pow_difficulty = if cfg.relay.abuse.enabled {
         cfg.relay.abuse.min_pow_difficulty
@@ -491,7 +491,16 @@ pub(crate) fn nip11(cfg: &Config, supported_nips: &[NipId]) -> serde_json::Value
         0
     };
     let mut v = serde_json::json!({
-        "supported_nips": supported_nips,
+        "supported_nips": supported_nips.iter().filter_map(|nip| match nip {
+            NipId::Number(number) => Some(*number),
+            NipId::Named(_) => None,
+        }).collect::<Vec<_>>(),
+        "wok": {
+            "supported_nips": supported_nips.iter().filter_map(|nip| match nip {
+                NipId::Named(name) => Some(name.as_ref()),
+                NipId::Number(_) => None,
+            }).collect::<Vec<_>>(),
+        },
         "software": SOFTWARE,
         "version": VERSION,
         "negentropy": PROTOCOL_NEG,
@@ -1145,6 +1154,22 @@ mod transport_tests;
 #[cfg(test)]
 mod landing_tests {
     use super::*;
+
+    #[test]
+    fn nip11_remains_readable_by_integer_only_consumers() {
+        #[derive(serde::Deserialize)]
+        struct StrictInformationDocument {
+            supported_nips: Vec<u16>,
+        }
+        let cfg = Config::default();
+        let document = nip11(&cfg, &wok_relay::supported_nips(&cfg));
+        let strict: StrictInformationDocument = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(
+            strict.supported_nips,
+            vec![1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91]
+        );
+        assert_eq!(document["wok"]["supported_nips"], serde_json::json!(["D9"]));
+    }
 
     #[test]
     fn landing_has_hierarchy_links_descriptions_and_revision() {

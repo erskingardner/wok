@@ -177,7 +177,7 @@ fn vanish_keeps_marked_history_after_sweep_restart_and_republication() {
 #[test]
 fn gift_wrap_recipient_authority_overrides_marker_even_when_recipient_is_signer() {
     for same_key in [false, true] {
-        for (kind, explicit_id) in [(5, false), (5, true), (62, false)] {
+        for (kind, explicit_id) in [(5, true), (62, false)] {
             let dir = tempfile::tempdir().unwrap();
             let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
             env.ensure_initialized().unwrap();
@@ -205,7 +205,7 @@ fn gift_wrap_recipient_authority_overrides_marker_even_when_recipient_is_signer(
             };
             let mut request = signed(&recipient, kind, 200, tags);
             write(&env, &mut request);
-            if kind == 62 || !explicit_id {
+            if kind == 62 {
                 assert!(is_event_vanished_ro(
                     &env.begin_ro().unwrap(),
                     PackedEventView::new(&gift.packed).unwrap()
@@ -305,285 +305,66 @@ fn compressed_historical_payloads_keep_protection_without_repacking() {
 }
 
 #[test]
-fn recipient_cleanup_is_bounded_resumes_after_restart_and_preserves_later_arrivals() {
-    for indexed in [false, true] {
+fn unrelated_and_replayed_kind5_requests_preserve_recipient_wraps() {
+    for target in ["none", "unknown", "keypackage"] {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
         env.ensure_initialized().unwrap();
         let recipient = key();
-        let sender = key();
         let recipient_hex = hex::encode(recipient.x_only_public_key().0.serialize());
-        let mut mentions = Vec::new();
+        let mut package = signed(&recipient, 443, 1, json!([]));
+        write(&env, &mut package);
+        // Old signed requests can arrive through replay or historical sync.
+        let tags = match target {
+            "none" => json!([]),
+            "unknown" => json!([["e", "00".repeat(32)]]),
+            _ => json!([["e", id(&package)]]),
+        };
+        let mut request = signed(&recipient, 5, 2, tags);
         let mut gifts = Vec::new();
-        for n in 0..20 {
-            mentions.push(signed(&sender, 1, n, json!([["p", recipient_hex]])));
-        }
-        for kind in [1059, 21059] {
-            for at in [0, 100, u64::MAX] {
+        for same_signer in [false, true] {
+            let sender = if same_signer { recipient } else { key() };
+            for marked in [false, true] {
                 let mut tags = json!([["p", recipient_hex]]);
-                if kind == 1059 {
+                if marked {
                     tags.as_array_mut().unwrap().push(json!(["no_delete"]));
                 }
-                gifts.push(signed(&sender, kind, at, tags));
+                let mut gift = signed(&sender, 1059, 100, tags);
+                write(&env, &mut gift);
+                gifts.push(gift);
             }
         }
-        for event in mentions.iter_mut().chain(gifts.iter_mut()) {
-            let mut txn = env.begin_rw().unwrap();
-            if !indexed {
-                wok_db::skip_tag_kind_postings(&mut txn);
-            }
-            wok_db::write_events(
-                &mut txn,
-                &mut NoopNegentropy,
-                std::slice::from_mut(event),
-                false,
-            )
-            .unwrap();
-            txn.commit().unwrap();
-        }
-        let mut request = signed(&recipient, 5, 200, json!([]));
-        let before = wok_db::state::policy_generation(&env.begin_ro().unwrap()).unwrap();
+        let generation = wok_db::state::policy_generation(&env.begin_ro().unwrap()).unwrap();
         write(&env, &mut request);
-        assert!(wok_db::state::policy_generation(&env.begin_ro().unwrap()).unwrap() > before);
+        assert_eq!(request.status, EventWriteStatus::Written);
+        if target != "keypackage" {
+            assert_eq!(
+                wok_db::state::policy_generation(&env.begin_ro().unwrap()).unwrap(),
+                generation,
+                "a request deleting nothing must not invalidate relay-wide visibility"
+            );
+        } else {
+            assert!(stored(&env, &package).is_none());
+        }
         for gift in &gifts {
             assert!(
-                stored(&env, gift).is_some(),
-                "publication only records a cutoff"
+                !is_event_vanished_ro(
+                    &env.begin_ro().unwrap(),
+                    PackedEventView::new(&gift.packed).unwrap()
+                )
+                .unwrap(),
+                "unrelated deletion must not hide a recipient's inbox"
             );
-            assert!(is_event_vanished_ro(
-                &env.begin_ro().unwrap(),
-                PackedEventView::new(&gift.packed).unwrap()
-            )
-            .unwrap());
         }
-        let mut later = signed(
-            &sender,
-            1059,
-            0,
-            json!([["p", recipient_hex], ["x", "later"]]),
-        );
-        write(&env, &mut later);
-        assert_eq!(later.status, EventWriteStatus::Written);
-        assert!(!is_event_vanished_ro(
-            &env.begin_ro().unwrap(),
-            PackedEventView::new(&later.packed).unwrap()
-        )
-        .unwrap());
-
-        // An aborted maintenance transaction cannot advance persisted progress
-        // or remove records. The caller discards its speculative cursor too.
-        {
-            let mut txn = env.begin_rw().unwrap();
-            let step =
-                sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut Default::default())
-                    .unwrap();
-            assert!(step.examined <= 1 && step.deleted <= 1 && step.markers <= 1);
-        }
-        assert!(gifts.iter().all(|gift| stored(&env, gift).is_some()));
-        let mut cursor = Default::default();
-        let mut txn = env.begin_rw().unwrap();
-        let first = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut cursor).unwrap();
-        txn.commit().unwrap();
-        let mut examined = first.examined;
-        let mut deleted = first.deleted;
+        sweep(&env);
         drop(env);
         let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
-        let mut cursor = Default::default();
-        let mut done = false;
-        for _ in 0..100 {
-            let mut txn = env.begin_rw().unwrap();
-            let step =
-                sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut cursor).unwrap();
-            assert!(step.examined <= 1 && step.deleted <= 1 && step.markers <= 1);
-            examined += step.examined;
-            deleted += step.deleted;
-            txn.commit().unwrap();
-            if step.markers == 0 {
-                done = true;
-                break;
-            }
-        }
-        assert!(done);
-        assert_eq!(deleted, gifts.len() as u64);
-        assert_eq!(
-            examined,
-            gifts.len() + 1 + if indexed { 0 } else { mentions.len() }
-        );
-        assert!(gifts.iter().all(|gift| stored(&env, gift).is_none()));
-        for mention in &mentions {
-            assert!(stored(&env, mention).is_some());
-            assert!(!is_event_vanished_ro(
-                &env.begin_ro().unwrap(),
-                PackedEventView::new(&mention.packed).unwrap()
-            )
-            .unwrap());
-        }
-        assert!(stored(&env, &later).is_some());
-        assert!(
-            !wok_db::has_deletion_markers_ro(&env.begin_ro().unwrap()).unwrap(),
-            "completed recipient work releases its read-time marker"
-        );
-
-        // A raised cutoff wakes an idle cursor. Only arrivals before this
-        // second request join the next pass, including backdated wraps.
-        let mut second = signed(&recipient, 5, 201, json!([]));
-        write(&env, &mut second);
-        let mut newest = signed(
-            &sender,
-            1059,
-            0,
-            json!([["p", recipient_hex], ["x", "newest"]]),
-        );
-        write(&env, &mut newest);
-        let mut txn = env.begin_rw().unwrap();
-        let step = sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut cursor).unwrap();
-        assert_eq!(step.markers, 1);
-        txn.commit().unwrap();
+        request.status = EventWriteStatus::Pending;
+        write(&env, &mut request);
+        assert_eq!(request.status, EventWriteStatus::Duplicate);
         sweep(&env);
-        assert!(stored(&env, &later).is_none());
-        assert!(stored(&env, &newest).is_some());
+        assert!(gifts.iter().all(|gift| stored(&env, gift).is_some()));
         assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
-    }
-}
-
-#[test]
-fn recipient_sweep_handles_a_raised_cutoff_and_index_reset_mid_pass() {
-    let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
-    env.ensure_initialized().unwrap();
-    let recipient = key();
-    let sender = key();
-    let recipient_hex = hex::encode(recipient.x_only_public_key().0.serialize());
-    let mut gifts = Vec::new();
-    for at in 0..4 {
-        let mut gift = signed(
-            &sender,
-            1059,
-            at,
-            json!([["p", recipient_hex], ["no_delete"]]),
-        );
-        write(&env, &mut gift);
-        gifts.push(gift);
-    }
-    write(&env, &mut signed(&recipient, 5, 100, json!([])));
-    let mut txn = env.begin_rw().unwrap();
-    let step =
-        sweep_vanished_events(&mut txn, &mut NoopNegentropy, 1, &mut Default::default()).unwrap();
-    assert_eq!(step.deleted, 1);
-    txn.commit().unwrap();
-    let mut later = signed(
-        &sender,
-        1059,
-        1,
-        json!([["p", recipient_hex], ["x", "later"]]),
-    );
-    write(&env, &mut later);
-    write(&env, &mut signed(&recipient, 5, 101, json!([])));
-    let mut txn = env.begin_rw().unwrap();
-    wok_db::reset_tag_kind_index(&mut txn).unwrap();
-    txn.commit().unwrap();
-    sweep(&env);
-    assert!(gifts.iter().all(|gift| stored(&env, gift).is_none()));
-    assert!(stored(&env, &later).is_none());
-    assert!(check_integrity(&env.begin_ro().unwrap()).unwrap().ok());
-}
-
-#[test]
-fn reindex_preserves_pending_recipient_deletions_and_later_arrivals() {
-    for packing in [
-        wok_db::PackedEventRebuild::Copy,
-        wok_db::PackedEventRebuild::RepackLongTags,
-    ] {
-        for partial_sweep in [false, true] {
-            for keep_request in [false, true] {
-                let source_dir = tempfile::tempdir().unwrap();
-                let source = Env::open(source_dir.path(), EnvOptions::for_tests()).unwrap();
-                source.ensure_initialized().unwrap();
-                let recipient = key();
-                let sender = key();
-                let recipient_hex = hex::encode(recipient.x_only_public_key().0.serialize());
-                let mut gifts = Vec::new();
-                for at in 0..3 {
-                    let mut gift = signed(
-                        &sender,
-                        1059,
-                        at,
-                        json!([["p", recipient_hex], ["no_delete"]]),
-                    );
-                    write(&source, &mut gift);
-                    gifts.push(gift);
-                }
-                let mut request = signed(&recipient, 5, 100, json!([]));
-                write(&source, &mut request);
-                if partial_sweep {
-                    let mut txn = source.begin_rw().unwrap();
-                    let step = sweep_vanished_events(
-                        &mut txn,
-                        &mut NoopNegentropy,
-                        1,
-                        &mut Default::default(),
-                    )
-                    .unwrap();
-                    assert_eq!(step.deleted, 1);
-                    txn.commit().unwrap();
-                }
-                let mut later = signed(
-                    &sender,
-                    1059,
-                    0,
-                    json!([["p", recipient_hex], ["x", "later"]]),
-                );
-                write(&source, &mut later);
-                if !keep_request {
-                    // The cutoff is authoritative even after operator deletion
-                    // removes the request; it cannot be derived from events.
-                    let lev = stored(&source, &request).unwrap();
-                    let mut txn = source.begin_rw().unwrap();
-                    delete_events(&mut txn, &mut NoopNegentropy, [lev]).unwrap();
-                    txn.commit().unwrap();
-                }
-                let remaining: Vec<_> = gifts
-                    .iter()
-                    .filter(|gift| stored(&source, gift).is_some())
-                    .collect();
-                let target_dir = tempfile::tempdir().unwrap();
-                let target = Env::open(target_dir.path(), EnvOptions::for_tests()).unwrap();
-                {
-                    let original = source.begin_ro().unwrap();
-                    let mut rebuilt = target.begin_rw().unwrap();
-                    wok_db::rebuild_primary_and_event_indices(&original, &mut rebuilt, packing)
-                        .unwrap();
-                    rebuilt.commit().unwrap();
-                }
-                drop(target);
-                let target = Env::open(target_dir.path(), EnvOptions::for_tests()).unwrap();
-                if keep_request {
-                    request.status = EventWriteStatus::Pending;
-                    write(&target, &mut request);
-                    assert_eq!(request.status, EventWriteStatus::Duplicate);
-                }
-                for gift in remaining {
-                    assert!(stored(&target, gift).is_some());
-                    assert!(
-                        is_event_vanished_ro(
-                            &target.begin_ro().unwrap(),
-                            PackedEventView::new(&gift.packed).unwrap()
-                        )
-                        .unwrap(),
-                        "reindex must not reveal a pending recipient deletion"
-                    );
-                }
-                assert!(!is_event_vanished_ro(
-                    &target.begin_ro().unwrap(),
-                    PackedEventView::new(&later.packed).unwrap()
-                )
-                .unwrap());
-                sweep(&target);
-                assert!(gifts.iter().all(|gift| stored(&target, gift).is_none()));
-                assert!(stored(&target, &later).is_some());
-                assert!(check_integrity(&target.begin_ro().unwrap()).unwrap().ok());
-            }
-        }
     }
 }
 

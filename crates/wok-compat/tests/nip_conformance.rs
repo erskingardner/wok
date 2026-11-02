@@ -759,7 +759,7 @@ async fn nipd9_survives_requests_in_both_orders_on_every_read_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nip59_recipient_sweeps_hide_marked_wraps_on_every_read_path() {
+async fn nip59_explicit_recipient_deletion_hides_marked_wraps_on_every_read_path() {
     for indexed in [false, true] {
         for same_signer in [false, true] {
             let relay = Relay::new(|cfg| {
@@ -792,10 +792,10 @@ async fn nip59_recipient_sweeps_hide_marked_wraps_on_every_read_path() {
             let gift = wrap("before recipient request");
             assert_eq!(publisher.publish(&gift).await[2], true);
             let filter = json!({"kinds": [1059], "#p": [pubkey_hex(&recipient)]});
-            assert_eq!(inbox.history(filter.clone()).await, vec![gift]);
+            assert_eq!(inbox.history(filter.clone()).await, vec![gift.clone()]);
             let request = sign_event_with_key(
                 json!({
-                    "created_at": now(), "kind": 5, "tags": [], "content": "clear existing inbox",
+                    "created_at": now(), "kind": 5, "tags": [["e", gift["id"]]], "content": "delete this wrap",
                 }),
                 &recipient,
             );

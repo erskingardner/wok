@@ -108,19 +108,26 @@ async fn fetch_nip11(http_url: String) -> Arc<CapabilityResult> {
 }
 
 fn parse_supported_nips(document: &Value) -> anyhow::Result<HashSet<NipId>> {
-    let Some(nips) = document.get("supported_nips") else {
-        return Ok(HashSet::new());
-    };
-    let nips = nips
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("supported_nips is not an array"))?;
-    nips.iter()
-        .map(|nip| {
-            serde_json::from_value(nip.clone()).map_err(|_| {
-                anyhow::anyhow!("supported_nips identifiers must be integers or strings")
+    // Tolerate mixed arrays from peers, but emit integer-only standard NIP-11.
+    let mut nips: HashSet<NipId> = match document.get("supported_nips") {
+        None => HashSet::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("supported_nips is not an array"))?
+            .iter()
+            .map(|nip| {
+                serde_json::from_value(nip.clone()).map_err(|_| {
+                    anyhow::anyhow!("supported_nips identifiers must be integers or strings")
+                })
             })
-        })
-        .collect()
+            .collect::<anyhow::Result<_>>()?,
+    };
+    if let Some(extensions) = document.pointer("/wok/supported_nips") {
+        let names: Vec<String> = serde_json::from_value(extensions.clone())
+            .map_err(|_| anyhow::anyhow!("wok.supported_nips must be an array of strings"))?;
+        nips.extend(names.into_iter().map(|name| NipId::Named(name.into())));
+    }
+    Ok(nips)
 }
 
 async fn relay_supported_nips(relay_url: &str) -> Result<Arc<HashSet<NipId>>, Arc<str>> {
@@ -501,6 +508,35 @@ mod tests {
                 .unwrap(),
             filter
         );
+    }
+
+    #[test]
+    fn supported_nips_reads_namespaced_extensions_without_numeric_aliases() {
+        let nips = parse_supported_nips(&serde_json::json!({
+            "supported_nips": [1, 11, 91],
+            "wok": {"supported_nips": ["D9", "5A", "91"]},
+        }))
+        .unwrap();
+        assert!(nips.contains(&NipId::Number(91)));
+        assert!(nips.contains(&NipId::named("D9")));
+        assert!(nips.contains(&NipId::named("5A")));
+        assert!(!nips.contains(&NipId::Number(217)));
+        assert!(!nips.contains(&NipId::Number(90)));
+        let named_only = parse_supported_nips(&serde_json::json!({
+            "wok": {"supported_nips": ["91"]},
+        }))
+        .unwrap();
+        assert!(!named_only.contains(&NipId::Number(91)));
+        for invalid in [
+            serde_json::json!([217]),
+            serde_json::json!("D9"),
+            serde_json::json!([null]),
+        ] {
+            assert!(parse_supported_nips(&serde_json::json!({
+                "wok": {"supported_nips": invalid},
+            }))
+            .is_err());
+        }
     }
 
     #[test]

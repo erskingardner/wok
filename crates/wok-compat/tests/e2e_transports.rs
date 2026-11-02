@@ -1197,8 +1197,10 @@ async fn nip11_http_document() {
         .any(|n| n == 1));
     assert_eq!(
         client["supported_nips"],
-        json!([1, 9, 11, 13, 40, 45, 50, 62, 67, 70, 77, 91, "D9"])
+        json!([1, 9, 11, 13, 40, 45, 50, 62, 67, 70, 77, 91])
     );
+    assert_eq!(client["wok"]["supported_nips"], json!(["D9"]));
+    let _: Vec<u16> = serde_json::from_value(client["supported_nips"].clone()).unwrap();
     assert_eq!(client["limitation"]["max_event_tags"], 5000);
     assert_eq!(client["limitation"]["max_message_length"], 2_097_152);
     assert_eq!(client["limitation"]["created_at_lower_limit"], 86_400);

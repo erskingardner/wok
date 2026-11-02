@@ -406,17 +406,11 @@ regression test. Differential parity alone is not a reason to retain it.
   later republication. The pinned strfry ignores this tag. Recipient deletion,
   expiration and independent operator policy still apply. Malformed markers
   and expiration metadata are refused; replaceable, addressable and ephemeral
-  kinds cannot opt in. NIP-11 advertises the literal string `"D9"` in
-  `supported_nips` alongside integer identifiers for numeric NIPs. Outbound
-  sync/router discovery also accepts these mixed arrays and preserves named
-  identifiers without converting them to integers; see [NIP support](nips.md).
-- NIP-59 recipient deletion: a kind-5 request sweeps stored gift wraps whose
-  `p` tag names the requester even without an `e` tag naming the wrap. This
-  includes marked wraps and a wrap whose recipient is also its signer. The
-  relay hides the existing wraps immediately and deletes them in bounded
-  maintenance batches whose progress survives restart; later arrivals remain
-  outside that request's local-sequence cutoff. The pinned strfry only checks
-  the recipient for explicitly referenced IDs.
+  kinds cannot opt in. NIP-11 keeps `supported_nips` integer-only and advertises
+  `"D9"` in the provisional Wok extension `wok.supported_nips`. Strict readers
+  can parse the standard document while D9-aware clients inspect the extension.
+  Outbound discovery reads this extension and tolerates mixed arrays from peers,
+  preserving literal names without integer conversion; see [NIP support](nips.md).
 - NIP-09 `a` tags of replaceable events: a deletion naming
   `<kind>:<pubkey>:`, for kinds 0, 3 and 10000–19999, deletes its author's
   versions up to its `created_at` and refuses such versions that arrive

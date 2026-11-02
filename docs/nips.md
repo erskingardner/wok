@@ -25,23 +25,32 @@ arbitrary list.
 | 78 | Arbitrary custom app data | kinds 78 and 30078 served only to, and accepted only from, a connection authenticated as their author | `nip_conformance.rs`, `access_model.rs` | usable AUTH and kinds 78 and 30078 in `relay.auth.owner_only_kinds` |
 | 86 | Relay management API | `wok-ws` RPC + `wok-db` moderation tables + `wok-relay` enforcement | `e2e_transports.rs` | `admin.enabled` with operator pubkeys |
 | 91 | AND operator in filters | `wok-query` compiled AND tags + full-event verification | matcher property tests, historical/live/COUNT conformance | both tag-filter limits are nonzero |
-| D9 | Deletion Request Protection | signed marker validation + `wok-db` deletion and vanish exemptions | `nip_conformance.rs`, `e2e_transports.rs`, `deletion_protection.rs` | always |
 
 Wok uses **NIP-D9** for **Deletion Request Protection**, following
 [nostr-protocol/nips#2531](https://github.com/nostr-protocol/nips/pull/2531),
 at revision `807264f308bef304779e347704842738b6e16ba5`.
-NIP-11 advertises the literal string **"D9"** in `supported_nips`, alongside
-integers for numeric NIPs. For example:
+The standard NIP-11 `supported_nips` field remains integer-only. The literal
+string **"D9"** is advertised separately in a provisional Wok extension:
 
 ```json
-{"supported_nips": [1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91, "D9"]}
+{
+  "supported_nips": [1, 9, 11, 40, 45, 50, 62, 67, 70, 77, 91],
+  "wok": {"supported_nips": ["D9"]}
+}
 ```
 
-Wok uses strings for lettered NIP identifiers without hexadecimal-to-integer
-conversion: `"5A"` and numeric `90` remain different identifiers. This is an
-interim extension to NIP-11's currently integer-only schema. Wok's outbound
-sync/router discovery accepts mixed integer/string arrays, preserving each
-identifier's type and spelling; numeric NIP-91 still requires integer `91`.
+[NIP-11](https://github.com/nostr-protocol/nips/blob/0b5532c0355ab27f447e071a93c09cf3a2b4aad5/11.md#supported-nips)
+defines integer identifiers and provides no encoding for lettered names.
+Putting a string in its standard array makes strict consumers reject the
+whole document. The namespaced extension preserves compatibility; it is
+Wok-specific, not a standardized hexadecimal NIP discovery convention.
+Clients requiring D9 must explicitly inspect `wok.supported_nips`.
+
+Wok's outbound sync/router discovery reads both the standard array and this
+extension. It also tolerates mixed integer/string standard arrays from peers.
+Names retain their literal spelling: `"5A"` and numeric `90` remain different
+identifiers, and numeric NIP-91 still requires integer `91` in the standard
+array. A name in the Wok extension never enables a numeric capability.
 
 The landing page labels the capability NIP-D9 and links to the proposal. Clients
 requiring protection must establish relay support; `OK true` alone is
@@ -70,12 +79,8 @@ tao-preimage IDs remain importable but do not acquire this extension's
 NIP-01 protection.
 
 Recipient gift-wrap deletion remains effective, even if the recipient and
-signer are the same key. A kind-5 recipient request sweeps stored p-tagged
-wraps without needing their IDs. Stored wraps are hidden immediately through
-a persisted local-sequence cutoff; physical cleanup shares the bounded,
-restartable maintenance sweep with NIP-62. Later arrivals are outside that
-cutoff unless explicitly tombstoned. The sweep uses the tag-kind index when
-it covers the cutoff, with a bounded tag-index fallback otherwise.
+signer are the same key. A kind-5 recipient request must name the wrap with
+an explicit `e` tag; unrelated requests do not clear the recipient's inbox.
 Kind-62 recipient suppression and cleanup keep their existing timestamp
 semantics. Wok does not implement NIP-26
 delegation, so this extension adds no delegator authority. Original NIP-40

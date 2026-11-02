@@ -10,7 +10,7 @@ use crate::EphemeralPersistence;
 use std::borrow::Cow;
 use std::fmt;
 
-/// A NIP-11 identifier. Numeric NIPs retain their integer representation;
+/// A relay capability identifier. Numeric NIPs retain their integer representation;
 /// lettered designations retain their literal spelling as strings. The two
 /// forms are distinct: `"5A"` is not numeric NIP-90, nor is `"91"` NIP-91.
 #[derive(
@@ -204,6 +204,8 @@ pub fn relay_capabilities(cfg: &Config) -> Vec<RelayCapability> {
         .collect()
 }
 
+/// Enabled numeric and named capabilities. HTTP discovery separates these into
+/// standard `supported_nips` and the provisional `wok.supported_nips` extension.
 pub fn supported_nips(cfg: &Config) -> Vec<NipId> {
     relay_capabilities(cfg)
         .into_iter()

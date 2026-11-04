@@ -57,7 +57,12 @@ ordinary cursor operations retain their existing behavior.
 Scans reuse one physical cursor across their logical author/tag/kind ranges and
 refills within each scan call. The cursor is dropped before returning to the
 scheduler; owned resume endpoints and the next call's transaction still control
-resumption. Candidate depths, merge ordering and work accounting are unchanged.
+resumption. Wide scans start with a small frontier from each logical range and
+merge candidates in a heap ordered by timestamp and local ID. Equal candidates
+retain their stable insertion order. Only ranges being consumed grow their
+refill batches, bounded at 50 entries for multi-range scans; single-range scans
+retain their existing batching. Candidate and processing work remains charged
+to the scan's budget, including across handler stops and scheduler slices.
 A read-only duplicate range with a full starting key/value positions
 directly at that inclusive endpoint, using one forward seek for newest-first
 traversal of the reversed indexes. Other operations retain total logical order;

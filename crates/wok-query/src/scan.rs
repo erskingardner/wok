@@ -16,7 +16,7 @@ use wok_event::PackedEventView;
 
 use crate::HyperLogLog;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CandidateEvent {
     packed: u64,
     lev_id: u64,
@@ -174,11 +174,56 @@ impl ScanPlan {
     }
 }
 
-fn cmp_cand(a: &CandidateEvent, b: &CandidateEvent) -> std::cmp::Ordering {
-    // Newer first; if equal created, higher levId first (matches C++ sort predicate).
-    b.created()
-        .cmp(&a.created())
-        .then_with(|| b.lev_id().cmp(&a.lev_id()))
+/// The heap's insertion sequence preserves the former stable sort's order
+/// when two index ranges name the same event.
+#[derive(PartialEq, Eq)]
+struct QueuedCandidate {
+    event: CandidateEvent,
+    sequence: u64,
+}
+
+impl Ord for QueuedCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.event
+            .created()
+            .cmp(&other.event.created())
+            .then_with(|| self.event.lev_id().cmp(&other.event.lev_id()))
+            .then_with(|| other.sequence.cmp(&self.sequence))
+            .then_with(|| self.event.scan_index().cmp(&other.event.scan_index()))
+    }
+}
+
+impl PartialOrd for QueuedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Default)]
+struct CandidateQueue {
+    heap: BinaryHeap<QueuedCandidate>,
+    next_sequence: u64,
+}
+
+impl CandidateQueue {
+    fn extend(&mut self, events: impl Iterator<Item = CandidateEvent>) {
+        for event in events {
+            let sequence = self.next_sequence;
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .expect("candidate insertion sequence exhausted");
+            self.heap.push(QueuedCandidate { event, sequence });
+        }
+    }
+
+    fn pop(&mut self) -> Option<CandidateEvent> {
+        self.heap.pop().map(|queued| queued.event)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
 }
 
 struct ScanCursor {
@@ -306,9 +351,11 @@ pub struct DbScan {
     index_dbi: lmdb_sys::MDB_dbi,
     pub desc: &'static str,
     cursors: Vec<ScanCursor>,
-    event_queue: VecDeque<CandidateEvent>,
+    event_queue: CandidateQueue,
+    /// Reused for each collection, avoiding one allocation per logical range.
+    collection_buffer: VecDeque<CandidateEvent>,
     initial_scan_depth: u64,
-    refill_scan_depth: u64,
+    refill_scan_depths: Vec<u64>,
     next_init_index: usize,
     pub approx_work: u64,
     since: u64,
@@ -1047,15 +1094,25 @@ impl DbScan {
         }
 
         let n = cursors.len().max(1) as u64;
-        let initial = (f.limit / n).clamp(5, 50);
+        // A wide feed needs each range's newest candidate before it can emit
+        // anything, but not five from every author. Grow only the ranges that
+        // win the merge. A single range retains its existing batching.
+        let initial = (f.limit / n).clamp(if n == 1 { 5 } else { 1 }, 50);
+        let refill = if n == 1 {
+            10 * initial
+        } else {
+            (2 * initial).min(50)
+        };
+        let refill_scan_depths = vec![refill; cursors.len()];
         Self {
             index_only,
             index_dbi,
             desc: plan.name(),
             cursors,
-            event_queue: VecDeque::new(),
+            event_queue: CandidateQueue::default(),
+            collection_buffer: VecDeque::new(),
             initial_scan_depth: initial,
-            refill_scan_depth: 10 * initial,
+            refill_scan_depths,
             next_init_index: 0,
             approx_work: 0,
             since: f.since,
@@ -1099,20 +1156,16 @@ impl DbScan {
                     self.since,
                     self.until,
                     self.initial_scan_depth,
-                    &mut self.event_queue,
+                    &mut self.collection_buffer,
                 )?;
+                self.event_queue.extend(self.collection_buffer.drain(..));
                 self.next_init_index += 1;
-                if self.next_init_index == self.cursors.len() {
-                    let mut v: Vec<_> = self.event_queue.drain(..).collect();
-                    v.sort_by(cmp_cand);
-                    self.event_queue = v.into();
-                }
                 continue;
             } else if self.event_queue.is_empty() {
                 return Ok(true);
             }
 
-            let ev = self.event_queue.pop_front().unwrap();
+            let ev = self.event_queue.pop().unwrap();
             let lev_id = ev.lev_id();
             let mut do_send = false;
             if self.index_only {
@@ -1144,18 +1197,18 @@ impl DbScan {
     fn settle(&mut self, cursor: &mut Cursor<'_>, si: usize) -> Result<(), wok_db::DbError> {
         self.cursors[si].outstanding -= 1;
         if self.cursors[si].outstanding == 0 {
-            let mut more = VecDeque::new();
             self.approx_work += self.cursors[si].collect(
                 cursor,
                 si as u64,
                 self.since,
                 self.until,
-                self.refill_scan_depth,
-                &mut more,
+                self.refill_scan_depths[si],
+                &mut self.collection_buffer,
             )?;
-            let mut merged: Vec<_> = self.event_queue.drain(..).chain(more).collect();
-            merged.sort_by(cmp_cand);
-            self.event_queue = merged.into();
+            self.event_queue.extend(self.collection_buffer.drain(..));
+            if self.cursors.len() > 1 {
+                self.refill_scan_depths[si] = (2 * self.refill_scan_depths[si]).min(50);
+            }
         }
         Ok(())
     }

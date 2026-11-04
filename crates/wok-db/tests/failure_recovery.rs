@@ -2,9 +2,9 @@ use std::process::Command;
 
 use serde_json::json;
 use tempfile::TempDir;
-use wok_db::{
-    check_integrity, write_events, DbError, Env, EnvOptions, EventToWrite, NoopNegentropy,
-};
+#[cfg(not(feature = "rocksdb-backend"))]
+use wok_db::DbError;
+use wok_db::{check_integrity, write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
 use wok_event::{parse_and_verify_event, EventLimits};
 
 const CRASH_CHILD_ENV: &str = "WOK_DB_CRASH_CHILD";
@@ -101,6 +101,7 @@ fn restart_after_writer_crash_preserves_only_committed_events() {
     assert_eq!(report.events, 1, "uncommitted event survived process death");
 }
 
+#[cfg(not(feature = "rocksdb-backend"))]
 fn constrained_options() -> EnvOptions {
     EnvOptions {
         map_size: 4 * 1024 * 1024,

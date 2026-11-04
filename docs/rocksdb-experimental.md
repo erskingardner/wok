@@ -39,6 +39,12 @@ The physical schema uses:
 - snapshot reads, with transaction-owned buffers and a combined-record cache;
 - atomic per-table entry counters, independently checked against physical scans.
 
+Read-only cursors retain their native iterator position and use native next/prev
+steps in either direction. After an unsuccessful seek or duplicate-boundary
+operation, they verify the physical position before resuming the last returned
+logical record. Writer cursors retain the seeking overlay merge. Neither this
+fast path nor its transaction-owned returned bytes changes the persistent format.
+
 The two reserved tag/kind progress keys have a small in-memory mirror loaded
 with bounded forward scans at open. Each transaction pairs an immutable mirror
 version with the same RocksDB snapshot; a commit publishes its new mirror after
@@ -84,3 +90,16 @@ COUNT scan that may still contend with writers. Keep buffered-ACK relays
 explicitly separate from synchronous commit policies. Preserve raw outcomes,
 correctness/readback counters, final resource accounting and all censored work;
 a censored latency histogram is not an eligible latency winner.
+
+The cursor regression suite checks traversal against the seeking writer cursor,
+snapshot and borrowed-byte lifetimes, failed positioning and duplicate edges:
+
+```sh
+cargo test --release --locked -p wok-db --features rocksdb-backend \
+  --target-dir target/rocksdb --test rocks_cursor
+```
+
+Its sequential-traversal check uses RocksDB's per-thread performance counters
+to require zero seeks after initial positioning. Counter diagnostics demonstrate
+which native operations ran; their instrumented elapsed times are not network
+latency measurements. Keep profiling separate from matched-arrival timing runs.

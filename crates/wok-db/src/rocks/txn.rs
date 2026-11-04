@@ -620,13 +620,24 @@ impl<'txn> Cursor<'txn> {
         mut inclusive: bool,
     ) -> Result<Option<Kv<'txn>>, DbError> {
         loop {
-            match (&bound, forward) {
-                (Some(b), true) => self.it.seek(b),
-                (Some(b), false) => self.it.seek_for_prev(b),
-                (None, true) => self.it.seek_to_first(),
-                (None, false) => self.it.seek_to_last(),
+            // A snapshot cursor can step directly from its current native
+            // position, in either direction. Overlay cursors still seek and
+            // merge: their last returned key may exist only in staged writes.
+            // Unsuccessful operations restore the logical position in `get`
+            // but can move/invalidate the native iterator, so check the actual
+            // key before reusing it (and reseek after a failed boundary/seek).
+            let on_bound = bound
+                .as_deref()
+                .is_some_and(|key| self.it.key() == Some(key));
+            if self.staged.is_some() || !on_bound {
+                match (&bound, forward) {
+                    (Some(b), true) => self.it.seek(b),
+                    (Some(b), false) => self.it.seek_for_prev(b),
+                    (None, true) => self.it.seek_to_first(),
+                    (None, false) => self.it.seek_to_last(),
+                }
             }
-            if !inclusive && self.it.key() == bound.as_deref() {
+            if !inclusive && bound.is_some() && self.it.key() == bound.as_deref() {
                 if forward {
                     self.it.next();
                 } else {

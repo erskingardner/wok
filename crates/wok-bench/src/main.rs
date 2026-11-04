@@ -18,6 +18,7 @@ mod codec;
 mod corpus;
 mod db_write;
 mod live;
+mod matched_network;
 mod rate;
 mod social;
 mod tag_kinds;
@@ -109,6 +110,12 @@ struct Args {
     /// connections, whether or not earlier events have been answered.
     #[arg(long, default_value_t = 1_000.0)]
     send_rate: f64,
+    /// Total fixed query arrivals per second in matched_network.
+    #[arg(long, default_value_t = 1_000)]
+    read_rate: u64,
+    /// Multiplexed historical query WebSockets in matched_network.
+    #[arg(long, default_value_t = 2)]
+    read_connections: usize,
     /// Seconds --scenario ws_publish_rate sends for.
     #[arg(long, default_value_t = 10)]
     send_secs: u64,
@@ -483,6 +490,12 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.out)?;
     if let (Some(log), Some(export)) = (&args.reconcile, &args.relay_export) {
         return reconcile_outcomes(&args.out, log, export);
+    }
+    if matches!(
+        args.scenario.as_deref(),
+        Some("matched_network" | "matched_network_generate")
+    ) {
+        return matched_network::dispatch(&args);
     }
     let profile_scenarios: Vec<&str> = if args.profile == "load" {
         vec!["ws_publish_scaled", "live_fanout", "idle_connections"]

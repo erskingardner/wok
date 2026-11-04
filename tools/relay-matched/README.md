@@ -36,7 +36,32 @@ Run the controller's offline tests without starting relay or load jobs:
 
 ```sh
 python3 -B -m unittest discover -s tools/relay-matched -p test_campaign.py -v
+python3 -B -m unittest discover -s tools/relay-matched -p test_timestamps.py -v
 ```
+
+Audit completed trial directories on the host that holds their raw ledgers:
+
+```sh
+python3 tools/relay-matched/audit-timestamps.py \
+  /path/to/campaign/main/reports/r1-w1000-rocksdb \
+  /path/to/campaign/main/reports/r1-w1000-strfry \
+  --window-seconds 5 --out /path/to/new-audit.json
+```
+
+The audit verifies completion-manifest hashes, reconciles raw read/write
+timestamps with report counts and histograms, checks caps and workload
+identities, and computes exact nearest-rank latency and arrival-window summaries.
+Compare the same timing origin: scheduled arrival to EOSE/OK includes send
+lateness; wire timing starts before the socket send. Windows group operations
+by their scheduled arrivals. Missing operations retain the fixed censor
+deadline and prevent either mixed-load latency distribution from winning.
+Client debt and outstanding requests do not measure internal relay queues.
+If a controller retained native RocksDB logs after shutdown, the audit also
+counts flush/compaction events within the relay process lifetime, excluding
+inherited seed history. These wall-clock observations include untimed startup,
+preflight, readback and settlement; they cannot be precisely aligned with
+individual query windows because the frozen driver records relative time.
+Only aggregate audit output needs to leave the benchmark hosts.
 
 Read-queue overflow classification is opt-in and requires external relay-side
 proof plus successful write/body checks. It retains the original protocol errors

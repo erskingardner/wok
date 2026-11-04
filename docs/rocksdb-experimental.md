@@ -132,3 +132,18 @@ Its sequential-traversal check uses RocksDB's per-thread performance counters
 to require zero seeks after initial positioning. Counter diagnostics demonstrate
 which native operations ran; their instrumented elapsed times are not network
 latency measurements. Keep profiling separate from matched-arrival timing runs.
+
+The query crate also has ignored, deterministic diagnostics for feed planning:
+
+```sh
+cargo test --release --locked -p wok-query --features wok-db/rocksdb-backend \
+  --target-dir target/rocksdb --test feed_frontier -- --ignored --nocapture
+cargo test --release --locked -p wok-query --features wok-db/rocksdb-backend \
+  --target-dir target/rocksdb --test global_probe -- --ignored --nocapture
+```
+
+These compare warmed local fixtures with fresh transactions per query, verify
+ordered results against stored metadata and report candidate/work counts. The
+bounded chronological probe is a diagnostic, not a production planner change:
+it includes sparse and adverse histories where probing adds work before the
+author merge. Local timings do not establish network latency or a schema change.

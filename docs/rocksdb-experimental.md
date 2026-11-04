@@ -45,6 +45,15 @@ operation, they verify the physical position before resuming the last returned
 logical record. Writer cursors retain the seeking overlay merge. Neither this
 fast path nor its transaction-owned returned bytes changes the persistent format.
 
+Historical scans reuse one physical cursor across their logical author/tag/kind
+ranges and refills within each scan call. The cursor is dropped before returning
+to the scheduler; owned resume endpoints and the next call's transaction still
+control resumption. Candidate depths, merge ordering and work accounting are
+unchanged. A read-only duplicate range with a full starting key/value positions
+directly at that inclusive endpoint, using one forward seek for newest-first
+traversal of the reversed indexes. Other operations retain total logical order;
+no prefix-only iterator mode or implicit range truncation is enabled.
+
 The two reserved tag/kind progress keys have a small in-memory mirror loaded
 with bounded forward scans at open. Each transaction pairs an immutable mirror
 version with the same RocksDB snapshot; a commit publishes its new mirror after

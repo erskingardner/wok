@@ -119,6 +119,47 @@ proptest! {
             }
         }
     }
+
+    #[test]
+    fn reused_snapshot_ranges_match_overlay_scans_of_escaped_composite_keys(
+        starts in proptest::collection::vec((0u64..10, 0u64..7, any::<bool>(), 1usize..20), 1..40),
+    ) {
+        use wok_db::keys::{make_key_string_u64, make_key_string_u64_u64};
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let dbis = [env.dbis().event_pubkey, env.dbis().event_pubkey_kind];
+        let key = |dbi, k: u64| {
+            let prefix = [0, b'a' + (k / 3) as u8, 255];
+            if dbi == dbis[0] { make_key_string_u64(&prefix, k % 3) }
+            else { make_key_string_u64_u64(&prefix, k % 2, k % 3) }
+        };
+        let mut tx = env.begin_rw().unwrap();
+        for dbi in dbis {
+            for k in [1, 3, 5, 7] {
+                for v in [1u64, 3, 5] { tx.put(dbi, &key(dbi, k), &v.to_ne_bytes(), 0).unwrap(); }
+            }
+        }
+        tx.commit().unwrap();
+        let ro = env.begin_ro().unwrap();
+        let rw = env.begin_rw().unwrap();
+        for dbi in dbis {
+            let mut cursor = ro.cursor(dbi).unwrap();
+            for &(k, v, reverse, cap) in &starts {
+                let mut seen = Vec::new();
+                let mut expected = Vec::new();
+                let start = if k == 0 { Vec::new() } else { key(dbi, k) };
+                let dup = if v == 0 { Vec::new() } else { v.to_ne_bytes().to_vec() };
+                let complete = cursor.foreach_full(&start, &dup, reverse, |k, v| {
+                    seen.push((k.to_vec(), v.to_vec())); seen.len() < cap
+                }).unwrap();
+                let finished = rw.foreach_full(dbi, &start, &dup, reverse, |k, v| {
+                    expected.push((k.to_vec(), v.to_vec())); expected.len() < cap
+                }).unwrap();
+                prop_assert_eq!((seen, complete), (expected, finished));
+            }
+        }
+    }
 }
 
 #[test]
@@ -198,4 +239,51 @@ fn sequential_snapshot_steps_do_not_reseek() {
             "sequential snapshot steps re-entered RocksDB seek"
         );
     }
+}
+
+#[test]
+fn snapshot_range_uses_one_forward_seek_for_a_missing_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    let dbi = env.dbis().event_created_at;
+    let mut tx = env.begin_rw().unwrap();
+    for k in 0..32u64 {
+        for v in 0..64u64 {
+            tx.put_u64(dbi, k, &v.to_ne_bytes(), 0).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    let tx = env.begin_ro().unwrap();
+    let mut cursor = tx.cursor(dbi).unwrap();
+    set_perf_stats(PerfStatsLevel::EnableCount);
+    let mut perf = PerfContext::default();
+    perf.reset();
+    let mut rows = Vec::new();
+    cursor
+        .foreach_full(
+            &99u64.to_ne_bytes(),
+            &u64::MAX.to_ne_bytes(),
+            true,
+            |k, v| {
+                rows.push((
+                    u64::from_ne_bytes(k.try_into().unwrap()),
+                    u64::from_ne_bytes(v.try_into().unwrap()),
+                ));
+                rows.len() < 50
+            },
+        )
+        .unwrap();
+    let seeks =
+        perf.metric(PerfMetric::SeekOnMemtableCount) + perf.metric(PerfMetric::SeekChildSeekCount);
+    let next = perf.metric(PerfMetric::NextOnMemtableCount);
+    let prev = perf.metric(PerfMetric::PrevOnMemtableCount);
+    set_perf_stats(PerfStatsLevel::Disable);
+    assert_eq!(rows, (14..64).rev().map(|v| (31, v)).collect::<Vec<_>>());
+    assert_eq!(
+        seeks, 1,
+        "range initialization repeated exact-key/duplicate probes"
+    );
+    assert!(next > 0);
+    assert_eq!(prev, 0, "newest-first range used a reverse physical step");
 }

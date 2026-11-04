@@ -458,6 +458,25 @@ impl<'txn> Cursor<'txn> {
         check(unsafe { mdb_cursor_count(self.cursor, &mut n) })?;
         Ok(n)
     }
+
+    /// Start an independent range scan, reusing this transaction's cursor.
+    /// Returns false when the callback stops the scan. Each call repositions
+    /// from its supplied endpoint, including after a failed or exhausted scan.
+    pub fn foreach_full<F>(
+        &mut self,
+        start_key: &[u8],
+        start_dup: &[u8],
+        reverse: bool,
+        cb: F,
+    ) -> Result<bool, DbError>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        // SAFETY: this cursor is open and its transaction outlives `self`.
+        let (txn, dbi) = unsafe { (mdb_cursor_txn(self.cursor), mdb_cursor_dbi(self.cursor)) };
+        let dups = dbi_flags(txn, dbi)? & MDB_DUPSORT != 0;
+        foreach_cursor(self, dups, start_key, start_dup, reverse, cb)
+    }
 }
 
 impl Drop for Cursor<'_> {
@@ -495,7 +514,7 @@ fn foreach_full<F>(
     start_key: &[u8],
     start_dup: &[u8],
     reverse: bool,
-    mut cb: F,
+    cb: F,
 ) -> Result<bool, DbError>
 where
     F: FnMut(&[u8], &[u8]) -> bool,
@@ -504,16 +523,30 @@ where
     // Values are only exposed to the callback while this function is active.
     let transaction_lifetime = ();
     let mut cursor = Cursor::open(txn, dbi, &transaction_lifetime)?;
+    foreach_cursor(&mut cursor, dups, start_key, start_dup, reverse, cb)
+}
+
+fn foreach_cursor<F>(
+    cursor: &mut Cursor<'_>,
+    dups: bool,
+    start_key: &[u8],
+    start_dup: &[u8],
+    reverse: bool,
+    mut cb: F,
+) -> Result<bool, DbError>
+where
+    F: FnMut(&[u8], &[u8]) -> bool,
+{
     let first = if reverse {
         if dups {
-            position_reverse_dup(&mut cursor, start_key, start_dup)?
+            position_reverse_dup(cursor, start_key, start_dup)?
         } else {
-            position_reverse_nodup(&mut cursor, start_key)?
+            position_reverse_nodup(cursor, start_key)?
         }
     } else if dups {
-        position_forward_dup(&mut cursor, start_key, start_dup)?
+        position_forward_dup(cursor, start_key, start_dup)?
     } else {
-        position_forward_nodup(&mut cursor, start_key)?
+        position_forward_nodup(cursor, start_key)?
     };
     let Some((mut k, mut v)) = first else {
         return Ok(true);

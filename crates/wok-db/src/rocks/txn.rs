@@ -211,7 +211,7 @@ impl<'env> RoTxn<'env> {
     where
         F: FnMut(&[u8], &[u8]) -> bool,
     {
-        foreach(self.cursor(dbi)?, key, dup, reverse, cb)
+        self.cursor(dbi)?.foreach_full(key, dup, reverse, cb)
     }
     pub fn abort(self) {}
 }
@@ -303,7 +303,7 @@ impl<'env> RwTxn<'env> {
     where
         F: FnMut(&[u8], &[u8]) -> bool,
     {
-        foreach(self.cursor(dbi)?, key, dup, reverse, cb)
+        self.cursor(dbi)?.foreach_full(key, dup, reverse, cb)
     }
     fn change_count(&mut self, dbi: u32, insert: bool) -> Result<(), DbError> {
         let n = self
@@ -819,6 +819,21 @@ impl<'txn> Cursor<'txn> {
             _ => Err(err("unsupported cursor operation")),
         }
     }
+    /// Start an independent range scan, reusing this transaction's cursor.
+    /// Returns false when the callback stops the scan. Each call repositions
+    /// from its supplied endpoint, including after a failed or exhausted scan.
+    pub fn foreach_full<F>(
+        &mut self,
+        key: &[u8],
+        dup: &[u8],
+        reverse: bool,
+        cb: F,
+    ) -> Result<bool, DbError>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        foreach(self, key, dup, reverse, cb)
+    }
     pub fn count(&mut self) -> Result<usize, DbError> {
         let Some(key) = self.logical_key.clone() else {
             return Ok(0);
@@ -834,7 +849,7 @@ impl<'txn> Cursor<'txn> {
     }
 }
 fn foreach<F>(
-    mut cursor: Cursor<'_>,
+    cursor: &mut Cursor<'_>,
     start_key: &[u8],
     start_dup: &[u8],
     reverse: bool,
@@ -846,6 +861,17 @@ where
     let dups = spec(cursor.dbi).flags & MDB_DUPSORT != 0;
     let first = if start_key.is_empty() {
         cursor.get(None, None, if reverse { MDB_LAST } else { MDB_FIRST })?
+    } else if cursor.staged.is_none() && dups && !start_dup.is_empty() {
+        // With a complete logical (key, duplicate) endpoint, bytewise
+        // positioning already expresses the whole inclusive range. In the
+        // reversed indexes, newest-first is a forward seek/step. Avoid the
+        // generic exact-key/duplicate probes, which also open reverse seeks
+        // on every author with no record at its requested cutoff.
+        cursor.position(
+            Some(encode(cursor.dbi, start_key, Some(start_dup))),
+            reverse == reversed(cursor.dbi),
+            true,
+        )?
     } else if reverse {
         if dups {
             let at = if start_dup.is_empty() {

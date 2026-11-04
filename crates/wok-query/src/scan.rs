@@ -7,6 +7,7 @@ use crate::subid::Subscription;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
+use wok_db::txn::Cursor;
 use wok_db::{
     count_phrase_pairs, event_search_terms, search_indexed_through_ro, search_posting_count,
     search_posting_exists, search_postings, Decompressor, RoTxn, SearchQuery,
@@ -215,8 +216,7 @@ impl ScanCursor {
     #[allow(clippy::too_many_arguments)]
     fn collect(
         &mut self,
-        txn: &RoTxn<'_>,
-        index_dbi: lmdb_sys::MDB_dbi,
+        cursor: &mut Cursor<'_>,
         scan_index: u64,
         since: u64,
         until: u64,
@@ -230,7 +230,7 @@ impl ScanCursor {
             let mut finished_naturally = true;
             let mut stop = false;
             let mut scan_err = None;
-            txn.foreach_full(index_dbi, &start_key, &start_dup, true, |k, v| {
+            cursor.foreach_full(&start_key, &start_dup, true, |k, v| {
                 if limit == 0 {
                     self.resume_key = k.to_vec();
                     match u64_from_ne_checked(v) {
@@ -1080,8 +1080,16 @@ impl DbScan {
         H: FnMut(u64) -> bool,
         P: FnMut(u64) -> bool,
     {
+        // One physical cursor per scan slice, shared by all logical author,
+        // tag or kind ranges and refills. Resume endpoints remain owned by
+        // ScanCursor; no native iterator survives this call or its snapshot.
+        let mut cursor = if self.cursors.is_empty() {
+            None
+        } else {
+            Some(txn.cursor(self.index_dbi)?)
+        };
         if let Some(si) = self.unsettled.take() {
-            self.settle(txn, si)?;
+            self.settle(cursor.as_mut().expect("active scan cursor"), si)?;
         }
         loop {
             self.approx_work += 1;
@@ -1091,8 +1099,7 @@ impl DbScan {
             if self.next_init_index < self.cursors.len() {
                 let idx = self.next_init_index;
                 self.approx_work += self.cursors[idx].collect(
-                    txn,
-                    self.index_dbi,
+                    cursor.as_mut().expect("active scan cursor"),
                     idx as u64,
                     self.since,
                     self.until,
@@ -1132,20 +1139,19 @@ impl DbScan {
                 self.unsettled = Some(si);
                 return Ok(true);
             }
-            self.settle(txn, si)?;
+            self.settle(cursor.as_mut().expect("active scan cursor"), si)?;
         }
     }
 
     /// One of cursor `si`'s candidates was taken. Once the queue holds none
     /// of its candidates, its next entries are read and merged in, so the
     /// queue's head stays the newest entry left in any cursor.
-    fn settle(&mut self, txn: &RoTxn<'_>, si: usize) -> Result<(), wok_db::DbError> {
+    fn settle(&mut self, cursor: &mut Cursor<'_>, si: usize) -> Result<(), wok_db::DbError> {
         self.cursors[si].outstanding -= 1;
         if self.cursors[si].outstanding == 0 {
             let mut more = VecDeque::new();
             self.approx_work += self.cursors[si].collect(
-                txn,
-                self.index_dbi,
+                cursor,
                 si as u64,
                 self.since,
                 self.until,

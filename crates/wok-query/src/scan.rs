@@ -6,7 +6,7 @@ use crate::filter::{FilterSetBytes, FilterSetUint, NostrFilter};
 use crate::subid::Subscription;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
+use wok_db::keys::u64_from_ne_checked;
 use wok_db::txn::Cursor;
 use wok_db::{
     count_phrase_pairs, event_search_terms, search_indexed_through_ro, search_posting_count,
@@ -202,13 +202,11 @@ impl ScanCursor {
         !self.resume_key.is_empty()
     }
 
-    fn key_match(&self, k: &[u8]) -> bool {
+    fn key_match(&self, entry: &wok_db::index::IndexEntry<'_>) -> bool {
         match self.match_mode {
-            MatchMode::Prefix => k.starts_with(&self.search),
-            MatchMode::PrefixExactLen => {
-                k.len() == self.search.len() + 8 && k.starts_with(&self.search)
-            }
-            MatchMode::Kind(kind) => k.len() >= 8 && u64_from_ne(&k[0..8]) == kind,
+            MatchMode::Prefix => entry.prefix_matches(&self.search, false),
+            MatchMode::PrefixExactLen => entry.prefix_matches(&self.search, true),
+            MatchMode::Kind(kind) => entry.matches_kind(kind),
             MatchMode::Always => true,
         }
     }
@@ -226,48 +224,50 @@ impl ScanCursor {
         let mut added = 0u64;
         while self.active() && limit > 0 {
             let start_key = self.resume_key.clone();
-            let start_dup = self.resume_val.to_ne_bytes();
             let mut finished_naturally = true;
             let mut stop = false;
             let mut scan_err = None;
-            cursor.foreach_full(&start_key, &start_dup, true, |k, v| {
+            cursor.foreach_index(&start_key, self.resume_val, |entry| {
                 if limit == 0 {
-                    self.resume_key = k.to_vec();
-                    match u64_from_ne_checked(v) {
-                        Ok(n) => self.resume_val = n,
+                    self.resume_key = entry.to_key();
+                    match entry.local_id() {
+                        Ok(id) => self.resume_val = id,
                         Err(e) => scan_err = Some(e),
                     }
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
-                if !self.key_match(k) {
+                if !self.key_match(&entry) {
                     self.resume_key.clear();
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
-                let parsed = parse_key_string_u64(k);
-                let Ok((prefix, created)) = parsed else {
+                let Some(created) = entry.created_at else {
                     return true;
                 };
                 if created < since {
-                    self.resume_key = make_key_string_u64(prefix, 0);
+                    self.resume_key = entry.to_key();
+                    let time_at = self.resume_key.len() - 8;
+                    self.resume_key[time_at..].copy_from_slice(&0u64.to_ne_bytes());
                     self.resume_val = 0;
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
                 if created > until {
-                    self.resume_key = make_key_string_u64(prefix, until);
+                    self.resume_key = entry.to_key();
+                    let time_at = self.resume_key.len() - 8;
+                    self.resume_key[time_at..].copy_from_slice(&until.to_ne_bytes());
                     self.resume_val = u64::MAX;
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
-                match u64_from_ne_checked(v) {
-                    Ok(lev_id) => {
-                        output.push_back(CandidateEvent::new(lev_id, created, scan_index));
+                match entry.local_id() {
+                    Ok(id) => {
+                        output.push_back(CandidateEvent::new(id, created, scan_index));
                         added += 1;
                         limit -= 1;
                         true
@@ -871,20 +871,15 @@ impl DbScan {
 
     fn probe_size(&self, txn: &RoTxn<'_>) -> Result<usize, wok_db::DbError> {
         let mut count = 0;
+        let mut physical = txn.cursor(self.index_dbi)?;
         for cursor in &self.cursors {
-            txn.foreach_full(
-                self.index_dbi,
-                &cursor.resume_key,
-                &cursor.resume_val.to_ne_bytes(),
-                true,
-                |key, _| {
-                    if !cursor.key_match(key) {
-                        return false;
-                    }
-                    count += 1;
-                    count < 64
-                },
-            )?;
+            physical.foreach_index(&cursor.resume_key, cursor.resume_val, |entry| {
+                if !cursor.key_match(&entry) {
+                    return false;
+                }
+                count += 1;
+                count < 64
+            })?;
             if count >= 64 {
                 return Ok(64);
             }

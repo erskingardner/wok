@@ -16,6 +16,7 @@ pub mod env;
 pub mod env;
 pub mod error;
 pub mod fbs;
+pub mod index;
 pub mod integrity;
 pub mod keys;
 pub mod long_tags;

@@ -25,12 +25,83 @@ fn physical(dbi: u32) -> u32 {
 fn count_key(dbi: u32) -> Vec<u8> {
     format!("entries/{dbi}").into_bytes()
 }
+enum RecordBytes<'env> {
+    Owned(Box<[u8]>),
+    Pinned(rocksdb::DBPinnableSlice<'env>),
+}
+impl AsRef<[u8]> for RecordBytes<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(raw) => raw,
+            Self::Pinned(raw) => raw,
+        }
+    }
+}
+fn record_key(id: u64) -> [u8; 9] {
+    let mut key = [1; 9];
+    key[1..].copy_from_slice(&id.to_be_bytes());
+    key
+}
+// Erase the cache's invariant internal lifetime so View remains covariant and
+// cursors can borrow it for less than the Env's full lifetime. Pins still keep
+// their concrete DB lifetime inside RecordStore; no lifetime is extended.
+trait RecordCache {
+    fn get(
+        &self,
+        id: u64,
+        dbi: u32,
+        snapshot: &rocksdb::Snapshot<'_>,
+    ) -> Result<Option<&[u8]>, DbError>;
+    fn cache(&self, id: u64, raw: &[u8]) -> &[u8];
+}
+struct RecordStore<'env> {
+    db: &'env rocksdb::DB,
+    records: FrozenMap<u64, Box<RecordBytes<'env>>>,
+}
+impl RecordCache for RecordStore<'_> {
+    fn get(
+        &self,
+        id: u64,
+        dbi: u32,
+        snapshot: &rocksdb::Snapshot<'_>,
+    ) -> Result<Option<&[u8]>, DbError> {
+        if let Some(raw) = self.records.get(&id) {
+            return Ok(Some(raw.as_ref()));
+        }
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_snapshot(snapshot);
+        let cf = self
+            .db
+            .cf_handle(cf_name(dbi))
+            .expect("validated column family");
+        // The pin owns its native storage reference and is tied to the Env's
+        // DB. The snapshot selects which version is pinned at lookup.
+        Ok(self
+            .db
+            .get_pinned_cf_opt(cf, record_key(id), &options)
+            .map_err(err)?
+            .map(|raw| {
+                self.records
+                    .insert(id, Box::new(RecordBytes::Pinned(raw)))
+                    .as_ref()
+            }))
+    }
+    fn cache(&self, id: u64, raw: &[u8]) -> &[u8] {
+        self.records
+            .get(&id)
+            .unwrap_or_else(|| {
+                self.records
+                    .insert(id, Box::new(RecordBytes::Owned(raw.into())))
+            })
+            .as_ref()
+    }
+}
 struct View<'env> {
     env: &'env Env,
     snapshot: rocksdb::Snapshot<'env>,
     markers: Arc<MarkerMap>,
     arena: Bump,
-    records: FrozenMap<u64, Box<[u8]>>,
+    records: Box<dyn RecordCache + 'env>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 impl<'env> View<'env> {
@@ -52,7 +123,10 @@ impl<'env> View<'env> {
                     snapshot,
                     markers,
                     arena: Bump::new(),
-                    records: FrozenMap::new(),
+                    records: Box::new(RecordStore {
+                        db: &env.inner.db,
+                        records: FrozenMap::new(),
+                    }),
                     _not_send_or_sync: PhantomData,
                 });
             }
@@ -116,6 +190,31 @@ impl<'env> View<'env> {
             .transpose()
             .map(|v| v.unwrap_or(0))
     }
+    // Covering iterator values last only until the iterator moves. Keep their
+    // exact combined bytes once, sharing the cache with pinned primary reads.
+    fn cache_record(&self, id: u64, raw: &[u8]) -> &[u8] {
+        self.records.cache(id, raw)
+    }
+    fn get_record<'a>(
+        &'a self,
+        dbi: u32,
+        id: u64,
+        staged: Option<&'a Overlay>,
+    ) -> Result<Option<&'a [u8]>, DbError> {
+        let raw = if staged.is_none() {
+            match self.records.get(id, dbi, &self.snapshot)? {
+                Some(raw) => raw,
+                None => return Ok(None),
+            }
+        } else {
+            match self.raw(dbi, &record_key(id), staged)? {
+                Some(raw) => self.arena.alloc_slice_copy(&raw),
+                None => return Ok(None),
+            }
+        };
+        let (packed, payload) = parts(raw)?;
+        Ok(if dbi == 3 { packed } else { payload })
+    }
     fn get<'a>(
         &'a self,
         dbi: u32,
@@ -124,22 +223,7 @@ impl<'env> View<'env> {
     ) -> Result<Option<&'a [u8]>, DbError> {
         if combined(dbi) {
             let id = u64::from_ne_bytes(key.try_into().map_err(|_| err("invalid event local ID"))?);
-            let raw = if staged.is_none() {
-                match self.records.get(&id) {
-                    Some(raw) => raw,
-                    None => match self.raw(dbi, &encode(dbi, key, None), None)? {
-                        Some(v) => self.records.insert(id, v.into_boxed_slice()),
-                        None => return Ok(None),
-                    },
-                }
-            } else {
-                match self.raw(dbi, &encode(dbi, key, None), staged)? {
-                    Some(v) => self.arena.alloc_slice_copy(&v),
-                    None => return Ok(None),
-                }
-            };
-            let (a, b) = parts(raw)?;
-            return Ok(if dbi == 3 { a } else { b });
+            return self.get_record(dbi, id, staged);
         }
         if spec(dbi).flags & MDB_DUPSORT != 0 {
             let mut cursor = Cursor::new(self, dbi, staged);
@@ -189,7 +273,11 @@ impl<'env> RoTxn<'env> {
         self.view.get(dbi, key, None)
     }
     pub fn get_u64(&self, dbi: u32, key: u64) -> Result<Option<&[u8]>, DbError> {
-        self.get(dbi, &key.to_ne_bytes())
+        if combined(dbi) {
+            self.view.get_record(dbi, key, None)
+        } else {
+            self.get(dbi, &key.to_ne_bytes())
+        }
     }
     pub fn cursor(&self, dbi: u32) -> Result<Cursor<'_>, DbError> {
         Ok(Cursor::new(&self.view, dbi, None))
@@ -613,6 +701,57 @@ impl<'txn> Cursor<'txn> {
             logical_key: None,
         }
     }
+    /// Independently position and scan newest-first historical postings. The
+    /// snapshot fast path borrows each physical key, reads its two integers
+    /// directly and advances the native iterator. It does not populate the
+    /// generic cursor's transaction-lifetime key/value arena.
+    pub fn foreach_index<F>(
+        &mut self,
+        start_key: &[u8],
+        start_dup: u64,
+        mut callback: F,
+    ) -> Result<bool, DbError>
+    where
+        F: FnMut(crate::index::IndexEntry<'_>) -> bool,
+    {
+        use crate::index::IndexEntry;
+        if self.staged.is_some() || !matches!(self.dbi, 4 | 5 | 6 | 9 | 10 | 12 | 21 | 23) {
+            return crate::index::foreach_logical(self, start_key, start_dup, callback);
+        }
+        let bound = encode(self.dbi, start_key, Some(&start_dup.to_ne_bytes()));
+        if start_key.is_empty() {
+            self.it.seek_to_first();
+        } else {
+            self.it.seek(&bound);
+        }
+        while let Some((key, value)) = self.it.item() {
+            let entry = IndexEntry::from_matching_rocks(self.dbi, key, start_key, &bound)
+                .or_else(|| IndexEntry::from_rocks(self.dbi, key));
+            if let Some(entry) = entry {
+                if self.dbi == COVER_DBI {
+                    self.view.cache_record(entry.local_id()?, value);
+                }
+                if !callback(entry) {
+                    return Ok(false);
+                }
+            } else {
+                // Raw maintenance transactions can create noncanonical keys
+                // and duplicates. Keep the generic decoder's validation and
+                // historical short-key handling for those records.
+                let (logical, duplicate) = decode(self.dbi, key, value)?;
+                let entry = IndexEntry::from_logical(&logical, &duplicate);
+                if self.dbi == COVER_DBI {
+                    self.view.cache_record(entry.local_id()?, value);
+                }
+                if !callback(entry) {
+                    return Ok(false);
+                }
+            }
+            self.it.next();
+        }
+        self.it.status().map_err(err)?;
+        Ok(true)
+    }
     fn position(
         &mut self,
         mut bound: Option<Vec<u8>>,
@@ -720,7 +859,7 @@ impl<'txn> Cursor<'txn> {
                         .try_into()
                         .map_err(|_| err("invalid covering local ID"))?,
                 );
-                self.view.records.insert(id, value.into_boxed_slice());
+                self.view.cache_record(id, &value);
             }
             self.current = Some(pk);
             self.logical_key = Some(key.clone());
@@ -926,4 +1065,66 @@ where
         row = cursor.get(None, None, if reverse { MDB_PREV } else { MDB_NEXT })?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod index_reader_tests {
+    use super::*;
+    use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
+
+    #[test]
+    fn native_postings_step_without_retaining_logical_candidate_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::open(dir.path(), crate::EnvOptions::for_tests()).unwrap();
+        env.ensure_initialized().unwrap();
+        let dbi = env.dbis().event_pubkey;
+        let prefix = [0; 32];
+        let mut tx = env.begin_rw().unwrap();
+        for id in 1..=2048u64 {
+            tx.put(
+                dbi,
+                &crate::keys::make_key_string_u64(&prefix, id),
+                &id.to_ne_bytes(),
+                0,
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let tx = env.begin_ro().unwrap();
+        let mut cursor = tx.cursor(dbi).unwrap();
+        let before = tx.view.arena.allocated_bytes();
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut perf = PerfContext::default();
+        perf.reset();
+        let mut expected = 2048;
+        cursor
+            .foreach_index(
+                &crate::keys::make_key_string_u64(&prefix, u64::MAX),
+                u64::MAX,
+                |entry| {
+                    assert_eq!(
+                        (entry.created_at.unwrap(), entry.local_id().unwrap()),
+                        (expected, expected)
+                    );
+                    assert!(entry.prefix_matches(&prefix, true));
+                    expected -= 1;
+                    true
+                },
+            )
+            .unwrap();
+        let seeks = perf.metric(PerfMetric::SeekOnMemtableCount)
+            + perf.metric(PerfMetric::SeekChildSeekCount);
+        let steps = perf.metric(PerfMetric::NextOnMemtableCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+        assert_eq!(expected, 0);
+        assert_eq!(tx.view.arena.allocated_bytes(), before);
+        assert!(
+            seeks <= 2,
+            "native scan re-sought its consecutive postings: {seeks}"
+        );
+        assert!(
+            steps >= 2048,
+            "native scan did not step its iterator: {steps}"
+        );
+    }
 }

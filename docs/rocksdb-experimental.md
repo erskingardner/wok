@@ -45,11 +45,20 @@ operation, they verify the physical position before resuming the last returned
 logical record. Writer cursors retain the seeking overlay merge. Neither this
 fast path nor its transaction-owned returned bytes changes the persistent format.
 
-Historical scans reuse one physical cursor across their logical author/tag/kind
-ranges and refills within each scan call. The cursor is dropped before returning
-to the scheduler; owned resume endpoints and the next call's transaction still
-control resumption. Candidate depths, merge ordering and work accounting are
-unchanged. A read-only duplicate range with a full starting key/value positions
+Historical scans read typed timestamp/local-ID entries through
+`Cursor::foreach_index`, borrowing the current physical posting only during its
+callback. Consecutive entries sharing a seek prefix reuse the existing logical
+prefix bytes: the reader compares physical prefixes and reads the two ordered
+integers directly, without reconstructing, unescaping or retaining every logical
+key/value. Only resume boundaries become owned keys. Other prefixes and
+noncanonical maintenance records retain validated decoding; writer overlays and
+ordinary cursor operations retain their existing behavior.
+
+Scans reuse one physical cursor across their logical author/tag/kind ranges and
+refills within each scan call. The cursor is dropped before returning to the
+scheduler; owned resume endpoints and the next call's transaction still control
+resumption. Candidate depths, merge ordering and work accounting are unchanged.
+A read-only duplicate range with a full starting key/value positions
 directly at that inclusive endpoint, using one forward seek for newest-first
 traversal of the reversed indexes. Other operations retain total logical order;
 no prefix-only iterator mode or implicit range truncation is enabled.
@@ -65,6 +74,12 @@ A single-author query's existing plan selects the covering index. Its candidates
 populate the transaction's combined-record cache; visibility and payload checks
 continue through the ordinary Wok path. Multi-author queries keep thin postings
 so unselected candidate payloads are not pulled into a feed merge.
+
+Primary point reads use stack-encoded local-ID keys and cache native pinned
+combined bytes, sharing the same snapshot and cache as owned covering records.
+The exact PackedEvent/payload bytes and independent missing/empty components are
+preserved. Pins are released with the transaction and can retain complete cache
+blocks until then; measure memory as well as latency when evaluating this path.
 
 The initial read-oriented options use a shared 8-GiB hyper-clock block cache,
 2-GiB row cache, 4-KiB blocks, Bloom filters, binary/hash data-block indexes,

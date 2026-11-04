@@ -308,6 +308,8 @@ fn sparse_local_ids_cost_their_events_not_the_id_space() {
     }
 }
 
+// Exercises an LMDB-specific on-disk/reader-table constraint.
+#[cfg(not(feature = "rocksdb-backend"))]
 #[test]
 fn verification_fits_the_reader_slots_left() {
     // Each worker holds a reader slot. With every slot but the caller's

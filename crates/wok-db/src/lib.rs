@@ -9,6 +9,10 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
 pub mod comparators;
+#[cfg(not(feature = "rocksdb-backend"))]
+pub mod env;
+#[cfg(feature = "rocksdb-backend")]
+#[path = "rocks/env.rs"]
 pub mod env;
 pub mod error;
 pub mod fbs;
@@ -23,9 +27,15 @@ pub mod op_log;
 pub mod payload;
 pub mod purge;
 pub mod reindex;
+#[cfg(feature = "rocksdb-backend")]
+mod rocks;
 pub mod schema;
 pub mod search;
 pub mod tag_kind;
+#[cfg(not(feature = "rocksdb-backend"))]
+pub mod txn;
+#[cfg(feature = "rocksdb-backend")]
+#[path = "rocks/txn.rs"]
 pub mod txn;
 pub mod vanish;
 pub mod write;
@@ -100,3 +110,12 @@ pub mod state;
 
 #[cfg(test)]
 mod crash_tests;
+
+/// Storage format used by this binary. The optional RocksDB build cannot open LMDB files.
+pub fn storage_backend_name() -> &'static str {
+    if cfg!(feature = "rocksdb-backend") {
+        "rocksdb-optimized-experimental"
+    } else {
+        "lmdb"
+    }
+}

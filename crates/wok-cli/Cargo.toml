@@ -11,6 +11,9 @@ default-run = "wok"
 name = "wok"
 path = "src/main.rs"
 
+[features]
+rocksdb-backend = ["wok-db/rocksdb-backend"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

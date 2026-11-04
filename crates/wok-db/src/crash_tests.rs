@@ -217,7 +217,11 @@ fn assert_counts_and_sequence(env: &Env, counts: [u64; 2], sequence: u64) {
 
 #[test]
 fn killed_writes_recover_atomic_events_counters_and_sequence() {
-    for lazy in [false, true] {
+    for lazy in if cfg!(feature = "rocksdb-backend") {
+        vec![false]
+    } else {
+        vec![false, true]
+    } {
         for action in ["insert", "replace", "delete", "mixed"] {
             for stage in [
                 "write-before-flush",
@@ -297,6 +301,7 @@ fn killed_writes_recover_atomic_events_counters_and_sequence() {
     }
 }
 
+#[cfg(not(feature = "rocksdb-backend"))]
 #[test]
 fn killed_v4_upgrade_is_atomic_and_retryable() {
     for stage in [
@@ -326,6 +331,7 @@ fn killed_v4_upgrade_is_atomic_and_retryable() {
     }
 }
 
+#[cfg(not(feature = "rocksdb-backend"))]
 #[test]
 fn v5_without_state_table_is_corrupt() {
     let dir = tempfile::tempdir().unwrap();

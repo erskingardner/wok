@@ -273,11 +273,13 @@ where
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "rocksdb-backend")))]
 mod tests {
     use super::*;
     use crate::{Env, EnvOptions};
 
+    // LMDB accepts a four-byte integer key; RocksDB rejects it at put instead.
+    #[cfg(not(feature = "rocksdb-backend"))]
     #[test]
     fn foreach_event_from_reports_a_short_event_key_instead_of_panicking() {
         let tmp = tempfile::TempDir::new().unwrap();

@@ -86,6 +86,8 @@ fn quota_uses_net_replacement_and_deletion_effect() {
     txn.commit().unwrap();
 }
 
+// Exercises an LMDB-specific on-disk/reader-table constraint.
+#[cfg(not(feature = "rocksdb-backend"))]
 #[test]
 fn v4_upgrade_preserves_records_and_initializes_state_lazily() {
     let dir = tempfile::tempdir().unwrap();

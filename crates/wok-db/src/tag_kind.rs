@@ -1132,6 +1132,8 @@ mod tests {
         }
     }
 
+    // LMDB allows another writable process; RocksDB holds an exclusive writer lock.
+    #[cfg(not(feature = "rocksdb-backend"))]
     #[test]
     fn postings_are_not_deferred_while_another_process_has_the_database_open() {
         use std::process::{Child, Command, Stdio};

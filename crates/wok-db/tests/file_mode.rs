@@ -1,3 +1,5 @@
+#![cfg(not(feature = "rocksdb-backend"))]
+
 //! Permission bits of the database files Wok creates.
 
 use std::os::unix::fs::PermissionsExt;

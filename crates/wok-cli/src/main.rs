@@ -112,6 +112,9 @@ enum Command {
     },
     Relay,
     Info,
+    /// Verify every RocksDB primary, signature, covering record and table count offline
+    #[cfg(feature = "rocksdb-backend")]
+    RocksdbCheck,
     /// Inspect the configuration file
     Config {
         #[command(subcommand)]
@@ -382,6 +385,23 @@ async fn main() -> Result<()> {
         Command::Config { .. } => unreachable!("config was dispatched before config load"),
         Command::Relay => cmd_relay(cfg, config).await,
         Command::Info => cmd_info(&cfg),
+        #[cfg(feature = "rocksdb-backend")]
+        Command::RocksdbCheck => {
+            let env = Env::open(
+                &cfg.db,
+                EnvOptions {
+                    read_only: true,
+                    create_dir: false,
+                    create_dbis: false,
+                    ..EnvOptions::default()
+                },
+            )?;
+            cli_println!(
+                "{}",
+                serde_json::to_string_pretty(&env.audit_rocksdb_layout()?)?
+            );
+            Ok(())
+        }
         Command::Doctor { json } => cmd_doctor(&cfg, &config, json),
         Command::Reindex {
             confirm_relay_stopped,
@@ -500,6 +520,7 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
     let (major, minor, patch) = wok_db::lmdb_version();
     tracing::info!(
+        storage_backend = wok_db::storage_backend_name(),
         preset = %cfg.preset,
         wok = env!("CARGO_PKG_VERSION"),
         lmdb = %format_args!("{major}.{minor}.{patch}"),

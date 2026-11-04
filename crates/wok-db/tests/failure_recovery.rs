@@ -108,6 +108,8 @@ fn constrained_options() -> EnvOptions {
     }
 }
 
+// Exercises an LMDB-specific on-disk/reader-table constraint.
+#[cfg(not(feature = "rocksdb-backend"))]
 #[test]
 fn map_full_aborts_the_entire_transaction() {
     let directory = TempDir::new().unwrap();

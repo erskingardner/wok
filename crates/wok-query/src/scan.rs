@@ -917,7 +917,14 @@ impl DbScan {
                 if f.kinds.is_some() {
                     index_only = false;
                 }
-                dbis.event_pubkey
+                if f.authors
+                    .as_ref()
+                    .is_some_and(|authors| authors.size() == 1)
+                {
+                    txn.env().covering_pubkey_dbi()
+                } else {
+                    dbis.event_pubkey
+                }
             }
             ScanPlan::Kind => dbis.event_kind,
             ScanPlan::CreatedAt => dbis.event_created_at,

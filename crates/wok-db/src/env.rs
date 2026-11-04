@@ -451,6 +451,10 @@ impl Env {
         &self.inner.path
     }
 
+    pub fn covering_pubkey_dbi(&self) -> MDB_dbi {
+        self.dbis().event_pubkey
+    }
+
     pub fn dbis(&self) -> Dbis {
         self.inner.dbis
     }

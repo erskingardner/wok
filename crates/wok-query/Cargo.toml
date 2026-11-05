@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Nostr filters, index selection, and resumable scans"
 
+[features]
+# Build-only author read-plan experiment; both RocksDB indexes remain written.
+rocksdb-thin-author-reads = ["wok-db/rocksdb-backend"]
+
 [dependencies]
 serde_json.workspace = true
 thiserror.workspace = true

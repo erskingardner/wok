@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [features]
 rocksdb-backend = ["wok-db/rocksdb-backend"]
+rocksdb-thin-author-reads = ["rocksdb-backend", "wok-query/rocksdb-thin-author-reads"]
 
 [dependencies]
 anyhow.workspace = true

@@ -962,6 +962,7 @@ impl DbScan {
                 if f.authors
                     .as_ref()
                     .is_some_and(|authors| authors.size() == 1)
+                    && !cfg!(feature = "rocksdb-thin-author-reads")
                 {
                     txn.env().covering_pubkey_dbi()
                 } else {
@@ -2003,3 +2004,7 @@ fn visible_event<'t>(
 #[cfg(test)]
 #[path = "peek_tests.rs"]
 mod peek_tests;
+
+#[cfg(test)]
+#[path = "author_index_tests.rs"]
+mod author_index_tests;

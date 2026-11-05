@@ -86,6 +86,27 @@ populate the transaction's combined-record cache; visibility and payload checks
 continue through the ordinary Wok path. Multi-author queries keep thin postings
 so unselected candidate payloads are not pulled into a feed merge.
 
+For an isolated comparison of that choice, the experimental
+`rocksdb-thin-author-reads` build feature makes single-author `Pubkey` scans use
+the thin author index and native primary reads instead. It enables the RocksDB
+backend and is off by default:
+
+```sh
+cargo build --release --locked -p wok-cli \
+  --features rocksdb-thin-author-reads --target-dir target/rocksdb-thin-author
+```
+
+Other selected plans retain their indexes. The choice also applies to a
+single-author alternative selected by the bounded author-versus-tag probe,
+which still checks the complete original filter. Both author indexes are still
+written and checked by the physical audit; this feature changes no persistent
+format, writer, cache limit or durability setting. Comparing the read plans
+therefore does not measure the write or compaction savings of removing the
+covering index. Such a layout experiment needs a separate format and rebuilt
+seeds. Record the exact enabled features alongside source and binary hashes,
+and compare correctness, read tails, native operations and memory before
+choosing a plan.
+
 Primary point reads use stack-encoded local-ID keys and cache native pinned
 combined bytes, sharing the same snapshot and cache as owned covering records.
 The exact PackedEvent/payload bytes and independent missing/empty components are
@@ -146,6 +167,8 @@ cargo test --release --locked -p wok-query --features wok-db/rocksdb-backend \
   --target-dir target/rocksdb --test feed_frontier -- --ignored --nocapture
 cargo test --release --locked -p wok-query --features wok-db/rocksdb-backend \
   --target-dir target/rocksdb --test global_probe -- --ignored --nocapture
+cargo test --release --locked -p wok-query --features wok-db/rocksdb-backend \
+  --target-dir target/rocksdb --lib author_index_causal_diagnostic -- --ignored --nocapture
 ```
 
 These compare warmed local fixtures with fresh transactions per query, verify
@@ -153,3 +176,7 @@ ordered results against stored metadata and report candidate/work counts. The
 bounded chronological probe is a diagnostic, not a production planner change:
 it includes sparse and adverse histories where probing adds work before the
 author merge. Local timings do not establish network latency or a schema change.
+The author-index diagnostic forces thin and covering reads in the same binary,
+including normal visibility, completeness and payload decoding. Its single-author
+fixture has contiguous local IDs and a warm shared native cache, so it does not
+represent the primary-record locality of an interleaved multi-author corpus.

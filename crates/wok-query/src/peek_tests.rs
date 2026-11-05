@@ -27,7 +27,10 @@ fn event(n: u64, who: u64, kind: u64, tags: &[&str]) -> EventToWrite {
     }
     let packed =
         PackedEventBuilder::build(&id, &author(who), BASE + n / 3, kind, 0, &packed_tags).unwrap();
-    EventToWrite::new(packed.into_bytes(), json!({"content": ""}).to_string())
+    EventToWrite::new(
+        packed.into_bytes(),
+        wok_event::json::to_tao_string(&json!({"content": ""})),
+    )
 }
 
 fn store(mut events: Vec<EventToWrite>) -> (tempfile::TempDir, Env, Vec<EventToWrite>) {

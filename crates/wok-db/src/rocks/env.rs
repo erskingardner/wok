@@ -136,6 +136,51 @@ pub fn lmdb_version() -> (i32, i32, i32) {
     (0, 9, 37)
 }
 
+/// Numeric/table options shared by ordinary opens and the private offline tests.
+/// This factory does not open a database or accept a format-marker override.
+pub(crate) fn native_options(
+    fresh: bool,
+    names: impl IntoIterator<Item = &'static str>,
+) -> (rocksdb::Options, Vec<rocksdb::ColumnFamilyDescriptor>) {
+    use rocksdb::{
+        BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, DataBlockIndexType,
+        Options,
+    };
+    let cache = Cache::new_hyper_clock_cache(8usize << 30, 0);
+    let cfopts = || {
+        let mut o = Options::default();
+        let mut t = BlockBasedOptions::default();
+        t.set_block_cache(&cache);
+        t.set_bloom_filter(10.0, false);
+        t.set_cache_index_and_filter_blocks(true);
+        t.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        t.set_block_size(4 << 10);
+        t.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
+        t.set_data_block_hash_ratio(0.75);
+        o.set_block_based_table_factory(&t);
+        o.set_write_buffer_size(64 << 20);
+        o.set_max_write_buffer_number(4);
+        o.set_level_compaction_dynamic_level_bytes(true);
+        o.set_compression_type(DBCompressionType::Lz4);
+        o.set_bottommost_compression_type(DBCompressionType::Lz4);
+        o
+    };
+    let mut options = cfopts();
+    options.create_if_missing(fresh);
+    options.create_missing_column_families(fresh);
+    options.set_max_background_jobs(8);
+    options.set_max_subcompactions(4);
+    options.set_db_write_buffer_size(2 << 30);
+    options.set_max_total_wal_size(1 << 30);
+    options.set_bytes_per_sync(1 << 20);
+    options.set_row_cache(&Cache::new_lru_cache(2 << 30));
+    let cfs = names
+        .into_iter()
+        .map(|n| ColumnFamilyDescriptor::new(n, cfopts()))
+        .collect::<Vec<_>>();
+    (options, cfs)
+}
+
 /// Inspect the manifest without opening a writer or creating missing CFs.
 pub(crate) fn check_cf_set(path: &Path) -> Result<(), DbError> {
     let mut actual = rocksdb::DB::list_cf(&rocksdb::Options::default(), path).map_err(err)?;
@@ -181,10 +226,6 @@ impl std::fmt::Debug for Env {
 }
 impl Env {
     pub fn open(path: impl AsRef<Path>, opts: EnvOptions) -> Result<Self, DbError> {
-        use rocksdb::{
-            BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
-            DataBlockIndexType, Options,
-        };
         let path = path.as_ref();
         if path.join("data.mdb").exists() || path.join("lock.mdb").exists() {
             return Err(err(
@@ -211,38 +252,7 @@ impl Env {
             // maintenance, the directory must not be replaced during open.
             check_existing_layout(path)?;
         }
-        let cache = Cache::new_hyper_clock_cache(8usize << 30, 0);
-        let cfopts = || {
-            let mut o = Options::default();
-            let mut t = BlockBasedOptions::default();
-            t.set_block_cache(&cache);
-            t.set_bloom_filter(10.0, false);
-            t.set_cache_index_and_filter_blocks(true);
-            t.set_pin_l0_filter_and_index_blocks_in_cache(true);
-            t.set_block_size(4 << 10);
-            t.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
-            t.set_data_block_hash_ratio(0.75);
-            o.set_block_based_table_factory(&t);
-            o.set_write_buffer_size(64 << 20);
-            o.set_max_write_buffer_number(4);
-            o.set_level_compaction_dynamic_level_bytes(true);
-            o.set_compression_type(DBCompressionType::Lz4);
-            o.set_bottommost_compression_type(DBCompressionType::Lz4);
-            o
-        };
-        let mut options = cfopts();
-        options.create_if_missing(fresh);
-        options.create_missing_column_families(fresh);
-        options.set_max_background_jobs(8);
-        options.set_max_subcompactions(4);
-        options.set_db_write_buffer_size(2 << 30);
-        options.set_max_total_wal_size(1 << 30);
-        options.set_bytes_per_sync(1 << 20);
-        options.set_row_cache(&Cache::new_lru_cache(2 << 30));
-        let cfs = physical_cf_names()
-            .into_iter()
-            .map(|n| ColumnFamilyDescriptor::new(n, cfopts()))
-            .collect::<Vec<_>>();
+        let (options, cfs) = native_options(fresh, physical_cf_names());
         let db = if opts.read_only {
             rocksdb::DB::open_cf_descriptors_read_only(&options, path, cfs, false)
         } else {
@@ -258,6 +268,16 @@ impl Env {
             }
             _ => return Err(err("unsupported or absent Wok RocksDB layout marker")),
         }
+        Self::from_native_db(db, path, opts.read_only)
+    }
+
+    // Callers must validate their exact layout and marker before construction.
+    // Ordinary opens do so above; the test-only pending-audit adapter is read-only.
+    pub(crate) fn from_native_db(
+        db: rocksdb::DB,
+        path: &Path,
+        read_only: bool,
+    ) -> Result<Self, DbError> {
         let dbis = Dbis {
             meta: 1,
             negentropy_filter: 2,
@@ -290,7 +310,7 @@ impl Env {
                 db,
                 dbis,
                 path: path.to_path_buf(),
-                read_only: opts.read_only,
+                read_only,
                 writer: Mutex::new(()),
             }),
         })

@@ -141,7 +141,8 @@ thin posting's existence and empty value, and checks that its exact count gives
 one posting per primary. Both layouts retain the same signature/body checks and
 length-framed local-ID, PackedEvent and encoded-payload fingerprint.
 
-There is no converter or claim of measured storage, write or compaction savings.
+The CLI provides no converter or claim of measured storage, write or compaction
+savings.
 Verified JSON import into a new database preserves event identity, but is not a
 general byte-preserving conversion of local IDs, encoded payloads or kept tables.
 Any causal layout comparison needs separately built and verified seeds, the same
@@ -160,7 +161,7 @@ with their postings in the same synchronous WAL batch. Unchanged frontier
 values are not rewritten. The format marker is
 `wok-rocks-v3:combined:thin-author-frontiers:reverse-order:sync-wal`. All three
 layouts require their own exact column family set and marker before a writable
-open; there is no converter.
+open. No runtime or CLI conversion path is enabled.
 
 That layout feature retains the established range-seek reader as a control.
 The additional `rocksdb-author-head-reads` feature enables native batched point
@@ -324,3 +325,37 @@ The input file and filters have their own identities; representative static
 filters must not be described as the matched network pool. Keep pristine seeds
 closed, preserve copy provenance, and run this diagnostic separately from clean
 network timings.
+
+The ignored `feed_query_diagnostic::diagnose_existing_seed_author_frontiers`
+test compares the ordinary author range reader with frontier initialization in
+one binary against the same disposable v3 database. Build it with
+`rocksdb-author-head-reads,rocksdb-read-diagnostics`. Set
+`WOK_AUTHOR_FRONTIER_DIAGNOSTIC_DB` to the verified disposable target,
+`WOK_AUTHOR_FRONTIER_DIAGNOSTIC_FILTERS` to the retained range-metadata file and
+`WOK_AUTHOR_FRONTIER_DIAGNOSTIC_PASSES` to one through four. It selects only
+pure 500-author, limit-50 records while preserving their original indexes and
+hashes, alternates the arms, and checks exact ordered IDs, PackedEvent, encoded
+payload, decoded bodies and final completeness hints. The separate
+`wok-author-frontier-query-diagnostic-v1` report retains incomplete and failed
+arms as ineligible. It records actual seeded and fallback outcomes separately
+from the 30 wrapper counters and 13 native counters; observing outcomes adds no
+header reads. Peeks must issue no header lookup. Reported query operations
+exclude transaction creation/drop, environment opening and final stored-byte
+verification. Shared native/OS caches remain warm; these counts do not measure
+latency, transaction lifecycle savings or physical device I/O.
+
+A private, ignored DB test, `physical_seed_builder::build_disposable_v3_target`,
+constructs a disposable v3 diagnostic target from an explicitly supplied v1
+copy and retained audit/inventory provenance. It requires
+`WOK_PHYSICAL_BUILDER_SOURCE`, `WOK_PHYSICAL_BUILDER_DESTINATION` and
+`WOK_PHYSICAL_BUILDER_PROVENANCE`; it has no default database path. It streams
+the kept physical column-family bytes unchanged, omits the covering family and
+derives the author frontiers. Only the format marker differs in the default
+column family. A rejected incomplete marker protects the target through copy
+and full signature/body/layout audit; sealing, normal read-only reopen and
+normalized byte-hash equality precede its ready report. Partial and failed
+outputs remain retained. It is a lab harness, not a general migration command.
+Its raw rewrite changes SST layout: compare readers within the generated v3
+target, and retain the original pristine database closed. Source, binary,
+resource, disk-growth and process-closure checks belong to the host wrapper;
+streaming alone does not bound total engine memory or compaction disk peaks.

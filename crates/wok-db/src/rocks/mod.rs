@@ -8,6 +8,8 @@
 mod audit;
 #[cfg(feature = "rocksdb-author-heads")]
 pub(crate) mod author_heads;
+#[cfg(all(test, feature = "rocksdb-author-heads"))]
+mod physical_seed_builder;
 
 use crate::schema::{dbi_specs, ComparatorKind};
 use crate::DbError;

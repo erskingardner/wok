@@ -12,7 +12,74 @@ use super::*;
 use wok_db::AuthorHead;
 
 const BATCH_KEYS: usize = 32;
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+pub(super) const DIAGNOSTIC_BATCH_KEYS: usize = BATCH_KEYS;
 const PACKED_TIME_MAX: u64 = 0xFF_FFFFFFFF;
+
+// Query-level observations for the distinct native seed diagnostic only.
+// These add no lookups and do not extend WrapperCounters or ordinary builds.
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InitializationStats {
+    pub(super) issued_keys: u64,
+    pub(super) seeded_heads: u64,
+    pub(super) fallback_missing: u64,
+    pub(super) fallback_below_since: u64,
+    pub(super) fallback_above_until: u64,
+    pub(super) fallback_unsupported_timestamp: u64,
+    pub(super) fallback_postings_collected: u64,
+    // A native batch error does not establish whether decoding or I/O failed.
+    pub(super) failed_batch_keys: u64,
+    pub(super) failed_batch_calls: u64,
+    pub(super) header_keys_during_peek: u64,
+}
+
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+impl InitializationStats {
+    pub(super) fn classified_keys(self) -> u64 {
+        self.seeded_heads
+            + self.fallback_missing
+            + self.fallback_below_since
+            + self.fallback_above_until
+            + self.fallback_unsupported_timestamp
+    }
+
+    /// A scanner may survive several process slices. Add only the new work;
+    /// all scanners, including a short-lived unscanned-filter peek, contribute.
+    pub(super) fn add_delta(&mut self, after: Self, before: Self, peek: bool) {
+        macro_rules! add {
+            ($($field:ident),+ $(,)?) => {$(self.$field += after.$field - before.$field;)+};
+        }
+        add!(
+            issued_keys,
+            seeded_heads,
+            fallback_missing,
+            fallback_below_since,
+            fallback_above_until,
+            fallback_unsupported_timestamp,
+            fallback_postings_collected,
+            failed_batch_keys,
+            failed_batch_calls,
+        );
+        self.header_keys_during_peek +=
+            after.header_keys_during_peek - before.header_keys_during_peek;
+        if peek {
+            self.header_keys_during_peek += after.issued_keys - before.issued_keys;
+        }
+    }
+
+    pub(super) fn observe(&mut self, head: Option<AuthorHead>, since: u64, until: u64) {
+        match head {
+            None => self.fallback_missing += 1,
+            Some(head) if head.first.created_at > PACKED_TIME_MAX => {
+                self.fallback_unsupported_timestamp += 1;
+            }
+            Some(head) if head.first.created_at < since => self.fallback_below_since += 1,
+            Some(head) if head.first.created_at > until => self.fallback_above_until += 1,
+            Some(_) => self.seeded_heads += 1,
+        }
+    }
+}
 
 pub(super) fn eligible(f: &NostrFilter, plan: ScanPlan, depth: u64, cursors: usize) -> bool {
     plan == ScanPlan::Pubkey
@@ -82,12 +149,23 @@ pub(super) fn initialize<'tx>(
     }
     let start = scan.next_init_index;
     let end = (start + BATCH_KEYS).min(scan.cursors.len());
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    {
+        scan.diagnostic_author_frontier_initialization.issued_keys += (end - start) as u64;
+    }
     let head_result = txn.author_heads(scan.cursors[start..end].iter().map(|range| {
         <&[u8; 32]>::try_from(range.search.as_slice()).expect("pure author range key")
     }));
     let heads = match head_result {
         Ok(heads) => heads,
         Err(error) => {
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            {
+                scan.diagnostic_author_frontier_initialization
+                    .failed_batch_keys += (end - start) as u64;
+                scan.diagnostic_author_frontier_initialization
+                    .failed_batch_calls += 1;
+            }
             scan.approx_work += (end - start - 1) as u64;
             return Err(error);
         }
@@ -112,6 +190,9 @@ fn initialize_entries<'tx>(
     let end = start + heads.len();
     for (offset, head) in heads.into_iter().enumerate() {
         let index = start + offset;
+        #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+        scan.diagnostic_author_frontier_initialization
+            .observe(head, scan.since, scan.until);
         if offset != 0 {
             scan.approx_work += 1;
         }
@@ -138,7 +219,14 @@ fn initialize_entries<'tx>(
                 )
             })();
             match added {
-                Ok(added) => scan.approx_work += added,
+                Ok(added) => {
+                    scan.approx_work += added;
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    {
+                        scan.diagnostic_author_frontier_initialization
+                            .fallback_postings_collected += added;
+                    }
+                }
                 Err(error) => {
                     // Later keys were looked up by the issued MultiGet even
                     // though their ordinary fallback is no longer attempted.

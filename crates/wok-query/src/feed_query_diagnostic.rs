@@ -4,7 +4,9 @@
 //! CreatedAt cursor, then checks the original author filter on every candidate.
 //! DbQuery still owns visibility, latest-ID cuts, deduplication, limits and its
 //! ordinary budgeted completeness peek. Single-range batching is unchanged.
-//! No speculative bounded probe, fallback, schema or production switch exists.
+//! The original external two-arm harness below remains unbounded. Additional
+//! private arms are used only by the separate bounded local prototype tests;
+//! they add no production planner switch or external input/output contract.
 //!
 //! The ignored harness reuses the exact range diagnostic's input parser and
 //! selects only feed500 records, preserving original input indexes and hashes.
@@ -34,9 +36,11 @@ const MAX_FEED_INPUTS: usize = 64;
 const MAX_SLICES: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
-enum Arm {
+pub(super) enum Arm {
     Pubkey,
     CreatedAtMembership,
+    BoundedGlobalPeek,
+    BoundedAuthorPeek,
 }
 
 impl Arm {
@@ -44,12 +48,24 @@ impl Arm {
         match self {
             Self::Pubkey => "pubkey_control",
             Self::CreatedAtMembership => "created_at_membership",
+            Self::BoundedGlobalPeek => "bounded_global_peek",
+            Self::BoundedAuthorPeek => "bounded_author_peek",
         }
     }
 
     fn scan(self, filter: &NostrFilter, txn: &RoTxn<'_>) -> DbScan {
         match self {
             Self::Pubkey => DbScan::new(filter, txn),
+            Self::BoundedGlobalPeek => super::bounded_feed_diagnostic::configure(
+                filter,
+                txn,
+                super::bounded_feed_diagnostic::PeekPolicy::GlobalUntilCap,
+            ),
+            Self::BoundedAuthorPeek => super::bounded_feed_diagnostic::configure(
+                filter,
+                txn,
+                super::bounded_feed_diagnostic::PeekPolicy::AuthorOnPeek,
+            ),
             Self::CreatedAtMembership => {
                 // Only the constructor sees an unscoped seed. The unchanged
                 // original filter remains the residual passed to DbQuery.
@@ -74,12 +90,12 @@ impl Arm {
 }
 
 #[derive(Clone)]
-struct QueryOptions {
-    visibility: ReadVisibility,
-    latest: u64,
-    max_total: u64,
-    time_budget_us: u64,
-    max_slices: usize,
+pub(super) struct QueryOptions {
+    pub(super) visibility: ReadVisibility,
+    pub(super) latest: u64,
+    pub(super) max_total: u64,
+    pub(super) time_budget_us: u64,
+    pub(super) max_slices: usize,
 }
 
 impl Default for QueryOptions {
@@ -95,44 +111,45 @@ impl Default for QueryOptions {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Delivery {
-    ids: Vec<u64>,
-    sent_count: u64,
-    body_sha256: String,
-    body_bytes: u64,
-    packed_sha256: String,
-    packed_bytes: u64,
-    payload_sha256: String,
-    payload_bytes: u64,
-    payload_failed: bool,
+pub(super) struct Delivery {
+    pub(super) ids: Vec<u64>,
+    pub(super) sent_count: u64,
+    pub(super) body_sha256: String,
+    pub(super) body_bytes: u64,
+    pub(super) packed_sha256: String,
+    pub(super) packed_bytes: u64,
+    pub(super) payload_sha256: String,
+    pub(super) payload_bytes: u64,
+    pub(super) payload_failed: bool,
 }
 
 #[derive(Debug)]
-struct Plan {
-    desc: &'static str,
-    index_dbi: u32,
-    index_only: bool,
-    cursors: usize,
-    initial_depth: u64,
-    refill_depths: Vec<u64>,
+pub(super) struct Plan {
+    pub(super) desc: &'static str,
+    pub(super) index_dbi: u32,
+    pub(super) index_only: bool,
+    pub(super) cursors: usize,
+    pub(super) initial_depth: u64,
+    pub(super) refill_depths: Vec<u64>,
 }
 
 #[derive(Debug)]
-struct Sample {
-    delivery: Delivery,
-    completeness: Completeness,
-    completed: bool,
-    plan: Plan,
-    chronological_work: u64,
-    peek_work: u64,
-    peek_candidates: u32,
+pub(super) struct Sample {
+    pub(super) delivery: Delivery,
+    pub(super) completeness: Completeness,
+    pub(super) completed: bool,
+    pub(super) plan: Plan,
+    pub(super) chronological_work: u64,
+    pub(super) peek_work: u64,
+    pub(super) peek_candidates: u32,
     // These are cumulative chronological work values, not elapsed-time shares.
-    slice_work: Vec<u64>,
-    measurements: ReadMeasurements,
-    diagnostic_closure_elapsed_us: u64,
+    pub(super) slice_work: Vec<u64>,
+    pub(super) measurements: ReadMeasurements,
+    pub(super) bounded: Option<super::bounded_feed_diagnostic::Stats>,
+    pub(super) diagnostic_closure_elapsed_us: u64,
 }
 
-fn subscription(group: NostrFilterGroup, latest: u64) -> Subscription {
+pub(super) fn subscription(group: NostrFilterGroup, latest: u64) -> Subscription {
     let mut sub = Subscription::new(
         1,
         SubId::new("feed-query-diagnostic").unwrap(),
@@ -143,7 +160,7 @@ fn subscription(group: NostrFilterGroup, latest: u64) -> Subscription {
     sub
 }
 
-fn read_arm(
+pub(super) fn read_arm(
     env: &Env,
     group: &NostrFilterGroup,
     arm: Arm,
@@ -261,12 +278,13 @@ fn read_arm(
         peek_candidates: PEEK_CANDIDATES - query.peek_budget.candidates,
         slice_work,
         measurements,
+        bounded: query.diagnostic_feed_stats,
         diagnostic_closure_elapsed_us: elapsed,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sample_json(
+pub(super) fn sample_json(
     sample: &Sample,
     input_index: usize,
     filter_sha256: &str,
@@ -466,19 +484,19 @@ use wok_event::{PackedEventBuilder, PackedEventTagBuilder};
 
 const BASE: u64 = 1_700_000_000;
 
-struct Fixture {
-    dir: tempfile::TempDir,
-    env: Env,
-    events: Vec<EventToWrite>,
+pub(super) struct Fixture {
+    pub(super) dir: tempfile::TempDir,
+    pub(super) env: Env,
+    pub(super) events: Vec<EventToWrite>,
 }
 
-fn author(n: u64) -> [u8; 32] {
+pub(super) fn author(n: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     bytes[..8].copy_from_slice(&n.to_be_bytes());
     bytes
 }
 
-fn event(n: u64, who: u64, created: u64, kind: u64, expiration: u64) -> EventToWrite {
+pub(super) fn event(n: u64, who: u64, created: u64, kind: u64, expiration: u64) -> EventToWrite {
     let mut id = [0u8; 32];
     id[..8].copy_from_slice(&n.to_be_bytes());
     let mut tags = PackedEventTagBuilder::default();
@@ -495,7 +513,7 @@ fn event(n: u64, who: u64, created: u64, kind: u64, expiration: u64) -> EventToW
     )
 }
 
-fn store(mut events: Vec<EventToWrite>) -> Fixture {
+pub(super) fn store(mut events: Vec<EventToWrite>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
@@ -511,15 +529,15 @@ fn store(mut events: Vec<EventToWrite>) -> Fixture {
     Fixture { dir, env, events }
 }
 
-fn group(value: &Value) -> NostrFilterGroup {
+pub(super) fn group(value: &Value) -> NostrFilterGroup {
     NostrFilterGroup::from_value(value, 10_000, 8, 16).unwrap()
 }
 
-fn feed(authors: impl Iterator<Item = u64>, limit: u64) -> Value {
+pub(super) fn feed(authors: impl Iterator<Item = u64>, limit: u64) -> Value {
     json!({"authors":authors.map(|n|hex::encode(author(n))).collect::<Vec<_>>(),"until":BASE+20000,"limit":limit})
 }
 
-fn dense_events(authors: u64, depths: u64, hidden: bool) -> Vec<EventToWrite> {
+pub(super) fn dense_events(authors: u64, depths: u64, hidden: bool) -> Vec<EventToWrite> {
     (0..authors * depths)
         .map(|n| {
             let kind = if hidden && n % 11 == 0 {
@@ -546,7 +564,11 @@ fn dense_events(authors: u64, depths: u64, hidden: bool) -> Vec<EventToWrite> {
         .collect()
 }
 
-fn expected(fixture: &Fixture, group: &NostrFilterGroup, options: &QueryOptions) -> Vec<u64> {
+pub(super) fn expected(
+    fixture: &Fixture,
+    group: &NostrFilterGroup,
+    options: &QueryOptions,
+) -> Vec<u64> {
     let tx = fixture.env.begin_ro().unwrap();
     let snapshot = ReadSnapshot::for_stored(&tx);
     let mut seen = HashSet::new();
@@ -577,7 +599,11 @@ fn expected(fixture: &Fixture, group: &NostrFilterGroup, options: &QueryOptions)
     output
 }
 
-fn pair(fixture: &Fixture, group: &NostrFilterGroup, options: &QueryOptions) -> (Sample, Sample) {
+pub(super) fn pair(
+    fixture: &Fixture,
+    group: &NostrFilterGroup,
+    options: &QueryOptions,
+) -> (Sample, Sample) {
     let control = read_arm(&fixture.env, group, Arm::Pubkey, options).unwrap();
     let global = read_arm(&fixture.env, group, Arm::CreatedAtMembership, options).unwrap();
     assert!(control.completed && global.completed);
@@ -587,7 +613,13 @@ fn pair(fixture: &Fixture, group: &NostrFilterGroup, options: &QueryOptions) -> 
     (control, global)
 }
 
-fn fixture_evidence(label: &str, filter: &Value, control: &Sample, global: &Sample, budget: u64) {
+pub(super) fn fixture_evidence(
+    label: &str,
+    filter: &Value,
+    control: &Sample,
+    global: &Sample,
+    budget: u64,
+) {
     let filter_sha256 = digest(wok_event::json::to_tao_string(filter).as_bytes());
     let delivery_equal = control.delivery == global.delivery;
     let completeness_equal = control.completeness == global.completeness;

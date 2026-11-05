@@ -347,6 +347,10 @@ impl ScanCursor {
 }
 
 pub struct DbScan {
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_feed_prefix: Option<bounded_feed_diagnostic::Prefix>,
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_feed_stats: bounded_feed_diagnostic::Stats,
     index_only: bool,
     index_dbi: lmdb_sys::MDB_dbi,
     pub desc: &'static str,
@@ -1123,6 +1127,10 @@ impl DbScan {
         };
         let refill_scan_depths = vec![refill; cursors.len()];
         Self {
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_feed_prefix: None,
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_feed_stats: bounded_feed_diagnostic::Stats::default(),
             index_only,
             index_dbi,
             desc: plan.name(),
@@ -1168,6 +1176,19 @@ impl DbScan {
         H: FnMut(u64) -> bool,
         P: FnMut(u64) -> bool,
     {
+        #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+        if self.diagnostic_feed_prefix.is_some() {
+            if let Some(complete) = bounded_feed_diagnostic::advance(
+                self,
+                txn,
+                filter,
+                depth_cap,
+                &mut handle_event,
+                &mut do_pause,
+            )? {
+                return Ok(complete);
+            }
+        }
         // One physical cursor per scan slice, shared by all logical author,
         // tag or kind ranges and refills. Resume endpoints remain owned by
         // ScanCursor; no native iterator survives this call or its snapshot.
@@ -1311,6 +1332,8 @@ pub struct DbQuery {
     /// work and planning probes use different units and are not included.
     #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
     diagnostic_chronological_work: u64,
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_feed_stats: Option<bounded_feed_diagnostic::Stats>,
     max_total_events: u64,
     hll: Option<HyperLogLog>,
     count_dedup_budget: u64,
@@ -1376,6 +1399,8 @@ impl DbQuery {
             last_work_checked: 0,
             #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             diagnostic_chronological_work: 0,
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_feed_stats: None,
             // COUNT needs the exact deduplicated count up to its separate
             // max_filter_limit_count. The request-wide delivery ceiling is
             // for EVENT responses.
@@ -1786,6 +1811,9 @@ impl DbQuery {
                     #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                     {
                         self.diagnostic_chronological_work += scanner.approx_work - work_before;
+                        if scanner.diagnostic_feed_stats.configured {
+                            self.diagnostic_feed_stats = Some(scanner.diagnostic_feed_stats);
+                        }
                     }
                     result?
                 }
@@ -1824,6 +1852,9 @@ impl DbQuery {
                     #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                     {
                         self.diagnostic_chronological_work += scanner.approx_work - work_before;
+                        if scanner.diagnostic_feed_stats.configured {
+                            self.diagnostic_feed_stats = Some(scanner.diagnostic_feed_stats);
+                        }
                     }
                     Some(result?)
                 }
@@ -2067,3 +2098,7 @@ mod range_seed_diagnostic;
 #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
 #[path = "feed_query_diagnostic.rs"]
 mod feed_query_diagnostic;
+
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+#[path = "bounded_feed_diagnostic.rs"]
+mod bounded_feed_diagnostic;

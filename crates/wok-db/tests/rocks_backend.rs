@@ -169,6 +169,13 @@ fn primary_pins_preserve_components_and_snapshot_bytes_across_commits() {
         .unwrap();
 
     let old = env.begin_ro().unwrap();
+    // Move an initialized read transaction before retaining its byte borrows.
+    // Later uncached reads must still use this snapshot's native handle.
+    assert_eq!(
+        old.get_u64(db.event_payload, 255).unwrap().unwrap(),
+        payload
+    );
+    let old = Box::new(old);
     let borrowed = old.get_u64(db.event_payload, 255).unwrap().unwrap();
     let packed = old.get(db.event, &255u64.to_ne_bytes()).unwrap().unwrap();
     assert!(std::ptr::eq(

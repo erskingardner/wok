@@ -7,6 +7,7 @@ use crate::DbError;
 use bumpalo::Bump;
 use elsa::FrozenMap;
 use lmdb_sys::*;
+use std::cell::OnceCell;
 #[cfg(not(feature = "rocksdb-coverless"))]
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
@@ -48,46 +49,34 @@ fn record_key(id: u64) -> [u8; 9] {
 // cursors can borrow it for less than the Env's full lifetime. Pins still keep
 // their concrete DB lifetime inside RecordStore; no lifetime is extended.
 trait RecordCache {
-    fn get(
-        &self,
-        id: u64,
-        dbi: u32,
-        snapshot: &rocksdb::Snapshot<'_>,
-    ) -> Result<Option<&[u8]>, DbError>;
+    fn cached(&self, id: u64) -> Option<&[u8]>;
+    fn get(&self, id: u64, options: &rocksdb::ReadOptions) -> Result<Option<&[u8]>, DbError>;
     fn cache(&self, id: u64, raw: &[u8]) -> &[u8];
 }
 struct RecordStore<'env> {
     db: &'env rocksdb::DB,
+    combined_cf: &'env rocksdb::ColumnFamily,
     records: FrozenMap<u64, Box<RecordBytes<'env>>>,
 }
 impl RecordCache for RecordStore<'_> {
-    fn get(
-        &self,
-        id: u64,
-        dbi: u32,
-        snapshot: &rocksdb::Snapshot<'_>,
-    ) -> Result<Option<&[u8]>, DbError> {
-        if let Some(raw) = self.records.get(&id) {
+    fn cached(&self, id: u64) -> Option<&[u8]> {
+        self.records.get(&id).map(|raw| {
             #[cfg(feature = "rocksdb-read-diagnostics")]
             crate::read_diagnostics::record(|c| match raw {
                 RecordBytes::Owned(_) => c.primary_cached_owned_hits += 1,
                 RecordBytes::Pinned(_) => c.primary_cached_pinned_hits += 1,
             });
-            return Ok(Some(raw.as_ref()));
-        }
-        let mut options = rocksdb::ReadOptions::default();
-        options.set_snapshot(snapshot);
-        let cf = self
-            .db
-            .cf_handle(cf_name(dbi))
-            .expect("validated column family");
+            raw.as_ref()
+        })
+    }
+    fn get(&self, id: u64, options: &rocksdb::ReadOptions) -> Result<Option<&[u8]>, DbError> {
         // The pin owns its native storage reference and is tied to the Env's
         // DB. The snapshot selects which version is pinned at lookup.
         #[cfg(feature = "rocksdb-read-diagnostics")]
         crate::read_diagnostics::record(|c| c.primary_pin_lookups += 1);
         let raw = self
             .db
-            .get_pinned_cf_opt(cf, record_key(id), &options)
+            .get_pinned_cf_opt(self.combined_cf, record_key(id), options)
             .map_err(err)?;
         #[cfg(feature = "rocksdb-read-diagnostics")]
         crate::read_diagnostics::record(|c| match &raw {
@@ -124,10 +113,14 @@ impl RecordCache for RecordStore<'_> {
 }
 struct View<'env> {
     env: &'env Env,
+    records: Box<dyn RecordCache + 'env>,
+    // ReadOptions stores the native snapshot handle, whose address is stable
+    // when View moves. Declaration order drops pins/options before snapshot.
+    // Initialize only on a primary cache miss, including after covering reads.
+    primary_options: OnceCell<rocksdb::ReadOptions>,
     snapshot: rocksdb::Snapshot<'env>,
     markers: Arc<MarkerMap>,
     arena: Bump,
-    records: Box<dyn RecordCache + 'env>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 impl<'env> View<'env> {
@@ -146,13 +139,19 @@ impl<'env> View<'env> {
             if sequence == before && before == after {
                 return Ok(Self {
                     env,
+                    records: Box::new(RecordStore {
+                        db: &env.inner.db,
+                        combined_cf: env
+                            .inner
+                            .db
+                            .cf_handle(COMBINED)
+                            .expect("validated combined column family"),
+                        records: FrozenMap::new(),
+                    }),
+                    primary_options: OnceCell::new(),
                     snapshot,
                     markers,
                     arena: Bump::new(),
-                    records: Box::new(RecordStore {
-                        db: &env.inner.db,
-                        records: FrozenMap::new(),
-                    }),
                     _not_send_or_sync: PhantomData,
                 });
             }
@@ -229,9 +228,18 @@ impl<'env> View<'env> {
         staged: Option<&'a Overlay>,
     ) -> Result<Option<&'a [u8]>, DbError> {
         let raw = if staged.is_none() {
-            match self.records.get(id, dbi, &self.snapshot)? {
-                Some(raw) => raw,
-                None => return Ok(None),
+            if let Some(raw) = self.records.cached(id) {
+                raw
+            } else {
+                let options = self.primary_options.get_or_init(|| {
+                    let mut options = rocksdb::ReadOptions::default();
+                    options.set_snapshot(&self.snapshot);
+                    options
+                });
+                match self.records.get(id, options)? {
+                    Some(raw) => raw,
+                    None => return Ok(None),
+                }
             }
         } else {
             match self.raw(dbi, &record_key(id), staged)? {

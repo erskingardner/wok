@@ -117,9 +117,16 @@ impl<'a> IndexEntry<'a> {
 
     /// Materialize only a resume boundary, rather than every candidate key.
     pub fn to_key(&self) -> Vec<u8> {
-        self.prefix_bytes()
+        let key: Vec<u8> = self
+            .prefix_bytes()
             .chain(self.created_at.into_iter().flat_map(u64::to_ne_bytes))
-            .collect()
+            .collect();
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        crate::read_diagnostics::record(|c| {
+            c.resume_key_copies += 1;
+            c.resume_key_bytes += key.len() as u64;
+        });
+        key
     }
 
     #[cfg(feature = "rocksdb-backend")]

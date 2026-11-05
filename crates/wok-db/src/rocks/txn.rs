@@ -66,6 +66,11 @@ impl RecordCache for RecordStore<'_> {
         snapshot: &rocksdb::Snapshot<'_>,
     ) -> Result<Option<&[u8]>, DbError> {
         if let Some(raw) = self.records.get(&id) {
+            #[cfg(feature = "rocksdb-read-diagnostics")]
+            crate::read_diagnostics::record(|c| match raw {
+                RecordBytes::Owned(_) => c.primary_cached_owned_hits += 1,
+                RecordBytes::Pinned(_) => c.primary_cached_pinned_hits += 1,
+            });
             return Ok(Some(raw.as_ref()));
         }
         let mut options = rocksdb::ReadOptions::default();
@@ -76,23 +81,42 @@ impl RecordCache for RecordStore<'_> {
             .expect("validated column family");
         // The pin owns its native storage reference and is tied to the Env's
         // DB. The snapshot selects which version is pinned at lookup.
-        Ok(self
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        crate::read_diagnostics::record(|c| c.primary_pin_lookups += 1);
+        let raw = self
             .db
             .get_pinned_cf_opt(cf, record_key(id), &options)
-            .map_err(err)?
-            .map(|raw| {
-                self.records
-                    .insert(id, Box::new(RecordBytes::Pinned(raw)))
-                    .as_ref()
-            }))
+            .map_err(err)?;
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        crate::read_diagnostics::record(|c| match &raw {
+            Some(raw) => {
+                c.primary_pins_found += 1;
+                c.primary_pin_returned_bytes += raw.len() as u64;
+            }
+            None => c.primary_pins_missing += 1,
+        });
+        Ok(raw.map(|raw| {
+            self.records
+                .insert(id, Box::new(RecordBytes::Pinned(raw)))
+                .as_ref()
+        }))
     }
     fn cache(&self, id: u64, raw: &[u8]) -> &[u8] {
+        if let Some(cached) = self.records.get(&id) {
+            #[cfg(feature = "rocksdb-read-diagnostics")]
+            crate::read_diagnostics::record(|c| match cached {
+                RecordBytes::Owned(_) => c.cover_cached_owned_hits += 1,
+                RecordBytes::Pinned(_) => c.cover_cached_pinned_hits += 1,
+            });
+            return cached.as_ref();
+        }
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        crate::read_diagnostics::record(|c| {
+            c.cover_records_copied += 1;
+            c.cover_record_bytes_copied += raw.len() as u64;
+        });
         self.records
-            .get(&id)
-            .unwrap_or_else(|| {
-                self.records
-                    .insert(id, Box::new(RecordBytes::Owned(raw.into())))
-            })
+            .insert(id, Box::new(RecordBytes::Owned(raw.into())))
             .as_ref()
     }
 }
@@ -208,7 +232,11 @@ impl<'env> View<'env> {
             }
         } else {
             match self.raw(dbi, &record_key(id), staged)? {
-                Some(raw) => self.arena.alloc_slice_copy(&raw),
+                Some(raw) => {
+                    #[cfg(feature = "rocksdb-read-diagnostics")]
+                    crate::read_diagnostics::record(|c| c.arena_copy_bytes += raw.len() as u64);
+                    self.arena.alloc_slice_copy(&raw)
+                }
                 None => return Ok(None),
             }
         };
@@ -229,9 +257,11 @@ impl<'env> View<'env> {
             let mut cursor = Cursor::new(self, dbi, staged);
             return Ok(cursor.get(Some(key), None, MDB_SET_KEY)?.map(|(_, v)| v));
         }
-        Ok(self
-            .raw(dbi, &encode(dbi, key, None), staged)?
-            .map(|v| &*self.arena.alloc_slice_copy(&v)))
+        Ok(self.raw(dbi, &encode(dbi, key, None), staged)?.map(|v| {
+            #[cfg(feature = "rocksdb-read-diagnostics")]
+            crate::read_diagnostics::record(|c| c.arena_copy_bytes += v.len() as u64);
+            &*self.arena.alloc_slice_copy(&v)
+        }))
     }
 }
 pub struct RoTxn<'env> {
@@ -692,6 +722,8 @@ impl<'txn> Cursor<'txn> {
     fn new(view: &'txn View<'txn>, dbi: u32, staged: Option<&'txn Overlay>) -> Self {
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_total_order_seek(true);
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        crate::read_diagnostics::record(|c| c.iterator_creations += 1);
         Self {
             view,
             dbi,
@@ -720,14 +752,20 @@ impl<'txn> Cursor<'txn> {
         }
         let bound = encode(self.dbi, start_key, Some(&start_dup.to_ne_bytes()));
         if start_key.is_empty() {
+            #[cfg(feature = "rocksdb-read-diagnostics")]
+            crate::read_diagnostics::record(|c| c.seek_to_first += 1);
             self.it.seek_to_first();
         } else {
+            #[cfg(feature = "rocksdb-read-diagnostics")]
+            crate::read_diagnostics::record(|c| c.seek += 1);
             self.it.seek(&bound);
         }
         while let Some((key, value)) = self.it.item() {
             let entry = IndexEntry::from_matching_rocks(self.dbi, key, start_key, &bound)
                 .or_else(|| IndexEntry::from_rocks(self.dbi, key));
             if let Some(entry) = entry {
+                #[cfg(feature = "rocksdb-read-diagnostics")]
+                crate::read_diagnostics::record(|c| c.typed_index_entries += 1);
                 if self.dbi == COVER_DBI {
                     self.view.cache_record(entry.local_id()?, value);
                 }
@@ -735,6 +773,8 @@ impl<'txn> Cursor<'txn> {
                     return Ok(false);
                 }
             } else {
+                #[cfg(feature = "rocksdb-read-diagnostics")]
+                crate::read_diagnostics::record(|c| c.fallback_index_entries += 1);
                 // Raw maintenance transactions can create noncanonical keys
                 // and duplicates. Keep the generic decoder's validation and
                 // historical short-key handling for those records.
@@ -747,6 +787,8 @@ impl<'txn> Cursor<'txn> {
                     return Ok(false);
                 }
             }
+            #[cfg(feature = "rocksdb-read-diagnostics")]
+            crate::read_diagnostics::record(|c| c.next += 1);
             self.it.next();
         }
         self.it.status().map_err(err)?;
@@ -770,21 +812,49 @@ impl<'txn> Cursor<'txn> {
                 .is_some_and(|key| self.it.key() == Some(key));
             if self.staged.is_some() || !on_bound {
                 match (&bound, forward) {
-                    (Some(b), true) => self.it.seek(b),
-                    (Some(b), false) => self.it.seek_for_prev(b),
-                    (None, true) => self.it.seek_to_first(),
-                    (None, false) => self.it.seek_to_last(),
+                    (Some(b), true) => {
+                        #[cfg(feature = "rocksdb-read-diagnostics")]
+                        crate::read_diagnostics::record(|c| c.seek += 1);
+                        self.it.seek(b);
+                    }
+                    (Some(b), false) => {
+                        #[cfg(feature = "rocksdb-read-diagnostics")]
+                        crate::read_diagnostics::record(|c| c.seek_for_prev += 1);
+                        self.it.seek_for_prev(b);
+                    }
+                    (None, true) => {
+                        #[cfg(feature = "rocksdb-read-diagnostics")]
+                        crate::read_diagnostics::record(|c| c.seek_to_first += 1);
+                        self.it.seek_to_first();
+                    }
+                    (None, false) => {
+                        #[cfg(feature = "rocksdb-read-diagnostics")]
+                        crate::read_diagnostics::record(|c| c.seek_to_last += 1);
+                        self.it.seek_to_last();
+                    }
                 }
             }
             if !inclusive && bound.is_some() && self.it.key() == bound.as_deref() {
                 if forward {
+                    #[cfg(feature = "rocksdb-read-diagnostics")]
+                    crate::read_diagnostics::record(|c| c.next += 1);
                     self.it.next();
                 } else {
+                    #[cfg(feature = "rocksdb-read-diagnostics")]
+                    crate::read_diagnostics::record(|c| c.prev += 1);
                     self.it.prev();
                 }
             }
             self.it.status().map_err(err)?;
-            let db = self.it.item().map(|(k, v)| (k.to_vec(), v.to_vec()));
+            let db = self.it.item().map(|(k, v)| {
+                #[cfg(feature = "rocksdb-read-diagnostics")]
+                crate::read_diagnostics::record(|c| {
+                    c.generic_row_materializations += 1;
+                    c.generic_key_copy_bytes += k.len() as u64;
+                    c.generic_value_copy_bytes += v.len() as u64;
+                });
+                (k.to_vec(), v.to_vec())
+            });
             let id = physical(self.dbi);
             let staged = self.staged.and_then(|s| {
                 let lo = if forward {
@@ -863,6 +933,10 @@ impl<'txn> Cursor<'txn> {
             }
             self.current = Some(pk);
             self.logical_key = Some(key.clone());
+            #[cfg(feature = "rocksdb-read-diagnostics")]
+            crate::read_diagnostics::record(|c| {
+                c.arena_copy_bytes += (key.len() + val.len()) as u64;
+            });
             return Ok(Some((
                 self.view.arena.alloc_slice_copy(&key),
                 self.view.arena.alloc_slice_copy(&val),

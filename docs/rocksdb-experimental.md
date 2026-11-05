@@ -160,6 +160,25 @@ to require zero seeks after initial positioning. Counter diagnostics demonstrate
 which native operations ran; their instrumented elapsed times are not network
 latency measurements. Keep profiling separate from matched-arrival timing runs.
 
+The opt-in `rocksdb-read-diagnostics` feature exposes
+`wok_db::read_diagnostics::measure` for one synchronous read closure. It records
+Wok iterator calls, typed and fallback decoding, resume-key materialization,
+selected owned copies, covering-record copies and primary pin/cache operations.
+Use a fresh transaction inside the closure to include its cache population.
+The byte counters cover the named materializations, not total allocation or
+live memory; returned pin bytes do not establish native zero-copy behavior or
+the size of retained cache blocks. RocksDB's internal count-level PerfContext
+metrics are reported separately, and native block reads may hit the OS cache.
+The scope owns, resets and disables that thread's PerfContext, including on
+unwind; it cannot restore an unknown previous native perf level. Keep writes,
+environment opening and unrelated reads outside the scope. Ordinary builds
+exclude both the API and its recording hooks. Its focused regressions run with:
+
+```sh
+cargo test --release --locked -p wok-db --features rocksdb-read-diagnostics \
+  --target-dir target/rocksdb-diagnostics --lib read_diagnostics::tests
+```
+
 The query crate also has ignored, deterministic diagnostics for feed planning:
 
 ```sh

@@ -27,6 +27,8 @@ pub mod moderation;
 pub mod op_log;
 pub mod payload;
 pub mod purge;
+#[cfg(feature = "rocksdb-read-diagnostics")]
+pub mod read_diagnostics;
 pub mod reindex;
 #[cfg(feature = "rocksdb-backend")]
 mod rocks;

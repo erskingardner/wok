@@ -39,7 +39,11 @@ pub(crate) fn load_markers(db: &rocksdb::DB) -> Result<MarkerMap, DbError> {
         if let Some(upper) = successor(&prefix) {
             options.set_iterate_upper_bound(upper);
         }
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        crate::read_diagnostics::record(|c| c.iterator_creations += 1);
         let mut it = db.raw_iterator_cf_opt(cf, options);
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        crate::read_diagnostics::record(|c| c.seek += 1);
         it.seek(&prefix);
         let mut values = Vec::new();
         while let Some((physical, value)) = it.item() {
@@ -48,6 +52,8 @@ pub(crate) fn load_markers(db: &rocksdb::DB) -> Result<MarkerMap, DbError> {
                 break;
             }
             values.push(dup);
+            #[cfg(feature = "rocksdb-read-diagnostics")]
+            crate::read_diagnostics::record(|c| c.next += 1);
             it.next();
         }
         it.status().map_err(err)?;
@@ -180,9 +186,16 @@ pub(crate) fn encode(dbi: u32, key: &[u8], dup: Option<&[u8]>) -> Vec<u8> {
             *b = !*b;
         }
     }
+    #[cfg(feature = "rocksdb-read-diagnostics")]
+    crate::read_diagnostics::record(|c| {
+        c.ordered_key_encodes += 1;
+        c.ordered_key_bytes += out.len() as u64;
+    });
     out
 }
 pub(crate) fn decode(dbi: u32, raw: &[u8], value: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DbError> {
+    #[cfg(feature = "rocksdb-read-diagnostics")]
+    crate::read_diagnostics::record(|c| c.logical_decode_calls += 1);
     let bytes: Vec<u8> = raw
         .iter()
         .map(|b| if reversed(dbi) { !*b } else { *b })

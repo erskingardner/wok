@@ -194,6 +194,14 @@ after a snapshot refresh. Later refills, event validation, visibility, latest-ID
 checks, deduplication and limits use the established query path. Completeness
 peeks always use ordinary collection with their existing work and candidate
 budgets, including when beginning an unscanned filter.
+
+If every frontier in the first full batch is present, supported, and newer than
+the requested window, the scan stops issuing frontier lookups and initializes
+all remaining ranges with ordinary seeks. Unprobed authors are still checked;
+none are treated as empty. A mixed first batch retains frontier reads. This
+choice can bypass useful later frontiers, and skipped frontier bytes remain the
+offline audit's responsibility.
+
 An exhausted author's shortcut can skip malformed neighboring-author rows that
 ordinary boundary lookahead would visit. Complete corruption detection remains
 the offline audit's responsibility.

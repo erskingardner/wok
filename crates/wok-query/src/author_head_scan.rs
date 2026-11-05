@@ -7,6 +7,8 @@
 //! lookup survives a yield. Peeks never use this path. The coarser initialization
 //! check may overshoot by one batch (at most 64 logical work plus the next
 //! loop check), not a fixed duration. Native/header costs are separate counters.
+//! When the first full batch is uniformly newer than the requested window,
+//! later ranges keep ordinary seeks: sampling only changes how they are read.
 
 use super::*;
 use wok_db::AuthorHead;
@@ -176,7 +178,24 @@ pub(super) fn initialize<'tx>(
             "author frontier result count mismatch",
         ));
     }
+    // A uniformly historical first batch already had to seek every range.
+    // Avoid more speculative head lookups, without inferring anything about
+    // the remaining authors. Their ordinary seeks still establish each exact
+    // candidate and lookahead. Unsupported/missing/mixed/short batches retain
+    // the reader, and errors must propagate before this policy can change.
+    let historical = start == 0
+        && heads.len() == BATCH_KEYS
+        && heads.iter().all(|head| {
+            head.is_some_and(|head| {
+                head.first.created_at <= PACKED_TIME_MAX
+                    && head.first.created_at >= scan.since
+                    && head.first.created_at > scan.until
+            })
+        });
     initialize_entries(scan, txn, cursor, start, heads)?;
+    if historical {
+        scan.author_head_reads = false;
+    }
     Ok(true)
 }
 

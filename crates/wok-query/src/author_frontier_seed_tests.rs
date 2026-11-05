@@ -147,10 +147,12 @@ fn separate_parser_pairing_schema_and_readonly_closure_preserve_original_entry()
 #[test]
 fn actual_initialization_outcomes_partition_issued_keys_across_process_slices() {
     let fixture = store(dense_events(128, 4, false));
-    for (since, until, seeds, missing, older, newer) in [
-        (0, BASE + 127, 128, 372, 0, 0),
-        (0, 0, 0, 372, 0, 128),
-        (BASE + 128, BASE + 20000, 0, 372, 128, 0),
+    for (since, until, issued, seeds, missing, older, newer) in [
+        (0, BASE + 127, 500, 128, 372, 0, 0),
+        // A historical first batch switches the remaining ranges to ordinary
+        // seeks; classify only the32 keys that were actually requested.
+        (0, 0, 32, 0, 0, 0, 32),
+        (BASE + 128, BASE + 20000, 500, 0, 372, 128, 0),
     ] {
         let mut value = feed(0..500, 50);
         value["since"] = json!(since);
@@ -168,13 +170,13 @@ fn actual_initialization_outcomes_partition_issued_keys_across_process_slices() 
         .unwrap();
         let s = sample.author_frontier_initialization;
         assert!(sample.completed);
-        assert_eq!(s.issued_keys, 500);
+        assert_eq!(s.issued_keys, issued);
         assert_eq!(s.seeded_heads, seeds);
         assert_eq!(s.fallback_missing, missing);
         assert_eq!(s.fallback_below_since, older);
         assert_eq!(s.fallback_above_until, newer);
         assert_eq!(s.fallback_unsupported_timestamp, 0);
-        assert_eq!(s.classified_keys(), 500);
+        assert_eq!(s.classified_keys(), issued);
         assert_eq!(s.header_keys_during_peek, 0);
         assert_eq!(s.issued_keys, sample.measurements.wrapper.author_head_keys);
     }

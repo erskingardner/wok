@@ -1,5 +1,8 @@
 //! Same-layout seek/control and optional frontier-reader comparisons.
 
+#[path = "author_history_tests.rs"]
+mod history_tests;
+
 use super::*;
 use crate::scan::feed_query_diagnostic::*;
 use crate::visibility::ReadRestrictor;
@@ -208,7 +211,10 @@ fn missing_and_out_of_window_heads_fall_back_without_omitting_matches() {
         value["since"] = json!(since);
         value["until"] = json!(until);
         let (control, heads) = equal_pair(&fixture, &group(&value), &QueryOptions::default());
-        assert_eq!(heads.measurements.wrapper.author_head_keys, 2047);
+        assert_eq!(
+            heads.measurements.wrapper.author_head_keys,
+            if until == 0 { BATCH_KEYS as u64 } else { 2047 }
+        );
         // Absent authors are None, not a reason to omit ordinary range reads.
         assert!(heads.measurements.wrapper.seek >= 2047 - 512);
         assert_eq!(heads.chronological_work, control.chronological_work);
@@ -326,6 +332,7 @@ fn fallback_error_still_charges_every_key_of_the_issued_batch() {
     })
     .unwrap();
     assert!(result.is_err());
+    assert!(scan.author_head_reads);
     assert_eq!(scan.approx_work, BATCH_KEYS as u64);
     assert_eq!(scan.next_init_index, 0);
     assert_eq!(measurements.wrapper.author_head_keys, BATCH_KEYS as u64);

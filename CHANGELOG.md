@@ -964,6 +964,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Historical REQ completeness checks collect one candidate at a time when
+  looking past a result limit, avoiding a full delivery-batch refill to find
+  one more visible match. Normal event-delivery batching is unchanged.
 - Publishing an event no longer writes its NIP-50 search postings (#257).
   The relay's writer indexes stored events afterwards, in steps of up to
   10,000 events whenever it is idle, and before a batch once 1,000 events

@@ -63,6 +63,12 @@ retain their stable insertion order. Only ranges being consumed grow their
 refill batches, bounded at 50 entries for multi-range scans; single-range scans
 retain their existing batching. Candidate and processing work remains charged
 to the scan's budget, including across handler stops and scheduler slices.
+Completeness lookahead uses the same ordered scan with collections capped at
+one candidate per range. It continues through hidden or already-sent matches
+within its existing work and visibility-check budgets, without fetching a normal
+delivery batch merely to find one additional visible match.
+The cursor can still visit and cache a further entry to retain its resume
+boundary; the cap bounds collected candidates, not every physical read or copy.
 A read-only duplicate range with a full starting key/value positions
 directly at that inclusive endpoint, using one forward seek for newest-first
 traversal of the reversed indexes. Other operations retain total logical order;

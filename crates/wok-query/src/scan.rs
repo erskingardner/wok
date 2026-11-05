@@ -1125,6 +1125,24 @@ impl DbScan {
         &mut self,
         txn: &RoTxn<'_>,
         filter: &NostrFilter,
+        handle_event: H,
+        do_pause: P,
+    ) -> Result<bool, wok_db::DbError>
+    where
+        H: FnMut(u64) -> bool,
+        P: FnMut(u64) -> bool,
+    {
+        self.scan_with_depth_cap(txn, filter, u64::MAX, handle_event, do_pause)
+    }
+
+    /// A completeness probe only needs the next match, which may already be
+    /// queued. Bound any new collection without changing ordinary batching
+    /// or the resume state shared by both paths.
+    fn scan_with_depth_cap<H, P>(
+        &mut self,
+        txn: &RoTxn<'_>,
+        filter: &NostrFilter,
+        depth_cap: u64,
         mut handle_event: H,
         mut do_pause: P,
     ) -> Result<bool, wok_db::DbError>
@@ -1141,7 +1159,7 @@ impl DbScan {
             Some(txn.cursor(self.index_dbi)?)
         };
         if let Some(si) = self.unsettled.take() {
-            self.settle(cursor.as_mut().expect("active scan cursor"), si)?;
+            self.settle(cursor.as_mut().expect("active scan cursor"), si, depth_cap)?;
         }
         loop {
             self.approx_work += 1;
@@ -1155,7 +1173,7 @@ impl DbScan {
                     idx as u64,
                     self.since,
                     self.until,
-                    self.initial_scan_depth,
+                    self.initial_scan_depth.min(depth_cap),
                     &mut self.collection_buffer,
                 )?;
                 self.event_queue.extend(self.collection_buffer.drain(..));
@@ -1187,26 +1205,32 @@ impl DbScan {
                 self.unsettled = Some(si);
                 return Ok(true);
             }
-            self.settle(cursor.as_mut().expect("active scan cursor"), si)?;
+            self.settle(cursor.as_mut().expect("active scan cursor"), si, depth_cap)?;
         }
     }
 
     /// One of cursor `si`'s candidates was taken. Once the queue holds none
     /// of its candidates, its next entries are read and merged in, so the
     /// queue's head stays the newest entry left in any cursor.
-    fn settle(&mut self, cursor: &mut Cursor<'_>, si: usize) -> Result<(), wok_db::DbError> {
+    fn settle(
+        &mut self,
+        cursor: &mut Cursor<'_>,
+        si: usize,
+        depth_cap: u64,
+    ) -> Result<(), wok_db::DbError> {
         self.cursors[si].outstanding -= 1;
         if self.cursors[si].outstanding == 0 {
+            let depth = self.refill_scan_depths[si].min(depth_cap);
             self.approx_work += self.cursors[si].collect(
                 cursor,
                 si as u64,
                 self.since,
                 self.until,
-                self.refill_scan_depths[si],
+                depth,
                 &mut self.collection_buffer,
             )?;
             self.event_queue.extend(self.collection_buffer.drain(..));
-            if self.cursors.len() > 1 {
+            if self.cursors.len() > 1 && depth == self.refill_scan_depths[si] {
                 self.refill_scan_depths[si] = (2 * self.refill_scan_depths[si]).min(50);
             }
         }
@@ -1215,10 +1239,10 @@ impl DbScan {
 }
 
 /// Most work the NIP-67 peeks of one REQ do, looking past where cut filters
-/// stopped for one more match, in `DbScan::approx_work` units: a refill of
-/// one cursor and about a hundred event reads. The peek that spends the last
-/// of it may overrun it by one cursor refill; later ones do no work. A peek
-/// that runs out has learned nothing, and the REQ's EOSE carries neither
+/// stopped for one more match, in `DbScan::approx_work` units. Peeks collect
+/// one posting at a time, and may overrun by an in-flight candidate check
+/// and one posting refill; later ones do no work. A peek that runs out has
+/// learned nothing, and the REQ's EOSE carries neither
 /// `finish` nor `more`.
 const PEEK_WORK: u64 = 2048;
 /// Most candidates those peeks check the read policy of.
@@ -1452,9 +1476,10 @@ impl DbQuery {
         let mut out_of_candidates = false;
         let mut error = None;
         let candidates = &mut budget.candidates;
-        let complete = scanner.scan(
+        let complete = scanner.scan_with_depth_cap(
             snapshot.txn(),
             filter,
+            1,
             |lev_id| {
                 if lev_id > latest || sent.contains(&lev_id) {
                     return false;
@@ -1974,3 +1999,7 @@ fn visible_event<'t>(
     let packed = PackedEventView::new(raw)?;
     Ok(visibility.allows(snapshot, packed)?.then_some(packed))
 }
+
+#[cfg(test)]
+#[path = "peek_tests.rs"]
+mod peek_tests;

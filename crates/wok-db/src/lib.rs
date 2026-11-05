@@ -83,6 +83,8 @@ pub use payload::{
 };
 pub use purge::{count_superseded_ro, purge_superseded, SupersededHistory};
 pub use reindex::{rebuild_primary_and_event_indices, PackedEventRebuild, ReindexStats};
+#[cfg(feature = "rocksdb-author-heads")]
+pub use rocks::author_heads::{AuthorHead, AuthorPosition};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use search::{
     build_search_index, count_phrase_pairs, event_search_terms, finish_search_index,
@@ -116,7 +118,9 @@ mod crash_tests;
 
 /// Storage format used by this binary. The optional RocksDB build cannot open LMDB files.
 pub fn storage_backend_name() -> &'static str {
-    if cfg!(feature = "rocksdb-coverless") {
+    if cfg!(feature = "rocksdb-author-heads") {
+        "rocksdb-author-heads-experimental"
+    } else if cfg!(feature = "rocksdb-coverless") {
         "rocksdb-coverless-experimental"
     } else if cfg!(feature = "rocksdb-backend") {
         "rocksdb-optimized-experimental"

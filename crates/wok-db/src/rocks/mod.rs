@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 mod audit;
+#[cfg(feature = "rocksdb-author-heads")]
+pub(crate) mod author_heads;
 
 use crate::schema::{dbi_specs, ComparatorKind};
 use crate::DbError;
@@ -66,12 +68,17 @@ pub(crate) fn load_markers(db: &rocksdb::DB) -> Result<MarkerMap, DbError> {
 
 pub(crate) const COMBINED: &str = "wok_events_combined_v1";
 pub(crate) const COVERING: &str = "wok_pubkey_covering_v1";
+#[cfg(feature = "rocksdb-author-heads")]
+pub(crate) const HEAD_CF: &str = "wok_author_frontiers_v1";
 pub(crate) const COVER_DBI: u32 = 23;
 pub(crate) const FORMAT_KEY: &[u8] = b"wok-rocksdb-format";
 #[cfg(not(feature = "rocksdb-coverless"))]
 pub(crate) const FORMAT: &[u8] = b"wok-rocks-v1:combined:dual-author:reverse-order:sync-wal";
-#[cfg(feature = "rocksdb-coverless")]
+#[cfg(all(feature = "rocksdb-coverless", not(feature = "rocksdb-author-heads")))]
 pub(crate) const FORMAT: &[u8] = b"wok-rocks-v2:combined:thin-author:reverse-order:sync-wal";
+#[cfg(feature = "rocksdb-author-heads")]
+pub(crate) const FORMAT: &[u8] =
+    b"wok-rocks-v3:combined:thin-author-frontiers:reverse-order:sync-wal";
 
 /// Exact physical CF set for this binary; logical Event/Payload share COMBINED.
 pub(crate) fn physical_cf_names() -> Vec<&'static str> {
@@ -79,6 +86,8 @@ pub(crate) fn physical_cf_names() -> Vec<&'static str> {
     if !cfg!(feature = "rocksdb-coverless") {
         names.push(COVERING);
     }
+    #[cfg(feature = "rocksdb-author-heads")]
+    names.push(HEAD_CF);
     names.extend(
         dbi_specs()
             .iter()

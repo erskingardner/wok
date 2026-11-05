@@ -28,6 +28,12 @@ use std::rc::Rc;
 /// traffic, live memory, decompressed bytes or native RocksDB allocations.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct WrapperCounters {
+    /// Nonempty author-head native batched MultiGet invocations, not internal seeks.
+    #[cfg(feature = "rocksdb-author-heads")]
+    pub author_head_multiget_calls: u64,
+    /// Requested head keys, including repeated keys, before native execution.
+    #[cfg(feature = "rocksdb-author-heads")]
+    pub author_head_keys: u64,
     pub iterator_creations: u64,
     pub seek: u64,
     pub seek_for_prev: u64,

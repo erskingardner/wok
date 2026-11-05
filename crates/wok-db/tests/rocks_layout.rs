@@ -14,12 +14,36 @@ const COVERING: &str = "wok_pubkey_covering_v1";
 const FORMAT_KEY: &[u8] = b"wok-rocksdb-format";
 const DUAL: &[u8] = b"wok-rocks-v1:combined:dual-author:reverse-order:sync-wal";
 const COVERLESS: &[u8] = b"wok-rocks-v2:combined:thin-author:reverse-order:sync-wal";
+const HEADS: &[u8] = b"wok-rocks-v3:combined:thin-author-frontiers:reverse-order:sync-wal";
 const IS_COVERLESS: bool = cfg!(feature = "rocksdb-coverless");
 
-fn names(coverless: bool) -> Vec<&'static str> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Layout {
+    Dual,
+    Coverless,
+    Heads,
+}
+const CURRENT: Layout = if cfg!(feature = "rocksdb-author-heads") {
+    Layout::Heads
+} else if IS_COVERLESS {
+    Layout::Coverless
+} else {
+    Layout::Dual
+};
+fn marker(layout: Layout) -> &'static [u8] {
+    match layout {
+        Layout::Dual => DUAL,
+        Layout::Coverless => COVERLESS,
+        Layout::Heads => HEADS,
+    }
+}
+fn names(layout: Layout) -> Vec<&'static str> {
     let mut names = vec!["default", COMBINED];
-    if !coverless {
+    if layout == Layout::Dual {
         names.push(COVERING);
+    }
+    if layout == Layout::Heads {
+        names.push("wok_author_frontiers_v1");
     }
     names.extend(
         wok_db::dbi_specs()
@@ -72,11 +96,11 @@ fn layout_has_exact_cfs_marker_and_author_accessor() {
     assert_eq!(env.db_version().unwrap(), wok_event::WOK_DB_VERSION);
     assert_eq!(
         env.inner.db.get(FORMAT_KEY).unwrap().unwrap(),
-        if IS_COVERLESS { COVERLESS } else { DUAL }
+        marker(CURRENT)
     );
     let mut actual = DB::list_cf(&Options::default(), dir.path()).unwrap();
     actual.sort_unstable();
-    let mut expected = names(IS_COVERLESS);
+    let mut expected = names(CURRENT);
     expected.sort_unstable();
     assert_eq!(actual, expected);
     assert_eq!(env.inner.db.cf_handle(COVERING).is_none(), IS_COVERLESS);
@@ -109,36 +133,51 @@ fn layout_has_exact_cfs_marker_and_author_accessor() {
 #[test]
 fn incompatible_layouts_are_refused_before_any_database_file_changes() {
     let dir = tempfile::tempdir().unwrap();
-    let marker = if IS_COVERLESS { COVERLESS } else { DUAL };
-    let other_marker = if IS_COVERLESS { DUAL } else { COVERLESS };
-    let mut extra = names(IS_COVERLESS);
+    let mut extra = names(CURRENT);
     extra.push("unrecognized-layout-cf");
-    let mut missing = names(IS_COVERLESS);
+    let mut missing = names(CURRENT);
     missing.retain(|name| *name != wok_db::schema::DBI_EVENT_TAG);
-    for (case, cfs, format, expected_error) in [
+    let mut cases = vec![
+        ("absent".to_string(), names(CURRENT), None, "layout marker"),
         (
-            "other",
-            names(!IS_COVERLESS),
-            Some(other_marker),
+            "extra".to_string(),
+            extra,
+            Some(marker(CURRENT)),
             "column family set",
         ),
         (
-            "marker",
-            names(IS_COVERLESS),
-            Some(other_marker),
-            "layout marker",
-        ),
-        ("absent", names(IS_COVERLESS), None, "layout marker"),
-        ("extra", extra, Some(marker), "column family set"),
-        ("missing", missing, Some(marker), "column family set"),
-        (
-            "mixed",
-            names(!IS_COVERLESS),
-            Some(marker),
+            "missing".to_string(),
+            missing,
+            Some(marker(CURRENT)),
             "column family set",
         ),
-    ] {
-        let path = dir.path().join(case);
+    ];
+    for other in [Layout::Dual, Layout::Coverless, Layout::Heads] {
+        if other != CURRENT {
+            cases.extend([
+                (
+                    format!("other-{other:?}"),
+                    names(other),
+                    Some(marker(other)),
+                    "column family set",
+                ),
+                (
+                    format!("marker-{other:?}"),
+                    names(CURRENT),
+                    Some(marker(other)),
+                    "layout marker",
+                ),
+                (
+                    format!("mixed-{other:?}"),
+                    names(other),
+                    Some(marker(CURRENT)),
+                    "column family set",
+                ),
+            ]);
+        }
+    }
+    for (case, cfs, format, expected_error) in cases {
+        let path = dir.path().join(&case);
         raw_fixture(&path, &cfs, format);
         let before = inventory(&path);
         for read_only in [false, true] {

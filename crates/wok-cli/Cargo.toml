@@ -15,6 +15,8 @@ path = "src/main.rs"
 rocksdb-backend = ["wok-db/rocksdb-backend"]
 rocksdb-thin-author-reads = ["rocksdb-backend", "wok-query/rocksdb-thin-author-reads"]
 rocksdb-coverless = ["rocksdb-thin-author-reads", "wok-query/rocksdb-coverless", "wok-relay/rocksdb-coverless"]
+rocksdb-author-heads = ["rocksdb-coverless", "wok-query/rocksdb-author-heads", "wok-relay/rocksdb-author-heads"]
+rocksdb-author-head-reads = ["rocksdb-author-heads", "wok-query/rocksdb-author-head-reads", "wok-relay/rocksdb-author-head-reads"]
 
 [dependencies]
 anyhow.workspace = true

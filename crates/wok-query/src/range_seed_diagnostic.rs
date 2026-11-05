@@ -224,10 +224,16 @@ fn read_arm(env: &Env, input: &Input, arm: Arm) -> Result<Sample, String> {
         let start = Instant::now();
         // Both paths execute the same untouched planner and unbounded probes.
         // Only selected initial execution endpoints differ; no public override.
-        let scan = match arm {
+        #[allow(unused_mut)]
+        let mut scan = match arm {
             Arm::LegacyMax => DbScan::new_planned(filter, &tx),
             Arm::DirectUntil => DbScan::new(filter, &tx),
         };
+        #[cfg(feature = "rocksdb-author-head-reads")]
+        {
+            // Preserve the original endpoint-only comparison in this harness.
+            scan.author_head_reads = false;
+        }
         let expected_plan = match input.shape.as_str() {
             "author" | "feed500" => "Pubkey",
             "tag" => "Tag",

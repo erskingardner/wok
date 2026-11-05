@@ -53,6 +53,24 @@ impl Env {
             if !thin.is_empty() {
                 return Err(err("thin author posting contains payload"));
             }
+            #[cfg(feature = "rocksdb-author-heads")]
+            {
+                let raw = snapshot
+                    .get_cf(cf(HEAD_CF)?, event.pubkey())
+                    .map_err(err)?
+                    .ok_or_else(|| err("missing author head"))?;
+                let head = crate::AuthorHead::decode(&raw)?;
+                let position = crate::AuthorPosition {
+                    created_at: event.created_at(),
+                    local_id: id,
+                };
+                if head.first < position {
+                    return Err(err("author head is older than a primary posting"));
+                }
+                if position != head.first && head.next.is_none_or(|next| next < position) {
+                    return Err(err("author next position is older than a primary posting"));
+                }
+            }
             #[cfg(not(feature = "rocksdb-coverless"))]
             {
                 let cover = snapshot
@@ -128,14 +146,72 @@ impl Env {
                 "author indexes do not contain exactly one posting per primary",
             ));
         }
+        #[cfg(feature = "rocksdb-author-heads")]
+        let (head_count, head_positions) = {
+            // Each primary is dominated by first, and every non-first primary
+            // by next (above). Both stored positions must reference a primary
+            // of that author. With the thin-index bijection this proves exact
+            // top-two frontiers without a database-sized author map.
+            let mut heads = snapshot.raw_iterator_cf(cf(HEAD_CF)?);
+            heads.seek_to_first();
+            let mut found = 0u64;
+            let mut positions = 0u64;
+            while let Some((author, value)) = heads.item() {
+                if author.len() != 32 {
+                    return Err(err("author head key is not 32 bytes"));
+                }
+                let head = crate::AuthorHead::decode(value)?;
+                for position in std::iter::once(head.first).chain(head.next) {
+                    let local_id = position.local_id.to_ne_bytes();
+                    let primary = snapshot
+                        .get_cf(cf(COMBINED)?, encode(3, &local_id, None))
+                        .map_err(err)?
+                        .ok_or_else(|| err("author head points to a missing primary"))?;
+                    let packed = parts(&primary)?
+                        .0
+                        .ok_or_else(|| err("author head has no packed primary"))?;
+                    let event = wok_event::PackedEventView::new(packed)?;
+                    if event.pubkey() != author || event.created_at() != position.created_at {
+                        return Err(err(
+                            "author head differs from its primary author or timestamp",
+                        ));
+                    }
+                    let posting = encode(
+                        10,
+                        &crate::keys::make_key_string_u64(author, position.created_at),
+                        Some(&local_id),
+                    );
+                    if snapshot
+                        .get_cf(cf(cf_name(10))?, posting)
+                        .map_err(err)?
+                        .as_deref()
+                        != Some(&[])
+                    {
+                        return Err(err("author head has no canonical thin posting"));
+                    }
+                    positions += 1;
+                }
+                found += 1;
+                heads.next();
+            }
+            heads.status().map_err(err)?;
+            (found, positions)
+        };
         self.check_background_errors()?;
         let hash = digest
             .finalize()
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        Ok(
-            serde_json::json!({"ok":true,"events":count,"verified_signatures_and_bodies":count,"thin_author_records_verified":count,"covering_records_verified":if cfg!(feature="rocksdb-coverless"){0}else{count},"primary_fingerprint_sha256":hash,"table_counts":counts,"physical_column_families":physical_cf_names(),"layout":String::from_utf8_lossy(FORMAT),"durability":"one atomic cross-CF WriteBatch with sync WAL before ACK; no power-loss proof implied"}),
-        )
+        let report = serde_json::json!({"ok":true,"events":count,"verified_signatures_and_bodies":count,"thin_author_records_verified":count,"covering_records_verified":if cfg!(feature="rocksdb-coverless"){0}else{count},"primary_fingerprint_sha256":hash,"table_counts":counts,"physical_column_families":physical_cf_names(),"layout":String::from_utf8_lossy(FORMAT),"durability":"one atomic cross-CF WriteBatch with sync WAL before ACK; no power-loss proof implied"});
+        #[cfg(feature = "rocksdb-author-heads")]
+        let report = {
+            let mut report = report;
+            report["author_head_records_verified"] = serde_json::json!(head_count);
+            report["author_frontier_positions_verified"] = serde_json::json!(head_positions);
+            report["derived_cf_counts"] = serde_json::json!({(HEAD_CF):head_count});
+            report
+        };
+        Ok(report)
     }
 }

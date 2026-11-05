@@ -8,7 +8,7 @@ use bumpalo::Bump;
 use elsa::FrozenMap;
 use lmdb_sys::*;
 use std::cell::OnceCell;
-#[cfg(not(feature = "rocksdb-coverless"))]
+#[cfg(any(not(feature = "rocksdb-coverless"), feature = "rocksdb-author-heads"))]
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
@@ -116,14 +116,22 @@ struct View<'env> {
     records: Box<dyn RecordCache + 'env>,
     // ReadOptions stores the native snapshot handle, whose address is stable
     // when View moves. Declaration order drops pins/options before snapshot.
-    // Initialize only on a primary cache miss, including after covering reads.
-    primary_options: OnceCell<rocksdb::ReadOptions>,
+    // Initialize on an uncached primary read or a nonempty frontier batch;
+    // covering-cache hits and transaction construction need no native options.
+    point_read_options: OnceCell<rocksdb::ReadOptions>,
     snapshot: rocksdb::Snapshot<'env>,
     markers: Arc<MarkerMap>,
     arena: Bump,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 impl<'env> View<'env> {
+    fn read_options(&self) -> &rocksdb::ReadOptions {
+        self.point_read_options.get_or_init(|| {
+            let mut options = rocksdb::ReadOptions::default();
+            options.set_snapshot(&self.snapshot);
+            options
+        })
+    }
     fn new(env: &'env Env) -> Result<Self, DbError> {
         loop {
             let (sequence, markers) = env
@@ -148,7 +156,7 @@ impl<'env> View<'env> {
                             .expect("validated combined column family"),
                         records: FrozenMap::new(),
                     }),
-                    primary_options: OnceCell::new(),
+                    point_read_options: OnceCell::new(),
                     snapshot,
                     markers,
                     arena: Bump::new(),
@@ -231,11 +239,7 @@ impl<'env> View<'env> {
             if let Some(raw) = self.records.cached(id) {
                 raw
             } else {
-                let options = self.primary_options.get_or_init(|| {
-                    let mut options = rocksdb::ReadOptions::default();
-                    options.set_snapshot(&self.snapshot);
-                    options
-                });
+                let options = self.read_options();
                 match self.records.get(id, options)? {
                     Some(raw) => raw,
                     None => return Ok(None),
@@ -288,6 +292,8 @@ pub struct RwTxn<'env> {
     touched_records: HashSet<u64>,
     #[cfg(not(feature = "rocksdb-coverless"))]
     touched_postings: HashSet<Vec<u8>>,
+    #[cfg(feature = "rocksdb-author-heads")]
+    touched_authors: HashSet<[u8; 32]>,
     _writer: MutexGuard<'env, ()>,
     pub(crate) event_sequence: Option<u64>,
     pub(crate) superseded_events: Option<u64>,
@@ -297,6 +303,40 @@ pub struct RwTxn<'env> {
     op_log: Vec<u8>,
 }
 impl<'env> RoTxn<'env> {
+    /// Read tiny derived author heads in this transaction's snapshot. Results
+    /// preserve input order and duplicates; no primary records enter the cache.
+    /// A missing head is not proof that the author has no matching history.
+    #[cfg(feature = "rocksdb-author-heads")]
+    pub fn author_heads<'a>(
+        &self,
+        authors: impl IntoIterator<Item = &'a [u8; 32]>,
+    ) -> Result<Vec<Option<crate::AuthorHead>>, DbError> {
+        let authors: Vec<_> = authors.into_iter().collect();
+        if authors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let db = &self.view.env.inner.db;
+        let cf = db.cf_handle(HEAD_CF).expect("validated author head CF");
+        let sorted_input = authors.windows(2).all(|pair| pair[0] <= pair[1]);
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        crate::read_diagnostics::record(|c| {
+            c.author_head_multiget_calls += 1;
+            c.author_head_keys += authors.len() as u64;
+        });
+        db.batched_multi_get_cf_opt(
+            cf,
+            authors.iter().copied(),
+            sorted_input,
+            self.view.read_options(),
+        )
+        .into_iter()
+        .map(|row| {
+            row.map_err(err)?
+                .map(|raw| crate::AuthorHead::decode(&raw))
+                .transpose()
+        })
+        .collect()
+    }
     pub fn begin(env: &'env Env) -> Result<Self, DbError> {
         Ok(Self {
             view: View::new(env)?,
@@ -382,6 +422,8 @@ impl<'env> RwTxn<'env> {
             touched_records: HashSet::new(),
             #[cfg(not(feature = "rocksdb-coverless"))]
             touched_postings: HashSet::new(),
+            #[cfg(feature = "rocksdb-author-heads")]
+            touched_authors: HashSet::new(),
             _writer: guard,
             event_sequence: None,
             superseded_events: None,
@@ -510,6 +552,10 @@ impl<'env> RwTxn<'env> {
             #[cfg(feature = "rocksdb-coverless")]
             let _ = u64::from_ne_bytes(key.try_into().map_err(|_| err("invalid local ID"))?);
         } else {
+            #[cfg(feature = "rocksdb-author-heads")]
+            if dbi == 10 && key.len() == 40 {
+                self.touched_authors.insert(key[..32].try_into().unwrap());
+            }
             #[cfg(not(feature = "rocksdb-coverless"))]
             if dbi == 10 {
                 self.touched_postings.insert(pk.clone());
@@ -591,6 +637,10 @@ impl<'env> RwTxn<'env> {
         } else {
             if self.view.raw(dbi, &pk, Some(&self.staged))?.is_none() {
                 return Ok(false);
+            }
+            #[cfg(feature = "rocksdb-author-heads")]
+            if dbi == 10 && key.len() == 40 {
+                self.touched_authors.insert(key[..32].try_into().unwrap());
             }
             #[cfg(not(feature = "rocksdb-coverless"))]
             if dbi == 10 {
@@ -677,6 +727,62 @@ impl<'env> RwTxn<'env> {
         }
         Ok(())
     }
+    #[cfg(feature = "rocksdb-author-heads")]
+    fn head_updates(&self) -> Result<Vec<author_heads::HeadUpdate>, DbError> {
+        let cf = self
+            .view
+            .env
+            .inner
+            .db
+            .cf_handle(HEAD_CF)
+            .expect("validated author head CF");
+        let mut updates = Vec::new();
+        for author in &self.touched_authors {
+            let start = crate::keys::make_key_string_u64(author, u64::MAX);
+            let (mut first, mut next) = (None, None);
+            let mut malformed = false;
+            // The ordinary writer cursor merges every staged insertion and
+            // deletion. Derive once from the final overlay, not the old head.
+            self.cursor(10)?.foreach_index(&start, u64::MAX, |entry| {
+                if !entry.prefix_matches(author, true) {
+                    return false;
+                }
+                let local_id = match entry.local_id() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        // A saved endpoint must not jump past a duplicate the
+                        // ordinary reader would reject. Preserve raw APIs and
+                        // remove the shortcut until that damage is repaired.
+                        malformed = true;
+                        return false;
+                    }
+                };
+                if let Some(created_at) = entry.created_at {
+                    let position = crate::AuthorPosition {
+                        created_at,
+                        local_id,
+                    };
+                    if first.is_none() {
+                        first = Some(position);
+                    } else {
+                        next = Some(position);
+                        return false;
+                    }
+                }
+                true
+            })?;
+            let head = if malformed {
+                None
+            } else {
+                first.map(|first| crate::AuthorHead { first, next }.encode())
+            };
+            let current = self.view.snapshot.get_cf(cf, author).map_err(err)?;
+            if current.as_deref() != head.as_deref() {
+                updates.push((*author, head));
+            }
+        }
+        Ok(updates)
+    }
     pub fn commit(mut self) -> Result<(), DbError> {
         #[cfg(test)]
         crate::crash_tests::checkpoint("write-before-flush");
@@ -688,6 +794,22 @@ impl<'env> RwTxn<'env> {
             match value {
                 Some(v) => batch.put_cf(self.view.cf(*dbi), key, v),
                 None => batch.delete_cf(self.view.cf(*dbi), key),
+            }
+        }
+        #[cfg(feature = "rocksdb-author-heads")]
+        {
+            let cf = self
+                .view
+                .env
+                .inner
+                .db
+                .cf_handle(HEAD_CF)
+                .expect("validated author head CF");
+            for (author, head) in self.head_updates()? {
+                match head {
+                    Some(value) => batch.put_cf(cf, author, value),
+                    None => batch.delete_cf(cf, author),
+                }
             }
         }
         for (&dbi, &n) in &self.counts {

@@ -38,6 +38,8 @@ const MAX_SLICES: usize = 64;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Arm {
     Pubkey,
+    #[cfg(feature = "rocksdb-author-head-reads")]
+    AuthorHeads,
     CreatedAtMembership,
     BoundedGlobalPeek,
     BoundedAuthorPeek,
@@ -47,6 +49,8 @@ impl Arm {
     fn name(self) -> &'static str {
         match self {
             Self::Pubkey => "pubkey_control",
+            #[cfg(feature = "rocksdb-author-head-reads")]
+            Self::AuthorHeads => "author_frontier_reader",
             Self::CreatedAtMembership => "created_at_membership",
             Self::BoundedGlobalPeek => "bounded_global_peek",
             Self::BoundedAuthorPeek => "bounded_author_peek",
@@ -55,7 +59,19 @@ impl Arm {
 
     fn scan(self, filter: &NostrFilter, txn: &RoTxn<'_>) -> DbScan {
         match self {
-            Self::Pubkey => DbScan::new(filter, txn),
+            Self::Pubkey => {
+                #[allow(unused_mut)]
+                let mut scan = DbScan::new(filter, txn);
+                #[cfg(feature = "rocksdb-author-head-reads")]
+                {
+                    // Keep the existing diagnostic's control causal when a
+                    // separate frontier experiment is built into this binary.
+                    scan.author_head_reads = false;
+                }
+                scan
+            }
+            #[cfg(feature = "rocksdb-author-head-reads")]
+            Self::AuthorHeads => DbScan::new(filter, txn),
             Self::BoundedGlobalPeek => super::bounded_feed_diagnostic::configure(
                 filter,
                 txn,
@@ -169,8 +185,9 @@ pub(super) fn read_arm(
     if group.filters.is_empty() || group.filters.iter().any(|f| f.search.is_some()) {
         return Err("diagnostic requires chronological filters".into());
     }
-    // All real inputs have one filter. Multi-filter fixture tests force only
-    // the first scanner; subsequent filters/peeks use the unchanged planner.
+    // All real inputs have one filter. The private frontier control below also
+    // applies to later chronological scanners/peeks in a multi-filter fixture;
+    // the original forced CreatedAt/bounded path still seeds only filter zero.
     let tx = env.begin_ro().map_err(|_| "cannot begin read snapshot")?;
     let mut query = DbQuery::new(
         subscription(group.clone(), options.latest),
@@ -179,6 +196,10 @@ pub(super) fn read_arm(
     );
     query.track_completeness();
     query.set_visibility(options.visibility.clone());
+    #[cfg(feature = "rocksdb-author-head-reads")]
+    {
+        query.diagnostic_author_head_reads = Some(matches!(arm, Arm::AuthorHeads));
+    }
     let mut ids = Vec::new();
     let mut body_hash = Sha256::new();
     let mut body_bytes = 0u64;

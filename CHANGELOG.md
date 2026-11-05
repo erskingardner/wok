@@ -449,6 +449,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add separate opt-in RocksDB author-frontier layout and read features. The
+  layout keeps each author's newest two positions in a derived column family;
+  the reader initializes wide pure-author scans with snapshot-bound native
+  batches of at most 32 keys. Ordinary range refills and bounded completeness
+  checks retain their existing path. The format requires a separate database,
+  with no converter or default change.
 - Add an opt-in `rocksdb-coverless` physical layout for isolated experiments.
   It keeps the combined primary bytes and thin author reads, omits the full
   covering author index and its maintenance, and uses a distinct marker and

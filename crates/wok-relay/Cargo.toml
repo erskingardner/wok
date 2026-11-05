@@ -8,6 +8,8 @@ description = "Transport-neutral Nostr relay core"
 
 [features]
 rocksdb-coverless = ["wok-db/rocksdb-coverless", "wok-query/rocksdb-coverless"]
+rocksdb-author-heads = ["rocksdb-coverless", "wok-db/rocksdb-author-heads", "wok-query/rocksdb-author-heads"]
+rocksdb-author-head-reads = ["rocksdb-author-heads", "wok-query/rocksdb-author-head-reads"]
 
 [dependencies]
 bytes.workspace = true

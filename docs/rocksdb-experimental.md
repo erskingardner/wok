@@ -150,6 +150,62 @@ database and temporary files. Keep original seeds unchanged; shared-file copies
 or deletion of an old covering column family are not the experiment described
 here.
 
+The separate `rocksdb-author-heads` feature extends the coverless layout with
+the derived `wok_author_frontiers_v1` column family. Each exact 32-byte author
+key stores its newest position and, if present, its second newest position.
+Each position uses two big-endian `u64` values, timestamp and local ID; values
+are exactly 16 or 32 bytes, with the second position strictly older. The writer
+derives changed frontiers from the final transaction overlay and commits them
+with their postings in the same synchronous WAL batch. Unchanged frontier
+values are not rewritten. The format marker is
+`wok-rocks-v3:combined:thin-author-frontiers:reverse-order:sync-wal`. All three
+layouts require their own exact column family set and marker before a writable
+open; there is no converter.
+
+That layout feature retains the established range-seek reader as a control.
+The additional `rocksdb-author-head-reads` feature enables native batched point
+reads for the depth-one initialization of wide, pure-author scans:
+
+```sh
+# Same frontier layout and writer, retaining ordinary initial range seeks.
+cargo build --release --locked -p wok-cli --features rocksdb-author-heads \
+  --target-dir target/rocksdb-author-heads-control
+# Same layout, initializing eligible feeds from author frontiers.
+cargo build --release --locked -p wok-cli --features rocksdb-author-head-reads \
+  --target-dir target/rocksdb-author-heads-reader
+```
+
+Both features are off by default and forward through the DB, query, relay and
+CLI crates. Use fresh, separate database directories for this format. The typed
+read API accepts borrowed author keys and binds each native MultiGet to the
+transaction's snapshot. It preserves input order and duplicates, validates
+frontier bytes, and returns small owned positions without populating the primary
+record cache. Single-author scans, other selected plans, missing frontiers and
+frontiers outside the usable query window use ordinary index collection.
+
+An eligible historical scan initializes at most 32 authors per native call. It
+immediately consumes and charges every member before checking its pause budget
+again, so initialization may overrun by one batch; this is not a wall-clock
+bound or identical per-key scheduler state. The existing merge receives each
+first candidate and resumes at the stored second position. Keeping that exact
+lookahead position preserves which newly backdated records can be encountered
+after a snapshot refresh. Later refills, event validation, visibility, latest-ID
+checks, deduplication and limits use the established query path. Completeness
+peeks always use ordinary collection with their existing work and candidate
+budgets, including when beginning an unscanned filter.
+An exhausted author's shortcut can skip malformed neighboring-author rows that
+ordinary boundary lookahead would visit. Complete corruption detection remains
+the offline audit's responsibility.
+
+The physical audit verifies that both stored positions refer to authoritative
+primaries and thin postings of the same author and timestamp. Together with
+per-primary ordering checks and the thin-index bijection, this proves that each
+frontier contains exactly the newest one or two positions with bounded working
+memory. Derived frontier counts are separate from logical table counts. The
+new metadata adds writer work and storage; same-format reader comparisons do
+not measure the effect of removing the covering index or establish a write,
+space or latency improvement.
+
 Primary point reads use stack-encoded local-ID keys and cache native pinned
 combined bytes, sharing the same snapshot and cache as owned covering records.
 The exact PackedEvent/payload bytes and independent missing/empty components are

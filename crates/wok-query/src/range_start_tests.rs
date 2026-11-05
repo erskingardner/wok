@@ -20,6 +20,11 @@ enum Start {
 impl Start {
     fn scan(self, txn: &RoTxn<'_>, filter: &NostrFilter) -> DbScan {
         let mut scan = DbScan::new(filter, txn);
+        #[cfg(feature = "rocksdb-author-head-reads")]
+        {
+            // This independent diagnostic compares execution endpoints only.
+            scan.author_head_reads = false;
+        }
         if matches!(self, Self::LegacyMax) {
             // Restore only fresh execution endpoints, after the ordinary
             // planner has made its unbounded author/tag probes.

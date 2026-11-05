@@ -41,10 +41,10 @@ struct Config {
     passes: u32,
 }
 
-struct Input {
-    shape: String,
-    filter_sha256: String,
-    group: NostrFilterGroup,
+pub(super) struct Input {
+    pub(super) shape: String,
+    pub(super) filter_sha256: String,
+    pub(super) group: NostrFilterGroup,
 }
 
 #[derive(Clone, Copy)]
@@ -88,11 +88,11 @@ struct Sample {
     diagnostic_closure_elapsed_us: u64,
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(super) fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn framed(hash: &mut Sha256, id: u64, bytes: &[u8]) {
+pub(super) fn framed(hash: &mut Sha256, id: u64, bytes: &[u8]) {
     hash.update(id.to_be_bytes());
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);
@@ -122,7 +122,7 @@ fn config_from_env() -> Result<Config, String> {
     })
 }
 
-fn read_inputs(path: &Path) -> Result<(Vec<Input>, String), String> {
+pub(super) fn read_inputs(path: &Path) -> Result<(Vec<Input>, String), String> {
     let file = std::fs::File::open(path).map_err(|_| "cannot open explicit filters file")?;
     let mut bytes = Vec::new();
     file.take(MAX_INPUT_BYTES as u64)

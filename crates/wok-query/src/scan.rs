@@ -2063,3 +2063,7 @@ mod range_start_tests;
 #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
 #[path = "range_seed_diagnostic.rs"]
 mod range_seed_diagnostic;
+
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+#[path = "feed_query_diagnostic.rs"]
+mod feed_query_diagnostic;

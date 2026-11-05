@@ -73,6 +73,11 @@ A read-only duplicate range with a full starting key/value positions
 directly at that inclusive endpoint, using one forward seek for newest-first
 traversal of the reversed indexes. Other operations retain total logical order;
 no prefix-only iterator mode or implicit range truncation is enabled.
+The selected scan starts at the filter's inclusive `until` timestamp, including
+every duplicate at that time. Bounded planning probes retain their unbounded
+history before that endpoint is selected. Queries validate the postings they
+visit; corruption strictly above the requested cutoff may be skipped, while
+the offline physical audit still checks the complete database.
 
 The two reserved tag/kind progress keys have a small in-memory mirror loaded
 with bounded forward scans at open. Each transaction pairs an immutable mirror
@@ -199,3 +204,27 @@ The author-index diagnostic forces thin and covering reads in the same binary,
 including normal visibility, completeness and payload decoding. Its single-author
 fixture has contiguous local IDs and a warm shared native cache, so it does not
 represent the primary-record locality of an interleaved multi-author corpus.
+
+The range-initialization diagnostic uses interleaved authors and forces the
+legacy newest-first endpoint and the selected `until` endpoint in one binary.
+It checks ordered results and logical work while retaining the separate native
+operation and named-copy counts:
+
+```sh
+cargo test --release --locked -p wok-query --features rocksdb-read-diagnostics \
+  --target-dir target/rocksdb-diagnostics --lib range_initialization_native_operations \
+  -- --ignored --nocapture
+```
+
+The ignored `range_seed_diagnostic::diagnose_existing_seed_ranges` test can run
+the same comparison on an existing database. Set `WOK_RANGE_DIAGNOSTIC_DB` to a
+verified disposable copy, `WOK_RANGE_DIAGNOSTIC_FILTERS` to an explicit JSON
+array of `{"shape":"author|feed500|tag|id","filter":{...}}` records, and
+`WOK_RANGE_DIAGNOSTIC_PASSES` to one through four. Each filter needs an explicit
+`until`, limit 50 and the selector matching its shape. It opens the copy through
+the read-only API, alternates the arms with fresh transactions, and retains
+per-pass result/body digests, completeness, chronological work and counters.
+The input file and filters have their own identities; representative static
+filters must not be described as the matched network pool. Keep pristine seeds
+closed, preserve copy provenance, and run this diagnostic separately from clean
+network timings.

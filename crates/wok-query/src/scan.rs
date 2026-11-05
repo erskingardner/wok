@@ -889,6 +889,23 @@ impl DbScan {
     }
 
     pub fn new(f: &NostrFilter, txn: &RoTxn<'_>) -> Self {
+        let mut scan = Self::new_planned(f, txn);
+        if f.until != u64::MAX {
+            // Planning probes retain their unbounded history. Only the chosen
+            // scan starts at the inclusive upper timestamp, avoiding a MAX
+            // seek and owned reposition key for each range with newer rows.
+            // Rows above until are outside this query, including any damage
+            // there; offline integrity checks still audit the full index.
+            // collect keeps validating every boundary the bounded seek returns.
+            for cursor in &mut scan.cursors {
+                let time_at = cursor.resume_key.len() - 8;
+                cursor.resume_key[time_at..].copy_from_slice(&f.until.to_ne_bytes());
+            }
+        }
+        scan
+    }
+
+    fn new_planned(f: &NostrFilter, txn: &RoTxn<'_>) -> Self {
         let default = Self::new_unplanned(f, txn);
         // A tiny author history can otherwise lose to a ubiquitous tag. Bound
         // this probe to 64 postings and eight seeks per alternative; avoid a
@@ -1289,6 +1306,11 @@ pub struct DbQuery {
     sent_events_full: HashSet<u64>,
     sent_events_curr: HashSet<u64>,
     last_work_checked: u64,
+    /// Test diagnostics only: actual chronological scan/peek work, including
+    /// paused slices and the final peek before a scanner is dropped. Search
+    /// work and planning probes use different units and are not included.
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_chronological_work: u64,
     max_total_events: u64,
     hll: Option<HyperLogLog>,
     count_dedup_budget: u64,
@@ -1352,6 +1374,8 @@ impl DbQuery {
             sent_events_full: HashSet::new(),
             sent_events_curr: HashSet::new(),
             last_work_checked: 0,
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_chronological_work: 0,
             // COUNT needs the exact deduplicated count up to its separate
             // max_filter_limit_count. The request-wide delivery ceiling is
             // for EVENT responses.
@@ -1525,8 +1549,9 @@ impl DbQuery {
             if f.limit == 0 || f.search.is_some() {
                 return Ok(Peek::Unknown);
             }
+            let mut scanner = DbScan::new(f, snapshot.txn());
             let peek = Self::peek(
-                &mut DbScan::new(f, snapshot.txn()),
+                &mut scanner,
                 snapshot,
                 f,
                 latest,
@@ -1534,7 +1559,13 @@ impl DbQuery {
                 &self.visibility,
                 &mut self.restricted,
                 &mut self.peek_budget,
-            )?;
+            );
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            {
+                self.diagnostic_chronological_work += scanner.approx_work;
+            }
+            drop(scanner);
+            let peek = peek?;
             if !matches!(peek, Peek::Exhausted) {
                 return Ok(peek);
             }
@@ -1742,14 +1773,21 @@ impl DbQuery {
             };
             let complete = match &mut scanner {
                 QueryScanner::Chronological(scanner) => {
-                    scanner.scan(txn, &f, &mut handle, |approx_work| {
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    let work_before = scanner.approx_work;
+                    let result = scanner.scan(txn, &f, &mut handle, |approx_work| {
                         if approx_work > last_work + 2000 {
                             last_work = approx_work;
                             elapsed_us() >= time_budget_us
                         } else {
                             false
                         }
-                    })?
+                    });
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    {
+                        self.diagnostic_chronological_work += scanner.approx_work - work_before;
+                    }
+                    result?
                 }
                 QueryScanner::Search(scanner) => scanner.scan(
                     &snapshot,
@@ -1770,16 +1808,25 @@ impl DbQuery {
             let peek = match &mut scanner {
                 _ if !self.completeness || !complete || dedup_budget_hit => None,
                 _ if f.limit == 0 => Some(Peek::Unknown),
-                QueryScanner::Chronological(scanner) if cut => Some(Self::peek(
-                    scanner,
-                    &snapshot,
-                    &f,
-                    latest,
-                    &sent_full,
-                    &self.visibility,
-                    &mut restricted,
-                    &mut self.peek_budget,
-                )?),
+                QueryScanner::Chronological(scanner) if cut => {
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    let work_before = scanner.approx_work;
+                    let result = Self::peek(
+                        scanner,
+                        &snapshot,
+                        &f,
+                        latest,
+                        &sent_full,
+                        &self.visibility,
+                        &mut restricted,
+                        &mut self.peek_budget,
+                    );
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    {
+                        self.diagnostic_chronological_work += scanner.approx_work - work_before;
+                    }
+                    Some(result?)
+                }
                 QueryScanner::Chronological(_) => Some(Peek::Exhausted),
                 QueryScanner::Search(scanner) => Some(scanner.remaining(&sent_full)),
             };
@@ -2008,3 +2055,11 @@ mod peek_tests;
 #[cfg(test)]
 #[path = "author_index_tests.rs"]
 mod author_index_tests;
+
+#[cfg(test)]
+#[path = "range_start_tests.rs"]
+mod range_start_tests;
+
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+#[path = "range_seed_diagnostic.rs"]
+mod range_seed_diagnostic;

@@ -964,6 +964,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Historical scans start at the query's inclusive `until` timestamp after
+  selecting their index plan, avoiding an extra seek through newer entries.
+  Planning probes, result ordering and resume boundaries retain their behavior.
 - Historical REQ completeness checks collect one candidate at a time when
   looking past a result limit, avoiding a full delivery-batch refill to find
   one more visible match. Normal event-delivery batching is unchanged.

@@ -9,6 +9,8 @@ description = "Nostr filters, index selection, and resumable scans"
 [features]
 # Build-only author read-plan experiment; both RocksDB indexes remain written.
 rocksdb-thin-author-reads = ["wok-db/rocksdb-backend"]
+# Build-only operation counters for focused native read diagnostics.
+rocksdb-read-diagnostics = ["wok-db/rocksdb-read-diagnostics"]
 
 [dependencies]
 serde_json.workspace = true
@@ -19,6 +21,7 @@ lmdb-sys.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 hex.workspace = true

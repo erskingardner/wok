@@ -3,7 +3,7 @@
 use crate::fbs::{decode_meta, encode_meta, encode_negentropy_filter, Meta};
 use crate::rocks::*;
 use crate::txn::{RoTxn, RwTxn};
-use crate::{dbi_specs, DbError};
+use crate::DbError;
 use lmdb_sys::*;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -135,6 +135,43 @@ pub struct Env {
 pub fn lmdb_version() -> (i32, i32, i32) {
     (0, 9, 37)
 }
+
+/// Inspect the manifest without opening a writer or creating missing CFs.
+pub(crate) fn check_cf_set(path: &Path) -> Result<(), DbError> {
+    let mut actual = rocksdb::DB::list_cf(&rocksdb::Options::default(), path).map_err(err)?;
+    let mut expected = physical_cf_names();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    if actual != expected {
+        return Err(err(
+            "column family set does not match this Wok RocksDB layout",
+        ));
+    }
+    Ok(())
+}
+
+fn check_format(db: &rocksdb::DB) -> Result<(), DbError> {
+    match db.get(FORMAT_KEY).map_err(err)? {
+        Some(value) if value == FORMAT => Ok(()),
+        _ => Err(err("unsupported or absent Wok RocksDB layout marker")),
+    }
+}
+
+fn check_existing_layout(path: &Path) -> Result<(), DbError> {
+    check_cf_set(path)?;
+    let mut options = rocksdb::Options::default();
+    // A read-only default-CF open can read the marker, including recovered WAL
+    // contents, without creating a LOCK, OPTIONS or on-disk recovery writes.
+    // Supply a callback logger so even rejected layouts do not rotate LOG.
+    options.set_info_logger(rocksdb::InfoLogger::new_callback_logger(
+        rocksdb::LogLevel::Error,
+        |_, _| {},
+    ));
+    options.set_skip_stats_update_on_db_open(true);
+    let probe = rocksdb::DB::open_for_read_only(&options, path, false).map_err(err)?;
+    check_format(&probe)
+}
+
 impl std::fmt::Debug for Env {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RocksEnv")
@@ -168,6 +205,12 @@ impl Env {
         if fresh && std::fs::read_dir(path).map_err(err)?.next().is_some() {
             return Err(err("refusing nonempty unrecognized database directory"));
         }
+        if !fresh {
+            // Refuse incompatible CF sets and markers before a writable native
+            // open can perform recovery or mutate auxiliary files. As with all
+            // maintenance, the directory must not be replaced during open.
+            check_existing_layout(path)?;
+        }
         let cache = Cache::new_hyper_clock_cache(8usize << 30, 0);
         let cfopts = || {
             let mut o = Options::default();
@@ -196,16 +239,7 @@ impl Env {
         options.set_max_total_wal_size(1 << 30);
         options.set_bytes_per_sync(1 << 20);
         options.set_row_cache(&Cache::new_lru_cache(2 << 30));
-        let mut names = vec!["default", COMBINED, COVERING];
-        names.extend(
-            dbi_specs()
-                .iter()
-                .filter(|s| {
-                    s.name != crate::schema::DBI_EVENT && s.name != crate::schema::DBI_EVENT_PAYLOAD
-                })
-                .map(|s| s.name),
-        );
-        let cfs = names
+        let cfs = physical_cf_names()
             .into_iter()
             .map(|n| ColumnFamilyDescriptor::new(n, cfopts()))
             .collect::<Vec<_>>();
@@ -216,7 +250,7 @@ impl Env {
         }
         .map_err(err)?;
         match db.get(FORMAT_KEY).map_err(err)? {
-            Some(v) if v == FORMAT => {}
+            Some(value) if value == FORMAT => {}
             None if fresh => {
                 let mut wo = rocksdb::WriteOptions::default();
                 wo.set_sync(true);
@@ -291,15 +325,14 @@ impl Env {
         RwTxn::begin(self)
     }
     pub fn covering_pubkey_dbi(&self) -> MDB_dbi {
-        COVER_DBI
+        if cfg!(feature = "rocksdb-coverless") {
+            self.dbis().event_pubkey
+        } else {
+            COVER_DBI
+        }
     }
     pub fn check_background_errors(&self) -> Result<(), DbError> {
-        for name in std::iter::once("default")
-            .chain(dbi_specs().iter().map(|s| {
-                cf_name((dbi_specs().iter().position(|v| v.name == s.name).unwrap() + 1) as u32)
-            }))
-            .chain([COVERING])
-        {
+        for name in physical_cf_names() {
             let cf = self
                 .inner
                 .db
@@ -425,16 +458,7 @@ impl Drop for EnvInner {
         // join and before RocksDB's own destructor; final child rusage captures
         // subsequent shutdown I/O as well.
         let mut cf_stats = serde_json::Map::new();
-        let mut names = vec!["default", COMBINED, COVERING];
-        names.extend(
-            dbi_specs()
-                .iter()
-                .filter(|s| {
-                    s.name != crate::schema::DBI_EVENT && s.name != crate::schema::DBI_EVENT_PAYLOAD
-                })
-                .map(|s| s.name),
-        );
-        for name in names {
+        for name in physical_cf_names() {
             let Some(cf) = self.db.cf_handle(name) else {
                 continue;
             };

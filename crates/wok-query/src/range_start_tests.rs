@@ -621,14 +621,15 @@ fn absent_and_max_until_do_not_change_native_execution_operations() {
 
 #[cfg(feature = "rocksdb-read-diagnostics")]
 #[test]
-fn covering_start_avoids_copying_the_excluded_newest_record() {
+fn author_start_only_copies_records_in_the_covering_layout() {
     let (_dir, env, events) = store(corpus(1, 24));
+    let has_cover = u64::from(env.covering_pubkey_dbi() != env.dbis().event_pubkey);
     let filter = filter(&json!({"authors": [hex::encode(author(0))], "until": BASE + 5}));
     let run = |start: Start| {
         let txn = env.begin_ro().unwrap();
         let mut scan = start.scan(&txn, &filter);
-        // Keep this cover-specific assertion independent of the build-only
-        // thin-author experiment's selected default.
+        // Use a physical cover even in the thin-read control build. In the
+        // coverless layout this accessor is thin and must copy no record.
         scan.index_dbi = env.covering_pubkey_dbi();
         wok_db::read_diagnostics::measure(|| {
             let mut id = None;
@@ -650,8 +651,8 @@ fn covering_start_avoids_copying_the_excluded_newest_record() {
     let legacy = run(Start::LegacyMax);
     let direct = run(Start::Direct);
     assert_eq!(direct.0, legacy.0);
-    assert_eq!(legacy.1.wrapper.cover_records_copied, 3);
-    assert_eq!(direct.1.wrapper.cover_records_copied, 2);
+    assert_eq!(legacy.1.wrapper.cover_records_copied, 3 * has_cover);
+    assert_eq!(direct.1.wrapper.cover_records_copied, 2 * has_cover);
     assert_eq!(legacy.1.wrapper.seek, 2);
     assert_eq!(direct.1.wrapper.seek, 1);
     let txn = env.begin_ro().unwrap();
@@ -669,7 +670,7 @@ fn covering_start_avoids_copying_the_excluded_newest_record() {
         + 8;
     assert_eq!(
         legacy.1.wrapper.cover_record_bytes_copied - direct.1.wrapper.cover_record_bytes_copied,
-        bytes as u64
+        bytes as u64 * has_cover
     );
     assert_eq!(direct.1.wrapper.primary_pin_lookups, 0);
 }

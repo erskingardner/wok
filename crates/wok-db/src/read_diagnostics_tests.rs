@@ -28,6 +28,7 @@ fn database() -> (tempfile::TempDir, Env) {
 }
 
 #[test]
+#[cfg(not(feature = "rocksdb-coverless"))]
 fn native_calls_and_cover_copies_include_the_stopping_entry_and_reuse_cache() {
     let (_dir, env) = database();
     let tx = env.begin_ro().unwrap();
@@ -116,10 +117,51 @@ fn primary_pins_are_shared_between_components_and_cover_does_not_copy_them() {
         (2, 1, 1)
     );
     assert_eq!(c.primary_cached_pinned_hits, 1);
-    assert_eq!(c.cover_cached_pinned_hits, 1);
+    assert_eq!(
+        c.cover_cached_pinned_hits,
+        u64::from(!cfg!(feature = "rocksdb-coverless"))
+    );
     assert_eq!(c.cover_records_copied, 0);
     let bytes = tx.get_u64(env.dbis().event, 12).unwrap().unwrap().len() + 7 + 8;
     assert_eq!(c.primary_pin_returned_bytes, bytes as u64);
+}
+
+#[test]
+#[cfg(feature = "rocksdb-coverless")]
+fn coverless_author_postings_do_not_populate_the_primary_cache() {
+    let (_dir, env) = database();
+    assert_eq!(env.covering_pubkey_dbi(), env.dbis().event_pubkey);
+    let tx = env.begin_ro().unwrap();
+    let (_, measured) = measure(|| {
+        tx.cursor(env.covering_pubkey_dbi())
+            .unwrap()
+            .foreach_index(
+                &make_key_string_u64(&[0; 32], u64::MAX),
+                u64::MAX,
+                |entry| {
+                    assert_eq!(entry.local_id().unwrap(), 12);
+                    false
+                },
+            )
+            .unwrap();
+        tx.get_u64(env.dbis().event, 12).unwrap().unwrap();
+        tx.get_u64(env.dbis().event_payload, 12).unwrap().unwrap();
+    })
+    .unwrap();
+    let c = measured.wrapper;
+    assert_eq!(
+        (c.iterator_creations, c.seek, c.typed_index_entries),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        (c.cover_records_copied, c.cover_record_bytes_copied),
+        (0, 0)
+    );
+    assert_eq!(
+        (c.cover_cached_owned_hits, c.cover_cached_pinned_hits),
+        (0, 0)
+    );
+    assert_eq!((c.primary_pins_found, c.primary_cached_pinned_hits), (1, 1));
 }
 
 #[test]

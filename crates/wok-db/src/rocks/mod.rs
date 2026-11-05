@@ -1,7 +1,8 @@
 //! Experimental optimized RocksDB layout. All relay policy remains in Wok.
 //! Bytewise ordered indexes are globally reversed, so newest-first logical
 //! scans advance forward physically. Event/payload components share one record;
-//! author reads have a covering index while feeds retain thin postings.
+//! Author reads have a covering index while feeds retain thin postings, unless
+//! the separate `rocksdb-coverless` physical layout is selected at build time.
 #![forbid(unsafe_code)]
 
 mod audit;
@@ -67,7 +68,34 @@ pub(crate) const COMBINED: &str = "wok_events_combined_v1";
 pub(crate) const COVERING: &str = "wok_pubkey_covering_v1";
 pub(crate) const COVER_DBI: u32 = 23;
 pub(crate) const FORMAT_KEY: &[u8] = b"wok-rocksdb-format";
+#[cfg(not(feature = "rocksdb-coverless"))]
 pub(crate) const FORMAT: &[u8] = b"wok-rocks-v1:combined:dual-author:reverse-order:sync-wal";
+#[cfg(feature = "rocksdb-coverless")]
+pub(crate) const FORMAT: &[u8] = b"wok-rocks-v2:combined:thin-author:reverse-order:sync-wal";
+
+/// Exact physical CF set for this binary; logical Event/Payload share COMBINED.
+pub(crate) fn physical_cf_names() -> Vec<&'static str> {
+    let mut names = vec!["default", COMBINED];
+    if !cfg!(feature = "rocksdb-coverless") {
+        names.push(COVERING);
+    }
+    names.extend(
+        dbi_specs()
+            .iter()
+            .filter(|s| {
+                s.name != crate::schema::DBI_EVENT && s.name != crate::schema::DBI_EVENT_PAYLOAD
+            })
+            .map(|s| s.name),
+    );
+    names
+}
+
+pub(crate) fn validate_dbi(dbi: u32) -> Result<(), DbError> {
+    if cfg!(feature = "rocksdb-coverless") && dbi == COVER_DBI {
+        return Err(err("covering index is absent in the coverless layout"));
+    }
+    Ok(())
+}
 pub(crate) fn err(e: impl std::fmt::Display) -> DbError {
     DbError::msg(format!("rocksdb: {e}"))
 }

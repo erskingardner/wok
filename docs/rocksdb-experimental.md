@@ -103,14 +103,52 @@ cargo build --release --locked -p wok-cli \
 
 Other selected plans retain their indexes. The choice also applies to a
 single-author alternative selected by the bounded author-versus-tag probe,
-which still checks the complete original filter. Both author indexes are still
-written and checked by the physical audit; this feature changes no persistent
+which still checks the complete original filter. With only the read-plan
+feature, both author indexes are still written and checked by the physical
+audit; this feature changes no persistent
 format, writer, cache limit or durability setting. Comparing the read plans
 therefore does not measure the write or compaction savings of removing the
 covering index. Such a layout experiment needs a separate format and rebuilt
 seeds. Record the exact enabled features alongside source and binary hashes,
 and compare correctness, read tails, native operations and memory before
 choosing a plan.
+
+The separate experimental `rocksdb-coverless` feature removes the full covering
+author column family and its writer maintenance. It enables thin author reads
+through the DB, query, relay and CLI crates. The combined primary record, thin
+postings, logical Wok v5 schema, query policy, snapshot cache and synchronous WAL
+commit policy stay the same. It is off by default:
+
+```sh
+# Current dual-index layout, reading thin postings (control).
+cargo build --release --locked -p wok-cli --features rocksdb-thin-author-reads \
+  --target-dir target/rocksdb-dual-thin
+# Separate physical layout, reading the same thin postings.
+cargo build --release --locked -p wok-cli --features rocksdb-coverless \
+  --target-dir target/rocksdb-coverless
+```
+
+Use separate new database directories and configurations for these binaries.
+The coverless marker is
+`wok-rocks-v2:combined:thin-author:reverse-order:sync-wal`; the dual-index marker
+remains `wok-rocks-v1:combined:dual-author:reverse-order:sync-wal`. Each binary
+checks the exact column family set and reads the marker without a writable
+native open before accepting an existing directory. Neither layout opens or
+converts the other; do not replace the directory during open. The coverless
+author accessor returns the thin index and raw access to removed DBI 23 fails.
+The audit requires that the covering column family is absent, verifies each
+thin posting's existence and empty value, and checks that its exact count gives
+one posting per primary. Both layouts retain the same signature/body checks and
+length-framed local-ID, PackedEvent and encoded-payload fingerprint.
+
+There is no converter or claim of measured storage, write or compaction savings.
+Verified JSON import into a new database preserves event identity, but is not a
+general byte-preserving conversion of local IDs, encoded payloads or kept tables.
+Any causal layout comparison needs separately built and verified seeds, the same
+thin read plan, configuration and durability, and a budget for the full new
+database and temporary files. Keep original seeds unchanged; shared-file copies
+or deletion of an old covering column family are not the experiment described
+here.
 
 Primary point reads use stack-encoded local-ID keys and cache native pinned
 combined bytes, sharing the same snapshot and cache as owned covering records.
@@ -128,7 +166,9 @@ universal optimality. Iterators preserve total logical ordering across prefixes.
 `rocksdb-check` opens the database read-only. Run it offline against a closed
 seed/copy. It streams all authoritative records with bounded working memory,
 verifies each signature/body against its PackedEvent, checks every event's thin
-and covering author records, and independently counts every logical table. It
+author record (and covering record in the dual-index layout), and independently
+counts every logical table. These counts do not verify the semantic contents of
+every other derived index. It
 fails on corruption, missing components, cover divergence, counter disagreement
 or RocksDB background errors. It does not prove that an input corpus contained
 all intended events; compare its event count with the verified import manifest.

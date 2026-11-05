@@ -449,6 +449,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add an opt-in `rocksdb-coverless` physical layout for isolated experiments.
+  It keeps the combined primary bytes and thin author reads, omits the full
+  covering author index and its maintenance, and uses a distinct marker and
+  column family set. Existing layouts are refused before a writable open;
+  no database conversion or default change is included.
 - `wok-bench --scenario db_write` times storing events without a relay or
   the network (#257). It loads a corpus into a fresh database, then writes
   the corpus's last events through the relay writer's storage calls in

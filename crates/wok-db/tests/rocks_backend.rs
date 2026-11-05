@@ -104,6 +104,7 @@ fn component_only_recompression_refreshes_cover_and_preserves_old_snapshot() {
     );
 }
 #[test]
+#[cfg(not(feature = "rocksdb-coverless"))]
 fn audit_detects_cover_divergence_even_when_counts_match() {
     let dir = tempfile::tempdir().unwrap();
     let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();

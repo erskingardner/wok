@@ -7,7 +7,9 @@ use crate::DbError;
 use bumpalo::Bump;
 use elsa::FrozenMap;
 use lmdb_sys::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(not(feature = "rocksdb-coverless"))]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::ops::Bound::{Excluded, Included};
 use std::rc::Rc;
@@ -201,6 +203,7 @@ impl<'env> View<'env> {
         self.snapshot.get_cf(self.cf(dbi), key).map_err(err)
     }
     fn count(&self, dbi: u32) -> Result<u64, DbError> {
+        validate_dbi(dbi)?;
         let dbi = if dbi == COVER_DBI { 10 } else { dbi };
         self.snapshot
             .get(count_key(dbi))
@@ -249,6 +252,7 @@ impl<'env> View<'env> {
         key: &[u8],
         staged: Option<&'a Overlay>,
     ) -> Result<Option<&'a [u8]>, DbError> {
+        validate_dbi(dbi)?;
         if combined(dbi) {
             let id = u64::from_ne_bytes(key.try_into().map_err(|_| err("invalid event local ID"))?);
             return self.get_record(dbi, id, staged);
@@ -272,7 +276,9 @@ pub struct RwTxn<'env> {
     staged: Overlay,
     counts: HashMap<u32, u64>,
     marker_values: MarkerMap,
+    #[cfg(not(feature = "rocksdb-coverless"))]
     touched_records: HashSet<u64>,
+    #[cfg(not(feature = "rocksdb-coverless"))]
     touched_postings: HashSet<Vec<u8>>,
     _writer: MutexGuard<'env, ()>,
     pub(crate) event_sequence: Option<u64>,
@@ -310,6 +316,7 @@ impl<'env> RoTxn<'env> {
         }
     }
     pub fn cursor(&self, dbi: u32) -> Result<Cursor<'_>, DbError> {
+        validate_dbi(dbi)?;
         Ok(Cursor::new(&self.view, dbi, None))
     }
     pub fn entries(&self, dbi: u32) -> Result<usize, DbError> {
@@ -363,7 +370,9 @@ impl<'env> RwTxn<'env> {
             marker_values,
             staged: BTreeMap::new(),
             counts: HashMap::new(),
+            #[cfg(not(feature = "rocksdb-coverless"))]
             touched_records: HashSet::new(),
+            #[cfg(not(feature = "rocksdb-coverless"))]
             touched_postings: HashSet::new(),
             _writer: guard,
             event_sequence: None,
@@ -391,6 +400,7 @@ impl<'env> RwTxn<'env> {
         self.get(dbi, &key.to_ne_bytes())
     }
     pub fn cursor(&self, dbi: u32) -> Result<Cursor<'_>, DbError> {
+        validate_dbi(dbi)?;
         Ok(Cursor::new(&self.view, dbi, Some(&self.staged)))
     }
     pub fn entries(&self, dbi: u32) -> Result<usize, DbError> {
@@ -485,10 +495,14 @@ impl<'env> RwTxn<'env> {
                 record.payload = Some(val.to_vec());
             }
             self.staged.insert((3, pk), Some(record.encode()));
+            #[cfg(not(feature = "rocksdb-coverless"))]
             self.touched_records.insert(u64::from_ne_bytes(
                 key.try_into().map_err(|_| err("invalid local ID"))?,
             ));
+            #[cfg(feature = "rocksdb-coverless")]
+            let _ = u64::from_ne_bytes(key.try_into().map_err(|_| err("invalid local ID"))?);
         } else {
+            #[cfg(not(feature = "rocksdb-coverless"))]
             if dbi == 10 {
                 self.touched_postings.insert(pk.clone());
             }
@@ -560,13 +574,17 @@ impl<'env> RwTxn<'env> {
                     Some(record.encode())
                 },
             );
+            #[cfg(not(feature = "rocksdb-coverless"))]
             self.touched_records.insert(u64::from_ne_bytes(
                 key.try_into().map_err(|_| err("invalid local ID"))?,
             ));
+            #[cfg(feature = "rocksdb-coverless")]
+            let _ = u64::from_ne_bytes(key.try_into().map_err(|_| err("invalid local ID"))?);
         } else {
             if self.view.raw(dbi, &pk, Some(&self.staged))?.is_none() {
                 return Ok(false);
             }
+            #[cfg(not(feature = "rocksdb-coverless"))]
             if dbi == 10 {
                 self.touched_postings.insert(pk.clone());
             }
@@ -608,6 +626,7 @@ impl<'env> RwTxn<'env> {
         }
         Ok(())
     }
+    #[cfg(not(feature = "rocksdb-coverless"))]
     fn refresh_covers(&mut self) -> Result<(), DbError> {
         let mut keys = std::mem::take(&mut self.touched_postings);
         for &id in &self.touched_records {
@@ -654,6 +673,7 @@ impl<'env> RwTxn<'env> {
         #[cfg(test)]
         crate::crash_tests::checkpoint("write-before-flush");
         crate::state::flush(&mut self)?;
+        #[cfg(not(feature = "rocksdb-coverless"))]
         self.refresh_covers()?;
         let mut batch = rocksdb::WriteBatch::default();
         for ((dbi, key), value) in &self.staged {

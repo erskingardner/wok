@@ -1,5 +1,6 @@
 //! The author read experiment changes only the selected index. These private
-//! tests force either index in one binary, leaving both indexes maintained.
+//! tests force either index in one binary. The coverless layout aliases the
+//! accessor to thin postings; the model and full-query assertions still apply.
 
 use super::*;
 use crate::visibility::ReadRestrictor;
@@ -226,6 +227,38 @@ fn author_index_order_resume_and_work_match() {
     }
 }
 
+#[cfg(feature = "rocksdb-coverless")]
+#[test]
+fn coverless_public_author_and_feed_plans_use_thin_postings() {
+    let (_dir, env, events) = store((1..=300).map(|n| event(n, n % 3, 1, 0, &[])).collect());
+    assert!(env.inner.db.cf_handle("wok_pubkey_covering_v1").is_none());
+    for value in [
+        json!({"authors": [hex::encode(author(0))], "until": BASE + 83, "limit": 50}),
+        json!({"authors": [hex::encode(author(0)), hex::encode(author(1))], "since": BASE + 17, "until": BASE + 83, "limit": 50}),
+    ] {
+        let txn = env.begin_ro().unwrap();
+        let filter = filter(&value);
+        let scan = DbScan::new(&filter, &txn);
+        assert_eq!(scan.desc, "Pubkey");
+        assert_eq!(scan.index_dbi, env.dbis().event_pubkey);
+        let (ids, _) = collect_scan(&txn, &filter, AuthorIndex::Covering);
+        assert_eq!(ids, expected(&events, &filter));
+        let result = collect_query(
+            &txn,
+            &value,
+            AuthorIndex::Covering,
+            &QueryOptions::default(),
+        );
+        assert_eq!(result.sent_count, 50);
+        assert!(result.completeness.more);
+        assert!(result.hits.iter().all(|hit| hit.json.is_ok()));
+        assert_eq!(
+            result.hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            ids[..50]
+        );
+    }
+}
+
 #[test]
 fn author_queries_preserve_policy_limits_hints_and_encoded_payloads() {
     let (_dir, env, events) = store(
@@ -446,8 +479,11 @@ fn knob(name: &str, default: usize) -> usize {
 #[test]
 #[ignore]
 fn author_index_causal_diagnostic() {
-    if wok_db::storage_backend_name() == "lmdb" {
-        println!("LMDB aliases the two author DBIs; no distinct physical index comparison");
+    if matches!(
+        wok_db::storage_backend_name(),
+        "lmdb" | "rocksdb-coverless-experimental"
+    ) {
+        println!("This layout aliases the two author DBIs; no distinct physical index comparison");
         return;
     }
     let rows = knob("AUTHOR_INDEX_ROWS", 10_000);

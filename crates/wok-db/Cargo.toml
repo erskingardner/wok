@@ -13,6 +13,8 @@ op-log = []
 rocksdb-backend = ["dep:rocksdb", "dep:bumpalo", "dep:elsa", "dep:fs2"]
 # Opt-in, synchronous read diagnostics. No hooks are compiled into ordinary builds.
 rocksdb-read-diagnostics = ["rocksdb-backend"]
+# Separate experimental physical layout, with only thin author postings.
+rocksdb-coverless = ["rocksdb-backend"]
 
 [dependencies]
 fs2 = { version = "0.4", optional = true }

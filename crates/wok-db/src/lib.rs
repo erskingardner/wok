@@ -116,7 +116,9 @@ mod crash_tests;
 
 /// Storage format used by this binary. The optional RocksDB build cannot open LMDB files.
 pub fn storage_backend_name() -> &'static str {
-    if cfg!(feature = "rocksdb-backend") {
+    if cfg!(feature = "rocksdb-coverless") {
+        "rocksdb-coverless-experimental"
+    } else if cfg!(feature = "rocksdb-backend") {
         "rocksdb-optimized-experimental"
     } else {
         "lmdb"

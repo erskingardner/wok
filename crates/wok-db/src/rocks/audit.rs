@@ -5,9 +5,12 @@ use sha2::{Digest, Sha256};
 
 impl Env {
     /// Run only on a closed seed/copy: the read-only open must not race a writer.
-    /// Scans authoritative components and verifies every covering/thin posting,
-    /// then independently counts every logical table against transactional counters.
+    /// Scans authoritative components and verifies every thin (and, in the dual
+    /// layout, covering) author posting. Per-primary existence plus exact counts
+    /// proves a bijection. Other tables are counted against transactional counters;
+    /// this is not a semantic verification of every other derived index.
     pub fn audit_rocksdb_layout(&self) -> Result<serde_json::Value, DbError> {
+        crate::env::check_cf_set(self.path())?;
         self.check_background_errors()?;
         let snapshot = self.inner.db.snapshot();
         let cf = |name: &str| {
@@ -50,12 +53,15 @@ impl Env {
             if !thin.is_empty() {
                 return Err(err("thin author posting contains payload"));
             }
-            let cover = snapshot
-                .get_cf(cf(COVERING)?, &posting)
-                .map_err(err)?
-                .ok_or_else(|| err("missing author cover"))?;
-            if cover != value {
-                return Err(err("author cover differs from combined primary"));
+            #[cfg(not(feature = "rocksdb-coverless"))]
+            {
+                let cover = snapshot
+                    .get_cf(cf(COVERING)?, &posting)
+                    .map_err(err)?
+                    .ok_or_else(|| err("missing author cover"))?;
+                if cover != value {
+                    return Err(err("author cover differs from combined primary"));
+                }
             }
             digest.update(id.to_le_bytes());
             digest.update((packed.len() as u64).to_le_bytes());
@@ -70,7 +76,12 @@ impl Env {
         }
         it.status().map_err(err)?;
         let mut counts = serde_json::Map::new();
-        for dbi in 1..=COVER_DBI {
+        let last_dbi = if cfg!(feature = "rocksdb-coverless") {
+            dbi_specs().len() as u32
+        } else {
+            COVER_DBI
+        };
+        for dbi in 1..=last_dbi {
             let mut it = snapshot.raw_iterator_cf(cf(cf_name(dbi))?);
             it.seek_to_first();
             let mut found = 0u64;
@@ -110,7 +121,8 @@ impl Env {
             .get(crate::schema::DBI_EVENT_PUBKEY)
             .and_then(|v| v.as_u64())
             != Some(count)
-            || counts.get(COVERING).and_then(|v| v.as_u64()) != Some(count)
+            || (!cfg!(feature = "rocksdb-coverless")
+                && counts.get(COVERING).and_then(|v| v.as_u64()) != Some(count))
         {
             return Err(err(
                 "author indexes do not contain exactly one posting per primary",
@@ -123,7 +135,7 @@ impl Env {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         Ok(
-            serde_json::json!({"ok":true,"events":count,"verified_signatures_and_bodies":count,"covering_records_verified":count,"primary_fingerprint_sha256":hash,"table_counts":counts,"layout":String::from_utf8_lossy(FORMAT),"durability":"one atomic cross-CF WriteBatch with sync WAL before ACK; no power-loss proof implied"}),
+            serde_json::json!({"ok":true,"events":count,"verified_signatures_and_bodies":count,"thin_author_records_verified":count,"covering_records_verified":if cfg!(feature="rocksdb-coverless"){0}else{count},"primary_fingerprint_sha256":hash,"table_counts":counts,"physical_column_families":physical_cf_names(),"layout":String::from_utf8_lossy(FORMAT),"durability":"one atomic cross-CF WriteBatch with sync WAL before ACK; no power-loss proof implied"}),
         )
     }
 }

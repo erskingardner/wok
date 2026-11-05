@@ -11,6 +11,8 @@ description = "Nostr filters, index selection, and resumable scans"
 rocksdb-thin-author-reads = ["wok-db/rocksdb-backend"]
 # Build-only operation counters for focused native read diagnostics.
 rocksdb-read-diagnostics = ["wok-db/rocksdb-read-diagnostics"]
+# Separate layout experiment; keep the same thin read plan as the dual-index control.
+rocksdb-coverless = ["rocksdb-thin-author-reads", "wok-db/rocksdb-coverless"]
 
 [dependencies]
 serde_json.workspace = true

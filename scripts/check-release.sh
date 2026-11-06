@@ -2,11 +2,13 @@
 set -euo pipefail
 
 tag=${1:-}
-if [[ ! "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-  echo "release tag must match vMAJOR.MINOR.PATCH, got: ${tag:-<empty>}" >&2
+if [[ "$tag" != v* ]]; then
+  echo "release tag must be v followed by a SemVer version, got: ${tag:-<empty>}" >&2
   exit 1
 fi
 version=${tag#v}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+prerelease=$(python3 "$script_dir/release-version.py" "$version")
 
 workspace_version=$(
   awk '
@@ -32,6 +34,8 @@ fi
 
 python3 - "$version" <<'PY'
 import json
+from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -50,12 +54,10 @@ wrong = sorted(
 if wrong:
     rendered = ", ".join(f"{name}={version}" for name, version in wrong)
     raise SystemExit(f"workspace packages do not match {expected}: {rendered}")
+heading = re.compile(rf"## \[{re.escape(expected)}\] - [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}")
+if not any(heading.fullmatch(line) for line in Path("CHANGELOG.md").read_text().splitlines()):
+    raise SystemExit(f"CHANGELOG.md has no dated [{expected}] release section")
 PY
-
-if ! grep -Eq "^## \[$version\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
-  echo "CHANGELOG.md has no dated [$version] release section" >&2
-  exit 1
-fi
 
 if git rev-parse --verify --quiet "refs/tags/$tag^{commit}" >/dev/null; then
   tag_commit=$(git rev-parse "refs/tags/$tag^{commit}")
@@ -71,5 +73,6 @@ fi
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "version=$version" >> "$GITHUB_OUTPUT"
+  echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 fi
 printf 'release contract valid: %s\n' "$tag"

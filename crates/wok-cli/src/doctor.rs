@@ -189,7 +189,13 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         );
         return report;
     }
-    for filename in ["data.mdb", "lock.mdb"] {
+    report.add(
+        "storage-backend",
+        CheckStatus::Pass,
+        wok_db::storage_backend_name(),
+    );
+    let database_files: &[&str] = &["CURRENT"];
+    for filename in database_files {
         let path = cfg.db.join(filename);
         report.add(
             format!("database-{filename}"),
@@ -207,13 +213,10 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
     let env = match Env::open(
         &cfg.db,
         EnvOptions {
-            max_readers: cfg.db_maxreaders,
-            map_size: cfg.db_mapsize,
-            no_read_ahead: cfg.db_no_read_ahead,
             create_dir: false,
             create_dbis: false,
             read_only: true,
-            ..EnvOptions::default()
+            ..cfg.db_options()
         },
     ) {
         Ok(env) => env,
@@ -282,31 +285,17 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         Err(error) => report.add("database-meta", CheckStatus::Fail, error.to_string()),
     }
 
+    let storage_check = "rocksdb-storage";
     match env.stats() {
         Ok(stats) => {
-            let utilization = if stats.map_size == 0 {
-                100.0
-            } else {
-                stats.used_bytes as f64 * 100.0 / stats.map_size as f64
-            };
-            let status = if utilization >= 90.0 {
-                CheckStatus::Fail
-            } else if utilization >= 75.0 {
-                CheckStatus::Warn
-            } else {
-                CheckStatus::Pass
-            };
             report.add(
-                "lmdb-map",
-                status,
-                format!(
-                    "{} of {} bytes used ({utilization:.1}%)",
-                    stats.used_bytes, stats.map_size
-                ),
+                storage_check,
+                CheckStatus::Pass,
+                format!("{} bytes in native database files", stats.used_bytes),
             );
             report.database = Some(stats);
         }
-        Err(error) => report.add("lmdb-map", CheckStatus::Fail, error.to_string()),
+        Err(error) => report.add(storage_check, CheckStatus::Fail, error.to_string()),
     }
 
     match available_bytes(&cfg.db) {

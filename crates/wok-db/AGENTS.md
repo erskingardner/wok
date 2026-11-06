@@ -1,26 +1,27 @@
 # wok-db
 
-Wok LMDB storage and the read-only strfry v3 migration boundary.
+Wok RocksDB runtime storage and read-only Wok v4/v5 / strfry v3 LMDB imports.
 
-Runtime databases are Wok-owned (v5 marker). strfry v3 is opened only as a migration source. This crate also owns NIP-50 search postings, NIP-62 vanish markers, NIP-86 moderation records, payload compression, integrity, and index rebuild.
+Runtime databases are Wok-owned (v5 marker). LMDB is opened only as an explicit read-only migration source. This crate also owns NIP-50 search postings, NIP-62 vanish markers, NIP-86 moderation records, payload compression, integrity, and index rebuild.
 
 ## Layout
 
-- `Cargo.toml` — crate manifest (`lmdb-sys`, zstd, flatbuffers)
+- `Cargo.toml` — crate manifest (RocksDB, read-only `lmdb-sys`, zstd, flatbuffers)
 - `src/` — env, schema, transactions, write/read paths
 - `tests/` — comparators, recovery, gift-wrap, vanish, optional C++ roundtrip
 
 ## Invariants
 
-- Transactions, cursors, and mmap slices must never cross a Tokio `.await`. Callers run DB work on dedicated OS threads and copy results into owned values first.
-- `#![deny(unsafe_code)]` with FFI isolated in `env`, `txn`, and migration snapshot helpers.
+- Transactions, cursors, and borrowed records must never cross a Tokio `.await`. Callers run DB work on dedicated OS threads and copy results into owned values first.
+- `#![deny(unsafe_code)]` with native FFI isolated in migration helpers and reviewed OS boundaries.
 - Authoritative primary bytes are PackedEvent (`Event`) and payload (`EventPayload`). Secondary indexes are derived and rebuildable (`reindex`).
 - Reindex copies the tables events don't derive (Meta, negentropy filters, compression dictionaries, vanish markers, moderation records) unchanged. `tests/reindex_kept_tables.rs` names every table as kept or derived, so a new table fails it until it is classified.
 - Reindex (`PackedEventRebuild::RepackLongTags`) is the only writer that changes a stored PackedEvent, and only when removing its hashed long tag values gives the stored bytes back (`long_tags`). Migration copies it unchanged.
 - That reindex then deletes the versions that deletion requests' repaired `a` tags name (long, replaceable `<kind>:<pubkey>:`, or a kind with leading zeros; `write::is_repaired_address`), through the write path's own `a`-tag lookup and `delete_event_basic`, and reports their local IDs so the CLI can verify the original's fingerprint without them.
 - `wok_Event__search`, `wok_Event__tagKind`, `wok_Event__tagKindBuild`, `wok_VanishPubkey`, and `wok_Moderation` are Wok DBIs (not in strfry v3).
 - The NIP-62 sweep never repeats a finished pass, so the write path must refuse every event a marker covers. Which gift wraps it deletes follows `vanish::gift_wrap_vanished`, the same rule that hides and refuses them.
-- Vanish maintenance retains unreadable records with a warning and marks the persisted pass as incompletely verified. That flag survives restart and raised cutoffs: completed progress must not grant a D9 read exemption to records the sweep skipped. Reindex discards the progress; LMDB failures still abort maintenance.
-- `wok_Event__tagKind` is complete only once its `indexed-through` marker reaches the sequence high-water mark (`tag_kind_index_state_ro`). Earlier releases leave stale entries when they delete events; readers must check the event is stored. `backfill_tag_kind_index` fills it in bounded steps: key-ordered over `Event__tag` from marker 0 (cursor in `wok_Event__tagKindBuild`), local-id order otherwise. `wok import` leaves postings to that pass while the table is at marker 0 with no pass running (`defer_tag_kind_postings`), then runs it; a deferring transaction must never move the marker or a pass's target. The import neither defers nor builds while another process has the env open (`Env::open_in_another_process`, the LMDB reader table): a relay's writer would start the pass under the load. That check is about cost, not correctness. A relay with `relay.tag_kind_index_enabled` off calls `skip_tag_kind_postings` on each write transaction instead: no postings and no marker move, while deletions still remove postings; its writer takes no backfill steps until the setting is back on.
+- Vanish maintenance retains unreadable records with a warning and marks the persisted pass as incompletely verified. That flag survives restart and raised cutoffs: completed progress must not grant a D9 read exemption to records the sweep skipped. Reindex discards the progress; Storage failures still abort maintenance.
+- `wok_Event__tagKind` is complete only once its `indexed-through` marker reaches the sequence high-water mark (`tag_kind_index_state_ro`). Earlier releases leave stale entries when they delete events; readers must check the event is stored. `backfill_tag_kind_index` fills it in bounded steps: key-ordered over `Event__tag` from marker 0 (cursor in `wok_Event__tagKindBuild`), local-id order otherwise. `wok import` leaves postings to that pass while the table is at marker 0 with no pass running (`defer_tag_kind_postings`), then runs it; a deferring transaction must never move the marker or a pass's target. The runtime's exclusive writer-process lock requires the relay to be stopped
+  before a separate importer; there is no concurrent LMDB-writer mode. A relay with `relay.tag_kind_index_enabled` off calls `skip_tag_kind_postings` on each write transaction instead: no postings and no marker move, while deletions still remove postings; its writer takes no backfill steps until the setting is back on.
 
 See `docs/lmdb-v3.md` for the import contract and `docs/migration-from-strfry.md` for the operator path.

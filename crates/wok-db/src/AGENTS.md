@@ -1,12 +1,12 @@
 # wok-db/src
 
-LMDB environment and table access. Start at `lib.rs` for the public API.
+RocksDB environment and logical table access. LMDB is only a read-only migration source. Start at `lib.rs` for the public API.
 
 | File | Role |
 | --- | --- |
 | `lib.rs` | Module graph and re-exports |
-| `env.rs` | `Env` / `EnvOptions`; LMDB FFI isolated here |
-| `txn.rs` | `RoTxn` / `RwTxn` and cursors; mmap lifetime tied to txn |
+| `rocks/env.rs` | Runtime `Env` / `EnvOptions`, physical marker, exclusive process lock |
+| `rocks/txn.rs` | `RoTxn` / `RwTxn`, native snapshots, pins, cursors and writer overlay |
 | `error.rs` | `DbError` |
 | `schema.rs` | DBI names and open flags (`rasgueadb_*`, plus Wok search/tag-kind/vanish/moderation) |
 | `keys.rs` | Key encode/decode re-exports |
@@ -25,6 +25,6 @@ LMDB environment and table access. Start at `lib.rs` for the public API.
 | `state.rs` | Transactional sequence, lazy author counters, visibility generation, vanish sweep progress |
 | `crash_tests.rs` | Test-only checkpoints and subprocess kill/restart coverage |
 | `reindex.rs` | Rebuild indexes from PackedEvent + payload primaries |
-| `migration.rs` | Read-only LMDB snapshot, event fingerprint, and parallel verification of each event against its payload (`verify_events`) for `wok migrate` |
+| `migration.rs` | Import verification, event fingerprints and read-only source helpers for `wok migrate` |
 
-Unsafe is allowed only at the LMDB FFI boundary (`env`, `txn`, snapshot copy). Do not add new `unsafe` elsewhere without isolating it the same way.
+Unsafe is allowed only at isolated native FFI boundaries (read-only LMDB import and reviewed OS helpers). Do not add new `unsafe` elsewhere without isolating it the same way.

@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Nostr filters, index selection, and resumable scans"
 
+[features]
+# Build-only operation counters for focused native read diagnostics.
+rocksdb-read-diagnostics = ["wok-db/rocksdb-read-diagnostics"]
+
 [dependencies]
 serde_json.workspace = true
 thiserror.workspace = true
@@ -15,6 +19,7 @@ lmdb-sys.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 hex.workspace = true

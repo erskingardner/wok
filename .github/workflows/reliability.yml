@@ -24,27 +24,32 @@ concurrency:
 
 jobs:
   soak:
+    name: mixed workload / RocksDB
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       SOAK_DURATION: ${{ github.event_name == 'schedule' && '3600' || inputs.seconds || '180' }}
+      CARGO_BUILD_JOBS: '2'
+      RUST_TEST_THREADS: '2'
     steps:
       - uses: actions/checkout@v6
+      - name: RocksDB native compiler and libclang
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Build production relay and load driver
         run: |
-          cargo build --release --locked -p wok-cli --bin wok
-          cargo build --release --locked -p wok-compat --example reliability_soak
-      - name: Verify mixed workload, bounded memory and restart
+          cargo build --release --locked -p wok-cli --bin wok --target-dir target/soak
+          cargo build --release --locked -p wok-compat --example reliability_soak --target-dir target/soak
+      - name: Verify mixed workload, author feeds, bounded memory, restart and process-crash recovery
         run: |
-          python3 scripts/reliability-soak.py --wok target/release/wok \
-            --driver target/release/examples/reliability_soak \
+          python3 scripts/reliability-soak.py --wok target/soak/release/wok \
+            --driver target/soak/release/examples/reliability_soak \
             --seconds "$SOAK_DURATION" --seed 4242 --out "$RUNNER_TEMP/wok-soak"
       - name: Preserve workload, results and failure evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reliability-soak-${{ github.sha }}
+          name: reliability-soak-rocksdb-${{ github.sha }}
           path: ${{ runner.temp }}/wok-soak
           if-no-files-found: error
           retention-days: 30
@@ -52,13 +57,15 @@ jobs:
   compose:
     name: portable Docker lab
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 90
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v6
       - name: Check result gates and artifact extraction
         run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
           python3 -m unittest discover -s scripts/tests -v
           shellcheck scripts/lab-bootstrap-debian.sh scripts/benchmark-*.sh
       - name: Build and exercise both Compose services

@@ -87,13 +87,13 @@ the search index and therefore do not appear in search results.
 
 ## Index and recovery
 
-The rebuildable `wok_Event__search` LMDB DBI stores the first 256 unique
+The rebuildable `wok_Event__search` logical table stores the first 256 unique
 normalized terms of each event's searched text, mapped to local event ids.
 An event of a kind that is not searched writes no postings. Publishing
 writes none either: the relay's writer indexes stored events in later
 transactions of their own, and deleting an indexed event removes its
 postings with it. Queries count postings, start with the
-rarest term, intersect remaining terms with exact LMDB lookups, and retain
+rarest term, intersect remaining terms with exact snapshot-bound lookups, and retain
 only the best `limit` candidates in a bounded heap. For a query of two or
 more words, each match's searched text is read once to find which adjacent
 pairs it holds; a word too long to index separates the words beside it. Adjacent

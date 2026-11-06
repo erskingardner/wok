@@ -17,21 +17,20 @@ quirk. It also provides an additional Unix-domain socket transport.
 
 ## Highlights
 
-- **Verified migration.** `wok migrate strfry` takes a read-only LMDB snapshot,
-  checks its integrity, preserves every packed event and payload byte, rewrites
-  only the database ownership marker, translates the config's database path,
-  translates supported settings into native TOML, and emits a checksummed
-  manifest.
-- **Independent storage ownership.** strfry v3 is an import format. Wok uses a
-  v5 marker so strfry and Wok cannot accidentally become mixed writers, even
-  while the initial Wok layout remains structurally close to v3.
+- **Verified migration.** `wok migrate strfry` imports a stopped strfry v3
+  database directly into RocksDB, preserves packed events and encoded payloads,
+  translates supported config settings, and emits a checksummed manifest.
+  `wok migrate rocksdb` preserves the full state of a Wok LMDB v4/v5 database.
+- **RocksDB storage.** Every build uses the same Wok-owned runtime layout,
+  snapshot reads, atomic index updates and synchronous WAL commits. LMDB is
+  supported only as a read-only migration source; no writers share a database.
 - **Nostr-first protocol behavior.** EVENT/REQ/CLOSE/COUNT/EOSE/OK/NOTICE/
   CLOSED/AUTH and NEG-* are tested against pinned NIPs. Differential tests are
   migration and regression evidence, not a promise to retain upstream bugs.
 - **NIP-42 AUTH, NIP-45 COUNT with mergeable HyperLogLog sketches, NIP-50
   ranked content search, NIP-62 restart-safe Request to Vanish, NIP-67 EOSE
   completeness hints, NIP-70 protected events, NIP-59 gift-wrap deletion
-  semantics, NIP-77 negentropy set reconciliation** (persistent LMDB B-tree,
+  semantics, NIP-77 negentropy set reconciliation** (persistent B-tree,
   tree-backed multi-round sync sessions), and **draft NIP-91 AND tag
   filters**.
 - **Standards-first ephemeral delivery**: ephemeral kinds are live-only by
@@ -42,7 +41,7 @@ quirk. It also provides an additional Unix-domain socket transport.
   length-prefixed JSON, same dispatcher as WebSocket.
 - **Mesh tooling**: `router` (multi-connection replication with hot reconfig),
   `sync` (NIP-77 two-phase transfer), `upload`, `download`.
-- **Operational continuity**: worker pools (`numThreads.*`), single LMDB writer,
+- **Operational continuity**: worker pools (`numThreads.*`), single application writer,
   bounded queues with backpressure, slow-client termination
   (`max_pending_outbound_bytes`), config hot-reload, graceful shutdown
   (SIGUSR1/SIGINT), write-policy plugins, Prometheus metrics, structured JSON
@@ -53,49 +52,54 @@ quirk. It also provides an additional Unix-domain socket transport.
   concurrency limits, bounded NIP-50 index growth, default global and author
   storage quotas, a free-disk reserve, rejection metrics, and optional NIP-13
   proof-of-work enforcement advertised through NIP-11.
-- **Hardened untrusted-input boundary**: safe crates forbid unsafe Rust, LMDB
-  and OS FFI are isolated and documented, and property tests plus scheduled
+- **Hardened untrusted-input boundary**: safe crates forbid unsafe Rust, native
+  storage and OS FFI are isolated and documented, and property tests plus scheduled
   AddressSanitizer-backed fuzzing exercise JSON, events, WebSockets, compression,
   Negentropy, and database transaction sequences.
 
 ## Build
 
 ```bash
-cargo build --release -p wok-cli
+cargo build --release --locked -p wok-cli
 ```
 
-The binary is `target/release/wok`. Requires a recent stable Rust (2021
-edition); LMDB 0.9.37 is built from the source in `vendor/lmdb-sys` (a system
-liblmdb is never linked), zstd from the `zstd` crate's vendored source, and
-outbound TLS uses Rustls with the operating system's native root certificate
-store, so no system libraries are needed beyond a C toolchain.
+The binary is `target/release/wok`. Requires Rust 1.88 or newer, a C/C++
+toolchain and libclang for RocksDB bindings. On Debian/Ubuntu install
+`g++ clang libclang-dev`; on macOS use Xcode's command-line tools and LLVM
+(`brew install llvm`, with `LIBCLANG_PATH` pointing to its `lib` directory if
+needed). RocksDB and zstd build from vendored native sources. LMDB 0.9.37 is
+vendored for read-only imports; no system liblmdb is linked. Outbound TLS uses
+Rustls and the operating system's native root certificates.
 
-Tagged releases publish checksummed native archives for Linux x86-64/ARM64 and
-macOS Intel/Apple Silicon. See [CHANGELOG.md](CHANGELOG.md) for notable changes
+Tagged releases publish one checksummed native archive per target for Linux
+x86-64/ARM64 and macOS Intel/Apple Silicon. The 0.8.0 release candidate uses
+RocksDB throughout. See [CHANGELOG.md](CHANGELOG.md) for notable changes
 and [docs/releases.md](docs/releases.md) for the tag and release process.
 
 ## Migrate from strfry
 
 ```bash
-# Read-only preflight: no snapshot or output directory is created.
+# Stop strfry and all other source writers; keep them stopped through copying.
+# Read-only preflight creates no snapshot or output directory.
 ./target/release/wok migrate strfry \
   --db /var/lib/strfry \
   --config /etc/strfry.conf \
   --output /var/lib/wok \
   --check
 
-# After reviewing the report and stopping strfry, perform the migration.
+# Review the report, then migrate while the source remains stopped.
 ./target/release/wok migrate strfry \
   --db /var/lib/strfry \
   --config /etc/strfry.conf \
-  --output /var/lib/wok
+  --output /var/lib/wok --confirm-relay-stopped
 
 # Review the generated config and manifest, then start Wok.
 ./target/release/wok --config /var/lib/wok/wok.toml relay
 ```
 
 The output contains `db/`, `wok.toml`, and `migration-manifest.json`. The source
-database and config are never modified. The output directory must not already
+authoritative data and config are unchanged; registered reader coordination can
+update LMDB's `lock.mdb`. The output directory must not already
 exist. See [Migration from strfry](docs/migration-from-strfry.md) for cutover,
 verification, and rollback.
 
@@ -117,10 +121,12 @@ Available operator commands:
 
 | Command | Notes |
 |---|---|
-| `migrate strfry --db <dir> --config <file> --output <dir> [--check]` | Read-only preflight or verified, one-way migration into a Wok-owned database (`--json` with `--check`) |
+| `migrate strfry --db <dir> --config <file> --output <dir> [--check]` | Direct read-only strfry v3 → RocksDB import; copying requires `--confirm-relay-stopped` |
+| `migrate rocksdb --source <dir> --output <dir> [--check] [--json]` | Offline full-state Wok LMDB v4/v5 → RocksDB copy; copying requires `--confirm-relay-stopped` |
+| `backup --output <new-directory>`, `storage-backend`, `rocksdb-check` | Native checkpoint (relay stopped), runtime identity, offline physical audit |
 | `relay` | WS (+ optional Unix) relay |
 | `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse` |
-| `scan`, `event <levId>`, `info`, `delete`, `compact`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |
+| `scan`, `event <levId>`, `info`, `delete`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |
 | `config show [--overrides \| --defaults]` | Effective configuration with each value's origin: default, preset, or file line (`--overrides`: only values the file changes from its preset; `--defaults`: every setting with the preset's value) |
 | `config minimize [--dry-run]` | Remove settings that repeat the preset's values, keeping comments and a `.bak` backup (`--dry-run`: print a diff) |
 | `doctor [--json]` | Config, storage, index, payload, negentropy, capacity, and runtime-path diagnostics |
@@ -134,7 +140,7 @@ Available operator commands:
 Before cutover or after an unclean shutdown, run `wok --config wok.toml
 doctor`. It validates every event-derived index semantically, decompresses
 payloads and matches their IDs to packed records, opens every negentropy tree,
-checks the Wok database marker and host endianness, reports LMDB map/disk
+checks the Wok database marker, reports RocksDB health and free disk
 capacity, and verifies configured plugin and Unix-socket paths. `--json` emits
 the complete machine-readable report; failures exit nonzero.
 
@@ -151,9 +157,9 @@ backup directory and a `reindex-manifest.json` records the operation.
 ```
 crates/
   wok-event       Event JSON, NIP-01 hashing (tao::json-exact), Schnorr, PackedEvent
-  wok-db          Wok storage, strfry v3 snapshot/import, transactions, integrity
+  wok-db          RocksDB storage, read-only LMDB imports, transactions, integrity
   wok-query       Filters, DBScan, QueryScheduler, ActiveMonitors
-  wok-negentropy  NIP-77 protocol, Vector storage, persistent BTreeLMDB
+  wok-negentropy  NIP-77 protocol, Vector storage, persistent B-tree
   wok-relay       Transport-neutral dispatcher, writer, AUTH, plugins, cron
   wok-ws          HTTP + WebSocket transport (in-house codec, permessage-deflate)
   wok-unix        Length-prefixed Unix SOCK_STREAM transport
@@ -163,27 +169,61 @@ crates/
 ```
 
 Threading model: Tokio only at transport boundaries; dedicated synchronous OS
-threads own LMDB. Transactions, cursors, and mmap borrows never cross an
-`.await`. One application-level LMDB writer with bounded queues; worker pools
+threads own storage. Transactions, cursors, and borrowed records never cross an
+`.await`. One application-level writer with bounded queues; worker pools
 per stage (`numThreads.*`) with connections hashed onto workers like C++
 `ThreadPool`.
 
 ## Benchmarks
 
-Harness: `wok-bench` uses disposable databases, deterministic signed corpora,
-rotated relay order, and correctness gates before speed. Local process
-comparisons, two-host load campaigns, and same-host Unix/WebSocket comparisons
-are separate experiments so network RTT is not confused with transport cost.
+We compared **Wok's optimized RocksDB candidate** with **strfry 1.1.3** over
+WebSocket on separate relay/load hosts with identical 15-million-event signed
+histories. Runs offered 1,000 queries/second alongside 1,000 or 4,000
+writes/second. Queries covered exact IDs, author history, 500-author feeds and
+tags. Each rate was repeated with reversed relay order: ten minutes at 1,000
+writes/second and five at 4,000. Checks verified bodies, ordering, completion
+and readback of every accepted write.
 
-Reproduce:
+Four later **fastr** runs covered the same workload and 16 query cases. fastr
+used buffered write acknowledgments without an fsync barrier; its write latency
+has a different durability guarantee.
+
+| Measurement | Wok RocksDB | strfry | fastr (buffered ACKs, later runs) |
+| --- | ---: | ---: | ---: |
+| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms | 52.2 ms–20.3 s |
+| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms | 266.9–269.2 s |
+| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms | 227.0–227.1 s |
+| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms | 83.9–85.7 ms |
+
+Latency runs from scheduled arrival to EOSE/acknowledgement, including client
+and network delay. Ranges span individual trial percentiles without pooling.
+fastr accumulated queues under sustained mixed traffic; its seconds-long values
+include waiting before send. Wok reduced read p99 versus strfry by **34–61% in
+all 16 matched cases**, with a worse rare read tail in one run. Finite,
+prewarmed runs do not establish maximum capacity
+or equal power-loss durability. Writers used different authors from the queries.
+A separate one-hour correctness soak checked 500-author latest feeds between
+write batches, live delivery, restart and acknowledged-write
+process-crash recovery.
+
+Results describe the measured RocksDB candidate at
+[`11fdf70`](https://github.com/erskingardner/wok/commit/11fdf700a9099aa7c8b0af357cce45832bf6c5c8)
+and fastr at
+[`bdbc0bc`](https://github.com/arx-ccn/fastr/commit/bdbc0bc053ad66df444eb47a02aa468e0109775d),
+before the single-runtime release preparation; they do not measure every later
+release change. [Evidence and limits](https://github.com/erskingardner/wok/pull/294)
+· [Matched campaign instructions](https://github.com/erskingardner/wok/tree/master/tools/relay-matched).
+
+For a smaller local comparison with the current RocksDB runtime:
 
 ```bash
-cargo build --release -p wok-cli -p wok-bench
+cargo build --release --locked -p wok-cli -p wok-bench
 ./target/release/wok-bench --profile full --out bench-results \
   --strfry /path/to/strfry --wok ./target/release/wok --seed 1
 ```
 
-Details and methodology: [docs/benchmarks.md](docs/benchmarks.md).
+Build requirements and full-state upgrades: [RocksDB migration guide](docs/migration-to-rocksdb.md).
+Harness and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 NIP-50 design, semantics, and search workload: [docs/nip50-search.md](docs/nip50-search.md).
 
 ## Differences from strfry

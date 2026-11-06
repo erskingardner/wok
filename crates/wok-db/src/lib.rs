@@ -1,36 +1,55 @@
-//! Wok's LMDB storage and the read-only strfry v3 migration boundary.
+//! Wok's RocksDB storage and the read-only LMDB migration boundary.
 //!
 //! # Transaction safety
 //!
-//! LMDB transactions, cursors, and mmap-backed slices obtained from this crate
+//! Database transactions, cursors, and borrowed slices obtained from this crate
 //! must never cross a Tokio `.await` point. Callers should run database work on
 //! dedicated OS threads and copy results into owned values before awaiting.
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
+#[path = "migration/backend.rs"]
+pub mod backend_migration;
+pub mod backup;
 pub mod comparators;
 mod deletion_protection;
+
+#[path = "rocks/env.rs"]
 pub mod env;
 pub mod error;
 pub mod fbs;
+pub mod index;
 pub mod integrity;
 pub mod keys;
 pub mod long_tags;
 pub mod lookup;
 pub mod migration;
 pub mod moderation;
+#[cfg(feature = "op-log")]
+pub mod op_log;
 pub mod payload;
 pub mod purge;
+#[cfg(feature = "rocksdb-read-diagnostics")]
+pub mod read_diagnostics;
 pub mod reindex;
+
+mod rocks;
 pub mod schema;
 pub mod search;
 pub mod tag_kind;
+
+#[path = "rocks/txn.rs"]
 pub mod txn;
 pub mod vanish;
 pub mod write;
 
+pub use backend_migration::{
+    audit_strfry_source, inspect_lmdb_source, inspect_strfry_source, migrate_lmdb_to_rocksdb,
+    migrate_strfry_to_rocksdb, LmdbSourceReport, LmdbTableInfo, LmdbTableVerification,
+    LmdbToRocksOptions, LmdbToRocksReport, StrfrySourceAudit,
+};
 pub use deletion_protection::is_deletion_protected_json;
-pub use env::{lmdb_version, Env, EnvOptions, EnvironmentStats};
+pub use env::{Env, EnvOptions, EnvironmentStats, RocksDbOptions};
 pub use error::DbError;
 pub use fbs::{
     decode_compression_dictionary, decode_meta, decode_negentropy_filter,
@@ -49,8 +68,7 @@ pub use lookup::{
 };
 pub use migration::{
     event_fingerprint, event_fingerprint_excluding, event_fingerprint_without_hashed_tag_values,
-    snapshot_lmdb_readonly, verify_events, EventFingerprint, EventVerificationFailure,
-    EventVerificationReport,
+    verify_events, EventFingerprint, EventVerificationFailure, EventVerificationReport,
 };
 pub use moderation::{
     allow_event, allow_kind, allow_pubkey, allowed_pubkey_reason_ro, assign_role, ban_event,
@@ -70,6 +88,8 @@ pub use payload::{
 };
 pub use purge::{count_superseded_ro, purge_superseded, SupersededHistory};
 pub use reindex::{rebuild_primary_and_event_indices, PackedEventRebuild, ReindexStats};
+
+pub use rocks::author_heads::{AuthorHead, AuthorPosition};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use search::{
     build_search_index, count_phrase_pairs, event_search_terms, finish_search_index,
@@ -101,3 +121,9 @@ pub mod state;
 
 #[cfg(test)]
 mod crash_tests;
+
+/// The sole supported runtime storage format. The identity is retained so
+/// existing verified v3 RocksDB databases and benchmark evidence stay compatible.
+pub fn storage_backend_name() -> &'static str {
+    "rocksdb-author-heads-experimental"
+}

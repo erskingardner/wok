@@ -6,7 +6,7 @@ Operator and design documentation. Code remains the authority for current behavi
 
 | File | Read when |
 | --- | --- |
-| `architecture.md` | Threading, crate boundaries, I/O vs LMDB |
+| `architecture.md` | Threading, crate boundaries, I/O vs synchronous storage |
 | `nips.md` | Advertised NIPs, pin, what is *not* advertised |
 | `compatibility-policy.md` | NIPs-first vs strfry; what migration promises |
 | `known-differences.md` | Intentional divergences from C++ |
@@ -19,8 +19,9 @@ Operator and design documentation. Code remains the authority for current behavi
 | File | Topic |
 | --- | --- |
 | `migration-from-strfry.md` | `wok migrate strfry` |
+| `migration-to-rocksdb.md` | Offline full-state Wok LMDB v4/v5 conversion, directory backups and rollback |
 | `cutover.md` | Cutover / rollback |
-| `production-deployment.md` | Hardening a live relay; macOS LMDB semaphore exhaustion (ENOSPC at `Env::open`) |
+| `production-deployment.md` | Hardening a live relay; macOS LMDB-import semaphore exhaustion |
 | `security.md` | Threat model, fuzzing, unsafe policy |
 | `attack-surface.md` | Every entry point, who reaches it, its gate; test-checked inventory and profiles |
 | `observability.md` | Metrics / tracing |

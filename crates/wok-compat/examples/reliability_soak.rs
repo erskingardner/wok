@@ -18,8 +18,10 @@ use wire::Wire;
 /// NIP-09 gives a deletion request against a deletion request no effect, so
 /// every kind 5 stays stored. Notes past the retained window are deleted in
 /// one request per author every this many rounds. For the longest soak
-/// (21600 one-second rounds) that keeps at most 5760 requests and 736 notes,
-/// so the model stays below the configured 30000-event history limit.
+/// (21600 one-second rounds) that keeps at most 5760 ordinary deletion
+/// requests, 2880 feed deletion requests, and bounded notes/replacements,
+/// so even with 20498 initial notes the model stays below the configured
+/// 30000-event history limit.
 const DELETE_EVERY_ROUNDS: u64 = 15;
 
 fn now() -> u64 {
@@ -31,6 +33,12 @@ fn now() -> u64 {
 fn event(key: &Keypair, kind: u64, tags: Value, content: String) -> Value {
     wok_compat::sign_event_with_key(
         json!({"created_at":now(),"kind":kind,"tags":tags,"content":content}),
+        key,
+    )
+}
+fn feed_event(key: &Keypair, created_at: u64, content: String) -> Value {
+    wok_compat::sign_event_with_key(
+        json!({"created_at":created_at,"kind":1,"tags":[["t","soak"]],"content":content}),
         key,
     )
 }
@@ -58,6 +66,123 @@ async fn subscribe(endpoint: &str, tag: &str) -> Result<Wire> {
     w.send(json!(["REQ","live",{"#t":[tag],"limit":0}])).await?;
     ensure!(w.recv().await? == json!(["EOSE", "live"]), "live setup");
     Ok(w)
+}
+async fn subscribe_feed(endpoint: &str, authors: &[String]) -> Result<Wire> {
+    let mut wire = Wire::connect(endpoint).await?;
+    wire.send(json!(["REQ","live",{"authors":authors,"kinds":[1],"limit":0}]))
+        .await?;
+    ensure!(wire.recv().await? == json!(["EOSE", "live"]), "feed setup");
+    Ok(wire)
+}
+
+async fn author_feed(
+    endpoint: &str,
+    authors: &[String],
+    model: &BTreeMap<String, Value>,
+    hist: &mut Histogram<u64>,
+) -> Result<()> {
+    let selected: BTreeSet<_> = authors.iter().map(String::as_str).collect();
+    let mut expected: Vec<_> = model
+        .values()
+        .filter(|e| e["kind"] == 1 && selected.contains(e["pubkey"].as_str().unwrap()))
+        .cloned()
+        .collect();
+    expected.sort_unstable_by_key(|e| std::cmp::Reverse(e["created_at"].as_u64().unwrap()));
+    ensure!(
+        expected
+            .windows(2)
+            .all(|w| w[0]["created_at"] != w[1]["created_at"]),
+        "feed fixture must avoid ambiguous timestamp ties"
+    );
+    let total = expected.len();
+    expected.truncate(50);
+    let start = Instant::now();
+    let mut wire = Wire::connect(endpoint).await?;
+    wire.send(json!(["REQ","feed",{"authors":authors,"kinds":[1],"limit":50}]))
+        .await?;
+    let mut actual = Vec::new();
+    loop {
+        let frame = wire.recv().await?;
+        ensure!(frame[1] == "feed", "unexpected feed subscription: {frame}");
+        if frame[0] == "EOSE" {
+            break;
+        }
+        ensure!(frame[0] == "EVENT", "feed frame: {frame}");
+        actual.push(frame[2].clone());
+        ensure!(actual.len() <= 50, "feed limit exceeded");
+    }
+    ensure!(
+        actual == expected,
+        "500-author feed changed order, IDs or full bodies"
+    );
+    hist.record(start.elapsed().as_micros().max(1) as u64)?;
+    wire.send(json!(["COUNT","feed-count",{"authors":authors,"kinds":[1]}]))
+        .await?;
+    let count = wire.recv().await?;
+    ensure!(
+        count[0] == "COUNT" && count[1] == "feed-count" && count[2]["count"] == total,
+        "feed COUNT mismatch: {count}"
+    );
+    Ok(())
+}
+
+struct Connections {
+    writers: Vec<Wire>,
+    readers: Vec<Wire>,
+    feed_readers: Vec<Wire>,
+    slow: Vec<Wire>,
+}
+impl Connections {
+    async fn connect(endpoints: &[&str; 2], authors: &[String]) -> Result<Self> {
+        let mut result = Self {
+            writers: Vec::new(),
+            readers: Vec::new(),
+            feed_readers: Vec::new(),
+            slow: Vec::new(),
+        };
+        for i in 0..8 {
+            result.writers.push(Wire::connect(endpoints[i % 2]).await?);
+        }
+        for i in 0..4 {
+            result
+                .readers
+                .push(subscribe(endpoints[i % 2], "soak").await?);
+        }
+        for endpoint in endpoints {
+            result
+                .feed_readers
+                .push(subscribe_feed(endpoint, authors).await?);
+            result.slow.push(subscribe(endpoint, "soak-slow").await?);
+        }
+        Ok(result)
+    }
+    fn clear(&mut self) {
+        self.writers.clear();
+        self.readers.clear();
+        self.feed_readers.clear();
+        self.slow.clear();
+    }
+}
+
+async fn recover(
+    phase: &str,
+    output: &Path,
+    endpoints: &[&str; 2],
+    authors: &[String],
+    model: &BTreeMap<String, Value>,
+    hist: &mut Histogram<u64>,
+) -> Result<Connections> {
+    std::fs::write(output.join(format!("{phase}.request")), b"ready")?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !output.join(format!("{phase}.ready")).exists() {
+        ensure!(Instant::now() < deadline, "{phase} deadline");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for endpoint in endpoints {
+        history(endpoint, model, hist).await?;
+        author_feed(endpoint, authors, model, hist).await?;
+    }
+    Connections::connect(endpoints, authors).await
 }
 async fn live(w: &mut Wire, events: &[Value]) -> Result<()> {
     let mut expected: BTreeMap<_, _> = events
@@ -176,6 +301,24 @@ async fn main() -> Result<()> {
     let seed: u64 = args[5].parse()?;
     let mut rng = StdRng::seed_from_u64(seed);
     let keys: Vec<_> = (0..4).map(|_| Keypair::new(SECP256K1, &mut rng)).collect();
+    let feed_keys: Vec<_> = (0..2).map(|_| Keypair::new(SECP256K1, &mut rng)).collect();
+    let seeded_feed_keys: Vec<_> = (0..498)
+        .map(|_| Keypair::new(SECP256K1, &mut rng))
+        .collect();
+    let mut feed_authors: Vec<_> = feed_keys
+        .iter()
+        .map(|key| hex::encode(key.x_only_public_key().0.serialize()))
+        .collect();
+    feed_authors.extend(
+        seeded_feed_keys
+            .iter()
+            .map(|key| hex::encode(key.x_only_public_key().0.serialize())),
+    );
+    feed_authors.sort_unstable();
+    feed_authors.dedup();
+    ensure!(feed_authors.len() == 500, "500 distinct feed authors");
+    // Unique, already-past timestamps make the exact newest50 deterministic.
+    let feed_epoch = now().saturating_sub(50_000);
     let mut writers = Vec::new();
     for i in 0..8 {
         writers.push(Wire::connect(endpoints[i % 2]).await?);
@@ -202,20 +345,34 @@ async fn main() -> Result<()> {
             model.insert(e["id"].as_str().unwrap().into(), e);
         }
     }
+    // Populate every inactive feed range before the two active authors append.
+    // All 498 timestamps are unique and older than every active feed note.
+    let seeded_feed: Vec<_> = seeded_feed_keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            feed_event(
+                key,
+                feed_epoch - seeded_feed_keys.len() as u64 + i as u64,
+                format!("feed seed {seed}/{i}"),
+            )
+        })
+        .collect();
+    publish(&mut writers, &seeded_feed, &mut ack_hist).await?;
+    for e in seeded_feed {
+        corpus.push_str(&wok_event::json::to_tao_string(&e));
+        corpus.push('\n');
+        model.insert(e["id"].as_str().unwrap().into(), e);
+    }
     std::fs::write(output.join("corpus.jsonl"), corpus)?;
     history(endpoints[0], &model, &mut query_hist).await?;
     sync(endpoints[1], &model).await?;
     ack_hist.reset();
     query_hist.reset();
-    let mut readers = Vec::new();
-    for i in 0..4 {
-        readers.push(subscribe(endpoints[i % 2], "soak").await?);
-    }
-    let mut slow = vec![
-        subscribe(endpoints[0], "soak-slow").await?,
-        subscribe(endpoints[1], "soak-slow").await?,
-    ];
+    drop(writers);
+    let mut connections = Connections::connect(&endpoints, &feed_authors).await?;
     let mut notes: VecDeque<(usize, String)> = VecDeque::new();
+    let mut feed_notes: VecDeque<(usize, String)> = VecDeque::new();
     let mut replacements: BTreeMap<(usize, u64), String> = BTreeMap::new();
     let start = Instant::now();
     let mut round = 0u64;
@@ -224,9 +381,13 @@ async fn main() -> Result<()> {
     let mut sync_rounds = 0;
     let mut slow_closes = 0;
     let mut restarted = false;
-    while start.elapsed() < duration {
+    let mut restart_round = None;
+    let mut crash_recovered = false;
+    let mut feed_checks = 0u64;
+    let mut author_live_deliveries = 0u64;
+    while start.elapsed() < duration || !crash_recovered {
         let tick = Instant::now();
-        if round % 60 == 0 {
+        if round.is_multiple_of(60) {
             // Dedicated ephemeral pressure frames must never appear in the
             // durable model or on the unrelated fast subscription.
             let pressure: Vec<_> = (0..64)
@@ -239,7 +400,7 @@ async fn main() -> Result<()> {
                     )
                 })
                 .collect();
-            publish(&mut writers, &pressure, &mut ack_hist).await?;
+            publish(&mut connections.writers, &pressure, &mut ack_hist).await?;
             pressure_receipts += pressure.len() as u64;
         }
         let mut batch = Vec::new();
@@ -272,7 +433,7 @@ async fn main() -> Result<()> {
             batch.push(e);
         }
         let mut removed: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        while round % DELETE_EVERY_ROUNDS == 0 && notes.len() > 256 {
+        while round.is_multiple_of(DELETE_EVERY_ROUNDS) && notes.len() > 256 {
             let (actor, id) = notes.pop_front().unwrap();
             model.remove(&id);
             removed.entry(actor).or_default().push(id);
@@ -289,21 +450,58 @@ async fn main() -> Result<()> {
             model.insert(e["id"].as_str().unwrap().to_string(), e.clone());
             batch.push(e);
         }
-        publish(&mut writers, &batch, &mut ack_hist).await?;
-        for reader in &mut readers {
+        let mut feed_batch = Vec::new();
+        for (actor, key) in feed_keys.iter().enumerate() {
+            let e = feed_event(
+                key,
+                feed_epoch + round * 2 + actor as u64,
+                format!("same-author feed {round}/{actor}"),
+            );
+            let id = e["id"].as_str().unwrap().to_owned();
+            model.insert(id.clone(), e.clone());
+            feed_notes.push_back((actor, id));
+            feed_batch.push(e.clone());
+            batch.push(e);
+        }
+        let mut removed_feed: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        while round.is_multiple_of(DELETE_EVERY_ROUNDS) && feed_notes.len() > 64 {
+            let (actor, id) = feed_notes.pop_front().unwrap();
+            model.remove(&id);
+            removed_feed.entry(actor).or_default().push(id);
+        }
+        for (actor, ids) in removed_feed {
+            let mut tags = vec![json!(["t", "soak"])];
+            tags.extend(ids.into_iter().map(|id| json!(["e", id])));
+            let e = event(
+                &feed_keys[actor],
+                5,
+                json!(tags),
+                format!("delete feed {round}/{actor}"),
+            );
+            model.insert(e["id"].as_str().unwrap().into(), e.clone());
+            batch.push(e);
+        }
+        publish(&mut connections.writers, &batch, &mut ack_hist).await?;
+        for reader in &mut connections.readers {
             live(reader, &batch).await?;
         }
+        for reader in &mut connections.feed_readers {
+            live(reader, &feed_batch).await?;
+        }
+        author_live_deliveries += (feed_batch.len() * connections.feed_readers.len()) as u64;
         receipts += batch.len() as u64;
-        if round % 15 == 0 {
+        if round.is_multiple_of(15) {
             for endpoint in endpoints {
                 history(endpoint, &model, &mut query_hist).await?;
+                author_feed(endpoint, &feed_authors, &model, &mut query_hist).await?;
+                feed_checks += 1;
             }
             sync_rounds += sync(endpoints[(round / 15) as usize % 2], &model).await?;
         }
-        if round > 0 && round % 60 == 0 {
-            readers[0] = subscribe(endpoints[0], "soak").await?;
-            readers[1] = subscribe(endpoints[1], "soak").await?;
-            for (i, wire) in slow.iter_mut().enumerate() {
+        if round > 0 && round.is_multiple_of(60) {
+            connections.readers[0] = subscribe(endpoints[0], "soak").await?;
+            connections.readers[1] = subscribe(endpoints[1], "soak").await?;
+            for (i, wire) in connections.slow.iter_mut().enumerate() {
                 if slow_closed(wire).await {
                     slow_closes += 1;
                 }
@@ -311,35 +509,45 @@ async fn main() -> Result<()> {
             }
         }
         if !restarted && start.elapsed() > duration / 2 {
-            writers.clear();
-            readers.clear();
-            slow.clear();
-            std::fs::write(output.join("restart.request"), b"ready")?;
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while !output.join("restart.ready").exists() {
-                ensure!(Instant::now() < deadline, "restart deadline");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            for endpoint in endpoints {
-                history(endpoint, &model, &mut query_hist).await?;
-            }
-            for i in 0..8 {
-                writers.push(Wire::connect(endpoints[i % 2]).await?);
-            }
-            for i in 0..4 {
-                readers.push(subscribe(endpoints[i % 2], "soak").await?);
-            }
-            slow = vec![
-                subscribe(endpoints[0], "soak-slow").await?,
-                subscribe(endpoints[1], "soak-slow").await?,
-            ];
+            connections.clear();
+            connections = recover(
+                "restart",
+                output,
+                &endpoints,
+                &feed_authors,
+                &model,
+                &mut query_hist,
+            )
+            .await?;
+            feed_checks += 2;
+            sync_rounds += sync(endpoints[0], &model).await?;
             restarted = true;
+            restart_round = Some(round);
+        }
+        if restarted
+            && !crash_recovered
+            && restart_round != Some(round)
+            && start.elapsed() > duration * 3 / 4
+        {
+            connections.clear();
+            connections = recover(
+                "crash",
+                output,
+                &endpoints,
+                &feed_authors,
+                &model,
+                &mut query_hist,
+            )
+            .await?;
+            feed_checks += 2;
+            sync_rounds += sync(endpoints[1], &model).await?;
+            crash_recovered = true;
         }
         round += 1;
-        if round % 10 == 0 {
+        if round.is_multiple_of(10) {
             println!(
                 "{}",
-                json!({"phase":"mixed","seconds":start.elapsed().as_secs_f64(),"rounds":round,"receipts":receipts,"pressure_receipts":pressure_receipts,"stored":model.len(),"ack_p99_ms":ack_hist.value_at_quantile(0.99) as f64/1000.0,"ack_max_ms":ack_hist.max() as f64/1000.0,"query_p99_ms":query_hist.value_at_quantile(0.99) as f64/1000.0,"sync_rounds":sync_rounds,"slow_closes":slow_closes,"restarted":restarted})
+                json!({"phase":"mixed","seconds":start.elapsed().as_secs_f64(),"rounds":round,"receipts":receipts,"pressure_receipts":pressure_receipts,"stored":model.len(),"ack_p99_ms":ack_hist.value_at_quantile(0.99) as f64/1000.0,"ack_max_ms":ack_hist.max() as f64/1000.0,"query_p99_ms":query_hist.value_at_quantile(0.99) as f64/1000.0,"sync_rounds":sync_rounds,"slow_closes":slow_closes,"restarted":restarted,"crash_recovered":crash_recovered,"author_feed_checks":feed_checks})
             );
         }
         if let Some(remaining) = Duration::from_secs(1).checked_sub(tick.elapsed()) {
@@ -348,13 +556,16 @@ async fn main() -> Result<()> {
     }
     for endpoint in endpoints {
         history(endpoint, &model, &mut query_hist).await?;
+        author_feed(endpoint, &feed_authors, &model, &mut query_hist).await?;
+        feed_checks += 1;
     }
     sync_rounds += sync(endpoints[0], &model).await?;
     ensure!(restarted, "restart phase did not run");
+    ensure!(crash_recovered, "crash recovery phase did not run");
     if duration.as_secs() >= 180 {
         ensure!(slow_closes > 0, "slow clients never observed closing");
     }
-    let result = json!({"ok":true,"seconds":start.elapsed().as_secs_f64(),"seed":seed,"rounds":round,"receipts":receipts,"pressure_receipts":pressure_receipts,"live_deliveries":receipts*4,"stored":model.len(),"sync_rounds":sync_rounds,"slow_closes":slow_closes,"restart_verified":restarted,"ack_p50_ms":ack_hist.value_at_quantile(0.5) as f64/1000.0,"ack_p99_ms":ack_hist.value_at_quantile(0.99) as f64/1000.0,"ack_max_ms":ack_hist.max() as f64/1000.0,"query_p99_ms":query_hist.value_at_quantile(0.99) as f64/1000.0,"query_max_ms":query_hist.max() as f64/1000.0});
+    let result = json!({"ok":true,"seconds":start.elapsed().as_secs_f64(),"seed":seed,"rounds":round,"receipts":receipts,"pressure_receipts":pressure_receipts,"live_deliveries":receipts*4,"author_live_deliveries":author_live_deliveries,"author_feed_checks":feed_checks,"feed_author_count":feed_authors.len(),"stored":model.len(),"sync_rounds":sync_rounds,"slow_closes":slow_closes,"restart_verified":restarted,"crash_recovery_verified":crash_recovered,"crash_scope":"SIGKILL after fully acknowledged batch; no in-flight/power-loss claim","ack_p50_ms":ack_hist.value_at_quantile(0.5) as f64/1000.0,"ack_p99_ms":ack_hist.value_at_quantile(0.99) as f64/1000.0,"ack_max_ms":ack_hist.max() as f64/1000.0,"query_p99_ms":query_hist.value_at_quantile(0.99) as f64/1000.0,"query_max_ms":query_hist.max() as f64/1000.0});
     std::fs::write(
         output.join("driver-result.json"),
         serde_json::to_vec_pretty(&result)?,

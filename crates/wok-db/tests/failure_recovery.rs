@@ -2,9 +2,8 @@ use std::process::Command;
 
 use serde_json::json;
 use tempfile::TempDir;
-use wok_db::{
-    check_integrity, write_events, DbError, Env, EnvOptions, EventToWrite, NoopNegentropy,
-};
+
+use wok_db::{check_integrity, write_events, Env, EnvOptions, EventToWrite, NoopNegentropy};
 use wok_event::{parse_and_verify_event, EventLimits};
 
 const CRASH_CHILD_ENV: &str = "WOK_DB_CRASH_CHILD";
@@ -101,54 +100,4 @@ fn restart_after_writer_crash_preserves_only_committed_events() {
     assert_eq!(report.events, 1, "uncommitted event survived process death");
 }
 
-fn constrained_options() -> EnvOptions {
-    EnvOptions {
-        map_size: 4 * 1024 * 1024,
-        ..EnvOptions::default()
-    }
-}
-
-#[test]
-fn map_full_aborts_the_entire_transaction() {
-    let directory = TempDir::new().unwrap();
-    let env = Env::open(directory.path(), constrained_options()).unwrap();
-    env.ensure_initialized().unwrap();
-    let mut baseline = signed_event("committed before map exhaustion", 1_800_000_000);
-    write_and_commit(&env, &mut baseline);
-    let before = wok_db::event_fingerprint(&env).unwrap();
-    let dbi = env.dbis().event_payload;
-    let value = vec![0x5a; 128 * 1024];
-    let mut txn = env.begin_rw().unwrap();
-    wok_db::delete_event_basic(&mut txn, baseline.lev_id).unwrap();
-    let mut uncommitted = [signed_event("uncommitted replacement", 1_800_000_001)];
-    write_events(&mut txn, &mut NoopNegentropy, &mut uncommitted, false).unwrap();
-    assert_eq!(uncommitted[0].lev_id, 2);
-    let mut map_full = false;
-
-    for key in 100..=1_124 {
-        match txn.put_u64(dbi, key, &value, 0) {
-            Ok(_) => {}
-            Err(DbError::Lmdb(code, _)) if code == lmdb_sys::MDB_MAP_FULL => {
-                map_full = true;
-                break;
-            }
-            Err(error) => panic!("unexpected LMDB failure: {error}"),
-        }
-    }
-    assert!(map_full, "fixture did not exhaust the constrained LMDB map");
-    drop(txn);
-    drop(env);
-
-    let reopened = Env::open(directory.path(), constrained_options()).unwrap();
-    assert_eq!(wok_db::event_fingerprint(&reopened).unwrap(), before);
-    let txn = reopened.begin_ro().unwrap();
-    assert_eq!(txn.entries(reopened.dbis().event_payload).unwrap(), 1);
-    assert_eq!(wok_db::state::high_water_ro(&txn).unwrap(), Some(1));
-    let report = check_integrity(&txn).unwrap();
-    assert!(report.ok(), "{report:#?}");
-    drop(txn);
-    let mut probe = signed_event("retry after map exhaustion", 1_800_000_002);
-    write_and_commit(&reopened, &mut probe);
-    assert_eq!(probe.lev_id, 2);
-    assert!(check_integrity(&reopened.begin_ro().unwrap()).unwrap().ok());
-}
+// Exercises an LMDB-specific on-disk/reader-table constraint.

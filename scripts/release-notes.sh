@@ -2,14 +2,12 @@
 set -euo pipefail
 
 version=${1:-}
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "version must match MAJOR.MINOR.PATCH, got: ${version:-<empty>}" >&2
-  exit 1
-fi
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+python3 "$script_dir/release-version.py" "$version" >/dev/null
 
 notes=$(
   awk -v version="$version" '
-    $0 ~ "^## \\[" version "\\] - " { found = 1; next }
+    index($0, "## [" version "] - ") == 1 { found = 1; next }
     found && /^## \[/ { exit }
     found && /^\[Unreleased\]:/ { exit }
     found { print }

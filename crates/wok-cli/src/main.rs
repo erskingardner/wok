@@ -18,6 +18,7 @@ mod config_show;
 mod doctor;
 mod mesh;
 mod migrate;
+mod migrate_rocksdb;
 mod reindex;
 mod router;
 mod sync;
@@ -105,13 +106,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a verified Wok-owned database from another relay
+    /// Create a verified database from strfry or Wok LMDB
     Migrate {
         #[command(subcommand)]
         cmd: MigrateCmd,
     },
     Relay,
     Info,
+    /// Print the storage backend compiled into this binary without opening a database
+    StorageBackend,
+    /// Back up the configured database to a new directory (stop a RocksDB relay first)
+    Backup {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify every RocksDB primary, signature, author frontier and table count offline
+    RocksdbCheck,
     /// Inspect the configuration file
     Config {
         #[command(subcommand)]
@@ -186,9 +196,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    Compact {
-        output_file: PathBuf,
-    },
     Monitor,
     Dict {
         #[command(subcommand)]
@@ -225,6 +232,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum MigrateCmd {
+    /// Copy a stopped Wok LMDB v4/v5 database into a verified new RocksDB database
+    Rocksdb(migrate_rocksdb::Options),
     /// Import a strfry LMDB v3 database and config without modifying either
     Strfry {
         /// strfry LMDB environment directory
@@ -236,6 +245,9 @@ enum MigrateCmd {
         /// Inspect source, translation, capacity, and runtime use without copying
         #[arg(long)]
         check: bool,
+        /// Confirm strfry and every other source user have been stopped
+        #[arg(long)]
+        confirm_relay_stopped: bool,
         /// Emit a machine-readable preflight report (requires --check)
         #[arg(long, requires = "check")]
         json: bool,
@@ -306,15 +318,7 @@ enum NegCmd {
 }
 
 fn open_env(cfg: &Config) -> Result<Env> {
-    let env = Env::open(
-        &cfg.db,
-        EnvOptions {
-            max_readers: cfg.db_maxreaders,
-            map_size: cfg.db_mapsize,
-            no_read_ahead: cfg.db_no_read_ahead,
-            ..EnvOptions::default()
-        },
-    )?;
+    let env = Env::open(&cfg.db, cfg.db_options())?;
     env.ensure_initialized()?;
     Ok(env)
 }
@@ -331,6 +335,36 @@ fn load_cfg(path: &Path) -> Result<Config> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let Cli { config, cmd } = Cli::parse();
+    // Backend selection and explicit-path migration must work even when the
+    // service configuration is absent, invalid, or names the other backend.
+    let cmd = match cmd {
+        Command::StorageBackend => {
+            cli_println!("{}", wok_db::storage_backend_name());
+            return Ok(());
+        }
+        Command::Migrate { cmd } => {
+            init_tracing(None)?;
+            return match cmd {
+                MigrateCmd::Rocksdb(options) => migrate_rocksdb::run(options),
+                MigrateCmd::Strfry {
+                    db,
+                    output,
+                    check,
+                    confirm_relay_stopped,
+                    json,
+                } => {
+                    if check {
+                        migrate::check_strfry(&db, &config, &output, json)
+                    } else if !confirm_relay_stopped {
+                        bail!("stop strfry and every other source user, then pass --confirm-relay-stopped");
+                    } else {
+                        migrate::migrate_strfry(&db, &config, &output)
+                    }
+                }
+            };
+        }
+        cmd => cmd,
+    };
     let startup_cfg = if config.exists() {
         Config::load(&config).ok()
     } else {
@@ -338,22 +372,6 @@ async fn main() -> Result<()> {
     };
     init_tracing(startup_cfg.as_ref())?;
     let cmd = match cmd {
-        Command::Migrate { cmd } => {
-            return match cmd {
-                MigrateCmd::Strfry {
-                    db,
-                    output,
-                    check,
-                    json,
-                } => {
-                    if check {
-                        migrate::check_strfry(&db, &config, &output, json)
-                    } else {
-                        migrate::migrate_strfry(&db, &config, &output)
-                    }
-                }
-            };
-        }
         Command::Config { cmd } => {
             let shown = match cmd {
                 ConfigCmd::Show {
@@ -379,9 +397,30 @@ async fn main() -> Result<()> {
     let cfg = load_cfg(&config)?;
     match cmd {
         Command::Migrate { .. } => unreachable!("migration was dispatched before config load"),
+        Command::StorageBackend => {
+            unreachable!("backend identity was dispatched before config load")
+        }
         Command::Config { .. } => unreachable!("config was dispatched before config load"),
         Command::Relay => cmd_relay(cfg, config).await,
         Command::Info => cmd_info(&cfg),
+        Command::Backup { output } => cmd_backup(&cfg, &output),
+
+        Command::RocksdbCheck => {
+            let env = Env::open(
+                &cfg.db,
+                EnvOptions {
+                    read_only: true,
+                    create_dir: false,
+                    create_dbis: false,
+                    ..cfg.db_options()
+                },
+            )?;
+            cli_println!(
+                "{}",
+                serde_json::to_string_pretty(&env.audit_rocksdb_layout()?)?
+            );
+            Ok(())
+        }
         Command::Doctor { json } => cmd_doctor(&cfg, &config, json),
         Command::Reindex {
             confirm_relay_stopped,
@@ -409,7 +448,6 @@ async fn main() -> Result<()> {
             dry_run,
         } => cmd_delete(&cfg, age, filter, dry_run),
         Command::PurgeSuperseded { dry_run, json } => cmd_purge_superseded(&cfg, dry_run, json),
-        Command::Compact { output_file } => cmd_compact(&cfg, &output_file),
         Command::Monitor => cmd_monitor(&cfg),
         Command::Dict { cmd } => cmd_dict(&cfg, cmd),
         Command::Negentropy { cmd } => cmd_neg(&cfg, cmd),
@@ -498,11 +536,10 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 }
 
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
-    let (major, minor, patch) = wok_db::lmdb_version();
     tracing::info!(
+        storage_backend = wok_db::storage_backend_name(),
         preset = %cfg.preset,
         wok = env!("CARGO_PKG_VERSION"),
-        lmdb = %format_args!("{major}.{minor}.{patch}"),
         "starting relay"
     );
     let warnings = [
@@ -632,6 +669,27 @@ async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
 fn cmd_info(cfg: &Config) -> Result<()> {
     let env = open_env(cfg)?;
     cli_println!("DB version: {}", env.db_version()?);
+    Ok(())
+}
+
+fn cmd_backup(cfg: &Config, output: &Path) -> Result<()> {
+    if !cfg.db.is_dir() {
+        bail!("configured database '{}' does not exist", cfg.db.display());
+    }
+    // A backup must not initialize or upgrade its source. LMDB supports a
+    // registered read-only snapshot; a native checkpoint needs RocksDB's
+    // exclusive writable open, so that backend's relay must be stopped first.
+    let env = Env::open(
+        &cfg.db,
+        EnvOptions {
+            read_only: false,
+            create_dir: false,
+            create_dbis: false,
+            ..cfg.db_options()
+        },
+    )?;
+    env.backup_to_directory(output)?;
+    cli_println!("Database backup created at {}", output.display());
     Ok(())
 }
 
@@ -1173,13 +1231,10 @@ fn cmd_purge_superseded(cfg: &Config, dry_run: bool, json: bool) -> Result<()> {
         let env = Env::open(
             &cfg.db,
             EnvOptions {
-                max_readers: cfg.db_maxreaders,
-                map_size: cfg.db_mapsize,
-                no_read_ahead: cfg.db_no_read_ahead,
                 create_dir: false,
                 create_dbis: false,
                 read_only: true,
-                ..EnvOptions::default()
+                ..cfg.db_options()
             },
         )?;
         let txn = env.begin_ro()?;
@@ -1205,16 +1260,6 @@ fn cmd_purge_superseded(cfg: &Config, dry_run: bool, json: bool) -> Result<()> {
             history.events,
             history.groups
         );
-    }
-    Ok(())
-}
-
-fn cmd_compact(cfg: &Config, output: &Path) -> Result<()> {
-    let env = open_env(cfg)?;
-    if output.as_os_str() == "-" {
-        env.compact_to_fd(1)?;
-    } else {
-        env.compact_to_path(output)?;
     }
     Ok(())
 }

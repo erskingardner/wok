@@ -6,7 +6,8 @@ use crate::filter::{FilterSetBytes, FilterSetUint, NostrFilter};
 use crate::subid::Subscription;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use wok_db::keys::{make_key_string_u64, parse_key_string_u64, u64_from_ne, u64_from_ne_checked};
+use wok_db::keys::u64_from_ne_checked;
+use wok_db::txn::Cursor;
 use wok_db::{
     count_phrase_pairs, event_search_terms, search_indexed_through_ro, search_posting_count,
     search_posting_exists, search_postings, Decompressor, RoTxn, SearchQuery,
@@ -15,7 +16,7 @@ use wok_event::PackedEventView;
 
 use crate::HyperLogLog;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CandidateEvent {
     packed: u64,
     lev_id: u64,
@@ -173,11 +174,56 @@ impl ScanPlan {
     }
 }
 
-fn cmp_cand(a: &CandidateEvent, b: &CandidateEvent) -> std::cmp::Ordering {
-    // Newer first; if equal created, higher levId first (matches C++ sort predicate).
-    b.created()
-        .cmp(&a.created())
-        .then_with(|| b.lev_id().cmp(&a.lev_id()))
+/// The heap's insertion sequence preserves the former stable sort's order
+/// when two index ranges name the same event.
+#[derive(PartialEq, Eq)]
+struct QueuedCandidate {
+    event: CandidateEvent,
+    sequence: u64,
+}
+
+impl Ord for QueuedCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.event
+            .created()
+            .cmp(&other.event.created())
+            .then_with(|| self.event.lev_id().cmp(&other.event.lev_id()))
+            .then_with(|| other.sequence.cmp(&self.sequence))
+            .then_with(|| self.event.scan_index().cmp(&other.event.scan_index()))
+    }
+}
+
+impl PartialOrd for QueuedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Default)]
+struct CandidateQueue {
+    heap: BinaryHeap<QueuedCandidate>,
+    next_sequence: u64,
+}
+
+impl CandidateQueue {
+    fn extend(&mut self, events: impl Iterator<Item = CandidateEvent>) {
+        for event in events {
+            let sequence = self.next_sequence;
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .expect("candidate insertion sequence exhausted");
+            self.heap.push(QueuedCandidate { event, sequence });
+        }
+    }
+
+    fn pop(&mut self) -> Option<CandidateEvent> {
+        self.heap.pop().map(|queued| queued.event)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
 }
 
 struct ScanCursor {
@@ -201,13 +247,11 @@ impl ScanCursor {
         !self.resume_key.is_empty()
     }
 
-    fn key_match(&self, k: &[u8]) -> bool {
+    fn key_match(&self, entry: &wok_db::index::IndexEntry<'_>) -> bool {
         match self.match_mode {
-            MatchMode::Prefix => k.starts_with(&self.search),
-            MatchMode::PrefixExactLen => {
-                k.len() == self.search.len() + 8 && k.starts_with(&self.search)
-            }
-            MatchMode::Kind(kind) => k.len() >= 8 && u64_from_ne(&k[0..8]) == kind,
+            MatchMode::Prefix => entry.prefix_matches(&self.search, false),
+            MatchMode::PrefixExactLen => entry.prefix_matches(&self.search, true),
+            MatchMode::Kind(kind) => entry.matches_kind(kind),
             MatchMode::Always => true,
         }
     }
@@ -215,8 +259,7 @@ impl ScanCursor {
     #[allow(clippy::too_many_arguments)]
     fn collect(
         &mut self,
-        txn: &RoTxn<'_>,
-        index_dbi: lmdb_sys::MDB_dbi,
+        cursor: &mut Cursor<'_>,
         scan_index: u64,
         since: u64,
         until: u64,
@@ -226,48 +269,50 @@ impl ScanCursor {
         let mut added = 0u64;
         while self.active() && limit > 0 {
             let start_key = self.resume_key.clone();
-            let start_dup = self.resume_val.to_ne_bytes();
             let mut finished_naturally = true;
             let mut stop = false;
             let mut scan_err = None;
-            txn.foreach_full(index_dbi, &start_key, &start_dup, true, |k, v| {
+            cursor.foreach_index(&start_key, self.resume_val, |entry| {
                 if limit == 0 {
-                    self.resume_key = k.to_vec();
-                    match u64_from_ne_checked(v) {
-                        Ok(n) => self.resume_val = n,
+                    self.resume_key = entry.to_key();
+                    match entry.local_id() {
+                        Ok(id) => self.resume_val = id,
                         Err(e) => scan_err = Some(e),
                     }
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
-                if !self.key_match(k) {
+                if !self.key_match(&entry) {
                     self.resume_key.clear();
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
-                let parsed = parse_key_string_u64(k);
-                let Ok((prefix, created)) = parsed else {
+                let Some(created) = entry.created_at else {
                     return true;
                 };
                 if created < since {
-                    self.resume_key = make_key_string_u64(prefix, 0);
+                    self.resume_key = entry.to_key();
+                    let time_at = self.resume_key.len() - 8;
+                    self.resume_key[time_at..].copy_from_slice(&0u64.to_ne_bytes());
                     self.resume_val = 0;
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
                 if created > until {
-                    self.resume_key = make_key_string_u64(prefix, until);
+                    self.resume_key = entry.to_key();
+                    let time_at = self.resume_key.len() - 8;
+                    self.resume_key[time_at..].copy_from_slice(&until.to_ne_bytes());
                     self.resume_val = u64::MAX;
                     finished_naturally = false;
                     stop = true;
                     return false;
                 }
-                match u64_from_ne_checked(v) {
-                    Ok(lev_id) => {
-                        output.push_back(CandidateEvent::new(lev_id, created, scan_index));
+                match entry.local_id() {
+                    Ok(id) => {
+                        output.push_back(CandidateEvent::new(id, created, scan_index));
                         added += 1;
                         limit -= 1;
                         true
@@ -302,13 +347,23 @@ impl ScanCursor {
 }
 
 pub struct DbScan {
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_author_frontier_initialization: author_head_scan::InitializationStats,
+
+    author_head_reads: bool,
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_feed_prefix: Option<bounded_feed_diagnostic::Prefix>,
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_feed_stats: bounded_feed_diagnostic::Stats,
     index_only: bool,
     index_dbi: lmdb_sys::MDB_dbi,
     pub desc: &'static str,
     cursors: Vec<ScanCursor>,
-    event_queue: VecDeque<CandidateEvent>,
+    event_queue: CandidateQueue,
+    /// Reused for each collection, avoiding one allocation per logical range.
+    collection_buffer: VecDeque<CandidateEvent>,
     initial_scan_depth: u64,
-    refill_scan_depth: u64,
+    refill_scan_depths: Vec<u64>,
     next_init_index: usize,
     pub approx_work: u64,
     since: u64,
@@ -842,6 +897,23 @@ impl DbScan {
     }
 
     pub fn new(f: &NostrFilter, txn: &RoTxn<'_>) -> Self {
+        let mut scan = Self::new_planned(f, txn);
+        if f.until != u64::MAX {
+            // Planning probes retain their unbounded history. Only the chosen
+            // scan starts at the inclusive upper timestamp, avoiding a MAX
+            // seek and owned reposition key for each range with newer rows.
+            // Rows above until are outside this query, including any damage
+            // there; offline integrity checks still audit the full index.
+            // collect keeps validating every boundary the bounded seek returns.
+            for cursor in &mut scan.cursors {
+                let time_at = cursor.resume_key.len() - 8;
+                cursor.resume_key[time_at..].copy_from_slice(&f.until.to_ne_bytes());
+            }
+        }
+        scan
+    }
+
+    fn new_planned(f: &NostrFilter, txn: &RoTxn<'_>) -> Self {
         let default = Self::new_unplanned(f, txn);
         // A tiny author history can otherwise lose to a ubiquitous tag. Bound
         // this probe to 64 postings and eight seeks per alternative; avoid a
@@ -871,20 +943,15 @@ impl DbScan {
 
     fn probe_size(&self, txn: &RoTxn<'_>) -> Result<usize, wok_db::DbError> {
         let mut count = 0;
+        let mut physical = txn.cursor(self.index_dbi)?;
         for cursor in &self.cursors {
-            txn.foreach_full(
-                self.index_dbi,
-                &cursor.resume_key,
-                &cursor.resume_val.to_ne_bytes(),
-                true,
-                |key, _| {
-                    if !cursor.key_match(key) {
-                        return false;
-                    }
-                    count += 1;
-                    count < 64
-                },
-            )?;
+            physical.foreach_index(&cursor.resume_key, cursor.resume_val, |entry| {
+                if !cursor.key_match(&entry) {
+                    return false;
+                }
+                count += 1;
+                count < 64
+            })?;
             if count >= 64 {
                 return Ok(64);
             }
@@ -1045,15 +1112,34 @@ impl DbScan {
         }
 
         let n = cursors.len().max(1) as u64;
-        let initial = (f.limit / n).clamp(5, 50);
+        // A wide feed needs each range's newest candidate before it can emit
+        // anything, but not five from every author. Grow only the ranges that
+        // win the merge. A single range retains its existing batching.
+        let initial = (f.limit / n).clamp(if n == 1 { 5 } else { 1 }, 50);
+        let refill = if n == 1 {
+            10 * initial
+        } else {
+            (2 * initial).min(50)
+        };
+        let refill_scan_depths = vec![refill; cursors.len()];
         Self {
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_author_frontier_initialization:
+                author_head_scan::InitializationStats::default(),
+
+            author_head_reads: author_head_scan::eligible(f, plan, initial, cursors.len()),
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_feed_prefix: None,
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_feed_stats: bounded_feed_diagnostic::Stats::default(),
             index_only,
             index_dbi,
             desc: plan.name(),
             cursors,
-            event_queue: VecDeque::new(),
+            event_queue: CandidateQueue::default(),
+            collection_buffer: VecDeque::new(),
             initial_scan_depth: initial,
-            refill_scan_depth: 10 * initial,
+            refill_scan_depths,
             next_init_index: 0,
             approx_work: 0,
             since: f.since,
@@ -1066,6 +1152,24 @@ impl DbScan {
         &mut self,
         txn: &RoTxn<'_>,
         filter: &NostrFilter,
+        handle_event: H,
+        do_pause: P,
+    ) -> Result<bool, wok_db::DbError>
+    where
+        H: FnMut(u64) -> bool,
+        P: FnMut(u64) -> bool,
+    {
+        self.scan_with_depth_cap(txn, filter, u64::MAX, handle_event, do_pause)
+    }
+
+    /// A completeness probe only needs the next match, which may already be
+    /// queued. Bound any new collection without changing ordinary batching
+    /// or the resume state shared by both paths.
+    fn scan_with_depth_cap<H, P>(
+        &mut self,
+        txn: &RoTxn<'_>,
+        filter: &NostrFilter,
+        depth_cap: u64,
         mut handle_event: H,
         mut do_pause: P,
     ) -> Result<bool, wok_db::DbError>
@@ -1073,8 +1177,34 @@ impl DbScan {
         H: FnMut(u64) -> bool,
         P: FnMut(u64) -> bool,
     {
+        #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+        if self.diagnostic_feed_prefix.is_some() {
+            if let Some(complete) = bounded_feed_diagnostic::advance(
+                self,
+                txn,
+                filter,
+                depth_cap,
+                &mut handle_event,
+                &mut do_pause,
+            )? {
+                return Ok(complete);
+            }
+        }
+        // One physical cursor per scan slice, shared by all logical author,
+        // tag or kind ranges and refills. Resume endpoints remain owned by
+        // ScanCursor; no native iterator survives this call or its snapshot.
+
+        let lazy_for_heads = depth_cap != 1 && author_head_scan::enabled(self);
+
+        let mut cursor = if self.cursors.is_empty() || lazy_for_heads {
+            None
+        } else {
+            Some(txn.cursor(self.index_dbi)?)
+        };
         if let Some(si) = self.unsettled.take() {
-            self.settle(txn, si)?;
+            let physical = author_head_scan::physical(&mut cursor, txn, self.index_dbi)?;
+
+            self.settle(physical, si, depth_cap)?;
         }
         loop {
             self.approx_work += 1;
@@ -1082,28 +1212,32 @@ impl DbScan {
                 return Ok(false);
             }
             if self.next_init_index < self.cursors.len() {
+                // A delivery batch is fully initialized/charged before it can
+                // yield or emit. Peeks always keep the ordinary per-range path.
+
+                if depth_cap != 1 && author_head_scan::initialize(self, txn, &mut cursor)? {
+                    continue;
+                }
                 let idx = self.next_init_index;
+
+                let physical = author_head_scan::physical(&mut cursor, txn, self.index_dbi)?;
+
                 self.approx_work += self.cursors[idx].collect(
-                    txn,
-                    self.index_dbi,
+                    physical,
                     idx as u64,
                     self.since,
                     self.until,
-                    self.initial_scan_depth,
-                    &mut self.event_queue,
+                    self.initial_scan_depth.min(depth_cap),
+                    &mut self.collection_buffer,
                 )?;
+                self.event_queue.extend(self.collection_buffer.drain(..));
                 self.next_init_index += 1;
-                if self.next_init_index == self.cursors.len() {
-                    let mut v: Vec<_> = self.event_queue.drain(..).collect();
-                    v.sort_by(cmp_cand);
-                    self.event_queue = v.into();
-                }
                 continue;
             } else if self.event_queue.is_empty() {
                 return Ok(true);
             }
 
-            let ev = self.event_queue.pop_front().unwrap();
+            let ev = self.event_queue.pop().unwrap();
             let lev_id = ev.lev_id();
             let mut do_send = false;
             if self.index_only {
@@ -1125,39 +1259,47 @@ impl DbScan {
                 self.unsettled = Some(si);
                 return Ok(true);
             }
-            self.settle(txn, si)?;
+
+            let physical = author_head_scan::physical(&mut cursor, txn, self.index_dbi)?;
+
+            self.settle(physical, si, depth_cap)?;
         }
     }
 
     /// One of cursor `si`'s candidates was taken. Once the queue holds none
     /// of its candidates, its next entries are read and merged in, so the
     /// queue's head stays the newest entry left in any cursor.
-    fn settle(&mut self, txn: &RoTxn<'_>, si: usize) -> Result<(), wok_db::DbError> {
+    fn settle(
+        &mut self,
+        cursor: &mut Cursor<'_>,
+        si: usize,
+        depth_cap: u64,
+    ) -> Result<(), wok_db::DbError> {
         self.cursors[si].outstanding -= 1;
         if self.cursors[si].outstanding == 0 {
-            let mut more = VecDeque::new();
+            let depth = self.refill_scan_depths[si].min(depth_cap);
             self.approx_work += self.cursors[si].collect(
-                txn,
-                self.index_dbi,
+                cursor,
                 si as u64,
                 self.since,
                 self.until,
-                self.refill_scan_depth,
-                &mut more,
+                depth,
+                &mut self.collection_buffer,
             )?;
-            let mut merged: Vec<_> = self.event_queue.drain(..).chain(more).collect();
-            merged.sort_by(cmp_cand);
-            self.event_queue = merged.into();
+            self.event_queue.extend(self.collection_buffer.drain(..));
+            if self.cursors.len() > 1 && depth == self.refill_scan_depths[si] {
+                self.refill_scan_depths[si] = (2 * self.refill_scan_depths[si]).min(50);
+            }
         }
         Ok(())
     }
 }
 
 /// Most work the NIP-67 peeks of one REQ do, looking past where cut filters
-/// stopped for one more match, in `DbScan::approx_work` units: a refill of
-/// one cursor and about a hundred event reads. The peek that spends the last
-/// of it may overrun it by one cursor refill; later ones do no work. A peek
-/// that runs out has learned nothing, and the REQ's EOSE carries neither
+/// stopped for one more match, in `DbScan::approx_work` units. Peeks collect
+/// one posting at a time, and may overrun by an in-flight candidate check
+/// and one posting refill; later ones do no work. A peek that runs out has
+/// learned nothing, and the REQ's EOSE carries neither
 /// `finish` nor `more`.
 const PEEK_WORK: u64 = 2048;
 /// Most candidates those peeks check the read policy of.
@@ -1193,6 +1335,8 @@ pub struct Completeness {
 }
 
 pub struct DbQuery {
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_author_frontier_initialization: author_head_scan::InitializationStats,
     pub visibility: ReadVisibility,
     pub sub: Subscription,
     scanner: Option<QueryScanner>,
@@ -1203,6 +1347,15 @@ pub struct DbQuery {
     sent_events_full: HashSet<u64>,
     sent_events_curr: HashSet<u64>,
     last_work_checked: u64,
+    /// Test diagnostics only: actual chronological scan/peek work, including
+    /// paused slices and the final peek before a scanner is dropped. Search
+    /// work and planning probes use different units and are not included.
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_chronological_work: u64,
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_feed_stats: Option<bounded_feed_diagnostic::Stats>,
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    diagnostic_author_head_reads: Option<bool>,
     max_total_events: u64,
     hll: Option<HyperLogLog>,
     count_dedup_budget: u64,
@@ -1256,6 +1409,9 @@ impl DbQuery {
                 .iter()
                 .all(|filter| filter.search.is_some());
         Self {
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_author_frontier_initialization:
+                author_head_scan::InitializationStats::default(),
             sub,
             visibility: ReadVisibility::default(),
             scanner: None,
@@ -1266,6 +1422,12 @@ impl DbQuery {
             sent_events_full: HashSet::new(),
             sent_events_curr: HashSet::new(),
             last_work_checked: 0,
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_chronological_work: 0,
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_feed_stats: None,
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            diagnostic_author_head_reads: None,
             // COUNT needs the exact deduplicated count up to its separate
             // max_filter_limit_count. The request-wide delivery ceiling is
             // for EVENT responses.
@@ -1292,6 +1454,13 @@ impl DbQuery {
     /// ceiling, so COUNT and sync scans leave it off.
     pub fn track_completeness(&mut self) {
         self.completeness = !self.sub.count_only;
+    }
+
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+    fn apply_diagnostic_head_policy(&self, scan: &mut DbScan) {
+        if let Some(enabled) = self.diagnostic_author_head_reads {
+            scan.author_head_reads &= enabled;
+        }
     }
 
     /// The read policy for the next time slice.
@@ -1391,9 +1560,10 @@ impl DbQuery {
         let mut out_of_candidates = false;
         let mut error = None;
         let candidates = &mut budget.candidates;
-        let complete = scanner.scan(
+        let complete = scanner.scan_with_depth_cap(
             snapshot.txn(),
             filter,
+            1,
             |lev_id| {
                 if lev_id > latest || sent.contains(&lev_id) {
                     return false;
@@ -1438,8 +1608,13 @@ impl DbQuery {
             if f.limit == 0 || f.search.is_some() {
                 return Ok(Peek::Unknown);
             }
+            let mut scanner = DbScan::new(f, snapshot.txn());
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            self.apply_diagnostic_head_policy(&mut scanner);
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            let frontier_before = scanner.diagnostic_author_frontier_initialization;
             let peek = Self::peek(
-                &mut DbScan::new(f, snapshot.txn()),
+                &mut scanner,
                 snapshot,
                 f,
                 latest,
@@ -1447,7 +1622,19 @@ impl DbQuery {
                 &self.visibility,
                 &mut self.restricted,
                 &mut self.peek_budget,
-            )?;
+            );
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            {
+                self.diagnostic_chronological_work += scanner.approx_work;
+            }
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+            self.diagnostic_author_frontier_initialization.add_delta(
+                scanner.diagnostic_author_frontier_initialization,
+                frontier_before,
+                true,
+            );
+            drop(scanner);
+            let peek = peek?;
             if !matches!(peek, Peek::Exhausted) {
                 return Ok(peek);
             }
@@ -1602,7 +1789,11 @@ impl DbQuery {
                     if f.search.is_some() {
                         QueryScanner::Search(SearchScan::new(&f, txn)?)
                     } else {
-                        QueryScanner::Chronological(DbScan::new(&f, txn))
+                        #[allow(unused_mut)]
+                        let mut scan = DbScan::new(&f, txn);
+                        #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                        self.apply_diagnostic_head_policy(&mut scan);
+                        QueryScanner::Chronological(scan)
                     }
                 }
             };
@@ -1655,14 +1846,32 @@ impl DbQuery {
             };
             let complete = match &mut scanner {
                 QueryScanner::Chronological(scanner) => {
-                    scanner.scan(txn, &f, &mut handle, |approx_work| {
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    let work_before = scanner.approx_work;
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    let frontier_before = scanner.diagnostic_author_frontier_initialization;
+                    let result = scanner.scan(txn, &f, &mut handle, |approx_work| {
                         if approx_work > last_work + 2000 {
                             last_work = approx_work;
                             elapsed_us() >= time_budget_us
                         } else {
                             false
                         }
-                    })?
+                    });
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    {
+                        self.diagnostic_chronological_work += scanner.approx_work - work_before;
+                        if scanner.diagnostic_feed_stats.configured {
+                            self.diagnostic_feed_stats = Some(scanner.diagnostic_feed_stats);
+                        }
+                    }
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    self.diagnostic_author_frontier_initialization.add_delta(
+                        scanner.diagnostic_author_frontier_initialization,
+                        frontier_before,
+                        false,
+                    );
+                    result?
                 }
                 QueryScanner::Search(scanner) => scanner.scan(
                     &snapshot,
@@ -1683,16 +1892,36 @@ impl DbQuery {
             let peek = match &mut scanner {
                 _ if !self.completeness || !complete || dedup_budget_hit => None,
                 _ if f.limit == 0 => Some(Peek::Unknown),
-                QueryScanner::Chronological(scanner) if cut => Some(Self::peek(
-                    scanner,
-                    &snapshot,
-                    &f,
-                    latest,
-                    &sent_full,
-                    &self.visibility,
-                    &mut restricted,
-                    &mut self.peek_budget,
-                )?),
+                QueryScanner::Chronological(scanner) if cut => {
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    let work_before = scanner.approx_work;
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    let frontier_before = scanner.diagnostic_author_frontier_initialization;
+                    let result = Self::peek(
+                        scanner,
+                        &snapshot,
+                        &f,
+                        latest,
+                        &sent_full,
+                        &self.visibility,
+                        &mut restricted,
+                        &mut self.peek_budget,
+                    );
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    {
+                        self.diagnostic_chronological_work += scanner.approx_work - work_before;
+                        if scanner.diagnostic_feed_stats.configured {
+                            self.diagnostic_feed_stats = Some(scanner.diagnostic_feed_stats);
+                        }
+                    }
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+                    self.diagnostic_author_frontier_initialization.add_delta(
+                        scanner.diagnostic_author_frontier_initialization,
+                        frontier_before,
+                        true,
+                    );
+                    Some(result?)
+                }
                 QueryScanner::Chronological(_) => Some(Peek::Exhausted),
                 QueryScanner::Search(scanner) => Some(scanner.remaining(&sent_full)),
             };
@@ -1913,3 +2142,30 @@ fn visible_event<'t>(
     let packed = PackedEventView::new(raw)?;
     Ok(visibility.allows(snapshot, packed)?.then_some(packed))
 }
+
+#[cfg(test)]
+#[path = "peek_tests.rs"]
+mod peek_tests;
+
+#[cfg(test)]
+#[path = "author_index_tests.rs"]
+mod author_index_tests;
+
+#[cfg(test)]
+#[path = "range_start_tests.rs"]
+mod range_start_tests;
+
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+#[path = "range_seed_diagnostic.rs"]
+mod range_seed_diagnostic;
+
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+#[path = "feed_query_diagnostic.rs"]
+mod feed_query_diagnostic;
+
+#[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
+#[path = "bounded_feed_diagnostic.rs"]
+mod bounded_feed_diagnostic;
+
+#[path = "author_head_scan.rs"]
+mod author_head_scan;

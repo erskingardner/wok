@@ -3501,7 +3501,7 @@ fn background_event(ctx: &Ctx, rng: &mut rand::rngs::StdRng, index: usize, n: u6
             )
         }
         _ => {
-            let tags = if n % 5 == 0 {
+            let tags = if n.is_multiple_of(5) {
                 vec![json!(["t", "nostr"])]
             } else {
                 vec![]

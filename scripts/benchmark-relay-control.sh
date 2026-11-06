@@ -248,12 +248,19 @@ effective_memory_max() {
     echo "$lowest"
 }
 
-# Apparent size of the database files a warm start reads.
+database_present() {
+    # CURRENT identifies today's RocksDB runtime; data.mdb remains valid for
+    # strfry and explicitly supplied historical Wok binaries.
+    [[ -s $DB_ROOT/db/CURRENT || -s $DB_ROOT/db/data.mdb ]]
+}
+
+# Apparent size of all regular database files a warm start reads, including
+# RocksDB SSTs, WAL and metadata rather than only historical LMDB files.
 database_bytes() {
     local file total=0
-    for file in "$DB_ROOT"/db/*.mdb; do
+    while IFS= read -r -d '' file; do
         total=$((total + $(stat -c %s -- "$file")))
-    done
+    done < <(find "$DB_ROOT/db" -type f -print0)
     echo "$total"
 }
 
@@ -261,10 +268,10 @@ database_bytes() {
 # of it in the page cache, counted in whole pages.
 database_residency() {
     local file resident
-    for file in "$DB_ROOT"/db/*.mdb; do
+    while IFS= read -r -d '' file; do
         resident=$(fincore --bytes --noheadings --output RES -- "$file")
         printf '%s %s %s\n' "$file" "$(stat -c %s -- "$file")" "${resident//[[:space:]]/}"
-    done
+    done < <(find "$DB_ROOT/db" -type f -print0)
 }
 
 # Prints the files of a database_residency listing that are not wholly in the
@@ -306,8 +313,8 @@ reset_db() {
     ensure_service_user
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DB_ROOT"
     find "$DB_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-    # Both relays keep LMDB in a db child. Wok creates it, while strfry
-    # requires the directory to exist before mdb_env_open.
+    # Both relays keep storage in a db child; strfry requires that directory
+    # to exist before mdb_env_open.
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DB_ROOT/db"
 }
 
@@ -327,8 +334,8 @@ import_corpus() {
         >"$artifacts/import-unit.txt" 2>&1; then
         die "$TARGET import failed; see $artifacts/import.stderr"
     fi
-    [[ -s $DB_ROOT/db/data.mdb ]] ||
-        die "$TARGET import wrote no $DB_ROOT/db/data.mdb; CONFIG must put the database there"
+    database_present ||
+        die "$TARGET import wrote no recognized database in $DB_ROOT/db; CONFIG must put the database there"
 }
 
 # Under the import's limits: strfry applies its open-file limit to every
@@ -555,7 +562,7 @@ start_measurement() {
     load_target "$target"
     parse_run_options "cache cpus memory nofile ready-timeout" "$@"
     assert_benchmark_path "$artifacts"
-    [[ -s $DB_ROOT/db/data.mdb ]] || die "$TARGET has no database; run prepare first"
+    database_present || die "$TARGET has no database; run prepare first"
     assert_db_config
     if [[ $RUN_CACHE == warm && -n $RUN_MEMORY ]] &&
         (($(database_bytes) >= $(memory_bytes "$RUN_MEMORY"))); then
@@ -571,7 +578,7 @@ start_measurement() {
         # Read the database inside the relay's own unit, so the warmed pages
         # count against its memory cap.
         # shellcheck disable=SC2016
-        command=(/bin/sh -c 'for file in "$1"/*.mdb; do cat -- "$file" >/dev/null || exit 1; done; shift; exec "$@"'
+        command=(/bin/sh -c 'find "$1" -type f -exec cat -- {} + >/dev/null || exit 1; shift; exec "$@"'
             warm "$DB_ROOT/db" "${command[@]}")
     fi
     unit_properties

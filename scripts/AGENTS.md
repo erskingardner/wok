@@ -5,9 +5,11 @@ Operator/CI helper scripts. Not on the relay runtime path.
 | File | Role |
 | --- | --- |
 | `check-release.sh` | Release contract: version, changelog, lockfile, tests |
+| `release-version.py` | Strict SemVer validation and prerelease classification shared by release scripts |
+| `publish-release.sh` | Publish an existing tag; prereleases are explicitly excluded from Latest |
 | `lab.py` | Local / two-VM Compose campaign, artifacts, shutdown and integrity |
 | `lab-bootstrap-debian.sh` | Opt-in Docker installation on clean Debian 12/13 |
-| `reliability-soak.py` | Disposable Linux relay/load processes, resource samples, restart and integrity gates |
+| `reliability-soak.py` | Disposable RocksDB relay/load processes, resource samples, 500-author feeds, restart/crash and offline integrity gates |
 | `attack-surface-reach.py` | Relay functions each caller (anonymous, authenticated, admin, admitted Unix peer) reaches per profile, under coverage; `--check` against `crates/wok-compat/tests/reachability/` |
 | `release-notes.sh` | Extract changelog notes for a tag |
 | `benchmark-campaign.sh` | Two-host `wok-bench` campaign over any number of relay targets, rotating their order each repetition |

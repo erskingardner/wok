@@ -1,0 +1,140 @@
+import importlib.util
+import json
+import os
+from pathlib import Path
+import signal
+import tempfile
+import tomllib
+import types
+import unittest
+from unittest.mock import Mock, patch
+
+PATH = Path(__file__).resolve().parents[1] / "reliability-soak.py"
+spec = importlib.util.spec_from_file_location("reliability_soak", PATH)
+soak = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(soak)
+
+
+class DatabaseBudget(unittest.TestCase):
+    def test_explicit_disk_allowance_is_bounded_and_default_is_unchanged(self):
+        required = ["--wok", "/unused/wok", "--driver", "/unused/driver", "--out", "/unused/out"]
+        with patch.object(soak.sys, "platform", "linux"):
+            self.assertEqual(soak.parse_args(required).max_db_mib, 512)
+            self.assertEqual(soak.parse_args(required + ["--max-db-mib", "2048"]).max_db_mib, 2048)
+            for value in ["0", "-1", "63", "16385"]:
+                with self.subTest(value=value), self.assertRaises(SystemExit):
+                    soak.parse_args(required + ["--max-db-mib", value])
+
+    def test_resource_profiles_generate_scoped_native_settings_without_changing_workload(self):
+        required = ["--wok", "/unused/wok", "--driver", "/unused/driver", "--out", "/unused/out"]
+        with patch.object(soak.sys, "platform", "linux"):
+            small = soak.parse_args(required)
+            native = soak.parse_args(required + ["--rocksdb-profile", "native-defaults"])
+            with self.assertRaises(SystemExit):
+                soak.parse_args(required + ["--rocksdb-profile", "unbounded"])
+        configs = [tomllib.loads(soak.config_text(args, Path('/scratch'), Path('/tmp/relay.sock')))
+                   for args in [small, native]]
+        options = configs[0]["database"].pop("rocksdb")
+        self.assertEqual(small.rocksdb_profile, "small")
+        self.assertEqual(options, {"block_cache_bytes": 16777216, "row_cache_bytes": 0,
+                                   "total_memtable_bytes": 16777216, "max_total_wal_bytes": 33554432})
+        self.assertEqual(configs[0], configs[1])
+        self.assertEqual(soak.rocksdb_overrides(native.rocksdb_profile), {})
+
+    def test_small_profile_bounds_child_arenas_without_mutating_parent_or_native_defaults(self):
+        with patch.dict(os.environ, {"MALLOC_ARENA_MAX": "128", "WOK_SOAK_KEEP": "preserved"}, clear=True):
+            small = soak.child_environment("small")
+            native = soak.child_environment("native-defaults")
+            self.assertEqual(small, {"MALLOC_ARENA_MAX": "2", "WOK_SOAK_KEEP": "preserved"})
+            self.assertEqual(native, {"MALLOC_ARENA_MAX": "128", "WOK_SOAK_KEEP": "preserved"})
+            self.assertEqual(os.environ["MALLOC_ARENA_MAX"], "128")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertNotIn("MALLOC_ARENA_MAX", soak.child_environment("native-defaults"))
+            self.assertNotIn("MALLOC_ARENA_MAX", os.environ)
+
+    def test_whole_rocks_directory_includes_wal_sst_and_nested_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "wal").mkdir()
+            for name, size in [("CURRENT", 8), ("000001.sst", 101), ("wal/000002.log", 37)]:
+                (root / name).write_bytes(b"x" * size)
+            self.assertEqual(soak.database_bytes(root), 146)
+            self.assertEqual(soak.database_footprint(root), {"wal": 37, "sst": 101, "other": 8})
+
+    def test_size_includes_metadata_and_lock_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CURRENT").write_bytes(b"data")
+            (root / "LOCK").write_bytes(b"lock")
+            self.assertEqual(soak.database_bytes(root), 8)
+
+    def test_compaction_can_remove_a_file_after_the_directory_listing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CURRENT").write_bytes(b"live")
+            # The walk already listed an SST that compaction has since unlinked.
+            with patch.object(soak.os, "walk", return_value=[(str(root), [], ["CURRENT", "retired.sst"])]):
+                self.assertEqual(soak.database_bytes(root), 4)
+
+    def test_symlinks_do_not_escape_bounded_scratch_or_hide_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / "db").mkdir(); (root / "outside").write_bytes(b"retained")
+            (root / "db/link").symlink_to(root / "outside")
+            with self.assertRaises(RuntimeError):
+                soak.database_bytes(root / "db")
+            self.assertEqual((root / "outside").read_bytes(), b"retained")
+            (root / "db/link").unlink()
+            (root / "db/link").symlink_to(root / "missing")
+            with self.assertRaises(RuntimeError):
+                soak.database_bytes(root / "db")
+
+
+class IdentityAndResults(unittest.TestCase):
+    def test_wrong_binary_or_old_rocks_layout_cannot_be_labelled_as_optimized_rocks(self):
+        for actual in ["lmdb", "rocksdb-coverless-experimental", "rocksdb-optimized-experimental"]:
+            with self.subTest(actual=actual), patch.object(soak.subprocess, "run", return_value=types.SimpleNamespace(stdout=actual)):
+                with self.assertRaises(RuntimeError):
+                    soak.verify_backend(Path("/unused/wok"))
+        with patch.object(soak.subprocess, "run", return_value=types.SimpleNamespace(stdout="rocksdb-author-heads-experimental\n")) as run:
+            self.assertEqual(soak.verify_backend(Path("/unused/wok")), "rocksdb-author-heads-experimental")
+            self.assertEqual(run.call_args.args[0][-1], "storage-backend")
+            env = {"MALLOC_ARENA_MAX": "2"}
+            soak.verify_backend(Path("/unused/wok"), env=env)
+            self.assertEqual(run.call_args.kwargs["env"], env)
+
+    def test_missing_crash_or_feed_verification_refuses_successful_driver_exit(self):
+        good = dict(ok=True, restart_verified=True, crash_recovery_verified=True,
+                    feed_author_count=500, author_feed_checks=6, author_live_deliveries=4)
+        soak.validate_driver_result(good)
+        for field, value in [("ok", False), ("restart_verified", False), ("crash_recovery_verified", False),
+                             ("feed_author_count", 2), ("author_feed_checks", 0), ("author_live_deliveries", 0)]:
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                soak.validate_driver_result(dict(good, **{field: value}))
+
+
+class ProcessOutcomes(unittest.TestCase):
+    def test_already_exited_failure_is_not_a_graceful_shutdown(self):
+        child = Mock(returncode=1); child.poll.return_value = 1
+        with self.assertRaises(RuntimeError):
+            soak.stop(child)
+        child.send_signal.assert_not_called()
+
+    def test_deliberate_sigkill_is_recorded_as_nonzero(self):
+        child = Mock(returncode=None); child.poll.return_value = None; child.wait.return_value = -signal.SIGKILL
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "crash.json"
+            soak.crash(child, path)
+            self.assertEqual(json.loads(path.read_text())["actual_returncode"], -signal.SIGKILL)
+            child.kill.assert_called_once_with()
+
+    def test_unexpected_crash_exit_cannot_continue_recovery(self):
+        child = Mock(returncode=None); child.poll.return_value = None; child.wait.return_value = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "crash.json"
+            with self.assertRaises(RuntimeError):
+                soak.crash(child, path)
+            self.assertEqual(json.loads(path.read_text())["actual_returncode"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

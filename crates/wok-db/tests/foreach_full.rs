@@ -89,3 +89,66 @@ fn forward_scan_missing_key_starts_at_next_key_first_dup() {
     .unwrap();
     assert_eq!(seen, vec![(200, 3)]);
 }
+
+#[test]
+fn reused_cursor_ranges_match_an_ordered_model_after_stops_and_empty_ranges() {
+    let env = env_with_created_at_dups();
+    let txn = env.begin_ro().unwrap();
+    let mut cursor = txn.cursor(env.dbis().event_created_at).unwrap();
+    let rows = [(100u64, 1u64), (100, 2), (200, 3)];
+    for key in [
+        None,
+        Some(0u64),
+        Some(100),
+        Some(150),
+        Some(200),
+        Some(u64::MAX),
+    ] {
+        for dup in [None, Some(0u64), Some(1), Some(2), Some(4), Some(u64::MAX)] {
+            for reverse in [true, false] {
+                for cap in [1, 2, 8] {
+                    let mut expected: Vec<_> = rows
+                        .iter()
+                        .copied()
+                        .filter(|&(k, v)| {
+                            let Some(key) = key else {
+                                return true;
+                            };
+                            match (reverse, dup) {
+                                (true, Some(dup)) => k < key || (k == key && v <= dup),
+                                (true, None) => k <= key,
+                                (false, Some(dup)) => k > key || (k == key && v >= dup),
+                                (false, None) => k > key,
+                            }
+                        })
+                        .collect();
+                    if reverse {
+                        expected.reverse();
+                    }
+                    let complete = expected.len() < cap;
+                    expected.truncate(cap);
+                    let mut seen = Vec::new();
+                    let result = cursor
+                        .foreach_full(
+                            &key.map(|k| k.to_ne_bytes().to_vec()).unwrap_or_default(),
+                            &dup.map(|v| v.to_ne_bytes().to_vec()).unwrap_or_default(),
+                            reverse,
+                            |k, v| {
+                                seen.push((
+                                    u64::from_ne_bytes(k.try_into().unwrap()),
+                                    u64::from_ne_bytes(v.try_into().unwrap()),
+                                ));
+                                seen.len() < cap
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        (seen, result),
+                        (expected, complete),
+                        "key={key:?} dup={dup:?} reverse={reverse} cap={cap}"
+                    );
+                }
+            }
+        }
+    }
+}

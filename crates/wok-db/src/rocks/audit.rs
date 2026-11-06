@@ -1,0 +1,202 @@
+//! Offline, bounded-memory verification of the optimized physical schema.
+use super::*;
+use crate::{Decompressor, Env};
+use sha2::{Digest, Sha256};
+
+impl Env {
+    /// Run only on a closed seed/copy: the read-only open must not race a writer.
+    /// Scans authoritative components and verifies every thin (and, in the dual
+    /// layout, covering) author posting. Per-primary existence plus exact counts
+    /// proves a bijection. Other tables are counted against transactional counters;
+    /// this is not a semantic verification of every other derived index.
+    pub fn audit_rocksdb_layout(&self) -> Result<serde_json::Value, DbError> {
+        crate::env::check_cf_set(self.path())?;
+        self.check_background_errors()?;
+        let snapshot = self.inner.db.snapshot();
+        let cf = |name: &str| {
+            self.inner
+                .db
+                .cf_handle(name)
+                .ok_or_else(|| err("missing audit column family"))
+        };
+        let mut it = snapshot.raw_iterator_cf(cf(COMBINED)?);
+        it.seek_to_first();
+        let mut count = 0u64;
+        let mut digest = Sha256::new();
+        let mut decompressor = Decompressor::new();
+        // Only compression dictionaries are read through this transaction; primary
+        // bytes stream directly from the iterator, never accumulating in an arena.
+        let txn = self.begin_ro()?;
+        while let Some((key, value)) = it.item() {
+            let (k, _) = decode(3, key, &[])?;
+            let id = u64::from_ne_bytes(
+                k.as_slice()
+                    .try_into()
+                    .map_err(|_| err("bad audit local ID"))?,
+            );
+            let (packed, payload) = parts(value)?;
+            let packed = packed.ok_or_else(|| err("orphan payload"))?;
+            let payload = payload.ok_or_else(|| err("missing event payload"))?;
+            let event = wok_event::PackedEventView::new(packed)?;
+            let json = decompressor.decode(&txn, payload, 16 * 1024 * 1024)?;
+            let parsed = wok_event::json::parse_strict(json)?;
+            wok_event::verify_strfry_event(event, &parsed)?;
+            let posting = encode(
+                10,
+                &crate::keys::make_key_string_u64(event.pubkey(), event.created_at()),
+                Some(&k),
+            );
+            let thin = snapshot
+                .get_cf(cf(cf_name(10))?, &posting)
+                .map_err(err)?
+                .ok_or_else(|| err("missing thin author posting"))?;
+            if !thin.is_empty() {
+                return Err(err("thin author posting contains payload"));
+            }
+
+            {
+                let raw = snapshot
+                    .get_cf(cf(HEAD_CF)?, event.pubkey())
+                    .map_err(err)?
+                    .ok_or_else(|| err("missing author head"))?;
+                let head = crate::AuthorHead::decode(&raw)?;
+                let position = crate::AuthorPosition {
+                    created_at: event.created_at(),
+                    local_id: id,
+                };
+                if head.first < position {
+                    return Err(err("author head is older than a primary posting"));
+                }
+                if position != head.first && head.next.is_none_or(|next| next < position) {
+                    return Err(err("author next position is older than a primary posting"));
+                }
+            }
+
+            digest.update(id.to_le_bytes());
+            digest.update((packed.len() as u64).to_le_bytes());
+            digest.update(packed);
+            digest.update((payload.len() as u64).to_le_bytes());
+            digest.update(payload);
+            count += 1;
+            if count.is_multiple_of(100000) {
+                tracing::info!(events = count, "RocksDB physical audit progress");
+            }
+            it.next();
+        }
+        it.status().map_err(err)?;
+        let mut counts = serde_json::Map::new();
+        let last_dbi = dbi_specs().len() as u32;
+        for dbi in 1..=last_dbi {
+            let mut it = snapshot.raw_iterator_cf(cf(cf_name(dbi))?);
+            it.seek_to_first();
+            let mut found = 0u64;
+            while let Some((key, value)) = it.item() {
+                let (_, dup) = decode(dbi, key, value)?;
+                if spec(dbi).flags & lmdb_sys::MDB_DUPSORT != 0 && dup.len() != 8 {
+                    return Err(err("malformed physical duplicate"));
+                }
+                if combined(dbi) {
+                    let (a, b) = parts(value)?;
+                    if (if dbi == 3 { a } else { b }).is_some() {
+                        found += 1;
+                    }
+                } else {
+                    found += 1;
+                }
+                it.next();
+            }
+            it.status().map_err(err)?;
+            let expected = txn.entries(dbi)? as u64;
+            if found != expected {
+                return Err(err(format!(
+                    "physical count {found} != transactional count {expected} in {}",
+                    cf_name(dbi)
+                )));
+            }
+            counts.insert(
+                if dbi == COVER_DBI {
+                    COVERING.to_string()
+                } else {
+                    spec(dbi).name.to_string()
+                },
+                serde_json::json!(found),
+            );
+        }
+        if counts
+            .get(crate::schema::DBI_EVENT_PUBKEY)
+            .and_then(|v| v.as_u64())
+            != Some(count)
+        {
+            return Err(err(
+                "author indexes do not contain exactly one posting per primary",
+            ));
+        }
+
+        let (head_count, head_positions) = {
+            // Each primary is dominated by first, and every non-first primary
+            // by next (above). Both stored positions must reference a primary
+            // of that author. With the thin-index bijection this proves exact
+            // top-two frontiers without a database-sized author map.
+            let mut heads = snapshot.raw_iterator_cf(cf(HEAD_CF)?);
+            heads.seek_to_first();
+            let mut found = 0u64;
+            let mut positions = 0u64;
+            while let Some((author, value)) = heads.item() {
+                if author.len() != 32 {
+                    return Err(err("author head key is not 32 bytes"));
+                }
+                let head = crate::AuthorHead::decode(value)?;
+                for position in std::iter::once(head.first).chain(head.next) {
+                    let local_id = position.local_id.to_ne_bytes();
+                    let primary = snapshot
+                        .get_cf(cf(COMBINED)?, encode(3, &local_id, None))
+                        .map_err(err)?
+                        .ok_or_else(|| err("author head points to a missing primary"))?;
+                    let packed = parts(&primary)?
+                        .0
+                        .ok_or_else(|| err("author head has no packed primary"))?;
+                    let event = wok_event::PackedEventView::new(packed)?;
+                    if event.pubkey() != author || event.created_at() != position.created_at {
+                        return Err(err(
+                            "author head differs from its primary author or timestamp",
+                        ));
+                    }
+                    let posting = encode(
+                        10,
+                        &crate::keys::make_key_string_u64(author, position.created_at),
+                        Some(&local_id),
+                    );
+                    if snapshot
+                        .get_cf(cf(cf_name(10))?, posting)
+                        .map_err(err)?
+                        .as_deref()
+                        != Some(&[])
+                    {
+                        return Err(err("author head has no canonical thin posting"));
+                    }
+                    positions += 1;
+                }
+                found += 1;
+                heads.next();
+            }
+            heads.status().map_err(err)?;
+            (found, positions)
+        };
+        self.check_background_errors()?;
+        let hash = digest
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let report = serde_json::json!({"ok":true,"events":count,"verified_signatures_and_bodies":count,"thin_author_records_verified":count,"covering_records_verified":0,"primary_fingerprint_sha256":hash,"table_counts":counts,"physical_column_families":physical_cf_names(),"layout":String::from_utf8_lossy(FORMAT),"durability":"one atomic cross-CF WriteBatch with sync WAL before ACK; no power-loss proof implied"});
+
+        let report = {
+            let mut report = report;
+            report["author_head_records_verified"] = serde_json::json!(head_count);
+            report["author_frontier_positions_verified"] = serde_json::json!(head_positions);
+            report["derived_cf_counts"] = serde_json::json!({(HEAD_CF):head_count});
+            report
+        };
+        Ok(report)
+    }
+}

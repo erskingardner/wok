@@ -25,7 +25,7 @@ wok-db  ←  wok-query  ←  wok-negentropy
 | Directory | Crate | Start here |
 | --- | --- | --- |
 | `wok-event/` | Event model, JSON, hashing, PackedEvent | `src/lib.rs` |
-| `wok-db/` | LMDB env, schema, write/query indexes | `src/lib.rs` |
+| `wok-db/` | RocksDB env, schema, write/query indexes, read-only LMDB import | `src/lib.rs` |
 | `wok-query/` | Filters, scans, live monitors, HLL | `src/lib.rs` |
 | `wok-negentropy/` | NIP-77 reconcile + persistent tree | `src/lib.rs` |
 | `wok-relay/` | Dispatcher, config, AUTH, plugins | `src/server.rs` |
@@ -38,6 +38,6 @@ wok-db  ←  wok-query  ←  wok-negentropy
 ## Working in this tree
 
 - Prefer changing behavior in the owning crate, not by special-casing in CLI or tests.
-- Keep LMDB work off Tokio tasks; copy out of mmap before `.await`.
+- Keep storage work off Tokio tasks; copy borrowed values before `.await`.
 - `#![forbid(unsafe_code)]` on event/query/negentropy/ws/unix/bench/compat. Exceptions are documented at the FFI boundary.
 - Integration and property tests live in each crate's `tests/` (or `#[cfg(test)]` in the module). Cross-crate protocol tests live in `wok-compat`.

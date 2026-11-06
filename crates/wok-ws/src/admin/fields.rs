@@ -543,13 +543,6 @@ pub(super) const SECTIONS: &[Section] = &[
                 "Writes stop while the disk still has room.",
                 &[Input::new("file", "min_free_disk_bytes", "database.min_free_disk_bytes", Unit::Bytes).off().file_only()],
             ),
-            field(
-                "Database size limit",
-                "The LMDB map size: writes fail once the database reaches it. Set in wok.toml; takes effect on restart.",
-                "Writes fail once the database fills its map.",
-                "Only address space: the file grows as data is written.",
-                &[Input::new("file", "map_size", "database.map_size", Unit::Bytes).file_only()],
-            ),
         ],
     },
     Section {

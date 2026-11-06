@@ -92,7 +92,7 @@ fn corpus(n: u64) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Rust computes the size/fingerprint of tree 1 by reading the LMDB store.
+/// Rust reads the imported native RocksDB negentropy bytes.
 fn rust_tree_stats(dir: &Path) -> (u64, String) {
     let env = Env::open(
         dir,
@@ -110,11 +110,7 @@ fn rust_tree_stats(dir: &Path) -> (u64, String) {
 }
 
 #[test]
-fn strfry_refuses_wok_owned_tree_database() {
-    if !strfry_available() {
-        eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
-        return;
-    }
+fn rocks_tree_survives_reopen() {
     let (dir, env) = temp_db();
     for ev in corpus(50) {
         write_event_to_env(&env, &ev);
@@ -145,26 +141,10 @@ fn strfry_refuses_wok_owned_tree_database() {
         txn.commit().unwrap();
     }
     drop(env);
-    let conf = write_conf(dir.path());
     let (rust_size, rust_fp) = rust_tree_stats(dir.path());
     assert_eq!(rust_size, 50);
     assert!(!rust_fp.is_empty());
-    let out = Command::new(strfry_bin())
-        .arg("--config")
-        .arg(&conf)
-        .args(["negentropy", "list"])
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success()
-            && String::from_utf8_lossy(&out.stderr).contains(&format!(
-                "Database version too new: {}",
-                wok_event::WOK_DB_VERSION
-            )),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_eq!(rust_tree_stats(dir.path()), (rust_size, rust_fp));
 }
 
 #[test]
@@ -181,7 +161,16 @@ fn cpp_built_tree_matches_rust_listing() {
     let out = strfry_cmd(&conf, &["negentropy", "list"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let (cpp_size, cpp_fp) = parse_list(&stdout, 1);
-    let (rust_size, rust_fp) = rust_tree_stats(dir.path());
+    let output =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let copied = wok_db::migrate_strfry_to_rocksdb(
+        dir.path(),
+        &output.path().join("db"),
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(copied.verified && copied.source_unchanged);
+    let (rust_size, rust_fp) = rust_tree_stats(&output.path().join("db"));
     assert_eq!(cpp_size, 50);
     assert_eq!(
         (rust_size, rust_fp.as_str()),

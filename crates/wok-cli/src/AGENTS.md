@@ -2,8 +2,9 @@
 
 | File | Role |
 | --- | --- |
-| `main.rs` | `Cli` / `Command`, relay startup, import/export/scan/event/delete/compact/monitor/dict/negentropy/upload/download |
-| `migrate.rs` | Read-only v3 snapshot, integrity, verification of each event against its payload, v5 marker, TOML translation, checksummed manifest |
+| `main.rs` | `Cli` / `Command`, relay startup, import/export/scan/event/delete/backup/monitor/dict/negentropy/upload/download |
+| `migrate.rs` | Direct registered-read-only strfry v3 → RocksDB conversion, stored-event verification, TOML translation and checksummed manifest |
+| `migrate_rocksdb.rs` | Full-state Wok LMDB-to-RocksDB preflight, retained staging, manifest and no-replace publication |
 | `config_show.rs` | `wok config show`: effective values with their origin, `--overrides`, `--defaults` |
 | `config_minimize.rs` | `wok config minimize`: drop keys equal to the preset, `--dry-run` diff or `.bak` backup |
 | `doctor.rs` | Config (including pinned past defaults, and public values kept under another preset), storage, index, payload, negentropy, capacity, runtime-path report (`--json`) |
@@ -12,4 +13,4 @@
 | `router.rs` | Multi-connection mesh client, hot-reload of tao-config router file |
 | `mesh.rs` | Bounded tungstenite client config for mesh links |
 
-`doctor.rs` and `migrate.rs` allow `unsafe` for LMDB snapshot/stat FFI; keep new unsafe there, not in `main.rs`. Mesh clients do not negotiate permessage-deflate (tungstenite limitation).
+Keep unsafe FFI in reviewed OS and read-only migration boundaries, never in `main.rs`. Mesh clients do not negotiate permessage-deflate (tungstenite limitation).

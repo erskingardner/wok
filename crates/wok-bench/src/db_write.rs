@@ -53,10 +53,15 @@ pub struct Options {
     pub dir: PathBuf,
     pub batches: Vec<usize>,
     pub step_events: u64,
+    /// Log every committed write here, for replay on other engines
+    /// (`op-log` feature).
+    pub record_ops: Option<PathBuf>,
 }
 
 #[derive(Serialize, Clone)]
 pub struct Report {
+    pub storage_backend: &'static str,
+    pub file_growth_scope: &'static str,
     pub corpus_events: u64,
     /// Corpus events written before the steps, and those of them stored.
     pub preloaded: u64,
@@ -92,7 +97,7 @@ pub struct Step {
     pub bytes_per_stored: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pages_per_commit: Option<f64>,
-    /// Growth of `data.mdb` over the step.
+    /// Positive size change over the step, with scope recorded in the report.
     pub file_growth_bytes: u64,
     /// Events the search build indexed during the step, and its time.
     pub search_built: u64,
@@ -245,6 +250,9 @@ pub fn run(opts: &Options) -> Result<Report> {
         .with_context(|| format!("create a database under {}", opts.dir.display()))?;
     let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::default())?;
     env.ensure_initialized()?;
+    if let Some(path) = &opts.record_ops {
+        record_ops(path, &env)?;
+    }
     let mut trees = wok_negentropy::NegentropyFilterCache::default();
     let mut lines = std::io::BufReader::new(std::fs::File::open(&opts.corpus)?)
         .lines()
@@ -255,6 +263,7 @@ pub fn run(opts: &Options) -> Result<Report> {
     };
 
     let preloaded = corpus_events - held;
+    phase(&format!("preload {preloaded}"))?;
     let started = Instant::now();
     let mut batch = Vec::with_capacity(PRELOAD_BATCH);
     let mut preload = Outcomes::default();
@@ -274,12 +283,12 @@ pub fn run(opts: &Options) -> Result<Report> {
         preload.unfinished
     );
 
-    let data = dir.path().join("data.mdb");
     let mut io_counted = true;
     let mut steps = Vec::new();
     for (&batch_size, &events) in opts.batches.iter().zip(&sizes) {
         let mut pending = (0..events).map(|_| next()).collect::<Result<Vec<_>>>()?;
-        let size_before = std::fs::metadata(&data)?.len();
+        phase(&format!("step {batch_size} {events}"))?;
+        let size_before = database_bytes(&env)?;
         let io_before = process_write_bytes();
         let mut txn_us = Vec::new();
         let mut commit_hist = Histogram::<u64>::new(3)?;
@@ -327,14 +336,19 @@ pub fn run(opts: &Options) -> Result<Report> {
             bytes_written,
             bytes_per_stored: bytes_written.map(|bytes| bytes as f64 / stored),
             pages_per_commit: bytes_written.map(|bytes| bytes as f64 / PAGE_BYTES / commits as f64),
-            file_growth_bytes: std::fs::metadata(&data)?.len().saturating_sub(size_before),
+            file_growth_bytes: database_bytes(&env)?.saturating_sub(size_before),
             search_built: search.events,
             search_build_secs: search.secs,
             txn_us,
         });
         pending.clear();
     }
+    if opts.record_ops.is_some() {
+        finish_ops()?;
+    }
     Ok(Report {
+        storage_backend: wok_db::storage_backend_name(),
+        file_growth_scope: "all native database files; no forced flush or compaction",
         corpus_events,
         preloaded,
         preload_stored: preload.stored,
@@ -342,6 +356,40 @@ pub fn run(opts: &Options) -> Result<Report> {
         io_counted,
         steps,
     })
+}
+
+fn database_bytes(env: &wok_db::Env) -> Result<u64> {
+    Ok(env.stats()?.used_bytes)
+}
+
+#[cfg(feature = "op-log")]
+fn record_ops(path: &std::path::Path, env: &wok_db::Env) -> Result<()> {
+    wok_db::op_log::start(path, env).with_context(|| format!("create {}", path.display()))
+}
+
+#[cfg(not(feature = "op-log"))]
+fn record_ops(_: &std::path::Path, _: &wok_db::Env) -> Result<()> {
+    anyhow::bail!("--db-record-ops needs wok-bench built with --features op-log")
+}
+
+#[cfg(feature = "op-log")]
+fn phase(label: &str) -> Result<()> {
+    Ok(wok_db::op_log::phase(label)?)
+}
+
+#[cfg(not(feature = "op-log"))]
+fn phase(_: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "op-log")]
+fn finish_ops() -> Result<()> {
+    Ok(wok_db::op_log::finish()?)
+}
+
+#[cfg(not(feature = "op-log"))]
+fn finish_ops() -> Result<()> {
+    Ok(())
 }
 
 fn parse(line: &str) -> Result<wok_db::EventToWrite> {
@@ -404,10 +452,11 @@ fn process_write_bytes() -> Option<u64> {
 }
 
 pub fn render_markdown(report: &Report) -> String {
-    let mut s = format!(
+    let mut s = format!("\nStorage backend: `{}`. File-growth scope: {}. The pages column reports 4 KiB equivalents of process writes.\n", report.storage_backend, report.file_growth_scope);
+    s.push_str(&format!(
         "\n## db_write: {} events preloaded ({} stored) in {:.1} s\n\nEach step writes its own slice of the corpus's last events in transactions of `batch` events, each committed durably, as the relay writer does. Stored events were inserted; settled ones are duplicates, older versions of replaceable events, or deleted, with no row of their own. Rates, times and bytes per event count stored events. Transaction time runs from `begin_rw` to the end of the commit. Bytes are what the process wrote, from `/proc/self/io`; a page counts once per commit that dirties it. With few commits, p99 is close to the step's maximum. The search index is built as the relay writer builds it: a step after a batch once 1,000 events wait, and the rest at the step's end. Its time and bytes count in the step's; `search built` and `build s` are its events and time, and commits count only event batches.\n\n| batch | events | stored | settled | unfinished | commits | stored/s | µs/stored | txn p50 µs | txn p99 µs | txn max µs | commit p50 µs | commit p99 µs | bytes/stored | pages/commit | file growth MB | search built | build s |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         report.preloaded, report.preload_stored, report.preload_secs
-    );
+    ));
     let optional = |value: Option<f64>| value.map_or_else(|| "n/a".into(), |v| format!("{v:.0}"));
     for step in &report.steps {
         s.push_str(&format!(
@@ -457,6 +506,7 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![1, 4],
             step_events: 40,
+            record_ops: None,
         })
         .unwrap();
         assert_eq!(report.corpus_events, 300);
@@ -519,6 +569,7 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![4],
             step_events: 80,
+            record_ops: None,
         })
         .unwrap();
         assert_eq!((report.preloaded, report.preload_stored), (101, 101));
@@ -548,6 +599,7 @@ mod tests {
             dir: dir.path().join("db"),
             batches: vec![1],
             step_events: 50,
+            record_ops: None,
         })
         .err()
         .unwrap();

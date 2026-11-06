@@ -1,6 +1,6 @@
 # wok-event/tests
 
-Integration tests for the event crate. Fast; no LMDB.
+Integration tests for the event crate. Fast; no database.
 
 | File | Role |
 | --- | --- |

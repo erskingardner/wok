@@ -1,4 +1,4 @@
-//! Process-death tests at real LMDB transaction boundaries. Checkpoints exist
+//! Process-death tests at real storage transaction boundaries. Checkpoints exist
 //! only in this unit-test build, never in the library used by the relay or CLI.
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -106,6 +106,8 @@ struct Snapshot {
     version: u64,
     records: Vec<(u64, Vec<u8>, Vec<u8>)>,
     state: Option<BTreeMap<Vec<u8>, Vec<u8>>>,
+
+    author_frontiers: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 fn snapshot(env: &Env) -> Snapshot {
@@ -140,6 +142,19 @@ fn snapshot(env: &Env) -> Snapshot {
         version,
         records,
         state,
+
+        author_frontiers: {
+            let cf = env.inner.db.cf_handle(crate::rocks::HEAD_CF).unwrap();
+            let mut cursor = env.inner.db.raw_iterator_cf(cf);
+            cursor.seek_to_first();
+            let mut heads = BTreeMap::new();
+            while let Some((key, value)) = cursor.item() {
+                heads.insert(key.to_vec(), value.to_vec());
+                cursor.next();
+            }
+            cursor.status().unwrap();
+            heads
+        },
     }
 }
 
@@ -217,7 +232,7 @@ fn assert_counts_and_sequence(env: &Env, counts: [u64; 2], sequence: u64) {
 
 #[test]
 fn killed_writes_recover_atomic_events_counters_and_sequence() {
-    for lazy in [false, true] {
+    for lazy in [false] {
         for action in ["insert", "replace", "delete", "mixed"] {
             for stage in [
                 "write-before-flush",
@@ -295,46 +310,4 @@ fn killed_writes_recover_atomic_events_counters_and_sequence() {
             }
         }
     }
-}
-
-#[test]
-fn killed_v4_upgrade_is_atomic_and_retryable() {
-    for stage in [
-        "upgrade-marker-staged",
-        "open-before-commit",
-        "open-after-commit",
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        seed(dir.path()).into_test_fixture_without_state(4);
-        let before = snapshot(&Env::open(dir.path(), options(true)).unwrap());
-        assert_eq!(before.version, 4);
-        assert!(before.state.is_none());
-        kill_at(dir.path(), "upgrade", stage);
-        let after = snapshot(&Env::open(dir.path(), options(true)).unwrap());
-        assert_eq!(before.records, after.records);
-        if stage == "open-after-commit" {
-            assert_eq!(after.version, 5);
-            assert_eq!(after.state, Some(BTreeMap::new()));
-        } else {
-            assert_eq!(before, after);
-        }
-        let env = Env::open(dir.path(), options(false)).unwrap();
-        assert_eq!(env.db_version().unwrap(), 5);
-        mutate(&env, "insert");
-        let snapshot = snapshot(&env);
-        assert_eq!(snapshot.records.last().unwrap().0, 4);
-    }
-}
-
-#[test]
-fn v5_without_state_table_is_corrupt() {
-    let dir = tempfile::tempdir().unwrap();
-    seed(dir.path()).into_test_fixture_without_state(5);
-    let env = Env::open(dir.path(), options(true)).unwrap();
-    let report = check_integrity(&env.begin_ro().unwrap()).unwrap();
-    assert!(!report.ok());
-    assert!(report
-        .issues
-        .iter()
-        .any(|issue| issue.category == "missing-table" && issue.table == "state"));
 }

@@ -652,7 +652,6 @@ fn dashboard_config(cfg: &Config) -> serde_json::Value {
                 .join(", "),
             "max_websocket_payload_size": cfg.relay.max_websocket_payload_size,
             "min_free_disk_bytes": cfg.db_min_free_disk_bytes,
-            "map_size": cfg.db_mapsize,
         },
     })
 }
@@ -1661,9 +1660,10 @@ mod tests {
         };
         let text = file(&format!("\"{kept}\", \"{removed}\""), "");
         std::fs::write(&path, &text).unwrap();
-        let env = wok_db::Env::open(dir.path(), wok_db::EnvOptions::for_tests()).unwrap();
+        let database = dir.path().join("db");
+        let env = wok_db::Env::open(&database, wok_db::EnvOptions::for_tests()).unwrap();
         let mut cfg = Config::parse_toml(&text).unwrap();
-        cfg.db = dir.path().to_path_buf();
+        cfg.db = database;
         let handle = wok_relay::start(env, cfg).unwrap();
         handle.set_config_path(path.clone());
         handle

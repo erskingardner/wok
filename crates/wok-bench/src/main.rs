@@ -18,6 +18,7 @@ mod codec;
 mod corpus;
 mod db_write;
 mod live;
+mod matched_network;
 mod rate;
 mod social;
 mod tag_kinds;
@@ -109,6 +110,16 @@ struct Args {
     /// connections, whether or not earlier events have been answered.
     #[arg(long, default_value_t = 1_000.0)]
     send_rate: f64,
+    /// Total fixed query arrivals per second in matched_network.
+    #[arg(long, default_value_t = 1_000)]
+    read_rate: u64,
+    /// Multiplexed historical query WebSockets in matched_network.
+    #[arg(long, default_value_t = 2)]
+    read_connections: usize,
+    /// matched_network writer authors: legacy disjoint keys, or the actual
+    /// historical author-plan keys (same seed as matched_network_generate).
+    #[arg(long, value_enum, default_value = "disjoint")]
+    matched_writer_authors: matched_network::WriterAuthors,
     /// Seconds --scenario ws_publish_rate sends for.
     #[arg(long, default_value_t = 10)]
     send_secs: u64,
@@ -320,6 +331,10 @@ struct Args {
     /// the end of the corpus; a step also writes at least 20 transactions.
     #[arg(long, default_value_t = 2_000)]
     db_step_events: u64,
+    /// Log every write --scenario db_write commits to this file, for
+    /// replaying on other storage engines. Needs the `op-log` feature.
+    #[arg(long)]
+    db_record_ops: Option<PathBuf>,
 }
 
 impl Args {
@@ -460,6 +475,11 @@ fn main() -> Result<()> {
         )
         .init();
     let mut args = Args::parse();
+    if args.matched_writer_authors == matched_network::WriterAuthors::Queried
+        && args.scenario.as_deref() != Some("matched_network")
+    {
+        anyhow::bail!("--matched-writer-authors queried requires --scenario matched_network");
+    }
     CLIENT_NODELAY.store(args.tcp_nodelay, std::sync::atomic::Ordering::Relaxed);
     if args.repetitions == 0 {
         anyhow::bail!("--repetitions must be at least 1");
@@ -479,6 +499,12 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.out)?;
     if let (Some(log), Some(export)) = (&args.reconcile, &args.relay_export) {
         return reconcile_outcomes(&args.out, log, export);
+    }
+    if matches!(
+        args.scenario.as_deref(),
+        Some("matched_network" | "matched_network_generate")
+    ) {
+        return matched_network::dispatch(&args);
     }
     let profile_scenarios: Vec<&str> = if args.profile == "load" {
         vec!["ws_publish_scaled", "live_fanout", "idle_connections"]
@@ -1306,6 +1332,7 @@ fn run_trial(
             dir: args.dataset_dir.clone(),
             batches: args.db_batches.clone(),
             step_events: args.db_step_events,
+            record_ops: args.db_record_ops.clone(),
         }) {
             Ok(report) => {
                 throughput = report.best_rate();
@@ -1583,7 +1610,7 @@ impl EventFactory {
         let pubkey = hex::encode(key.x_only_public_key().0.serialize());
         let mut tags = vec![json!(["t", format!("tag-{}", i % 64)])];
         match kind {
-            1 if i % 5 == 0 => {
+            1 if i.is_multiple_of(5) => {
                 if let Some((event_id, parent_pubkey, _)) = &self.last_note {
                     tags.push(json!(["e", event_id, "", "reply"]));
                     tags.push(json!(["p", parent_pubkey]));

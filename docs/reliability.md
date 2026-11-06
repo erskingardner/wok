@@ -8,7 +8,7 @@ or production capacity.
 
 | Workflow | Evidence |
 | --- | --- |
-| `ci.yml` | Formatting, Clippy, all workspace tests (including benchmark correctness), Rust 1.85 compilation |
+| `ci.yml` | Formatting, Clippy, RocksDB workspace tests (including benchmark correctness), Rust 1.88 compilation |
 | `ci.yml` migration job | Builds pinned strfry `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`; verifies import, event identity, and actual CLI migration |
 | `platforms.yml` | Native release build, version check, storage/transport/compatibility/CLI tests on Linux x86-64/ARM64 and macOS Intel/Apple Silicon |
 | `fuzz.yml` | 10,000 AddressSanitizer ingress fuzz iterations, protocol-shaped seeds, 2 MiB input ceiling, corpus reuse, crash artifacts |
@@ -27,14 +27,19 @@ the fuzz workflow. Inputs are seeded at protocol and WebSocket length boundaries
 and retained between runs. This remains a bounded fuzz smoke test; iteration
 counts and exercised branches are not coverage of every possible input.
 
-On macOS, if every LMDB-backed test fails at `Env::open` with
-`Lmdb(28, "No space left on device")` even though the disk has space, the
-system POSIX semaphore table is full of leaked LMDB semaphores. See "LMDB
-semaphores on macOS" in `production-deployment.md`.
+On macOS, legacy LMDB import fixtures can encounter semaphore exhaustion even
+when disk space remains. This affects the read-only import boundary, not the
+RocksDB runtime. See "LMDB import semaphores on macOS" in
+`production-deployment.md`.
 
 The GitHub ruleset is separate from workflow configuration. Defining mandatory
 jobs within a workflow does not make passing checks a prerequisite for pushing
 to master. Branch-rule changes require a separate repository-policy decision.
+
+Native functional test jobs use `RUST_TEST_THREADS=2` to bound concurrent
+database fixtures and their open files, particularly RocksDB's column-family
+fixtures. This is test resource control, not a runtime capacity claim; soak and
+benchmark arrival rates and production file-descriptor settings are unchanged.
 
 ## Generated lifecycle tests
 
@@ -85,25 +90,60 @@ python3 scripts/reliability-soak.py \
   --seconds 3600 --seed 4242 --out /tmp/wok-soak-run-1
 ```
 
+RocksDB is the sole runtime and soak backend; no feature or `--backend`
+selector is needed. The runner checks `wok storage-backend` before starting.
+Builds require Rust 1.88+, a C/C++ compiler and libclang. The separate load
+driver speaks WS/Unix and has no storage backend choice.
+
 Python 3.11+ and Linux `/proc` are required. The runner creates disposable storage
 and loopback listeners, never resets an existing database, and refuses to reuse
 an output directory. `--port` defaults to 17777. The driver uses both transports
 against one relay process and runs approximately one mixed round per second.
+The default `--rocksdb-profile small` sets a 16-MiB block cache, disables the row
+cache, sets a 16-MiB aggregate memtable target and a 32-MiB WAL flush trigger.
+It also sets `MALLOC_ARENA_MAX=2` for the relay, load driver, backend identity
+check and offline audits. On glibc this limits allocator arenas and the memory
+they can retain after transient large messages; other libcs may ignore it.
+This tests a small-memory deployment under the budgets below. It does not
+change Wok's production defaults, format, workload or synchronous WAL durability.
+The manifest records every native override, the effective allocator environment
+and detected controller libc. The variable's presence does not prove that the
+relay's allocator honors it. This setting is specific to the soak fixture; it
+is not a production throughput recommendation or a hard RSS limit.
 
 The workload includes:
 
-- 20,000 seeded initial notes, followed by a bounded rotating set of 256 notes,
-  64 addressable replaceable events, and four deletion events.
+- 20,000 initial base notes plus 498 author-feed seed notes, followed by a
+  bounded rotating set of notes, 64 addressable replaceable events and batched
+  deletion requests every 15 rounds.
 - Eight publisher connections, four fast live subscribers, two slow subscribers,
   and periodic reconnects.
 - Exact per-event receipts and fast-subscriber payload checks.
 - Historical queries and COUNT on both transports every 15 rounds, followed by
   multi-round negentropy against the full expected set.
+- Two additional same-author note streams, retained with bounded batched
+  deletion, within a 500-author filter. Both transports check live bodies,
+  newest-50 order and complete COUNT as those authors keep appending. The
+  other 498 author ranges each contain one signed seed note older than the
+  active streams, so the filter exercises populated author ranges. Distinct
+  timestamps make the exact ordered answer unambiguous.
 - Separate 512 KiB ephemeral bursts to pressure slow subscribers without growing
   the durable dataset. Slow-reader closure must be observed in runs of at least
   three minutes.
-- A midpoint SIGTERM shutdown, offline integrity check, restart, and exact
-  post-restart history verification; final integrity after shutdown.
+- A midpoint SIGTERM shutdown and a later deliberate SIGKILL after a fully
+  acknowledged batch, each followed by offline integrity, reopen and exact
+  history/feed/COUNT/negentropy verification. These are process-crash and
+  acknowledged-data recovery checks, not a power-loss or in-flight-transaction
+  guarantee. Very short canaries can extend past the requested mixed duration
+  to finish both recovery phases.
+- Full offline RocksDB primary, signature, derived-index and author-frontier
+  audits after each stop and at the end. The final primary event count must
+  match the driver's complete stored-event model.
+
+Historical queries, latest-feed checks, COUNT and negentropy run between fully
+acknowledged publication batches. Live subscriptions stay open during
+publication. Simultaneous fixed-rate query/write measurements use the
+[matched campaign](../tools/relay-matched/README.md).
 
 Each run records hashes of the relay, driver, config and initial signed corpus;
 Linux/cgroup details; per-process RSS, anonymous memory, CPU time, thread count,
@@ -112,7 +152,21 @@ results. Keys are seeded; the initial corpus records its actual timestamps and s
 Mixed-workload events use the live clock and are not retained as a complete
 replay stream, so a seed alone does not reproduce every event byte.
 
-Sampled budgets are 768 MiB relay RSS and 512 MiB database size. Five-second
+Database size counts all regular files below the owned database directory,
+including RocksDB WAL/SST files. Paths containing
+symlinks are rejected; a file removed by compaction during a sample is skipped.
+These directory samples are not atomic storage snapshots. Default sampled budgets
+are 768 MiB relay RSS and 512 MiB database size. `--max-db-mib` records an explicit
+whole-database allowance in the manifest. To diagnose the unmodified production
+defaults instead, select `--rocksdb-profile native-defaults --max-db-mib 2048`:
+this emits no native overrides and leaves disk allowance above the default
+1-GiB WAL flush target. It inherits the allocator environment without overriding
+it; the manifest records the effective value. The RSS and memory-growth checks
+remain identical, so
+that diagnostic can fail those checks while buffers are filling. It does not
+qualify the native defaults for a small-memory deployment. Preserve failed runs
+and report each profile separately.
+Five-second
 sampling can miss shorter resource spikes; these are not continuous peak measurements. For each process lifetime,
 after 120 seconds of warmup, growth between the first and last six anonymous-RSS
 samples must remain within 64 MiB. Short canaries may have no eligible growth
@@ -125,8 +179,20 @@ The config allows a 30,000-event query and 16 MiB per-connection outbound queue
 for this dataset. Rate limiting is disabled to isolate storage/transport
 reliability; admission-limit behavior is covered separately by integration tests.
 Fixtures retain the host's inherited file-descriptor limit (`nofiles = 0`).
-Normal synchronous LMDB durability is retained. The resource cap does not cover
+Normal synchronous RocksDB WAL batches are retained.
+These are workload budgets, not the storage engines' production memory limits.
+The resource cap does not cover
 the load driver's memory; container limits and host details are recorded.
+
+For a separate allocation diagnosis, build the relay with
+`--features wok-db/rocksdb-memory-diagnostics`. It logs native per-family
+memtable/table-reader sizes, snapshots, the shared block cache once and row-cache
+usage at transaction boundaries, at most once per 15 seconds per environment,
+plus a final sample before native shutdown. Samples include process, path and
+read-only identity; offline audits are different processes from the live relay.
+The properties are non-atomic observations; pinned sizes are subsets. This
+feature forces no flush or compaction and is absent from ordinary builds.
+Keep instrumented diagnosis separate from comparative latency results.
 
 This workload checks periodic sync during continuing relay operation. It does
 not establish behavior for every large private sync, sustained saturation,

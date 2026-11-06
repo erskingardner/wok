@@ -1,75 +1,53 @@
-//! Permission bits of the database files Wok creates.
+//! The directory protects every native file, including WAL and compaction output.
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use wok_db::{event_fingerprint, snapshot_lmdb_readonly, Env, EnvOptions};
+use wok_db::{Env, EnvOptions};
 
-/// Files are created with mode `0o640` less the umask, so whatever the umask
-/// they never give other users access.
-fn assert_no_other_access(path: &Path) {
-    let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode & !0o640, 0, "{} has mode {mode:o}", path.display());
-}
-
-fn env_with_an_event(path: &Path) -> Env {
-    let env = Env::open(path, EnvOptions::for_tests()).unwrap();
-    env.ensure_initialized().unwrap();
-    let packed = wok_event::PackedEventBuilder::build(
-        &[1; 32],
-        &[9; 32],
-        1,
-        1,
-        0,
-        &wok_event::PackedEventTagBuilder::default(),
-    )
-    .unwrap();
-    let json = serde_json::json!({"id":hex::encode([1;32]),"pubkey":hex::encode([9;32]),"created_at":1,"kind":1,"tags":[],"content":"","sig":"00".repeat(64)});
-    let mut events = [wok_db::EventToWrite::new(
-        packed.into_bytes(),
-        json.to_string(),
-    )];
-    let mut txn = env.begin_rw().unwrap();
-    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
-    txn.commit().unwrap();
-    env
+fn mode(path: &std::path::Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
 #[test]
-fn a_new_environment_gives_other_users_no_access() {
-    let dir = tempfile::tempdir().unwrap();
-    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
+fn new_database_directory_excludes_other_users() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("new-db");
+    let env = Env::open(&db, EnvOptions::for_tests()).unwrap();
     env.ensure_initialized().unwrap();
-    assert_no_other_access(&dir.path().join("data.mdb"));
-    assert_no_other_access(&dir.path().join("lock.mdb"));
+    assert_eq!(mode(&db) & 0o077, 0);
+    assert!(db.join("CURRENT").is_file());
 }
 
 #[test]
-fn a_compact_copy_is_the_named_file_and_gives_other_users_no_access() {
-    let dir = tempfile::tempdir().unwrap();
-    let env = env_with_an_event(&dir.path().join("source"));
-    let copy_dir = dir.path().join("copy");
-    std::fs::create_dir(&copy_dir).unwrap();
-    let copy = copy_dir.join("data.mdb");
+fn writable_open_protects_an_existing_directory_and_keeps_group_permissions() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("db");
+    std::fs::create_dir(&db).unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = Env::open(&db, EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    assert_eq!(mode(&db), 0o750);
+    drop(env);
 
-    env.compact_to_path(&copy).unwrap();
-    assert_no_other_access(&copy);
-    let err = env.compact_to_path(&copy).unwrap_err();
-    assert!(err.to_string().contains("exists, not overwriting"), "{err}");
+    let backup = root.path().join("backup");
+    let env = Env::open(&db, EnvOptions::for_tests()).unwrap();
+    env.backup_to_directory(&backup).unwrap();
+    assert_eq!(mode(&backup) & 0o007, 0);
+    assert!(backup.join("CURRENT").is_file());
+}
 
-    let copied = Env::open(&copy_dir, EnvOptions::for_tests()).unwrap();
+#[test]
+fn rejecting_lmdb_does_not_change_its_bytes_or_permissions() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("legacy");
+    std::fs::create_dir(&db).unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(db.join("data.mdb"), b"preserved legacy source").unwrap();
+    let error = Env::open(&db, EnvOptions::for_tests()).unwrap_err();
+    assert!(error.to_string().contains("wok migrate rocksdb"));
+    assert_eq!(mode(&db), 0o755);
     assert_eq!(
-        event_fingerprint(&copied).unwrap(),
-        event_fingerprint(&env).unwrap()
+        std::fs::read(db.join("data.mdb")).unwrap(),
+        b"preserved legacy source"
     );
-}
-
-#[test]
-fn a_migration_snapshot_gives_other_users_no_access() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    drop(env_with_an_event(&source));
-    let snapshot = dir.path().join("snapshot");
-
-    snapshot_lmdb_readonly(&source, &snapshot, false).unwrap();
-    assert_no_other_access(&snapshot.join("data.mdb"));
+    assert_eq!(std::fs::read_dir(&db).unwrap().count(), 1);
 }

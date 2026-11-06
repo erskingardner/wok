@@ -139,7 +139,7 @@ The runner writes `bench-results/lab/<run-id>/`, including:
   logs, and explicit success/failure records.
 - Sampled Docker CPU, memory, network/block I/O and process counts for both roles.
   Samples are sequential snapshots about five seconds apart plus collection
-  overhead, not continuous peak measurements or LMDB writer-queue timings.
+  overhead, not continuous peak measurements or writer-queue timings.
 - Relay config, metrics, logs including shutdown, final container exit state,
   and offline integrity output.
 

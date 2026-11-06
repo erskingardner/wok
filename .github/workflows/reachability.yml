@@ -31,9 +31,14 @@ jobs:
   check:
     name: attack-surface reachability
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 75
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RUST_TEST_THREADS: '2'
     steps:
       - uses: actions/checkout@v6
+      - name: RocksDB native compiler and libclang
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
       - name: Pinned toolchain with llvm-tools
         run: |
           rustup toolchain install

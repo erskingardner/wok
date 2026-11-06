@@ -57,8 +57,15 @@ fn make_cpp_db() -> (TempDir, PathBuf) {
 fn open_cpp_created_database() {
     require_strfry!();
     let (_tmp, db) = make_cpp_db();
-    let env = Env::open(&db, EnvOptions::for_tests()).unwrap();
-    assert_eq!(env.db_version().unwrap(), 3);
+    let output =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    assert_eq!(wok_db::inspect_strfry_source(&db).unwrap().db_version, 3);
+    let report =
+        wok_db::migrate_strfry_to_rocksdb(&db, &output.path().join("db"), &Default::default())
+            .unwrap();
+    assert!(report.verified && report.sealed && report.source_unchanged);
+    let env = Env::open(output.path().join("db"), EnvOptions::for_tests()).unwrap();
+    assert_eq!(env.db_version().unwrap(), wok_event::WOK_DB_VERSION);
     let txn = env.begin_ro().unwrap();
     let meta = txn.get_u64(env.dbis().meta, 1).unwrap().unwrap();
     let m = wok_db::decode_meta(meta).unwrap();
@@ -67,38 +74,14 @@ fn open_cpp_created_database() {
 }
 
 #[test]
-fn cpp_refuses_wok_owned_database() {
+fn runtime_refuses_cpp_source_without_creating_rocks_files() {
     require_strfry!();
-    let tmp = TempDir::new().unwrap();
-    let db = tmp.path().join("db");
-    let env = Env::open(&db, EnvOptions::for_tests()).unwrap();
-    env.ensure_initialized().unwrap();
-    drop(env);
-
-    let conf = tmp.path().join("strfry.conf");
-    std::fs::write(
-        &conf,
-        format!("db = \"{}\"\nrelay {{ nofiles = 0 }}\n", db.display()),
-    )
-    .unwrap();
-    let out = Command::new(strfry_bin())
-        .args(["--config", conf.to_str().unwrap(), "info"])
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "strfry unexpectedly opened a Wok-owned database: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains(&format!(
-            "Database version too new: {}",
-            wok_event::WOK_DB_VERSION
-        )),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let (_tmp, db) = make_cpp_db();
+    let before = std::fs::read(db.join("data.mdb")).unwrap();
+    assert!(Env::open(&db, EnvOptions::for_tests()).is_err());
+    assert_eq!(std::fs::read(db.join("data.mdb")).unwrap(), before);
+    assert!(!db.join("CURRENT").exists());
+    assert_eq!(wok_db::inspect_strfry_source(&db).unwrap().db_version, 3);
 }
 
 fn sign_kind1(content: &str, created_at: u64) -> (Vec<u8>, String) {

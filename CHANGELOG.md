@@ -7,8 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0-rc.1] - 2026-11-06
+
+### Changed
+
+- RocksDB is the sole runtime and ordinary build. LMDB is read-only import
+  support for Wok v4/v5 and strfry v3; runtime/layout build selectors are removed.
+  The verified v3 RocksDB format and its historical storage identity are retained.
+- Rust 1.88 is the minimum. Releases produce one native archive per target;
+  release-candidate tags publish as prereleases without replacing latest stable.
+- The LMDB-only `compact <file>` command is removed; use
+  `wok backup --output <new-directory>` for a native checkpoint.
+- Stop the relay before separate imports, maintenance or checkpoints: RocksDB
+  takes an exclusive writer-process lock. New native directories are private and
+  writable opens strip other-user access. Legacy LMDB configuration keys remain
+  accepted but do not tune RocksDB.
+
 ### Added
 
+- `wok storage-backend` identifies the runtime without opening a database;
+  `doctor` reports native storage health and free space.
+- `wok migrate rocksdb` performs an offline, verified full-state copy from Wok
+  LMDB v4/v5 into a new RocksDB directory, preserving local IDs, encoded payloads
+  and administrative state. It retains the source and failed staging, publishes
+  without replacing an existing path, and provides `--check` and JSON outcomes.
+- `wok backup --output <new-directory>` creates a native RocksDB checkpoint
+  without replacing a path. Operator guidance covers migration, verification,
+  source preservation and rollback limits after new writes.
+- Optional `wok-db/rocksdb-memory-diagnostics` builds report native allocation
+  usage without changing storage settings. The soak runner records an explicit
+  `--max-db-mib` allowance while retaining its memory and recovery checks.
+- Startup-only `[database.rocksdb]` controls size the shared block cache, row
+  cache, aggregate memtables and WAL flush trigger. Existing native defaults,
+  physical format and synchronous durability are unchanged. The soak's explicit
+  small-memory profile exercises smaller targets under its original budgets.
 - NIP-D9 Deletion Request Protection from NIPs proposal #2531: eligible
   events signed with `["no_delete"]` survive their author's kind-5 deletion
   and kind-62 purge requests, regardless of arrival order or republication.
@@ -80,9 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a recipient, address, deletion target or expiry its author did not sign,
   or not signed at all. A source holding such an event is refused, and up to
   100 of them are named by local ID, id and reason; `--check` reports the
-  same. Verification spreads over every core, or half of them for `--check`,
-  which may run beside strfry: a million events took about 4 s on a 14-core
-  Apple M4 Max.
+  same. Verification streams in bounded memory. `--check` creates no destination;
+  stop strfry and every other source writer before checking and keep them stopped
+  through the copy.
 - A file that gives a kind more readers than its preset does is warned about
   when the relay starts, and by `wok doctor` in a new `read-classes` check
   (#163). `relay.auth.recipient_only_kinds = []`, `owner_only_kinds = []` or
@@ -471,6 +503,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Author frontiers store each author's newest two positions atomically with
+  thin postings. Wide pure-author scans initialize from snapshot-bound point
+  batches of 32, preserve exact resume lookahead and use ordinary seeks for
+  completeness peeks and unusable frontiers.
+- Runtime RocksDB keeps combined primary/payload records and thin author
+  postings without the former full author covering index. Older experimental
+  physical layouts remain incompatible and are refused explicitly.
 - `wok-bench --scenario db_write` times storing events without a relay or
   the network (#257). It loads a corpus into a fresh database, then writes
   the corpus's last events through the relay writer's storage calls in
@@ -994,6 +1033,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Historical scans start at the query's inclusive `until` timestamp after
+  selecting their index plan, avoiding an extra seek through newer entries.
+  Planning probes, result ordering and resume boundaries retain their behavior.
+- Historical REQ completeness checks collect one candidate at a time when
+  looking past a result limit, avoiding a full delivery-batch refill to find
+  one more visible match. Normal event-delivery batching is unchanged.
 - Publishing an event no longer writes its NIP-50 search postings (#257).
   The relay's writer indexes stored events afterwards, in steps of up to
   10,000 events whenever it is idle, and before a batch once 1,000 events

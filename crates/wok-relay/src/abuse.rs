@@ -366,7 +366,7 @@ impl AbuseController {
         let now = Instant::now();
         let mut state = self.state.lock();
         state.checks = state.checks.wrapping_add(1);
-        if state.checks % 4096 == 0 {
+        if state.checks.is_multiple_of(4096) {
             let stale_before = now.checked_sub(Duration::from_secs(600)).unwrap_or(now);
             state
                 .buckets

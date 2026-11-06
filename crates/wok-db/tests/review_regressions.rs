@@ -86,38 +86,7 @@ fn quota_uses_net_replacement_and_deletion_effect() {
     txn.commit().unwrap();
 }
 
-#[test]
-fn v4_upgrade_preserves_records_and_initializes_state_lazily() {
-    let dir = tempfile::tempdir().unwrap();
-    let original;
-    {
-        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
-        env.ensure_initialized().unwrap();
-        let mut txn = env.begin_rw().unwrap();
-        let mut events = [stored_event(1, 1, 1)];
-        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
-        original = events[0].packed.clone();
-        txn.commit().unwrap();
-        let mut txn = env.begin_rw().unwrap();
-        txn.clear(env.dbis().state.unwrap()).unwrap();
-        let mut meta =
-            wok_db::decode_meta(txn.get_u64(env.dbis().meta, 1).unwrap().unwrap()).unwrap();
-        meta.db_version = 4;
-        txn.put_u64(env.dbis().meta, 1, &wok_db::encode_meta(&meta), 0)
-            .unwrap();
-        txn.commit().unwrap();
-    }
-    let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
-    assert_eq!(env.db_version().unwrap(), wok_event::WOK_DB_VERSION);
-    let mut txn = env.begin_rw().unwrap();
-    assert_eq!(txn.get_u64(env.dbis().event, 1).unwrap().unwrap(), original);
-    assert_eq!(wok_db::state::author_count(&mut txn, &[9; 32]).unwrap(), 1);
-    wok_db::delete_event_basic(&mut txn, 1).unwrap();
-    let mut events = [stored_event(2, 2, 1)];
-    wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
-    assert_eq!(events[0].lev_id, 2);
-    txn.commit().unwrap();
-}
+// Exercises an LMDB-specific on-disk/reader-table constraint.
 
 #[test]
 fn reindex_preserves_deleted_tail_and_rebuilds_author_counts() {

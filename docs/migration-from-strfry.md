@@ -1,13 +1,16 @@
 # Migration from strfry
 
 Wok treats strfry LMDB v3 as a one-way import format, not as a shared runtime
-database. Migration is designed to be lossless for event records, auditable,
+database. The command converts directly into RocksDB; it never writes an LMDB
+intermediate. Migration is designed to be lossless for event records, auditable,
 and safe to abandon before cutover.
 
 ## Command
 
-Run the no-write preflight first; it does not create a snapshot or output
-directory and may be run while strfry is serving traffic:
+Stop strfry and every other source writer before preflight, and keep them
+stopped through copying. The read-only check creates no snapshot or output
+directory, but verifies source file and transaction identity; active writes can
+make it refuse the source:
 
 ```bash
 wok migrate strfry \
@@ -29,43 +32,42 @@ well-known absolute path (`/usr/bin/lsof` etc.) before falling back to `PATH`
 lookup. Since migration is the highest-trust operation wok performs, run it
 with a clean `PATH` if your system keeps `lsof` elsewhere.
 
-After reviewing the report, stop strfry so the cutover has a clear event
-boundary, then run:
+After reviewing the report, keep the source stopped and run:
 
 ```bash
 wok migrate strfry \
   --db /var/lib/strfry \
   --config /etc/strfry.conf \
-  --output /var/lib/wok
+  --output /var/lib/wok --confirm-relay-stopped
 ```
 
-The source paths must exist and the output path must not. The migration repeats
+The source paths must exist and the output path must not. Stop every source
+writer and pass `--confirm-relay-stopped` for actual conversion. The migration repeats
 the preflight before doing any work. Wok builds the result
 in a sibling staging directory and renames it into place only after every check
 passes.
 
 ## What the command guarantees
 
-1. The source LMDB environment is opened read-only and copied with LMDB's
-   transactionally consistent compact-copy operation.
-2. The copy must be strfry database version 3 and pass Wok's integrity checks.
-3. Every event in the copy must verify against its stored payload: the payload
-   names the packed record's id, pubkey, kind and created_at, hashes to that
-   id, and carries a valid Schnorr signature by that pubkey, and the packed
-   record, from which every index is derived, indexes nothing the payload does
-   not carry. See
+1. The source is a registered read-only strfry v3 LMDB snapshot. No source
+   write transaction or writable LMDB intermediate is used.
+2. Integrity checks and each stored event's id, signature, packed fields, tags
+   and expiration must agree with its payload. See
    [Events that do not verify](#events-that-do-not-verify).
-4. Every Event and EventPayload record is fingerprinted using its local event
-   ID, exact packed bytes, and exact stored payload bytes.
-5. Only the copied Meta database ownership marker is changed, from strfry v3
-   to Wok v5.
-6. The event fingerprint and count must remain identical after that change, and
-   the result must reopen as a Wok database.
-7. Supported source settings are translated into native Wok TOML, with the
-   database path selecting the new Wok database.
+3. The bounded converter preserves logical tables, local event IDs, PackedEvent,
+   encoded payloads and dictionaries; it derives native author frontiers and
+   normalizes the destination's ownership marker to Wok v5.
+4. Per-table framed hashes/counts and the primary fingerprint verify the copy;
+   the sealed target reopens as RocksDB before publication.
+5. Supported source settings become native Wok TOML pointing to the new database.
+   A checksummed manifest records verification and configuration translation.
+6. Sibling staging is retained on failure. Only a verified result is published,
+   atomically and without replacing an existing output.
 
-The command does not write to the source `data.mdb` or source config. A failed
-migration does not promote a partial output.
+The command does not write source `data.mdb`, logical records or configuration.
+LMDB may update `lock.mdb` to coordinate its registered reader. Keep all source
+writers stopped until copying finishes; the converter checks source file and
+transaction identity again before sealing. No service is switched automatically.
 
 ## Events that do not verify
 
@@ -103,37 +105,40 @@ preimage a stored event may use (NIP-01, or the one strfry hashed for events
 containing U+007F). Hex is read as strfry read it, in either case and after an
 optional `0x`, and no limit from strfry's config is applied, so an event
 strfry verified and packed fails only if Wok's JSON parser refuses its
-payload, for example for nesting deeper than 128 levels (see
+payload, for example for nesting deeper than 128 levels. Conversion also has
+hard byte bounds: 64 MiB per source record and 16 MiB per decoded event JSON.
+Oversized records refuse conversion and are never skipped (see
 [known differences](known-differences.md)).
 
-Any event that fails refuses the migration. It is not skipped: migration
-copies every record or none. The error, like the preflight report, gives the
+Any event that fails refuses publication. It is not skipped: the migration
+retains an unpublished staging directory instead of publishing a partial copy. The error, like the preflight report, gives the
 number that failed and names up to 100 of them by local ID, the id the
 indexes hold, and the reason, such as `bad signature` or `packed p tag <hex> is
 not in the payload`. To migrate, stop strfry, delete those events (for
 example `strfry delete --filter '{"ids":["<id>"]}'`) or restore the database
 from a backup, and run the migration again.
 
-Verification costs a pass over the tags, a SHA-256 and a Schnorr signature
-check per event, spread over every core. The preflight, which may run beside strfry, uses half of
-them. The migration verifies its own snapshot, not the database the preflight
-read, so what it promotes is what it verified.
+Verification performs a tag check, SHA-256 and Schnorr signature check per
+event. Preflight and copying read separate snapshots; the converter verifies
+the exact snapshot it will publish. Allow downtime for full copying and
+verification, and reserve destination/temporary space rather than treating the
+preflight duration as a conversion estimate.
 
 ## Output
 
 ```text
 /var/lib/wok/
   db/
-    data.mdb
-    lock.mdb
+    ... native RocksDB files ...
   wok.toml
   migration-manifest.json
+  migration-manifest.sha256
 ```
 
 The manifest records source and target paths and versions, Wok's version,
-migration time, event count and fingerprint, config hashes, the final Wok
-`data.mdb` hash, verification results (`source_events_verified` is the check
-above), and review warnings.
+migration time, event count and fingerprint, config hashes, source `data.mdb`
+hash, native-file inventory, logical-table verification hashes, source
+preservation and review warnings. The sidecar checksums the exact manifest bytes.
 It also records `superseded_groups` and `superseded_events` for retained
 replaceable history, and `legacy_long_tag_records` for records that lack long
 tag values and that reindex can repack. Preflight warns about these versions and migration reports
@@ -190,4 +195,8 @@ be opened by strfry. If post-cutover events need to move back, stop Wok, export
 the required JSONL, and import it into a separate strfry v3 database. Test that
 recovery workflow before production cutover if zero event loss is required.
 
-Never run strfry and Wok as writers against the same LMDB environment.
+The preserved source is a pre-cutover snapshot. After Wok accepts new events or
+administrative changes, restarting strfry on that source omits those changes.
+Event JSON transfer does not restore moderation or other complete runtime state;
+validate any reconciliation before choosing rollback. Never point strfry at the
+RocksDB directory or mutate an import source during conversion.

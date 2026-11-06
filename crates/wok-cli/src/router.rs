@@ -487,15 +487,7 @@ struct ConnHandle {
 }
 
 pub async fn run_router(cfg: Config, router_path: PathBuf) -> Result<()> {
-    let env = wok_db::Env::open(
-        &cfg.db,
-        wok_db::EnvOptions {
-            max_readers: cfg.db_maxreaders,
-            map_size: cfg.db_mapsize,
-            no_read_ahead: cfg.db_no_read_ahead,
-            ..wok_db::EnvOptions::default()
-        },
-    )?;
+    let env = wok_db::Env::open(&cfg.db, cfg.db_options())?;
     env.ensure_initialized()?;
     let (manager_tx, mut manager_rx) = mpsc::channel::<ManagerMsg>(4096);
     let queue_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_EVENT_BYTES));

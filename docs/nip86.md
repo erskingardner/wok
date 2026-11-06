@@ -122,7 +122,7 @@ in-process `RelayHandle::manage` call).
 Stored NIP-56 reports (kind 1984) feed `listeventsneedingmoderation`: each
 `e` tag target (up to 64 per report) is recorded with a reason derived from
 the reporting pubkey and content. Queue entries are recorded in the same
-LMDB transaction as the report itself. `banevent` and `allowevent` both
+database transaction as the report itself. `banevent` and `allowevent` both
 remove the target from the queue; `unbanevent` and `unallowevent` leave it
 alone.
 
@@ -182,7 +182,7 @@ WebSocket connections already open from the address, before it answers.
 
 ## Persistence
 
-Moderation records live in a dedicated Wok-owned LMDB table
+Moderation records live in a dedicated Wok-owned logical table
 (`wok_Moderation`, prefix-keyed by record type) next to the NIP-62 markers.
 They survive restarts and `wok reindex`, are loaded into memory at startup,
 and are refreshed after every management mutation and every stored report.

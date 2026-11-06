@@ -4,13 +4,15 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wok_db::{
-    check_integrity, event_fingerprint, snapshot_lmdb_readonly, verify_events, Env, EnvOptions,
-    EnvironmentStats, EventVerificationReport, IntegrityReport,
+    audit_strfry_source, migrate_strfry_to_rocksdb, Env, EnvOptions, EnvironmentStats,
+    EventVerificationReport, IntegrityReport, LmdbSourceReport, LmdbToRocksOptions,
+    LmdbToRocksReport,
 };
 use wok_relay::{Config, StrfryConfigTranslation};
 
@@ -33,7 +35,11 @@ struct MigrationManifest {
     superseded_events: u64,
     legacy_long_tag_records: u64,
     event_fingerprint_sha256: String,
-    target_data_sha256: String,
+    source_data_sha256: String,
+    target_files: Vec<NativeFile>,
+    native_migration: LmdbToRocksReport,
+    /// Native table hashes above describe the raw copy, before new Wok-only derived tables were initialized.
+    destination_derived_tables_initialized: bool,
     source_config_sha256: String,
     output_config_sha256: String,
     translated_config_keys: Vec<String>,
@@ -61,12 +67,13 @@ pub struct MigrationPreflight {
     pub expected_source_db_version: u64,
     pub event_count: u64,
     pub source_data_bytes: u64,
+    pub source_logical_state: LmdbSourceReport,
+    pub event_fingerprint_sha256: String,
     pub estimated_output_bytes: u64,
     pub available_output_bytes: Option<u64>,
     pub lmdb: EnvironmentStats,
     pub source_integrity: IntegrityReport,
-    /// Each event against its payload. Absent from the preflight a migration
-    /// repeats, which verifies its snapshot instead.
+    /// Each event against its payload when full verification was requested.
     pub event_verification: Option<EventVerificationReport>,
     pub translated_keys: Vec<String>,
     pub ignored_keys: Vec<String>,
@@ -98,6 +105,7 @@ struct PreparedMigration {
     output: PathBuf,
     source_config_bytes: Vec<u8>,
     source_cfg: Config,
+    source_audit: wok_db::StrfrySourceAudit,
 }
 
 impl MigrationPreflight {
@@ -193,12 +201,27 @@ pub fn check_strfry(
     Ok(())
 }
 
+/// Caller must acknowledge that all source users are stopped before copying.
 pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> Result<()> {
-    let prepared = prepare_strfry(source_db, source_config, output, false)?;
+    let prepared = prepare_strfry(source_db, source_config, output, true)?;
+    if let Some(verification) = &prepared.report.event_verification {
+        if !verification.ok() {
+            bail!(
+                "{} of {} source events do not verify against their stored payloads:\n{}\
+                Restore or repair the source before migrating.",
+                verification.failed,
+                verification.events,
+                failure_lines(verification)
+            );
+        }
+    }
     if !prepared.report.ok {
         bail!(
             "migration preflight failed; run `wok migrate strfry --check` for the complete report"
         );
+    }
+    if !prepared.report.active_source_processes.is_empty() {
+        bail!("source database is in use; stop every source relay and utility");
     }
     let PreparedMigration {
         report,
@@ -207,179 +230,181 @@ pub fn migrate_strfry(source_db: &Path, source_config: &Path, output: &Path) -> 
         output,
         source_config_bytes,
         source_cfg,
+        source_audit,
     } = prepared;
-    let output_parent = output
-        .parent()
-        .context("output path has no parent directory")?;
-    std::fs::create_dir_all(output_parent).with_context(|| {
-        format!(
-            "create output parent directory '{}'",
-            output_parent.display()
-        )
-    })?;
-
+    let parent = output.parent().context("output path has no parent")?;
+    let source_identity = source_file_identity(&source_db.join("data.mdb"))?;
+    let source_data_sha256 = sha256_file(&source_db.join("data.mdb"))?;
+    // Keep immediately: every failed copy/manifest/promotion remains private
+    // and available for diagnosis. Nothing is automatically deleted or reused.
     let staging = tempfile::Builder::new()
         .prefix(".wok-migrate-")
-        .tempdir_in(output_parent)
-        .context("create migration staging directory")?;
-    let staging_db = staging.path().join("db");
-    snapshot_lmdb_readonly(&source_db, &staging_db, source_cfg.db_no_read_ahead)
-        .context("take read-only LMDB snapshot")?;
-
-    let options = EnvOptions {
-        max_readers: source_cfg.db_maxreaders,
-        map_size: source_cfg.db_mapsize,
-        no_read_ahead: source_cfg.db_no_read_ahead,
-        create_dir: false,
-        create_dbis: false,
-        ..EnvOptions::default()
-    };
-    let snapshot = Env::open(&staging_db, options.clone()).context("open strfry snapshot")?;
-    let source_version = snapshot.db_version()?;
-    if source_version != wok_event::STRFRY_DB_VERSION {
-        bail!(
-            "source database version is {source_version}; expected strfry version {}",
-            wok_event::STRFRY_DB_VERSION
-        );
-    }
-    let source_integrity = check_integrity(&snapshot.begin_ro()?)?;
-    if !source_integrity.ok() {
-        bail!("source database failed integrity checks: {source_integrity:?}");
-    }
-    // The snapshot is private to this process; strfry should be stopped by
-    // now (docs/migration-from-strfry.md), so verification uses every core.
-    let verification = verify_events(&snapshot, verify_threads(1))?;
-    if !verification.ok() {
-        bail!(
-            "{} of {} source events do not verify against their stored payloads:\n{}\
-             Delete them from the strfry database, or restore it from a backup, and migrate again.",
-            verification.failed,
-            verification.events,
-            failure_lines(&verification),
-        );
-    }
-    let before = event_fingerprint(&snapshot)?;
-    snapshot.upgrade_strfry_v3_to_wok()?;
-    drop(snapshot);
-
-    // A real strfry snapshot has none of Wok's extension tables. Create them
-    // only in the private, now Wok-owned staging copy, before promotion.
-    let target = Env::open(
-        &staging_db,
-        EnvOptions {
-            create_dbis: true,
-            ..options
-        },
-    )
-    .context("reopen migrated Wok database")?;
-    target.ensure_initialized()?;
-    // A relay started on the database can search it at once.
-    wok_db::finish_search_index(&target).context("build the search index")?;
-    let target_integrity = check_integrity(&target.begin_ro()?)?;
-    if !target_integrity.ok() {
-        bail!("migrated database failed integrity checks: {target_integrity:?}");
-    }
-    let after = event_fingerprint(&target)?;
-    if before != after {
-        bail!("event verification failed after assigning Wok database ownership");
-    }
-    drop(target);
-
-    let final_db = output.join("db");
-    let final_config = output.join("wok.toml");
-    let translated_config = translated_config(&source_cfg, &final_db)?;
-    let parsed_target = Config::parse_toml(&translated_config).map_err(anyhow::Error::msg)?;
-    if parsed_target.db != final_db {
-        bail!("translated config does not select the migrated database");
-    }
-    std::fs::write(
-        staging.path().join("wok.toml"),
-        translated_config.as_bytes(),
-    )
-    .context("write translated Wok config")?;
-
-    let manifest = MigrationManifest {
-        format_version: 1,
-        source_type: "strfry-lmdb-v3",
-        source_db: source_db.display().to_string(),
-        source_config: source_config.display().to_string(),
-        source_db_version: source_version,
-        target_db: final_db.display().to_string(),
-        target_config: final_config.display().to_string(),
-        target_db_version: wok_event::WOK_DB_VERSION,
-        wok_version: env!("CARGO_PKG_VERSION"),
-        migrated_at_unix_seconds: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before Unix epoch")?
-            .as_secs(),
-        event_count: before.count,
-        superseded_groups: source_integrity.superseded_groups,
-        superseded_events: source_integrity.superseded_events,
-        legacy_long_tag_records: target_integrity.legacy_long_tag_records,
-        event_fingerprint_sha256: hex::encode(before.sha256),
-        target_data_sha256: sha256_file(&staging_db.join("data.mdb"))?,
-        source_config_sha256: sha256_bytes(&source_config_bytes),
-        output_config_sha256: sha256_bytes(translated_config.as_bytes()),
-        translated_config_keys: report.translated_keys,
-        ignored_config_keys: report.ignored_keys,
-        verification: Verification {
-            source_integrity_ok: true,
-            source_events_verified: true,
-            event_records_unchanged: true,
-            target_opens_as_wok: true,
-        },
-        warnings: vec![
-            "The source database and config were not modified.",
-            "The copied database is Wok-owned and must not be opened by strfry.",
-            "Review plugin, write-policy, and socket paths before cutover.",
-            "Only supported strfry settings were translated into Wok TOML.",
-            "New ephemeral events are live-only by default; set events.ephemeral_persistence = \"ttl\" for strfry-compatible retention.",
-            "Wok native abuse controls are enabled by default; review relay.abuse budgets and quotas before cutover.",
-        ],
-    };
-    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
-    std::fs::write(staging.path().join(MANIFEST_NAME), manifest_json)
-        .context("write migration manifest")?;
-
-    let staging_path = staging.keep();
-    if let Err(error) = std::fs::rename(&staging_path, &output) {
-        let _ = std::fs::remove_dir_all(&staging_path);
-        return Err(error).with_context(|| {
-            format!(
-                "atomically promote migration output to '{}'",
-                output.display()
-            )
-        });
-    }
-
-    println!("Migrated {} events from strfry.", before.count);
-    if source_integrity.superseded_events != 0 {
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)
+        .context("create private migration staging")?
+        .keep();
+    let result = (|| -> Result<()> {
+        let staging_db = staging.join("db");
+        let copied =
+            migrate_strfry_to_rocksdb(&source_db, &staging_db, &LmdbToRocksOptions::default())
+                .context("direct read-only strfry v3 to RocksDB conversion")?;
+        if !copied.verified
+            || !copied.sealed
+            || !copied.source_unchanged
+            || copied.source.transaction_id != report.source_logical_state.transaction_id
+            || copied.primary_fingerprint_sha256 != report.event_fingerprint_sha256
+        {
+            bail!("source state changed since preflight or conversion was not fully verified");
+        }
+        // The sixteen imported tables stay byte-identical except Meta version.
+        // Only new, derived Wok indexes/bookkeeping are initialized here.
+        let target = Env::open(
+            &staging_db,
+            EnvOptions {
+                create_dir: false,
+                ..EnvOptions::default()
+            },
+        )
+        .context("open verified RocksDB destination")?;
+        wok_db::backend_migration::initialize_strfry_derived_state(&target, &copied, &source_audit)
+            .context("initialize verified replacement-history bookkeeping without a legacy scan")?;
+        target.ensure_initialized()?;
+        wok_db::finish_search_index(&target).context("build destination search index")?;
+        let after = wok_db::backend_migration::verify_rocksdb_events_bounded(&target)?;
+        if after.count != report.event_count
+            || hex::encode(after.sha256) != copied.primary_fingerprint_sha256
+        {
+            bail!("stored event bytes changed during destination initialization");
+        }
+        target.check_background_errors()?;
+        drop(target);
+        if source_file_identity(&source_db.join("data.mdb"))? != source_identity
+            || sha256_file(&source_db.join("data.mdb"))? != source_data_sha256
+            || wok_db::inspect_strfry_source(&source_db)?.transaction_id
+                != copied.source.transaction_id
+            || std::fs::read(&source_config)? != source_config_bytes
+        {
+            bail!("source database/config changed during migration");
+        }
+        let final_db = output.join("db");
+        let final_config = output.join("wok.toml");
+        let config = translated_config(&source_cfg, &final_db)?;
+        if Config::parse_toml(&config).map_err(anyhow::Error::msg)?.db != final_db {
+            bail!("translated config does not select the migrated database");
+        }
+        write_new(&staging.join("wok.toml"), config.as_bytes())?;
+        let manifest=MigrationManifest {
+            format_version:2,source_type:"strfry-lmdb-v3",source_db:source_db.display().to_string(),
+            source_config:source_config.display().to_string(),source_db_version:3,
+            target_db:final_db.display().to_string(),target_config:final_config.display().to_string(),
+            target_db_version:wok_event::WOK_DB_VERSION,wok_version:env!("CARGO_PKG_VERSION"),
+            migrated_at_unix_seconds:SystemTime::now().duration_since(UNIX_EPOCH)
+                .context("system clock is before Unix epoch")?.as_secs(),
+            event_count:after.count,superseded_groups:report.source_integrity.superseded_groups,
+            superseded_events:report.source_integrity.superseded_events,
+            legacy_long_tag_records:report.source_integrity.legacy_long_tag_records,
+            event_fingerprint_sha256:hex::encode(after.sha256),source_data_sha256,
+            target_files:native_inventory(&staging_db)?,native_migration:copied,
+            destination_derived_tables_initialized:true,
+            source_config_sha256:sha256_bytes(&source_config_bytes),
+            output_config_sha256:sha256_bytes(config.as_bytes()),
+            translated_config_keys:report.translated_keys.clone(),ignored_config_keys:report.ignored_keys.clone(),
+            verification:Verification {source_integrity_ok:true,source_events_verified:true,
+                event_records_unchanged:true,target_opens_as_wok:true},
+            warnings:vec!["Source data.mdb and config retained unchanged; LMDB reader coordination can update lock.mdb.",
+                "The destination is RocksDB and must never be opened by strfry.",
+                "Only supported config settings were translated; review plugin, AUTH, abuse and socket policies.",
+                "New ephemeral events are live-only by default; review events.ephemeral_persistence before cutover."]
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        write_new(&staging.join(MANIFEST_NAME), &bytes)?;
+        write_new(
+            &staging.join("migration-manifest.sha256"),
+            format!("{}  {MANIFEST_NAME}\n", sha256_bytes(&bytes)).as_bytes(),
+        )?;
+        File::open(&staging)?.sync_all()?;
+        wok_db::backup::promote_directory_noreplace(&staging, &output)
+            .context("publish verified migration without replacing any existing output")?;
+        File::open(parent)?.sync_all()?;
         println!(
-            "Retained {} superseded events in {} replacement groups; relay reads serve only the winners.",
-            source_integrity.superseded_events, source_integrity.superseded_groups,
+            "Migrated {} events directly from strfry to RocksDB.",
+            after.count
         );
-    }
-    if target_integrity.legacy_long_tag_records != 0 {
+        if report.source_integrity.superseded_events != 0 {
+            println!("Retained {} superseded events in {} replacement groups; relay reads serve only the winners.",
+                report.source_integrity.superseded_events,report.source_integrity.superseded_groups);
+        }
+        if report.source_integrity.legacy_long_tag_records != 0 {
+            println!("Kept {} records as strfry packed them; `wok reindex --confirm-relay-stopped` indexes omitted long tag values.",report.source_integrity.legacy_long_tag_records);
+        }
+        if report.source_integrity.legacy_untombstoned_deletions != 0 {
+            println!("{} deletion requests name replaceable events or kinds with leading zeros, which strfry did not tombstone; `wok reindex --confirm-relay-stopped` repairs those tombstones.",report.source_integrity.legacy_untombstoned_deletions);
+        }
         println!(
-            "Kept {} records as strfry packed them, without their single-letter tag values longer than 255 bytes; `wok reindex --confirm-relay-stopped` indexes those values.",
-            target_integrity.legacy_long_tag_records,
+            "Wok config: {}\nManifest: {}\nSource data and config were not modified.",
+            final_config.display(),
+            output.join(MANIFEST_NAME).display()
         );
-    }
-    if target_integrity.legacy_untombstoned_deletions != 0 {
-        println!(
-            "{} deletion requests name replaceable events or kinds with leading zeros, which strfry did not tombstone; `wok reindex --confirm-relay-stopped` deletes the versions they name and adds the tombstones.",
-            target_integrity.legacy_untombstoned_deletions,
-        );
-    }
-    println!("Wok config: {}", final_config.display());
-    println!("Manifest: {}", output.join(MANIFEST_NAME).display());
-    println!("Source files were not modified.");
-    Ok(())
+        Ok(())
+    })();
+    result.with_context(|| {
+        format!(
+            "migration staging retained at {} (unless already published at {})",
+            staging.display(),
+            output.display()
+        )
+    })
 }
 
-/// Workers for [`verify_events`]: the available cores divided by `share`.
-fn verify_threads(share: usize) -> usize {
-    std::thread::available_parallelism().map_or(1, |cores| (cores.get() / share).max(1))
+#[derive(Serialize)]
+struct NativeFile {
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+fn source_file_identity(path: &Path) -> Result<(u64, u64, u64, i64, i64, i64, i64)> {
+    let m = std::fs::symlink_metadata(path)?;
+    if !m.is_file() {
+        bail!("source data.mdb must remain a regular file");
+    }
+    Ok((
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    ))
+}
+fn native_inventory(path: &Path) -> Result<Vec<NativeFile>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            bail!("unexpected nonregular destination database entry");
+        }
+        files.push(NativeFile {
+            path: entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("nonUTF8 database filename"))?,
+            bytes: entry.metadata()?.len(),
+            sha256: sha256_file(&entry.path())?,
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o640)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn failure_lines(verification: &EventVerificationReport) -> String {
@@ -397,8 +422,8 @@ fn failure_lines(verification: &EventVerificationReport) -> String {
     out
 }
 
-/// With `verify`, also check each source event against its payload, on half
-/// the cores, since a preflight may run beside strfry.
+/// With `verify`, also check each source event against its payload in one
+/// registered snapshot. All source users must remain stopped during copying.
 fn prepare_strfry(
     source_db: &Path,
     source_config: &Path,
@@ -413,7 +438,30 @@ fn prepare_strfry(
             source_db.display()
         );
     }
+    if output
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("output must not contain parent traversal");
+    }
     let output = std::path::absolute(output).context("resolve output path")?;
+    let parent = output
+        .parent()
+        .context("output needs a parent")?
+        .canonicalize()
+        .context("output parent must already exist")?;
+    let output = parent.join(
+        output
+            .file_name()
+            .context("output needs a new directory name")?,
+    );
+    if output.starts_with(&source_db) || source_db.starts_with(&output) {
+        bail!("source/output paths must not overlap");
+    }
+    if source_db.to_str().is_none() || source_config.to_str().is_none() || output.to_str().is_none()
+    {
+        bail!("migration paths must be valid UTF8");
+    }
     let source_config_bytes = std::fs::read(&source_config)
         .with_context(|| format!("read source config '{}'", source_config.display()))?;
     let source_config_text =
@@ -429,38 +477,20 @@ fn prepare_strfry(
     Config::parse_toml(&generated_toml).map_err(anyhow::Error::msg)?;
 
     let (source_use_probe, active_source_processes) = probe_source_processes(&source_db);
-    let env = Env::open(
-        &source_db,
-        EnvOptions {
-            max_readers: source_cfg.db_maxreaders,
-            map_size: source_cfg.db_mapsize,
-            no_read_ahead: source_cfg.db_no_read_ahead,
-            create_dir: false,
-            create_dbis: false,
-            read_only: true,
-            ..EnvOptions::default()
-        },
-    )
-    .context("open strfry source read-only")?;
-    let source_db_version = env.db_version()?;
-    let lmdb = env.stats()?;
-    let source_integrity = check_integrity(&env.begin_ro()?)?;
-    let event_verification = verify
-        .then(|| verify_events(&env, verify_threads(2)))
-        .transpose()?;
-    drop(env);
-
-    let source_data_bytes = std::fs::metadata(source_db.join("data.mdb"))
-        .context("inspect source data.mdb")?
-        .len();
-    // The compact LMDB snapshot is normally smaller than data.mdb. Use the
-    // existing file size plus fixed metadata/config headroom as a conservative
-    // capacity estimate rather than promising compaction savings.
-    let estimated_output_bytes = source_data_bytes.saturating_add(64 * 1024 * 1024);
+    let audit =
+        audit_strfry_source(&source_db, verify).context("inspect strfry source read-only")?;
+    let source_db_version = audit.source.db_version;
+    let lmdb = audit.lmdb;
+    let source_integrity = audit.integrity.clone();
+    let event_verification = audit.event_verification.clone();
+    let source_data_bytes = audit.source.data_file_bytes;
+    // Planning floor, not an upper bound on WAL/compaction growth.
+    let estimated_output_bytes = source_data_bytes.saturating_mul(2).saturating_add(2 << 30);
     let available_output_bytes =
         nearest_existing_parent(&output).and_then(|path| crate::doctor::available_bytes(path).ok());
     let external_paths = external_path_checks(&source_cfg);
-    let output_available = !output.exists();
+    let output_available =
+        std::fs::symlink_metadata(&output).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
     let mut warnings = Vec::new();
     if source_integrity.superseded_events != 0 {
         warnings.push(format!(
@@ -505,7 +535,7 @@ fn prepare_strfry(
         let utilization = lmdb.used_bytes as f64 / lmdb.map_size as f64;
         if utilization >= 0.75 {
             warnings.push(format!(
-                "LMDB map is {:.1}% full; increase database.map_size before growth",
+                "source LMDB map is {:.1}% full; the RocksDB destination does not use database.map_size",
                 utilization * 100.0
             ));
         }
@@ -539,6 +569,8 @@ fn prepare_strfry(
         expected_source_db_version: wok_event::STRFRY_DB_VERSION,
         event_count: source_integrity.events,
         source_data_bytes,
+        source_logical_state: audit.source.clone(),
+        event_fingerprint_sha256: hex::encode(audit.fingerprint.sha256),
         estimated_output_bytes,
         available_output_bytes,
         lmdb,
@@ -559,6 +591,7 @@ fn prepare_strfry(
         output,
         source_config_bytes,
         source_cfg,
+        source_audit: audit,
     })
 }
 
@@ -709,10 +742,12 @@ fn sha256_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wok_db::{
-        encode_meta, encode_negentropy_filter, write_events, EventToWrite, Meta, NoopNegentropy,
-    };
+    use wok_db::{encode_meta, EventToWrite, Meta};
     use wok_event::{parse_and_verify_event, EventLimits};
+
+    fn fixture_dir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
 
     #[test]
     fn translated_config_converts_supported_values_to_toml() {
@@ -729,18 +764,17 @@ mod tests {
 
     #[test]
     fn migrates_verified_v3_snapshot_without_touching_source() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = fixture_dir();
         let source_db = temp.path().join("strfry-db");
         let source_config = temp.path().join("strfry.conf");
         let output = temp.path().join("wok-output");
 
         let parsed = signed_event();
-        let source = strfry_source(
+        strfry_source(
             &source_db,
             vec![EventToWrite::new(parsed.packed.into_bytes(), parsed.json)],
         );
-        let source_fingerprint = event_fingerprint(&source).unwrap();
-        drop(source);
+        let source_fingerprint = audit_strfry_source(&source_db, true).unwrap().fingerprint;
         std::fs::write(
             &source_config,
             format!(
@@ -771,17 +805,45 @@ mod tests {
 
         migrate_strfry(&source_db, &source_config, &output).unwrap();
 
+        let manifest_bytes = std::fs::read(output.join(MANIFEST_NAME)).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output.join("migration-manifest.sha256")).unwrap(),
+            format!("{}  {MANIFEST_NAME}\n", sha256_bytes(&manifest_bytes))
+        );
+        assert_eq!(
+            saved["target_files"],
+            serde_json::to_value(native_inventory(&output.join("db")).unwrap()).unwrap()
+        );
+        assert!(saved["native_migration"]["verified"].as_bool().unwrap());
+        assert!(saved["native_migration"]["source_unchanged"]
+            .as_bool()
+            .unwrap());
+        assert_eq!(saved["format_version"], 2);
+        assert!(
+            !output.join("db/data.mdb").exists(),
+            "destination must be native RocksDB"
+        );
+
         assert_eq!(
             sha256_file(&source_db.join("data.mdb")).unwrap(),
             source_data_before,
             "migration modified the source data.mdb"
         );
-        let source = Env::open(&source_db, EnvOptions::for_tests()).unwrap();
-        assert_eq!(source.db_version().unwrap(), wok_event::STRFRY_DB_VERSION);
+        assert_eq!(
+            wok_db::inspect_strfry_source(&source_db)
+                .unwrap()
+                .db_version,
+            3
+        );
+        assert!(Env::open(&source_db, EnvOptions::for_tests()).is_err());
         let target = Env::open(output.join("db"), EnvOptions::for_tests()).unwrap();
         target.ensure_initialized().unwrap();
         assert_eq!(target.db_version().unwrap(), wok_event::WOK_DB_VERSION);
-        assert_eq!(event_fingerprint(&target).unwrap(), source_fingerprint);
+        assert_eq!(
+            wok_db::event_fingerprint(&target).unwrap(),
+            source_fingerprint
+        );
         let txn = target.begin_ro().unwrap();
         let mut search_hits = Vec::new();
         wok_query::foreach_by_filter(
@@ -816,7 +878,7 @@ mod tests {
 
     #[test]
     fn refuses_sources_whose_events_do_not_verify() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = fixture_dir();
         let source_db = temp.path().join("strfry-db");
         let source_config = temp.path().join("strfry.conf");
         let output = temp.path().join("wok-output");
@@ -837,7 +899,7 @@ mod tests {
         let moved = signed("moved", 1_700_000_003);
         let mut moved_packed = moved.clone();
         moved_packed["created_at"] = json!(1_700_086_403u64);
-        let source = strfry_source(
+        strfry_source(
             &source_db,
             vec![
                 EventToWrite::new(packed(&good), tao(&good)),
@@ -846,7 +908,6 @@ mod tests {
                 EventToWrite::new(packed(&moved_packed), tao(&moved)),
             ],
         );
-        drop(source);
         std::fs::write(
             &source_config,
             format!("db = \"{}\"\n", source_db.display()),
@@ -910,31 +971,107 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
-    /// A strfry v3 database at `path` holding `events` as given.
-    fn strfry_source(path: &Path, mut events: Vec<EventToWrite>) -> Env {
-        let source = Env::open(path, EnvOptions::for_tests()).unwrap();
-        let mut txn = source.begin_rw().unwrap();
-        txn.put_u64(
-            source.dbis().meta,
-            1,
-            &encode_meta(&Meta {
-                db_version: wok_event::STRFRY_DB_VERSION,
-                endianness: 1,
-                negentropy_modification_counter: 1,
-            }),
-            lmdb_sys::MDB_NOOVERWRITE | lmdb_sys::MDB_APPEND,
-        )
-        .unwrap();
-        txn.put_u64(
-            source.dbis().negentropy_filter,
-            1,
-            &encode_negentropy_filter("{}"),
-            lmdb_sys::MDB_NOOVERWRITE | lmdb_sys::MDB_APPEND,
-        )
-        .unwrap();
-        write_events(&mut txn, &mut NoopNegentropy, &mut events, false).unwrap();
-        txn.commit().unwrap();
-        source
+    /// Synthetic v3 native fixture. It is never opened by the runtime Env.
+    fn strfry_source(path: &Path, events: Vec<EventToWrite>) {
+        use lmdb_sys::*;
+        use std::os::unix::ffi::OsStrExt;
+        use std::{ffi::CString, ptr};
+        let root = fixture_dir();
+        let fixture = Env::open(root.path().join("db"), EnvOptions::for_tests()).unwrap();
+        fixture.ensure_initialized().unwrap();
+        {
+            let mut tx = fixture.begin_rw().unwrap();
+            let mut events = events;
+            wok_db::write_events(&mut tx, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+            assert!(events
+                .iter()
+                .all(|e| e.status == wok_db::EventWriteStatus::Written));
+            tx.commit().unwrap();
+        }
+        std::fs::create_dir(path).unwrap();
+        struct Native {
+            env: *mut MDB_env,
+            txn: *mut MDB_txn,
+        }
+        impl Drop for Native {
+            fn drop(&mut self) {
+                unsafe {
+                    if !self.txn.is_null() {
+                        mdb_txn_abort(self.txn);
+                    }
+                    if !self.env.is_null() {
+                        mdb_env_close(self.env);
+                    }
+                }
+            }
+        }
+        let mut owner = Native {
+            env: ptr::null_mut(),
+            txn: ptr::null_mut(),
+        };
+        // SAFETY: test-only handles exclusively own a new temporary native DB;
+        // all borrowed row buffers and comparator callbacks outlive each call.
+        unsafe {
+            assert_eq!(mdb_env_create(&mut owner.env), 0);
+            assert_eq!(mdb_env_set_maxdbs(owner.env, 64), 0);
+            assert_eq!(mdb_env_set_mapsize(owner.env, 32 << 20), 0);
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(mdb_env_open(owner.env, name.as_ptr(), 0, 0o640), 0);
+            assert_eq!(
+                mdb_txn_begin(owner.env, ptr::null_mut(), 0, &mut owner.txn),
+                0
+            );
+            let ro = fixture.begin_ro().unwrap();
+            for (n, spec) in wok_db::schema::dbi_specs().iter().take(16).enumerate() {
+                let name = CString::new(spec.name).unwrap();
+                let mut dbi = 0;
+                assert_eq!(
+                    mdb_dbi_open(owner.txn, name.as_ptr(), spec.flags, &mut dbi),
+                    0
+                );
+                let cmp = match spec.comparator {
+                    wok_db::schema::ComparatorKind::Default => None,
+                    wok_db::schema::ComparatorKind::StringUint64 => {
+                        Some(wok_db::comparators::lmdb_comparator_string_u64 as *mut MDB_cmp_func)
+                    }
+                    wok_db::schema::ComparatorKind::Uint64Uint64 => {
+                        Some(wok_db::comparators::lmdb_comparator_u64_u64 as *mut MDB_cmp_func)
+                    }
+                    wok_db::schema::ComparatorKind::StringUint64Uint64 => Some(
+                        wok_db::comparators::lmdb_comparator_string_u64_u64 as *mut MDB_cmp_func,
+                    ),
+                };
+                if let Some(cmp) = cmp {
+                    assert_eq!(mdb_set_compare(owner.txn, dbi, cmp), 0);
+                }
+                ro.foreach_full(n as u32 + 1, &[], &[], false, |key, value| {
+                    let normalized;
+                    let value = if n == 0 && key == 1u64.to_ne_bytes() {
+                        normalized = encode_meta(&Meta {
+                            db_version: 3,
+                            endianness: 1,
+                            negentropy_modification_counter: 1,
+                        });
+                        normalized.as_slice()
+                    } else {
+                        value
+                    };
+                    let mut key = MDB_val {
+                        mv_size: key.len(),
+                        mv_data: key.as_ptr().cast_mut().cast(),
+                    };
+                    let mut value = MDB_val {
+                        mv_size: value.len(),
+                        mv_data: value.as_ptr().cast_mut().cast(),
+                    };
+                    assert_eq!(mdb_put(owner.txn, dbi, &mut key, &mut value, 0), 0);
+                    true
+                })
+                .unwrap();
+            }
+            let tx = std::mem::replace(&mut owner.txn, ptr::null_mut());
+            assert_eq!(mdb_txn_commit(tx), 0);
+        }
     }
 
     fn signed(content: &str, created_at: u64) -> serde_json::Value {

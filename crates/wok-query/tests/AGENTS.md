@@ -8,7 +8,7 @@
 | `scheduler_queue.rs` | Queries over a connection's concurrency cap wait in order; cancel, replace, close, reload |
 | `scan_plan.rs` | `ScanPlan`, which the query-cost gate prices, names the plan `DbScan` runs and counts its cursors |
 | `tag_kind_plan.rs` | Property test: the TagKind plan returns what the Tag plan does, stale entries included |
-| `search.rs` | NIP-50 ranked search against the LMDB term index |
+| `search.rs` | NIP-50 ranked search against the persistent term index |
 | `operator_scan.rs` | Operator scans (`wok scan`, `wok delete`, `wok dict`) send what a REQ would, once each, and run searches to the end |
 | `timeslice.rs` | Time slices of multi-filter scans; an ignored slice-length bench |
 | `visibility_cost.rs` | Ignored bench: per-event read-visibility cost by policy record |

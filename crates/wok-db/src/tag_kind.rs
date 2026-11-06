@@ -1147,55 +1147,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn postings_are_not_deferred_while_another_process_has_the_database_open() {
-        use std::process::{Child, Command, Stdio};
-        use std::time::{Duration, Instant};
-        struct KillOnDrop(Child);
-        impl Drop for KillOnDrop {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let defers = |env: &Env| {
-            let mut txn = env.begin_rw().unwrap();
-            defer_tag_kind_postings(&mut txn).unwrap()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::open(dir.path(), EnvOptions::for_tests()).unwrap();
-        env.ensure_initialized().unwrap();
-        // This process's own readers do not count.
-        drop(env.begin_ro().unwrap());
-        assert!(!env.open_in_another_process().unwrap());
-        assert!(defers(&env));
-
-        let ready_dir = tempfile::tempdir().unwrap();
-        let ready = ready_dir.path().join("ready");
-        let mut child = KillOnDrop(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "tag_kind::tests::reader_child", "--nocapture"])
-                .env(READER_DATABASE, dir.path())
-                .env(READER_READY, &ready)
-                .stdout(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !ready.exists() {
-            assert!(child.0.try_wait().unwrap().is_none(), "reader exited");
-            assert!(Instant::now() < deadline, "reader never read");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(env.open_in_another_process().unwrap());
-        assert!(!defers(&env));
-
-        // A process that died leaves its slot behind; the check clears it.
-        child.0.kill().unwrap();
-        child.0.wait().unwrap();
-        assert!(!env.open_in_another_process().unwrap());
-        assert!(defers(&env));
-    }
+    // LMDB allows another writable process; RocksDB holds an exclusive writer lock.
 
     #[test]
     fn a_deferring_transaction_still_deletes_postings() {

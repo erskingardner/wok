@@ -452,6 +452,53 @@ impl Expected<'_> {
     }
 }
 
+/// A compact independent reply oracle that can be shared by asynchronous clients.
+pub(crate) struct OwnedExpected {
+    wanted: HashMap<[u8; 32], (u64, bool)>,
+    required: usize,
+    count: usize,
+}
+impl OwnedExpected {
+    pub fn matches(&self, actual: &[Value]) -> bool {
+        if actual.len() != self.count {
+            return false;
+        }
+        let mut seen = HashSet::new();
+        let mut required = 0;
+        for event in actual {
+            let Some(id) = event["id"].as_str().and_then(hex32) else {
+                return false;
+            };
+            let Some(&(digest, is_required)) = self.wanted.get(&id) else {
+                return false;
+            };
+            if !seen.insert(id) || value_digest(event) != Some(digest) {
+                return false;
+            }
+            required += usize::from(is_required);
+        }
+        required == self.required
+    }
+}
+impl Expected<'_> {
+    pub fn owned(&self) -> OwnedExpected {
+        OwnedExpected {
+            wanted: self
+                .required
+                .iter()
+                .map(|&i| (i, true))
+                .chain(self.tied.iter().map(|&i| (i, false)))
+                .map(|(i, needed)| {
+                    let r = self.corpus.record(i);
+                    (r.id, (r.digest, needed))
+                })
+                .collect(),
+            required: self.required.len(),
+            count: self.len(),
+        }
+    }
+}
+
 /// A filter, in the corpus's terms. Values the corpus lacks are dropped, as
 /// they match nothing.
 struct Query {
@@ -903,6 +950,55 @@ impl Corpus {
         expected(required, tied, take)
     }
 
+    /// Immutable historical plans for the network matched-arrival scenario.
+    /// Concurrent appends must have timestamps strictly after the returned cutoff.
+    pub fn matched_filters(&self, per_shape: usize) -> Result<(u64, Vec<(&'static str, Value)>)> {
+        anyhow::ensure!(per_shape > 0, "empty matched query pool");
+        let kept: Vec<_> = self.kept_indices().collect();
+        anyhow::ensure!(!kept.is_empty(), "empty retained corpus");
+        anyhow::ensure!(
+            kept.iter().all(|&i| matches!(self.record(i).kind, 1 | 7)),
+            "matched network corpus must contain only append-only public kinds1/7"
+        );
+        let cutoff = kept
+            .iter()
+            .map(|&i| self.record(i).created_at)
+            .max()
+            .unwrap();
+        let authors: Vec<_> = kept
+            .iter()
+            .map(|&i| self.authors[self.record(i).author as usize])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(hex::encode)
+            .collect();
+        anyhow::ensure!(
+            authors.len() > 500,
+            "feed500 needs more than500 distinct retained authors"
+        );
+        let tags: Vec<_> = self
+            .values
+            .iter()
+            .filter(|(letter, _)| *letter == 't')
+            .map(|(_, value)| value.render())
+            .collect();
+        anyhow::ensure!(!tags.is_empty(), "matched corpus needs #t tags");
+        let mut result = Vec::new();
+        for i in 0..per_shape {
+            let selected = i * STRIDE;
+            let follow: Vec<_> = (0..500)
+                .map(|offset| authors[(selected + offset) % authors.len()].clone())
+                .collect();
+            result.extend([
+                ("author", json!({"authors":[authors[selected % authors.len()]],"until":cutoff,"limit":50})),
+                ("feed500", json!({"authors":follow,"until":cutoff,"limit":50})),
+                ("tag", json!({"#t":[tags[selected % tags.len()]],"until":cutoff,"limit":50})),
+                ("id", json!({"ids":[self.hex_id(kept[selected % kept.len()])],"until":cutoff,"limit":50})),
+            ]);
+        }
+        Ok((cutoff, result))
+    }
+
     /// `count` filters for `ws_query_latency`.
     pub fn filters(&self, count: u64, mix: EventMix) -> Result<Vec<Value>> {
         if mix == EventMix::Social {
@@ -1066,6 +1162,50 @@ mod tests {
             .filter(|(_, &kept)| kept)
             .map(|(e, _)| id(e).to_owned())
             .collect()
+    }
+
+    #[test]
+    fn matched_network_plan_has_four_shapes_and_exact_owned_oracle() {
+        let events: Vec<_> = (0..600)
+            .map(|i| {
+                event(
+                    &format!("id{i}"),
+                    &format!("author{i}"),
+                    1,
+                    100 + i,
+                    json!([["t", format!("topic{}", i % 8)]]),
+                )
+            })
+            .collect();
+        let c = corpus(&events);
+        let (cutoff, plans) = c.matched_filters(2).unwrap();
+        assert_eq!(cutoff, 699);
+        assert_eq!(
+            plans.iter().map(|(shape, _)| *shape).collect::<Vec<_>>(),
+            ["author", "feed500", "tag", "id", "author", "feed500", "tag", "id"]
+        );
+        assert_eq!(plans[1].1["authors"].as_array().unwrap().len(), 500);
+        assert!(plans
+            .iter()
+            .all(|(_, filter)| filter["limit"] == 50 && filter["until"] == 699));
+        let expected = c.expected(&plans[3].1).owned();
+        assert!(expected.matches(&events[..1]));
+        assert!(!expected.matches(&[]));
+        assert!(!expected.matches(&[events[0].clone(), events[0].clone()]));
+        let mut changed = events[0].clone();
+        changed["content"] = json!("changed");
+        assert!(!expected.matches(&[changed]));
+        let recent = c.expected(&json!({"limit":3})).owned();
+        assert!(recent.matches(&[
+            events[599].clone(),
+            events[598].clone(),
+            events[597].clone()
+        ]));
+        assert!(recent.matches(&[
+            events[597].clone(),
+            events[598].clone(),
+            events[599].clone()
+        ]));
     }
 
     #[test]

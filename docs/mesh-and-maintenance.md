@@ -313,7 +313,7 @@ built and verified before relying on it for reconciliation.
 `wok negentropy build` scans a fixed snapshot of the primary event high-water
 mark in bounded batches. Each batch uses a read-only scan followed by a short
 write transaction, so a large build does not retain every matching event in
-memory or hold LMDB's single writer for the full database scan.
+memory or hold the database's single application writer for the full database scan.
 
 ```console
 wok negentropy build 1 --batch-size 10000
@@ -368,7 +368,7 @@ per connection and 1 GiB across all workers. Construction reserves conservative
 space for query/ranking/deduplication state; after sealing, unused space is
 released. A sealed vector uses about 40 bytes per item before allocator slack,
 plus a 4 MiB protocol/filter allowance. Budgets cover session allocations, not
-the process's total RSS, LMDB mappings, or separately bounded transport queues.
+the process's total RSS, native storage caches, or separately bounded transport queues.
 A budget rejection returns NEG-ERR; it never silently reconciles a truncated set.
 
 Sessions expire after 60 seconds waiting for the next client reconciliation

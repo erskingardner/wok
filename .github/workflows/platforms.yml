@@ -15,7 +15,8 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.target }} / RocksDB
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -29,16 +30,30 @@ jobs:
           - runner: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: target
+      RUST_TEST_THREADS: '2'
     steps:
       - uses: actions/checkout@v6
+      - name: Linux RocksDB compiler and libclang
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
+      - name: macOS RocksDB libclang
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli
       - name: Native storage and transport behavior
-        run: cargo test --locked --target '${{ matrix.target }}' -p wok-db -p wok-unix -p wok-ws -p wok-compat -p wok-cli
+        run: cargo test --locked --target '${{ matrix.target }}' -p wok-db -p wok-query -p wok-unix -p wok-ws -p wok-compat -p wok-cli
       - name: Smoke-test version metadata
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          test "$(target/${{ matrix.target }}/release/wok --version)" = "wok $version"
+          binary="target/${{ matrix.target }}/release/wok"
+          test "$("$binary" --version)" = "wok $version"
+          test "$("$binary" storage-backend)" = rocksdb-author-heads-experimental

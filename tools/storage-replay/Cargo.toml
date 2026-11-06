@@ -1,0 +1,31 @@
+[package]
+name = "storage-replay"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Replays a db_write op log on LMDB or RocksDB (#257 item 12)"
+
+# Not a Wok workspace member: RocksDB's C++ build and MSRV stay out of it.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+libc = "0.2"
+lmdb-sys = "0.8"
+rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wok-db = { path = "../../crates/wok-db", features = ["op-log"] }
+zstd = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+# The LMDB Wok bundles (0.9.37), as in the workspace.
+[patch.crates-io]
+lmdb-sys = { path = "../../vendor/lmdb-sys" }

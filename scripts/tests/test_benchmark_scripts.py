@@ -70,6 +70,29 @@ METRICS_URL=http://10.0.0.2:7777/metrics
         result = self.control('load_target strfry; echo "$KIND $SERVICE_USER"')
         self.assertEqual(result.stdout.strip(), 'strfry relay-bench', result.stderr)
 
+    def test_native_database_presence_and_complete_file_size(self):
+        self.write_target('wok', self.valid())
+        db = self.prefix/'var/lib/relay-bench/wok/db'
+        (db/'wal').mkdir(parents=True)
+        self.assertNotEqual(self.control('load_target wok; database_present').returncode, 0)
+        for name, body in [('CURRENT', b'manifest'), ('000001.sst', b'event-table'),
+                           ('wal/000002.log', b'unflushed'), ('LOCK', b'lock')]:
+            (db/name).write_bytes(body)
+        result = self.control('load_target wok; database_present; database_bytes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(int(result.stdout), 32)
+        residency = self.control('load_target wok; fincore() { echo 4096; }; database_residency')
+        self.assertEqual(residency.returncode, 0, residency.stderr)
+        self.assertEqual({line.rsplit(' ', 2)[0] for line in residency.stdout.splitlines()},
+                         {str(path) for path in db.rglob('*') if path.is_file()})
+
+    def test_historical_lmdb_database_presence_remains_explicitly_supported(self):
+        self.write_target('strfry', self.valid(KIND='strfry'))
+        db = self.prefix/'var/lib/relay-bench/strfry/db'
+        db.mkdir(parents=True)
+        (db/'data.mdb').write_bytes(b'closed historical database')
+        self.assertEqual(self.control('load_target strfry; database_present').returncode, 0)
+
     def test_rejects_invalid_target_files(self):
         cases = {
             'unknown key': self.valid() + 'EXTRA=1\n',

@@ -14,14 +14,22 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate release contract and tests
+    name: Validate release contract, RocksDB storage and import recovery
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: target/release-gate
+      RUST_TEST_THREADS: '2'
     outputs:
       version: ${{ steps.contract.outputs.version }}
+      prerelease: ${{ steps.contract.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Native compiler and libclang
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,6 +46,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: validate
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -51,8 +60,19 @@ jobs:
           - runner: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@v6
+      - name: Linux RocksDB compiler and libclang
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
+      - name: macOS RocksDB libclang
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -60,6 +80,8 @@ jobs:
         run: cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli
       - name: Verify embedded version
         run: 'target/${{ matrix.target }}/release/wok --version | grep -Fx "wok ${{ needs.validate.outputs.version }}"'
+      - name: Verify storage backend
+        run: test "$(target/${{ matrix.target }}/release/wok storage-backend)" = rocksdb-author-heads-experimental
       - name: Package release archive
         env:
           COPYFILE_DISABLE: '1'
@@ -72,6 +94,17 @@ jobs:
           install -m 0755 "target/${TARGET}/release/wok" "package/${archive}/wok"
           cp README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md LICENSE docs/wok.toml "package/${archive}/"
           cp -R docs/. "package/${archive}/docs/"
+          python3 - "$archive" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          package = pathlib.Path('package') / sys.argv[1]
+          (package / 'BACKEND.json').write_text(json.dumps({
+              'backend': 'rocksdb', 'features': [],
+              'storage_backend': subprocess.check_output([str(package / 'wok'), 'storage-backend'], text=True).strip(),
+              'version': os.environ['VERSION'], 'target': os.environ['TARGET'],
+              'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+          }, indent=2, sort_keys=True) + '\n')
+          PY
           tar -C package -czf "dist/${archive}.tar.gz" "$archive"
       - uses: actions/upload-artifact@v4
         with:
@@ -113,10 +146,4 @@ jobs:
       - name: Publish tag release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/*.tar.gz dist/SHA256SUMS \
-            --verify-tag \
-            --title "Wok $VERSION" \
-            --notes-file release-notes.md
+        run: bash scripts/publish-release.sh "$GITHUB_REF_NAME" dist release-notes.md

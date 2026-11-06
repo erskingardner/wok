@@ -20,6 +20,10 @@ pub use ip_range::IpRange;
 pub use preset::Preset;
 pub use provenance::{ConfigEntry, ConfigExplanation, Origin};
 
+#[cfg(test)]
+#[path = "config/rocksdb_tests.rs"]
+mod rocksdb_tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -32,6 +36,8 @@ pub struct Config {
     pub db_mapsize: usize,
     pub db_no_read_ahead: bool,
     pub db_min_free_disk_bytes: u64,
+    #[serde(default)]
+    pub db_rocksdb: wok_db::RocksDbOptions,
     pub events: EventsConfig,
     pub observability: ObservabilityConfig,
     pub relay: RelayConfig,
@@ -176,6 +182,8 @@ struct DatabaseConfig {
     map_size: usize,
     no_read_ahead: bool,
     min_free_disk_bytes: u64,
+    #[serde(default)]
+    rocksdb: wok_db::RocksDbOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +486,7 @@ impl Default for Config {
             db_mapsize: 68_719_476_736,
             db_no_read_ahead: false,
             db_min_free_disk_bytes: 1_073_741_824,
+            db_rocksdb: wok_db::RocksDbOptions::default(),
             events: EventsConfig {
                 max_event_size: wok_event::DEFAULT_MAX_EVENT_SIZE,
                 reject_newer_than_secs: 900,
@@ -648,6 +657,7 @@ impl From<Config> for TomlConfig {
                 map_size: config.db_mapsize,
                 no_read_ahead: config.db_no_read_ahead,
                 min_free_disk_bytes: config.db_min_free_disk_bytes,
+                rocksdb: config.db_rocksdb,
             },
             events: config.events,
             observability: config.observability,
@@ -666,6 +676,7 @@ impl From<TomlConfig> for Config {
             db_mapsize: config.database.map_size,
             db_no_read_ahead: config.database.no_read_ahead,
             db_min_free_disk_bytes: config.database.min_free_disk_bytes,
+            db_rocksdb: config.database.rocksdb,
             events: config.events,
             observability: config.observability,
             relay: config.relay,
@@ -747,6 +758,11 @@ fn encode(config: &Config) -> Result<toml::Value, String> {
 
 /// Check and normalize a merged configuration.
 fn validate(mut parsed: TomlConfig) -> Result<Config, String> {
+    parsed
+        .database
+        .rocksdb
+        .validate()
+        .map_err(|e| e.to_string())?;
     validate_admin_config(&mut parsed.admin)?;
     clamp_size_class(&mut parsed);
     parsed.relay.unix.mode = mask_socket_mode(parsed.relay.unix.mode);
@@ -811,6 +827,18 @@ fn merge_toml(base: &mut toml::Value, supplied: toml::Value) {
 }
 
 impl Config {
+    /// Native settings for Config-based runtime and maintenance opens.
+    /// Standalone migrations use their explicit conversion defaults instead.
+    pub fn db_options(&self) -> wok_db::EnvOptions {
+        wok_db::EnvOptions {
+            max_readers: self.db_maxreaders,
+            map_size: self.db_mapsize,
+            no_read_ahead: self.db_no_read_ahead,
+            rocksdb: self.db_rocksdb,
+            ..wok_db::EnvOptions::default()
+        }
+    }
+
     /// The `created_at` window an event of `kind` must fall in.
     ///
     /// `events.reject_older_than_secs` bounds regular events only.
@@ -2287,6 +2315,7 @@ impl Config {
         self.db_mapsize = old.db_mapsize;
         self.db_no_read_ahead = old.db_no_read_ahead;
         self.db_min_free_disk_bytes = old.db_min_free_disk_bytes;
+        self.db_rocksdb = old.db_rocksdb;
         self.relay.bind = old.relay.bind;
         self.relay.port = old.relay.port;
         self.relay.nofiles = old.relay.nofiles;

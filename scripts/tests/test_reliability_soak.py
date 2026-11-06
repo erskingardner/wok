@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import signal
 import tempfile
@@ -39,6 +40,17 @@ class DatabaseBudget(unittest.TestCase):
                                    "total_memtable_bytes": 16777216, "max_total_wal_bytes": 33554432})
         self.assertEqual(configs[0], configs[1])
         self.assertEqual(soak.rocksdb_overrides(native.rocksdb_profile), {})
+
+    def test_small_profile_bounds_child_arenas_without_mutating_parent_or_native_defaults(self):
+        with patch.dict(os.environ, {"MALLOC_ARENA_MAX": "128", "WOK_SOAK_KEEP": "preserved"}, clear=True):
+            small = soak.child_environment("small")
+            native = soak.child_environment("native-defaults")
+            self.assertEqual(small, {"MALLOC_ARENA_MAX": "2", "WOK_SOAK_KEEP": "preserved"})
+            self.assertEqual(native, {"MALLOC_ARENA_MAX": "128", "WOK_SOAK_KEEP": "preserved"})
+            self.assertEqual(os.environ["MALLOC_ARENA_MAX"], "128")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertNotIn("MALLOC_ARENA_MAX", soak.child_environment("native-defaults"))
+            self.assertNotIn("MALLOC_ARENA_MAX", os.environ)
 
     def test_whole_rocks_directory_includes_wal_sst_and_nested_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,6 +98,9 @@ class IdentityAndResults(unittest.TestCase):
         with patch.object(soak.subprocess, "run", return_value=types.SimpleNamespace(stdout="rocksdb-author-heads-experimental\n")) as run:
             self.assertEqual(soak.verify_backend(Path("/unused/wok")), "rocksdb-author-heads-experimental")
             self.assertEqual(run.call_args.args[0][-1], "storage-backend")
+            env = {"MALLOC_ARENA_MAX": "2"}
+            soak.verify_backend(Path("/unused/wok"), env=env)
+            self.assertEqual(run.call_args.kwargs["env"], env)
 
     def test_missing_crash_or_feed_verification_refuses_successful_driver_exit(self):
         good = dict(ok=True, restart_verified=True, crash_recovery_verified=True,

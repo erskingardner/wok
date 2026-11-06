@@ -69,9 +69,9 @@ def database_bytes(path):
     return sum(database_footprint(path).values())
 
 
-def verify_backend(wok):
+def verify_backend(wok, env=None):
     actual = subprocess.run([str(wok.resolve()), "storage-backend"], capture_output=True,
-                            text=True, check=True, timeout=15).stdout.strip()
+                            text=True, check=True, timeout=15, env=env).stdout.strip()
     if actual != STORAGE_BACKEND:
         raise RuntimeError(f"binary reports {actual!r}; expected {STORAGE_BACKEND!r}")
     return actual
@@ -146,6 +146,15 @@ def rocksdb_overrides(profile):
     return SMALL_ROCKSDB_OPTIONS.copy() if profile == "small" else {}
 
 
+def child_environment(profile):
+    env = os.environ.copy()
+    if profile == "small":
+        # Bound glibc arena retention in this small-memory fixture only. Other
+        # libcs may ignore this variable; record the libc and effective value.
+        env["MALLOC_ARENA_MAX"] = "2"
+    return env
+
+
 def config_text(args, root, unix):
     overrides = rocksdb_overrides(args.rocksdb_profile)
     native = ""
@@ -177,6 +186,7 @@ max_pending_outbound_bytes = 16777216
 
 def main():
     args = parse_args()
+    child_env = child_environment(args.rocksdb_profile)
     root = args.out.resolve()
     root.mkdir(parents=True, exist_ok=False)
     # Short socket path avoids AF_UNIX's small sun_path even for deep artifact roots.
@@ -195,6 +205,11 @@ def main():
                 "database_policy": {"max_mib": args.max_db_mib},
                 "rocksdb_profile": args.rocksdb_profile,
                 "rocksdb_overrides": rocksdb_overrides(args.rocksdb_profile),
+                "allocator_environment": {
+                    "controller_libc": platform.libc_ver(),
+                    "MALLOC_ARENA_MAX": child_env.get("MALLOC_ARENA_MAX"),
+                    "source": "small-profile override" if args.rocksdb_profile == "small" else "inherited",
+                    "scope": "relay, load driver, backend identity and offline audits"},
                 "crash_scope": "one intentional SIGKILL after an acknowledged batch; not in-flight writes or power loss",
                 "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "memory_policy": {"rss_max_mib": 768, "anonymous_growth_max_mib_after_120s_warmup": 64}}
@@ -213,7 +228,7 @@ def main():
     driver_err = open(root / "driver.stderr", "w")
 
     def launch():
-        child = subprocess.Popen([str(args.wok.resolve()), "--config", str(cfg), "relay"], stdout=relay_log, stderr=relay_log)
+        child = subprocess.Popen([str(args.wok.resolve()), "--config", str(cfg), "relay"], stdout=relay_log, stderr=relay_log, env=child_env)
         try:
             ready(child, url)
         except BaseException:
@@ -225,11 +240,11 @@ def main():
 
     def integrity(name):
         with open(root / name, "w") as log:
-            subprocess.run([str(args.wok.resolve()), "--config", str(cfg), "integrity"], stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
+            subprocess.run([str(args.wok.resolve()), "--config", str(cfg), "integrity"], stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120, env=child_env)
         path = root / name.replace("-integrity.txt", "-rocksdb-audit.json")
         with path.open("x") as log:
             subprocess.run([str(args.wok.resolve()), "--config", str(cfg), "rocksdb-check"],
-                           stdout=log, stderr=relay_log, check=True, timeout=120)
+                           stdout=log, stderr=relay_log, check=True, timeout=120, env=child_env)
         audit = json.loads(path.read_text())
         if not (audit.get("ok") is True and audit.get("author_head_records_verified", 0) > 0
                 and audit.get("author_frontier_positions_verified", 0) > 0):
@@ -237,10 +252,10 @@ def main():
         return audit
 
     try:
-        metadata["binary_storage_backend"] = verify_backend(args.wok)
+        metadata["binary_storage_backend"] = verify_backend(args.wok, env=child_env)
         (root / "manifest.json").write_text(json.dumps(metadata, indent=2))
         relay = launch()
-        load = subprocess.Popen([str(args.driver.resolve()), f"ws://127.0.0.1:{args.port}", f"unix://{unix}", str(args.seconds), str(root), str(args.seed)], stdout=driver_log, stderr=driver_err)
+        load = subprocess.Popen([str(args.driver.resolve()), f"ws://127.0.0.1:{args.port}", f"unix://{unix}", str(args.seconds), str(root), str(args.seed)], stdout=driver_log, stderr=driver_err, env=child_env)
         next_sample = 0
         with open(root / "samples.jsonl", "w") as log, open(root / "metrics.jsonl", "w") as metrics:
             deadline = started + args.seconds + 300

@@ -101,9 +101,15 @@ an output directory. `--port` defaults to 17777. The driver uses both transports
 against one relay process and runs approximately one mixed round per second.
 The default `--rocksdb-profile small` sets a 16-MiB block cache, disables the row
 cache, sets a 16-MiB aggregate memtable target and a 32-MiB WAL flush trigger.
-This qualifies a small-memory deployment under the budgets below. It does not
+It also sets `MALLOC_ARENA_MAX=2` for the relay, load driver, backend identity
+check and offline audits. On glibc this limits allocator arenas and the memory
+they can retain after transient large messages; other libcs may ignore it.
+This tests a small-memory deployment under the budgets below. It does not
 change Wok's production defaults, format, workload or synchronous WAL durability.
-The manifest records the profile and every native override.
+The manifest records every native override, the effective allocator environment
+and detected controller libc. The variable's presence does not prove that the
+relay's allocator honors it. This setting is specific to the soak fixture; it
+is not a production throughput recommendation or a hard RSS limit.
 
 The workload includes:
 
@@ -149,7 +155,9 @@ are 768 MiB relay RSS and 512 MiB database size. `--max-db-mib` records an expli
 whole-database allowance in the manifest. To diagnose the unmodified production
 defaults instead, select `--rocksdb-profile native-defaults --max-db-mib 2048`:
 this emits no native overrides and leaves disk allowance above the default
-1-GiB WAL flush target. The RSS and memory-growth checks remain identical, so
+1-GiB WAL flush target. It inherits the allocator environment without overriding
+it; the manifest records the effective value. The RSS and memory-growth checks
+remain identical, so
 that diagnostic can fail those checks while buffers are filling. It does not
 qualify the native defaults for a small-memory deployment. Preserve failed runs
 and report each profile separately.

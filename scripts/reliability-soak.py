@@ -15,6 +15,12 @@ import time
 import urllib.request
 
 STORAGE_BACKEND = "rocksdb-author-heads-experimental"
+SMALL_ROCKSDB_OPTIONS = {
+    "block_cache_bytes": 16 * 1024 * 1024,
+    "row_cache_bytes": 0,
+    "total_memtable_bytes": 16 * 1024 * 1024,
+    "max_total_wal_bytes": 32 * 1024 * 1024,
+}
 
 
 def digest(path):
@@ -126,6 +132,8 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=17777)
     parser.add_argument("--max-db-mib", type=int, default=512,
                         help="whole database allowance, including WAL (default: 512 MiB)")
+    parser.add_argument("--rocksdb-profile", choices=["small", "native-defaults"], default="small",
+                        help="startup resource targets (default: small); native-defaults applies no overrides")
     args = parser.parse_args(argv)
     if sys.platform != "linux" or not 10 <= args.seconds <= 21600:
         parser.error("requires Linux and a duration between 10 and 21600 seconds")
@@ -134,20 +142,20 @@ def parse_args(argv=None):
     return args
 
 
-def main():
-    args = parse_args()
-    root = args.out.resolve()
-    root.mkdir(parents=True, exist_ok=False)
-    # Short socket path avoids AF_UNIX's small sun_path even for deep artifact roots.
-    import tempfile
-    socket_dir = tempfile.TemporaryDirectory(prefix="wok-soak-")
-    unix = Path(socket_dir.name) / "relay.sock"
-    cfg = root / "wok.toml"
-    cfg.write_text(f'''[database]
+def rocksdb_overrides(profile):
+    return SMALL_ROCKSDB_OPTIONS.copy() if profile == "small" else {}
+
+
+def config_text(args, root, unix):
+    overrides = rocksdb_overrides(args.rocksdb_profile)
+    native = ""
+    if overrides:
+        native = "[database.rocksdb]\n" + "".join(f"{key} = {value}\n" for key, value in overrides.items())
+    return f'''[database]
 path = {json.dumps(str(root / "db"))}
 map_size = 1073741824
 min_free_disk_bytes = 0
-[relay]
+{native}[relay]
 bind = "127.0.0.1"
 port = {args.port}
 # Retain the runner's inherited limit; this bounded workload uses few sockets.
@@ -164,7 +172,19 @@ metrics_enabled = true
 enabled = true
 path = {json.dumps(str(unix))}
 max_pending_outbound_bytes = 16777216
-''')
+'''
+
+
+def main():
+    args = parse_args()
+    root = args.out.resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    # Short socket path avoids AF_UNIX's small sun_path even for deep artifact roots.
+    import tempfile
+    socket_dir = tempfile.TemporaryDirectory(prefix="wok-soak-")
+    unix = Path(socket_dir.name) / "relay.sock"
+    cfg = root / "wok.toml"
+    cfg.write_text(config_text(args, root, unix))
     metadata = {"platform": platform.platform(), "machine": platform.machine(), "cpu_count": os.cpu_count(),
                 "nofile_limits": resource.getrlimit(resource.RLIMIT_NOFILE),
                 "seconds_requested": args.seconds, "seed": args.seed, "wok_sha256": digest(args.wok),
@@ -173,6 +193,8 @@ max_pending_outbound_bytes = 16777216
                 "durability": "synchronous RocksDB WAL batches",
                 "db_size_scope": "all regular database files, including WAL/SST/metadata; logical bytes",
                 "database_policy": {"max_mib": args.max_db_mib},
+                "rocksdb_profile": args.rocksdb_profile,
+                "rocksdb_overrides": rocksdb_overrides(args.rocksdb_profile),
                 "crash_scope": "one intentional SIGKILL after an acknowledged batch; not in-flight writes or power loss",
                 "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "memory_policy": {"rss_max_mib": 768, "anonymous_growth_max_mib_after_120s_warmup": 64}}

@@ -71,12 +71,9 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
     }
 
     let options = EnvOptions {
-        max_readers: cfg.db_maxreaders,
-        map_size: cfg.db_mapsize,
-        no_read_ahead: cfg.db_no_read_ahead,
         create_dir: false,
         create_dbis: false,
-        ..EnvOptions::default()
+        ..cfg.db_options()
     };
     let source = Env::open(&database, options.clone()).context("open source database")?;
     if source.db_version()? != wok_event::WOK_DB_VERSION {
@@ -95,16 +92,7 @@ pub fn run(cfg: &Config, backup: Option<&Path>, confirmed_stopped: bool) -> Resu
         .prefix(".wok-reindex-")
         .tempdir_in(parent)
         .context("create reindex staging directory")?;
-    let target = Env::open(
-        staging.path(),
-        EnvOptions {
-            max_readers: cfg.db_maxreaders,
-            map_size: cfg.db_mapsize,
-            no_read_ahead: cfg.db_no_read_ahead,
-            ..EnvOptions::default()
-        },
-    )
-    .context("create staged database")?;
+    let target = Env::open(staging.path(), cfg.db_options()).context("create staged database")?;
     target.ensure_initialized()?;
     let stats = {
         let source_txn = source.begin_ro()?;

@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `wok-db/rocksdb-memory-diagnostics` builds report native allocation
   usage without changing storage settings. The soak runner records an explicit
   `--max-db-mib` allowance while retaining its memory and recovery checks.
+- Startup-only `[database.rocksdb]` controls size the shared block cache, row
+  cache, aggregate memtables and WAL flush trigger. Existing native defaults,
+  physical format and synchronous durability are unchanged. The soak's explicit
+  small-memory profile exercises smaller targets under its original budgets.
 - NIP-D9 Deletion Request Protection from NIPs proposal #2531: eligible
   events signed with `["no_delete"]` survive their author's kind-5 deletion
   and kind-62 purge requests, regardless of arrival order or republication.

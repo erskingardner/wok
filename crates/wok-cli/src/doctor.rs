@@ -213,13 +213,10 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
     let env = match Env::open(
         &cfg.db,
         EnvOptions {
-            max_readers: cfg.db_maxreaders,
-            map_size: cfg.db_mapsize,
-            no_read_ahead: cfg.db_no_read_ahead,
             create_dir: false,
             create_dbis: false,
             read_only: true,
-            ..EnvOptions::default()
+            ..cfg.db_options()
         },
     ) {
         Ok(env) => env,

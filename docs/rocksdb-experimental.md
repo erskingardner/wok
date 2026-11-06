@@ -102,11 +102,19 @@ Keep the entire checkpoint directory and its physical format together. New
 native directories use `0700`; writable opens remove other-user access from the
 directory. Read-only import does not alter source permissions.
 
-The native options use a shared 8-GiB hyper-clock block cache, 2-GiB row cache,
+The native defaults use a shared 8-GiB hyper-clock block cache, 2-GiB row cache,
 4-KiB blocks, Bloom filters, binary/hash data-block indexes, LZ4 compression,
 dynamic levels, up to eight background jobs/four subcompactions, 64-MiB per-family
 write buffers, a 2-GiB total write-buffer target and a 1-GiB WAL target. These are
 configured engine targets, not total process-RSS caps or universal optimums.
+The startup-only `[database.rocksdb]` settings in the [configuration reference](config.md#database)
+adjust the block cache, row cache, total memtable target and WAL trigger. A zero
+row-cache capacity disables that cache. Smaller buffer targets trigger earlier
+flushes; per-family write buffers remain 64 MiB. Flush work, pinned data and
+allocator retention mean that configured bytes are not a hard memory ceiling.
+Changing these targets preserves the physical format and synchronous WAL
+durability. Configuration-based maintenance uses the same targets; standalone
+offline migrations retain the native defaults.
 For native allocation observations without changing those targets, see the
 optional memory diagnostic build in [reliability validation](reliability.md).
 Legacy `database.map_size`, `max_readers` and `no_read_ahead` settings do not tune

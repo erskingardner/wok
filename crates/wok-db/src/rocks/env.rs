@@ -23,6 +23,56 @@ pub struct EnvOptions {
     pub create_dbis: bool,
     /// Open the database and all transactions without write access.
     pub read_only: bool,
+    pub rocksdb: RocksDbOptions,
+}
+
+/// Startup-only native resource targets per environment. These capacities and
+/// flush triggers are not process-RSS or whole-directory hard limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RocksDbOptions {
+    pub block_cache_bytes: usize,
+    /// Zero disables the row cache.
+    pub row_cache_bytes: usize,
+    pub total_memtable_bytes: usize,
+    pub max_total_wal_bytes: u64,
+}
+
+impl Default for RocksDbOptions {
+    fn default() -> Self {
+        Self {
+            block_cache_bytes: 8usize << 30,
+            row_cache_bytes: 2 << 30,
+            total_memtable_bytes: 2 << 30,
+            max_total_wal_bytes: 1 << 30,
+        }
+    }
+}
+
+impl RocksDbOptions {
+    /// Validate before creating a directory or allocating native caches.
+    pub fn validate(&self) -> Result<(), DbError> {
+        for (key, value) in [
+            ("block_cache_bytes", self.block_cache_bytes),
+            ("row_cache_bytes", self.row_cache_bytes),
+            ("total_memtable_bytes", self.total_memtable_bytes),
+        ] {
+            if (value == 0 && key != "row_cache_bytes") || value > isize::MAX as usize {
+                return Err(err(format!(
+                    "database.rocksdb.{key} must be {} and fit a native allocation size",
+                    if key == "row_cache_bytes" {
+                        "nonnegative"
+                    } else {
+                        "positive"
+                    }
+                )));
+            }
+        }
+        if self.max_total_wal_bytes == 0 {
+            return Err(err("database.rocksdb.max_total_wal_bytes must be positive"));
+        }
+        Ok(())
+    }
 }
 
 impl Default for EnvOptions {
@@ -35,6 +85,7 @@ impl Default for EnvOptions {
             create_dir: true,
             create_dbis: true,
             read_only: false,
+            rocksdb: RocksDbOptions::default(),
         }
     }
 }
@@ -110,13 +161,15 @@ pub struct Env {
     pub inner: Arc<EnvInner>,
 }
 
-/// Numeric/table options shared by ordinary opens and the private offline tests.
+/// Default numeric/table options for standalone migrations and offline tests.
 /// This factory does not open a database or accept a format-marker override.
 pub(crate) fn native_options(
     fresh: bool,
     names: impl IntoIterator<Item = &'static str>,
 ) -> (rocksdb::Options, Vec<rocksdb::ColumnFamilyDescriptor>) {
-    let native = make_native_options(fresh, names);
+    // Standalone offline migrations deliberately retain native defaults. They
+    // do not load the relay's database.rocksdb configuration.
+    let native = make_native_options(fresh, names, RocksDbOptions::default());
     (native.options, native.cfs)
 }
 
@@ -124,20 +177,25 @@ struct NativeOptions {
     options: rocksdb::Options,
     cfs: Vec<rocksdb::ColumnFamilyDescriptor>,
     #[cfg(feature = "rocksdb-memory-diagnostics")]
-    row_cache: rocksdb::Cache,
+    row_cache: KnownRowCache,
 }
 
-const ROW_CACHE_CAPACITY: usize = 2 << 30;
+#[cfg(feature = "rocksdb-memory-diagnostics")]
+struct KnownRowCache {
+    cache: Option<rocksdb::Cache>,
+    capacity_bytes: usize,
+}
 
 fn make_native_options(
     fresh: bool,
     names: impl IntoIterator<Item = &'static str>,
+    sizing: RocksDbOptions,
 ) -> NativeOptions {
     use rocksdb::{
         BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, DataBlockIndexType,
         Options,
     };
-    let cache = Cache::new_hyper_clock_cache(8usize << 30, 0);
+    let cache = Cache::new_hyper_clock_cache(sizing.block_cache_bytes, 0);
     let cfopts = || {
         let mut o = Options::default();
         let mut t = BlockBasedOptions::default();
@@ -161,11 +219,14 @@ fn make_native_options(
     options.create_missing_column_families(fresh);
     options.set_max_background_jobs(8);
     options.set_max_subcompactions(4);
-    options.set_db_write_buffer_size(2 << 30);
-    options.set_max_total_wal_size(1 << 30);
+    options.set_db_write_buffer_size(sizing.total_memtable_bytes);
+    options.set_max_total_wal_size(sizing.max_total_wal_bytes);
     options.set_bytes_per_sync(1 << 20);
-    let row_cache = Cache::new_lru_cache(ROW_CACHE_CAPACITY);
-    options.set_row_cache(&row_cache);
+    let row_cache =
+        (sizing.row_cache_bytes != 0).then(|| Cache::new_lru_cache(sizing.row_cache_bytes));
+    if let Some(cache) = &row_cache {
+        options.set_row_cache(cache);
+    }
     let cfs = names
         .into_iter()
         .map(|n| ColumnFamilyDescriptor::new(n, cfopts()))
@@ -174,7 +235,10 @@ fn make_native_options(
         options,
         cfs,
         #[cfg(feature = "rocksdb-memory-diagnostics")]
-        row_cache,
+        row_cache: KnownRowCache {
+            cache: row_cache,
+            capacity_bytes: sizing.row_cache_bytes,
+        },
     }
 }
 
@@ -223,6 +287,7 @@ impl std::fmt::Debug for Env {
 }
 impl Env {
     pub fn open(path: impl AsRef<Path>, opts: EnvOptions) -> Result<Self, DbError> {
+        opts.rocksdb.validate()?;
         let path = path.as_ref();
         match std::fs::symlink_metadata(path.join(crate::backend_migration::INCOMPLETE_MARKER_FILE))
         {
@@ -277,7 +342,7 @@ impl Env {
             cfs,
             #[cfg(feature = "rocksdb-memory-diagnostics")]
             row_cache,
-        } = make_native_options(fresh, physical_cf_names());
+        } = make_native_options(fresh, physical_cf_names(), opts.rocksdb);
         if opts.read_only {
             // Read-only maintenance must not rotate LOG or persist open-time
             // statistics, even though those files are outside the key space.
@@ -332,7 +397,7 @@ impl Env {
         db: rocksdb::DB,
         path: &Path,
         read_only: bool,
-        #[cfg(feature = "rocksdb-memory-diagnostics")] row_cache: Option<rocksdb::Cache>,
+        #[cfg(feature = "rocksdb-memory-diagnostics")] row_cache: Option<KnownRowCache>,
     ) -> Result<Self, DbError> {
         let dbis = Dbis {
             meta: 1,
@@ -557,14 +622,14 @@ struct MemoryDiagnostics {
     next_sample_millis: AtomicU64,
     // Native options and DB already retain this same cache. This extra handle
     // observes it; it creates no new cache and cannot change its capacity.
-    row_cache: Option<rocksdb::Cache>,
+    row_cache: Option<KnownRowCache>,
 }
 
 #[cfg(feature = "rocksdb-memory-diagnostics")]
 impl MemoryDiagnostics {
     const INTERVAL_MILLIS: u64 = 15_000;
 
-    fn new(row_cache: Option<rocksdb::Cache>) -> Self {
+    fn new(row_cache: Option<KnownRowCache>) -> Self {
         Self {
             started: Instant::now(),
             next_sample_millis: AtomicU64::new(0),
@@ -653,11 +718,12 @@ impl EnvInner {
             }
         }
         let row_cache = match &self.memory_diagnostics.row_cache {
-            Some(cache) => json!({
+            Some(row) => json!({
                 "available": true,
-                "capacity_bytes": ROW_CACHE_CAPACITY,
-                "usage_bytes": cache.get_usage(),
-                "pinned_usage_bytes": cache.get_pinned_usage(),
+                "enabled": row.cache.is_some(),
+                "capacity_bytes": row.capacity_bytes,
+                "usage_bytes": row.cache.as_ref().map_or(0, rocksdb::Cache::get_usage),
+                "pinned_usage_bytes": row.cache.as_ref().map_or(0, rocksdb::Cache::get_pinned_usage),
             }),
             None => json!({
                 "available": false,
@@ -745,3 +811,7 @@ impl Drop for EnvInner {
 #[cfg(all(test, feature = "rocksdb-memory-diagnostics"))]
 #[path = "memory_diagnostics_tests.rs"]
 mod memory_diagnostics_tests;
+
+#[cfg(test)]
+#[path = "resource_options_tests.rs"]
+mod resource_options_tests;

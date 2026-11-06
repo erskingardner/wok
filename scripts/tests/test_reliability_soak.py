@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import signal
 import tempfile
+import tomllib
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -22,6 +23,22 @@ class DatabaseBudget(unittest.TestCase):
             for value in ["0", "-1", "63", "16385"]:
                 with self.subTest(value=value), self.assertRaises(SystemExit):
                     soak.parse_args(required + ["--max-db-mib", value])
+
+    def test_resource_profiles_generate_scoped_native_settings_without_changing_workload(self):
+        required = ["--wok", "/unused/wok", "--driver", "/unused/driver", "--out", "/unused/out"]
+        with patch.object(soak.sys, "platform", "linux"):
+            small = soak.parse_args(required)
+            native = soak.parse_args(required + ["--rocksdb-profile", "native-defaults"])
+            with self.assertRaises(SystemExit):
+                soak.parse_args(required + ["--rocksdb-profile", "unbounded"])
+        configs = [tomllib.loads(soak.config_text(args, Path('/scratch'), Path('/tmp/relay.sock')))
+                   for args in [small, native]]
+        options = configs[0]["database"].pop("rocksdb")
+        self.assertEqual(small.rocksdb_profile, "small")
+        self.assertEqual(options, {"block_cache_bytes": 16777216, "row_cache_bytes": 0,
+                                   "total_memtable_bytes": 16777216, "max_total_wal_bytes": 33554432})
+        self.assertEqual(configs[0], configs[1])
+        self.assertEqual(soak.rocksdb_overrides(native.rocksdb_profile), {})
 
     def test_whole_rocks_directory_includes_wal_sst_and_nested_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

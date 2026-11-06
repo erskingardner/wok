@@ -318,15 +318,7 @@ enum NegCmd {
 }
 
 fn open_env(cfg: &Config) -> Result<Env> {
-    let env = Env::open(
-        &cfg.db,
-        EnvOptions {
-            max_readers: cfg.db_maxreaders,
-            map_size: cfg.db_mapsize,
-            no_read_ahead: cfg.db_no_read_ahead,
-            ..EnvOptions::default()
-        },
-    )?;
+    let env = Env::open(&cfg.db, cfg.db_options())?;
     env.ensure_initialized()?;
     Ok(env)
 }
@@ -420,7 +412,7 @@ async fn main() -> Result<()> {
                     read_only: true,
                     create_dir: false,
                     create_dbis: false,
-                    ..EnvOptions::default()
+                    ..cfg.db_options()
                 },
             )?;
             cli_println!(
@@ -690,13 +682,10 @@ fn cmd_backup(cfg: &Config, output: &Path) -> Result<()> {
     let env = Env::open(
         &cfg.db,
         EnvOptions {
-            max_readers: cfg.db_maxreaders,
-            map_size: cfg.db_mapsize,
-            no_read_ahead: cfg.db_no_read_ahead,
             read_only: false,
             create_dir: false,
             create_dbis: false,
-            ..EnvOptions::default()
+            ..cfg.db_options()
         },
     )?;
     env.backup_to_directory(output)?;
@@ -1242,13 +1231,10 @@ fn cmd_purge_superseded(cfg: &Config, dry_run: bool, json: bool) -> Result<()> {
         let env = Env::open(
             &cfg.db,
             EnvOptions {
-                max_readers: cfg.db_maxreaders,
-                map_size: cfg.db_mapsize,
-                no_read_ahead: cfg.db_no_read_ahead,
                 create_dir: false,
                 create_dbis: false,
                 read_only: true,
-                ..EnvOptions::default()
+                ..cfg.db_options()
             },
         )?;
         let txn = env.begin_ro()?;

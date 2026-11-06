@@ -99,6 +99,11 @@ Python 3.11+ and Linux `/proc` are required. The runner creates disposable stora
 and loopback listeners, never resets an existing database, and refuses to reuse
 an output directory. `--port` defaults to 17777. The driver uses both transports
 against one relay process and runs approximately one mixed round per second.
+The default `--rocksdb-profile small` sets a 16-MiB block cache, disables the row
+cache, sets a 16-MiB aggregate memtable target and a 32-MiB WAL flush trigger.
+This qualifies a small-memory deployment under the budgets below. It does not
+change Wok's production defaults, format, workload or synchronous WAL durability.
+The manifest records the profile and every native override.
 
 The workload includes:
 
@@ -141,9 +146,13 @@ including RocksDB WAL/SST files. Paths containing
 symlinks are rejected; a file removed by compaction during a sample is skipped.
 These directory samples are not atomic storage snapshots. Default sampled budgets
 are 768 MiB relay RSS and 512 MiB database size. `--max-db-mib` records an explicit
-whole-database allowance in the manifest; for example, `--max-db-mib 2048` leaves
-room above the current native 1-GiB WAL flush target. It changes no engine option,
-arrival rate or memory check. Preserve failed runs when comparing allowances.
+whole-database allowance in the manifest. To diagnose the unmodified production
+defaults instead, select `--rocksdb-profile native-defaults --max-db-mib 2048`:
+this emits no native overrides and leaves disk allowance above the default
+1-GiB WAL flush target. The RSS and memory-growth checks remain identical, so
+that diagnostic can fail those checks while buffers are filling. It does not
+qualify the native defaults for a small-memory deployment. Preserve failed runs
+and report each profile separately.
 Five-second
 sampling can miss shorter resource spikes; these are not continuous peak measurements. For each process lifetime,
 after 120 seconds of warmup, growth between the first and last six anonymous-RSS

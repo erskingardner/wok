@@ -49,7 +49,7 @@ pub use backend_migration::{
     LmdbToRocksOptions, LmdbToRocksReport, StrfrySourceAudit,
 };
 pub use deletion_protection::is_deletion_protected_json;
-pub use env::{Env, EnvOptions, EnvironmentStats};
+pub use env::{Env, EnvOptions, EnvironmentStats, RocksDbOptions};
 pub use error::DbError;
 pub use fbs::{
     decode_compression_dictionary, decode_meta, decode_negentropy_filter,

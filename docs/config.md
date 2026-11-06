@@ -854,6 +854,17 @@ RocksDB; native cache/buffer settings are described in [storage](rocksdb-experim
 | `database.path` | `"./wok-db/"` | Wok-owned RocksDB directory. LMDB requires explicit offline migration to a new directory. |
 | `database.max_readers` | `256` | Legacy LMDB reader-slot setting; accepted but ignored by RocksDB. |
 | `database.no_read_ahead` | `false` | Legacy LMDB read-ahead setting; accepted but ignored by RocksDB. |
+| `database.rocksdb.block_cache_bytes` | `8589934592` (8 GiB) | Shared native block-cache capacity. Must be positive. |
+| `database.rocksdb.row_cache_bytes` | `2147483648` (2 GiB) | Native row-cache capacity; `0` disables it. |
+| `database.rocksdb.total_memtable_bytes` | `2147483648` (2 GiB) | Aggregate write-buffer flush target. Must be positive. |
+| `database.rocksdb.max_total_wal_bytes` | `1073741824` (1 GiB) | Native WAL-size flush trigger. Must be positive. |
+
+Set the native keys in a `[database.rocksdb]` table. They apply to the relay and
+configuration-based maintenance commands, require a restart, and do not alter the
+database format or synchronous write durability. These are cache capacities and
+flush triggers, not hard process-memory or directory-size limits; buffers, pins
+and outstanding flush work can exceed them. Standalone `wok migrate` conversions
+use the built-in native defaults rather than this configuration.
 
 ## Admin
 

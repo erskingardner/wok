@@ -94,6 +94,10 @@ impact of a compromised admin credential.
 - Size `database.min_free_disk_bytes` and the global and
   per-pubkey storage ceilings for the host. Alert before the disk reserve or
   storage reserve is reached. Legacy LMDB map/read-ahead settings do not tune RocksDB.
+- Choose [native cache and write-buffer targets](config.md#database) for the
+  host's available memory before starting. Defaults allow an 8-GiB block cache,
+  2-GiB row cache and 2-GiB aggregate memtables, plus other process allocations;
+  smaller hosts need explicit settings. These are not hard RSS caps.
 - Stop the relay before `wok backup --output <new-directory>` to create a
   native RocksDB checkpoint. Keep its complete directory; never copy live
   native files independently and assume a consistent snapshot. See

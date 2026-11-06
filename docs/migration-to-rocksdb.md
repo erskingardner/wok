@@ -43,7 +43,9 @@ headroom, and monitor the disk throughout conversion. The copy uses bounded
 batches and per-record limits: default batches are 8 MiB, individual source
 records are limited to 64 MiB and decoded event JSON to 16 MiB. A record over a
 limit refuses conversion rather than being skipped. Native engines also have
-their own caches.
+their own caches. Standalone conversions use the built-in native resource
+defaults, not the relay's `[database.rocksdb]` overrides; allow memory for those
+[cache and buffer targets](rocksdb-experimental.md#operations-and-resource-limits).
 
 ## Stop, check, and copy
 

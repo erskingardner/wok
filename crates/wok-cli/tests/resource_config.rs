@@ -8,7 +8,7 @@ fn configured_native_targets_reach_cli_open_and_invalid_limits_create_nothing() 
     let config = dir.path().join("wok.toml");
     let prefix = format!(
         "[database]\npath={}\n[database.rocksdb]\n",
-        toml::Value::String(database.to_str().unwrap().to_string())
+        serde_json::to_string(database.to_str().unwrap()).unwrap()
     );
     fs::write(
         &config,
@@ -48,7 +48,7 @@ fn configured_native_targets_reach_cli_open_and_invalid_limits_create_nothing() 
         &config,
         format!(
             "[database]\npath={}\n[database.rocksdb]\nmax_total_wal_bytes=0\n",
-            toml::Value::String(rejected.to_str().unwrap().to_string())
+            serde_json::to_string(rejected.to_str().unwrap()).unwrap()
         ),
     )
     .unwrap();

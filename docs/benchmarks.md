@@ -1054,9 +1054,13 @@ history.
 Per step the table gives those counts, transactions, stored events per
 second and µs per stored event, transaction time (from `begin_rw` to the
 end of the commit) and commit time at p50 and p99, the growth of
-`data.mdb`, and the events the search build indexed and its time. On Linux it also gives the bytes the process wrote per stored
+`data.mdb` for LMDB or all native database files for RocksDB, and the events the
+search build indexed and its time. The report identifies its compiled storage
+backend and size scope; RocksDB is sampled without forcing flush or compaction.
+On Linux it also gives the bytes the process wrote per stored
 event and the 4 KiB pages per commit, from `write_bytes` in
-`/proc/self/io`, which counts each page once per commit that dirties it.
+`/proc/self/io`. The page column is 4 KiB equivalents; RocksDB bytes also include
+its background writes, rather than LMDB page-level write amplification.
 With the minimum of 20 commits, a step's p99 is close to its maximum. The
 trial's throughput is the best step's stored events per second, its latency
 columns hold the smallest batch's transaction times, and it records this

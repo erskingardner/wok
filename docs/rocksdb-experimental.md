@@ -1,18 +1,24 @@
-# Experimental RocksDB relay backend
+# Optional RocksDB relay backend
 
-The optional `rocksdb-backend` feature builds the real Wok relay on an
-experimental RocksDB storage implementation. The default build still uses LMDB.
-The feature currently needs Rust 1.88 or newer for rocksdb 0.25 / RocksDB 11.8.1;
+The optional `rocksdb` feature builds the complete RocksDB relay, selecting the
+v3 thin-author/frontier layout and its optimized reader. The default build uses
+LMDB. RocksDB currently needs Rust 1.88 or newer for rocksdb 0.25 / RocksDB 11.8.1;
 the default LMDB build retains its existing MSRV.
 
 ```sh
-cargo build --release -p wok-cli --features rocksdb-backend --locked
-./target/release/wok --config rocks-relay.toml import < events.jsonl
-./target/release/wok --config rocks-relay.toml rocksdb-check
-./target/release/wok --config rocks-relay.toml relay
+cargo build --release -p wok-cli --features rocksdb --locked \
+  --target-dir target/rocksdb
+./target/rocksdb/release/wok storage-backend
+./target/rocksdb/release/wok migrate rocksdb --source /var/lib/wok/lmdb-db \
+  --output /var/lib/wok/rocks-db --check
 ```
 
-Use a separate new `db` directory in the configuration. The RocksDB binary
+See [offline LMDB migration, backup and rollback](migration-to-rocksdb.md) for
+the complete operator procedure. Event JSON import is available for a fresh
+corpus but is not a full-state migration. The lower-level features below retain
+separately marked experimental layouts for development and comparisons.
+
+Use a separate database directory in the configuration. The RocksDB binary
 refuses LMDB directories and nonempty unrecognized directories. A persistent
 layout marker identifies the RocksDB format, independently of Wok's logical
 schema version. Neither binary converts an existing database in place.
@@ -27,12 +33,12 @@ primary, sequence and count changes commit in one cross-column-family
 before the relay sends positive OK. This is a durable commit policy, not proof
 of survival under storage/controller/power failure.
 
-The physical schema uses:
+All RocksDB layouts use:
 
 - one combined record per local event ID, preserving the exact PackedEvent and
   payload components, including their independent presence;
-- a thin author/time posting index for multi-author feeds and a separate
-  covering author/time index for single-author queries;
+- thin author/time postings; the original dual-index layout additionally keeps
+  covering author/time records, while v3 keeps compact two-position frontiers;
 - bytewise encoded native-integer/composite/duplicate keys, with escaped string
   boundaries so variable-length prefixes remain unambiguous;
 - reversed physical index order, so logical newest-first scans advance forward;
@@ -86,7 +92,7 @@ the synchronous batch succeeds. This avoids reverse scans through historical
 deleted marker values while preserving duplicate ordering, aborts and old reader
 snapshots. It changes no persistent record or format and needs no seed rewrite.
 
-A single-author query's existing plan selects the covering index. Its candidates
+A single-author query in the original dual-index layout selects the covering index. Its candidates
 populate the transaction's combined-record cache; visibility and payload checks
 continue through the ordinary Wok path. Multi-author queries keep thin postings
 so unselected candidate payloads are not pulled into a feed merge.
@@ -141,8 +147,8 @@ thin posting's existence and empty value, and checks that its exact count gives
 one posting per primary. Both layouts retain the same signature/body checks and
 length-framed local-ID, PackedEvent and encoded-payload fingerprint.
 
-The CLI provides no converter or claim of measured storage, write or compaction
-savings.
+No command converts between these RocksDB physical layouts, and the layout
+features themselves establish no storage, write or compaction savings.
 Verified JSON import into a new database preserves event identity, but is not a
 general byte-preserving conversion of local IDs, encoded payloads or kept tables.
 Any causal layout comparison needs separately built and verified seeds, the same
@@ -161,7 +167,8 @@ with their postings in the same synchronous WAL batch. Unchanged frontier
 values are not rewritten. The format marker is
 `wok-rocks-v3:combined:thin-author-frontiers:reverse-order:sync-wal`. All three
 layouts require their own exact column family set and marker before a writable
-open. No runtime or CLI conversion path is enabled.
+open. `wok migrate rocksdb` creates this v3 layout from a stopped Wok LMDB
+v4/v5 source; it does not convert an existing v1 or v2 RocksDB directory.
 
 That layout feature retains the established range-seek reader as a control.
 The additional `rocksdb-author-head-reads` feature enables native batched point
@@ -240,11 +247,12 @@ all intended events; compare its event count with the verified import manifest.
 
 RocksDB holds an exclusive writer-process lock. The LMDB workflow in which a
 second process imports while the relay is open is unavailable. Stop the relay
-before a separate mutating utility. Legacy LMDB file upgrade, strfry snapshot
-migration and LMDB compact-to-file operations are not RocksDB migration or
-backup interfaces; keep original databases and use verified JSON export/import.
-The feature is intended for isolated comparison and validation, not production
-cutover. Long operator scans still use the existing transaction-lifetime borrow
+before a separate mutating utility. Use `wok migrate rocksdb` for the verified
+full-state LMDB copy and `wok backup --output <new-directory>` for a native
+directory checkpoint. Legacy LMDB compact-to-file operations are not a RocksDB
+backup interface. Keep original databases and follow the
+[cutover and rollback procedure](migration-to-rocksdb.md).
+Long operator scans still use the existing transaction-lifetime borrow
 API and can retain copied data until transaction drop; the dedicated offline
 physical audit avoids that accumulation.
 

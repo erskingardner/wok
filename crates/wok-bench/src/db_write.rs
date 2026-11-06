@@ -60,6 +60,8 @@ pub struct Options {
 
 #[derive(Serialize, Clone)]
 pub struct Report {
+    pub storage_backend: &'static str,
+    pub file_growth_scope: &'static str,
     pub corpus_events: u64,
     /// Corpus events written before the steps, and those of them stored.
     pub preloaded: u64,
@@ -95,7 +97,7 @@ pub struct Step {
     pub bytes_per_stored: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pages_per_commit: Option<f64>,
-    /// Growth of `data.mdb` over the step.
+    /// Positive size change over the step, with scope recorded in the report.
     pub file_growth_bytes: u64,
     /// Events the search build indexed during the step, and its time.
     pub search_built: u64,
@@ -281,13 +283,12 @@ pub fn run(opts: &Options) -> Result<Report> {
         preload.unfinished
     );
 
-    let data = dir.path().join("data.mdb");
     let mut io_counted = true;
     let mut steps = Vec::new();
     for (&batch_size, &events) in opts.batches.iter().zip(&sizes) {
         let mut pending = (0..events).map(|_| next()).collect::<Result<Vec<_>>>()?;
         phase(&format!("step {batch_size} {events}"))?;
-        let size_before = std::fs::metadata(&data)?.len();
+        let size_before = database_bytes(&env)?;
         let io_before = process_write_bytes();
         let mut txn_us = Vec::new();
         let mut commit_hist = Histogram::<u64>::new(3)?;
@@ -335,7 +336,7 @@ pub fn run(opts: &Options) -> Result<Report> {
             bytes_written,
             bytes_per_stored: bytes_written.map(|bytes| bytes as f64 / stored),
             pages_per_commit: bytes_written.map(|bytes| bytes as f64 / PAGE_BYTES / commits as f64),
-            file_growth_bytes: std::fs::metadata(&data)?.len().saturating_sub(size_before),
+            file_growth_bytes: database_bytes(&env)?.saturating_sub(size_before),
             search_built: search.events,
             search_build_secs: search.secs,
             txn_us,
@@ -346,6 +347,12 @@ pub fn run(opts: &Options) -> Result<Report> {
         finish_ops()?;
     }
     Ok(Report {
+        storage_backend: wok_db::storage_backend_name(),
+        file_growth_scope: if wok_db::storage_backend_name() == "lmdb" {
+            "data.mdb"
+        } else {
+            "all native database files; no forced flush or compaction"
+        },
         corpus_events,
         preloaded,
         preload_stored: preload.stored,
@@ -353,6 +360,15 @@ pub fn run(opts: &Options) -> Result<Report> {
         io_counted,
         steps,
     })
+}
+
+fn database_bytes(env: &wok_db::Env) -> Result<u64> {
+    if wok_db::storage_backend_name() == "lmdb" {
+        // Keep the historical LMDB measurement unchanged.
+        Ok(std::fs::metadata(env.path().join("data.mdb"))?.len())
+    } else {
+        Ok(env.stats()?.used_bytes)
+    }
 }
 
 #[cfg(feature = "op-log")]
@@ -445,10 +461,11 @@ fn process_write_bytes() -> Option<u64> {
 }
 
 pub fn render_markdown(report: &Report) -> String {
-    let mut s = format!(
+    let mut s = format!("\nStorage backend: `{}`. File-growth scope: {}. The pages column reports 4 KiB equivalents of process writes.\n", report.storage_backend, report.file_growth_scope);
+    s.push_str(&format!(
         "\n## db_write: {} events preloaded ({} stored) in {:.1} s\n\nEach step writes its own slice of the corpus's last events in transactions of `batch` events, each committed durably, as the relay writer does. Stored events were inserted; settled ones are duplicates, older versions of replaceable events, or deleted, with no row of their own. Rates, times and bytes per event count stored events. Transaction time runs from `begin_rw` to the end of the commit. Bytes are what the process wrote, from `/proc/self/io`; a page counts once per commit that dirties it. With few commits, p99 is close to the step's maximum. The search index is built as the relay writer builds it: a step after a batch once 1,000 events wait, and the rest at the step's end. Its time and bytes count in the step's; `search built` and `build s` are its events and time, and commits count only event batches.\n\n| batch | events | stored | settled | unfinished | commits | stored/s | µs/stored | txn p50 µs | txn p99 µs | txn max µs | commit p50 µs | commit p99 µs | bytes/stored | pages/commit | file growth MB | search built | build s |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         report.preloaded, report.preload_stored, report.preload_secs
-    );
+    ));
     let optional = |value: Option<f64>| value.map_or_else(|| "n/a".into(), |v| format!("{v:.0}"));
     for step in &report.steps {
         s.push_str(&format!(

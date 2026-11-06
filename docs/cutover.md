@@ -1,5 +1,9 @@
 # Cutover and rollback
 
+For Wok's optional RocksDB backend, use the separate
+[offline LMDB-to-RocksDB procedure](migration-to-rocksdb.md). It preserves the
+full database state and describes directory backups and rollback after writes.
+
 ## Cutover (strfry → wok)
 
 1. Run `wok migrate strfry --db <strfry-db> --config <strfry.conf> --output <new-wok-dir> --check` and review every ignored key, path, capacity, and active-process warning.

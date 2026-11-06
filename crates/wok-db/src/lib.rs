@@ -8,6 +8,10 @@
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
+#[cfg(feature = "rocksdb-backend")]
+#[path = "migration/backend.rs"]
+pub mod backend_migration;
+pub mod backup;
 pub mod comparators;
 mod deletion_protection;
 #[cfg(not(feature = "rocksdb-backend"))]
@@ -44,6 +48,11 @@ pub mod txn;
 pub mod vanish;
 pub mod write;
 
+#[cfg(feature = "rocksdb-backend")]
+pub use backend_migration::{
+    inspect_lmdb_source, migrate_lmdb_to_rocksdb, LmdbSourceReport, LmdbTableInfo,
+    LmdbTableVerification, LmdbToRocksOptions, LmdbToRocksReport,
+};
 pub use deletion_protection::is_deletion_protected_json;
 pub use env::{lmdb_version, Env, EnvOptions, EnvironmentStats};
 pub use error::DbError;

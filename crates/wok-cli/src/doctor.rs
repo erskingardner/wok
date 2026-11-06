@@ -189,7 +189,17 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         );
         return report;
     }
-    for filename in ["data.mdb", "lock.mdb"] {
+    report.add(
+        "storage-backend",
+        CheckStatus::Pass,
+        wok_db::storage_backend_name(),
+    );
+    let database_files: &[&str] = if cfg!(feature = "rocksdb-backend") {
+        &["CURRENT"]
+    } else {
+        &["data.mdb", "lock.mdb"]
+    };
+    for filename in database_files {
         let path = cfg.db.join(filename);
         report.add(
             format!("database-{filename}"),
@@ -282,7 +292,20 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         Err(error) => report.add("database-meta", CheckStatus::Fail, error.to_string()),
     }
 
+    let storage_check = if cfg!(feature = "rocksdb-backend") {
+        "rocksdb-storage"
+    } else {
+        "lmdb-map"
+    };
     match env.stats() {
+        Ok(stats) if cfg!(feature = "rocksdb-backend") => {
+            report.add(
+                storage_check,
+                CheckStatus::Pass,
+                format!("{} bytes in native database files", stats.used_bytes),
+            );
+            report.database = Some(stats);
+        }
         Ok(stats) => {
             let utilization = if stats.map_size == 0 {
                 100.0
@@ -297,7 +320,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
                 CheckStatus::Pass
             };
             report.add(
-                "lmdb-map",
+                storage_check,
                 status,
                 format!(
                     "{} of {} bytes used ({utilization:.1}%)",
@@ -306,7 +329,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
             );
             report.database = Some(stats);
         }
-        Err(error) => report.add("lmdb-map", CheckStatus::Fail, error.to_string()),
+        Err(error) => report.add(storage_check, CheckStatus::Fail, error.to_string()),
     }
 
     match available_bytes(&cfg.db) {

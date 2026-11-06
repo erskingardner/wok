@@ -12,6 +12,8 @@ name = "wok"
 path = "src/main.rs"
 
 [features]
+# Complete optimized RocksDB relay and offline LMDB migration build.
+rocksdb = ["rocksdb-author-head-reads"]
 rocksdb-backend = ["wok-db/rocksdb-backend"]
 rocksdb-thin-author-reads = ["rocksdb-backend", "wok-query/rocksdb-thin-author-reads"]
 rocksdb-coverless = ["rocksdb-thin-author-reads", "wok-query/rocksdb-coverless", "wok-relay/rocksdb-coverless"]

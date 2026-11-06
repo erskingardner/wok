@@ -16,7 +16,7 @@ pub struct EnvOptions {
     pub max_dbs: u32,
     pub create_dir: bool,
     pub create_dbis: bool,
-    /// Open the LMDB environment and all transactions without write access.
+    /// Open the database and all transactions without write access.
     pub read_only: bool,
 }
 
@@ -123,6 +123,7 @@ pub struct EnvInner {
     pub dbis: Dbis,
     pub path: PathBuf,
     pub read_only: bool,
+    pub(crate) protection_cache: Mutex<crate::deletion_protection::ProtectionCache>,
     pub writer: Mutex<()>,
     /// Published only after its synchronous WriteBatch completes. The sequence
     /// couples these tiny immutable metadata values to every read snapshot.
@@ -227,6 +228,16 @@ impl std::fmt::Debug for Env {
 impl Env {
     pub fn open(path: impl AsRef<Path>, opts: EnvOptions) -> Result<Self, DbError> {
         let path = path.as_ref();
+        match std::fs::symlink_metadata(path.join(crate::backend_migration::INCOMPLETE_MARKER_FILE))
+        {
+            Ok(_) => {
+                return Err(err(
+                    "incomplete LMDB migration; destination has not been sealed",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(err(error)),
+        }
         if path.join("data.mdb").exists() || path.join("lock.mdb").exists() {
             return Err(err(
                 "refusing LMDB directory; RocksDB requires a separate new database",
@@ -311,6 +322,7 @@ impl Env {
                 dbis,
                 path: path.to_path_buf(),
                 read_only,
+                protection_cache: Default::default(),
                 writer: Mutex::new(()),
             }),
         })
@@ -373,12 +385,26 @@ impl Env {
     }
     pub fn stats(&self) -> Result<EnvironmentStats, DbError> {
         self.check_background_errors()?;
-        let used = std::fs::read_dir(self.path())
-            .map_err(err)?
-            .filter_map(Result::ok)
-            .filter_map(|f| f.metadata().ok())
-            .map(|m| m.len())
-            .sum();
+        let used =
+            std::fs::read_dir(self.path())
+                .map_err(err)?
+                .try_fold(0u64, |total, entry| {
+                    let metadata = match entry.map_err(err)?.metadata() {
+                        Ok(metadata) => metadata,
+                        // Native compaction can retire an SST after read_dir.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(total)
+                        }
+                        Err(error) => return Err(err(error)),
+                    };
+                    if metadata.is_file() {
+                        total
+                            .checked_add(metadata.len())
+                            .ok_or_else(|| err("database size overflow"))
+                    } else {
+                        Ok(total)
+                    }
+                })?;
         Ok(EnvironmentStats {
             map_size: 0,
             used_bytes: used,
@@ -396,6 +422,22 @@ impl Env {
     pub fn open_in_another_process(&self) -> Result<bool, DbError> {
         Ok(false)
     }
+    /// Create a native checkpoint in a new protected directory. The caller
+    /// must own this environment's exclusive writer-process lock.
+    pub fn backup_to_directory(&self, output: &Path) -> Result<(), DbError> {
+        if self.inner.read_only {
+            return Err(err(
+                "RocksDB backup requires the exclusive writable open; stop the relay first",
+            ));
+        }
+        self.check_background_errors()?;
+        crate::backup::create(self.path(), output, |directory| {
+            rocksdb::checkpoint::Checkpoint::new(&self.inner.db)
+                .and_then(|checkpoint| checkpoint.create_checkpoint(directory))
+                .map_err(err)
+        })
+    }
+
     pub fn compact_to_fd(&self, _fd: i32) -> Result<(), DbError> {
         Err(err(
             "RocksDB checkpoints are directories; stream compaction is unsupported",
@@ -472,6 +514,7 @@ impl Env {
     }
 }
 
+#[cfg(feature = "rocksdb-read-diagnostics")]
 impl Drop for EnvInner {
     fn drop(&mut self) {
         // Observe, never force flush/compaction. This happens after relay threads

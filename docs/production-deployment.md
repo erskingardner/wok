@@ -96,6 +96,9 @@ impact of a compromised admin credential.
   map ceiling is reached.
 - Back up with a filesystem snapshot or another LMDB-safe procedure. Never
   copy live LMDB files independently and assume the pair is consistent.
+  `wok backup --output <new-directory>` creates a compact LMDB snapshot or a
+  native RocksDB checkpoint; stop a RocksDB relay first. Use the binary matching
+  the stored backend. See [backend migration and backups](migration-to-rocksdb.md).
 - Run `wok doctor` after an unclean stop and before returning the instance to
   service. Run `wok integrity` periodically and retain its exit status.
 

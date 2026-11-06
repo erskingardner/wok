@@ -1,3 +1,5 @@
+#![cfg(not(feature = "rocksdb-backend"))]
+
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;

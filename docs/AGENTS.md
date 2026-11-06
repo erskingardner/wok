@@ -19,6 +19,7 @@ Operator and design documentation. Code remains the authority for current behavi
 | File | Topic |
 | --- | --- |
 | `migration-from-strfry.md` | `wok migrate strfry` |
+| `migration-to-rocksdb.md` | Offline full-state Wok LMDB v4/v5 conversion, backend selection, directory backups and rollback |
 | `cutover.md` | Cutover / rollback |
 | `production-deployment.md` | Hardening a live relay; macOS LMDB semaphore exhaustion (ENOSPC at `Env::open`) |
 | `security.md` | Threat model, fuzzing, unsafe policy |

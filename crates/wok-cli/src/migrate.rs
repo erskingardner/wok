@@ -405,6 +405,9 @@ fn prepare_strfry(
     output: &Path,
     verify: bool,
 ) -> Result<PreparedMigration> {
+    if wok_db::storage_backend_name() != "lmdb" {
+        bail!("strfry import requires an LMDB Wok build; first run `wok migrate strfry` with that build, then use `wok migrate rocksdb` on its Wok database");
+    }
     let source_db = absolute_existing(source_db, "source database")?;
     let source_config = absolute_existing(source_config, "source config")?;
     if !source_db.is_dir() {
@@ -705,7 +708,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "rocksdb-backend")))]
 mod tests {
     use super::*;
     use serde_json::json;

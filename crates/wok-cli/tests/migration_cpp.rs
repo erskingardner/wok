@@ -1,3 +1,4 @@
+#![cfg(not(feature = "rocksdb-backend"))]
 //! Actual CLI migration of a database created by the pinned C++ reference.
 use serde_json::json;
 use sha2::{Digest, Sha256};

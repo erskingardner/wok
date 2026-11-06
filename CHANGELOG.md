@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional `--features rocksdb` builds and separate RocksDB release assets;
+  LMDB remains the default. `wok storage-backend` identifies the binary without
+  opening a database, and `doctor` reports backend-appropriate storage health.
+- `wok migrate rocksdb` performs an offline, verified full-state copy from Wok
+  LMDB v4/v5 into a new RocksDB directory, preserving local IDs, encoded payloads
+  and administrative state. It retains the source and failed staging, publishes
+  without replacing an existing path, and provides `--check` and JSON outcomes.
+- `wok backup --output <new-directory>` creates an LMDB compact snapshot or a
+  native RocksDB checkpoint. RocksDB requires the relay to be stopped. Operator
+  guidance covers binary selection, migration, verification and rollback limits.
 - NIP-D9 Deletion Request Protection from NIPs proposal #2531: eligible
   events signed with `["no_delete"]` survive their author's kind-5 deletion
   and kind-62 purge requests, regardless of arrival order or republication.

@@ -9,6 +9,7 @@ Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default conf
 - `Cargo.toml`
 - `src/main.rs` — clap CLI and most dbutils (import/export/scan/…)
 - `src/migrate.rs` — `wok migrate strfry`
+- `src/migrate_rocksdb.rs` — offline full-state Wok LMDB conversion and verified publication
 - `src/config_show.rs` — `wok config show` (effective config with per-key origin)
 - `src/config_minimize.rs` — `wok config minimize` (drop keys equal to the preset, diff or backup)
 - `src/doctor.rs` — `wok doctor`
@@ -21,10 +22,10 @@ Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default conf
 
 | Group | Commands |
 | --- | --- |
-| Migration | `migrate strfry` (`--check` preflight) |
+| Migration | `migrate strfry`, `migrate rocksdb` (`--check` preflight) |
 | Relay | `relay` |
-| Diagnostics | `doctor`, `integrity`, `info`, `config show` |
-| Maintenance | `reindex`, `purge-superseded`, `compact`, `dict`, `negentropy`, `config minimize` |
+| Diagnostics | `doctor`, `integrity`, `info`, `storage-backend`, `config show` |
+| Maintenance | `backup`, `reindex`, `purge-superseded`, `compact`, `dict`, `negentropy`, `config minimize` |
 | Data | `import`, `export`, `scan`, `event`, `delete`, `monitor` |
 | Mesh | `router`, `sync`, `upload`, `download` |
 

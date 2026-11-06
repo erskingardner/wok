@@ -53,7 +53,7 @@ fn strfry_import(conf: &Path, events: &[Value]) {
 
 #[test]
 fn cpp_refuses_wok_owned_database() {
-    if !strfry_available() {
+    if wok_db::storage_backend_name() != "lmdb" || !strfry_available() {
         eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
         return;
     }
@@ -106,7 +106,7 @@ fn rust_open_own_db_and_scan() {
 
 #[test]
 fn cpp_write_rust_read_query() {
-    if !strfry_available() {
+    if wok_db::storage_backend_name() != "lmdb" || !strfry_available() {
         eprintln!("skip: strfry binary missing");
         return;
     }
@@ -211,7 +211,7 @@ fn wok_delete_removes_event_from_queries() {
 
 #[test]
 fn strfry_v3_database_is_read_only_to_wok() {
-    if !strfry_available() {
+    if wok_db::storage_backend_name() != "lmdb" || !strfry_available() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();

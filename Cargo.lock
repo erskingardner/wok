@@ -3051,6 +3051,7 @@ dependencies = [
  "proptest",
  "rand 0.8.7",
  "rocksdb",
+ "rustix",
  "secp256k1",
  "serde",
  "serde_json",

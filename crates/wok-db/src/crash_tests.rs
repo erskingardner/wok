@@ -1,4 +1,4 @@
-//! Process-death tests at real LMDB transaction boundaries. Checkpoints exist
+//! Process-death tests at real storage transaction boundaries. Checkpoints exist
 //! only in this unit-test build, never in the library used by the relay or CLI.
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -106,6 +106,8 @@ struct Snapshot {
     version: u64,
     records: Vec<(u64, Vec<u8>, Vec<u8>)>,
     state: Option<BTreeMap<Vec<u8>, Vec<u8>>>,
+    #[cfg(feature = "rocksdb-author-heads")]
+    author_frontiers: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 fn snapshot(env: &Env) -> Snapshot {
@@ -140,6 +142,19 @@ fn snapshot(env: &Env) -> Snapshot {
         version,
         records,
         state,
+        #[cfg(feature = "rocksdb-author-heads")]
+        author_frontiers: {
+            let cf = env.inner.db.cf_handle(crate::rocks::HEAD_CF).unwrap();
+            let mut cursor = env.inner.db.raw_iterator_cf(cf);
+            cursor.seek_to_first();
+            let mut heads = BTreeMap::new();
+            while let Some((key, value)) = cursor.item() {
+                heads.insert(key.to_vec(), value.to_vec());
+                cursor.next();
+            }
+            cursor.status().unwrap();
+            heads
+        },
     }
 }
 

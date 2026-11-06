@@ -111,7 +111,7 @@ fn rust_tree_stats(dir: &Path) -> (u64, String) {
 
 #[test]
 fn strfry_refuses_wok_owned_tree_database() {
-    if !strfry_available() {
+    if wok_db::storage_backend_name() != "lmdb" || !strfry_available() {
         eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
         return;
     }
@@ -169,7 +169,7 @@ fn strfry_refuses_wok_owned_tree_database() {
 
 #[test]
 fn cpp_built_tree_matches_rust_listing() {
-    if !strfry_available() {
+    if wok_db::storage_backend_name() != "lmdb" || !strfry_available() {
         eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
         return;
     }

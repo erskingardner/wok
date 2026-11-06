@@ -240,7 +240,10 @@ does not list.
 | --- | --- | --- |
 | `wok relay` | Config file, the network, the Unix socket | Everything on this page. |
 | `wok info` | Database | |
+| `wok storage-backend` | Compiled feature selection | Prints the backend without reading config or opening a database. |
+| `wok backup` | Configured database | Creates a new backup directory without replacing a path. LMDB uses a registered read-only compact snapshot; RocksDB requires its exclusive process lock and creates a native checkpoint. |
 | `wok migrate strfry` | strfry LMDB environment and config | Opens the strfry database through LMDB FFI and parses its HOCON-subset config. Verifies each event's id and signature against its stored payload, that the payload names the packed record's id, pubkey, kind and created_at, and that the packed tags, address, first recipient and expiration come from the payload; an event that does not verify refuses the migration (see [Events that do not verify](migration-from-strfry.md#events-that-do-not-verify)). Runs `lsof` to check that no process has the database open. Writes only a new directory. |
+| `wok migrate rocksdb` | Explicit Wok LMDB v4/v5 source and new output paths | Requires a RocksDB build and, for copying, `--confirm-relay-stopped`. A registered read-only LMDB snapshot preserves all logical tables and exact primary/payload bytes. Bounded conversion verifies the target before publishing without replacement; failures retain staging. Does not load service config. See [offline migration](migration-to-rocksdb.md). |
 | `wok config show` | Config file | |
 | `wok config minimize` | Config file | Rewrites the file and keeps the original as `<file>.bak`. |
 | `wok doctor` | Config file, database, runtime paths | |
@@ -261,6 +264,7 @@ does not list.
 | `wok negentropy add` | Filter argument, database | |
 | `wok negentropy build` | Database | |
 | `wok integrity` | Database | |
+| `wok rocksdb-check` | RocksDB database (RocksDB builds only) | Offline read-only physical audit of exact primary/payload bytes, signatures, author postings/frontiers and table counts; not a full semantic audit of every other derived index. |
 | `wok sync` | A remote relay | Parses its NIP-77 messages; verifies each downloaded event before storing it. |
 | `wok upload` | JSONL events on standard input, a remote relay | Sends each line that is event JSON to the URL and matches the relay's OKs to them by id. Exits nonzero if it skipped a line, the relay refused an event, or the connection closed with acknowledgments outstanding. |
 | `wok download` | A remote relay | Checks each event as `wok import` does, ids and signatures unless `--no-verify`, and skips and reports those that fail. Exits nonzero if it skipped any, the connection closed before EOSE, the relay refused the REQ (CLOSED, or a refusal NOTICE before any event), or `--timeout` seconds passed without the WebSocket handshake, an event or EOSE. |

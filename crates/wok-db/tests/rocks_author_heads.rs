@@ -392,7 +392,6 @@ fn unchanged_frontier_is_not_rewritten_by_duplicate_posting_or_recompression() {
 fn malformed_frontier_lengths_and_non_descending_next_fail_without_primary_reads() {
     let (_dir, env, events) = fixture();
     let a = author(&events[0]);
-    let b = author(&events[1]);
     let cf = env.inner.db.cf_handle(HEAD_CF).unwrap();
     let original = native_head(&env, &a).unwrap();
     let first = position(&events[2]);

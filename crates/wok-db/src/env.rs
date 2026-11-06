@@ -599,6 +599,19 @@ impl Env {
         Ok(scan.other)
     }
 
+    /// Write an independent compact database directory without replacing any
+    /// existing destination. Source records are read without modification.
+    pub fn backup_to_directory(&self, output: &Path) -> Result<(), DbError> {
+        crate::backup::create(self.path(), output, |directory| {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o750)
+                .create(directory)
+                .map_err(|error| DbError::msg(error.to_string()))?;
+            self.compact_to_path(&directory.join("data.mdb"))
+        })
+    }
+
     pub fn compact_to_fd(&self, fd: i32) -> Result<(), DbError> {
         check(unsafe { mdb_env_copyfd2(self.inner.env, fd, MDB_CP_COMPACT) })
     }
